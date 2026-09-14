@@ -261,7 +261,7 @@ pub async fn run_with_telemetry(
     let mut inboxes: HashMap<String, mpsc::Receiver<Delivered>> = HashMap::with_capacity(ids.len());
     for id in &ids {
         // No channel at all for a `target` (`docs/adr/target-components.md`): a target declares
-        // no `sources:` and nothing may *name* one as a source (rule 45), so -- unlike a listener,
+        // no `sources:` and nothing may *name* one as a source (rule 49), so -- unlike a listener,
         // whose inbox exists but is immediately dropped because nothing can ever write to it --
         // there is nothing here to create in the first place. Same reasoning as the listener arm
         // below gives for its dead inbox, one step stronger: a listener's inbox is unreachable,
@@ -383,7 +383,7 @@ pub async fn run_with_telemetry(
                     .map(|target| {
                         target_fanouts.get(target.as_str()).cloned().unwrap_or_else(|| {
                             panic!(
-                                "component '{id}': target '{target}' has no Fanout -- rules 44/45 \
+                                "component '{id}': target '{target}' has no Fanout -- rules 48/49 \
                                  guarantee every target reference resolves to a defined `target`"
                             )
                         })
@@ -1453,7 +1453,7 @@ async fn run_router(
             };
             // `Fanout::deliver` returns early on zero consumers and counts *nothing*, so the
             // ADR's "unrouted events are dropped and counted, never silently" has to be explicit
-            // here. A router with targets and no ordinary consumers is a legal config (rule 46),
+            // here. A router with targets and no ordinary consumers is a legal config (rule 50),
             // and its forward partition is exactly the events no route claimed.
             if slot == 0 && destination.is_empty() {
                 telemetry.count(
@@ -6519,7 +6519,7 @@ mod tests {
         );
     }
 
-    /// A router with targets and no ordinary consumers is a legal config (rule 46), and its
+    /// A router with targets and no ordinary consumers is a legal config (rule 50), and its
     /// unrouted events are dropped -- but never *silently*: `Fanout::deliver` returns early on
     /// zero consumers and counts nothing, so `run_router` has to count them itself. Also pins that
     /// the run still terminates: a partition with nowhere to go must not park the node.

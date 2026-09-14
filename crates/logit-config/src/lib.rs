@@ -392,15 +392,102 @@ pub enum ComponentKind {
         #[serde(default)]
         types_db: Vec<PathBuf>,
     },
-    /// RFC 3164 / RFC 5424 syslog over UDP. **Not** TCP, despite this doc comment's old claim --
-    /// `crates/logit-inputs/src/syslog.rs`'s own module doc has always said UDP-only (nginx's
-    /// `syslog:` writer is UDP-only, so a TCP accept loop would buy this listener nothing;
-    /// `docs/known-gaps.md`'s "`syslog_in` is UDP-only" entry tracks it as future, additive
-    /// work; RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd`, see
-    /// `docs/adr/syslog-structured-data-convention.md`). `syslog_out` (the egress side,
-    /// `docs/adr/syslog-output.md`) supports
-    /// both UDP and TCP -- that asymmetry is deliberate, not a sign this needs fixing to match.
-    SyslogIn { bind: String },
+    /// Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch
+    /// protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`;
+    /// `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the
+    /// codec). The listener half of the `graphite_in -> graphite_out` lossless pair.
+    ///
+    /// `bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle
+    /// port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*`
+    /// attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags
+    /// **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire
+    /// path. See `docs/deploying.md`'s `graphite_in` section.
+    ///
+    /// `transport: tcp` (the default, matching carbon's own default listener) runs an accept loop
+    /// with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram
+    /// listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule
+    /// 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:`
+    /// block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length
+    /// prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.
+    GraphiteIn {
+        bind: String,
+        #[serde(default)]
+        transport: GraphiteTransport,
+        #[serde(default)]
+        protocol: GraphiteProtocol,
+        /// The longest plaintext line this listener will assemble before giving up on it and
+        /// draining to the next newline (counted once as `logit.input.metrics.skipped
+        /// {reason="oversize_line"}`; the line *after* it still decodes). Defaults to `"8192"` --
+        /// carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so
+        /// 8 KiB is comfortably past any real tagged path while keeping one hostile connection
+        /// from growing an unbounded read buffer. A string via [`human_bytes`], exactly like
+        /// `TailOptions::max_line_bytes`. Rule 46 rejects `0`. TCP plaintext only -- a UDP
+        /// datagram is already its own frame.
+        #[serde(default = "default_graphite_max_line_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_line_bytes: u64,
+        /// The largest pickle frame this listener will accept. A frame declaring more than this
+        /// closes the connection (diagnostic `oversize_frame`): a length-framed stream has no
+        /// resync point, so there is nothing to skip forward to. Defaults to `"1MiB"`, Twisted's
+        /// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits
+        /// -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and
+        /// anything outside `1024..=16MiB`. `protocol: pickle` only.
+        #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_frame_bytes: u64,
+    },
+    /// RFC 3164 / RFC 5424 syslog, over UDP (the default) or TCP. RFC 5424 STRUCTURED-DATA is
+    /// parsed into `syslog.sd` either way -- see
+    /// `docs/adr/syslog-structured-data-convention.md`.
+    ///
+    /// Under `transport: tcp` each connection's framing is **auto-detected from its first byte**
+    /// and latched for that connection's life: an ASCII digit means RFC 6587 section 3.4.1
+    /// octet-counting (`MSG-LEN SP MSG`, the framing `syslog_out` emits, and the only one that
+    /// can carry a message containing a newline), anything else means non-transparent,
+    /// LF-delimited framing (rsyslog's `omfwd` default, and what a well-formed message's leading
+    /// `<` gives away). There is no `framing:` field to get wrong; a frame over 64 KiB, or a
+    /// malformed octet count, closes that one connection. See
+    /// `docs/adr/syslog-tcp-ingress-and-tls.md`.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
+    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
+    /// block.
+    ///
+    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
+    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
+    /// apply, scoped **per connection**: N live connections can hold up to N times
+    /// `batch_max_events` in flight, not one shared bound.
+    SyslogIn {
+        bind: String,
+        #[serde(default)]
+        transport: SyslogTransport,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `logit_in`, and unlike `otlp_in`, this isn't an
+        /// HTTP-shaped protocol with anything for a client to negotiate down to. See
+        /// [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
+        /// udp`, where a datagram listener has no connection to time out). How long one
+        /// connection has, **per pre-message phase**, to get somewhere before this listener
+        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
+        /// set, and then the wait for the connection's very first byte. Each phase gets its own
+        /// budget of this length, so a TLS connection that says nothing at all costs up to two
+        /// of them -- 10s at the default -- exactly the way `syslog_out`'s `connect_timeout`
+        /// bounds its own TCP connect and TLS handshake separately.
+        ///
+        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
+        /// on the gap before the next frame -- a long-lived, mostly-quiet sender is ordinary
+        /// syslog traffic, not a fault. A connection that goes silent *after* that first byte
+        /// holds its permit indefinitely; that is a known, deliberately separate gap
+        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+    },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
         bind: String,
@@ -410,6 +497,26 @@ pub enum ComponentKind {
         /// present; plaintext when omitted. See [`TlsServerConfig`].
         #[serde(default)]
         tls: Option<TlsServerConfig>,
+        /// How long one connection has to finish its **TLS accept** before this listener closes
+        /// it and hands back its connection-cap permit. **`tls:` only** -- a plaintext listener
+        /// has no phase for it to bound, so rule 45 rejects a non-default value on one rather
+        /// than accepting a guaranteed no-op.
+        ///
+        /// **Narrower here than on `syslog_in`/`logit_in`, deliberately.** On those two the same
+        /// field also bounds the wait for the first byte *after* the handshake, because their
+        /// accept loops read that byte themselves. This listener hands the accepted stream
+        /// straight to `hyper`, whose `hyper_util::server::conn::auto::Builder` reads the first
+        /// bytes itself to tell HTTP/1.1 from h2 -- a read this listener never sees and cannot
+        /// wrap without reimplementing that sniff, and one `hyper`'s own
+        /// `http1().header_read_timeout(..)` does not cover either (it starts only once the
+        /// version is already known). Under `protocol: grpc` there is no such knob at all.
+        /// So on `otlp_in` a handshaken-then-silent connection still holds its permit (the same
+        /// open row as the post-handshake idle case, `docs/known-gaps.md`'s "no idle-connection
+        /// timeout on a TCP listener"), and a plaintext one is not bounded at any point at all
+        /// (`docs/known-gaps.md`'s "a plaintext `otlp_in` has no pre-first-byte bound").
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
     },
     /// Tails one or more files as a log source, one line per event -- rotation-, truncation-,
     /// and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the
@@ -467,6 +574,21 @@ pub enum ComponentKind {
         #[serde(default, with = "human_bytes::option")]
         #[schemars(with = "Option<String>")]
         max_frame_bytes: Option<u64>,
+        /// How long one connection has, **per pre-`Hello` phase**, to get somewhere before this
+        /// listener closes it and hands back its connection-cap permit: the TLS accept when
+        /// `tls:` is set, and then the `Hello` read itself. Each phase gets its own budget of
+        /// this length, so a TLS connection that sends no `Hello` costs up to two of them --
+        /// 10s at the default -- exactly the way `logit_out` races every step of its own connect
+        /// against its single `request_timeout`.
+        ///
+        /// **Not an idle timeout.** Once a connection is handshaken, the gap before its next
+        /// data frame is unbounded on purpose -- an idle `logit_out` peer with nothing to send
+        /// is ordinary. Such a connection holds its permit indefinitely; that is a known,
+        /// deliberately separate gap (`docs/known-gaps.md`'s "no idle-connection timeout on a
+        /// TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
     },
     /// `logit` talking about itself: drains every component's buffered self-telemetry points on
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
@@ -1007,10 +1129,23 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_message_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) is allowed to take before `send` reports it as a failure.
+        /// dropped connection) is allowed to take before `send` reports it as a failure. Also
+        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS
+        /// connect can take up to twice this value, the same way `logit_out` races every step of
+        /// its own connect against its single `request_timeout`.
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// Turns on TLS for this connection when present -- RFC 5425, syslog over TLS over TCP.
+        /// Presence turns it on and makes it *required* (there is no plaintext fallback), the
+        /// same shape as `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to
+        /// read that signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means
+        /// TLS with the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope,
+        /// and `tls:` alongside `transport: udp` is a config error (rule 44), not silently
+        /// ignored. See [`TlsClientConfig`] for path resolution (relative to the config file's
+        /// own directory) and `!env` compatibility, both identical here.
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
         /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*`
         /// attributes -- absent (the default) means no such element is ever emitted; a
         /// `syslog.sd` attribute (round-tripped from `syslog_in`) still renders regardless of
@@ -1052,7 +1187,8 @@ pub enum ComponentKind {
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`.
+        /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
+        /// dropped connection) is allowed to take before `send` reports it as a failure.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
@@ -1086,6 +1222,51 @@ pub enum ComponentKind {
         /// there is no honest substitute for one.
         #[serde(default)]
         hostname: Option<String>,
+    },
+    /// Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay:
+    /// path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the
+    /// other end. See `docs/adr/graphite-carbon-relay.md` and
+    /// `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are
+    /// supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).
+    GraphiteOut {
+        /// `host:port`. Resolved at send time, never at config-load time -- the same
+        /// `statsd_out`/`collectd_out` precedent.
+        endpoint: String,
+        #[serde(default)]
+        transport: GraphiteTransport,
+        #[serde(default)]
+        protocol: GraphiteProtocol,
+        /// Whether to render event attributes as carbon tags. `carbon` (the default) writes
+        /// `;name=value` in ascending rendered-name order; `drop` is the escape hatch for a
+        /// pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory
+        /// name silently -- see `docs/deploying.md`'s `graphite_out` section.
+        #[serde(default)]
+        tags: GraphiteTags,
+        /// What to do with a metric kind carbon's one-number-per-datapoint wire cannot carry.
+        /// `skip` (the default) drops the record, counted; `expand` renders the dotted sub-paths
+        /// `crates/logit-proto/src/graphite/mod.rs`'s module doc tables, counted degraded.
+        #[serde(default)]
+        multi_value: GraphiteMultiValue,
+        /// Bounds one UDP datagram's worth of packed plaintext lines (several lines
+        /// newline-joined per send) -- not a single line's length, and ignored under
+        /// `transport: tcp`, which has no datagram to overflow. Defaults to `"1432"`, the same
+        /// "commodity Ethernet LAN" figure `statsd_out`'s own `max_packet_bytes` uses. A string
+        /// via [`human_bytes`]. Rule 38 rejects `0`.
+        #[serde(default = "default_graphite_max_packet_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_packet_bytes: u64,
+        /// The longest pickle payload this sink will pack into one length-prefixed frame.
+        /// Defaults to `"1MiB"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound
+        /// carbon's own pickle receiver enforces, so a relay never writes a frame the far end
+        /// would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and
+        /// rejects `0`.
+        #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_frame_bytes: u64,
+        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.
+        #[serde(default = "default_graphite_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
     },
     /// Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server
     /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
@@ -1473,6 +1654,21 @@ fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
+/// The one default behind `syslog_in`/`logit_in`/`otlp_in`'s `handshake_timeout` -- deliberately
+/// one function for all three, since a per-phase pre-message budget is the same question on every
+/// ingress listener kind and one number is one thing for an operator to learn. Mirrors
+/// `logit_inputs::tcp::HANDSHAKE_TIMEOUT` and `logit_inputs::logit::HANDSHAKE_TIMEOUT` (the
+/// listeners' own constants, still the default when no config value is threaded through) -- can't
+/// reference either directly, same reason as [`default_syslog_connect_timeout`].
+///
+/// `pub`, unlike every other `default_*` in this module: graph rule 45
+/// (`logit_pipeline::graph`) has to tell a *set* `handshake_timeout` from a defaulted one, and
+/// `logit-pipeline` already depends on this crate, so it imports this rather than hand-mirroring
+/// the number.
+pub fn default_handshake_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 /// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT` -- can't reference it directly, same reason
 /// as [`default_syslog_connect_timeout`].
 fn default_logit_out_request_timeout() -> Duration {
@@ -1495,6 +1691,32 @@ fn default_statsd_connect_timeout() -> Duration {
 /// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
 fn default_collectd_max_packet_bytes() -> u64 {
     1452
+}
+
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
+fn default_graphite_max_line_bytes() -> u64 {
+    8192
+}
+
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES` -- Twisted's
+/// `Int32StringReceiver.MAX_LENGTH`, which carbon's own pickle receiver inherits. Can't reference
+/// it directly, same reason as [`default_syslog_connect_timeout`]; shared by `graphite_in`'s and
+/// `graphite_out`'s `max_frame_bytes`, kept in sync by hand.
+fn default_graphite_max_frame_bytes() -> u64 {
+    1 << 20
+}
+
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
+/// reason as [`default_syslog_connect_timeout`].
+fn default_graphite_max_packet_bytes() -> u64 {
+    1432
+}
+
+/// `GraphiteOut::connect_timeout`'s default -- matches `StatsdOut`'s/`SyslogOut`'s own 5s default
+/// TCP connect timeout.
+fn default_graphite_connect_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
@@ -1584,11 +1806,20 @@ pub enum SpanKindConfig {
     Consumer,
 }
 
-/// `syslog_out`'s transport. UDP (the default) mirrors `syslog_in` and needs no ordering
-/// guarantee against the receiver's startup -- a fire-and-forget `send_to` before the receiver is
-/// up just loses that line, the same honest limit `syslog_in`'s own UDP intake accepts on the way
-/// in. TCP is what makes `Fault` classification (`docs/adr/buffered-sink-delivery.md`)
-/// meaningful for this sink: a connect failure is unambiguously `Fault::Clean`.
+/// The transport `syslog_in` listens on and `syslog_out` sends over -- one enum shared by both
+/// directions of the one protocol (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+///
+/// UDP is the default on both sides: it is what nginx's `syslog:` writer and most senders speak,
+/// and it needs no ordering guarantee against the receiver's startup -- a fire-and-forget
+/// `send_to` before the receiver is up just loses that line, the same honest limit `syslog_in`'s
+/// own UDP intake accepts on the way in.
+///
+/// TCP is the reliable, framed transport. On the way out it is what makes `Fault` classification
+/// (`docs/adr/buffered-sink-delivery.md`) meaningful for the sink -- a connect failure is
+/// unambiguously `Fault::Clean`; on the way in it is what a `tls:` block needs underneath it,
+/// since syslog-over-TLS (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP.
+/// `syslog_out` always emits octet-counted frames; `syslog_in` accepts either RFC 6587 framing,
+/// detected per connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SyslogTransport {
@@ -1644,6 +1875,56 @@ pub enum StatsdFormat {
     #[default]
     Dogstatsd,
     Statsd,
+}
+
+/// `graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own
+/// default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46
+/// rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle
+/// framing has no meaning in a datagram. Deliberately its own enum rather than a reused
+/// `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a
+/// type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out`
+/// document their transport by pointing at a statsd-named type.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteTransport {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// Which carbon wire protocol `graphite_in`/`graphite_out` speaks: `plaintext`
+/// (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a
+/// 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's
+/// port 2004). `pickle` requires `transport: tcp` (rule 46). Its own enum for
+/// [`GraphiteTransport`]'s reason. See `crates/logit-proto/src/graphite/mod.rs`'s module doc for
+/// the wire shapes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteProtocol {
+    #[default]
+    Plaintext,
+    Pickle,
+}
+
+/// Whether `graphite_out` renders attributes as carbon tags at all. See
+/// `crates/logit-proto/src/graphite/mod.rs`'s `Tags` doc comment -- this is that same choice,
+/// exposed as config.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteTags {
+    #[default]
+    Carbon,
+    Drop,
+}
+
+/// What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot
+/// carry. See `crates/logit-proto/src/graphite/mod.rs`'s `MultiValue` doc comment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphiteMultiValue {
+    #[default]
+    Skip,
+    Expand,
 }
 
 /// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
@@ -2588,6 +2869,51 @@ mod tests {
         }
     }
 
+    /// `tls:` is additive the same way `structured_data` is: absent means plaintext, and every
+    /// pre-TLS `syslog_out` config still deserializes unchanged (`docs/plans/syslog-tls.md`).
+    #[test]
+    fn syslog_out_without_tls_defaults_to_none() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "syslog_out", "endpoint": "127.0.0.1:514"}"#).unwrap();
+        match component.kind {
+            ComponentKind::SyslogOut { tls, .. } => assert_eq!(tls, None),
+            other => panic!("expected SyslogOut, got {other:?}"),
+        }
+    }
+
+    /// Presence turns TLS on, so an empty `tls: {}` is meaningful, not equivalent to omitting it
+    /// -- it means "TLS with the bundled Mozilla roots" (`SyslogOut::tls`'s own doc comment).
+    #[test]
+    fn syslog_out_tls_parses_and_an_empty_block_is_distinct_from_absent() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_out", "endpoint": "relay:6514", "transport": "tcp", "tls": {}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogOut { tls, .. } => {
+                assert_eq!(tls, Some(TlsClientConfig::default()));
+                assert!(tls.unwrap().is_empty(), "an empty block still means TLS is on");
+            }
+            other => panic!("expected SyslogOut, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_out", "endpoint": "relay:6514", "transport": "tcp",
+                "tls": {"ca_file": "ca.pem", "cert_file": "client.pem", "key_file": "client.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogOut { tls, .. } => {
+                let tls = tls.expect("a set tls: block parses");
+                assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+                assert_eq!(tls.cert_file.as_deref(), Some("client.pem"));
+                assert_eq!(tls.key_file.as_deref(), Some("client.key"));
+                assert!(!tls.insecure_skip_verify);
+            }
+            other => panic!("expected SyslogOut, got {other:?}"),
+        }
+    }
+
     /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`sample`/`throttle`/`dedup`
     /// were retired, not merely left unimplemented -- a config referencing one is now a
     /// deserialization error (naming the valid kinds) rather than `graph::resolve`'s "not
@@ -2941,6 +3267,90 @@ mod tests {
         }
     }
 
+    /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own:
+    /// TCP plaintext (its default listener is plaintext on 2003), an 8 KiB line bound and
+    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound.
+    #[test]
+    fn graphite_in_component_defaults_to_tcp_plaintext_with_carbons_bounds() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "graphite_in", "bind": "0.0.0.0:2003"}"#).unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn {
+                bind,
+                transport,
+                protocol,
+                max_line_bytes,
+                max_frame_bytes,
+            } => {
+                assert_eq!(bind, "0.0.0.0:2003");
+                assert_eq!(transport, GraphiteTransport::Tcp);
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(max_line_bytes, 8192);
+                assert_eq!(max_frame_bytes, 1 << 20);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// Both enums are `snake_case` on the wire, like every other config enum -- and the pickle
+    /// listener is the TCP-only combination rule 46 is the gate for.
+    #[test]
+    fn graphite_in_component_parses_snake_case_transport_and_protocol() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2004",
+                "transport": "tcp", "protocol": "pickle"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { transport, protocol, .. } => {
+                assert_eq!(transport, GraphiteTransport::Tcp);
+                assert_eq!(protocol, GraphiteProtocol::Pickle);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let udp: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "transport": "udp"}"#,
+        )
+        .unwrap();
+        match udp.kind {
+            ComponentKind::GraphiteIn { transport, protocol, .. } => {
+                assert_eq!(transport, GraphiteTransport::Udp);
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// Both byte bounds go through [`human_bytes`], so `"16KiB"` and a bare `"16384"` are the same
+    /// setting -- the property `StatsdOut::max_packet_bytes`'s own test pins for that field.
+    #[test]
+    fn graphite_in_component_parses_human_byte_sizes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003",
+                "max_line_bytes": "16KiB", "max_frame_bytes": "2MiB"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { max_line_bytes, max_frame_bytes, .. } => {
+                assert_eq!(max_line_bytes, 16 * 1024);
+                assert_eq!(max_frame_bytes, 2 * 1024 * 1024);
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let plain: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "max_line_bytes": "16384"}"#,
+        )
+        .unwrap();
+        match plain.kind {
+            ComponentKind::GraphiteIn { max_line_bytes, .. } => {
+                assert_eq!(max_line_bytes, 16 * 1024, "a bare digit string is bytes");
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
     #[test]
     fn component_with_no_sources_defaults_to_empty() {
         let component: Component =
@@ -3026,6 +3436,58 @@ mod tests {
         }
     }
 
+    /// The default shape every pre-TCP `syslog_in:` config in the wild already has -- UDP, no
+    /// TLS -- must keep deserializing unchanged now that two fields sit behind `#[serde(default)]`
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    #[test]
+    fn syslog_in_defaults_to_udp_with_no_tls() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "syslog_in", "bind": "0.0.0.0:5514"}"#).unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { bind, transport, tls, handshake_timeout } => {
+                assert_eq!(bind, "0.0.0.0:5514");
+                assert_eq!(transport, SyslogTransport::Udp);
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_in_with_transport_tcp_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:5514", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { transport, tls, .. } => {
+                assert_eq!(transport, SyslogTransport::Tcp);
+                assert_eq!(tls, None, "transport alone must not imply TLS");
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syslog_in_with_tls_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::SyslogIn { transport, tls: Some(tls), .. } => {
+                assert_eq!(transport, SyslogTransport::Tcp);
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+            }
+            other => panic!("expected SyslogIn with tls set, got {other:?}"),
+        }
+    }
+
     #[test]
     fn otlp_in_with_protocol_grpc_deserializes() {
         let component: Component = serde_json::from_str(
@@ -3033,10 +3495,11 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol, tls } => {
+            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -3083,10 +3546,11 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "logit_in", "bind": "0.0.0.0:5140"}"#).unwrap();
         match component.kind {
-            ComponentKind::LogitIn { bind, tls, max_frame_bytes } => {
+            ComponentKind::LogitIn { bind, tls, max_frame_bytes, handshake_timeout } => {
                 assert_eq!(bind, "0.0.0.0:5140");
                 assert_eq!(tls, None);
                 assert_eq!(max_frame_bytes, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
             }
             other => panic!("expected LogitIn, got {other:?}"),
         }
@@ -3107,6 +3571,47 @@ mod tests {
                 assert_eq!(max_frame_bytes, Some(32 * 1024 * 1024));
             }
             other => panic!("expected LogitIn with tls and max_frame_bytes set, got {other:?}"),
+        }
+    }
+
+    /// `handshake_timeout` is one field on three listener kinds behind one shared default
+    /// (`default_handshake_timeout`), so it is worth one test that all three really carry it and
+    /// really parse a humantime string -- a typo in any one of the three attribute copies would
+    /// otherwise only show up as a silently-defaulted value in a deployment.
+    #[test]
+    fn handshake_timeout_parses_on_all_three_tcp_listeners() {
+        let syslog: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp",
+                "handshake_timeout": "2s"}"#,
+        )
+        .unwrap();
+        match syslog.kind {
+            ComponentKind::SyslogIn { handshake_timeout, .. } => {
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+
+        let logit: Component = serde_json::from_str(
+            r#"{"type": "logit_in", "bind": "0.0.0.0:5140", "handshake_timeout": "500ms"}"#,
+        )
+        .unwrap();
+        match logit.kind {
+            ComponentKind::LogitIn { handshake_timeout, .. } => {
+                assert_eq!(handshake_timeout, Duration::from_millis(500));
+            }
+            other => panic!("expected LogitIn, got {other:?}"),
+        }
+
+        let otlp: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4317", "handshake_timeout": "1m"}"#,
+        )
+        .unwrap();
+        match otlp.kind {
+            ComponentKind::OtlpIn { handshake_timeout, .. } => {
+                assert_eq!(handshake_timeout, Duration::from_secs(60));
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
         }
     }
 
@@ -3254,6 +3759,78 @@ mod tests {
                 assert_eq!(hostname, Some("logit-relay".to_string()));
             }
             other => panic!("expected CollectdOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_needs_only_an_endpoint_and_defaults_everything_else() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2003"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut {
+                endpoint,
+                transport,
+                protocol,
+                tags,
+                multi_value,
+                max_packet_bytes,
+                max_frame_bytes,
+                connect_timeout,
+            } => {
+                assert_eq!(endpoint, "127.0.0.1:2003");
+                assert_eq!(transport, GraphiteTransport::Tcp, "carbon's own default listener");
+                assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(tags, GraphiteTags::Carbon);
+                assert_eq!(multi_value, GraphiteMultiValue::Skip);
+                assert_eq!(max_packet_bytes, 1432);
+                assert_eq!(max_frame_bytes, 1 << 20, "Twisted's Int32StringReceiver.MAX_LENGTH");
+                assert_eq!(connect_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_enums_deserialize_snake_case() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2004",
+                "transport": "udp", "protocol": "pickle", "tags": "drop",
+                "multi_value": "expand"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut { transport, protocol, tags, multi_value, .. } => {
+                assert_eq!(transport, GraphiteTransport::Udp);
+                assert_eq!(protocol, GraphiteProtocol::Pickle);
+                assert_eq!(tags, GraphiteTags::Drop);
+                assert_eq!(multi_value, GraphiteMultiValue::Expand);
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graphite_out_byte_and_duration_fields_accept_human_strings() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_out", "sources": ["in"], "endpoint": "127.0.0.1:2003",
+                "max_packet_bytes": "8KiB", "max_frame_bytes": "2MiB",
+                "connect_timeout": "10s"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteOut {
+                max_packet_bytes,
+                max_frame_bytes,
+                connect_timeout,
+                ..
+            } => {
+                assert_eq!(max_packet_bytes, 8 * 1024);
+                assert_eq!(max_frame_bytes, 2 * 1024 * 1024);
+                assert_eq!(connect_timeout, Duration::from_secs(10));
+            }
+            other => panic!("expected GraphiteOut, got {other:?}"),
         }
     }
 

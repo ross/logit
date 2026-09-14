@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # Syslog egress: format, transport, and header-field precedence
@@ -86,6 +86,14 @@ of the current write has succeeded yet. This is connection re-establishment, not
 a reset before any byte of this attempt lands means the peer discarded its prior connection state,
 so the duplicate risk is exactly a `Clean` retry's (zero) — the batch has provably not been
 partially delivered twice.
+
+**Amendment (2026-09-13):** this bounded reconnect is **plaintext-only**. Since `syslog_out`
+gained TLS ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)), the proof it rests
+on — one `write(2)` failing means zero bytes of that call were accepted — holds for a raw
+`TcpStream` and not for a `tokio_rustls` one, whose failing write may already have put complete
+records (complete octet-counted messages) on the socket. On a TLS connection there is no internal
+retry: once an application write has been attempted, every failure is `Fault::Ambiguous` and the
+frame is never resent. That ADR's `syslog_out` section has the details.
 
 ### `duplicate_safe()` is `false` for both transports
 
@@ -251,3 +259,27 @@ None of this changes this ADR's own decisions on format default, transport, deli
 injection safety, or sizing — see [ADR `syslog-structured-data-convention`](syslog-structured-data-convention.md)
 for the full STRUCTURED-DATA/timestamp/PROCID/MSG rules, and `docs/known-gaps.md` for which
 previously-accepted gaps this closes or narrows.
+
+## Amendment: TLS, and `syslog_in` gaining TCP (2026-09-13)
+
+[ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md) adds a `tls:` block to this
+sink's TCP transport (RFC 5425 — syslog over TLS over TCP), and, on the ingress side, gives
+`syslog_in` `transport: tcp` of its own. Both change what this ADR's text says above.
+
+**"### Transport: both UDP and TCP" gains TLS on the TCP arm.** `transport: tcp` can now carry
+`tls:` (`TlsClientConfig`) — presence turns TLS on and makes it required, the same "no plaintext
+fallback once configured" shape `logit_out`'s own `tls:` already uses, since `endpoint` here is a
+bare `host:port` with no scheme to read a TLS signal from. The section's own reasoning for why TCP
+makes `Fault` classification meaningful is unchanged and now covers the TLS case too: a failed
+`TlsConnector::connect` is `Fault::Clean` for the same reason a failed plain TCP connect already
+was — nothing has been written yet.
+
+**The Consequences section's `SyslogIn` note — "UDP-only... the egress/ingress asymmetry this ADR
+creates is deliberate" — is superseded, not merely narrowed.** `syslog_in` now also speaks TCP (and,
+with a `tls:` block, TLS), on the same generic stream driver
+(`logit-inputs::tcp::TcpListener`) this ADR's own TCP transport paved the way for on the egress
+side. The asymmetry this ADR recorded as deliberate no longer holds; see
+[ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md) for the full ingress-side design
+(RFC 6587 framing auto-detection, the connection-cap/handshake-timeout accept loop, and why no
+receive queue is needed on this transport) and `docs/known-gaps.md` for the closed/narrowed gap
+entries.

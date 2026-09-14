@@ -16,6 +16,7 @@ use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
+use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
@@ -25,6 +26,7 @@ use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::collectd::CollectdOutput;
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
+use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
 use logit_outputs::logit::LogitOutput;
 use logit_outputs::null::NullOutput;
@@ -43,6 +45,10 @@ use logit_pipeline::{
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
 use logit_proto::frame::Compression as NativeCompression;
+use logit_proto::graphite::{
+    GraphiteEncoder, MultiValue as GraphiteWireMultiValue, Protocol as GraphiteWireProtocol,
+    Tags as GraphiteWireTags,
+};
 use logit_transforms::{
     AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
     Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
@@ -345,19 +351,52 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        SyslogIn { bind } => NodeSpec::Input(
-            Box::new(
-                SyslogInput::new(bind.clone())
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone())
-                    .with_receive(receive_config(&component.receive)),
-            ),
-            input_runtime_config(&component.receive),
-        ),
-        OtlpIn { bind, protocol, tls } => {
+        // Both transports go through one component (`logit_inputs::graphite::GraphiteInput`),
+        // which picks its own driver from `transport`: the shared `UdpListener` under `udp`, its
+        // own accept loop under `tcp`. `with_receive` is safe to call either way -- graph rule 17
+        // has already rejected a queue-bounding field on the TCP case, so what reaches the accept
+        // loop is only the batch-assembly half it actually reads.
+        GraphiteIn { bind, transport, protocol, max_line_bytes, max_frame_bytes } => {
+            let input = GraphiteInput::new(
+                bind.clone(),
+                graphite_transport(*transport),
+                graphite_protocol(*protocol),
+            )
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            .with_receive(receive_config(&component.receive))
+            .with_max_line_bytes(*max_line_bytes as usize)
+            .with_max_frame_bytes(*max_frame_bytes as usize);
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        // The transport picks both the constructor and the matching `receive:` translation:
+        // a TCP listener has no receive queue, so it takes `tcp_receive_config`'s four
+        // batching/shutdown fields, not `receive_config`'s eight (graph rule 17,
+        // `docs/adr/syslog-tcp-ingress-and-tls.md`). `tls:` is TCP-only -- rule 43 has already
+        // rejected it under UDP, and `SyslogInput::with_tls` refuses it again on that arm.
+        SyslogIn { bind, transport, tls, handshake_timeout } => {
+            let mut input = match transport {
+                logit_config::SyslogTransport::Udp => {
+                    SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
+                }
+                logit_config::SyslogTransport::Tcp => SyslogInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+            }
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            // A no-op on the UDP arm, which has no connection to bound -- rule 45 has already
+            // rejected a non-default value there, so nothing is silently discarded here.
+            .with_handshake_timeout(*handshake_timeout);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        OtlpIn { bind, protocol, tls, handshake_timeout } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_handshake_timeout(*handshake_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -372,10 +411,11 @@ fn build_spec(
                 .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        LogitIn { bind, tls, max_frame_bytes } => {
+        LogitIn { bind, tls, max_frame_bytes, handshake_timeout } => {
             let mut input = LogitInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+                .with_telemetry(telemetry.clone())
+                .with_handshake_timeout(*handshake_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -668,6 +708,7 @@ fn build_spec(
             max_message_bytes,
             connect_timeout,
             structured_data,
+            tls,
         } => {
             // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
             // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
@@ -697,6 +738,13 @@ fn build_spec(
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
+            // TCP only -- RFC 5425 is syslog over TLS over TCP, and `graph::resolve`'s rule 44
+            // already rejected a `tls:` block under `transport: udp` (`with_tls` errors on the
+            // UDP arm anyway). After `with_diagnostics`, so the `insecure_skip_verify` warning
+            // lands on this component's own diagnostics -- the `otlp_out` arm's ordering above.
+            if let (logit_config::SyslogTransport::Tcp, Some(tls)) = (transport, tls) {
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+            }
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -742,6 +790,40 @@ fn build_spec(
             if let Some(hostname) = hostname {
                 encoder = encoder.with_hostname(hostname.clone());
             }
+            let output = output
+                .with_encoder(encoder)
+                .with_max_packet_bytes(*max_packet_bytes as usize)
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone());
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+
+        GraphiteOut {
+            endpoint,
+            transport,
+            protocol,
+            tags,
+            multi_value,
+            max_packet_bytes,
+            max_frame_bytes,
+            connect_timeout,
+        } => {
+            // Eager for UDP, lazy for TCP -- the `StatsdOut` split above.
+            let output = match graphite_out_transport(*transport) {
+                GraphiteOutTransport::Udp => GraphiteOutput::udp(endpoint.clone())?,
+                GraphiteOutTransport::Tcp => {
+                    GraphiteOutput::tcp(endpoint.clone(), *connect_timeout)
+                }
+            };
+            let encoder = GraphiteEncoder::new()
+                .with_protocol(graphite_out_protocol(*protocol))
+                .with_tags(graphite_tags(*tags))
+                .with_multi_value(graphite_multi_value(*multi_value))
+                .with_max_frame_bytes(*max_frame_bytes as usize);
             let output = output
                 .with_encoder(encoder)
                 .with_max_packet_bytes(*max_packet_bytes as usize)
@@ -954,6 +1036,23 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
     }
 }
 
+/// [`receive_config`]'s stream-transport sibling: a TCP listener's `TcpListenerConfig` from the
+/// same `receive:` block (`docs/adr/syslog-tcp-ingress-and-tls.md`). The queue fields
+/// (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) are deliberately *not*
+/// carried across -- a TCP listener has no receive queue at all, the connection's own flow
+/// control being the backpressure, which is exactly why graph rule 17 rejects those four by name
+/// on one. The four that do cross over are scoped per connection there, not per listener.
+fn tcp_receive_config(
+    receive: &logit_config::ReceiveConfig,
+) -> logit_inputs::tcp::TcpListenerConfig {
+    logit_inputs::tcp::TcpListenerConfig {
+        batch_max_events: receive.batch_max_events,
+        batch_max_bytes: receive.batch_max_bytes,
+        batch_flush_interval: receive.batch_flush_interval,
+        shutdown_grace: receive.shutdown_grace,
+    }
+}
+
 /// Builds any listener's `InputRuntimeConfig` from its `ReceiveConfig` -- safe to call
 /// unconditionally for every `NodeSpec::Input` arm, including `internal`: graph validation's rule
 /// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
@@ -1035,6 +1134,70 @@ fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Form
     match cfg {
         logit_config::StatsdFormat::Dogstatsd => logit_outputs::statsd::Format::DogStatsd,
         logit_config::StatsdFormat::Statsd => logit_outputs::statsd::Format::Statsd,
+    }
+}
+
+/// The sole place `logit_config::GraphiteTransport` crosses into
+/// `logit_inputs::graphite::Transport` -- same reasoning as [`syslog_format`]: `logit-inputs`
+/// never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the two
+/// vocabularies meet here and nowhere else.
+fn graphite_transport(cfg: logit_config::GraphiteTransport) -> logit_inputs::graphite::Transport {
+    match cfg {
+        logit_config::GraphiteTransport::Tcp => logit_inputs::graphite::Transport::Tcp,
+        logit_config::GraphiteTransport::Udp => logit_inputs::graphite::Transport::Udp,
+    }
+}
+
+/// The sole place `logit_config::GraphiteProtocol` crosses into
+/// `logit_proto::graphite::Protocol` -- same reasoning as [`graphite_transport`]. Graph rule 46 is
+/// what guarantees the `pickle`/`udp` pair never reaches here.
+fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> logit_proto::graphite::Protocol {
+    match cfg {
+        logit_config::GraphiteProtocol::Plaintext => logit_proto::graphite::Protocol::Plaintext,
+        logit_config::GraphiteProtocol::Pickle => logit_proto::graphite::Protocol::Pickle,
+    }
+}
+
+/// The sole place `logit_config::GraphiteTransport` crosses into `graphite_out`'s own transport
+/// choice -- `statsd_format`'s shape. Namespaced `graphite_out_*`, not bare `graphite_transport`:
+/// `graphite_in` needs the identical mapping onto its own, different (`logit_inputs`-side)
+/// transport type, and a same-named free function returning an incompatible type is a hard
+/// collision at merge, not a dedupe-able duplicate the way the shared `GraphiteTransport`/
+/// `GraphiteProtocol` config enums are -- so each side names its own.
+fn graphite_out_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransport {
+    match cfg {
+        logit_config::GraphiteTransport::Udp => GraphiteOutTransport::Udp,
+        logit_config::GraphiteTransport::Tcp => GraphiteOutTransport::Tcp,
+    }
+}
+
+/// The sole place `logit_config::GraphiteProtocol` crosses into `logit_proto::graphite::Protocol`
+/// for `graphite_out`. `graphite_in` needs the identical mapping for its own decoder, but through
+/// its own namespaced converter -- same reasoning as [`graphite_out_transport`].
+fn graphite_out_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtocol {
+    match cfg {
+        logit_config::GraphiteProtocol::Plaintext => GraphiteWireProtocol::Plaintext,
+        logit_config::GraphiteProtocol::Pickle => GraphiteWireProtocol::Pickle,
+    }
+}
+
+/// The sole place `logit_config::GraphiteTags` crosses into `logit_proto::graphite::Tags` --
+/// `graphite_out`-only, unlike [`graphite_out_transport`]/[`graphite_out_protocol`] (`graphite_in`
+/// has no `tags:` field), so no namespacing collision is possible here.
+fn graphite_tags(cfg: logit_config::GraphiteTags) -> GraphiteWireTags {
+    match cfg {
+        logit_config::GraphiteTags::Carbon => GraphiteWireTags::Carbon,
+        logit_config::GraphiteTags::Drop => GraphiteWireTags::Drop,
+    }
+}
+
+/// The sole place `logit_config::GraphiteMultiValue` crosses into
+/// `logit_proto::graphite::MultiValue` -- `graphite_out`-only, same reasoning as
+/// [`graphite_tags`].
+fn graphite_multi_value(cfg: logit_config::GraphiteMultiValue) -> GraphiteWireMultiValue {
+    match cfg {
+        logit_config::GraphiteMultiValue::Skip => GraphiteWireMultiValue::Skip,
+        logit_config::GraphiteMultiValue::Expand => GraphiteWireMultiValue::Expand,
     }
 }
 
@@ -1451,6 +1614,65 @@ mod tests {
         ));
     }
 
+    fn graphite_out_kind(
+        transport: logit_config::GraphiteTransport,
+        protocol: logit_config::GraphiteProtocol,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteOut {
+            endpoint: "127.0.0.1:2003".to_string(),
+            transport,
+            protocol,
+            tags: logit_config::GraphiteTags::default(),
+            multi_value: logit_config::GraphiteMultiValue::default(),
+            max_packet_bytes: 1432,
+            max_frame_bytes: 1 << 20,
+            connect_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// `#[tokio::test]`, `CollectdOutput::udp`'s own precedent: `GraphiteOutput::udp` binds an
+    /// ephemeral local UDP socket eagerly, which needs an active tokio runtime to register with.
+    #[tokio::test]
+    async fn build_spec_builds_a_graphite_udp_sink() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec![],
+            kind: graphite_out_kind(
+                logit_config::GraphiteTransport::Udp,
+                logit_config::GraphiteProtocol::Plaintext,
+            ),
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
+    /// TCP does not bind eagerly -- `GraphiteOutput::tcp` never touches a socket at construction
+    /// (`Conn::Tcp`'s own doc comment), so this needs no runtime either, unlike the UDP variant
+    /// above.
+    #[test]
+    fn build_spec_builds_a_graphite_tcp_sink_without_binding_eagerly() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec![],
+            kind: graphite_out_kind(
+                logit_config::GraphiteTransport::Tcp,
+                logit_config::GraphiteProtocol::Pickle,
+            ),
+        };
+        assert!(matches!(
+            build_spec("out", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Output(_, _, _)
+        ));
+    }
+
     /// `bind: "127.0.0.1:0"` and no assertion about the port: `build_spec` must not bind anything
     /// at all (that is `Output::bind`'s pre-spawn pass), so this test needs no runtime.
     #[test]
@@ -1503,6 +1725,7 @@ mod tests {
                     bind: "127.0.0.1:0".to_string(),
                     protocol,
                     tls: None,
+                    handshake_timeout: Duration::from_secs(5),
                 },
             };
             assert!(
@@ -1622,6 +1845,81 @@ mod tests {
         assert!(err.contains("loading types_db"), "got: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn graphite_component(
+        transport: logit_config::GraphiteTransport,
+        protocol: logit_config::GraphiteProtocol,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig {
+                batch_max_events: 4242,
+                ..logit_config::ReceiveConfig::default()
+            },
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::GraphiteIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport,
+                protocol,
+                max_line_bytes: 8192,
+                max_frame_bytes: 1 << 20,
+            },
+        }
+    }
+
+    /// Every `transport`/`protocol` pair rule 46 permits builds a real input, and the `receive:`
+    /// block reaches it on both transports -- the TCP one takes only the batch-assembly half, but
+    /// it is the same block and the same converter, so a wiring mistake would show up here.
+    #[test]
+    fn build_spec_builds_a_graphite_input_for_every_permitted_transport_and_protocol() {
+        use logit_config::{GraphiteProtocol, GraphiteTransport};
+        for (transport, protocol) in [
+            (GraphiteTransport::Tcp, GraphiteProtocol::Plaintext),
+            (GraphiteTransport::Tcp, GraphiteProtocol::Pickle),
+            (GraphiteTransport::Udp, GraphiteProtocol::Plaintext),
+        ] {
+            let component = graphite_component(transport, protocol);
+            let (spec, _telemetry) = build_spec("in", &component, Path::new(""), None)
+                .unwrap_or_else(|e| panic!("{transport:?}/{protocol:?} should build: {e}"));
+            match spec {
+                NodeSpec::Input(input, runtime) => {
+                    assert_eq!(
+                        runtime.shutdown_grace,
+                        logit_config::ReceiveConfig::default().shutdown_grace,
+                        "{transport:?}: shutdown_grace comes from the same receive: block"
+                    );
+                    drop(input);
+                }
+                _other => panic!("{transport:?}/{protocol:?} should have built a NodeSpec::Input"),
+            }
+        }
+    }
+
+    /// The two converters are the only place `logit-config`'s vocabulary crosses into
+    /// `logit-inputs`'/`logit-proto`'s, so a mismapped arm (a `pickle` that built a plaintext
+    /// decoder, say) would be silent everywhere else.
+    #[test]
+    fn graphite_converters_map_every_variant() {
+        use logit_config::{GraphiteProtocol, GraphiteTransport};
+        assert_eq!(
+            graphite_transport(GraphiteTransport::Tcp),
+            logit_inputs::graphite::Transport::Tcp
+        );
+        assert_eq!(
+            graphite_transport(GraphiteTransport::Udp),
+            logit_inputs::graphite::Transport::Udp
+        );
+        assert_eq!(
+            graphite_protocol(GraphiteProtocol::Plaintext),
+            logit_proto::graphite::Protocol::Plaintext
+        );
+        assert_eq!(
+            graphite_protocol(GraphiteProtocol::Pickle),
+            logit_proto::graphite::Protocol::Pickle
+        );
     }
 
     #[test]
@@ -1874,12 +2172,116 @@ mod tests {
                     key_file: "server.key".to_string(),
                     client_ca_file: None,
                 }),
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
             build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
             NodeSpec::Input(..)
         ));
+    }
+
+    /// A `syslog_in` component at whichever transport, with or without TLS -- the three shapes
+    /// the `SyslogIn` arm branches on.
+    fn syslog_in_component(
+        transport: logit_config::SyslogTransport,
+        tls: Option<logit_config::TlsServerConfig>,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::SyslogIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport,
+                tls,
+                handshake_timeout: Duration::from_secs(5),
+            },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_tcp_syslog_input() {
+        let component = syslog_in_component(logit_config::SyslogTransport::Tcp, None);
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The TLS arm actually loads `testdata/tls/server.{pem,key}` -- `graph::resolve`'s rule 43
+    /// never touches the filesystem, so `build_spec` is where a bad path would first fail (the
+    /// same division of labour `build_spec_reports_a_missing_tls_ca_file_clearly` documents).
+    #[test]
+    fn build_spec_wires_a_tls_server_config_into_a_tcp_syslog_input() {
+        let component = syslog_in_component(
+            logit_config::SyslogTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The negative twin of the test above, and the one that actually pins the `with_tls` call:
+    /// the positive test passes even with that call deleted, since `build_spec` would still hand
+    /// back a `NodeSpec::Input`. A cert path that doesn't exist can only fail if the certificate
+    /// is really being loaded -- the same division of labour
+    /// `build_spec_reports_a_missing_tls_ca_file_clearly` documents for `otlp_out`, since graph
+    /// rule 43 never touches the filesystem.
+    #[test]
+    fn build_spec_reports_a_missing_syslog_tls_cert_file_clearly() {
+        let component = syslog_in_component(
+            logit_config::SyslogTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "does-not-exist.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        let err = match build_spec("in", &component, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.cert_file to fail build_spec"),
+            Err(err) => err,
+        };
+        let err = format!("{err:?}");
+        assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
+    }
+
+    /// The default transport still builds the UDP listener, `receive:` and all.
+    #[test]
+    fn build_spec_builds_a_udp_syslog_input() {
+        let component = syslog_in_component(logit_config::SyslogTransport::Udp, None);
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// `tcp_receive_config` carries the four batch/shutdown fields and drops the four queue ones
+    /// -- a TCP listener has no receive queue for them to configure (graph rule 17).
+    #[test]
+    fn tcp_receive_config_carries_only_the_batch_and_shutdown_fields() {
+        let receive = logit_config::ReceiveConfig {
+            max_datagrams: 4096,
+            batch_max_events: 7,
+            batch_max_bytes: 99,
+            batch_flush_interval: Duration::from_millis(25),
+            shutdown_grace: Duration::from_secs(3),
+            ..logit_config::ReceiveConfig::default()
+        };
+        let cfg = tcp_receive_config(&receive);
+        assert_eq!(cfg.batch_max_events, 7);
+        assert_eq!(cfg.batch_max_bytes, 99);
+        assert_eq!(cfg.batch_flush_interval, Duration::from_millis(25));
+        assert_eq!(cfg.shutdown_grace, Duration::from_secs(3));
     }
 
     #[test]
@@ -1894,6 +2296,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 tls: None,
                 max_frame_bytes: None,
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
@@ -1918,12 +2321,120 @@ mod tests {
                     client_ca_file: None,
                 }),
                 max_frame_bytes: Some(32 * 1024 * 1024),
+                handshake_timeout: Duration::from_secs(5),
             },
         };
         assert!(matches!(
             build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
             NodeSpec::Input(..)
         ));
+    }
+
+    // ---- `handshake_timeout` reaches each of the three listeners -------------------------------
+    //
+    // `NodeSpec::Input` is a `Box<dyn Input + Send>`, so there is nothing to read the field back
+    // off -- a `#[cfg(test)]` accessor on the concrete listener wouldn't be visible here anyway
+    // (this crate compiles `logit-inputs` without `cfg(test)`). These three tests therefore pin
+    // the wiring the way `build_spec_reports_a_missing_syslog_tls_cert_file_clearly` pins
+    // `with_tls`: by asserting something that can only be true if the call really happened.
+    // A 50ms budget, a connection that says nothing, and the server-side close it must produce --
+    // with `.with_handshake_timeout(..)` deleted from the arm, the listener's own 5s default
+    // applies and every one of these fails on its 1s read.
+
+    /// A free loopback port, released again -- the bind-drop-rebind idiom this crate's own
+    /// integration tests use (`crates/logit-cli/tests/otlp_round_trip.rs`'s `ephemeral_addr`),
+    /// needed here because `Input` has no `local_addr` for a boxed listener to report through.
+    async fn free_port() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().to_string()
+    }
+
+    /// Spawns a built `NodeSpec::Input` and asserts the server closes a connection that sends
+    /// nothing, within a second -- i.e. well inside the 5s default but well outside a 50ms one.
+    async fn assert_closes_a_silent_connection(spec: NodeSpec, addr: &str) {
+        let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut silent, &mut buf),
+        )
+        .await
+        .expect("a configured 50ms handshake_timeout should close a silent connection within 1s");
+        match result {
+            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("read failed outright: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_a_tcp_syslog_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::SyslogIn {
+                bind: addr.clone(),
+                transport: logit_config::SyslogTransport::Tcp,
+                tls: None,
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_a_logit_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: addr.clone(),
+                tls: None,
+                max_frame_bytes: None,
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    /// `otlp_in`'s knob bounds the TLS accept and nothing else (`logit_inputs::otlp`'s "Handshake
+    /// timeout" doc section), so this one needs a real `tls:` block to have any phase to bound.
+    #[tokio::test]
+    async fn build_spec_wires_handshake_timeout_into_an_otlp_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::OtlpIn {
+                bind: addr.clone(),
+                protocol: logit_config::OtlpProtocol::Http,
+                tls: Some(logit_config::TlsServerConfig {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                }),
+                handshake_timeout: Duration::from_millis(50),
+            },
+        };
+        let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
+        assert_closes_a_silent_connection(spec, &addr).await;
     }
 
     #[test]

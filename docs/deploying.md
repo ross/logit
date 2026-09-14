@@ -171,7 +171,7 @@ alert on directly:
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`collectd_in`/`graphite_in`/`otlp_in`; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped mid-drain. |
@@ -296,7 +296,7 @@ thing, sized against `buffer.disk.max_bytes`; `batches.dropped` gains `frame_too
 
 ## Listener intake
 
-Every UDP listener (`statsd_in`, `collectd_in`, `syslog_in`) sits in front of a per-component, in-memory receive
+Every UDP listener (`statsd_in`, `collectd_in`, `syslog_in`, and a `graphite_in` with `transport: udp`) sits in front of a per-component, in-memory receive
 queue that decouples reading the socket from decoding and batching what it received
 ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) — the listener-side sibling of the sink delivery
 buffering above. This is what lets a slow or backed-up destination downstream be ridden out without
@@ -306,6 +306,56 @@ the socket itself going unread. It's tunable per listener via a `receive:` block
 batch-assembly fields apply; see "Tailing files and Docker logs" below) — see the commented example
 in [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field defaults,
 so an omitted `receive:` is the values below.
+
+### `handshake_timeout` on a TCP listener
+
+A stream listener has no receive queue (its connection's own flow control is the backpressure), but
+it does have something a datagram listener doesn't: a connection that can be opened and then left
+saying nothing, holding one of the listener's 1024 concurrency-cap permits. `syslog_in`
+(`transport: tcp`), `logit_in`, and `otlp_in` each bound that with a `handshake_timeout:` field —
+**5s by default**, a humantime string like `connect_timeout`:
+
+```yaml
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    handshake_timeout: 5s        # the default; per pre-message phase, not a total
+```
+
+**It is a per-phase budget, not one deadline for the connection.** Each pre-message phase gets its
+own budget of the configured length, so a TLS connection that says nothing at all can cost up to
+two of them — 10s at the default — before it is closed and its permit released. The phases are:
+
+| Kind | Phases bounded |
+|---|---|
+| `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
+| `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
+| `otlp_in` | the TLS accept **only** — and so nothing at all on a plaintext listener |
+
+`otlp_in` is the narrow one, and not by choice. It hands each accepted connection straight to
+`hyper`, whose connection builder reads the first bytes itself to tell HTTP/1.1 from an HTTP/2
+preface — a read this listener never sees, and one `hyper`'s own HTTP/1 header-read timeout
+doesn't cover either (that starts only once the version is already decided). So on `otlp_in` this
+knob bounds the TLS handshake and nothing after it, and a **plaintext `otlp_in` has no phase for
+it to bound at all** — which is why rule 45 rejects a non-default `handshake_timeout` on one
+rather than accepting a value that could never fire. A plaintext `otlp_in` therefore has *no*
+pre-message bound, which is a real gap and not a tuning choice: see `docs/known-gaps.md`'s
+"a plaintext `otlp_in` has no pre-first-byte bound" row.
+
+**It is not an idle timeout, on any of the three.** Once a connection has got past its pre-message
+phases, the gap before its next frame/request is deliberately unbounded — a long-lived,
+mostly-quiet sender is ordinary traffic, not a fault. A connection that goes silent *after* that
+point holds its permit indefinitely, which is a known, separately-tracked gap (see
+`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row for why closing it is its
+own piece of work). Lowering `handshake_timeout` does not help with that case; it only tightens how
+fast a connection that never said anything at all is given up on.
+
+`handshake_timeout` must be greater than `0s` (rule 45 — `0` would close every connection before
+its handshake could start), and on a `syslog_in` with `transport: udp` it must be left at its
+default: a datagram listener has no connection to hand shake, so a value set there is rejected at
+validation time rather than silently ignored.
 
 ### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
@@ -403,6 +453,70 @@ that cross-protocol hop costs: the `collectd.*` attributes become ordinary Influ
 wire identity, and one N-data-source list becomes N measurements named `plugin.type.ds` sharing a
 tag set and a timestamp.
 
+### `graphite_in`: carbon plaintext and pickle, TCP or UDP
+
+`graphite_in` ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)) is a carbon receiver:
+point a `write_graphite` plugin, a StatsD backend, a `carbon-relay` or anything else that speaks
+carbon at it. It is one component with two settings that change a great deal about how it behaves.
+[`examples/graphite-relay.yaml`](../examples/graphite-relay.yaml) is the like-for-like runnable
+topology (`graphite_in` straight into `graphite_out`, every default present as a commented
+reference); [`examples/statsd-to-graphite.yaml`](../examples/statsd-to-graphite.yaml) is the
+cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out`.
+
+- **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
+  (plaintext on port 2003). A TCP listener serves up to 1024 connections at once; one arriving past
+  that cap is closed immediately and counted
+  (`logit.input.connections.rejected{reason="limit"}`), because carbon's wire has no way to say
+  "try later" and a sender holding an accepted-but-unread connection would look healthy while
+  delivering nothing. `udp` runs the same shared datagram listener `statsd_in`/`collectd_in`/
+  `syslog_in` do, so everything in the receive-queue section above applies to it unchanged.
+  **Known gap:** unlike `syslog_in`/`otlp_in`/`logit_in`, `graphite_in` has no `handshake_timeout`
+  field at all, so a TCP peer that connects and sends nothing holds one of those 1024 permits
+  indefinitely — see `docs/known-gaps.md`'s "`graphite_in` over TCP has no `handshake_timeout`" row.
+- **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
+  block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
+  and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
+  stream cannot have — so only `batch_max_events`, `batch_max_bytes`, `batch_flush_interval` and
+  `shutdown_grace` apply to it. A queue-bounding field (`max_datagrams`, `max_bytes`, `overflow`,
+  `receive_buffer_bytes`) on a TCP `graphite_in` is a `logit validate` error naming the field, not
+  a setting that is silently ignored. A stalled TCP `graphite_in` therefore shows up as
+  backpressure at the *sender*, which is what you want, rather than as a drop counter here.
+- **`protocol: pickle` requires `transport: tcp`.** Carbon's pickle batch protocol (port 2004) is a
+  4-byte big-endian length prefix around each batch — Twisted's `Int32StringReceiver` — which has
+  no meaning in a datagram that already delimits itself, so the combination is rejected at
+  validation time rather than mis-framing at runtime. The pickle reader is a **restricted** one: it
+  accepts the opcodes real senders emit (`pickle.dumps(..., protocol=2)` and `protocol=-1`) and
+  rejects everything capable of constructing an object, with bounded depth, memo and item counts
+  and every declared length validated before anything is allocated. It is deliberately not a
+  general unpickler.
+- **The two size bounds are the ones you may need to raise.** `max_line_bytes` (default `"8192"`)
+  bounds one TCP plaintext line: past it, with no newline in sight, the line is abandoned and
+  counted once (`logit.input.metrics.skipped{reason="oversize_line"}`, diagnostic `oversize_line`)
+  and the reader drains to the next newline — so the line *after* an oversize one still decodes.
+  `max_frame_bytes` (default `"1MiB"`, Twisted's own `MAX_LENGTH`) bounds one pickle frame, and a
+  frame declaring more closes the connection (`oversize_frame`), because a length-framed stream has
+  no resync point to skip forward to. `logit validate` holds it to `1024..=16MiB`.
+
+**The path is the metric name, and there is no `graphite.*` namespace.** Unlike `collectd_in` and
+`syslog_in`, which park their wire identity in attributes a matching sink reads back,
+`graphite_in` maps the four facts carbon carries straight onto the model: the dotted path *is*
+`MetricRecord.name`, the `;k=v` tags *are* event attributes, the number is a `Gauge`, the second is
+the event timestamp. Nothing is duplicated, and nothing is reserved. State that plainly because it
+cuts both ways: **a `lua`/`set` stage that renames the metric silently changes the wire path** a
+downstream `graphite_out` writes. That is the intended way to rename a series — there is no
+`prefix:` or `template:` field on either component — but it means a rename transform in the middle
+of a relay is a wire-visible change, not a display one.
+
+Two smaller behaviours worth knowing before deploying one:
+
+- **A `-1` timestamp means receipt time**, carbon's own rule. Any other non-positive timestamp
+  rejects the line (`bad_timestamp`), rather than being quietly stamped with "now".
+- **A malformed tag rejects the whole line**, not just that tag — carbon's own
+  `TaggedSeries.parse` raises too, and dropping one tag would silently change the series identity
+  the receiver keys on. A repeated tag key keeps its **last** value, counted
+  `logit.input.tags.normalized{reason="duplicate_key"}`, which is again what carbon does (it
+  builds a `dict`).
+
 ### `collectd_out`: relaying back onto the wire
 
 `collectd_out` is the like-for-like other half, and the sink to reach for when the destination is
@@ -446,6 +560,57 @@ reference. Three things worth knowing before deploying one:
   `logit.output.metrics.skipped{reason="no_host"}` with a `no_host` diagnostic. That is deliberate —
   collectd's receiver rejects an empty host, and inventing one would merge every unlabelled sender
   into a single host's metrics.
+
+### `graphite_out`: relaying to Carbon
+
+`graphite_out` is the sink to reach for when the destination is a real Carbon/Graphite listener
+(or anything else speaking its wire protocols) rather than a general time-series database:
+`graphite_in -> graphite_out` is a fixed point modulo the named normalization list in
+[ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md). Unlike `collectd_out`, both transports
+are supported — carbon's own plaintext listener (port 2003) speaks either UDP or TCP — and there is
+a second wire protocol entirely, carbon's length-prefixed pickle batch format (port 2004, **TCP
+only**: a length prefix has no meaning in a datagram, and `logit validate` rejects `protocol:
+pickle` under `transport: udp`). See `graphite_in`'s own section above for the two runnable
+examples pointing at this sink. Four things worth knowing before deploying one:
+
+- **There is no `graphite.*` carrier, unlike `collectd_out`'s `collectd.*` or `syslog_out`'s
+  `syslog.*`.** The wire path *is* [`MetricRecord::name`](design/data-model.md) — there is no
+  separate `prefix:`/`template:` field and nothing to restore identity from if it changes downstream.
+  This means a `lua`/`set` stage that renames a metric between `graphite_in` and `graphite_out`
+  **silently changes the series carbon stores it under** — there is no wire fact left to notice the
+  rename against, unlike a collectd or syslog relay, where the identity attributes ride alongside
+  the (possibly transformed) rest of the event. If a pipeline renames metrics on the way through,
+  that rename *is* the intended new wire path; there is no way to keep the old one going out this
+  sink.
+- **`tags: carbon` (the default) against a pre-1.1 Graphite silently corrupts data on disk.**
+  Carbon versions before 1.1 have no tag support at all, and their whisper backend takes whatever
+  the plaintext path contains straight into a filesystem path — a `;env=prod` tag suffix becomes
+  literal `;` characters in a **whisper directory name**, not a rejected line. There is no error to
+  see; `carbon-cache` simply creates directories nobody intended. If the destination might be an
+  older Graphite, set `tags: drop` — every attribute is then omitted from the wire entirely (counted
+  `logit.output.tags.dropped{reason="dialect"}`), which is the escape hatch this switch exists for.
+  Confirm the destination's tag support before turning `tags: carbon` on against an unfamiliar
+  cluster.
+- **`multi_value: skip` (the default) drops anything carbon's one-number-per-datapoint wire can't
+  carry** — `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
+  `SetMembers` records are all dropped whole and counted
+  `logit.output.metrics.skipped{metric_kind=...}` rather than guessing at a convention. Set
+  `multi_value: expand` to render the dotted sub-paths `logit_proto::graphite`'s module doc tables
+  instead (`.count`, `.sum`, `.q0_5`...`.q0_99`, per-bucket counts, and so on) — an explicit,
+  named convention rather than a silent default, counted
+  `logit.output.metrics.degraded{metric_kind=...}` once per record.
+- **`max_packet_bytes:` (UDP only, default `1432`) bounds a datagram, not a single line**, the same
+  shape as `statsd_out`'s own setting; `max_frame_bytes:` (default `1MiB`, Twisted's own
+  `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame instead, and applies regardless of
+  transport since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) is
+  `statsd_out`'s/`syslog_out`'s own default. This sink is also the first non-HTTP sink with a real
+  destination to report `duplicate_safe: true` (`null_out` reports it trivially, having no
+  destination) — whisper is last-write-wins per `(path, second)`, so a
+  redelivered datapoint on retry simply overwrites itself with the same number rather than
+  double-counting, unlike a collectd COUNTER or a statsd `|c`. That argument is specifically about
+  whisper's own storage semantics, not the carbon wire protocol in the abstract — a non-whisper
+  Graphite-protocol receiver could treat a redelivered datapoint as an addition instead, and this
+  sink has no way to tell the difference.
 
 ## Tailing files and Docker logs
 
@@ -709,6 +874,13 @@ components:
 `client_ca_file` requires every connecting client to present a certificate chaining to it (mutual
 TLS); omit it to accept any client once the handshake itself completes.
 
+`otlp_in.handshake_timeout` (default 5s) bounds that handshake: a client that completes the TCP
+connect and then never sends a ClientHello is closed and its concurrency-cap permit released. It
+bounds the TLS accept and nothing after it, and it therefore only applies to a listener that has a
+`tls:` block at all (rule 45 rejects a non-default value on a plaintext one) — see
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above for why, and
+for what that leaves open.
+
 **`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification — the
 connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
 whenever it's set; it's meant for a throwaway or pre-production endpoint, not a real deployment,
@@ -721,6 +893,73 @@ listener-side `logit.component.diagnostics` counters as any other transport fail
 -specific to watch beyond that. `docs/known-gaps.md` tracks two open items: certificates are read
 once at startup (a renewed cert needs a restart, not a live reload), and `otlp_out` has no
 `server_name` override for an endpoint reached by IP or through a proxy.
+
+### syslog (RFC 5425)
+
+`syslog_in`/`syslog_out` can speak TLS too — RFC 5425, syslog framed per RFC 6587 carried over TLS
+over TCP — see [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). Same shape as
+`logit_in`/`logit_out` just above: both `bind` and `endpoint` are bare `host:port` strings with no
+URL scheme to read a TLS signal from, so a `tls:` block's mere **presence turns TLS on and makes it
+required** — there is no plaintext fallback once one is configured — and it applies to
+`transport: tcp` only; DTLS (syslog over TLS over UDP) is out of scope, so `tls:` under
+`transport: udp` is a config error rather than a silently ignored block. The fields are the same
+`TlsServerConfig`/`TlsClientConfig` pair every other TLS-capable component uses:
+
+```yaml
+# sender
+components:
+  syslog_out:
+    type: syslog_out
+    sources: [enrich]
+    endpoint: collector.internal:6514   # RFC 5425's registered port
+    transport: tcp
+    tls:
+      ca_file: /etc/logit/tls/ca.pem    # trust this CA instead of the bundled Mozilla set
+```
+
+```yaml
+# collector
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    tls:
+      cert_file: /etc/logit/tls/server.pem
+      key_file: /etc/logit/tls/server.key
+      client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
+```
+
+Mutual TLS adds a client certificate on `syslog_out`'s `tls:` block, exactly `logit_out`'s example
+above (`cert_file`/`key_file` together). `tls.insecure_skip_verify` (`syslog_out` only, same
+contradictory-with-`ca_file` rejection) behaves identically too.
+
+`syslog_out.connect_timeout` bounds the TCP connect and the TLS handshake as two separate phases,
+not one combined deadline — a TLS connect can therefore take up to twice the configured value
+([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s amendment). Size it
+accordingly if raising it from the default.
+
+`syslog_in.handshake_timeout` (default 5s) is the receiving side's own version of the same
+arrangement: one budget of that length for the TLS accept, then a fresh one for the wait for the
+connection's first byte, so a TLS peer that connects and then goes quiet is dropped after at most
+10s. It applies on the plaintext TCP arm too (where only the first-byte phase exists), and not at
+all under `transport: udp`. See
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above.
+
+**What to watch.** `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
+`logit.output.reconnects` (should stay near zero in steady state — a climbing count on a TLS
+connection means the peer or the network, not this sink, is unstable; counted identically on a
+plaintext and a TLS connection, since both take the same connect path). `syslog_in`:
+`logit.input.connections` (a gauge — should match the number of `syslog_out` peers actually
+connected) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the 1024
+-connection cap is binding). Both: a handshake failure, a framing violation, or an oversize/
+malformed frame all surface through
+`logit.component.diagnostics{key="connection_error"|"framing_error"}` and
+`logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` — there is no separate
+TLS-specific counter, the same call this section's `otlp_in`/`otlp_out` paragraphs already make.
+`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, no
+`server_name` override, and no idle-connection timeout once a connection has handshaken (or, on
+plaintext, sent its first byte).
 
 ## Forwarding between `logit` nodes
 
@@ -776,9 +1015,12 @@ comfortably under `retry_budget` -- a `request_timeout` close to or above the re
 room for at most one attempt before the budget itself expires, which defeats retry's purpose.
 `request_timeout` also bounds `logit_in`'s own handshake grace on the far end only loosely: a
 `logit_out` configured with a shorter `request_timeout` than its peer's handshake patience just
-means *this* side gives up first, not that the connection is unsafe. That far-end grace is 5s per
-pre-`Hello` phase, applied independently to the TLS accept and to the `Hello` read that follows
-it -- so a TLS peer that connects and then goes silent is dropped after at most 10s, not 5s.
+means *this* side gives up first, not that the connection is unsafe. That far-end grace is
+`logit_in.handshake_timeout` (default 5s) and it is *per pre-`Hello` phase*, applied independently
+to the TLS accept and to the `Hello` read that follows it -- so a TLS peer that connects and then
+goes silent is dropped after at most 10s, not 5s. See
+["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above; it is a
+pre-`Hello` bound only, never an idle timeout on an established connection.
 A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
 classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
 the batch is retried within `retry_budget`; once a frame has already left on that connection it's
