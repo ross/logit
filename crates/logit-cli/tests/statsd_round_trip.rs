@@ -1107,6 +1107,10 @@ mod tcp {
         let mut client = TcpStream::connect(addr).await.expect("the listener should accept");
         client.write_all(b"halves.joined:4").await.unwrap();
         client.flush().await.unwrap();
+        // The pause is the test: back-to-back writes can coalesce into one `read_buf`, which
+        // would pass without the framer ever having buffered across reads. The unit twin in
+        // `crates/logit-inputs/src/statsd.rs` does the same.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         client.write_all(b"2|c\n").await.unwrap();
         client.flush().await.unwrap();
         drop(client);
