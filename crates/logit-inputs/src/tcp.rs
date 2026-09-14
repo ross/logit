@@ -2654,8 +2654,9 @@ mod tests {
     }
 
     /// A first-byte deadline must not become an idle deadline: once a connection has latched its
-    /// framing, a long gap before the next frame is ordinary (this module's "Pre-handshake
-    /// timeout" doc section says there is deliberately no idle timeout). With a 50ms budget and a
+    /// framing, a long gap before the next frame is ordinary with no `idle_timeout` configured
+    /// (this module's "Idle timeout" doc section -- off unless set, exactly today's behaviour with
+    /// none). With a 50ms budget and a
     /// 100ms flush interval, this also exercises the interaction the naive wrapper would get
     /// wrong -- several flush ticks elapse between the two frames.
     #[tokio::test]
