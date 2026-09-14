@@ -612,8 +612,8 @@ Worked examples, one per shipped component:
   [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)): **the
   stream-transport pair and nothing at layer 3 below it.** `logit.input.connections` (gauge,
   sampled on every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}`
-  (count — the 1024-connection cap actually binding), the same two points `logit_in` and a
-  `syslog_in` on the shared TCP driver record, and for the same reason: this listener's accept
+  (count — the 1024-connection cap actually binding), the same two points `logit_in` and
+  `syslog_in`/`graphite_in`/`statsd_in` on the shared TCP driver record, and for the same reason: this listener's accept
   loop rejects at the cap rather than queueing behind a permit, so there is a refusal to count,
   and the gauge counts permit holders only. A past-the-cap connection is dropped before any TLS
   accept — OTLP has no in-band "try later" to spend a handshake delivering — so a rejection is
@@ -652,8 +652,9 @@ Worked examples, one per shipped component:
   (count) — every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `logit.input.connections` (gauge, sampled
   on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
-  1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in` record the same pair, all
-  three rejecting at the cap rather than queueing behind a permit).
+  1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in`
+  on the shared driver record the same pair, all five rejecting at the cap rather than queueing
+  behind a permit).
 - `generate_in` (`crates/logit-inputs/src/generate.rs`,
   [ADR `load-test-harness`](../adr/load-test-harness.md)): **layer 2 only, no layer-3 points at
   all** — the runtime's own `logit.component.events.sent` on this node's fanout edge already *is*

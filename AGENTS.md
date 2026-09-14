@@ -83,8 +83,9 @@ logit-outputs/src/logit.rs`) are implemented, tested `ComponentKind`s: one TCP (
 connection, a `Hello`/`HelloAck` version/codec/compression handshake, one native frame per batch
 acknowledged before the next is sent
 ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
-`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP,
-DogStatsD tags round-tripped through the real decoder,
+`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP
+(optionally TLS, the `syslog_out` arrangement ported verbatim), DogStatsD tags round-tripped
+through the real decoder,
 [ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- it encodes
 `Sum` (delta, monotonic), `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD
 events/service checks; a `statsd_in -> statsd_out` relay with no `aggregate` in between, or one

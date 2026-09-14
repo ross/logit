@@ -102,17 +102,22 @@ already built that have a known, accepted rough edge.
     and a handshake failure both surface through the same per-connection `connection_error`
     diagnostic, and the permit comes back because the task ends. `handshake_timeout:` is an
     operator-facing field on `syslog_in`, `logit_in`, and `otlp_in` alike now, 5s by default,
-    non-zero per graph rule 45. **What it does not close, on `otlp_in`:** it bounds the TLS accept
-    and nothing after it, because this listener hands each accepted stream straight to `hyper`,
-    whose `hyper_util::server::conn::auto::Builder` reads the connection's first bytes itself to
-    tell HTTP/1.1 from an h2 preface — a read this module never sees and cannot wrap without
-    reimplementing that sniff, and one `http1().header_read_timeout(..)` does not cover either
-    (that starts only once the version is already decided; `protocol: grpc`, on
-    `hyper::server::conn::http2::Builder`, has no equivalent knob at all). So a *TLS* `otlp_in`
-    connection that finishes its handshake and then says nothing still holds its permit — the
-    post-handshake idle case, in the idle-connection-timeout row below — and a *plaintext*
-    `otlp_in` connection is not bounded at any point at all, which is its own row further down
-    ("a plaintext `otlp_in` has no pre-first-byte bound"), not something this row covers.
+    non-zero per graph rule 45. **What it does not close, on `otlp_in`:** on the *TLS* arm it
+    bounds the TLS accept and nothing after it, because this listener hands each accepted stream
+    straight to `hyper`, whose `hyper_util::server::conn::auto::Builder` reads the connection's
+    first bytes itself to tell HTTP/1.1 from an h2 preface — a read this module never sees and
+    cannot wrap without reimplementing that sniff, and one `http1().header_read_timeout(..)` does
+    not cover either (that starts only once the version is already decided; `protocol: grpc`, on
+    `hyper::server::conn::http2::Builder`, has no equivalent knob at all). The *plaintext* arm
+    also has a bound now (closed 2026-09-14, [ADR
+    `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)'s amendment): a
+    `TcpStream::peek` under this same `handshake_timeout` before the stream ever reaches `hyper`,
+    so a connection that sends zero bytes is closed on both arms within the budget. So a *TLS*
+    `otlp_in` connection that finishes its handshake and then says nothing still holds its permit
+    — the post-handshake idle case, in the idle-connection-timeout row below — and a *plaintext*
+    `otlp_in` connection that sends its one peeked byte and then says nothing does too, which is
+    its own row further down ("An `otlp_in` connection that sends its first byte and then goes
+    silent..."), not something this row covers.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -1284,19 +1289,20 @@ already built that have a known, accepted rough edge.
   ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md),
   [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)).
 - **No idle-connection timeout on a TCP listener after a successful handshake (or, on plaintext,
-  after the first byte).** `syslog_in` (`transport: tcp`) and `logit_in` bound every *pre*-message
-  phase they have, and the budget is operator-tunable on all three — `handshake_timeout:`, 5s by
-  default, applied per phase (the TLS accept, then the first-byte/`Hello` read). `otlp_in` is the
-  exception and has its own row, immediately below: its budget reaches the TLS accept alone, so a
-  plaintext `otlp_in` bounds nothing at any point. What none of the three bounds is what happens
-  *after*: a connection that completes its handshake (or, on a plaintext
-  listener, delivers at least one byte and then stops) goes silent forever and holds its
-  connection-cap permit indefinitely, right up to the cap itself (1024 on all three;
+  after the first byte).** `syslog_in`, `logit_in`, `graphite_in`, and `statsd_in` (the last two
+  each `transport: tcp`; `syslog_in` too) bound every *pre*-message phase they have, and the
+  budget is operator-tunable on all four — `handshake_timeout:`, 5s by default, applied per phase
+  (the TLS accept, then the first-byte/`Hello` read). `otlp_in` is the exception and has its own
+  row, immediately below: on its TLS arm the budget reaches the TLS accept alone, nothing past
+  it; its plaintext arm now bounds only the first byte (a `TcpStream::peek`), not what follows.
+  What none of the five bounds is what happens *after*: a connection that completes its handshake
+  (or, on a plaintext listener, delivers at least one byte and then stops) goes silent forever and
+  holds its connection-cap permit indefinitely, right up to the cap itself (1024 on all five;
   [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s "Pre-handshake timeout"
   section names this explicitly as a known gap `syslog_in` shares with `otlp_in`, not one it
   introduces fresh). A slow-loris-shaped client can exhaust the cap with connections that will
   never send another byte. Closing it means an idle-read timeout per connection, reset on every
-  frame/line/request actually read — no such timer exists on any of the three listeners today.
+  frame/line/request actually read — no such timer exists on any of the five listeners today.
 
   **Deliberately a separate effort with its own ADR, not a second use of `handshake_timeout`**
   (recorded 2026-09-13, when that field landed and this was explicitly *not* built alongside it).
