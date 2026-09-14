@@ -56,7 +56,8 @@ Settled with Ross (2026-09-13), recorded in full in the ADR:
    `prometheus_out`'s delta-skip). `GaugeDelta` skipped with the shared `gauge_delta_unresolved`
    key. `FLAG_NO_RECORDED_VALUE` skipped `{reason="no_recorded_value"}` (`metric.rs:36-40`).
 6. **`duplicate_safe() -> true`** for `graphite_out`: whisper is last-write-wins per
-   `(path, second)` — `influxdb.rs:191-199`'s argument. First non-HTTP sink with `true`.
+   `(path, second)` — `influxdb.rs:191-199`'s argument. First non-HTTP sink with a real
+   destination to report `true` (`null_out` reports it trivially, having no destination).
 7. **Timestamps.** Egress: `event.timestamp.div_euclid(1_000_000_000)`; a result `<= 0` drops the
    record, `{reason="unencodable_timestamp"}` (collectd `encode.rs:52-58` precedent). Ingress: `-1`
    = receipt time (carbon's rule); any other non-positive timestamp rejects the line.
