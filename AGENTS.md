@@ -199,7 +199,19 @@ since the receiver resets its sticky state at every datagram edge and `max_packe
 where those edges fall) rather than the one-blob-per-batch `Encoder`. So `collectd_in ->
 collectd_out` is a fixed point modulo its own named normalization list
 ([ADR `collectd-binary-relay`](docs/adr/collectd-binary-relay.md),
-[examples/collectd-relay.yaml](examples/collectd-relay.yaml)). `generate_in`/`null_out`
+[examples/collectd-relay.yaml](examples/collectd-relay.yaml)). `graphite_in`/`graphite_out`
+(`crates/logit-proto`'s `graphite` codec) are the sixth pair, both of carbon's wire protocols --
+plaintext and pickle (a hand-rolled writer and a restricted, opcode-allowlisted reader, no new
+crate dependency) -- with a `multi_value: skip | expand` switch for the metric kinds carbon's
+one-number-per-datapoint wire can't carry natively and `tags: carbon | drop` for whether attributes
+render as carbon's own `;k=v` segment; `graphite_in`'s TCP listener has no receive queue at all
+(TCP's own flow control is the backpressure, unlike the UDP-only decoupled-listener-io queue every
+other datagram listener shares) and runs its own accept loop rather than the shared stream driver
+`syslog_in` uses (`crates/logit-inputs/src/tcp.rs`) -- porting it onto that driver is follow-up
+work, not a decision. So `graphite_in -> graphite_out` is a fixed point modulo its own named
+normalization list
+([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
+[examples/graphite-relay.yaml](examples/graphite-relay.yaml)). `generate_in`/`null_out`
 (`crates/logit-inputs`/`crates/logit-outputs`) are two more real, unconditionally-shipped
 `ComponentKind`s, but not protocol work like everything above -- a declarative event generator
 (`event:` templates via `logit_core::template`, `{seq}`/`{seq%N}` placeholders) and a sink that
@@ -296,7 +308,7 @@ not a style preference:
   `aggregate` is its first caller); `HyperLogLog` has wrapped the `cardinality-estimator` crate since
   W2, also a real, mergeable sketch — don't replace either with a non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
-  prometheus_out`, and `collectd_in -> collectd_out` must each be a
+  prometheus_out`, `collectd_in -> collectd_out`, and `graphite_in -> graphite_out` must each be a
   lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
   sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
   decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a

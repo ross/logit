@@ -9,6 +9,7 @@
 pub mod collectd;
 pub mod docker;
 pub mod generate;
+pub mod graphite;
 pub mod internal;
 pub mod logit;
 pub mod otlp;

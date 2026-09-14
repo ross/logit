@@ -170,6 +170,51 @@
           }
         },
         {
+          "description": "Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`; `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the codec). The listener half of the `graphite_in -> graphite_out` lossless pair.\n\n`bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*` attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire path. See `docs/deploying.md`'s `graphite_in` section.\n\n`transport: tcp` (the default, matching carbon's own default listener) runs an accept loop with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:` block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.",
+          "type": "object",
+          "required": [
+            "bind",
+            "type"
+          ],
+          "properties": {
+            "bind": {
+              "type": "string"
+            },
+            "max_frame_bytes": {
+              "description": "The largest pickle frame this listener will accept. A frame declaring more than this closes the connection (diagnostic `oversize_frame`): a length-framed stream has no resync point, so there is nothing to skip forward to. Defaults to `\"1MiB\"`, Twisted's `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and anything outside `1024..=16MiB`. `protocol: pickle` only.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "max_line_bytes": {
+              "description": "The longest plaintext line this listener will assemble before giving up on it and draining to the next newline (counted once as `logit.input.metrics.skipped {reason=\"oversize_line\"}`; the line *after* it still decodes). Defaults to `\"8192\"` -- carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so 8 KiB is comfortably past any real tagged path while keeping one hostile connection from growing an unbounded read buffer. A string via [`human_bytes`], exactly like `TailOptions::max_line_bytes`. Rule 46 rejects `0`. TCP plaintext only -- a UDP datagram is already its own frame.",
+              "default": "8192",
+              "type": "string"
+            },
+            "protocol": {
+              "default": "plaintext",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteProtocol"
+                }
+              ]
+            },
+            "transport": {
+              "default": "tcp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "graphite_in"
+              ]
+            }
+          }
+        },
+        {
           "description": "RFC 3164 / RFC 5424 syslog, over UDP (the default) or TCP. RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd` either way -- see `docs/adr/syslog-structured-data-convention.md`.\n\nUnder `transport: tcp` each connection's framing is **auto-detected from its first byte** and latched for that connection's life: an ASCII digit means RFC 6587 section 3.4.1 octet-counting (`MSG-LEN SP MSG`, the framing `syslog_out` emits, and the only one that can carry a message containing a newline), anything else means non-transparent, LF-delimited framing (rsyslog's `omfwd` default, and what a well-formed message's leading `<` gives away). There is no `framing:` field to get wrong; a frame over 64 KiB, or a malformed octet count, closes that one connection. See `docs/adr/syslog-tcp-ingress-and-tls.md`.\n\n`tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored block.\n\nA TCP listener has no receive *queue* -- the connection's own flow control is the backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do apply, scoped **per connection**: N live connections can hold up to N times `batch_max_events` in flight, not one shared bound.",
           "type": "object",
           "required": [
@@ -1530,6 +1575,75 @@
           }
         },
         {
+          "description": "Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay: path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the other end. See `docs/adr/graphite-carbon-relay.md` and `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "connect_timeout": {
+              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "`host:port`. Resolved at send time, never at config-load time -- the same `statsd_out`/`collectd_out` precedent.",
+              "type": "string"
+            },
+            "max_frame_bytes": {
+              "description": "The longest pickle payload this sink will pack into one length-prefixed frame. Defaults to `\"1MiB\"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound carbon's own pickle receiver enforces, so a relay never writes a frame the far end would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and rejects `0`.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "max_packet_bytes": {
+              "description": "Bounds one UDP datagram's worth of packed plaintext lines (several lines newline-joined per send) -- not a single line's length, and ignored under `transport: tcp`, which has no datagram to overflow. Defaults to `\"1432\"`, the same \"commodity Ethernet LAN\" figure `statsd_out`'s own `max_packet_bytes` uses. A string via [`human_bytes`]. Rule 38 rejects `0`.",
+              "default": "1432",
+              "type": "string"
+            },
+            "multi_value": {
+              "description": "What to do with a metric kind carbon's one-number-per-datapoint wire cannot carry. `skip` (the default) drops the record, counted; `expand` renders the dotted sub-paths `crates/logit-proto/src/graphite/mod.rs`'s module doc tables, counted degraded.",
+              "default": "skip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteMultiValue"
+                }
+              ]
+            },
+            "protocol": {
+              "default": "plaintext",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteProtocol"
+                }
+              ]
+            },
+            "tags": {
+              "description": "Whether to render event attributes as carbon tags. `carbon` (the default) writes `;name=value` in ascending rendered-name order; `drop` is the escape hatch for a pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory name silently -- see `docs/deploying.md`'s `graphite_out` section.",
+              "default": "carbon",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteTags"
+                }
+              ]
+            },
+            "transport": {
+              "default": "tcp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "graphite_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
           "type": "object",
           "required": [
@@ -1900,6 +2014,38 @@
             "sum"
           ]
         }
+      ]
+    },
+    "GraphiteMultiValue": {
+      "description": "What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot carry. See `crates/logit-proto/src/graphite/mod.rs`'s `MultiValue` doc comment.",
+      "type": "string",
+      "enum": [
+        "skip",
+        "expand"
+      ]
+    },
+    "GraphiteProtocol": {
+      "description": "Which carbon wire protocol `graphite_in`/`graphite_out` speaks: `plaintext` (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's port 2004). `pickle` requires `transport: tcp` (rule 46). Its own enum for [`GraphiteTransport`]'s reason. See `crates/logit-proto/src/graphite/mod.rs`'s module doc for the wire shapes.",
+      "type": "string",
+      "enum": [
+        "plaintext",
+        "pickle"
+      ]
+    },
+    "GraphiteTags": {
+      "description": "Whether `graphite_out` renders attributes as carbon tags at all. See `crates/logit-proto/src/graphite/mod.rs`'s `Tags` doc comment -- this is that same choice, exposed as config.",
+      "type": "string",
+      "enum": [
+        "carbon",
+        "drop"
+      ]
+    },
+    "GraphiteTransport": {
+      "description": "`graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46 rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle framing has no meaning in a datagram. Deliberately its own enum rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out` document their transport by pointing at a statsd-named type.",
+      "type": "string",
+      "enum": [
+        "tcp",
+        "udp"
       ]
     },
     "InternalLogs": {

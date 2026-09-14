@@ -189,31 +189,45 @@ their own, but a receiver that can't verify/decrypt has nothing further to parse
 
 ### Graphite
 
-References: <https://graphite.readthedocs.io/en/latest/feeding-carbon.html> (plaintext),
-<https://graphite.readthedocs.io/en/latest/tags.html> (tags).
+References: <https://graphite.readthedocs.io/en/latest/feeding-carbon.html> (plaintext + pickle),
+<https://graphite.readthedocs.io/en/latest/tags.html> (tags). `logit`'s relay:
+[ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md).
 
 Plaintext: `<path> <value> <timestamp>`, one per line, `path` a dot-separated hierarchy
 (`servers.web01.cpu.idle`). No kind, no explicit metadata — retention and aggregation function
 (sum/average/max/last) are configured server-side per path pattern, not carried on the wire.
 **Tagged** extension: `<path>;tag1=value1;tag2=value2 <value> <timestamp>` — tag names forbid
 `;`, `!`, `^`, `=`; tag values forbid `;` and a leading `~`; Carbon normalizes tag order on
-ingest. A pickle-serialized batch protocol exists as a transport optimization, same semantics.
+ingest.
+
+A pickle-serialized batch protocol exists as a transport optimization over the same semantics, on
+its own port (2004, versus plaintext's 2003): each message is a 4-byte **big-endian** length
+prefix (Twisted's `Int32StringReceiver` framing) followed by exactly that many bytes of a pickled
+`[(path, (timestamp, value)), ...]` — a flat list of `(str, (number, number))` tuples, one per
+datapoint, in no particular grouping. Real senders (`carbon-relay`'s own pickle client, collectd's
+`write_graphite` plugin in `Protocol Pickle` mode) emit protocol 2 or `-1` (which resolves to the
+sender's highest available protocol); nothing in the field emits protocol 0 or 1 for this payload
+shape. Carbon's receiver treats `timestamp <= 0` specially: `-1` means "now" (the point is stamped
+with receipt time, not rejected), while `pickle.dumps`'s own float/int formatting is otherwise
+carried straight through. Both wire forms share one value rule: Carbon filters out NaN before
+storing it (a `nan` datapoint is silently dropped, never written to Whisper), and both share the
+same tag grammar given above regardless of which protocol carries the tagged path.
 
 ### Metrics comparison matrix
 
 | Feature | statsd | DogStatsD | OTLP | Prometheus (exposition/OM) | Prom. remote-write | InfluxDB LP | collectd | Graphite |
 |---|---|---|---|---|---|---|---|---|
-| Counter/monotonic sum | `c` | `c` | `Sum{monotonic:true}` | `counter` | via `Sum` type | untyped field | `COUNTER`, `DERIVE` | untyped |
-| Gauge | `g` (absolute) | `g` | `Gauge` | `gauge` | via type | untyped field | `GAUGE` | untyped |
+| Counter/monotonic sum | `c` | `c` | `Sum{monotonic:true}` | `counter` | via `Sum` type | untyped field | `COUNTER`, `DERIVE` | untyped → `Gauge` (temporality/monotonicity dropped, `docs/adr/graphite-carbon-relay.md`) |
+| Gauge | `g` (absolute) | `g` | `Gauge` | `gauge` | via type | untyped field | `GAUGE` | untyped → `Gauge` |
 | Relative gauge delta | `+`/`-` on `g` | `+`/`-` on `g` | — | — | — | — | — | — |
 | Temporality (delta/cumulative) | — (implicit delta) | — | explicit field | cumulative only (`_bucket`) | via native histogram | — | — | — |
 | Timer/raw samples | `ms` (server-summarized) | `ms` | — | — | — | — | — | — |
-| Distribution (sketch) | — | `d` | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram | — | — | — |
-| Set/cardinality | `s` | `s` | — | — | — | — | — | — |
-| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | `Histogram` | `histogram` | via native | — | — | — |
-| Histogram sum/count/min/max | — | — | yes | `_sum`/`_count` (no min/max) | yes | — | — | — |
-| Exponential/native histogram | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) | — | — | — |
-| Summary (pre-computed quantiles) | — | — | `Summary` | `summary` | — | — | — | — |
+| Distribution (sketch) | — | `d` | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram | — | — | none natively; `multi_value: expand` → `.count`/`.sum`/`.q0_5`…`.q0_99` sub-paths, else dropped |
+| Set/cardinality | `s` | `s` | — | — | — | — | — | none natively; `expand` → `.count`, else dropped |
+| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | `Histogram` | `histogram` | via native | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped |
+| Histogram sum/count/min/max | — | — | yes | `_sum`/`_count` (no min/max) | yes | — | — | `expand` only (see row above) |
+| Exponential/native histogram | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped |
+| Summary (pre-computed quantiles) | — | — | `Summary` | `summary` | — | — | — | none natively; `expand` → `.count`/`.sum`/`.q<q>`, else dropped |
 | Exemplars | — | — | yes | OpenMetrics only | yes (2.0) | — | — | — |
 | Unit | — | — | `Metric.unit` | `# UNIT` (OM) | via metadata (2.0) | — | — | — |
 | Description | — | — | `Metric.description` | `# HELP` | via metadata (2.0) | — | — | — |
@@ -226,7 +240,7 @@ ingest. A pickle-serialized batch protocol exists as a transport optimization, s
 | schema_url | — | — | yes | — | — | — | — | — |
 | Events/service checks | — | `_e{}` / `_sc` (in `logit`: `log` (`_e`) / `Gauge` + `statsd.service_check.*` carriers (`_sc`), both ways -- `docs/adr/statsd-output.md`'s amendment) | (as logs, not metrics) | — | — | — | notifications (`Message`+`Severity` parts; in `logit`: `log` + `collectd.severity`) | — |
 | Container id | — | `\|c:` | resource attrs | — | — | — | — | — |
-| Multi-value point | `a:1:2:3\|c` | yes | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line |
+| Multi-value point | `a:1:2:3\|c` | yes | one point per `Metric` (batch-level regroup) | one line per series | one series per point | multiple fields/point | one value/part | one value/line (expandable — `multi_value: expand` renders several dotted sub-paths) |
 | No-recorded-value / stale marker | — | — | `flags` bit 0 | staleness marker (internal) | — | — | — | — |
 | Int vs. float value | float only | float only | `oneof{int,double}` | float only (text) | float | typed (`i`/`u`/float) | typed per value-type | float only |
 

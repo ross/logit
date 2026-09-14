@@ -452,7 +452,7 @@ point every datagram passes through:
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) |
-| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` (`tail_in`/`docker_in` only) is a single tracked file's own accumulator flushing because that file rotated away or was removed, while the listener itself keeps running — distinct from `shutdown`, the whole component stopping. |
+| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. Distinct from `shutdown`, the whole component stopping. An ordinary client disconnect shows up here as `closed`, never as `shutdown`. |
 | `logit.input.receive_buffer.bytes` / `.requested.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp, and what was actually requested (absent when unset) — sampled once at bind |
 
 Three naming choices worth calling out, since the obvious names collide with existing ones: drops
@@ -534,6 +534,40 @@ Worked examples, one per shipped component:
   message, or no host set — the same shape `incomplete_identity` reports for a value list). A type
   simply *missing* from `types_db` is deliberately not reported: that is routine, not a
   misconfiguration.
+- `graphite_in` (`crates/logit-inputs/src/graphite/`,
+  [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)): **what it reports depends on
+  its `transport:`**, because the two transports genuinely run different drivers. Under
+  `transport: udp` it is `collectd_in`'s shape exactly -- no layer-3 counters of its own, with
+  `logit.input.datagrams`/`.datagram.bytes`, the `ReceiveQueue` table and `receive_buffer.*` all
+  coming free from the shared `UdpListener`. Under `transport: tcp` there is no such driver (and
+  deliberately no receive queue at all -- TCP's own flow control is the backpressure), so the
+  listener records the stream's own facts itself: `logit.input.connections` (gauge, sampled on
+  every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}` (count --
+  the 1024-connection cap actually binding, `logit_in`'s shape rather than `otlp_in`'s blocking
+  one, since carbon's wire has no way to say "try later"); `logit.input.lines` / `.line.bytes`
+  under `protocol: plaintext` and `logit.input.frames` / `.frame.bytes` under `protocol: pickle`
+  (each counted as it arrived on the wire, length prefix included) -- the per-read parity with
+  `statsd_in`'s per-datagram pair, at whichever unit the protocol actually frames in; and
+  `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator`, which is
+  the same layer-2 point a datagram listener's shared `decode_loop` records.
+
+  The codec adds its own, under both transports:
+  `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
+  "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag
+  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Exactly
+  one of that family's reasons is the *listener's* rather than the codec's, because framing is:
+  `{reason="oversize_line"}`, counted once when a TCP plaintext line passes `max_line_bytes` with
+  no newline in it (the reader then drains to the next one). The other framing failure,
+  `oversize_frame`, has no counter of its own at all -- it closes the connection, and the
+  datapoints lost with it were never framed, so there is no honest number to report; it is a
+  diagnostic only. Its per-connection accumulator flushes as `receive.flushed{reason="closed"}`
+  when a client hangs up and `{reason="shutdown"}` only when the component itself is going away.
+  `Diagnostics` keys, mirrored as
+  `logit.component.diagnostics{key}` by the bridge: `bound`, the codec's `bad_line`/`bad_tag`/
+  `bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`, and this listener's own
+  `oversize_line`, `oversize_frame` (a pickle frame declaring more than `max_frame_bytes` -- the
+  connection is closed, since a length-framed stream has no resync point) and `connection_error`
+  (one connection's I/O failing, never fatal to the listener or its siblings).
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
   `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
@@ -755,6 +789,27 @@ Worked examples, one per shipped component:
   being-attempted or out of `{1, 2, 4}`), `empty_message`, `oversize_notification`, and
   `message_truncated` (an over-255-byte message). Retry stays a
   Layer 2 metric here too.
+- `graphite_out` (`crates/logit-outputs/src/graphite.rs`, `docs/adr/graphite-carbon-relay.md`):
+  **the codec emits its own counters and diagnostics directly**, `collectd_out`'s model rather than
+  `statsd_out`'s -- `logit_proto::graphite`'s module doc has the full mapping-to-counter table:
+  `logit.output.metrics.skipped{reason|metric_kind}`, `logit.output.metrics.degraded{metric_kind}`
+  (a multi-value kind expanded, once per record), `logit.output.metrics.normalized{reason=
+  "path_sanitized"|"tag_sanitized"}`, `logit.output.tags.dropped{reason="dialect"|
+  "unrepresentable"|"empty"|"collision"}`, `logit.output.tags.normalized{reason="multi_value"}` --
+  fed by this sink's `with_telemetry`/`with_diagnostics`, so both halves of one `send` show up
+  under one component id exactly as `collectd_out`'s do. This sink adds only what a socket send can
+  produce that the codec has no way to know about: `logit.output.batch.bytes`,
+  `logit.output.request.duration`, `logit.output.requests{class="ok"|"error"}` -- the same shape
+  every other sink's. `logit.output.messages` counts entries actually sent (one plaintext line, or
+  one already-length-prefixed pickle frame) and `logit.output.datapoints` counts Σ each sent
+  entry's own datapoint count (`MessageBuf<usize>`'s `meta`) -- the two coincide for plaintext
+  (every line's meta is `1`) and can differ for pickle, whose frames each carry several datapoints;
+  `logit.output.datagrams` (UDP only) counts datagrams actually sent, `collectd_out`'s identical
+  concept. `logit.output.messages.dropped{reason="oversize_datagram"}` plus a throttled
+  `oversize_datagram` diagnostic cover `EMSGSIZE` on one already-packed UDP datagram, mirroring
+  `statsd_out`'s/`collectd_out`'s identical case -- the datagram's own datapoints are dropped, not
+  the whole batch, and sending continues with the next datagram. Retry stays a Layer 2 metric here
+  too.
 - `logit_out` (`crates/logit-outputs/src/logit.rs`, [ADR
   `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md)):
   `logit.proto.frames{direction="out",codec,compression}` and `logit.proto.frame.bytes` — the
