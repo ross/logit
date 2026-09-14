@@ -81,6 +81,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~0.83-1.24M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.16M/s (median; see note) |
+| `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 20M | ~3.7M/s |
 
 Counts target roughly 5-10 seconds of wall time each on the dev box; tuned against a first real
 `script/perf run --repeat 1 --profile release` pass per scenario, as recorded in this table, rather
@@ -101,6 +102,9 @@ expect its wall time to vary more than every other scenario's when re-run.
 ([`docs/design/performance.md`](../design/performance.md)) showed it clearing 25M events in ~3.2s
 — comfortably under this table's target band once nothing else was loading the machine at the same
 time. Every other scenario's original count held up under that same solo run.
+
+`route` was added on 2026-09-14 (after the target/route stack, #155–#181, landed) as the one
+scenario exercising a router and `target`s; its numbers are in `performance.md` §1.
 
 `fanout` was then re-shaped on 2026-09-14 to generate `passthrough`'s exact six-attribute event
 at `passthrough`'s exact count (20M), rather than its original one-attribute event at 55M. The
@@ -151,7 +155,7 @@ W0-W7 have all landed (PR numbers on each row above); the harness the ADR decide
 runnable by hand, and now carries one real recorded run
 ([`docs/design/performance.md`](../design/performance.md)) rather than only a design.
 
-- **The measurement gap `memory.md` §7 named is closed.** All nine scenarios in the table above
+- **The measurement gap `memory.md` §7 named is closed.** All ten scenarios in the table above
   exist, run in the 5-10s-per-scenario range this plan targeted (`docs/design/performance.md`'s
   results table), and `script/perf run --repeat 3` produces exact-equality-free but real,
   repeatable events/s, CPU µs/event, and peak RSS numbers for a real release-profile `logit run`

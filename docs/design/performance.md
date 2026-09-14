@@ -88,7 +88,7 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   every other `script/*` command does, not a dedicated, pinned-core bench host — see the preamble's
   ~20% caveat.
 
-## 1. Results: all nine scenarios, median of 3
+## 1. Results: all ten scenarios, median of 3
 
 `script/perf run --repeat 3 --profile release --label quiet`, solo, on battery, with the host
 otherwise idle (see the preamble above). Sorted as `script/perf list` orders them (alphabetical);
@@ -107,6 +107,7 @@ noise sub-section right after this table for what it means when that range is wi
 | `lua` | 4M | 628,380 | 554,182 – 776,491 | 2.085 | 29.4 MiB | 6.37 s |
 | `native-relay` | 7M | 1,164,963 | 691,884 – 1,465,330 | 1.118 | 130.0 MiB | 6.01 s |
 | `passthrough` | 20M | 3,078,773 | 2,803,814 – 3,360,304 | 0.478 | 71.0 MiB | 6.50 s |
+| `route` (added later; quiet run at `506e4ca`, see below) | 20M | 3,747,289 | 3,600,158 – 3,956,587 | 0.668 | 82.3 MiB | 5.34 s |
 
 A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures:
 
@@ -158,6 +159,30 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   idle workers. `passthrough`'s own 0.404 here against 0.478 in the row above is #189's saving on
   this path (six fewer interner resolves per event at queue admission), not run-to-run noise —
   the two are different commits.
+- **`route`** was added on 2026-09-14 after the rest of this table, so its row is the other
+  exception to the table's provenance: a quiet run (host idle, on battery, `--repeat 3`) at
+  `506e4ca`, with `passthrough` re-run in the same invocation as the control (3,252,961 events/s,
+  0.394 µs/event, 37.6 MiB — consistent with the `7ead7a4` number above). Same six-attribute
+  event and count as `passthrough`/`fanout`, through a `route` keyed on `host` (ten values: nine
+  routed three-per-target onto three `target`s, one left unrouted onto the router's own
+  `null_out`), so every 100-event batch is split into four ~25-event batches and every event is
+  delivered exactly once — the same data volume as `passthrough`, one hop longer.
+  **0.668 vs 0.394 µs per generated event: the router topology costs 0.274 µs on top of
+  `passthrough`, and about three-quarters of that is the router itself.** `attribute --scenario
+  route` puts `split`'s `process s` at 4.11 s over 20M events — 0.206 µs/event inside `route_batch`
+  (one `AttrMap::get_sym` plus a linear scan of nine byte-string alternatives per event, then the
+  count/reserve/move passes, `crates/logit-pipeline/src/runtime.rs`), at 5 allocations per batch
+  as `docs/adr/target-components.md` pins. The remaining ~0.07 µs is three more sink-side hops
+  (`drain_inbox → SinkQueue → write_loop`) on quarter-size batches, where the fixed per-batch
+  cost is amortized over 25 events instead of 100; `sys_s` also rises from 0.09 s to 0.94 s
+  (more tasks parking and waking), the same shape `fanout` shows. Read against `fanout`
+  (0.572 µs, every event delivered three times): routing a stream once costs more CPU than
+  fan-out delivering it three times, because `fanout`'s extra work is refcount bumps and
+  `null_out`'s empty `send`, while `route` does real per-event work. Wall throughput
+  (3.75M events/s) is in the same band as `passthrough`'s, and `gen` was blocked in send only
+  0.30 s of the run — still generator-bound, with the router on its own task. The 82 MiB peak RSS
+  against `passthrough`'s 38 MiB is the four sink queues plus the router's inbox holding batches
+  in flight at once.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
