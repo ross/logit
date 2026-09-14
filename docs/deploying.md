@@ -332,17 +332,20 @@ two of them — 10s at the default — before it is closed and its permit releas
 |---|---|
 | `syslog_in` (`transport: tcp`) | the TLS accept (under `tls:`), then the wait for the connection's first byte — on the plaintext arm too |
 | `logit_in` | the TLS accept (under `tls:`), then the `Hello` read |
-| `otlp_in` | the TLS accept **only** — and so nothing at all on a plaintext listener |
+| `otlp_in` | the TLS accept (under `tls:`), or — on the plaintext arm, which has no TLS accept — the wait for the connection's first byte |
 
-`otlp_in` is the narrow one, and not by choice. It hands each accepted connection straight to
-`hyper`, whose connection builder reads the first bytes itself to tell HTTP/1.1 from an HTTP/2
-preface — a read this listener never sees, and one `hyper`'s own HTTP/1 header-read timeout
-doesn't cover either (that starts only once the version is already decided). So on `otlp_in` this
-knob bounds the TLS handshake and nothing after it, and a **plaintext `otlp_in` has no phase for
-it to bound at all** — which is why rule 45 rejects a non-default `handshake_timeout` on one
-rather than accepting a value that could never fire. A plaintext `otlp_in` therefore has *no*
-pre-message bound, which is a real gap and not a tuning choice: see `docs/known-gaps.md`'s
-"a plaintext `otlp_in` has no pre-first-byte bound" row.
+`otlp_in` is the narrow one, and not by choice: it bounds one phase per connection rather than two.
+It hands each accepted connection straight to `hyper`, whose connection builder reads the first
+bytes itself to tell HTTP/1.1 from an HTTP/2 preface — a read this listener never sees. What it
+*can* do on a plaintext listener is wait for the first byte to become available without consuming
+it (a `MSG_PEEK`), which is the bound this knob applies there; the version sniff then proceeds over
+an untouched socket. So a connection that sends nothing at all is closed inside the budget on
+either arm, but a connection that sends **one byte** and then goes silent is past everything this
+knob reaches, and holds its permit until the cap is the only thing bounding it. That residual is a
+real gap and not a tuning choice: see `docs/known-gaps.md`'s "an `otlp_in` connection that sends
+its *first* byte and then goes silent" row. `hyper`'s own HTTP/1 header-read timeout is
+deliberately not used to close it — it re-arms on every idle keep-alive gap, so it would behave as
+an idle timeout and kill a long-interval exporter's pooled connection.
 
 **It is not an idle timeout, on any of the three.** Once a connection has got past its pre-message
 phases, the gap before its next frame/request is deliberately unbounded — a long-lived,

@@ -18,10 +18,10 @@
 //! a frame boundary. An already-in-flight frame (past its header) is allowed to finish -- the
 //! `select!` below only ever re-evaluates between frames, never mid-body-read.
 //!
-//! **Connection limit.** Unlike `otlp_in`'s [`crate::otlp::MAX_CONCURRENT_CONNECTIONS`] (a
-//! blocking `acquire_owned` -- the 1025th connection just waits for a permit), this listener uses
-//! a non-blocking `try_acquire_owned`: at capacity, a connecting client gets a clean `Reject` and
-//! the connection closes immediately rather than hanging with a handshake that never starts.
+//! **Connection limit.** A non-blocking `try_acquire_owned` against the same 1024-connection cap
+//! `otlp_in` ([`crate::otlp::MAX_CONCURRENT_CONNECTIONS`]) and `syslog_in`'s driver use: at
+//! capacity, a connecting client gets a clean `Reject` and the connection closes immediately
+//! rather than hanging with a handshake that never starts.
 //! `logit`-to-`logit` peers are expected to retry/back off on their own, the same assumption the
 //! connection protocol's ack-driven backpressure already leans on. **The reject goes out after
 //! the TLS wrap, when TLS is configured, not onto the raw `TcpStream`** -- a TLS-configured

@@ -551,8 +551,8 @@ Worked examples, one per shipped component:
   deliberately no receive queue at all -- TCP's own flow control is the backpressure), so the
   listener records the stream's own facts itself: `logit.input.connections` (gauge, sampled on
   every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}` (count --
-  the 1024-connection cap actually binding, `logit_in`'s shape rather than `otlp_in`'s blocking
-  one, since carbon's wire has no way to say "try later"); `logit.input.lines` / `.line.bytes`
+  the 1024-connection cap actually binding, `logit_in`'s reject-don't-queue shape, since carbon's
+  wire has no way to say "try later"); `logit.input.lines` / `.line.bytes`
   under `protocol: plaintext` and `logit.input.frames` / `.frame.bytes` under `protocol: pickle`
   (each counted as it arrived on the wire, length prefix included) -- the per-read parity with
   `statsd_in`'s per-datagram pair, at whichever unit the protocol actually frames in; and
@@ -576,6 +576,22 @@ Worked examples, one per shipped component:
   `oversize_line`, `oversize_frame` (a pickle frame declaring more than `max_frame_bytes` -- the
   connection is closed, since a length-framed stream has no resync point) and `connection_error`
   (one connection's I/O failing, never fatal to the listener or its siblings).
+- `otlp_in` (`crates/logit-inputs/src/otlp.rs`,
+  [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)): **the
+  stream-transport pair and nothing at layer 3 below it.** `logit.input.connections` (gauge,
+  sampled on every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}`
+  (count — the 1024-connection cap actually binding), the same two points `logit_in` and a
+  `syslog_in` on the shared TCP driver record, and for the same reason: this listener's accept
+  loop rejects at the cap rather than queueing behind a permit, so there is a refusal to count,
+  and the gauge counts permit holders only. A past-the-cap connection is dropped before any TLS
+  accept — OTLP has no in-band "try later" to spend a handshake delivering — so a rejection is
+  never also a handshake. There is no frame/request counter under them: this input's unit of
+  arrival is an HTTP request or a gRPC call, and `Fanout`'s own per-batch view already sees one
+  batch per accepted request, so a counter here would only restate it. `Diagnostics` keys,
+  mirrored as `logit.component.diagnostics{key}` by the bridge: `bound`, and `connection_error` —
+  one connection's I/O failing, a TLS accept that failed or timed out, or a plaintext connection
+  that produced no first byte inside `handshake_timeout` and so gave its permit back. There is no
+  TLS-specific metric: a handshake failure surfaces through that same diagnostic.
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
   `logit.input.lines` / `.line.bytes` — the read-side parity with `statsd_in`'s per-datagram pair,
@@ -601,8 +617,8 @@ Worked examples, one per shipped component:
   (count) — every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `logit.input.connections` (gauge, sampled
   on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
-  1024-connection cap actually binding, unlike `otlp_in`'s blocking-backpressure shape, which has
-  nothing to count here since it never rejects outright).
+  1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in` record the same pair, all
+  three rejecting at the cap rather than queueing behind a permit).
 - `generate_in` (`crates/logit-inputs/src/generate.rs`,
   [ADR `load-test-harness`](../adr/load-test-harness.md)): **layer 2 only, no layer-3 points at
   all** — the runtime's own `logit.component.events.sent` on this node's fanout edge already *is*

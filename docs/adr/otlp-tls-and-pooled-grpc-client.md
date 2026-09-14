@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-14
 ---
 
 # TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it
@@ -141,3 +141,56 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
 - `docs/known-gaps.md`'s "`otlp_out` has no gRPC TLS" and "opens a fresh connection per request"
   entries are retired; "certificates are loaded once at startup" and "no `server_name` override"
   are filed as new, smaller ones.
+
+## Amendment: `otlp_in` rejects at the cap and bounds a plaintext connection's first byte (2026-09-14)
+
+This ADR left `otlp_in`'s accept loop as it found it: a blocking
+`connection_limit.acquire_owned().await` after `accept`, with `handshake_timeout` (added shortly
+afterwards, alongside `syslog_in`'s TCP transport) wrapping the TLS accept and nothing else. Both
+halves of that are now changed, and `docs/known-gaps.md`'s "a plaintext `otlp_in` has no
+pre-first-byte bound" row narrows to a much smaller residual.
+
+**Reject, don't queue.** The loop uses `try_acquire_owned`; a connection past
+`MAX_CONCURRENT_CONNECTIONS` is dropped immediately and counted as
+`logit.input.connections.rejected{reason="limit"}`, and the new `logit.input.connections` gauge
+tracks permit holders. This is `logit_in`'s and the shared TCP driver's shape
+(`crates/logit-inputs/src/tcp.rs`'s "Connection limit" section), including the one deliberate
+difference from `logit_in`: the rejection happens *before* any TLS accept, because OTLP — unlike
+the native protocol's `Reject` control frame — has no in-band way to tell a peer why it is being
+closed, so there is nothing to say and no reason to spend a handshake saying it. What the blocking
+version cost was not fairness but liveness: under it, connections that completed the TCP handshake
+and then sent nothing pinned every permit, and the accept loop stopped draining its backlog at
+all, so the 1025th peer got neither service nor a refusal.
+
+**`handshake_timeout` on a plaintext listener now means something.** It bounds each of a
+connection's pre-request phases, one budget each: the TLS accept when `tls:` is set, and — on the
+plaintext arm, which has no TLS accept — the wait for the connection's very first byte. That
+second bound is `tokio::net::TcpStream::peek`, i.e. `recv(..., MSG_PEEK)`, run under the same
+timeout: it waits for a byte to become *available* and consumes nothing, so the stream handed to
+`hyper` afterwards is byte-for-byte the one it would have been with no bound at all and
+`hyper_util::server::conn::auto::Builder`'s own `ReadVersion` sniff still does the HTTP/1.1-vs-h2
+detection over a pristine socket. That is the whole reason the bound is a peek: wrapping the sniff
+itself would mean reimplementing it behind a `Rewind`-shaped buffer. The TLS arm deliberately gets
+no peek — `acceptor.accept` is already waiting on that connection's first bytes under the same
+budget. Graph rule 45 correspondingly no longer rejects a non-default `handshake_timeout` on a
+plaintext `otlp_in`; the value is live with or without `tls:`, and only the `0s` check still names
+that kind (`docs/design/pipeline-graph.md`).
+
+**No `header_read_timeout`, and the reason is worth recording.** The obvious next step — the
+`hyper_util::rt::TokioTimer` + `http1().header_read_timeout(..)` pair `prometheus_out` already
+installs on its own client-side `http1::Builder` — was verified against the pinned sources and
+deliberately not taken. The API is available: hyper-util 0.1.20's `auto::Builder::http1()` returns
+an `Http1Builder` that forwards `timer()`/`header_read_timeout()` to the inner `http1` builder and
+whose `serve_connection` delegates straight back to the auto builder, so h2 auto-detection would
+survive it. The *semantics* are the problem. In hyper 1.11.1 (`src/proto/h1/conn.rs`) the timer is
+armed at the top of `poll_read_head`, before a single header byte has been parsed, and
+`State::idle` sets `notify_read = true` whenever `h1_header_read_timeout.is_some()` — its own
+comment reads "Next read will start and poll the header read timeout, so we can close the
+connection if another header isn't received in a timely manner." It re-arms across every idle
+keep-alive gap, which makes it an idle timeout wearing a first-head name, and a 5s one would close
+a long-interval OTLP exporter's pooled connection between exports. Idle-connection timeouts across
+all four listeners are held out for their own effort and ADR (`docs/known-gaps.md`'s
+"no idle-connection timeout on a TCP listener"); half-building one here, per transport, is exactly
+what that row exists to prevent. So the residual gap is now: one byte of a request head, or one
+byte of an HTTP/2 preface under `protocol: grpc` (where `http2::Builder` has no such knob at all),
+followed by silence.
