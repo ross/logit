@@ -318,12 +318,12 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         return write_control(&mut stream, &reject).await;
     };
 
-    live_connections.fetch_add(1, Ordering::Relaxed);
-    telemetry.gauge(
-        "logit.input.connections",
-        live_connections.load(Ordering::Relaxed) as f64,
-        &[],
-    );
+    // Published from the read-modify-write's own return value, not a separate `load`:
+    // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an add and a
+    // load would leave the stale one as the published value until the next transition.
+    // `crate::tcp`/`crate::otlp`'s own accept loops publish this gauge the same way.
+    let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
+    telemetry.gauge("logit.input.connections", live as f64, &[]);
 
     let result = serve_connection(
         stream,
@@ -335,12 +335,8 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     )
     .await;
 
-    live_connections.fetch_sub(1, Ordering::Relaxed);
-    telemetry.gauge(
-        "logit.input.connections",
-        live_connections.load(Ordering::Relaxed) as f64,
-        &[],
-    );
+    let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+    telemetry.gauge("logit.input.connections", live as f64, &[]);
 
     result
 }

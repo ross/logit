@@ -25,10 +25,9 @@ pub enum FlushReason {
     Shutdown,
     /// **A single tracked file or connection** is ending, and its own accumulator is flushing on
     /// the way out: a tailed file rotated away, removed, or drained past EOF
-    /// (`logit_inputs::tail`), one TCP connection on the shared stream driver reaching EOF or a
-    /// fatal framing error (`logit_inputs::tcp`), or a `graphite_in` TCP connection the client
-    /// closed or reset, or that was dropped for an oversize frame
-    /// (`logit_inputs::graphite::tcp`). Distinct from [`FlushReason::Shutdown`]: this fires while
+    /// (`logit_inputs::tail`), or one TCP connection on the shared stream driver
+    /// (`logit_inputs::tcp`, which every stream listener runs on) reaching EOF, being reset by its
+    /// client, or hitting a fatal framing error. Distinct from [`FlushReason::Shutdown`]: this fires while
     /// the listener keeps running, for one source among several it may be tracking, not for the
     /// whole component's own shutdown. Keeping the two apart is what stops a healthy listener from
     /// reporting `receive.flushed{reason="shutdown"}` every time a client hangs up.

@@ -409,7 +409,12 @@ mod tests {
             }
         }
 
-        let statsd_in = || ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() };
+        let statsd_in = || ComponentKind::StatsdIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport: logit_config::StatsdTransport::default(),
+            tls: None,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+        };
         let mut components = HashMap::new();
         components.insert(
             "web_in".to_string(),

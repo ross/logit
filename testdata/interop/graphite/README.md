@@ -58,7 +58,7 @@ covers everything not named individually -- that all three fixtures decode with 
   easy to run in a throwaway container the way `collectd-core` is.
 - **Reconnection / multiple connections.** Every fixture here is one accepted connection; carbon's
   own reconnect behavior (a sender that drops and re-opens mid-run) isn't captured. `crates/
-  logit-inputs/src/graphite/tcp.rs`'s own socket tests cover multiple connections and connection
+  logit-inputs/src/graphite/mod.rs`'s own socket tests cover multiple connections and connection
   loss against the real driver instead.
 - **Protocol 0/1 pickle (text-mode / the original binary protocol).** Both are rejected outright
   by the restricted reader (`crates/logit-proto/src/graphite/mod.rs`'s "Rejected" list) and are

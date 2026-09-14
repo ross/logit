@@ -63,16 +63,17 @@
 //! | not exactly 3 whitespace-separated fields; an unparseable value; non-UTF-8 bytes; an empty path | skipped | `logit.input.metrics.skipped{reason="bad_line"}` + diag `bad_line` |
 //! | malformed tag (a `;` segment with no `=`, an empty name, or an empty value) | the **whole line** is skipped -- carbon's own `TaggedSeries.parse` raises rather than dropping the one tag | `logit.input.metrics.skipped{reason="bad_tag"}` + diag `bad_tag` |
 //! | empty / whitespace-only line | skipped, **uncounted** (packet padding, a trailing `\n`) | -- |
-//! | line longer than `max_line_bytes` (TCP) | the reader drains to the next `\n`; the line after it still decodes | `logit.input.metrics.skipped{reason="oversize_line"}` + diag `oversize_line` |
-//! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | diag `oversize_frame` |
+//! | line longer than `max_line_bytes` (TCP) | the framer drops it and resynchronizes at the next `\n`; the line after it still decodes, and the connection stays up | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
+//! | pickle frame longer than `max_frame_bytes` | the connection is closed -- there is no resync point in a length-framed stream | `logit.input.frames.dropped{reason="oversize"}` + diag `framing_error` |
 //! | a disallowed pickle opcode, or the depth/item caps | `CodecError::Malformed`, the whole frame is dropped | diag `bad_pickle` |
 //! | a pickle item that is not `(str, (num, num))` | **that datapoint** is skipped; the rest of the frame still decodes | `logit.input.metrics.skipped{reason="bad_shape"}` |
 //! | `Resource` / `Scope` | the decoder's own shared default / `None` | -- |
 //!
 //! The last three rows plus the two oversize rows are *shared* with `graphite_in`
-//! (`crates/logit-inputs/src/graphite/`): framing is the listener's job, so it -- not
-//! [`GraphiteDecoder`] -- counts `oversize_line`/`oversize_frame` and closes the connection. Every
-//! other row is emitted here.
+//! (`crates/logit-inputs/src/graphite/`): framing is the listener's job, and since W5 of the
+//! connection-follow-ups effort that means the shared TCP driver's `Framer`
+//! (`crates/logit-inputs/src/tcp.rs`) -- so the two oversize rows are counted and diagnosed there,
+//! in that driver's vocabulary, not by [`GraphiteDecoder`]. Every other row is emitted here.
 //!
 //! ## Encode: model → wire
 //!

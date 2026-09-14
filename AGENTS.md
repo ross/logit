@@ -83,8 +83,9 @@ logit-outputs/src/logit.rs`) are implemented, tested `ComponentKind`s: one TCP (
 connection, a `Hello`/`HelloAck` version/codec/compression handshake, one native frame per batch
 acknowledged before the next is sent
 ([ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md)).
-`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP,
-DogStatsD tags round-tripped through the real decoder,
+`statsd_out` (`crates/logit-outputs/src/statsd.rs`, the mirror of `statsd_in`, UDP or TCP
+(optionally TLS, the `syslog_out` arrangement ported verbatim), DogStatsD tags round-tripped
+through the real decoder,
 [ADR `statsd-output`](docs/adr/statsd-output.md)) is also implemented and tested now -- it encodes
 `Sum` (delta, monotonic), `Gauge`/`GaugeDelta`, `Samples`, `SetMembers`, and DogStatsD
 events/service checks; a `statsd_in -> statsd_out` relay with no `aggregate` in between, or one
@@ -142,10 +143,13 @@ real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `
 read and its decode/batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side
 mirror of `SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket
 being read; see [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:`
-config block it introduces. `syslog_in` alone can instead run `transport: tcp` on a second, generic
-stream driver, `logit-inputs::tcp::TcpListener` (RFC 6587 framing, auto-detected per connection,
-plus a `tls:` block for RFC 5425 syslog over TLS) — see
-[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md).
+config block it introduces. `syslog_in`, `graphite_in` and `statsd_in` can each instead run
+`transport: tcp` on a second, generic stream driver, `logit-inputs::tcp::TcpListener` — an accept
+loop, a connection cap, per-listener framing (RFC 6587's auto-detecting pair for `syslog_in`,
+LF-delimited lines for `statsd_in` and carbon plaintext, carbon's 4-byte length prefix for pickle),
+a `handshake_timeout:` bounding each pre-message phase, and a `tls:` block (RFC 5425 for syslog, a
+`logit`-to-`logit` or stunnel-shaped relay hop for the other two) — see
+[ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) and its amendment.
 `logit` now has an operator surface: leveled, structured self-logging through `tracing`
 (`--log-level`/`LOGIT_LOG`, `--log-format text|json`,
 [ADR `tracing-for-self-logging`](docs/adr/tracing-for-self-logging.md)); a top-level `admin:` block serving `/readyz`/
@@ -206,9 +210,10 @@ crate dependency) -- with a `multi_value: skip | expand` switch for the metric k
 one-number-per-datapoint wire can't carry natively and `tags: carbon | drop` for whether attributes
 render as carbon's own `;k=v` segment; `graphite_in`'s TCP listener has no receive queue at all
 (TCP's own flow control is the backpressure, unlike the UDP-only decoupled-listener-io queue every
-other datagram listener shares) and runs its own accept loop rather than the shared stream driver
-`syslog_in` uses (`crates/logit-inputs/src/tcp.rs`) -- porting it onto that driver is follow-up
-work, not a decision. So `graphite_in -> graphite_out` is a fixed point modulo its own named
+other datagram listener shares) and runs on the shared stream driver `syslog_in` uses
+(`crates/logit-inputs/src/tcp.rs`), which is where its framing, connection cap, TLS termination and
+`handshake_timeout` all come from -- so a TCP `graphite_in` takes the same `tls:` block a TCP
+`syslog_in` does. So `graphite_in -> graphite_out` is a fixed point modulo its own named
 normalization list
 ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
 [examples/graphite-relay.yaml](examples/graphite-relay.yaml)). `generate_in`/`null_out`

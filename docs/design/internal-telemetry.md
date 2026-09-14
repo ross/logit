@@ -484,11 +484,33 @@ picture per component, not two.
 Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
-  `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
-  decode failures free via the `Diagnostics` bridge. Both listeners are now thin wrappers over
-  `logit-inputs::udp::UdpListener` (`docs/adr/decoupled-listener-io.md`), which is where the
-  `ReceiveQueue`/`receive_buffer.*` table above actually gets recorded — free for both, no
-  per-listener code. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
+  `logit.input.datagram.bytes`, **under `transport: udp`** — per-datagram detail `Fanout`'s
+  per-batch view can't see, plus decode failures free via the `Diagnostics` bridge. Both listeners
+  are thin wrappers over `logit-inputs::udp::UdpListener` on that transport
+  (`docs/adr/decoupled-listener-io.md`), which is where the `ReceiveQueue`/`receive_buffer.*` table
+  above actually gets recorded — free for both, no per-listener code. Under `transport: tcp` it
+  runs on `logit-inputs::tcp::TcpListener` instead, exactly as a TCP `syslog_in`/`graphite_in`
+  does, and records that driver's stream set in place of the datagram pair — nothing statsd-
+  specific, and nothing this component writes itself: `logit.input.connections` (gauge) and
+  `logit.input.connections.rejected{reason="limit"}` (count), `logit.input.frames` /
+  `logit.input.frame.bytes` (count/sum, where one *frame* is one LF-delimited statsd line), and
+  `logit.input.frames.dropped{reason}`. Only two of that reason set can occur here: `oversize`, a
+  line past the driver's 64 KiB bound — dropped and counted once, the connection kept and the line
+  after it still decoded, since a statsd listener frames `Lines{DrainToNextLine}` and never
+  RFC 6587's octet counting (a statsd line may legally begin with a digit) — and `truncated`, a
+  partial line left buffered when a connection ends: abruptly, on shutdown mid-message, **or on a
+  clean close with the final line unterminated**. That last case is where a line protocol parts
+  company with `syslog_in` above: RFC 6587 §3.4.2 explicitly permits a terminator-less final
+  message, statsd does not, and emitting a half-line here would turn a sender dying mid-write into
+  a plausible-looking metric. A whitespace-only remainder is not counted — nothing was lost.
+  `malformed` cannot occur: it is an octet count RFC 6587's grammar doesn't permit, and
+  nothing here ever reads one. Both report on the `framing_error` diagnostic key, distinct from
+  `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
+  first byte inside the handshake budget). A line that *parses* badly is not a framing error at
+  all: it is the decoder's own `bad_line`, on either transport, throttled per listener since every
+  connection's decoder clone shares one set of counts. The driver's `bad_frame` key fires only for
+  the single whole-frame failure `StatsdDecoder::decode_into` can return, a frame that is not valid
+  UTF-8. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
   `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on how far one value can
   inflate a `Distribution`'s `count()`) clamps rather than extrapolating unboundedly, reported via
   that same `Diagnostics` bridge as `logit.component.diagnostics{key="sample_rate_clamped"}` — no
@@ -518,9 +540,11 @@ Worked examples, one per shipped component:
   badly is not a framing error at all: `SyslogDecoder::decode_into` is infallible, so a rejected
   syslog message reports as the decoder's own `bad_line` on either transport, and the driver's
   `bad_frame` key — for a decoder that can fail a whole frame — stays unused here.
-  `framing_error` and `bad_frame` share one listener-wide throttle rather than a per-connection
-  one, so a peer looping connect / bad-frame / close is throttled like any other repeated failure
-  instead of warning once per TCP handshake. No
+  `framing_error`, `bad_frame`, `connection_error` and the decoder's own `bad_line` all throttle
+  listener-wide rather than per connection — a `Diagnostics` clone shares its original's counts
+  ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
+  2026-09-14 amendment) — so a peer looping connect / bad-frame / close is throttled like any
+  other repeated failure instead of warning once per TCP handshake. No
   `ReceiveQueue` and so none of the `receive_buffer.*` table above on this path — the connection's
   own flow control is the queue (graph rule 17). There is no TLS-specific metric on either
   transport: a handshake failure surfaces through the same connection-error diagnostics any other
@@ -547,41 +571,49 @@ Worked examples, one per shipped component:
   its `transport:`**, because the two transports genuinely run different drivers. Under
   `transport: udp` it is `collectd_in`'s shape exactly -- no layer-3 counters of its own, with
   `logit.input.datagrams`/`.datagram.bytes`, the `ReceiveQueue` table and `receive_buffer.*` all
-  coming free from the shared `UdpListener`. Under `transport: tcp` there is no such driver (and
-  deliberately no receive queue at all -- TCP's own flow control is the backpressure), so the
-  listener records the stream's own facts itself: `logit.input.connections` (gauge, sampled on
-  every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}` (count --
-  the 1024-connection cap actually binding, `logit_in`'s reject-don't-queue shape, since carbon's
-  wire has no way to say "try later"); `logit.input.lines` / `.line.bytes`
-  under `protocol: plaintext` and `logit.input.frames` / `.frame.bytes` under `protocol: pickle`
-  (each counted as it arrived on the wire, length prefix included) -- the per-read parity with
-  `statsd_in`'s per-datagram pair, at whichever unit the protocol actually frames in; and
+  coming free from the shared `UdpListener`. Under `transport: tcp` it has none of its own either,
+  since it moved onto the shared `TcpListener` (`docs/adr/graphite-carbon-relay.md`'s 2026-09-14
+  amendment): it reports exactly what a TCP `syslog_in` reports, because it is the same driver.
+  That is `logit.input.connections` (gauge, sampled on every connect and disconnect) and
+  `logit.input.connections.rejected{reason="limit"}` (count -- the 1024-connection cap actually
+  binding, the reject-don't-queue shape, since carbon's wire has no way to say "try later");
+  `logit.input.frames` / `.frame.bytes` under **both** protocols, where one frame is one plaintext
+  line or one pickle payload, counted at the size the decoder was handed (a pickle frame's own
+  4-byte length prefix is stripped before the count, so it is the payload, not the wire framing);
+  `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`; and
   `logit.component.receive.flushed{reason}` from the per-connection `BatchAccumulator`, which is
-  the same layer-2 point a datagram listener's shared `decode_loop` records.
+  the same layer-2 point a datagram listener's shared `decode_loop` records. There is deliberately
+  no receive queue on this transport at all -- TCP's own flow control is the backpressure -- so
+  none of the `ReceiveQueue` table appears under it.
+
+  Both framing failures now land on `frames.dropped{reason="oversize"}`, and the difference
+  between them is whether the connection survives: a plaintext line past `max_line_bytes` is
+  dropped and the reader resynchronizes at the next newline, while a pickle frame declaring more
+  than `max_frame_bytes` closes the connection, since a length-framed stream has no resync point.
+  Neither is `metrics.skipped` any more -- the old `{reason="oversize_line"}` spelling was the
+  bespoke listener's, and one vocabulary per driver is the point of the port.
 
   The codec adds its own, under both transports:
   `logit.input.metrics.skipped{reason="bad_line"|"bad_tag"|"bad_timestamp"|"non_finite_value"|
   "bad_shape"}` and `logit.input.tags.normalized{reason="duplicate_key"}` (a repeated carbon tag
-  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Exactly
-  one of that family's reasons is the *listener's* rather than the codec's, because framing is:
-  `{reason="oversize_line"}`, counted once when a TCP plaintext line passes `max_line_bytes` with
-  no newline in it (the reader then drains to the next one). The other framing failure,
-  `oversize_frame`, has no counter of its own at all -- it closes the connection, and the
-  datapoints lost with it were never framed, so there is no honest number to report; it is a
-  diagnostic only. Its per-connection accumulator flushes as `receive.flushed{reason="closed"}`
-  when a client hangs up and `{reason="shutdown"}` only when the component itself is going away.
-  `Diagnostics` keys, mirrored as
-  `logit.component.diagnostics{key}` by the bridge: `bound`, the codec's `bad_line`/`bad_tag`/
-  `bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`, and this listener's own
-  `oversize_line`, `oversize_frame` (a pickle frame declaring more than `max_frame_bytes` -- the
-  connection is closed, since a length-framed stream has no resync point) and `connection_error`
-  (one connection's I/O failing, never fatal to the listener or its siblings).
+  key collapsing to its last value, which is what carbon's own `TaggedSeries.parse` does). Its
+  per-connection accumulator flushes as `receive.flushed{reason="closed"}` when a client hangs up
+  and `{reason="shutdown"}` only when the component itself is going away. `Diagnostics` keys,
+  mirrored as `logit.component.diagnostics{key}` by the bridge: `bound`, the codec's
+  `bad_line`/`bad_tag`/`bad_timestamp`/`non_finite_value`/`duplicate_tag_key`/`bad_pickle`, and
+  the driver's `framing_error` (either oversize case above, or a partial frame discarded by an
+  abrupt close), `bad_frame` (one framed payload the decoder rejected outright -- pickle only,
+  since the plaintext path isolates every failure per line) and `connection_error` (one
+  connection's I/O failing, a TLS accept that failed or timed out, or a connection that produced
+  no first byte inside `handshake_timeout` and so gave its permit back -- never fatal to the
+  listener or its siblings). A TLS `graphite_in` adds no metric of its own: a handshake failure
+  surfaces through that same diagnostic.
 - `otlp_in` (`crates/logit-inputs/src/otlp.rs`,
   [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)): **the
   stream-transport pair and nothing at layer 3 below it.** `logit.input.connections` (gauge,
   sampled on every connect and disconnect) and `logit.input.connections.rejected{reason="limit"}`
-  (count — the 1024-connection cap actually binding), the same two points `logit_in` and a
-  `syslog_in` on the shared TCP driver record, and for the same reason: this listener's accept
+  (count — the 1024-connection cap actually binding), the same two points `logit_in` and
+  `syslog_in`/`graphite_in`/`statsd_in` on the shared TCP driver record, and for the same reason: this listener's accept
   loop rejects at the cap rather than queueing behind a permit, so there is a refusal to count,
   and the gauge counts permit holders only. A past-the-cap connection is dropped before any TLS
   accept — OTLP has no in-band "try later" to spend a handshake delivering — so a rejection is
@@ -620,8 +652,9 @@ Worked examples, one per shipped component:
   (count) — every way a frame or a handshake can be rejected, each its own reason so a version
   mismatch doesn't hide behind a generic "bad frame" tag. `logit.input.connections` (gauge, sampled
   on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
-  1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in` record the same pair, all
-  three rejecting at the cap rather than queueing behind a permit).
+  1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in`
+  on the shared driver record the same pair, all five rejecting at the cap rather than queueing
+  behind a permit).
 - `generate_in` (`crates/logit-inputs/src/generate.rs`,
   [ADR `load-test-harness`](../adr/load-test-harness.md)): **layer 2 only, no layer-3 points at
   all** — the runtime's own `logit.component.events.sent` on this node's fanout edge already *is*
@@ -799,7 +832,12 @@ Worked examples, one per shipped component:
   changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
   with `relative_gauges: false` reports under
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical key `influxdb_out`
-  uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
+  uses, so one grep finds both sinks. **New**, `logit.output.reconnects` (count, TCP only) —
+  incremented on every connect *after* the first, exactly as `syslog_out`'s above: a climbing
+  count in steady state means the peer or the network, not this sink, is unstable. Counted on a
+  plaintext and a TLS connection alike, since both take the same `TcpDial::connect` path
+  ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment); UDP is connectionless and
+  never reports it. Retry stays a Layer 2 metric here too.
 - `collectd_out` (`crates/logit-outputs/src/collectd.rs`, `docs/adr/collectd-binary-relay.md`):
   **the codec emits its own counters and diagnostics directly** (`logit_proto::collectd`'s module
   doc has the full mapping-to-counter table: `logit.output.metrics.skipped{metric_kind|reason}`,

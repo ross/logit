@@ -9,8 +9,8 @@ its branches (`<key>/w<N>`) and prefixes its PR titles; see
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-14 |
 | [Enabling plan: `target` components and routers](target-components.md) | 2026-09-13 | 2026-09-13 |
-| [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-13 |
 | [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-13 |
 | [Enabling plan: a load-test harness for the real `logit` binary](load-test-harness.md) | 2026-09-12 | 2026-09-13 |
 | [Enabling plan: `collectd_in`/`collectd_out` — a lossless collectd binary-protocol relay](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |

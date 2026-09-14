@@ -941,10 +941,13 @@ dependencies = [
  "logit-proto",
  "logit-transforms",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde_json",
  "serde_norway",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

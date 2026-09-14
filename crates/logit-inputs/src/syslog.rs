@@ -334,9 +334,12 @@ impl Input for SyslogInput {
 /// logic is directly unit-testable without a socket.
 ///
 /// `Clone` because [`TcpListener`] hands every accepted connection its own decoder
-/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section) -- this one's
-/// clonable state is its `Diagnostics` throttle, which is per-connection in exactly the way that
-/// driver wants.
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section). This one holds
+/// no per-connection state to speak of: its clonable state is a *shared handle*, since a
+/// `Diagnostics` clone shares its original's throttle counts (`logit_core::Diagnostics`' type
+/// doc). So `bad_line` is throttled listener-wide -- which is what it has to be, for the same
+/// reason the driver's own `framing_error` is: a peer looping connect / send-one-bad-message /
+/// close would otherwise report its "1st" occurrence once per connection forever.
 #[derive(Clone)]
 pub struct SyslogDecoder {
     resource: Arc<Resource>,
@@ -1862,6 +1865,16 @@ mod tests {
         tls: Option<&TlsServerSettings>,
     ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>)
     {
+        running_tcp_input_with(tls, None).await
+    }
+
+    /// [`running_tcp_input`] with a `Diagnostics` attached, so a test can read the component's
+    /// own occurrence counts back.
+    async fn running_tcp_input_with(
+        tls: Option<&TlsServerSettings>,
+        diag: Option<Diagnostics>,
+    ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>)
+    {
         let mut input = SyslogInput::tcp("127.0.0.1:0").with_tcp_receive(TcpListenerConfig {
             // One event per frame, no interval timer: every delivery is attributable to exactly
             // one frame, so a multiline message arriving as two events would fail loudly here
@@ -1874,6 +1887,9 @@ mod tests {
             input = input
                 .with_tls(settings, &testdata_tls_dir())
                 .expect("the committed testdata/tls fixtures should load");
+        }
+        if let Some(diag) = diag {
+            input = input.with_diagnostics(diag);
         }
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
@@ -1905,6 +1921,50 @@ mod tests {
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
         assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Info)); // 134 % 8 = 6
         assert_eq!(message_str(event), "hello over tcp");
+    }
+
+    /// `bad_line` throttles listener-wide, not per connection: the decoder clone each connection
+    /// gets shares its `Diagnostics`' counts with every other clone of the component's value
+    /// (`logit_core::Diagnostics`' type doc), so two connections rejecting two messages each
+    /// leave the component at 4. Counting per connection would leave this at 0 -- `diag` here is
+    /// the value handed to `with_diagnostics`, and each connection would have counted to 2 in a
+    /// throwaway decoder clone of its own that died with the connection.
+    ///
+    /// The well-formed line written last on each connection is what orders the assertion after
+    /// both connections' rejects: frames arriving on one connection are decoded in order, so
+    /// receiving its event proves the two bad lines ahead of it were already absorbed.
+    #[tokio::test]
+    async fn bad_line_throttles_across_connections() {
+        let diag = Diagnostics::new("syslog_in");
+        let (addr, handle, mut rx) = running_tcp_input_with(None, Some(diag.clone())).await;
+
+        for connection in 0..2 {
+            let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut client,
+                b"not a syslog line\nnor is this one\n\
+                  <134>Aug 30 10:00:00 myhost nginx: hello over tcp\n",
+            )
+            .await
+            .unwrap();
+
+            let events = recv_events(&mut rx).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "connection {connection}: only the well-formed line becomes an event"
+            );
+            assert_nginx_line(&events[0]);
+        }
+
+        assert_eq!(
+            diag.occurrences("bad_line"),
+            4,
+            "two connections rejecting two messages each must count on one listener-wide \
+             throttle -- a decoder clone with counts of its own would leave this at 0, having \
+             counted 2 in each throwaway copy"
+        );
+        handle.abort();
     }
 
     /// rsyslog's `omfwd` default framing (RFC 6587 section 3.4.2) through a real listener.

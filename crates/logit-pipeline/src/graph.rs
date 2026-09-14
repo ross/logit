@@ -33,9 +33,9 @@
 //! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
 //!     something to clamp silently.
 //! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `statsd_in`/`collectd_in`, and `syslog_in`/`graphite_in` under `transport: udp`),
-//!     a **stream listener** (`syslog_in`/`graphite_in` under `transport: tcp`), or a tail
-//!     listener (`tail_in`/`docker_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`)
+//!     (today `collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`),
+//!     a **stream listener** (`syslog_in`/`graphite_in`/`statsd_in` under `transport: tcp`), or a
+//!     tail listener (`tail_in`/`docker_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`)
 //!     configures a listener's receive-side batch assembly, and a datagram listener's socket-side
 //!     receive queue on top of that. Neither a tail listener (the tailed file is its own durable
 //!     buffer) nor a stream listener (the connection's own flow control is the backpressure, ADRs
@@ -161,13 +161,15 @@
 //!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
 //!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
 //!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
-//! 43. A `syslog_in` with a `tls:` block must be `transport: tcp`. Syslog over TLS (RFC 5425) is
-//!     RFC 6587 framing carried over TLS over TCP, and DTLS (RFC 6012), its UDP-carried sibling,
-//!     is out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`) -- so a `tls:` block under
-//!     `transport: udp` could never take effect. Rejected rather than ignored, the same call
-//!     rule 22 makes for a `tls:` block under a plaintext `otlp_out` endpoint: an operator who
-//!     wrote one meant the connection encrypted, and running it in the clear anyway is the worst
-//!     of the available outcomes.
+//! 43. A listener with a `tls:` block must be on a stream transport -- `transport: tcp` on a
+//!     `syslog_in`, a `graphite_in` or a `statsd_in`. TLS is defined over a reliable ordered byte
+//!     stream, and DTLS, its datagram sibling, is out of scope throughout this project (RFC 6012
+//!     for syslog, `docs/adr/syslog-tcp-ingress-and-tls.md`; neither carbon nor statsd has a DTLS
+//!     receiver at all) -- so a
+//!     `tls:` block under `transport: udp` could never take effect. Rejected rather than ignored,
+//!     the same call rule 22 makes for a `tls:` block under a plaintext `otlp_out` endpoint: an
+//!     operator who wrote one meant the connection encrypted, and running it in the clear anyway
+//!     is the worst of the available outcomes.
 //! 44. A `syslog_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
 //!     together, no `insecure_skip_verify` alongside `ca_file` -- the same two checks rule 34
 //!     makes for `logit_out`'s own `tls:`, and for the same reason: both sinks dial a bare
@@ -177,10 +179,10 @@
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`), so silently ignoring the block would leave an
 //!     operator who asked for encryption on a plaintext datagram socket.
 //! 45. Every TCP listener's `handshake_timeout` must be greater than `0s`, and a *non-default*
-//!     value is rejected where nothing could consult it -- on a UDP `syslog_in`, which has no
-//!     connection to hand shake. `0s` is an impossible budget, not a tight one -- rules
-//!     9/15/18/28's call again -- and set-but-ignored is rule 33's shape for an "only means
-//!     anything under X" field (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//!     value is rejected where nothing could consult it -- on a UDP `syslog_in`, `graphite_in` or
+//!     `statsd_in`, none of which has a connection to hand shake. `0s` is an impossible budget, not a tight
+//!     one -- rules 9/15/18/28's call again -- and set-but-ignored is rule 33's shape for an "only
+//!     means anything under X" field (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 //! 46. A `graphite_in`'s and a `graphite_out`'s protocol/transport combination and size bounds
 //!     (`docs/adr/graphite-carbon-relay.md`). `protocol: pickle` requires `transport: tcp` on
 //!     both kinds: carbon's pickle wire is a 4-byte big-endian length prefix around each batch
@@ -227,6 +229,14 @@
 //!     value (it could never name a real target), and, under `by: {attribute: k}`/
 //!     `{resource: k}`, a non-empty `k`: rule 19/20's empty-field-name rejection, applied to the
 //!     one key a `route` reads per event.
+//! 52. A `statsd_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
+//!     together, no `insecure_skip_verify` alongside `ca_file` -- rule 44's three checks with its
+//!     messages verbatim, since this sink dials the same bare `host:port` where `tls:`'s mere
+//!     presence is the only "TLS is wanted" signal there is. Plus that rule's own third check:
+//!     `tls:` together with `transport: udp` is rejected, since DTLS is out of scope here too
+//!     (`docs/adr/statsd-output.md`'s TLS amendment). One rule per *sink* (24/34/44/52), unlike
+//!     rule 43's one-rule-for-every-listener, because each sink also checks its own `tls:`
+//!     internals.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -238,7 +248,8 @@
 
 use logit_config::{
     default_handshake_timeout, BufferConfig, Component, ComponentKind, Compression, Config,
-    GraphiteProtocol, GraphiteTransport, ReceiveConfig, StreamFormat, SyslogTransport,
+    GraphiteProtocol, GraphiteTransport, ReceiveConfig, StatsdTransport, StreamFormat,
+    SyslogTransport,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -979,16 +990,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 if is_stream_listener(&component.kind) {
                     anyhow::bail!(
                         "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                         listener (statsd_in, collectd_in, a UDP syslog_in or graphite_in) -- a \
-                         stream listener has no receive queue; the connection's own flow control \
-                         is the backpressure. Only receive.batch_max_events, batch_max_bytes, \
-                         batch_flush_interval, and shutdown_grace apply (per connection)"
+                         listener (collectd_in, or a UDP statsd_in, syslog_in or graphite_in) -- \
+                         a stream listener has no receive queue; the connection's own flow \
+                         control is the backpressure. Only receive.batch_max_events, \
+                         batch_max_bytes, batch_flush_interval, and shutdown_grace apply (per \
+                         connection)"
                     );
                 }
                 anyhow::bail!(
                     "component '{id}': 'receive.{field}' is only meaningful on a datagram \
-                     listener (statsd_in, collectd_in, a UDP syslog_in or graphite_in) -- a tail \
-                     listener has no receive queue; \
+                     listener (collectd_in, or a UDP statsd_in, syslog_in or graphite_in) -- a \
+                     tail listener has no receive queue; \
                      only receive.batch_max_events, batch_max_bytes, batch_flush_interval, and \
                      shutdown_grace apply"
                 );
@@ -1948,20 +1960,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 43: a `syslog_in` `tls:` block needs `transport: tcp`. Syslog over TLS (RFC 5425) is
-    // RFC 6587 framing carried over TLS over TCP; its UDP-carried sibling, DTLS (RFC 6012), is
-    // deliberately out of scope (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives), so a
-    // `tls:` block under `transport: udp` could never take effect. Rejected rather than ignored,
-    // for the same reason rule 22 rejects a `tls:` block under a plaintext `otlp_out` endpoint:
-    // an operator who wrote one meant the connection to be encrypted, and silently running it in
-    // the clear is the worst of the three possible outcomes.
+    // Rule 43: a listener's `tls:` block needs a stream transport. TLS is defined over a reliable
+    // ordered byte stream; its datagram sibling, DTLS, is deliberately out of scope everywhere in
+    // this project (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives -- RFC 6012 for
+    // syslog, and carbon has no DTLS receiver at all), so a `tls:` block on a datagram listener
+    // could never take effect. Rejected rather than ignored, for the same reason rule 22 rejects a
+    // `tls:` block under a plaintext `otlp_out` endpoint: an operator who wrote one meant the
+    // connection to be encrypted, and silently running it in the clear is the worst of the three
+    // possible outcomes.
+    //
+    // One rule over every such listener rather than one rule each: the check, the message and the
+    // reasoning are identical, and only the kind's own `transport` spelling differs -- so a new
+    // stream-capable listener joins by adding one arm to the match below, not by claiming another
+    // rule number. Three today: `syslog_in`, `graphite_in`, `statsd_in`.
     for (id, component) in &components {
-        if let ComponentKind::SyslogIn { transport: SyslogTransport::Udp, tls: Some(_), .. } =
-            &component.kind
-        {
+        let tls_on_a_datagram_transport = match &component.kind {
+            ComponentKind::SyslogIn { transport, tls: Some(_), .. } => {
+                *transport == SyslogTransport::Udp
+            }
+            ComponentKind::GraphiteIn { transport, tls: Some(_), .. } => {
+                *transport == GraphiteTransport::Udp
+            }
+            ComponentKind::StatsdIn { transport, tls: Some(_), .. } => {
+                *transport == StatsdTransport::Udp
+            }
+            _ => false,
+        };
+        if tls_on_a_datagram_transport {
             anyhow::bail!(
-                "component '{id}': 'tls:' needs 'transport: tcp' -- syslog over TLS (RFC 5425) is \
-                 TCP-carried, and DTLS is out of scope"
+                "component '{id}': 'tls:' needs 'transport: tcp' -- TLS is defined over a byte \
+                 stream, and DTLS is out of scope"
             );
         }
     }
@@ -1997,6 +2025,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 52: `statsd_out`'s `tls:` block -- rule 44's three checks, with its messages verbatim,
+    // for the same reason it shares them with rule 34: this sink dials the same bare `host:port`
+    // shape where `tls:`'s mere presence is the only signal TLS is wanted, so one grep still
+    // finds every sink making these checks. Kept a rule of its own rather than folded into rule
+    // 44's loop -- the sink rules stay one per sink (24/34/44/52), the opposite convention from
+    // rule 43's one-rule-for-every-listener, because each sink also validates its own `tls:`
+    // internals. `StatsdOutput::with_tls` re-checks the `transport: udp` one itself, since
+    // `graph::resolve` isn't the only possible caller.
+    for (id, component) in &components {
+        let ComponentKind::StatsdOut { tls: Some(tls), transport, .. } = &component.kind else {
+            continue;
+        };
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if *transport == StatsdTransport::Udp {
+            anyhow::bail!("component '{id}': DTLS is out of scope; 'tls:' needs 'transport: tcp'");
+        }
+    }
+
     // Rule 45: every TCP listener's `handshake_timeout` must be non-zero, and on a UDP
     // `syslog_in` it must be left at its default. `0s` is an impossible budget, not a tight one --
     // the phase it bounds (a TLS accept, a first-byte read, a `Hello` read) cannot complete in
@@ -2007,9 +2065,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // The context check is rule 43's spirit applied to this field instead of `tls:`, and rule 33's
     // shape for an "only means anything under X" field: where nothing could ever consult the
     // value, an operator who set one meant it to take effect, so set-but-ignored is an error
-    // rather than a silent no-op. A UDP `syslog_in` has no connection at all to hand shake. Only a
-    // *non-default* value is rejected, so the field can carry its default on every `syslog_in`
-    // without making `transport: udp` a config error.
+    // rather than a silent no-op. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection at
+    // all to hand shake. Only a *non-default* value is rejected, so the field can carry its
+    // default on every one of them without making `transport: udp` a config error.
     //
     // A *plaintext* `otlp_in` used to be the second such case -- that listener's budget once
     // bounded its TLS accept and nothing else. It now bounds the wait for a plaintext
@@ -2019,6 +2077,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     for (id, component) in &components {
         let handshake_timeout = match &component.kind {
             ComponentKind::SyslogIn { handshake_timeout, .. }
+            | ComponentKind::GraphiteIn { handshake_timeout, .. }
+            | ComponentKind::StatsdIn { handshake_timeout, .. }
             | ComponentKind::LogitIn { handshake_timeout, .. }
             | ComponentKind::OtlpIn { handshake_timeout, .. } => *handshake_timeout,
             _ => continue,
@@ -2032,10 +2092,22 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if handshake_timeout == default_handshake_timeout() {
             continue; // a defaulted value is not a set one -- see this rule's comment
         }
-        if let ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. } = &component.kind {
+        let (kind_name, datagram) = match &component.kind {
+            ComponentKind::SyslogIn { transport, .. } => {
+                ("syslog_in", *transport == SyslogTransport::Udp)
+            }
+            ComponentKind::GraphiteIn { transport, .. } => {
+                ("graphite_in", *transport == GraphiteTransport::Udp)
+            }
+            ComponentKind::StatsdIn { transport, .. } => {
+                ("statsd_in", *transport == StatsdTransport::Udp)
+            }
+            _ => continue,
+        };
+        if datagram {
             anyhow::bail!(
-                "component '{id}': 'handshake_timeout' needs 'transport: tcp' -- a UDP syslog_in \
-                 has no connection to hand shake, so the value could never take effect"
+                "component '{id}': 'handshake_timeout' needs 'transport: tcp' -- a UDP \
+                 {kind_name} has no connection to hand shake, so the value could never take effect"
             );
         }
     }
@@ -2159,25 +2231,27 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,
-        ComponentKind::StatsdIn { .. }
-            | ComponentKind::CollectdIn { .. }
+        ComponentKind::CollectdIn { .. }
             // Narrowed by `docs/adr/syslog-tcp-ingress-and-tls.md`: a TCP `syslog_in` runs on
             // the stream driver, which has no `ReceiveQueue` at all -- see
             // [`is_stream_listener`]. A TCP `graphite_in` is narrowed out for the same reason
-            // (`docs/adr/graphite-carbon-relay.md`).
+            // (`docs/adr/graphite-carbon-relay.md`), and a TCP `statsd_in` because that same ADR
+            // named it as the driver's third caller.
             | ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. }
             | ComponentKind::GraphiteIn { transport: GraphiteTransport::Udp, .. }
+            | ComponentKind::StatsdIn { transport: StatsdTransport::Udp, .. }
     )
 }
 
 /// [`is_datagram_listener`]'s stream-transport counterpart, and the predicate rules 17/18 need
 /// for a **stream** listener: one that assembles batches on the receive side but has no receive
-/// *queue*, because its transport cannot drop silently. Two kinds today -- a TCP `syslog_in` on
-/// the shared stream driver (`docs/adr/syslog-tcp-ingress-and-tls.md`,
-/// `logit_inputs::tcp::TcpListener`) and a TCP `graphite_in` on its own
-/// (`docs/adr/graphite-carbon-relay.md`, `crates/logit-inputs/src/graphite/tcp.rs`). `statsd_in`
-/// stays UDP-only until a real need appears, which is exactly why this is an explicit list rather
-/// than "anything with a `transport` field".
+/// *queue*, because its transport cannot drop silently. Three kinds today, all on the one shared
+/// stream driver (`logit_inputs::tcp::TcpListener`): a TCP `syslog_in`
+/// (`docs/adr/syslog-tcp-ingress-and-tls.md`), a TCP `graphite_in`
+/// (`docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment, which moved it off its own accept
+/// loop and onto that driver) and a TCP `statsd_in` (the third adoption that same syslog ADR
+/// named). Still an explicit list rather than "anything with a `transport` field": the next
+/// listener kind to gain one rejects `receive:` until it is genuinely wired to a driver.
 ///
 /// Like a tail listener, a stream listener has no receive *queue* -- ADR `decoupled-listener-io`'s
 /// queue exists for a UDP socket's invisible drops, and the connection's own TCP flow control is
@@ -2195,6 +2269,7 @@ fn is_stream_listener(kind: &ComponentKind) -> bool {
         kind,
         ComponentKind::SyslogIn { transport: SyslogTransport::Tcp, .. }
             | ComponentKind::GraphiteIn { transport: GraphiteTransport::Tcp, .. }
+            | ComponentKind::StatsdIn { transport: StatsdTransport::Tcp, .. }
     )
 }
 
@@ -2499,7 +2574,12 @@ mod tests {
     }
 
     fn listener() -> ComponentKind {
-        ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }
+        ComponentKind::StatsdIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport: StatsdTransport::default(),
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+        }
     }
 
     fn target() -> ComponentKind {
@@ -2586,6 +2666,7 @@ mod tests {
             relative_gauges: false,
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+            tls: None,
         }
     }
 
@@ -5390,6 +5471,87 @@ mod tests {
         assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
     }
 
+    // ---- Rule 52: `statsd_out`'s `tls:` block ---------------------------------------------------
+
+    fn statsd_out_with_tls(
+        transport: StatsdTransport,
+        tls: Option<logit_config::TlsClientConfig>,
+    ) -> ComponentKind {
+        ComponentKind::StatsdOut {
+            endpoint: "relay:8125".to_string(),
+            transport,
+            format: logit_config::StatsdFormat::default(),
+            relative_gauges: false,
+            max_packet_bytes: 1432,
+            connect_timeout: Duration::from_secs(5),
+            tls,
+        }
+    }
+
+    #[test]
+    fn a_statsd_out_with_cert_file_but_no_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_statsd_out_with_insecure_skip_verify_and_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    /// Rule 52's own third check, rule 44's verbatim: DTLS is out of scope here too, so a `tls:`
+    /// block under `transport: udp` is rejected rather than silently ignored -- which would leave
+    /// an operator who asked for encryption with a plaintext datagram socket.
+    #[test]
+    fn a_statsd_out_with_tls_under_transport_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                statsd_out_with_tls(
+                    StatsdTransport::Udp,
+                    Some(logit_config::TlsClientConfig::default()),
+                ),
+            ),
+        ]));
+        assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    /// The positive case: a consistent `tls:` block on the TCP transport resolves, so the three
+    /// rejections above are pinning a real distinction rather than rejecting every `tls:` block
+    /// that reaches this sink.
+    #[test]
+    fn a_statsd_out_with_a_consistent_tls_block_over_tcp_resolves() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            insecure_skip_verify: false,
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]))
+        .expect("a mutual-TLS statsd_out over tcp is a legal config");
+    }
+
     // ---- Rule 45: `handshake_timeout` on the three TCP listeners --------------------------------
 
     /// `0s` cannot be met by any handshake, so a listener configured with it would accept
@@ -6344,13 +6506,155 @@ mod tests {
         max_line_bytes: u64,
         max_frame_bytes: u64,
     ) -> ComponentKind {
-        ComponentKind::GraphiteIn {
-            bind: "0.0.0.0:2003".to_string(),
+        graphite_in_full(
             transport,
             protocol,
             max_line_bytes,
             max_frame_bytes,
+            false,
+            default_handshake_timeout(),
+        )
+    }
+
+    /// [`graphite_in`] with rules 43's and 45's knobs exposed too -- `tls:` and
+    /// `handshake_timeout`, both TCP-only, since `graphite_in` joined the shared stream driver.
+    fn graphite_in_full(
+        transport: GraphiteTransport,
+        protocol: GraphiteProtocol,
+        max_line_bytes: u64,
+        max_frame_bytes: u64,
+        tls: bool,
+        handshake_timeout: Duration,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteIn {
+            bind: "0.0.0.0:2003".to_string(),
+            transport,
+            protocol,
+            tls: tls.then(|| logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+            handshake_timeout,
+            max_line_bytes,
+            max_frame_bytes,
         }
+    }
+
+    /// Rule 43 over `graphite_in`, the second listener it covers: a `tls:` block on the datagram
+    /// transport is rejected with the identical message a `syslog_in` gets, since the check and
+    /// the reasoning are the same one.
+    #[test]
+    fn tls_on_a_udp_graphite_in_is_rejected() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_full(
+                    GraphiteTransport::Udp,
+                    GraphiteProtocol::Plaintext,
+                    8192,
+                    1 << 20,
+                    true,
+                    default_handshake_timeout(),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'tls:' needs 'transport: tcp'"), "got: {err}");
+        assert!(err.contains("DTLS"), "got: {err}");
+    }
+
+    /// Rule 43's other side for carbon: TLS over a TCP `graphite_in` is exactly the relay hop the
+    /// listener now supports.
+    #[test]
+    fn tls_on_a_tcp_graphite_in_validates_fine() {
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_full(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Plaintext,
+                    8192,
+                    1 << 20,
+                    true,
+                    default_handshake_timeout(),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a TLS-terminating TCP graphite_in is legal");
+    }
+
+    /// Rule 45 over `graphite_in`: `0s` is impossible on either transport, and a non-default value
+    /// is set-but-ignored under `transport: udp`. The TCP case with a real value validates.
+    #[test]
+    fn rule_45_covers_a_graphite_in_handshake_timeout() {
+        let zero = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_full(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Plaintext,
+                    8192,
+                    1 << 20,
+                    false,
+                    Duration::ZERO,
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(zero.contains("'handshake_timeout' must be greater than 0s"), "got: {zero}");
+
+        let on_udp = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_full(
+                    GraphiteTransport::Udp,
+                    GraphiteProtocol::Plaintext,
+                    8192,
+                    1 << 20,
+                    false,
+                    Duration::from_secs(2),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(on_udp.contains("needs 'transport: tcp'"), "got: {on_udp}");
+        assert!(on_udp.contains("UDP graphite_in"), "got: {on_udp}");
+
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_full(
+                    GraphiteTransport::Tcp,
+                    GraphiteProtocol::Plaintext,
+                    8192,
+                    1 << 20,
+                    false,
+                    Duration::from_secs(2),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a non-default handshake_timeout on a TCP graphite_in is what the field is for");
+    }
+
+    /// And the default value is not a *set* one: a UDP `graphite_in` that never mentions
+    /// `handshake_timeout` must keep validating, which is what the defaulted-value early return in
+    /// rule 45 is there for.
+    #[test]
+    fn a_defaulted_handshake_timeout_on_a_udp_graphite_in_is_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], graphite_in(GraphiteTransport::Udp, GraphiteProtocol::Plaintext)),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an untouched handshake_timeout must not make transport: udp a config error");
     }
 
     #[test]
@@ -6953,5 +7257,134 @@ mod tests {
         assert_eq!(graph.topological_order.len(), 4);
         assert!(graph.components["relay_out"].consumers.is_empty());
         assert_eq!(graph.components["sink"].sources, vec!["relay_in".to_string()]);
+    }
+
+    // ---- `statsd_in`'s stream transport: rules 43/45/17 ------------------------------------------
+
+    /// A `statsd_in` with `transport`/`tls:`/`handshake_timeout` spelled out -- an enum variant
+    /// has no functional-record-update syntax, so every case below goes through this.
+    fn statsd_in_full(
+        transport: StatsdTransport,
+        tls: bool,
+        handshake_timeout: Duration,
+    ) -> ComponentKind {
+        ComponentKind::StatsdIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport,
+            tls: tls.then(|| logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+            handshake_timeout,
+        }
+    }
+
+    /// Rule 43 over `statsd_in`, the third listener it covers: DTLS is out of scope and no statsd
+    /// client speaks it anyway, so a `tls:` block on the datagram transport could never take
+    /// effect and is rejected rather than silently ignored.
+    #[test]
+    fn a_udp_statsd_in_with_tls_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], statsd_in_full(StatsdTransport::Udp, true, default_handshake_timeout())),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'tls:' needs 'transport: tcp'"), "got: {err}");
+        assert!(err.contains("DTLS"), "got: {err}");
+    }
+
+    /// Rule 43's other side for statsd: a TLS-terminating TCP `statsd_in` is exactly the relay hop
+    /// the listener gained a stream transport for.
+    #[test]
+    fn a_tcp_statsd_in_with_tls_resolves_fine() {
+        resolve(cfg(vec![
+            ("in", vec![], statsd_in_full(StatsdTransport::Tcp, true, default_handshake_timeout())),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a TLS-terminating TCP statsd_in is legal");
+    }
+
+    /// Rule 45 over `statsd_in`: `0s` is impossible on either transport, and a non-default value
+    /// is set-but-ignored under `transport: udp`, where there is no connection to hand shake. The
+    /// TCP case with a real value resolves, which is what the field is for.
+    #[test]
+    fn a_non_default_handshake_timeout_on_a_udp_statsd_in_is_rejected() {
+        let zero = expect_err(cfg(vec![
+            ("in", vec![], statsd_in_full(StatsdTransport::Tcp, false, Duration::ZERO)),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(zero.contains("'handshake_timeout' must be greater than 0s"), "got: {zero}");
+
+        let on_udp = expect_err(cfg(vec![
+            ("in", vec![], statsd_in_full(StatsdTransport::Udp, false, Duration::from_secs(2))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(on_udp.contains("needs 'transport: tcp'"), "got: {on_udp}");
+        assert!(on_udp.contains("UDP statsd_in"), "got: {on_udp}");
+
+        resolve(cfg(vec![
+            ("in", vec![], statsd_in_full(StatsdTransport::Tcp, false, Duration::from_secs(2))),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a non-default handshake_timeout on a TCP statsd_in is what the field is for");
+
+        // And the *default* value is not a set one, on either transport -- the defaulted-value
+        // early return in rule 45. `listener()` above is a bare UDP `statsd_in`, so every other
+        // test in this module depends on this holding.
+        resolve(cfg(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_full(StatsdTransport::Udp, false, default_handshake_timeout()),
+            ),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a UDP statsd_in that never mentions handshake_timeout must keep resolving");
+    }
+
+    /// Rule 17 through the narrowed `is_datagram_listener`: a TCP `statsd_in` runs on the stream
+    /// driver, which has no receive queue at all, so a queue-only field is rejected by name --
+    /// and the UDP arm must not have lost its own queue fields in the narrowing.
+    #[test]
+    fn a_tcp_statsd_in_rejects_receive_max_datagrams() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_full(StatsdTransport::Tcp, false, default_handshake_timeout()),
+                non_default_receive(),
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'receive.max_datagrams'"), "got: {err}");
+        assert!(err.contains("a stream listener has no receive queue"), "got: {err}");
+        assert!(err.contains("UDP statsd_in"), "got: {err}");
+
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_full(StatsdTransport::Udp, false, default_handshake_timeout()),
+                non_default_receive(),
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a UDP statsd_in is still a datagram listener with a real receive queue");
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
+
+        // The batch-assembly half still applies on TCP, per connection (rule 17's split).
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_full(StatsdTransport::Tcp, false, default_handshake_timeout()),
+                ReceiveConfig { batch_max_events: 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("batch_max_events is one of the fields a stream listener may override");
+        assert_eq!(graph.components["in"].receive.batch_max_events, 1);
     }
 }

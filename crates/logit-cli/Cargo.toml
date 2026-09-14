@@ -60,6 +60,15 @@ async-trait.workspace = true
 # `StatsdDecoder` directly, which takes its input as `bytes::Bytes` -- already a transitive
 # dependency via every crate above, named directly here because the test constructs one itself.
 bytes.workspace = true
+# tests/statsd_round_trip.rs's `mod tls` now drives the real `statsd_out -> statsd_in` path over
+# TLS on both ends (`docs/adr/statsd-output.md`'s TLS amendment). A raw `tokio_rustls` client
+# survives alongside it for the one assertion a sink cannot make: that a *refused* handshake
+# leaves the listener still serving everyone else. All three are already transitive dependencies
+# at these exact versions via `logit-inputs`/`logit-outputs`, so naming them here adds no new
+# crate version to the graph -- the same call `bytes`/`reqwest` below already make.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
 # tests/prometheus_round_trip.rs's scrape client, and its canned-target server (the same
 # `hyper`/`hyper-util`/`http-body-util` stack `crates/logit-inputs/src/prometheus.rs`'s own tests
 # use, all already ordinary dependencies above). `reqwest` is already a transitive dependency at
