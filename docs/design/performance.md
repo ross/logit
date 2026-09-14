@@ -102,7 +102,7 @@ noise sub-section right after this table for what it means when that range is wi
 | `buffered` | 1.2M | 1,087,248 | 1,079,632 – 1,099,616 | 1.522 | 26.6 MiB | 1.10 s |
 | `encode-human-devnull` | 8M | 999,423 | 974,599 – 1,014,536 | 1.330 | 176.8 MiB | 8.00 s |
 | `encode-native-devnull` | 8M | 1,189,960 | 1,165,315 – 1,224,892 | 1.180 | 168.9 MiB | 6.72 s |
-| `fanout` (old one-attribute shape, superseded — see below) | 55M | 5,675,019 | 5,297,478 – 5,895,784 | 0.466 | 131.5 MiB | 9.69 s |
+| `fanout` (re-shaped; quiet run at `7ead7a4`, see below) | 20M | 3,311,403 | 3,270,606 – 3,535,480 | 0.572 | 12.3 MiB | 6.04 s |
 | `json-parse` | 7M | 945,491 | 795,169 – 991,003 | 2.054 | 294.5 MiB | 7.40 s |
 | `lua` | 4M | 628,380 | 554,182 – 776,491 | 2.085 | 29.4 MiB | 6.37 s |
 | `native-relay` | 7M | 1,164,963 | 691,884 – 1,465,330 | 1.118 | 130.0 MiB | 6.01 s |
@@ -110,8 +110,10 @@ noise sub-section right after this table for what it means when that range is wi
 
 A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures:
 
-- **`passthrough`** (0.478 µs/event) is the runtime floor every other scenario is read relative to:
-  scheduling, the `Fanout` channel hop, layer-2 telemetry, no parsing or encoding. **Most of that
+- **`passthrough`** (0.478 µs/event; 0.404 on the same quiet-battery setup at `7ead7a4`, after #189
+  stopped resolving symbols in `estimated_heap_bytes` — see the `fanout` bullet) is the runtime
+  floor every other scenario is read relative to: scheduling, the `Fanout` channel hop, layer-2
+  telemetry, no parsing or encoding. **Most of that
   floor is the generator, not the runtime.** A 2026-09-14 `attribute` pass on `passthrough` (after
   #189, busy box) had `gen` blocked in `Fanout::send` for only 0.36 s of a ~9.3 s run and the
   sink's queue never above 5% of its 1024-batch bound — `null_out` keeps up and `generate_in`'s
@@ -124,10 +126,12 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   one `Arc::new` in `drain_inbox`, the queue's two lock/notify pairs, `deliver_with_retry`'s
   timeout registration — is under 3% of samples combined. So a change to the delivery path can
   move this number by a few percent at most; a cheaper generator would move it more.
-- **`fanout`** was re-shaped on 2026-09-14 (after this run). The row above is the *old* shape: a
-  one-attribute event (`host: web-{seq%20}`) at 55M, which this section used to read as "three
-  sends costs barely more than one" because 0.466 µs landed under `passthrough`'s 0.478 µs. That
-  reading was wrong: the two scenarios generated different events, and `passthrough`'s six
+- **`fanout`** was re-shaped on 2026-09-14, after the run the rest of this table records, and its
+  row above is the one exception to the table's provenance: a separate quiet run (host idle, on
+  battery, same dev container and `rustc`) at `7ead7a4`, `--repeat 3`, after #189. Before the
+  re-shape it generated a one-attribute event (`host: web-{seq%20}`) at 55M, and this section read
+  its 0.466 µs landing under `passthrough`'s 0.478 µs as "three sends costs barely more than one".
+  That reading was wrong: the two scenarios generated different events, and `passthrough`'s six
   attributes (two templated) cost the generator roughly 6× more per event than `fanout`'s one, which
   is more than the two extra sinks cost. A 2×2 that crossed both topologies with both event
   templates (same busy box, same invocation, `--repeat 3`, medians, CPU µs per *generated* event,
@@ -145,8 +149,15 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   clone plus one more `drain_inbox → SinkQueue → write_loop` hop each), and halve it for one. Note
   that `cpu_us_per_event` divides by `generate_in.count` — *generated* events — for every
   scenario; a fan-out scenario delivers `count × consumers` batch-events, so its per-delivery cost
-  is that much lower than the column shows. The re-shaped `fanout` has not yet been re-measured on
-  a quiet machine; the next quiet `--repeat 3` run should replace this row.
+  is that much lower than the column shows. On the quiet `7ead7a4` run the two scenarios, same
+  event, same count, same invocation, came out at 0.404 (`passthrough`) and 0.572 (`fanout`) µs per
+  generated event — two extra sinks cost 0.168 µs, or ~0.08 µs per generated event per extra
+  consumer, which is the honest per-edge price of an `Arc` clone plus a `drain_inbox → SinkQueue →
+  write_loop` hop for a 100-event batch. Wall-clock throughput was essentially identical (3.27M vs
+  3.31M events/s), as it should be for a generator-bound graph: the extra sinks run on otherwise
+  idle workers. `passthrough`'s own 0.404 here against 0.478 in the row above is #189's saving on
+  this path (six fewer interner resolves per event at queue admission), not run-to-run noise —
+  the two are different commits.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
