@@ -225,7 +225,10 @@ Consequences beyond `crates/logit-core/src/diag.rs`:
 - An independent throttle, if one is ever genuinely wanted, is spelled by constructing rather than
   cloning: `Diagnostics::new(id).with_telemetry(telemetry)`. No `detached()` helper is added for a
   case nothing in the tree has.
-- `Diagnostics::new` now allocates once (the `Arc`). Construction happens at build time for every
-  component, so this is off every hot path — but it is a real allocation where there was none, and
-  `crates/logit-bench/tests/allocations.rs` measures one region that constructs a `Diagnostics`
-  inside it (`prometheus::text::write`'s throwaway `PrometheusEncoder::new()`).
+- The shared counts cost one allocation per construction. That is off every hot path for a
+  configured component (built once, at startup), but *not* for `Diagnostics::default()`: a
+  throwaway no-op value is built inside real work, `prometheus::text::write`'s own
+  `PrometheusEncoder::new()` among them, which `crates/logit-bench/tests/allocations.rs` measures.
+  So `component_id` becomes a `Cow<'static, str>` and the default's placeholder id is borrowed
+  rather than copied onto the heap — a default `Diagnostics` allocates exactly once either way,
+  and every allocation pin in that file holds unchanged.

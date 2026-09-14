@@ -6,6 +6,7 @@
 //! `docs/adr/service-lifecycle-and-output-retry.md`.
 
 use crate::telemetry::Telemetry;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{Arc, Mutex};
@@ -31,7 +32,13 @@ use std::sync::{Arc, Mutex};
 /// `Diagnostics::new(id).with_telemetry(telemetry)`. Nothing in the tree needs one today.
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
-    component_id: String,
+    /// A [`Cow`] rather than a `String` so [`Diagnostics::default`]'s placeholder id -- a
+    /// `&'static str` -- costs no allocation: `Default` is what every component that never got a
+    /// `with_diagnostics` call carries, including the throwaway no-op encoders/decoders built
+    /// inside hot paths (`logit_proto::prometheus::text::write`'s own, which
+    /// `crates/logit-bench/tests/allocations.rs` measures). A real id comes from config as an
+    /// owned `String` and is stored as one. `Debug` renders both variants identically.
+    component_id: Cow<'static, str>,
     /// Per-key occurrence counts for [`Diagnostics::warn_throttled`]. Independent keys never
     /// interfere with each other's throttling -- a component with two distinct failure modes
     /// (e.g. `json`'s "no brace found" and "parse failed") reports each on its own cadence.
@@ -50,16 +57,23 @@ pub struct Diagnostics {
 
 impl Default for Diagnostics {
     fn default() -> Self {
-        Self::new("<unnamed>")
+        // The placeholder id is borrowed, not copied onto the heap, so a default `Diagnostics`
+        // costs exactly the one allocation its shared counts need -- see the `component_id`
+        // field's doc comment.
+        Self::with_id(Cow::Borrowed("<unnamed>"))
     }
 }
 
 impl Diagnostics {
     pub fn new(component_id: impl Into<String>) -> Self {
+        Self::with_id(Cow::Owned(component_id.into()))
+    }
+
+    fn with_id(component_id: Cow<'static, str>) -> Self {
         Self {
-            component_id: component_id.into(),
-            // A fresh `Arc` per `new`: two components never share a throttle, only clones of one
-            // component's value do.
+            component_id,
+            // A fresh `Arc` per construction: two components never share a throttle, only clones
+            // of one component's value do.
             counts: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Telemetry::default(),
         }
