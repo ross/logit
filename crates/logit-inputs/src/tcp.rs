@@ -727,9 +727,9 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     max_frame_bytes: usize,
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
-    /// bind-pre-pass shape `otlp_in` uses (`docs/plans/operator-surface.md`, workstream B), rather
-    /// than `logit_in`'s bind-inside-`run_until_shutdown`, so a test (and `logit run`'s startup
-    /// ordering) can learn the real address before anything is spawned.
+    /// bind-pre-pass shape `otlp_in` and `logit_in` use (`docs/plans/operator-surface.md`,
+    /// workstream B), so a test (and `logit run`'s startup ordering) can learn the real address
+    /// before anything is spawned.
     listener: Option<TokioTcpListener>,
     max_connections: usize,
     handshake_timeout: Duration,
@@ -1870,8 +1870,8 @@ mod tests {
         }
     }
 
-    /// Binds an ephemeral port through `Input::bind` (not by binding and dropping a probe socket
-    /// the way `logit_in`'s tests must) -- the whole point of this driver's bind pre-pass.
+    /// Binds an ephemeral port through `Input::bind` (not by binding and dropping a probe
+    /// socket) -- the whole point of this driver's bind pre-pass.
     async fn bound_listener(config: TcpListenerConfig) -> (String, TcpListener<TestDecoder>) {
         let mut listener = TcpListener::new("127.0.0.1:0", TestDecoder::new(), config);
         listener.bind().await.expect("binding an ephemeral port should succeed");
