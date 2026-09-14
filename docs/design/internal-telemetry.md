@@ -590,7 +590,10 @@ Worked examples, one per shipped component:
   batch per accepted request, so a counter here would only restate it. `Diagnostics` keys,
   mirrored as `logit.component.diagnostics{key}` by the bridge: `bound`, and `connection_error` —
   one connection's I/O failing, a TLS accept that failed or timed out, or a plaintext connection
-  that produced no first byte inside `handshake_timeout` and so gave its permit back. There is no
+  held open past `handshake_timeout` without producing a first byte, which then gave its permit
+  back. A plaintext peer that *closes cleanly* before sending anything is deliberately not counted
+  there: that is what a TCP health check looks like, and counting it would put one point per probe
+  interval on this key forever. There is no
   TLS-specific metric: a handshake failure surfaces through that same diagnostic.
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)):
