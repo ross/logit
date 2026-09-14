@@ -1,6 +1,6 @@
 ---
 created: 2026-08-30
-updated: 2026-09-02
+updated: 2026-09-14
 ---
 
 # Service lifecycle: signal-driven shutdown and bounded output retry
@@ -183,3 +183,49 @@ bounded under typical load.
   retry now exists but `Buffer`/at-least-once delivery remain unimplemented; a new entry records
   that delivery IO is not decoupled from event processing within a node, which is what makes the
   retry budget above tight rather than generous.
+
+## Amendment: throttle scope is the component, not the clone (2026-09-14)
+
+"Diagnostics: attribution via a builder, throttling by count" above describes `warn_throttled`'s
+per-key occurrence counts but never says *which* counts a given `Diagnostics` value consults. The
+original `#[derive(Clone)]` answered that by accident: each clone got its own `HashMap`, so the
+throttle's scope was whatever value happened to be in hand. That was harmless for the components
+this ADR was written against — one `JsonParser`, one `InfluxDbOutput`, one long-lived value per
+component — and wrong for every listener built since, which clones its `Diagnostics` once per
+connection or per decoder. A count that restarts at 1 with each clone is not a throttle at all:
+`crates/logit-inputs/src/tcp.rs`' `framing_error` is fatal to its connection, so a peer looping
+connect / send-a-bad-frame / close would warn on every occurrence forever, one log line per TCP
+handshake.
+
+So: **a throttle's scope is the component.** `Diagnostics::counts` is an
+`Arc<Mutex<HashMap<&'static str, u64>>>`; `Diagnostics::new` builds a fresh one, and every clone of
+that value — the one a listener hands each connection task, the one it pushes into a
+per-connection decoder, the one a transform hands a helper — counts against the same totals.
+`Diagnostics::occurrences` reads through the same lock, so any clone answers for all of them. The
+mutex is `std::sync`'s, not tokio's: it is taken only on a diagnostic's error branch, never on a
+happy path, and the guard never outlives the statement that takes it, so it is never held across an
+`.await`. A poisoned lock is tolerated (`unwrap_or_else(|p| p.into_inner())`) — a panicking
+reporter elsewhere should not take the throttle down with it.
+
+`warn_throttled` keeps `&mut self`. It no longer needs the exclusive borrow, but that borrow is
+what all ~190 call sites already hold, and it still says the honest thing: the call mutates the
+component's diagnostic state. What it does not do is scope the throttle.
+
+Consequences beyond `crates/logit-core/src/diag.rs`:
+
+- `tcp.rs`'s `frame_diag: Arc<Mutex<Diagnostics>>` and `warn_frame_throttled` are gone. They were
+  this fix applied to two keys (`framing_error`, `bad_frame`) at one call site; the connection's
+  own `Diagnostics` clone now carries all three keys, `connection_error` included, and
+  `serve_connection`/`absorb_frame`/`report_frame_error`/`report_buffered_tail` take
+  `&mut Diagnostics`.
+- `SyslogDecoder`'s `bad_line` is listener-wide. Its doc comment previously called the
+  per-connection throttle deliberate; nothing pinned that, and a listener flooded with bad lines
+  from many short connections is exactly the case the throttle exists for
+  ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)).
+- An independent throttle, if one is ever genuinely wanted, is spelled by constructing rather than
+  cloning: `Diagnostics::new(id).with_telemetry(telemetry)`. No `detached()` helper is added for a
+  case nothing in the tree has.
+- `Diagnostics::new` now allocates once (the `Arc`). Construction happens at build time for every
+  component, so this is off every hot path — but it is a real allocation where there was none, and
+  `crates/logit-bench/tests/allocations.rs` measures one region that constructs a `Diagnostics`
+  inside it (`prometheus::text::write`'s throwaway `PrometheusEncoder::new()`).

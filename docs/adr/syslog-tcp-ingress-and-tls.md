@@ -127,8 +127,10 @@ every connection.
 mirroring `udp::UdpListener<D>` closely enough that `statsd_in` can adopt it later without a second
 driver being written -- but only `syslog_in` is wired to it in this decision; `statsd_in` stays on
 UDP-only until a real TCP statsd need appears. `D: Clone` is load-bearing, not incidental: a future
-decoder with real per-connection scratch state needs its own clone per connection the same way this
-one's `SyslogDecoder` will.
+decoder with real per-connection scratch state needs its own clone per connection. `SyslogDecoder`
+itself has no such state — its `Diagnostics` is a shared handle, so `bad_line` throttles
+listener-wide (see [ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s
+2026-09-14 amendment).
 
 The accept loop is copied from `logit_in`'s (`crates/logit-inputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md)): a

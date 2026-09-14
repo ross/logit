@@ -518,9 +518,11 @@ Worked examples, one per shipped component:
   badly is not a framing error at all: `SyslogDecoder::decode_into` is infallible, so a rejected
   syslog message reports as the decoder's own `bad_line` on either transport, and the driver's
   `bad_frame` key — for a decoder that can fail a whole frame — stays unused here.
-  `framing_error` and `bad_frame` share one listener-wide throttle rather than a per-connection
-  one, so a peer looping connect / bad-frame / close is throttled like any other repeated failure
-  instead of warning once per TCP handshake. No
+  `framing_error`, `bad_frame`, `connection_error` and the decoder's own `bad_line` all throttle
+  listener-wide rather than per connection — a `Diagnostics` clone shares its original's counts
+  ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
+  2026-09-14 amendment) — so a peer looping connect / bad-frame / close is throttled like any
+  other repeated failure instead of warning once per TCP handshake. No
   `ReceiveQueue` and so none of the `receive_buffer.*` table above on this path — the connection's
   own flow control is the queue (graph rule 17). There is no TLS-specific metric on either
   transport: a handshake failure surfaces through the same connection-error diagnostics any other
