@@ -10,10 +10,11 @@
 //! ever differ in.
 //!
 //! **`D: Clone` is load-bearing.** Every connection gets its own decoder clone, because a decoder
-//! may hold real per-connection state (`SyslogDecoder`'s own `Diagnostics` throttle today; a
-//! future decoder's scratch buffers or sticky identity, the way `collectd`'s already works per
-//! datagram). Sharing one decoder across connections behind a lock would serialize every
-//! connection's decode against every other's; cloning keeps each connection independent.
+//! may hold real per-connection state (a future decoder's scratch buffers or sticky identity, the
+//! way `collectd`'s already works per datagram; `SyslogDecoder`'s clonable state today is only its
+//! `Diagnostics`, whose counts every clone shares). Sharing one decoder across connections behind
+//! a lock would serialize every connection's decode against every other's; cloning keeps each
+//! connection independent.
 //!
 //! **No receive queue.** Unlike the UDP driver, there is no [`crate::udp::ReceiveQueue`] here and
 //! no `receive.max_datagrams`/`max_bytes`/`overflow` to configure. TCP's own flow control *is* the
@@ -62,7 +63,7 @@ use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -447,13 +448,6 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     decoder: D,
     config: TcpListenerConfig,
     diag: Diagnostics,
-    /// The listener-wide throttle for the two per-frame diagnostic keys (`bad_frame`,
-    /// `framing_error`), shared by every connection task -- see the comment where it is cloned in
-    /// [`Input::run_until_shutdown`] for why those two keys cannot use the per-connection
-    /// `diag` clone that `connection_error` does. Held here rather than built inside
-    /// `run_until_shutdown` so it is one piece of listener state with one owner, settable by
-    /// [`Self::with_diagnostics`] and readable by a test.
-    frame_diag: Arc<Mutex<Diagnostics>>,
     telemetry: Telemetry,
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
@@ -472,7 +466,6 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             decoder,
             config,
             diag: Diagnostics::default(),
-            frame_diag: Arc::new(Mutex::new(Diagnostics::default())),
             telemetry: Telemetry::default(),
             tls: None,
             listener: None,
@@ -493,17 +486,8 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
     /// the full reasoning, and use [`Self::map_decoder`] to propagate the same value into a
     /// concrete decoder that needs it.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.frame_diag = Arc::new(Mutex::new(diag.clone()));
         self.diag = diag;
         self
-    }
-
-    /// Test-only handle on the shared per-frame throttle (the `frame_diag` field), so a test can
-    /// read `Diagnostics::occurrences` after driving several connections and confirm the count is
-    /// genuinely listener-wide. Taken before the listener is moved into its task.
-    #[cfg(test)]
-    fn frame_diag(&self) -> Arc<Mutex<Diagnostics>> {
-        Arc::clone(&self.frame_diag)
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -614,22 +598,9 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let config = self.config;
-        // One shared `Diagnostics` for the two per-frame keys, so their throttle is listener-wide
-        // rather than per connection. `logit_core::Diagnostics` derives a plain `Clone` over its
-        // own per-key counts, so the per-connection clone below starts every connection back at
-        // zero -- and since a framing error is fatal to its connection, `framing_error` would then
-        // sit at count 1 forever and warn on every single occurrence, one log line per TCP
-        // handshake from a peer looping connect / send-a-bad-frame / close. `udp.rs` gets
-        // listener-wide `bad_datagram` throttling for free by handing one clone to its single
-        // `decode_loop`; a stream listener has one task per connection, so it takes a real shared
-        // handle. `with_diagnostics`'s own doc already describes these keys as listener-scoped.
-        //
-        // A `std::sync::Mutex`, not tokio's: it is locked only on an error branch, never on the
-        // happy path, and never held across an `.await`. `connection_error` deliberately keeps the
-        // per-connection clone below -- it is inherited verbatim from `logit_in`/`otlp_in`, and
-        // forking that convention here is not this driver's call to make.
-        let frame_diag = Arc::clone(&self.frame_diag);
-
+        // All three of this listener's diagnostic keys (`connection_error`, `framing_error`,
+        // `bad_frame`) throttle listener-wide through the per-connection `Diagnostics` clone
+        // below: a clone shares its original's counts -- see `logit_core::Diagnostics`' type doc.
         loop {
             let (stream, _peer) = tokio::select! {
                 accepted = listener.accept() => accepted?,
@@ -660,7 +631,6 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
             let conn_shutdown = shutdown.clone();
             let live_connections = Arc::clone(&live_connections);
             let decoder = self.decoder.clone();
-            let frame_diag = Arc::clone(&frame_diag);
 
             tokio::spawn(async move {
                 // Held for exactly as long as this task runs -- a TLS accept that fails or times
@@ -685,7 +655,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                                     handshake_timeout,
                                     sink,
                                     telemetry.clone(),
-                                    frame_diag,
+                                    &mut diag,
                                     conn_shutdown,
                                 )
                                 .await
@@ -707,7 +677,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                             handshake_timeout,
                             sink,
                             telemetry.clone(),
-                            frame_diag,
+                            &mut diag,
                             conn_shutdown,
                         )
                         .await
@@ -778,6 +748,11 @@ async fn read_step<S: AsyncRead + Unpin + Send>(
 /// any sibling connection. Flushes on the accumulator's own bounds, on `batch_flush_interval`, on
 /// shutdown, and on close (clean or otherwise).
 ///
+/// `diag` is the accept loop's per-connection [`Diagnostics`] clone -- borrowed, not moved, so it
+/// is still there for the `connection_error` report on whatever this returns. It is where
+/// `framing_error` and `bad_frame` are reported, and those still throttle listener-wide: a clone
+/// shares its original's counts (`logit_core::Diagnostics`' type doc).
+///
 /// `handshake_timeout` bounds the wait for this connection's *first* byte -- see this module's
 /// "Pre-handshake timeout" doc section. Passed on both arms of the accept loop, TLS or not.
 #[allow(clippy::too_many_arguments)] // one connection's whole context; a params struct would only move it
@@ -788,7 +763,7 @@ async fn serve_connection<S, D>(
     handshake_timeout: Duration,
     sink: Fanout,
     telemetry: Telemetry,
-    frame_diag: Arc<Mutex<Diagnostics>>,
+    diag: &mut Diagnostics,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
@@ -835,7 +810,7 @@ where
         // already true when this iteration started". The `Ref` temporary is dropped at the end of
         // this statement, well before any `.await`.
         if *shutdown.borrow() {
-            report_buffered_tail(&framer, &telemetry, &frame_diag);
+            report_buffered_tail(&framer, &telemetry, diag);
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
@@ -885,7 +860,7 @@ where
         match step {
             ReadStep::Bytes => {}
             ReadStep::Shutdown => {
-                report_buffered_tail(&framer, &telemetry, &frame_diag);
+                report_buffered_tail(&framer, &telemetry, diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
                 }
@@ -904,13 +879,13 @@ where
                             &mut accumulator,
                             &sink,
                             &telemetry,
-                            &frame_diag,
+                            diag,
                         )
                         .await;
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        report_frame_error(&err, &telemetry, &frame_diag);
+                        report_frame_error(&err, &telemetry, diag);
                     }
                 }
                 if let Some(batch) = accumulator.take() {
@@ -921,7 +896,7 @@ where
             ReadStep::Failed(err) => {
                 // The connection broke, but whatever was already decoded is still good -- deliver
                 // it before surfacing the error as this connection's `connection_error`.
-                report_buffered_tail(&framer, &telemetry, &frame_diag);
+                report_buffered_tail(&framer, &telemetry, diag);
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                 }
@@ -944,7 +919,7 @@ where
                         &mut accumulator,
                         &sink,
                         &telemetry,
-                        &frame_diag,
+                        diag,
                     )
                     .await;
                 }
@@ -953,7 +928,7 @@ where
                     // Neither framing can resynchronize past one of these (see [`FrameError`]), so
                     // this connection ends here -- diagnosed on its own key rather than bubbling
                     // up as a `connection_error`, since the cause is the peer's framing, not I/O.
-                    report_frame_error(&err, &telemetry, &frame_diag);
+                    report_frame_error(&err, &telemetry, diag);
                     if let Some(batch) = accumulator.take() {
                         emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                     }
@@ -976,7 +951,7 @@ async fn absorb_frame<D: Decoder + Send>(
     accumulator: &mut BatchAccumulator,
     sink: &Fanout,
     telemetry: &Telemetry,
-    frame_diag: &Mutex<Diagnostics>,
+    diag: &mut Diagnostics,
 ) {
     telemetry.count("logit.input.frames", 1.0, &[]);
     telemetry.count("logit.input.frame.bytes", frame.len() as f64, &[]);
@@ -990,7 +965,7 @@ async fn absorb_frame<D: Decoder + Send>(
             }
         }
         Err(err) => {
-            warn_frame_throttled(frame_diag, "bad_frame", err);
+            diag.warn_throttled("bad_frame", err);
         }
     }
 }
@@ -999,13 +974,9 @@ async fn absorb_frame<D: Decoder + Send>(
 /// operator triaging "my sender's frames are being rejected" is looking at something quite
 /// different from "a peer's socket broke". Returns whether the diagnostic actually reported (i.e.
 /// was not throttled), so a test can assert the listener-wide cadence directly.
-fn report_frame_error(
-    err: &FrameError,
-    telemetry: &Telemetry,
-    frame_diag: &Mutex<Diagnostics>,
-) -> bool {
+fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagnostics) -> bool {
     telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", err.reason())]);
-    warn_frame_throttled(frame_diag, "framing_error", err)
+    diag.warn_throttled("framing_error", err)
 }
 
 /// A partial frame still held by the [`Framer`] when a connection ends *without* a clean EOF --
@@ -1017,7 +988,7 @@ fn report_frame_error(
 /// `truncated` under octet counting, and `logit.input.frames.dropped{reason="truncated"}` exists
 /// precisely to make this class visible. A no-op when nothing is buffered, which is the ordinary
 /// case on both paths.
-fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, frame_diag: &Mutex<Diagnostics>) {
+fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, diag: &mut Diagnostics) {
     let held = framer.buffered();
     if held == 0 {
         return;
@@ -1027,23 +998,8 @@ fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, frame_diag: &Mut
             "the connection ended abruptly with {held} byte(s) of an incomplete frame buffered"
         )),
         telemetry,
-        frame_diag,
+        diag,
     );
-}
-
-/// Reports one per-frame diagnostic through the listener-wide throttle -- see the `frame_diag`
-/// handle's own comment in `run_until_shutdown` for why these two keys need a shared
-/// [`Diagnostics`] rather than the per-connection clone `connection_error` uses. The guard never
-/// outlives this call, so it is never held across an `.await`.
-fn warn_frame_throttled(
-    frame_diag: &Mutex<Diagnostics>,
-    key: &'static str,
-    msg: impl std::fmt::Display,
-) -> bool {
-    // A poisoned lock means some other connection panicked mid-report; the counts themselves are
-    // still perfectly usable, and losing the throttle entirely would be the worse outcome.
-    let mut diag = frame_diag.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    diag.warn_throttled(key, msg)
 }
 
 /// `sink.send` mints a fresh [`logit_pipeline::TraceContext::new_root`] here -- once per
@@ -1737,27 +1693,36 @@ mod tests {
     }
 
     /// The throttle `report_frame_error` reports through has to be shared across connections to
-    /// work at all: a framing error is fatal to its connection, so against a per-connection
-    /// `Diagnostics` clone the count would sit at 1 forever and every single occurrence would
-    /// warn. Asserted on `warn_throttled`'s own return value, since the `tracing` output itself is
-    /// only capturable on the emitting thread and these reports come from spawned tasks.
+    /// work at all: a framing error is fatal to its connection, so if each connection counted in
+    /// a copy of its own, the count would sit at 1 forever and every single occurrence would
+    /// warn. The sharing is now `Diagnostics`' own (a clone shares its original's counts), so
+    /// this half of the property is asserted straight against a connection-shaped clone, on
+    /// `warn_throttled`'s return value -- the `tracing` output itself is only capturable on the
+    /// emitting thread, and the real reports come from spawned tasks.
     #[test]
     fn the_per_frame_diagnostic_throttle_is_shared_not_per_connection() {
-        let frame_diag = Mutex::new(Diagnostics::new("syslog_in"));
+        let diag = Diagnostics::new("syslog_in");
+        // What the accept loop hands one connection task.
+        let mut connection_diag = diag.clone();
         let telemetry = Telemetry::default();
         let err = FrameError::Malformed("an octet count of zero".to_string());
 
         assert!(
-            report_frame_error(&err, &telemetry, &frame_diag),
+            report_frame_error(&err, &telemetry, &mut connection_diag),
             "the 1st occurrence across the listener reports"
         );
         assert!(
-            report_frame_error(&err, &telemetry, &frame_diag),
+            report_frame_error(&err, &telemetry, &mut connection_diag),
             "the 2nd reports too -- 2 is a power of two"
         );
         assert!(
-            !report_frame_error(&err, &telemetry, &frame_diag),
-            "the 3rd is suppressed, which a per-connection clone could never manage"
+            !report_frame_error(&err, &telemetry, &mut connection_diag),
+            "the 3rd is suppressed, which an unshared per-connection count could never manage"
+        );
+        assert_eq!(
+            diag.occurrences("framing_error"),
+            3,
+            "and the listener's own value reads all three back"
         );
     }
 
@@ -1770,19 +1735,20 @@ mod tests {
     /// `Telemetry` mirrors into one shared component buffer no matter which `Diagnostics` value
     /// did the counting -- so a metric assertion would pass against the per-connection clone this
     /// test exists to rule out. `warn_throttled`'s return value is no help from out here either,
-    /// since the reports happen on spawned tasks. The occurrence count on the shared handle is the
-    /// one observable that differs: 3 when the handle is shared, and 0 when each connection counts
-    /// 1 in its own throwaway clone.
+    /// since the reports happen on spawned tasks. The occurrence count read back through a clone
+    /// of the value handed to `with_diagnostics` is the one observable that differs: 3 when the
+    /// counts are shared, and 0 when each connection counts 1 in its own throwaway clone. This is
+    /// the regression net for that sharing now living inside `Diagnostics` itself.
     #[tokio::test]
     async fn three_connections_report_their_framing_errors_through_one_throttle() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
         let (addr, listener) = bound_listener(one_per_frame()).await;
-        let listener =
-            listener.with_telemetry(telemetry).with_diagnostics(Diagnostics::new("syslog_in"));
-        // Taken before the listener moves into its task -- this is the very handle every
-        // connection task reports through.
-        let frame_diag = listener.frame_diag();
+        let diag = Diagnostics::new("syslog_in");
+        // Held before the listener moves into its task: a clone of the very value it was given,
+        // sharing the counts every connection task's own clone reports through.
+        let frame_diag = diag.clone();
+        let listener = listener.with_telemetry(telemetry).with_diagnostics(diag);
         let (sink, _rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut listener = listener;
@@ -1798,10 +1764,10 @@ mod tests {
         }
 
         assert_eq!(
-            frame_diag.lock().unwrap().occurrences("framing_error"),
+            frame_diag.occurrences("framing_error"),
             3,
-            "all three connections must count on the one listener-wide Diagnostics -- a \
-             per-connection clone would leave this at 0, having counted 1 in each throwaway copy"
+            "all three connections must count on the one listener-wide Diagnostics -- a clone \
+             with counts of its own would leave this at 0, having counted 1 in each throwaway copy"
         );
         // Weaker (it would hold either way, per this test's doc comment), but it does confirm the
         // three errors were classified as malformed rather than as something else on the way.
