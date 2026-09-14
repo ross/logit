@@ -342,7 +342,7 @@ impl Input for OtlpInput {
                 // Published from the read-modify-write's own return value, not a separate `load`:
                 // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an
                 // add and a load would leave the stale one as the published value until the next
-                // transition. `crate::graphite::tcp::gauge_connections` does the same.
+                // transition. `crate::tcp`'s own accept loop does the same.
                 let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
                 telemetry.gauge("logit.input.connections", live as f64, &[]);
 

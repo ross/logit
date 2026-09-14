@@ -896,12 +896,12 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                 let _permit = permit;
                 // One framer per connection, built from this listener's one framing decision.
                 let framer = Framer::new(framing, max_frame_bytes);
-                live_connections.fetch_add(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
+                // Published from the read-modify-write's own return value, not a separate
+                // `load`: `Telemetry::gauge` is last-write-wins per key, so two tasks that
+                // interleave an add and a load would leave the stale one as the published value
+                // until the next transition. `crate::otlp`'s own accept loop says the same.
+                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 let result = match tls_acceptor {
                     Some(acceptor) => {
@@ -946,12 +946,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                     }
                 };
 
-                live_connections.fetch_sub(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
+                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // One connection's I/O error (a peer vanishing mid-frame, a TLS accept that failed
                 // or timed out) must not be fatal to the listener or its sibling connections --
