@@ -231,6 +231,27 @@ the wire. The wire itself carries no data-source names, so the naming rule is:
 Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
 otherwise.
 
+**The Graphite/Carbon codec is the counter-example, and that is the point**
+(`crates/logit-proto/src/graphite/`,
+[ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)): it adds **no well-known attributes
+at all** — no `graphite.*` namespace, no `pub const ATTR_*`, nothing in the table above. Carbon's
+wire carries exactly four facts, and each one already has a home in this model with no lossy
+normalization on the way: a dotted path *is* `MetricRecord.name`, the `;k=v` tags *are* event
+attributes, the number *is* `MetricKind::Gauge`'s payload, and the whole second *is*
+`Event.timestamp`. Rule (b) of [ADR `lossless-transit`](../adr/lossless-transit.md) — the raw
+protocol-native fact rides alongside the normalized model field and wins on the way back out —
+exists to resolve a *conflict* between the two, and here there is none to resolve; a carrier would
+be a second spelling of something already stored once, and `graphite_in -> graphite_out` would be a
+fixed point either way. So a protocol-namespaced attribute is not the default for a new codec: it
+is what a codec reaches for when the wire says something the model would otherwise have to
+throw away or reinterpret.
+
+The visible consequence is worth stating, because it is the one place this pair is *less* forgiving
+than collectd or syslog: with no `graphite.path` carrier, a `lua`/`set` stage that renames
+`MetricRecord.name` silently changes the wire path. That is the intended way to rename a series —
+neither `graphite_in` nor `graphite_out` has a `prefix:`/`template:` field — and
+[docs/deploying.md](../deploying.md) says so plainly.
+
 `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
 [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
 more event attributes, and a resource sub-convention of their own:
@@ -475,8 +496,8 @@ trait SignalEncoder { fn encode_signals(&mut self, batch: &EventBatch) -> Result
 trait FramedEncoder { type Meta; type Stats; fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<Self::Meta>) -> Self::Stats; }
 ```
 
-statsd, syslog, OTLP, and the native protocol ([docs/design/wire-protocol.md](wire-protocol.md))
-are all just implementations of these traits — which shape a codec gets is decided by what its
+statsd, syslog, OTLP, collectd, graphite, and the native protocol
+([docs/design/wire-protocol.md](wire-protocol.md)) are all just implementations of these traits — which shape a codec gets is decided by what its
 transport needs to frame, not by the protocol's importance
 ([ADR `framed-encoder`](../adr/framed-encoder.md)), and OTLP has no special status in the core,
 per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).

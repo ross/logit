@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # Recorded interop fixtures: real producers, captured once, replayed as tests forever
@@ -108,6 +108,45 @@ capture, exercising the notification parts (`Message` 0x0100 / `Severity` 0x0101
 `testdata/interop/collectd/README.md`'s own "what isn't covered here (yet)" section carries the
 rest (signed/encrypted traffic, multi-host forwarding, legacy second-resolution time parts,
 COUNTER/ABSOLUTE data sources).
+
+## Amendment (2026-09-13): Graphite/Carbon, recorded
+
+A **sixth producer pair** landed with W4a of
+[`graphite-carbon-relay.md`](graphite-carbon-relay.md): `record_graphite` in
+`script/record-fixtures` (plus `tools/record-fixtures/collectd-write-graphite.conf` and
+`tools/record-fixtures/python_graphite_pickle_producer.py`), three captured connection streams in
+`testdata/interop/graphite/`, and three `interop_fixture_*` tests in
+`crates/logit-inputs/src/graphite/mod.rs` consuming them.
+
+Two things about this one differ from every producer above it, both worth naming:
+
+- **A first `raw_capture.py --proto tcp` producer, not `--proto udp`.** Carbon's own plaintext and
+  pickle listeners are both TCP by default (`logit_proto::graphite::DEFAULT_PLAINTEXT_PORT`/
+  `DEFAULT_PICKLE_PORT`), so unlike every syslog/collectd fixture (one file per UDP datagram),
+  each file here is **one whole TCP connection's byte stream** — `raw_capture.py`'s TCP mode
+  already existed for exactly this (its own docstring names "when `syslog_in` grows TCP support"),
+  it just had no producer using it until now. `write-graphite-000.raw` in particular holds three
+  `Interval 1` read cycles' worth of lines from one persistent connection, because `write_graphite`
+  opens its `<Node>` connection once at startup and keeps writing to it rather than reconnecting
+  per flush the way collectd's `network` plugin flushes discrete UDP datagrams — reused
+  `collectd-entrypoint.sh` with a new `RUN_SECONDS` env var (default 10, unchanged for the
+  existing collectd captures) to keep this fixture's size in the same class as the rest of the
+  corpus rather than committing a full ten seconds of read cycles.
+- **A second, hand-rolled producer for the second wire protocol.** There is no realistic way to
+  get a real *carbon* pickle sender (Twisted, carbon's own `carbon-client.py`) running in a
+  throwaway container without pulling in a much larger dependency stack for one fixture, so
+  `python_graphite_pickle_producer.py` uses only the Python standard library (`pickle`, `struct`,
+  `socket`) to send the exact same 4-byte-big-endian-length-prefixed `pickle.dumps(...)` payload a
+  real carbon client would — CPython's own `pickle` module is the thing being tested against
+  either way, not a third-party carbon library. It runs twice, at `protocol=2` and `protocol=-1`
+  (Python's "highest available", which resolved to protocol 5 on the `python:3.12-slim` image
+  every producer here runs in), pickling the identical fixed datapoint list both times so the two
+  fixtures can be asserted against the same expected output — see that script's own docstring for
+  why protocol -1 specifically is the one that exercises `FRAME`/`SHORT_BINUNICODE`/`MEMOIZE`.
+
+The follow-on list below is otherwise unchanged. `testdata/interop/graphite/README.md`'s own "what
+isn't covered here (yet)" section carries what this pair doesn't capture (tagged plaintext, UDP
+plaintext, a real carbon/Twisted pickle sender, reconnection, protocol 0/1 pickle).
 
 ## 1. How captures are recorded, reproducibly
 
@@ -249,6 +288,28 @@ not built there either. No `fuzz/` directory exists anywhere in this repo yet (c
 double as a fuzz seed corpus once that lands — real, minimal, protocol-diverse inputs are exactly
 what a fuzzer seeds from — but building that integration now would be speculative against a
 toolchain gap this repo has already decided not to pay for yet. Noted here as intent, not started.
+
+## Amendment (2026-09-13): TCP-framed syslog, recorded (closes the follow-on above)
+
+`docs/plans/syslog-tls.md`'s W4 workstream closes the "TCP-framed syslog fixtures" follow-on
+noted above: `record_rsyslog_tcp` in `script/record-fixtures`, next to `record_rsyslog`, and
+`tools/record-fixtures/rsyslog-tcp.conf`, the same shape as `rsyslog.conf` with one line
+different — `omfwd`'s `target`/`protocol` point at `raw_capture.py`'s TCP listener instead of UDP.
+Reuses `rsyslog-entrypoint.sh` unchanged, since it only ever runs whatever config is mounted at
+`/etc/rsyslog-fixture.conf`. One new fixture, `testdata/interop/syslog/rsyslog-tcp-000.raw` — see
+that directory's `README.md` for its row — and one new test,
+`interop_fixture_rsyslog_tcp_non_transparent_frame` in `crates/logit-inputs/src/tcp.rs`, which
+reads the fixture, pushes it through `Framer`, and decodes the resulting frame with
+`SyslogDecoder`.
+
+Deliberately **not** octet-counted: `rsyslog-tcp.conf` sets `protocol="tcp"` with no
+`TCP_Framing` parameter, which is rsyslog's own default — RFC 6587 §3.4.2 non-transparent
+(LF-terminated) framing — and that stock default, not the opt-in octet-counting mode, is the
+framing a real rsyslog forwarder actually puts on the wire and the one `logit`'s auto-detecting
+TCP listener (`crates/logit-inputs/src/tcp.rs`'s `Framer`) most needs to be checked against.
+Octet-counted rsyslog (`TCP_Framing="octet-counted"`) and syslog-ng (over any transport) remain
+unstarted follow-on work — see `testdata/interop/syslog/README.md`'s own "what isn't covered here
+(yet)" section.
 
 ## Consuming tests, and what they assert
 

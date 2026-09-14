@@ -110,7 +110,7 @@ components:
 
 **Unrouted events go to the router's ordinary consumers** -- whoever lists the router in
 `sources:` -- which is how the else-branch is spelled: not a chain of complements, but the
-router's own edge. A router with targets and no ordinary consumers is a legal config (rule 46
+router's own edge. A router with targets and no ordinary consumers is a legal config (rule 50
 below); its unrouted events are dropped and counted,
 `logit.component.events.dropped{reason="unrouted"}`, never silently.
 
@@ -161,7 +161,7 @@ Two operator-visible consequences fall out of the alias, and are features rather
 come from a pure `graph::targets_of(&Component)` and participate in cycle detection: a target's
 indegree counts its routers, so `router → target → … → router` is caught as the deadlock it
 would be. `logit graph` renders targets as dashed boxes and router → target edges dashed,
-labelled with the route key. Validation adds five rules (43-47, `docs/design/pipeline-graph.md`):
+labelled with the route key. Validation adds five rules (47-51, `docs/design/pipeline-graph.md`):
 `targets:` only on `lua`/`lua_file`; every target reference resolves, names a `target`, isn't
 the router itself, and isn't repeated; a `target` declares no `sources`, has at least one
 consumer, and is directed to by at least one router (rule 7's mirror: a target nothing routes to
@@ -228,7 +228,7 @@ what the component does to an event, the way `set`/`keep`/`scale` do. `event:to(
   breaking config change, accepted pre-release: the routing concept is the more general use of the
   word.
 - **Graph.** `Role::Target`; `graph::targets_of`/`target_edges`; `ResolvedComponent.targets`
-  (slot order); `topological_order` over `sources` plus target edges; rules 43-47; `dot.rs`
+  (slot order); `topological_order` over `sources` plus target edges; rules 47-51; `dot.rs`
   styling. Rule 6's arity table gains a row; rule 7 is relaxed for routers only.
 - **Runtime.** `logit_pipeline::Router` trait (`route(&mut self, &Arc<Resource>, &Event) ->
   Destination`, plus the `observe_*`/`map_resource` hooks `Transform` has; no flush -- no router
