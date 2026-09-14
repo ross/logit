@@ -67,8 +67,8 @@
 //! `first_byte_seen`, and not "has the framer latched a [`Framing`] yet": only
 //! [`FramingMode::Rfc6587Auto`] has anything to latch, so under either explicit mode a
 //! latch-shaped predicate would read "already framed" on a connection that has not sent a byte,
-//! and the deadline would silently never fire. `the_first_byte_deadline_applies_under_every_
-//! framing_mode` is the pin.
+//! and the deadline would silently never fire. The test
+//! `the_first_byte_deadline_applies_under_every_framing_mode` is the pin.
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
@@ -1585,7 +1585,7 @@ mod tests {
 
         // Past the bound with no terminator in sight: the end of this line has not arrived, so
         // the framer abandons it now and discards bytes until the `LF` that ends it.
-        framer.push(&vec![b'x'; 40]);
+        framer.push(&[b'x'; 40]);
         let err = framer.next_frame().expect_err("40 bytes with no LF is past the 16-byte bound");
         assert_eq!(err.reason(), "oversize", "{err}");
         assert!(!err.is_fatal(), "a line protocol resynchronizes at the next LF: {err}");

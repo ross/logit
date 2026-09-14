@@ -1217,8 +1217,9 @@ mod tests {
     /// splits on `\n` internally either way, so the decoded events are identical and this stays
     /// the honest shape for a fixture: a raw capture records what actually arrived on the wire,
     /// and what arrived was one connection's stream, not one file per line. What it exercises is
-    /// the *decoder* against real `write_graphite` bytes; `a_tcp_line_split_across_writes_is_
-    /// reassembled` and the driver's own framer tests cover the framing.
+    /// the *decoder* against real `write_graphite` bytes; the socket test
+    /// `a_tcp_line_split_across_writes_is_reassembled` and the driver's own framer tests cover
+    /// the framing.
     fn decode_interop_plaintext(name: &str) -> (Vec<Event>, Arc<Registry>) {
         let (mut decoder, registry) = interop_decoder(Protocol::Plaintext);
         let mut events = Vec::new();
