@@ -41,7 +41,7 @@ For continuity: the previous recorded run this table carried, taken 2026-09-13 o
 machine (`c75399d8bccc`, `perf/results/20260913T104956Z-c75399d8bccc-recorded.json`), was 14–27%
 slower across the board in events/s than this quiet run, scenario for scenario — except `aggregate`
 (an apparent -15%, which the noise sub-section below shows is run-to-run variance rather than a
-real slowdown) and `fanout` (-5% against its retuned 55M count, essentially flat). `buffered`'s own
+real slowdown) and `fanout` (-5% against its then-current 55M count, essentially flat). `buffered`'s own
 before/after story is its own section, §3.
 
 ## 0. What this measures, and what it doesn't
@@ -64,7 +64,9 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   makes it the number `script/perf compare --threshold` gates a regression on.
 - **peak RSS** — `ru_maxrss` (kibibytes on Linux, converted to bytes). Reported for every scenario,
   especially informative for `buffered` (real segment-file I/O and buffering), but never gates
-  `compare`'s exit code unless `--rss-threshold` is passed explicitly.
+  `compare`'s exit code unless `--rss-threshold` is passed explicitly. **In a short run this
+  number is roughly half jemalloc's freed-but-not-yet-purged pages** — see §1's "Peak RSS" sub-
+  section for the paired measurement and how to read a scenario's RSS against its live data.
 - **startup_s** — spawn → `ready`, alongside the other three (a column in `run`'s table, a field
   next to `wall_s` in the results JSON). `compare` *warns* — never gates the exit code — on a
   startup regression past `--threshold`: process bring-up is a different question from the graph's
@@ -88,7 +90,7 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   every other `script/*` command does, not a dedicated, pinned-core bench host — see the preamble's
   ~20% caveat.
 
-## 1. Results: all nine scenarios, median of 3
+## 1. Results: all ten scenarios, median of 3
 
 `script/perf run --repeat 3 --profile release --label quiet`, solo, on battery, with the host
 otherwise idle (see the preamble above). Sorted as `script/perf list` orders them (alphabetical);
@@ -102,22 +104,94 @@ noise sub-section right after this table for what it means when that range is wi
 | `buffered` | 1.2M | 1,087,248 | 1,079,632 – 1,099,616 | 1.522 | 26.6 MiB | 1.10 s |
 | `encode-human-devnull` | 8M | 999,423 | 974,599 – 1,014,536 | 1.330 | 176.8 MiB | 8.00 s |
 | `encode-native-devnull` | 8M | 1,189,960 | 1,165,315 – 1,224,892 | 1.180 | 168.9 MiB | 6.72 s |
-| `fanout` | 55M | 5,675,019 | 5,297,478 – 5,895,784 | 0.466 | 131.5 MiB | 9.69 s |
+| `fanout` (re-shaped; quiet run at `7ead7a4`, see below) | 20M | 3,311,403 | 3,270,606 – 3,535,480 | 0.572 | 12.3 MiB | 6.04 s |
 | `json-parse` | 7M | 945,491 | 795,169 – 991,003 | 2.054 | 294.5 MiB | 7.40 s |
 | `lua` | 4M | 628,380 | 554,182 – 776,491 | 2.085 | 29.4 MiB | 6.37 s |
 | `native-relay` | 7M | 1,164,963 | 691,884 – 1,465,330 | 1.118 | 130.0 MiB | 6.01 s |
 | `passthrough` | 20M | 3,078,773 | 2,803,814 – 3,360,304 | 0.478 | 71.0 MiB | 6.50 s |
+| `route` (added later; quiet run at `506e4ca`, see below) | 20M | 3,747,289 | 3,600,158 – 3,956,587 | 0.668 | 82.3 MiB | 5.34 s |
 
 A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures:
 
-- **`passthrough`** (0.478 µs/event) is the runtime floor every other scenario is read relative to:
-  scheduling, the `Fanout` channel hop, layer-2 telemetry, no parsing or encoding.
-- **`fanout`**'s count was retuned 25M → 55M during the 2026-09-13 solo run (this table already
-  reflects that retuned count — see `docs/plans/load-test-harness.md`'s scenario table for the full
-  history). At this count its CPU cost per event (0.466 µs) lands close to `passthrough`'s own
-  (0.478 µs) despite doing strictly *more* work per event (three sends instead of one) — consistent
-  with `memory.md`'s own finding that an all-`Output` fan-out is a strict win (0/1 allocations), so
-  three sends costs barely more than one here.
+- **`passthrough`** (0.478 µs/event; 0.404 on the same quiet-battery setup at `7ead7a4`, after #189
+  stopped resolving symbols in `estimated_heap_bytes` — see the `fanout` bullet) is the runtime
+  floor every other scenario is read relative to: scheduling, the `Fanout` channel hop, layer-2
+  telemetry, no parsing or encoding. **Most of that
+  floor is the generator, not the runtime.** A 2026-09-14 `attribute` pass on `passthrough` (after
+  #189, busy box) had `gen` blocked in `Fanout::send` for only 0.36 s of a ~9.3 s run and the
+  sink's queue never above 5% of its 1024-batch bound — `null_out` keeps up and `generate_in`'s
+  own render loop sets the pace. The matching flamegraph splits the same way: the `generate_in`
+  task is ~30% of samples (`render_one` ~14%, the six sorted `AttrMap::insert_sym`s ~3.4%, the
+  two templated `Bytes::copy_from_slice`s ~1%); the whole sink task is ~17.5%, and of that ~11.3%
+  is dropping the batch after delivery (freeing 200 `Bytes` + the `Vec<Event>` per 100-event
+  batch — the cost of owning the data, not of the channel) and ~3.6% is `estimated_heap_bytes`
+  at `SinkQueue` admission. Everything else on the single-consumer path — the `mpsc` hop, the
+  one `Arc::new` in `drain_inbox`, the queue's two lock/notify pairs, `deliver_with_retry`'s
+  timeout registration — is under 3% of samples combined. So a change to the delivery path can
+  move this number by a few percent at most; a cheaper generator would move it more.
+- **`fanout`** was re-shaped on 2026-09-14, after the run the rest of this table records, and its
+  row above is the one exception to the table's provenance: a separate quiet run (host idle, on
+  battery, same dev container and `rustc`) at `7ead7a4`, `--repeat 3`, after #189. Before the
+  re-shape it generated a one-attribute event (`host: web-{seq%20}`) at 55M, and this section read
+  its 0.466 µs landing under `passthrough`'s 0.478 µs as "three sends costs barely more than one".
+  That reading was wrong: the two scenarios generated different events, and `passthrough`'s six
+  attributes (two templated) cost the generator roughly 6× more per event than `fanout`'s one, which
+  is more than the two extra sinks cost. A 2×2 that crossed both topologies with both event
+  templates (same busy box, same invocation, `--repeat 3`, medians, CPU µs per *generated* event,
+  after #189) makes the actual relationship plain — one consumer is cheaper than three whichever
+  event shape is held fixed:
+
+  | CPU µs / generated event | one-attribute event | six-attribute event |
+  |---|---:|---:|
+  | 1 × `null_out` | 0.304 | 0.624 |
+  | 3 × `null_out` | 0.488 | 0.920 |
+
+  `fanout.yaml` now generates `passthrough.yaml`'s exact event at `passthrough`'s exact count
+  (20M), so the two differ only in consumer count — which is what the scenario was always meant to
+  isolate. Read `fanout` − `passthrough` as the marginal cost of two more sinks (per-edge `Arc`
+  clone plus one more `drain_inbox → SinkQueue → write_loop` hop each), and halve it for one. Note
+  that `cpu_us_per_event` divides by `generate_in.count` — *generated* events — for every
+  scenario; a fan-out scenario delivers `count × consumers` batch-events, so its per-delivery cost
+  is that much lower than the column shows. On the quiet `7ead7a4` run the two scenarios, same
+  event, same count, same invocation, came out at 0.404 (`passthrough`) and 0.572 (`fanout`) µs per
+  generated event — two extra sinks cost 0.168 µs, or ~0.08 µs per generated event per extra
+  consumer, which is the honest per-edge price of an `Arc` clone plus a `drain_inbox → SinkQueue →
+  write_loop` hop for a 100-event batch. Wall-clock throughput was essentially identical (3.27M vs
+  3.31M events/s), as it should be for a generator-bound graph: the extra sinks run on otherwise
+  idle workers. `passthrough`'s own 0.404 here against 0.478 in the row above is #189's saving on
+  this path (six fewer interner resolves per event at queue admission), not run-to-run noise —
+  the two are different commits.
+- **`route`** was added on 2026-09-14 after the rest of this table, so its row is the other
+  exception to the table's provenance: a quiet run (host idle, on battery, `--repeat 3`) at
+  `506e4ca`, with `passthrough` re-run in the same invocation as the control (3,252,961 events/s,
+  0.394 µs/event, 37.6 MiB — consistent with the `7ead7a4` number above). Same six-attribute
+  event and count as `passthrough`/`fanout`, through a `route` keyed on `host` (ten values: nine
+  routed three-per-target onto three `target`s, one left unrouted onto the router's own
+  `null_out`), so every 100-event batch is split into four ~25-event batches and every event is
+  delivered exactly once — the same data volume as `passthrough`, one hop longer.
+  **0.668 vs 0.394 µs per generated event: the router topology costs 0.274 µs on top of
+  `passthrough`, and about three-quarters of that is the router itself.** `attribute --scenario
+  route` puts `split`'s `process s` at 4.11 s over 20M events — 0.206 µs/event inside `route_batch`
+  (one `AttrMap::get_sym` plus a linear scan of nine byte-string alternatives per event, then the
+  count/reserve/move passes, `crates/logit-pipeline/src/runtime.rs`), at 5 allocations per batch
+  as `docs/adr/target-components.md` pins. The remaining ~0.07 µs is three more sink-side hops
+  (`drain_inbox → SinkQueue → write_loop`) on quarter-size batches, where the fixed per-batch
+  cost is amortized over 25 events instead of 100; `sys_s` also rises from 0.09 s to 0.94 s
+  (more tasks parking and waking), the same shape `fanout` shows. Read against `fanout`
+  (0.572 µs, every event delivered three times): routing a stream once costs more CPU than
+  fan-out delivering it three times, because `fanout`'s extra work is refcount bumps and
+  `null_out`'s empty `send`, while `route` does real per-event work. Wall throughput
+  (3.75M events/s) is in the same band as `passthrough`'s, and `gen` was blocked in send only
+  0.30 s of the run — still generator-bound, with the router on its own task. **The 82 MiB peak
+  RSS against `passthrough`'s 38 MiB is jemalloc retention, not buffered events.** The live-data
+  bound is small: the router's 64-slot inbox holds at most 64 × 100 events × 864 B ≈ 5.5 MiB, the
+  four sink inboxes another ≈ 5.5 MiB between them, and `attribute` showed every sink queue
+  essentially empty (`buf max` 0.00). Under immediate purge (the "Peak RSS" sub-section below)
+  `route` is 24 MiB to `passthrough`'s 17.5 — that 6 MiB *is* the extra in-flight data. `route`
+  retains more than any other scenario because it churns more page-sized allocations: every
+  batch's 86 KiB `Vec<Event>` is freed by the router after its events are moved into four fresh
+  `reserve_exact` vectors, which four sink tasks then free on whichever worker threads they happen
+  to run on, so dirty pages pile up across more arenas before decay purges them.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
@@ -164,6 +238,52 @@ per-scenario threshold so a flush-tick scenario can carry a wider band than `pas
 Raising `--repeat` specifically for flush-tick scenarios, so the reported median is less exposed to
 any one repeat's tick alignment, is a third, cheaper option worth trying before either.
 `docs/known-gaps.md`'s harness entry carries the same recommendation.
+
+### Peak RSS: what is live data and what is jemalloc retention
+
+`logit` runs on jemalloc (ADR `jemalloc-global-allocator`), which returns freed pages to the kernel
+on a decay schedule (`dirty_decay_ms` = 10 s by default) rather than at `free`. A scenario that
+runs for 5–10 s therefore reports a peak RSS that includes most of what it freed along the way,
+not just what it held at its high-water mark. To separate the two, the whole suite was run twice
+at `a9c00c1` (host idle, on battery, `--repeat 3`, release): once as-is, once with
+`_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`, which purges at `free` and makes peak RSS
+a close proxy for peak live data. Medians:
+
+| Scenario | Peak RSS, default decay | Peak RSS, immediate purge | Reading |
+|---|---:|---:|---|
+| `aggregate` | 47.1 MiB | 24.1 MiB | 1000 live `SeriesKey`s + window state |
+| `buffered` | 25.7 MiB | 18.3 MiB | disk spool; little in memory |
+| `encode-human-devnull` | 181.7 MiB | 85.0 MiB | **sink queue full** (see below) |
+| `encode-native-devnull` | 211.5 MiB | 84.9 MiB | **sink queue full** |
+| `fanout` | 12.3 MiB | 14.5 MiB | nothing retained: one shared batch, freed once |
+| `json-parse` | 39.9 MiB | 22.8 MiB | post-#187/#189, nothing backs up |
+| `lua` | 27.8 MiB | 19.4 MiB | |
+| `native-relay` | 136.7 MiB | 86.5 MiB | **`logit_out`'s sink queue full** (ack-bound) |
+| `passthrough` | 37.2 MiB | 17.5 MiB | one 64-slot inbox ≈ 5.5 MiB + baseline |
+| `route` | 80.6 MiB | 24.4 MiB | five 64-slot inboxes ≈ 11 MiB + baseline |
+
+Two things fall out:
+
+- **Where the sink is slower than the generator, RSS really is queue depth**, and it is the
+  sink queue's default `buffer.max_bytes` of 64 MiB that sets it: a 100-event batch of this
+  shape weighs ~87 KiB by `estimated_heap_bytes`, so the byte bound trips at ~770 batches, well
+  before the 1024-batch bound; add the 64-slot inbox and the process baseline and you get the
+  ~85 MiB the three sink-bound scenarios (`encode-*`, `native-relay`) all converge on under
+  immediate purge. Their default-decay numbers are that plus what jemalloc hadn't returned yet.
+  So the "in-flight buffering at default `buffer:` is large" observation stands for those, and the
+  bound doing it is `max_bytes`, not `max_batches` or the channels.
+- **Where the sink keeps up, RSS is mostly retention.** `passthrough`, `route`, `aggregate`,
+  `json-parse` and `lua` all drop by half or more under immediate purge, down to a number that
+  matches their in-flight channel data plus process baseline. `route` is the extreme case
+  (80 → 24 MiB) because it churns more page-sized allocations per batch than anything else
+  (its own reading above); `fanout` the opposite (no re-allocation between generator and sinks,
+  the shared batch freed exactly once).
+
+The immediate-purge run's CPU numbers are *not* comparable to anything else in this document —
+purging at `free` costs an `madvise` per page-sized free and roughly doubled CPU µs/event for the
+churn-heavy scenarios (`route` 0.645 → 1.239, `aggregate` 0.273 → 0.599). It is a diagnostic
+setting for reading RSS, not a configuration to run with. When a peak-RSS number looks
+surprising, re-run that one scenario with decay 0 before concluding anything about queue bounds.
 
 ## 2. Attribution: where a scenario's time actually goes
 

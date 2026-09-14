@@ -76,11 +76,12 @@ Lua a scenario needs — validated the same way every other example config is.
 | `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 7M | ~0.78M/s |
 | `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~2.8-3.6M/s |
 | `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.48-0.50M/s |
-| `fanout` | `generate_in` → 3 × `null_out` | `Arc`-based fan-out to multiple sinks | 55M | ~5.7-6.2M/s |
+| `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 20M | ~3.3M/s |
 | `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.79-1.37M/s |
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~0.83-1.24M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.16M/s (median; see note) |
+| `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 20M | ~3.7M/s |
 
 Counts target roughly 5-10 seconds of wall time each on the dev box; tuned against a first real
 `script/perf run --repeat 1 --profile release` pass per scenario, as recorded in this table, rather
@@ -101,6 +102,18 @@ expect its wall time to vary more than every other scenario's when re-run.
 ([`docs/design/performance.md`](../design/performance.md)) showed it clearing 25M events in ~3.2s
 — comfortably under this table's target band once nothing else was loading the machine at the same
 time. Every other scenario's original count held up under that same solo run.
+
+`route` was added on 2026-09-14 (after the target/route stack, #155–#181, landed) as the one
+scenario exercising a router and `target`s; its numbers are in `performance.md` §1.
+
+`fanout` was then re-shaped on 2026-09-14 to generate `passthrough`'s exact six-attribute event
+at `passthrough`'s exact count (20M), rather than its original one-attribute event at 55M. The
+original shape made `fanout` look cheaper per event than `passthrough` (0.466 vs 0.478 µs on the
+quiet run), which was read as the delivery path being cheap — it was actually a 6× lighter
+generator. Holding the event shape fixed, one consumer is cheaper than three in both directions
+(`performance.md` §1). The two scenarios now differ only in consumer count, which is what the
+scenario was always meant to isolate; on a quiet box it clears 20M in ~6.0s, inside the target
+band without a further retune.
 
 ## Verification
 
@@ -142,7 +155,7 @@ W0-W7 have all landed (PR numbers on each row above); the harness the ADR decide
 runnable by hand, and now carries one real recorded run
 ([`docs/design/performance.md`](../design/performance.md)) rather than only a design.
 
-- **The measurement gap `memory.md` §7 named is closed.** All nine scenarios in the table above
+- **The measurement gap `memory.md` §7 named is closed.** All ten scenarios in the table above
   exist, run in the 5-10s-per-scenario range this plan targeted (`docs/design/performance.md`'s
   results table), and `script/perf run --repeat 3` produces exact-equality-free but real,
   repeatable events/s, CPU µs/event, and peak RSS numbers for a real release-profile `logit run`
