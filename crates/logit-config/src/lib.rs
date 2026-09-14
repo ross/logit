@@ -363,8 +363,55 @@ fn default_span_sample_rate() -> f64 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
-    /// statsd / DogStatsD-style tagged metrics over UDP.
-    StatsdIn { bind: String },
+    /// statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.
+    ///
+    /// Under `transport: tcp` a message is one **LF-delimited line, always** -- there is no
+    /// `framing:` field and no octet-counted alternative the way `syslog_in` has: a statsd line
+    /// may legally begin with an ASCII digit (`1.hits:1|c`), so sniffing a leading digit as a
+    /// length prefix could only ever mis-frame. A line longer than 64 KiB is dropped and counted
+    /// (`logit.input.frames.dropped{reason="oversize"}`); the connection stays open and the line
+    /// after it still decodes. There is deliberately no `max_line_bytes` knob -- no statsd server
+    /// exposes one for an operator to match.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
+    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
+    /// block. Plain statsd clients have no TLS of their own -- this is for a `logit`-to-`logit`
+    /// or stunnel-shaped relay hop, the `statsd_in`/`statsd_out` pair included.
+    ///
+    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
+    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
+    /// apply, scoped **per connection**: N live connections can hold up to N times
+    /// `batch_max_events` in flight, not one shared bound.
+    StatsdIn {
+        bind: String,
+        #[serde(default)]
+        transport: StatsdTransport,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
+        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
+        /// See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
+        /// udp`, where a datagram listener has no connection to time out). How long one
+        /// connection has, **per pre-message phase**, to get somewhere before this listener
+        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
+        /// set, and then the wait for the connection's very first byte. Each phase gets its own
+        /// budget of this length, so a TLS connection that says nothing at all costs up to two
+        /// of them -- 10s at the default.
+        ///
+        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
+        /// on the gap before the next line -- a long-lived, mostly-quiet statsd client is
+        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
+        /// holds its permit indefinitely; that is a known, deliberately separate gap
+        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+    },
     /// collectd's binary "`network` plugin" protocol over UDP
     /// (`docs/adr/collectd-binary-relay.md`; `crates/logit-inputs/src/collectd.rs` is the
     /// listener, `crates/logit-proto/src/collectd/` the codec).
@@ -1881,11 +1928,15 @@ pub struct SyslogStructuredData {
     pub sd_id: String,
 }
 
-/// `statsd_out`'s transport. UDP (the default) matches classic statsd and DogStatsD clients;
-/// TCP is what makes `Fault` classification meaningful for this sink, same as `SyslogTransport`.
-/// Deliberately its own enum rather than reusing `SyslogTransport`: schemars publishes a type's
-/// own name into the schema's `$defs`, so sharing one would make `statsd_out` document its
-/// transport by pointing at a syslog-named type.
+/// `statsd_in`'s and `statsd_out`'s transport. UDP (the default) matches classic statsd and
+/// DogStatsD clients; TCP is the reliable, framed one -- on the way out it is what makes `Fault`
+/// classification meaningful for the sink (same as `SyslogTransport`), and on the way in it is
+/// what a `tls:` block needs underneath it, since DTLS is out of scope. Both directions frame a
+/// TCP message the same way, as one LF-delimited line: there is no statsd equivalent of RFC
+/// 6587's octet counting to choose between. Deliberately its own enum rather than reusing
+/// `SyslogTransport`: schemars publishes a type's own name into the schema's `$defs`, so sharing
+/// one would make `statsd_in`/`statsd_out` document their transport by pointing at a syslog-named
+/// type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsdTransport {
@@ -4630,5 +4681,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(component.targets, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `statsd_in`'s three new fields all default, and all round-trip when set: the bare
+    /// `{"type": "statsd_in", "bind": ...}` shape every pre-TCP config in the wild already has
+    /// must keep deserializing unchanged (`component_with_no_sources_defaults_to_empty` above is
+    /// the other half of that pin), and a `transport: tcp` listener must be able to carry a
+    /// `tls:` block and a `handshake_timeout` (`docs/adr/syslog-tcp-ingress-and-tls.md`, whose
+    /// driver this listener now shares).
+    #[test]
+    fn statsd_in_round_trips_transport_tls_and_handshake_timeout() {
+        let bare: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
+        match bare.kind {
+            ComponentKind::StatsdIn { bind, transport, tls, handshake_timeout } => {
+                assert_eq!(bind, "0.0.0.0:8125");
+                assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+
+        let full: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"},
+                "handshake_timeout": "2s"}"#,
+        )
+        .unwrap();
+        match full.kind {
+            ComponentKind::StatsdIn { transport, tls: Some(tls), handshake_timeout, .. } => {
+                assert_eq!(transport, StatsdTransport::Tcp);
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected StatsdIn with tls set, got {other:?}"),
+        }
+
+        // `transport` alone must not imply TLS -- the same pin `syslog_in_with_transport_tcp_
+        // deserializes` makes.
+        let plaintext_tcp: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match plaintext_tcp.kind {
+            ComponentKind::StatsdIn { transport, tls, .. } => {
+                assert_eq!(transport, StatsdTransport::Tcp);
+                assert_eq!(tls, None);
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
     }
 }
