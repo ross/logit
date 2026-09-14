@@ -508,26 +508,31 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `graph::resolve` isn't the only possible caller.
 
 45. A `handshake_timeout` must be greater than `0s` on every kind that has one — `syslog_in`,
-    `logit_in`, `otlp_in` — and must be left at its default in the two places it could never take
-    effect: a `syslog_in` with `transport: udp`, and a plaintext `otlp_in` (no `tls:` block).
+    `logit_in`, `otlp_in` — and must be left at its default in the one place it could never take
+    effect: a `syslog_in` with `transport: udp`.
     `0s` is an impossible budget rather than a tight one: no TLS accept, first-byte read,
     or `Hello` read completes in zero time, so a listener configured with it would accept
     connections only to close each one immediately and would receive nothing at all — the same
     "0 is impossible, not just small" call rules 9/15/18/28 make for a flush interval, a queue
-    bound, and a poll interval. The two context checks are rule 43's reasoning applied to this
+    bound, and a poll interval. The context check is rule 43's reasoning applied to this
     field instead of `tls:`, in rule 33's "only means anything under X" shape: a UDP `syslog_in`
-    has no connection to hand shake, and a plaintext `otlp_in` has a connection but no phase this
-    field reaches — on that listener the budget bounds the TLS accept *alone* (hyper's own version
-    sniff, which follows it, is not wrapped; see `docs/known-gaps.md`'s plaintext-`otlp_in` row),
-    so with no `tls:` block it is inert. In both cases an operator who set a value meant it to take
-    effect, so set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
+    has no connection to hand shake at all, so an operator who set a value there meant it to take
+    effect and set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
     is rejected, so the field's own default stays legal everywhere and no pre-existing config
     becomes invalid; `graph.rs` imports `logit_config::default_handshake_timeout` to make that
     distinction rather than mirroring the number, and
-    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine`/
-    `a_plaintext_otlp_in_at_the_default_handshake_timeout_resolves_fine` both deserialize a real
-    config rather than constructing the variant, so they exercise the `serde` defaulting path this
+    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine` deserializes a real
+    config rather than constructing the variant, so it exercises the `serde` defaulting path this
     comparison has to agree with.
+
+    **A plaintext `otlp_in` was the second such case and no longer is.** That listener's budget
+    once bounded its TLS accept alone, so with no `tls:` block it was inert and a set value was
+    rejected. It now also bounds the wait for a plaintext connection's very first byte — a
+    `TcpStream::peek` under the same budget, which consumes nothing and so leaves hyper's own
+    version sniff untouched (`crates/logit-inputs/src/otlp.rs`, and
+    [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)'s 2026-09-14
+    amendment) — so the value is live with or without `tls:` and this rule no longer names
+    `otlp_in` in its context check at all, only in the `0s` one.
 
 46. A `graphite_in`'s and a `graphite_out`'s protocol/transport pair and size bounds
     ([ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)). `protocol: pickle` requires

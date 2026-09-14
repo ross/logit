@@ -1350,42 +1350,33 @@ already built that have a known, accepted rough edge.
     `TokioTimer`) rather than in a wrapper we would have to invent around it. Half-building the
     feature in our own accept loops for two listeners and in hyper's for the third is exactly the
     per-transport divergence an ADR should settle before any of it is written.
-- **A plaintext `otlp_in` has no pre-first-byte bound at all — a connection that sends zero bytes
-  holds a connection-cap permit indefinitely, and because that accept loop *blocks* rather than
-  rejecting, enough of them stop it draining the backlog.** The narrowed remainder of the closed
-  "`otlp_in`'s TLS accept has no timeout" row above, recorded 2026-09-13 when
-  `handshake_timeout:` landed: that field wraps `acceptor.accept` and nothing else, so with no
-  `tls:` block (the default shape) there is no phase for it to bound — which is why graph rule 45
-  rejects a non-default value on a plaintext `otlp_in` rather than implying one is doing something.
-  Each connection task then sits in `hyper_util::server::conn::auto::Builder`'s own `ReadVersion`,
-  an unbounded read of up to 24 bytes that decides HTTP/1.1 versus an h2 preface (verified against
-  the pinned hyper-util 0.1.20 / hyper 1.11.1 sources), and `hyper`'s own 30s HTTP/1
-  header-read default is inert here because no `Timer` is installed (`Time::check` logs "timeout
-  has default, but no timer set" and returns `None`; configuring one *without* a timer panics).
-  This is worse than the idle case above rather than a variant of it: `otlp_in`'s accept loop uses
-  a blocking `acquire_owned().await` instead of `logit_in`/`syslog_in`'s
-  `try_acquire_owned`-and-reject ([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)'s
-  "Connection limit"), so 1024 connections that complete the TCP handshake and send nothing — no
-  crypto, no bytes — stop the loop accepting anything further, where on the other two listeners
-  the 1025th peer at least gets an immediate refusal. Pre-existing behaviour, not introduced by
-  the `handshake_timeout` work; tracked here because that work retired the row that used to cover
-  it.
+- **An `otlp_in` connection that sends its *first* byte and then goes silent holds a
+  connection-cap permit indefinitely.** The narrowed remainder of the "a plaintext `otlp_in` has
+  no pre-first-byte bound" row, most of which closed on 2026-09-14
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)'s amendment).
+  What closed: the accept loop now uses `try_acquire_owned` and drops a past-the-cap connection
+  before any TLS accept, so silent connections can no longer stop it draining its backlog; and
+  `handshake_timeout:` now bounds a plaintext connection's wait for its very first byte, via a
+  `TcpStream::peek` (`MSG_PEEK`, which consumes nothing, so `hyper_util`'s own `ReadVersion`
+  sniff still reads a pristine stream and needs no rewind buffer). A connection that sends **zero**
+  bytes is therefore closed inside the budget on both arms now, and its permit comes back.
 
-  Two independent halves to closing it, and neither is the timeout knob:
-
-  - **The post-sniff header read** *can* be bounded with a pattern already in this tree:
-    `prometheus_out` installs `hyper_util::rt::TokioTimer` alongside
-    `header_read_timeout` on its own `http1::Builder`
-    (`crates/logit-outputs/src/prometheus.rs`, its "Two deadlines, not one" comment). The same two
-    lines on `otlp_in`'s `auto::Builder` would bound a client that sends a *partial* request head
-    — but not the zero-byte case, since `ReadVersion` resolves before any of that applies, and
-    not `protocol: grpc` at all (`http2::Builder` has no equivalent).
-  - **The zero-byte case** needs either a `try_acquire_owned`-and-close accept loop like
-    `logit_in`'s (so a silent connection can no longer starve the backlog even while it holds a
-    permit) or wrapping the version sniff itself — peeking the first byte under a deadline and
-    handing `hyper` a rewound stream, which is reimplementing `auto::Builder`'s own detection.
-    Either is a real change to how this listener accepts, which is why it is a row rather than a
-    follow-up commit.
+  What is left is everything past that first byte, on both transports: under `protocol: http` a
+  client that sends one byte of a request head and then stops, and under `protocol: grpc` one that
+  sends one byte of the HTTP/2 preface and then stops, are each inside `hyper`'s own read loop,
+  which this listener does not drive. **`hyper`'s `http1().header_read_timeout(..)` is deliberately
+  not the fix**, though `prometheus_out` installs exactly that pattern
+  (`crates/logit-outputs/src/prometheus.rs`, its "Two deadlines, not one" comment): in the pinned
+  hyper 1.11.1 (`src/proto/h1/conn.rs`) the timer is armed at the top of `poll_read_head`, before
+  any header byte has been parsed, and `State::idle` sets `notify_read = true` whenever it is
+  configured — "Next read will start and poll the header read timeout, so we can close the
+  connection if another header isn't received in a timely manner". It therefore re-arms across
+  every idle keep-alive gap, which makes it an idle timeout in disguise and would close a
+  long-interval OTLP exporter's pooled connection between exports. `protocol: grpc`
+  (`hyper::server::conn::http2::Builder`) has no equivalent knob at all. So this residual belongs
+  to the idle-connection-timeout row above and its dedicated effort, not to a second use of
+  `handshake_timeout:` — the cap (1024) still bounds the damage, and a peer must now spend a byte
+  per connection to reach it.
 - **A write-only TLS sink (`syslog_out`, and `logit_out` before its per-batch ack) cannot observe a
   peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
   `Finished` included, before it ever sees the client's certificate message — so a client-cert
