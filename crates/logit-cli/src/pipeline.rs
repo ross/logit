@@ -427,11 +427,15 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        OtlpIn { bind, protocol, tls, handshake_timeout } => {
+        OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout } => {
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_handshake_timeout(*handshake_timeout);
+                // `handshake_timeout` does double duty on this listener: the pre-request budget,
+                // and the grace an idle close gives `hyper` to shut down in -- so it is passed
+                // once and read twice inside `OtlpInput` (`docs/adr/idle-connection-timeout.md`).
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1813,6 +1817,7 @@ mod tests {
                     protocol,
                     tls: None,
                     handshake_timeout: Duration::from_secs(5),
+                    idle_timeout: None,
                 },
             };
             assert!(
@@ -2310,6 +2315,7 @@ mod tests {
                     client_ca_file: None,
                 }),
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
             },
         };
         assert!(matches!(
@@ -2570,23 +2576,25 @@ mod tests {
                     client_ca_file: None,
                 }),
                 handshake_timeout: Duration::from_millis(50),
+                idle_timeout: None,
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
         assert_closes_a_silent_connection(spec, &addr).await;
     }
 
-    // ---- `idle_timeout` reaches each of the three TCP listeners that honour it ------------------
+    // ---- `idle_timeout` reaches each TCP listener that honours it -------------------------------
     //
     // The same "assert something only the real call could produce" shape as the
     // `handshake_timeout` tests above, one phase later: a 50ms `idle_timeout`, a client that
-    // sends one complete frame and then goes quiet, and the server-side close it must produce.
-    // `handshake_timeout` is deliberately left at its 5s default in all three, so the close can
+    // says its piece and then goes quiet, and the server-side close it must produce.
+    // `handshake_timeout` is deliberately left at its 5s default in all of them, so the close can
     // only have come from the idle clock -- delete `.with_idle_timeout(..)` from a `build_spec`
     // arm and that test fails on its 1s read.
 
     /// Spawns a built `NodeSpec::Input`, sends `wire` (one complete frame for that listener's
-    /// protocol), then asserts the server closes the connection within a second of it going
+    /// protocol -- or, for `otlp_in`, just enough to clear its first-byte peek), then asserts the
+    /// server closes the connection within a second of it going
     /// quiet -- well inside a 5s `handshake_timeout` and well outside a 50ms `idle_timeout`.
     async fn assert_closes_a_quiet_connection(spec: NodeSpec, addr: &str, wire: &[u8]) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
@@ -2674,6 +2682,34 @@ mod tests {
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
         assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
+    }
+
+    /// `otlp_in`'s own arm, which reads the field off a different variant and hands it to a
+    /// different listener implementation. The "wire" here is a single byte rather than a complete
+    /// request: that is all `otlp_in`'s first-byte peek waits for, and this listener's idle clock
+    /// starts at the connection rather than at a frame -- so a connection that produced one byte
+    /// and nothing else is exactly the thing `idle_timeout` closes
+    /// (`docs/adr/idle-connection-timeout.md`'s request-completion narrowing). A complete request
+    /// would be answered, and a response is not a close.
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_an_otlp_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::OtlpIn {
+                bind: addr.clone(),
+                protocol: logit_config::OtlpProtocol::Http,
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: Some(Duration::from_millis(50)),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_quiet_connection(spec, &addr, b"P").await;
     }
 
     #[test]
