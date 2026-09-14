@@ -94,7 +94,10 @@ already built that have a known, accepted rough edge.
     indefinitely, which the cancel-by-drop shutdown mechanism ([ADR
     `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) depends on
     every listener eventually releasing. Not fixed here — `logit_in`'s design is the pattern to
-    follow when this is addressed.
+    follow when this is addressed. **Narrowed as of 2026-09-14:** a connection an operator-configured
+    `idle_timeout:` has already closed no longer holds anything open at shutdown time — this row
+    is now only about a connection still within its idle budget (or with none configured) when
+    shutdown begins.
   - ~~**`otlp_in`'s TLS accept has no timeout.**~~ — **closed as of 2026-09-13** for the TLS
     accept itself, which is all this row ever claimed. `crate::otlp::run`'s
     `acceptor.accept(stream)` is now wrapped in `tokio::time::timeout` against an
@@ -112,12 +115,11 @@ already built that have a known, accepted rough edge.
     also has a bound now (closed 2026-09-14, [ADR
     `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)'s amendment): a
     `TcpStream::peek` under this same `handshake_timeout` before the stream ever reaches `hyper`,
-    so a connection that sends zero bytes is closed on both arms within the budget. So a *TLS*
-    `otlp_in` connection that finishes its handshake and then says nothing still holds its permit
-    — the post-handshake idle case, in the idle-connection-timeout row below — and a *plaintext*
-    `otlp_in` connection that sends its one peeked byte and then says nothing does too, which is
-    its own row further down ("An `otlp_in` connection that sends its first byte and then goes
-    silent..."), not something this row covers.
+    so a connection that sends zero bytes is closed on both arms within the budget. What happens
+    to a *TLS* `otlp_in` connection that finishes its handshake and then says nothing, or a
+    *plaintext* one that sends its one peeked byte and then says nothing, is the
+    idle-connection-timeout row below's `idle_timeout:` field, opt-in and closed 2026-09-14 — not
+    something this row (a pre-message bound) ever covered.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -1288,75 +1290,44 @@ already built that have a known, accepted rough edge.
   `crates/logit-outputs/src/tls.rs`); left out of the initial TLS work on each to keep it small
   ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md),
   [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)).
-- **No idle-connection timeout on a TCP listener after a successful handshake (or, on plaintext,
-  after the first byte).** `syslog_in`, `logit_in`, `graphite_in`, and `statsd_in` (the last two
-  each `transport: tcp`; `syslog_in` too) bound every *pre*-message phase they have, and the
-  budget is operator-tunable on all four — `handshake_timeout:`, 5s by default, applied per phase
-  (the TLS accept, then the first-byte/`Hello` read). `otlp_in` is the exception and has its own
-  row, immediately below: on its TLS arm the budget reaches the TLS accept alone, nothing past
-  it; its plaintext arm now bounds only the first byte (a `TcpStream::peek`), not what follows.
-  What none of the five bounds is what happens *after*: a connection that completes its handshake
-  (or, on a plaintext listener, delivers at least one byte and then stops) goes silent forever and
-  holds its connection-cap permit indefinitely, right up to the cap itself (1024 on all five;
-  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s "Pre-handshake timeout"
-  section names this explicitly as a known gap `syslog_in` shares with `otlp_in`, not one it
-  introduces fresh). A slow-loris-shaped client can exhaust the cap with connections that will
-  never send another byte. Closing it means an idle-read timeout per connection, reset on every
-  frame/line/request actually read — no such timer exists on any of the five listeners today.
+- ~~**No idle-connection timeout on a TCP listener after a successful handshake (or, on plaintext,
+  after the first byte).**~~ — **closed 2026-09-14.** All five TCP-capable listener kinds
+  (`syslog_in`, `graphite_in`, `statsd_in` each `transport: tcp`, `logit_in`, `otlp_in`) now take
+  an opt-in `idle_timeout:` bounding exactly this gap — off by default, so nothing about the
+  three design questions this row used to pose was skirted: a connection blocked handing a batch
+  to a full downstream is never mistaken for a silent peer (the clock only runs while the listener
+  is actually waiting on the socket), `logit_in` measures idle from its last `Ack` written rather
+  than from bytes read (a peer waiting on a delayed ack is not idle), and `otlp_in` tracks idleness
+  at the service level (an in-flight counter, not an IO-level timer) rather than trying to wrap
+  hyper's own read loop. See [ADR `idle-connection-timeout`](adr/idle-connection-timeout.md) for
+  the full design and [`docs/deploying.md`'s "`idle_timeout` on a TCP
+  listener"](deploying.md#idle_timeout-on-a-tcp-listener) for the operator-facing account,
+  including the recommendation to enable it wherever consistent traffic is expected.
 
-  **Deliberately a separate effort with its own ADR, not a second use of `handshake_timeout`**
-  (recorded 2026-09-13, when that field landed and this was explicitly *not* built alongside it).
-  An idle timer is not the same shape as a pre-message one, and it raises three design questions a
-  knob can't answer:
+  **What is still open.** The client-side complement (`logit_out`/`syslog_out`/`statsd_out`/
+  `graphite_out` each probe a reused pooled connection before writing to it) closes the common
+  case but not the point-in-time race: a peer's FIN arriving *while* the sink is writing is still
+  today's `Fault::Ambiguous` on `logit_out`, and a silent, unclassified loss on the three plaintext
+  sinks, whose wire protocols give the sender no way to learn the write failed at all. And
+  `otlp_in`'s own idle clock resets on request *completion*, not on bytes — see the row below.
+- ~~**An `otlp_in` connection that sends its *first* byte and then goes silent holds a
+  connection-cap permit indefinitely.**~~ — **closed 2026-09-14** by the same `idle_timeout:` field
+  above: once set, a connection that produced one byte and nothing else is closed the same way any
+  other idle connection is (`graceful_shutdown()`, a bounded grace reusing `handshake_timeout`,
+  then drop). An idle-timed-out connection no longer holds the graph open past shutdown either —
+  see the `otlp_in`-can-hold-the-graph-open-past-shutdown row above, which this narrows but does
+  not close: a connection still *within* `idle_timeout` at shutdown time is untouched by this.
 
-  - **It must not fire on a connection that is silent because of *this* process's own
-    backpressure.** A connection task blocked in `Fanout::send` — waiting on a full downstream
-    channel, which is exactly the backpressure a stream transport is supposed to apply — stops
-    reading its socket, so to a naive idle timer it looks identical to a slow-loris peer. Killing
-    it would turn a downstream stall into dropped connections and lost data, the opposite of what
-    the no-receive-queue design
-    ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) is for. The timer has
-    to distinguish "the peer sent nothing" from "we haven't read yet."
-  - **`logit_in`'s per-batch ack semantics.** A `logit_out` peer legitimately waits for an `Ack`
-    before sending its next frame
-    ([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)), and
-    that ack is deliberately delayed by a slow downstream. On that listener an idle gap is not
-    merely tolerable, it is a protocol state — and whether "idle" should be measured from the last
-    frame read, the last ack written, or something else is a wire-protocol question, not a timer
-    detail.
-  - **`otlp_in` is hyper-driven.** Its connections' read loop belongs to
-    `hyper_util::server::conn::auto::Builder`, not to any loop in this codebase, so its idle
-    handling belongs in that builder's own configuration (keep-alive/idle settings, with a
-    `TokioTimer`) rather than in a wrapper we would have to invent around it. Half-building the
-    feature in our own accept loops for two listeners and in hyper's for the third is exactly the
-    per-transport divergence an ADR should settle before any of it is written.
-- **An `otlp_in` connection that sends its *first* byte and then goes silent holds a
-  connection-cap permit indefinitely.** The narrowed remainder of the "a plaintext `otlp_in` has
-  no pre-first-byte bound" row, most of which closed on 2026-09-14
-  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)'s amendment).
-  What closed: the accept loop now uses `try_acquire_owned` and drops a past-the-cap connection
-  before any TLS accept, so silent connections can no longer stop it draining its backlog; and
-  `handshake_timeout:` now bounds a plaintext connection's wait for its very first byte, via a
-  `TcpStream::peek` (`MSG_PEEK`, which consumes nothing, so `hyper_util`'s own `ReadVersion`
-  sniff still reads a pristine stream and needs no rewind buffer). A connection that sends **zero**
-  bytes is therefore closed inside the budget on both arms now, and its permit comes back.
-
-  What is left is everything past that first byte, on both transports: under `protocol: http` a
-  client that sends one byte of a request head and then stops, and under `protocol: grpc` one that
-  sends one byte of the HTTP/2 preface and then stops, are each inside `hyper`'s own read loop,
-  which this listener does not drive. **`hyper`'s `http1().header_read_timeout(..)` is deliberately
-  not the fix**, though `prometheus_out` installs exactly that pattern
-  (`crates/logit-outputs/src/prometheus.rs`, its "Two deadlines, not one" comment): in the pinned
-  hyper 1.11.1 (`src/proto/h1/conn.rs`) the timer is armed at the top of `poll_read_head`, before
-  any header byte has been parsed, and `State::idle` sets `notify_read = true` whenever it is
-  configured — "Next read will start and poll the header read timeout, so we can close the
-  connection if another header isn't received in a timely manner". It therefore re-arms across
-  every idle keep-alive gap, which makes it an idle timeout in disguise and would close a
-  long-interval OTLP exporter's pooled connection between exports. `protocol: grpc`
-  (`hyper::server::conn::http2::Builder`) has no equivalent knob at all. So this residual belongs
-  to the idle-connection-timeout row above and its dedicated effort, not to a second use of
-  `handshake_timeout:` — the cap (1024) still bounds the damage, and a peer must now spend a byte
-  per connection to reach it.
+  **What is still open: the reset-on-request-completion narrowing.** `hyper` owns this listener's
+  bytes, so the finest grain `idle_timeout` can see is a request starting and finishing, not
+  individual bytes read. A request head that dribbles in more slowly than `idle_timeout` on an
+  otherwise-quiet keep-alive connection is therefore still closed — a documented cost, not a bug,
+  and distinct from the case this row used to track. A narrower edge case sits inside the grace
+  window itself: a request whose head arrives right at the idle deadline can start being served
+  during the bounded grace (`graceful_shutdown` then poll for up to `handshake_timeout`), and if
+  its handler outlives that grace the connection is dropped before the response is written. The
+  events themselves already reached the `Fanout` before the drop, so the cost is a client retry
+  (and a possible duplicate under the exporter's own retry policy), not lost data.
 - **A write-only TLS sink (`syslog_out`, and `logit_out` before its per-batch ack) cannot observe a
   peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
   `Finished` included, before it ever sees the client's certificate message — so a client-cert
