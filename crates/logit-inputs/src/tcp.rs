@@ -1,13 +1,21 @@
 //! The shared TCP (optionally TLS) listener driver: an accept loop, one connection task per
-//! peer, RFC 6587 framing, and frame->batch assembly -- the stream-transport twin of
+//! peer, framing, and frame->batch assembly -- the stream-transport twin of
 //! [`crate::udp::UdpListener`] (`docs/adr/decoupled-listener-io.md`).
 //!
-//! **Why a generic driver rather than a `syslog_in`-shaped accept loop.** `syslog_in` over TCP is
+//! **Why a generic driver rather than a `syslog_in`-shaped accept loop.** `syslog_in` over TCP was
 //! the first caller (`docs/plans/syslog-tls.md`), but nothing below mentions syslog: the same
 //! accept loop, connection cap, TLS termination and batching apply unchanged to any
-//! newline-or-length-framed stream protocol, `statsd_in` included. Generic over the decoder for
-//! exactly the reason [`crate::udp::UdpListener`] is -- that is the only thing two such listeners
-//! ever differ in.
+//! newline-or-length-framed stream protocol. `graphite_in` is the second caller
+//! (`docs/adr/graphite-carbon-relay.md`'s amendment), `statsd_in` the next. Generic over the
+//! decoder for exactly the reason [`crate::udp::UdpListener`] is -- that is the only thing two
+//! such listeners ever differ in.
+//!
+//! **Framing is chosen per listener, not guessed per driver.** [`FramingMode`] is set once, at
+//! construction, through [`TcpListener::with_framing`]: RFC 6587's auto-detecting pair for
+//! `syslog_in`, LF-delimited lines for a line protocol whose messages may legitimately *start*
+//! with a digit (`graphite_in` plaintext, `statsd_in`), or carbon's 4-byte big-endian length
+//! prefix. A builder rather than a [`TcpListenerConfig`] field: that struct is the image of the
+//! `receive:` config block, and framing is not something an operator sets.
 //!
 //! **`D: Clone` is load-bearing.** Every connection gets its own decoder clone, because a decoder
 //! may hold real per-connection state (a future decoder's scratch buffers or sticky identity, the
@@ -50,16 +58,23 @@
 //! **The first-byte bound applies on both arms, plaintext included.** It has to: `syslog_in` with
 //! no `tls:` block is the default shape, and without it 1024 connections that complete the TCP
 //! handshake and then send nothing would hold every permit forever, at a cost to the peer of 1024
-//! SYNs and no bytes. The bound is on the *first* byte specifically -- i.e. until [`Framer`] has
-//! latched a [`Framing`] -- because that is the phase with no legitimate reason to be slow; after
-//! it there is deliberately *no* idle timeout, so a connection that sent one frame and then went
-//! quiet holds its permit indefinitely, the same known gap `otlp_in` has
+//! SYNs and no bytes. The bound is on the *first* byte specifically -- i.e. until
+//! [`Framer::first_byte_seen`] is true -- because that is the phase with no legitimate reason to
+//! be slow; after it there is deliberately *no* idle timeout, so a connection that sent one frame
+//! and then went quiet holds its permit indefinitely, the same known gap `otlp_in` has
 //! (`docs/known-gaps.md`).
+//!
+//! `first_byte_seen`, and not "has the framer latched a [`Framing`] yet": only
+//! [`FramingMode::Rfc6587Auto`] has anything to latch, so under either explicit mode a
+//! latch-shaped predicate would read "already framed" on a connection that has not sent a byte,
+//! and the deadline would silently never fire. `the_first_byte_deadline_applies_under_every_
+//! framing_mode` is the pin.
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
+use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
 use logit_proto::Decoder;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -90,9 +105,13 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// mirrors this number by hand (it cannot depend on this crate).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The largest single frame this driver will assemble, in bytes, for either framing.
+/// The largest single frame this driver will assemble, in bytes, for any framing -- the
+/// **default** behind [`TcpListener::with_framing`]'s second argument, and what a listener that
+/// never calls it gets.
 ///
-/// Not configurable, deliberately. It is *not* `syslog_out`'s `max_message_bytes` (8192): that is a
+/// Not configurable on `syslog_in`, deliberately (`graphite_in` overrides it with its own
+/// operator-facing `max_line_bytes`/`max_frame_bytes`, which carbon's own receivers expose and
+/// whose pickle default is a megabyte). It is *not* `syslog_out`'s `max_message_bytes` (8192): that is a
 /// sender-side knob an operator may legitimately raise, and a receiver whose ceiling tracked it
 /// would have to be re-tuned in lockstep with every sender on the network. 64 KiB instead, which
 /// is where the UDP driver's own 65507-byte read buffer already puts the practical per-message
@@ -107,12 +126,50 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 
 // ---- framing ---------------------------------------------------------------------------------
 
-/// Which of RFC 6587's two framings a connection is speaking.
+/// How a [`Framer`] delimits one connection's messages. Chosen once per listener, through
+/// [`TcpListener::with_framing`], and never re-evaluated.
 ///
-/// Latched from the very first byte a connection sends and never re-evaluated
-/// (`docs/adr/syslog-tcp-ingress-and-tls.md`): an ASCII digit can only begin an octet count, since
-/// a non-transparent syslog frame always begins `<` (the PRI's opening angle bracket). Anything
-/// else is non-transparent.
+/// Explicit rather than "always sniff the first byte" because the sniff is only sound for syslog:
+/// it reads a leading ASCII digit as an RFC 6587 octet count, which is right for a protocol whose
+/// every non-transparent message starts `<`, and catastrophically wrong for one whose lines
+/// routinely start with a digit -- `1.hits:1|c` (statsd), or a carbon path beginning with a host
+/// number. A line protocol says so instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FramingMode {
+    /// RFC 6587's two framings, auto-detected from the connection's first byte and latched for its
+    /// life (`docs/adr/syslog-tcp-ingress-and-tls.md`). `syslog_in`'s mode, and nothing else's.
+    Rfc6587Auto,
+    /// LF-delimited lines only, never octet-counting, whatever the first byte is. `graphite_in`'s
+    /// plaintext mode; `statsd_in`'s.
+    Lines {
+        /// What a line past the frame bound does -- see [`Oversize`].
+        oversize: Oversize,
+    },
+    /// A 4-byte big-endian payload length, then that many bytes: Twisted's `Int32StringReceiver`,
+    /// which is how carbon frames a pickle batch (`crates/logit-proto/src/graphite/pickle.rs`).
+    LengthPrefixed,
+}
+
+/// What [`FramingMode::Lines`] does with a line past the frame bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Oversize {
+    /// Close the connection, as RFC 6587 framing does: a line past the ceiling can only get
+    /// longer, and under octet counting there is no resync point at all.
+    Fatal,
+    /// Skip that one line and resynchronize at the next `LF`, counting the skip **once**. Carbon's
+    /// own behaviour (`docs/adr/graphite-carbon-relay.md`), and the right call for a metrics line
+    /// protocol: one pathological datapoint must not cost a busy relay's whole connection, and an
+    /// LF-delimited stream has an unambiguous resync point that a length-framed one does not.
+    DrainToNextLine,
+}
+
+/// Which framing a connection is actually speaking, once known.
+///
+/// Under [`FramingMode::Rfc6587Auto`] this is latched from the very first byte a connection sends
+/// and never re-evaluated (`docs/adr/syslog-tcp-ingress-and-tls.md`): an ASCII digit can only
+/// begin an octet count, since a non-transparent syslog frame always begins `<` (the PRI's opening
+/// angle bracket). Anything else is non-transparent. Under either explicit mode it is fixed at
+/// construction and nothing is sniffed.
 ///
 /// Note the latch keys on "ASCII digit", not on `1`-`9`, even though RFC 6587 §3.4.1's `MSG-LEN =
 /// NONZERO-DIGIT *DIGIT` forbids a leading zero. A leading `0` is a malformed octet count, not a
@@ -124,8 +181,13 @@ pub enum Framing {
     /// RFC 6587 §3.4.1: `MSG-LEN SP MSG`, where `MSG-LEN` is the octet count of `MSG`. The only
     /// framing that can carry a message containing a newline.
     OctetCounting,
-    /// RFC 6587 §3.4.2: messages separated by a trailing `LF` (a `CR` before it is stripped).
+    /// RFC 6587 §3.4.2: messages separated by a trailing `LF` (a `CR` before it is stripped). Also
+    /// what [`FramingMode::Lines`] speaks, from the first byte, with no octet-counting sibling to
+    /// be mistaken for.
     NonTransparent,
+    /// A 4-byte big-endian payload length, then that many payload bytes
+    /// ([`FramingMode::LengthPrefixed`]).
+    LengthPrefixed,
 }
 
 impl Framing {
@@ -133,39 +195,55 @@ impl Framing {
         match self {
             Framing::OctetCounting => "octet_counting",
             Framing::NonTransparent => "non_transparent",
+            Framing::LengthPrefixed => "length_prefixed",
         }
     }
 }
 
-/// Why [`Framer`] could not produce the next frame. Every variant is fatal *to the connection*:
-/// neither framing can resynchronize after one (an octet count that cannot be trusted leaves no
-/// way to know where the next frame starts, and a line past the size ceiling would only get
-/// longer), so the driver counts it, diagnoses it, and closes.
+/// Why [`Framer`] could not produce the next frame. All but [`FrameError::OversizeSkipped`] are
+/// fatal *to the connection* ([`FrameError::is_fatal`]): neither RFC 6587 framing nor a
+/// length-prefixed one can resynchronize after one (an octet count that cannot be trusted leaves
+/// no way to know where the next frame starts, a declared length past the ceiling has nothing
+/// buffered after it, and a line past the size ceiling would only get longer), so the driver
+/// counts it, diagnoses it, and closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
-    /// A frame larger than [`MAX_FRAME_BYTES`] -- a declared octet count above it, or a
-    /// non-transparent line that passed it without a terminator.
+    /// A frame larger than this listener's frame bound -- a declared octet count or length prefix
+    /// above it, or a line that passed it without a terminator under [`Oversize::Fatal`].
     Oversize(String),
     /// An octet count that is not one RFC 6587 §3.4.1's `MSG-LEN = NONZERO-DIGIT *DIGIT`
     /// production permits: a non-digit before the SP, a leading zero (a zero count included), or
     /// more than nine digits.
     Malformed(String),
-    /// The peer closed mid-frame under octet counting, so a declared MSG never fully arrived.
-    /// Distinct from the two above in that nothing was wrong with what the peer *sent* -- it just
-    /// stopped -- and distinct from the non-transparent EOF case, where a terminator-less remainder
-    /// is a perfectly ordinary final message and is emitted rather than dropped.
+    /// The peer closed mid-frame under a framing whose declared length says bytes are missing
+    /// (octet counting, or a length prefix). Distinct from the two above in that nothing was wrong
+    /// with what the peer *sent* -- it just stopped -- and distinct from the LF-delimited EOF
+    /// case, where a terminator-less remainder is a perfectly ordinary final message and is
+    /// emitted rather than dropped.
     Truncated(String),
+    /// One line past the frame bound under [`Oversize::DrainToNextLine`]: dropped, counted, and
+    /// resynchronized at the next `LF`. The one **non-fatal** variant -- the connection stays open
+    /// and the line after it still decodes.
+    OversizeSkipped(String),
 }
 
 impl FrameError {
     /// The `reason` tag on `logit.input.frames.dropped`
-    /// (`docs/design/internal-telemetry.md`'s "Naming" section).
+    /// (`docs/design/internal-telemetry.md`'s "Naming" section). `OversizeSkipped` shares
+    /// `oversize` with its fatal sibling on purpose: an operator watching the counter cares that a
+    /// frame was too big, and `is_fatal` is what says whether the connection survived it.
     pub fn reason(&self) -> &'static str {
         match self {
-            FrameError::Oversize(_) => "oversize",
+            FrameError::Oversize(_) | FrameError::OversizeSkipped(_) => "oversize",
             FrameError::Malformed(_) => "malformed",
             FrameError::Truncated(_) => "truncated",
         }
+    }
+
+    /// Whether this error ends the connection. Only [`FrameError::OversizeSkipped`] does not:
+    /// every other variant leaves the framer with no trustworthy resync point.
+    pub fn is_fatal(&self) -> bool {
+        !matches!(self, FrameError::OversizeSkipped(_))
     }
 }
 
@@ -174,43 +252,81 @@ impl std::fmt::Display for FrameError {
         match self {
             FrameError::Oversize(detail)
             | FrameError::Malformed(detail)
-            | FrameError::Truncated(detail) => f.write_str(detail),
+            | FrameError::Truncated(detail)
+            | FrameError::OversizeSkipped(detail) => f.write_str(detail),
         }
     }
 }
 
 impl std::error::Error for FrameError {}
 
-/// RFC 6587 frame extraction over a byte stream -- pure, socket-free and synchronous, so it is
-/// directly unit-testable and a recorded interop fixture can be replayed through it byte for byte
+/// Frame extraction over a byte stream -- pure, socket-free and synchronous, so it is directly
+/// unit-testable and a recorded interop fixture can be replayed through it byte for byte
 /// (`docs/plans/recorded-interop-fixtures.md`) without standing anything up.
 ///
 /// Usage is `push` whatever came off the socket, then `next_frame` in a loop until it returns
 /// `Ok(None)`; at EOF, [`Framer::finish`] once for whatever partial frame is left.
 pub struct Framer {
-    /// `None` until the first byte arrives -- see [`Framing`]'s doc comment for the latch rule.
+    /// How this connection's messages are delimited -- fixed at construction.
+    mode: FramingMode,
+    /// The largest single frame this connection will assemble. Per listener, not a constant:
+    /// `syslog_in`/`statsd_in` take [`MAX_FRAME_BYTES`], a `graphite_in` takes its operator-facing
+    /// `max_line_bytes`/`max_frame_bytes`.
+    max_frame_bytes: usize,
+    /// `None` only under [`FramingMode::Rfc6587Auto`] before the first byte arrives -- see
+    /// [`Framing`]'s doc comment for the latch rule. Both explicit modes set it at construction.
     framing: Option<Framing>,
     buf: BytesMut,
-    /// How far into `buf` the non-transparent path has already looked for a `LF` without finding
-    /// one. Reset whenever a frame is taken. Without it, a long line arriving over many reads
-    /// would be rescanned from the start on every read -- O(n^2) in the line's own length.
+    /// How far into `buf` the line path has already looked for a `LF` without finding one. Reset
+    /// whenever a frame is taken. Without it, a long line arriving over many reads would be
+    /// rescanned from the start on every read -- O(n^2) in the line's own length.
     scanned: usize,
-}
-
-impl Default for Framer {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Set when a line passed the bound with no `LF` under [`Oversize::DrainToNextLine`]:
+    /// everything up to and including the next `LF` belongs to that abandoned line and is
+    /// discarded uncounted (the skip was counted once, when the bound was crossed).
+    draining: bool,
+    /// Whether this connection has ever produced a byte. The first-byte deadline's predicate
+    /// ([`Self::first_byte_seen`]) -- *not* `framing.is_none()`, which only ever means anything
+    /// under [`FramingMode::Rfc6587Auto`].
+    seen_bytes: bool,
 }
 
 impl Framer {
-    pub fn new() -> Self {
-        Self { framing: None, buf: BytesMut::with_capacity(READ_BUFFER_BYTES), scanned: 0 }
+    /// A framer speaking `mode`, refusing any single frame larger than `max_frame_bytes`.
+    ///
+    /// No `Default`: both arguments are real per-listener decisions (a `graphite_in` plaintext
+    /// connection bounds lines at `max_line_bytes` and drains past them; a `syslog_in` connection
+    /// bounds RFC 6587 frames at [`MAX_FRAME_BYTES`] and closes), and a default would silently
+    /// pick syslog's.
+    pub fn new(mode: FramingMode, max_frame_bytes: usize) -> Self {
+        let framing = match mode {
+            FramingMode::Rfc6587Auto => None,
+            FramingMode::Lines { .. } => Some(Framing::NonTransparent),
+            FramingMode::LengthPrefixed => Some(Framing::LengthPrefixed),
+        };
+        Self {
+            mode,
+            max_frame_bytes,
+            framing,
+            buf: BytesMut::with_capacity(READ_BUFFER_BYTES),
+            scanned: 0,
+            draining: false,
+            seen_bytes: false,
+        }
     }
 
-    /// The framing this connection latched, or `None` if it has not sent a byte yet.
+    /// The framing this connection is speaking, or `None` if it is an [`FramingMode::Rfc6587Auto`]
+    /// connection that has not sent a byte yet.
     pub fn framing(&self) -> Option<Framing> {
         self.framing
+    }
+
+    /// Whether this connection has ever produced a byte -- the first-byte deadline's predicate
+    /// (this module's "Pre-handshake timeout" doc section). Distinct from
+    /// `framing().is_some()`, which is true from construction under both explicit modes and so
+    /// would make that deadline inert on every listener but `syslog_in`.
+    pub fn first_byte_seen(&self) -> bool {
+        self.seen_bytes
     }
 
     /// Bytes held but not yet formed into a frame. Read by `report_buffered_tail` on the paths
@@ -220,10 +336,12 @@ impl Framer {
         self.buf.len()
     }
 
-    /// Appends whatever came off the socket. Latches [`Framing`] on the first byte ever pushed.
+    /// Appends whatever came off the socket. Under [`FramingMode::Rfc6587Auto`] only, latches
+    /// [`Framing`] on the first byte ever pushed.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
-        if self.framing.is_none() {
+        self.seen_bytes |= !bytes.is_empty();
+        if matches!(self.mode, FramingMode::Rfc6587Auto) && self.framing.is_none() {
             if let Some(&first) = self.buf.first() {
                 self.framing = Some(if first.is_ascii_digit() {
                     Framing::OctetCounting
@@ -246,6 +364,7 @@ impl Framer {
             match self.framing {
                 None => return Ok(None),
                 Some(Framing::OctetCounting) => return self.next_octet_counted(),
+                Some(Framing::LengthPrefixed) => return self.next_length_prefixed(),
                 Some(Framing::NonTransparent) => match self.next_line()? {
                     // An empty line carries no message. Senders emit them (a stray `LF` after a
                     // `CRLF`-terminated message, a keepalive newline), and RFC 6587 §3.4.2 has
@@ -258,9 +377,10 @@ impl Framer {
         }
     }
 
-    /// Whatever is left when the peer closes. Under non-transparent framing a terminator-less
-    /// remainder is an ordinary final message and is returned; under octet counting a partial MSG
-    /// is [`FrameError::Truncated`], since its declared length says bytes are missing.
+    /// Whatever is left when the peer closes. Under LF-delimited framing a terminator-less
+    /// remainder is an ordinary final message and is returned; under octet counting or a length
+    /// prefix a partial payload is [`FrameError::Truncated`], since its declared length says bytes
+    /// are missing.
     pub fn finish(&mut self) -> Result<Option<Bytes>, FrameError> {
         if self.buf.is_empty() {
             return Ok(None);
@@ -276,15 +396,38 @@ impl Framer {
                      buffered"
                 )))
             }
+            Some(Framing::LengthPrefixed) => {
+                let held = self.buf.len();
+                self.buf.clear();
+                self.scanned = 0;
+                Err(FrameError::Truncated(format!(
+                    "the peer closed with {held} byte(s) of an incomplete length-prefixed frame \
+                     buffered"
+                )))
+            }
             Some(Framing::NonTransparent) => {
-                if self.buf.len() > MAX_FRAME_BYTES {
+                // A drain in progress means these bytes are the tail of a line already counted
+                // as skipped -- delivering them would emit half a datapoint.
+                if self.draining {
+                    self.buf.clear();
+                    self.scanned = 0;
+                    return Ok(None);
+                }
+                let bound = self.max_frame_bytes;
+                if self.buf.len() > bound {
                     let held = self.buf.len();
                     self.buf.clear();
                     self.scanned = 0;
-                    return Err(FrameError::Oversize(format!(
-                        "the peer closed with a {held}-byte unterminated line buffered, over the \
-                         {MAX_FRAME_BYTES}-byte frame ceiling"
-                    )));
+                    return Err(match self.oversize_policy() {
+                        Oversize::Fatal => FrameError::Oversize(format!(
+                            "the peer closed with a {held}-byte unterminated line buffered, over \
+                             the {bound}-byte frame ceiling"
+                        )),
+                        Oversize::DrainToNextLine => FrameError::OversizeSkipped(format!(
+                            "the peer closed with a {held}-byte unterminated line buffered, over \
+                             the {bound}-byte frame ceiling; skipping it"
+                        )),
+                    });
                 }
                 let line = self.buf.split_to(self.buf.len()).freeze();
                 self.scanned = 0;
@@ -294,31 +437,113 @@ impl Framer {
         }
     }
 
-    /// RFC 6587 §3.4.2: everything up to the next `LF`, with at most one preceding `CR` removed.
+    /// What a line past [`Self::max_frame_bytes`] costs -- [`Oversize::Fatal`] everywhere but
+    /// [`FramingMode::Lines`], which says so for itself.
+    fn oversize_policy(&self) -> Oversize {
+        match self.mode {
+            FramingMode::Lines { oversize } => oversize,
+            FramingMode::Rfc6587Auto | FramingMode::LengthPrefixed => Oversize::Fatal,
+        }
+    }
+
+    /// RFC 6587 §3.4.2 (and [`FramingMode::Lines`]): everything up to the next `LF`, with at most
+    /// one preceding `CR` removed.
     fn next_line(&mut self) -> Result<Option<Bytes>, FrameError> {
+        // Finishing an abandoned line from a previous call, before anything else is looked at:
+        // every byte up to and including the next `LF` still belongs to it.
+        if self.draining {
+            match self.buf.iter().position(|&b| b == b'\n') {
+                Some(at) => {
+                    let _skipped = self.buf.split_to(at + 1);
+                    self.draining = false;
+                    self.scanned = 0;
+                }
+                None => {
+                    self.buf.clear();
+                    self.scanned = 0;
+                    return Ok(None);
+                }
+            }
+        }
+
+        let bound = self.max_frame_bytes;
         let found = self.buf[self.scanned..].iter().position(|&b| b == b'\n');
         let Some(offset) = found else {
             self.scanned = self.buf.len();
-            if self.buf.len() > MAX_FRAME_BYTES {
-                return Err(FrameError::Oversize(format!(
-                    "a non-transparent line reached {} bytes with no LF, over the \
-                     {MAX_FRAME_BYTES}-byte frame ceiling",
-                    self.buf.len()
-                )));
+            if self.buf.len() > bound {
+                let held = self.buf.len();
+                return Err(match self.oversize_policy() {
+                    Oversize::Fatal => FrameError::Oversize(format!(
+                        "a non-transparent line reached {held} bytes with no LF, over the \
+                         {bound}-byte frame ceiling"
+                    )),
+                    // Nothing after it has arrived, so there is no resync point *yet*: abandon
+                    // what is buffered and discard bytes until the `LF` that ends this line.
+                    Oversize::DrainToNextLine => {
+                        self.buf.clear();
+                        self.scanned = 0;
+                        self.draining = true;
+                        FrameError::OversizeSkipped(format!(
+                            "a line reached {held} bytes with no LF, over the {bound}-byte bound; \
+                             skipping it and draining to the next newline"
+                        ))
+                    }
+                });
             }
             return Ok(None);
         };
         let idx = self.scanned + offset;
-        if idx > MAX_FRAME_BYTES {
-            return Err(FrameError::Oversize(format!(
-                "a non-transparent line of {idx} bytes is over the {MAX_FRAME_BYTES}-byte frame \
-                 ceiling"
-            )));
+        if idx > bound {
+            return Err(match self.oversize_policy() {
+                Oversize::Fatal => FrameError::Oversize(format!(
+                    "a non-transparent line of {idx} bytes is over the {bound}-byte frame ceiling"
+                )),
+                // The terminator is already buffered, so this line's end is known: drop exactly
+                // it, and the next line is framed normally with no drain state at all.
+                Oversize::DrainToNextLine => {
+                    let _skipped = self.buf.split_to(idx + 1);
+                    self.scanned = 0;
+                    FrameError::OversizeSkipped(format!(
+                        "a line of {idx} bytes is over the {bound}-byte bound; skipping it"
+                    ))
+                }
+            });
         }
         let line = self.buf.split_to(idx).freeze();
         let _lf = self.buf.split_to(1);
         self.scanned = 0;
         Ok(Some(strip_cr(line)))
+    }
+
+    /// Twisted's `Int32StringReceiver`: a 4-byte **big-endian** payload length, then that many
+    /// payload bytes. The prefix is validated and stripped here, so the decoder is handed exactly
+    /// one already-unframed payload -- which is what `GraphiteDecoder`'s pickle path expects
+    /// (`logit_proto::graphite::decode`'s module doc: framing is the listener's job).
+    ///
+    /// A declared length past the bound is [`FrameError::Oversize`] and therefore fatal: nothing
+    /// after it has been read, so unlike an LF-delimited stream there is no resync point to skip
+    /// forward to. A short buffer is `Ok(None)` -- the rest of the frame has not arrived yet.
+    fn next_length_prefixed(&mut self) -> Result<Option<Bytes>, FrameError> {
+        if self.buf.len() < LENGTH_PREFIX_BYTES {
+            return Ok(None);
+        }
+        let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
+        prefix.copy_from_slice(&self.buf[..LENGTH_PREFIX_BYTES]);
+        let payload_len = u32::from_be_bytes(prefix) as usize;
+        if payload_len > self.max_frame_bytes {
+            return Err(FrameError::Oversize(format!(
+                "a length-prefixed frame declared {payload_len} bytes, over the {}-byte frame \
+                 ceiling; a length-framed stream has no resync point to skip forward to",
+                self.max_frame_bytes
+            )));
+        }
+        if self.buf.len() < LENGTH_PREFIX_BYTES + payload_len {
+            return Ok(None); // the rest of this frame hasn't arrived yet
+        }
+        let _prefix = self.buf.split_to(LENGTH_PREFIX_BYTES);
+        let payload = self.buf.split_to(payload_len).freeze();
+        self.scanned = 0;
+        Ok(Some(payload))
     }
 
     /// RFC 6587 §3.4.1: `MSG-LEN SP MSG`, where `MSG-LEN = NONZERO-DIGIT *DIGIT` -- so a leading
@@ -327,7 +552,8 @@ impl Framer {
     /// At most nine digits, rather than "as many as fit": [`MAX_FRAME_BYTES`] needs five, so nine
     /// is already far past any legitimate count, and an explicit ceiling is what turns "a peer
     /// that sent digits forever" from an unbounded buffer into a bounded, diagnosable
-    /// [`FrameError::Malformed`].
+    /// [`FrameError::Malformed`]. The size ceiling itself is this framer's own `max_frame_bytes`,
+    /// which is [`MAX_FRAME_BYTES`] on the one listener that speaks this framing.
     fn next_octet_counted(&mut self) -> Result<Option<Bytes>, FrameError> {
         const MAX_COUNT_DIGITS: usize = 9;
 
@@ -379,9 +605,10 @@ impl Framer {
             .expect("every byte was checked to be an ASCII digit")
             .parse()
             .expect("at most nine ASCII digits always fit a usize");
-        if len > MAX_FRAME_BYTES {
+        if len > self.max_frame_bytes {
             return Err(FrameError::Oversize(format!(
-                "an octet count of {len} is over the {MAX_FRAME_BYTES}-byte frame ceiling"
+                "an octet count of {len} is over the {}-byte frame ceiling",
+                self.max_frame_bytes
             )));
         }
 
@@ -440,15 +667,19 @@ impl Default for TcpListenerConfig {
     }
 }
 
-/// A TCP (optionally TLS) listener that turns each connection's RFC 6587 frame stream into
-/// batches of decoded events -- the stream twin of [`crate::udp::UdpListener`]. See this module's
-/// own doc comment for the accept/cap/handshake/batching contracts.
+/// A TCP (optionally TLS) listener that turns each connection's frame stream into batches of
+/// decoded events -- the stream twin of [`crate::udp::UdpListener`]. See this module's own doc
+/// comment for the accept/cap/handshake/framing/batching contracts.
 pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     bind: String,
     decoder: D,
     config: TcpListenerConfig,
     diag: Diagnostics,
     telemetry: Telemetry,
+    /// How every connection's messages are delimited, and the bound on one of them. See
+    /// [`Self::with_framing`]; [`FramingMode::Rfc6587Auto`] + [`MAX_FRAME_BYTES`] by default.
+    framing: FramingMode,
+    max_frame_bytes: usize,
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Set by [`Input::bind`], taken back out by [`Input::run_until_shutdown`] -- the same
     /// bind-pre-pass shape `otlp_in` uses (`docs/plans/operator-surface.md`, workstream B), rather
@@ -467,6 +698,8 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             config,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            framing: FramingMode::Rfc6587Auto,
+            max_frame_bytes: MAX_FRAME_BYTES,
             tls: None,
             listener: None,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
@@ -546,10 +779,33 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         &self.decoder
     }
 
+    /// How this listener's connections are framed, and the largest single frame any of them will
+    /// assemble. [`FramingMode::Rfc6587Auto`] with [`MAX_FRAME_BYTES`] when never called -- what
+    /// `syslog_in` wants, and the only shape that existed before `graphite_in` joined this driver.
+    ///
+    /// A builder rather than a [`TcpListenerConfig`] field: that struct is the image of the
+    /// `receive:` config block an operator writes, and framing is a property of the protocol, not
+    /// of the receive pipeline. See [`FramingMode`] for why it is explicit rather than always
+    /// sniffed.
+    pub fn with_framing(mut self, mode: FramingMode, max_frame_bytes: usize) -> Self {
+        self.set_framing(mode, max_frame_bytes);
+        self
+    }
+
+    /// [`Self::with_framing`] against an already-built listener, for a wrapper that has to defer
+    /// the decision until `bind()` -- `graphite_in` holds `max_line_bytes`/`max_frame_bytes` as
+    /// fields and applies them there, so its own builder methods can be called in any order
+    /// (`crates/logit-inputs/src/graphite/mod.rs`).
+    pub(crate) fn set_framing(&mut self, mode: FramingMode, max_frame_bytes: usize) {
+        self.framing = mode;
+        self.max_frame_bytes = max_frame_bytes;
+    }
+
     /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
     /// exercise the cap would be slow and flaky; this makes the cap reachable with two.
+    /// `pub(crate)` so a wrapper's own test module (`crate::graphite`'s) can expose it too.
     #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
+    pub(crate) fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
@@ -598,6 +854,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let config = self.config;
+        let framing = self.framing;
+        let max_frame_bytes = self.max_frame_bytes;
         // All three of this listener's diagnostic keys (`connection_error`, `framing_error`,
         // `bad_frame`) throttle listener-wide through the per-connection `Diagnostics` clone
         // below: a clone shares its original's counts -- see `logit_core::Diagnostics`' type doc.
@@ -636,6 +894,8 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                 // Held for exactly as long as this task runs -- a TLS accept that fails or times
                 // out gives the permit back here, which is the whole point of bounding it.
                 let _permit = permit;
+                // One framer per connection, built from this listener's one framing decision.
+                let framer = Framer::new(framing, max_frame_bytes);
                 live_connections.fetch_add(1, Ordering::Relaxed);
                 telemetry.gauge(
                     "logit.input.connections",
@@ -651,6 +911,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                                 serve_connection(
                                     tls_stream,
                                     decoder,
+                                    framer,
                                     config,
                                     handshake_timeout,
                                     sink,
@@ -673,6 +934,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                         serve_connection(
                             stream,
                             decoder,
+                            framer,
                             config,
                             handshake_timeout,
                             sink,
@@ -759,6 +1021,7 @@ async fn read_step<S: AsyncRead + Unpin + Send>(
 async fn serve_connection<S, D>(
     mut stream: S,
     mut decoder: D,
+    mut framer: Framer,
     config: TcpListenerConfig,
     handshake_timeout: Duration,
     sink: Fanout,
@@ -773,9 +1036,8 @@ where
     // Absolute, computed once, rather than a budget re-armed per read: the read below is re-entered
     // on every `batch_flush_interval` tick (the `Err(_elapsed) => continue` arm), so a per-read
     // budget would be reset by each 100ms tick and never actually fire. Only ever consulted while
-    // `framer` has not yet latched a `Framing`, i.e. before this connection's first byte.
+    // `framer` has not seen a byte, i.e. before this connection's first one.
     let first_byte_deadline = tokio::time::Instant::now() + handshake_timeout;
-    let mut framer = Framer::new();
     // Reused across every read, cleared (not replaced) between them, so its allocated capacity
     // survives from one read to the next.
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_BYTES);
@@ -822,7 +1084,11 @@ where
         // the first-byte deadline (once, fatal). Race whichever comes first, then decide which it
         // was -- `timeout_at`, not `timeout`, so the first-byte deadline stays absolute across
         // however many flush ticks elapse before it.
-        let awaiting_first_byte = framer.framing().is_none();
+        // `first_byte_seen`, never `framing().is_none()`: under an explicit `FramingMode` the
+        // framing is known from construction, so the latch-shaped predicate would read "already
+        // framed" here and this deadline would never fire at all (this module's "Pre-handshake
+        // timeout" doc section; `the_first_byte_deadline_applies_under_every_framing_mode`).
+        let awaiting_first_byte = !framer.first_byte_seen();
         let read_deadline = match (next_flush, awaiting_first_byte) {
             (Some(flush), true) => Some(flush.min(first_byte_deadline)),
             (Some(flush), false) => Some(flush),
@@ -925,10 +1191,18 @@ where
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    // Neither framing can resynchronize past one of these (see [`FrameError`]), so
-                    // this connection ends here -- diagnosed on its own key rather than bubbling
-                    // up as a `connection_error`, since the cause is the peer's framing, not I/O.
+                    // Diagnosed on its own key rather than bubbling up as a `connection_error`,
+                    // since the cause is the peer's framing, not I/O.
                     report_frame_error(&err, &telemetry, diag);
+                    // A non-fatal error (`FrameError::OversizeSkipped`) has already resynchronized
+                    // the framer -- it dropped one line and either consumed its terminator or
+                    // latched the drain state that will. Carrying on is the whole point of it: a
+                    // carbon relay must not lose a connection over one pathological datapoint.
+                    if !err.is_fatal() {
+                        continue;
+                    }
+                    // Nothing can resynchronize past the rest (see [`FrameError`]), so this
+                    // connection ends here.
                     if let Some(batch) = accumulator.take() {
                         emit(&sink, &telemetry, batch, FlushReason::Closed).await;
                     }
@@ -1058,9 +1332,13 @@ mod tests {
 
     #[test]
     fn the_first_byte_latches_the_framing_for_the_connection() {
-        assert_eq!(Framer::new().framing(), None, "nothing is latched before the first byte");
+        assert_eq!(
+            Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES).framing(),
+            None,
+            "nothing is latched before the first byte"
+        );
 
-        let mut counted = Framer::new();
+        let mut counted = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         counted.push(b"1");
         assert_eq!(counted.framing(), Some(Framing::OctetCounting));
         assert_eq!(counted.framing().unwrap().as_str(), "octet_counting");
@@ -1068,7 +1346,7 @@ mod tests {
         // A non-transparent syslog frame always starts `<` -- but anything that isn't an ASCII
         // digit latches this way, not just `<`.
         for first in [&b"<"[..], b" ", b"x", b"\n"] {
-            let mut lines = Framer::new();
+            let mut lines = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
             lines.push(first);
             assert_eq!(
                 lines.framing(),
@@ -1083,7 +1361,7 @@ mod tests {
     /// changes nothing.
     #[test]
     fn the_latched_framing_is_never_re_evaluated() {
-        let mut lines = Framer::new();
+        let mut lines = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(
             push_and_drain(&mut lines, b"<13>one\n12 not a count\n"),
             vec!["<13>one", "12 not a count"]
@@ -1094,7 +1372,7 @@ mod tests {
     #[test]
     fn a_frame_delivered_one_byte_per_push_is_assembled() {
         for wire in [&b"<13>hello\n"[..], &b"9 <13>hello"[..]] {
-            let mut framer = Framer::new();
+            let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
             let mut got = Vec::new();
             for byte in wire {
                 got.extend(push_and_drain(&mut framer, &[*byte]));
@@ -1112,24 +1390,24 @@ mod tests {
 
     #[test]
     fn a_frame_spanning_two_pushes_is_assembled() {
-        let mut lines = Framer::new();
+        let mut lines = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert!(push_and_drain(&mut lines, b"<13>hel").is_empty(), "no LF yet");
         assert_eq!(push_and_drain(&mut lines, b"lo\n"), vec!["<13>hello"]);
 
-        let mut counted = Framer::new();
+        let mut counted = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert!(push_and_drain(&mut counted, b"9 <13>he").is_empty(), "short of the declared 9");
         assert_eq!(push_and_drain(&mut counted, b"llo"), vec!["<13>hello"]);
     }
 
     #[test]
     fn several_frames_in_one_push_come_out_in_order() {
-        let mut lines = Framer::new();
+        let mut lines = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(
             push_and_drain(&mut lines, b"<13>one\n<13>two\n<13>three\n"),
             vec!["<13>one", "<13>two", "<13>three"]
         );
 
-        let mut counted = Framer::new();
+        let mut counted = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(
             push_and_drain(&mut counted, b"7 <13>one7 <13>two9 <13>three"),
             vec!["<13>one", "<13>two", "<13>three"]
@@ -1141,13 +1419,13 @@ mod tests {
     fn an_octet_counted_message_containing_a_newline_stays_one_frame() {
         let msg = "<13>first line\nsecond line\nthird";
         let wire = format!("{} {msg}", msg.len());
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(push_and_drain(&mut framer, wire.as_bytes()), vec![msg]);
     }
 
     #[test]
     fn one_trailing_cr_is_stripped_from_a_non_transparent_line() {
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(push_and_drain(&mut framer, b"<13>hello\r\n"), vec!["<13>hello"]);
         // Only one: a message genuinely ending in CR keeps it.
         assert_eq!(push_and_drain(&mut framer, b"<13>hello\r\r\n"), vec!["<13>hello\r"]);
@@ -1155,7 +1433,7 @@ mod tests {
 
     #[test]
     fn an_empty_non_transparent_line_is_skipped() {
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(push_and_drain(&mut framer, b"<13>a\n\n\r\n<13>b\n"), vec!["<13>a", "<13>b"]);
     }
 
@@ -1164,13 +1442,19 @@ mod tests {
         // Past the ceiling with no terminator in sight: the framer must not keep buffering in the
         // hope that one arrives.
         let unterminated = vec![b'<'; MAX_FRAME_BYTES + 1];
-        let err = push_and_expect_error(&mut Framer::new(), &unterminated);
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            &unterminated,
+        );
         assert_eq!(err.reason(), "oversize", "{err}");
 
         // And the same line *with* its terminator, which takes the other branch.
         let mut terminated = unterminated.clone();
         terminated.push(b'\n');
-        let err = push_and_expect_error(&mut Framer::new(), &terminated);
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            &terminated,
+        );
         assert_eq!(err.reason(), "oversize", "{err}");
 
         // Exactly at the ceiling is fine -- the bound is inclusive.
@@ -1179,19 +1463,29 @@ mod tests {
             line.push(b'\n');
             line
         };
-        assert_eq!(push_and_drain(&mut Framer::new(), &at_ceiling).len(), 1);
+        assert_eq!(
+            push_and_drain(
+                &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+                &at_ceiling
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]
     fn an_octet_count_over_the_ceiling_is_an_oversize_error() {
         let wire = format!("{} x", MAX_FRAME_BYTES + 1);
-        let err = push_and_expect_error(&mut Framer::new(), wire.as_bytes());
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            wire.as_bytes(),
+        );
         assert_eq!(err.reason(), "oversize", "{err}");
     }
 
     #[test]
     fn a_trailing_partial_line_at_eof_is_emitted_as_a_final_message() {
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert_eq!(push_and_drain(&mut framer, b"<13>a\n<13>no terminator"), vec!["<13>a"]);
         let last = framer.finish().expect("a terminator-less remainder is a message, not an error");
         assert_eq!(last.as_deref().map(String::from_utf8_lossy), Some("<13>no terminator".into()));
@@ -1200,7 +1494,7 @@ mod tests {
 
     #[test]
     fn a_trailing_partial_octet_counted_frame_at_eof_is_truncated() {
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         assert!(push_and_drain(&mut framer, b"9 <13>hel").is_empty());
         assert_eq!(framer.buffered(), 9);
         let err = framer.finish().expect_err("a short MSG under a declared count is truncated");
@@ -1210,19 +1504,28 @@ mod tests {
 
     #[test]
     fn a_non_digit_before_the_sp_is_malformed() {
-        let err = push_and_expect_error(&mut Framer::new(), b"12x <13>hello");
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            b"12x <13>hello",
+        );
         assert_eq!(err.reason(), "malformed", "{err}");
     }
 
     #[test]
     fn a_ten_digit_octet_count_is_malformed() {
-        let err = push_and_expect_error(&mut Framer::new(), b"1234567890 <13>hello");
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            b"1234567890 <13>hello",
+        );
         assert_eq!(err.reason(), "malformed", "{err}");
     }
 
     #[test]
     fn a_zero_octet_count_is_malformed() {
-        let err = push_and_expect_error(&mut Framer::new(), b"0 <13>hello");
+        let err = push_and_expect_error(
+            &mut Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES),
+            b"0 <13>hello",
+        );
         assert_eq!(err.reason(), "malformed", "{err}");
         assert!(err.to_string().contains("zero"), "{err}");
     }
@@ -1232,12 +1535,127 @@ mod tests {
     /// connection fails loudly here rather than being silently read as non-transparent.
     #[test]
     fn an_octet_count_with_a_leading_zero_is_malformed() {
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         framer.push(b"012 <13>hello");
         assert_eq!(framer.framing(), Some(Framing::OctetCounting));
         let err = framer.next_frame().expect_err("a padded count is malformed, not 12");
         assert_eq!(err.reason(), "malformed", "{err}");
         assert!(err.to_string().contains("leading zero"), "{err}");
+    }
+
+    // ---- framer: explicit framing modes --------------------------------------------------------
+
+    /// The reason [`FramingMode::Lines`] exists at all. `graphite_in`'s paths and `statsd_in`'s
+    /// metric names routinely begin with a digit (`1.hits:1|c`), which under
+    /// [`FramingMode::Rfc6587Auto`] is an RFC 6587 octet count -- so the sniff would reframe the
+    /// whole connection off one leading character. The contrast is asserted here rather than
+    /// assumed, because "the mode was wired through" is exactly the sort of thing a refactor
+    /// silently loses.
+    #[test]
+    fn a_line_only_framer_never_latches_octet_counting_on_a_leading_digit() {
+        let mut framer =
+            Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, MAX_FRAME_BYTES);
+        assert_eq!(
+            framer.framing(),
+            Some(Framing::NonTransparent),
+            "fixed at construction, with nothing to sniff"
+        );
+        assert!(!framer.first_byte_seen(), "and no byte has arrived yet");
+
+        assert_eq!(
+            push_and_drain(&mut framer, b"1.hits:1|c\n12 not a count\n"),
+            vec!["1.hits:1|c", "12 not a count"]
+        );
+        assert!(framer.first_byte_seen());
+        assert_eq!(framer.framing(), Some(Framing::NonTransparent), "and never re-evaluated");
+
+        // The same first byte under the auto mode, which is what this mode exists to avoid.
+        let mut auto = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+        auto.push(b"1.hits:1|c\n");
+        assert_eq!(auto.framing(), Some(Framing::OctetCounting), "the contrast this test is for");
+    }
+
+    /// [`Oversize::DrainToNextLine`]: one line past the bound is dropped and counted, the
+    /// connection survives, and the *next* line still frames -- carbon's own behaviour, and what
+    /// `graphite_in`'s `max_line_bytes` has always meant.
+    #[test]
+    fn a_line_only_framer_drains_to_the_next_newline_past_the_bound() {
+        let mut framer =
+            Framer::new(FramingMode::Lines { oversize: Oversize::DrainToNextLine }, 16);
+
+        // Past the bound with no terminator in sight: the end of this line has not arrived, so
+        // the framer abandons it now and discards bytes until the `LF` that ends it.
+        framer.push(&vec![b'x'; 40]);
+        let err = framer.next_frame().expect_err("40 bytes with no LF is past the 16-byte bound");
+        assert_eq!(err.reason(), "oversize", "{err}");
+        assert!(!err.is_fatal(), "a line protocol resynchronizes at the next LF: {err}");
+        assert_eq!(framer.next_frame(), Ok(None), "still draining, nothing to hand over");
+
+        // The tail of the abandoned line, then a good one: only the good one comes out, and it is
+        // counted once (when the bound was crossed), not once per byte drained.
+        assert_eq!(push_and_drain(&mut framer, b"more of it\nsurvivor\n"), vec!["survivor"]);
+        assert_eq!(
+            push_and_drain(&mut framer, b"another\n"),
+            vec!["another"],
+            "the bound is per line, not a running total over the connection"
+        );
+
+        // The other branch: a line already *has* its terminator buffered when the bound is
+        // checked, so there is nothing to drain -- exactly that line is dropped.
+        let mut terminated =
+            Framer::new(FramingMode::Lines { oversize: Oversize::DrainToNextLine }, 16);
+        let err = push_and_expect_error(&mut terminated, b"0123456789012345678\nsurvivor\n");
+        assert_eq!(err.reason(), "oversize", "{err}");
+        assert!(!err.is_fatal(), "{err}");
+        assert_eq!(push_and_drain(&mut terminated, b""), vec!["survivor"]);
+    }
+
+    #[test]
+    fn a_length_prefixed_frame_split_across_pushes_is_assembled() {
+        let payload = b"a pickled batch";
+        let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(payload);
+
+        let mut framer = Framer::new(FramingMode::LengthPrefixed, MAX_FRAME_BYTES);
+        assert_eq!(framer.framing(), Some(Framing::LengthPrefixed));
+        assert_eq!(Framing::LengthPrefixed.as_str(), "length_prefixed");
+
+        // One byte per push, so the 4-byte big-endian prefix itself straddles pushes: a reader
+        // that assumed a whole prefix per read -- or read it little-endian -- fails this and
+        // passes a single-push test. (`graphite/mod.rs`'s socket-level test is its twin.)
+        let mut got = Vec::new();
+        for byte in &wire {
+            got.extend(push_and_drain(&mut framer, &[*byte]));
+        }
+        assert_eq!(got, vec!["a pickled batch".to_string()]);
+
+        let mut both = wire.clone();
+        both.extend_from_slice(&wire);
+        assert_eq!(
+            push_and_drain(&mut framer, &both).len(),
+            2,
+            "two frames back to back in one push come out in order"
+        );
+    }
+
+    #[test]
+    fn a_length_prefix_over_the_bound_is_a_fatal_oversize() {
+        let mut framer = Framer::new(FramingMode::LengthPrefixed, 1024);
+        let err = push_and_expect_error(&mut framer, &1_000_000u32.to_be_bytes());
+        assert_eq!(err.reason(), "oversize", "{err}");
+        assert!(
+            err.is_fatal(),
+            "nothing after a bad length has been read, so there is no resync point: {err}"
+        );
+
+        // And the peer closing mid-payload is truncated, not an ordinary final message -- the
+        // declared length says bytes are missing.
+        let mut short = Framer::new(FramingMode::LengthPrefixed, 1024);
+        short.push(&[0, 0, 0, 9, b'h', b'i']);
+        assert_eq!(short.next_frame(), Ok(None), "the declared 9 bytes have not all arrived");
+        assert_eq!(short.buffered(), 6);
+        let err = short.finish().expect_err("a short payload under a declared length is truncated");
+        assert_eq!(err.reason(), "truncated", "{err}");
     }
 
     // ---- framer: recorded interop fixtures ----------------------------------------------------
@@ -1268,7 +1686,7 @@ mod tests {
         // One push, then `finish` -- rsyslog's own TCP connection here sends its one message and
         // is torn down by the recording harness rather than the peer sending an explicit
         // terminator-then-more-traffic, so the whole fixture arrives as a single read.
-        let mut framer = Framer::new();
+        let mut framer = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
         framer.push(&wire);
         assert_eq!(
             framer.framing(),
@@ -2071,6 +2489,61 @@ mod tests {
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>much later"]);
 
         handle.abort();
+    }
+
+    /// **The regression net for `first_byte_seen()`.** The first-byte deadline's predicate used to
+    /// be `framer.framing().is_none()`, which is only ever `true` before the first byte under
+    /// [`FramingMode::Rfc6587Auto`]: under either explicit mode the framing is known from
+    /// construction, so that predicate reads "already framed" on a connection that has said
+    /// nothing and the deadline silently never fires. Nothing else would catch it -- `syslog_in`
+    /// keeps working, and `graphite_in`/`statsd_in` just quietly stop bounding a silent
+    /// connection.
+    ///
+    /// So: every mode, `with_max_connections(1)`, a silent client that is *held* past the
+    /// deadline, and then a real frame that can only be served if the first one's permit genuinely
+    /// came back.
+    #[tokio::test]
+    async fn the_first_byte_deadline_applies_under_every_framing_mode() {
+        // `(mode, the wire bytes of one frame, the payload the decoder should see)`.
+        let length_prefixed = {
+            let mut wire = 9u32.to_be_bytes().to_vec();
+            wire.extend_from_slice(b"<13>hello");
+            wire
+        };
+        let cases: Vec<(FramingMode, Vec<u8>)> = vec![
+            (FramingMode::Rfc6587Auto, b"<13>hello\n".to_vec()),
+            (FramingMode::Lines { oversize: Oversize::Fatal }, b"<13>hello\n".to_vec()),
+            (FramingMode::Lines { oversize: Oversize::DrainToNextLine }, b"<13>hello\n".to_vec()),
+            (FramingMode::LengthPrefixed, length_prefixed),
+        ];
+
+        for (mode, wire) in cases {
+            let (addr, listener) = bound_listener(one_per_frame()).await;
+            let mut listener = listener
+                .with_framing(mode, MAX_FRAME_BYTES)
+                .with_max_connections(1)
+                .with_handshake_timeout(Duration::from_millis(50));
+            let (sink, mut rx) = fanout_into_channel(16);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let handle =
+                tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+            // Connected, not a byte sent, and held (not dropped) past the deadline -- so nothing
+            // but the deadline itself could free the permit.
+            let mut silent = connect(&addr).await;
+            expect_closed(&mut silent, &format!("a silent connection under {mode:?}")).await;
+
+            let mut client = connect(&addr).await;
+            client.write_all(&wire).await.unwrap();
+            assert_eq!(
+                payloads(&recv_batch(&mut rx).await),
+                vec!["<13>hello"],
+                "the permit must have come back under {mode:?}"
+            );
+
+            drop(silent);
+            handle.abort();
+        }
     }
 
     /// The pre-handshake timeout's whole purpose (this module's "Pre-handshake timeout" doc
