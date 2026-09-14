@@ -17,91 +17,110 @@
 //!     protocol: plaintext            # plaintext (default) | pickle (tcp only)
 //!     max_line_bytes: "8192"         # tcp plaintext: drain-to-newline past this
 //!     max_frame_bytes: "1MiB"        # pickle: Twisted's Int32StringReceiver.MAX_LENGTH
+//!     tls:                           # tcp only; presence turns TLS on and makes it required
+//!       cert_file: server.pem
+//!       key_file: server.key
+//!     handshake_timeout: 5s          # tcp only; per pre-message phase
 //!     receive:                       # optional; see "Transports" below for which half applies
 //!       batch_max_events: 1000
 //! ```
 //!
 //! ## Transports
 //!
-//! One component, two genuinely different drivers, chosen by `transport:`.
+//! One component, two shared drivers, chosen by `transport:` -- this type is just the decoder
+//! choice plus the public builder surface `logit-cli::pipeline` and these tests depend on, exactly
+//! as [`crate::syslog::SyslogInput`] is.
 //!
-//! **`udp`** is a thin wrapper over [`UdpListener<GraphiteDecoder>`](crate::udp::UdpListener), the
-//! same shape [`crate::collectd::CollectdInput`] is: the read/decode split, the receive queue, the
+//! **`udp`** wraps [`UdpListener<GraphiteDecoder>`](crate::udp::UdpListener), the same shape
+//! [`crate::collectd::CollectdInput`] is: the read/decode split, the receive queue, the
 //! datagram→batch assembly, `SO_RCVBUF`, multicast auto-join and the shutdown drain all come free
 //! from that driver (`docs/adr/decoupled-listener-io.md`), and the whole `receive:` block applies.
 //! `protocol: pickle` is rejected here by graph rule 46, not by this module: a 4-byte big-endian
 //! length prefix has no meaning in a datagram that already delimits itself.
 //!
-//! **`tcp`** is the accept loop in [`tcp`], written here rather than shared because there is
-//! nothing to share it with yet -- `syslog_in` is UDP-only and `otlp_in`/`logit_in` own bespoke,
-//! protocol-specific loops (ADR `graphite-carbon-relay`'s "No shared `logit_inputs::tcp` driver
-//! yet"; the extraction trigger it names is a second line listener). It has **no
+//! **`tcp`** wraps [`TcpListener<GraphiteDecoder>`](crate::tcp::TcpListener), the shared stream
+//! driver `syslog_in` runs on (`docs/adr/syslog-tcp-ingress-and-tls.md`). The accept loop, the
+//! connection cap, the per-connection decoder clone and batch assembly, the first-byte deadline
+//! and TLS termination are all that driver's; what this component picks is the **framing mode**
+//! (see below) and the bound that goes with it. It has **no
 //! [`ReceiveQueue`](crate::udp::ReceiveQueue)**: TCP's own flow control already is the
 //! backpressure, and ADR `decoupled-listener-io` exists for UDP's *silent* drops, which a stream
 //! cannot have. So only `receive:`'s batch-assembly fields (`batch_max_events`, `batch_max_bytes`,
 //! `batch_flush_interval`) and `shutdown_grace` apply to a TCP listener -- graph rule 17 rejects
 //! the queue-bounding ones by name.
 //!
-//! Each connection owns a read buffer, its own [`GraphiteDecoder`] and its own
-//! [`logit_pipeline::BatchAccumulator`], and sends into a clone of the shared
-//! [`Fanout`]: one slow or hostile connection stalls only itself. All of them share one
-//! `Arc<Resource>` (see [`GraphiteInput::new`]) so batches from different connections can still
-//! merge downstream -- `BatchAccumulator::absorb` keys on `Arc::ptr_eq`.
+//! Each connection owns a read buffer, its own [`GraphiteDecoder`] clone and its own
+//! [`logit_pipeline::BatchAccumulator`], and sends into a clone of the shared [`Fanout`]: one slow
+//! or hostile connection stalls only itself. All of them share one `Arc<Resource>` (the clone
+//! keeps it -- `logit_proto::graphite::GraphiteDecoder`'s own `Clone` impl says why) so batches
+//! from different connections can still merge downstream: `BatchAccumulator::absorb` keys on
+//! `Arc::ptr_eq`.
 //!
 //! ## Framing
 //!
-//! Framing is this listener's job, not the decoder's ([`logit_proto::graphite::decode`]'s module
-//! doc says so from the other side), which is why the two oversize rows of the codec's decode
-//! table are counted here.
+//! Framing is the listener's job, not the decoder's ([`logit_proto::graphite::decode`]'s module
+//! doc says so from the other side) -- here, the driver's [`Framer`](crate::tcp::Framer) under a
+//! [`FramingMode`] this component chooses from `protocol:`. **Never
+//! [`FramingMode::Rfc6587Auto`]**: a carbon path may legitimately begin with a digit, which that
+//! mode would read as an RFC 6587 octet count and reframe the whole connection on.
 //!
 //! | Protocol | Frame | Over the bound |
 //! |---|---|---|
 //! | plaintext, UDP | the datagram | nothing to bound: a datagram is already one read |
-//! | plaintext, TCP | everything through the last `\n` in the buffer, handed to `decode_into` in one call | a residue with no `\n` past `max_line_bytes` puts the connection into a drain-to-next-newline state, counted **once** as `logit.input.metrics.skipped{reason="oversize_line"}`; the line after it still decodes |
-//! | pickle, TCP | a 4-byte big-endian length prefix then that many payload bytes, handed to `decode_into` unframed | a frame declaring more than `max_frame_bytes` **closes the connection** (diagnostic `oversize_frame`) -- a length-framed stream has no resync point to skip forward to |
+//! | plaintext, TCP | [`FramingMode::Lines`] with [`Oversize::DrainToNextLine`]: one `\n`-delimited line (a trailing `\r` stripped) per `decode_into` | a line past `max_line_bytes` is dropped and counted **once** as `logit.input.frames.dropped{reason="oversize"}`; the connection stays open and the line after it still decodes |
+//! | pickle, TCP | [`FramingMode::LengthPrefixed`]: a 4-byte big-endian length prefix then that many payload bytes, handed to `decode_into` unframed | a frame declaring more than `max_frame_bytes` **closes the connection** (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`) -- a length-framed stream has no resync point to skip forward to |
 //!
 //! A pickle payload that fails to decode (a disallowed opcode, a depth or item cap) drops that
 //! frame and keeps the connection: unlike an oversize length, a *decoded* length has already told
 //! the reader where the next frame starts.
 //!
-//! ## Connection limit
+//! **One `decode_into` per line, not per read.** The driver frames first and hands the decoder one
+//! delimited message at a time, where the old bespoke loop handed it everything through the read
+//! buffer's last `\n` in a single call. `decode_plaintext` splits on `\n` internally either way, so
+//! the result is identical; the cost is one call (plus its `Arc` clone and `absorb`) per line
+//! rather than per read on carbon's hottest path. Measured, not assumed --
+//! `docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment records it, and a `LineChunk` framing
+//! mode is the reserve fix if it ever stops being acceptable.
 //!
-//! [`MAX_CONCURRENT_CONNECTIONS`] connections at a time, exactly as `logit_in`'s listener
-//! (`crates/logit-inputs/src/logit.rs`): the permit is taken non-blockingly *after* `accept`, and
-//! a connection that arrives past the cap is closed immediately and counted
-//! `logit.input.connections.rejected{reason="limit"}`. Closed rather than `otlp_in`'s
-//! block-the-accept-loop shape because carbon's wire has no way to say "try later" and a sender
-//! holding an accepted-but-never-read connection would look healthy while delivering nothing.
+//! ## Connections
+//!
+//! The driver's: 1024 at a time, the permit taken non-blockingly *after* `accept`, a past-the-cap
+//! connection closed immediately and counted `logit.input.connections.rejected{reason="limit"}`
+//! (carbon's wire has no way to say "try later"). `handshake_timeout:` bounds each pre-message
+//! phase independently -- the TLS accept when `tls:` is set, then the wait for the connection's
+//! very first byte -- and is **not** an idle timeout: once a connection has sent a byte there is
+//! no bound on the gap before the next datapoint (`docs/known-gaps.md`).
 //!
 //! ## Diagnostics
 //!
 //! Every one is throttled (`logit.component.diagnostics{key}`,
-//! `docs/design/internal-telemetry.md`). The decoder's own -- `bad_line`, `bad_tag`,
-//! `bad_timestamp`, `non_finite_value`, `duplicate_tag_key`, `bad_pickle` -- reach it through
-//! [`GraphiteInput::with_diagnostics`], which propagates into the decoder as well as this
-//! listener. This module adds:
+//! `docs/design/internal-telemetry.md`), and every clone of this component's [`Diagnostics`]
+//! shares one set of counts, so a key throttles per *listener* rather than per connection. The
+//! decoder's own -- `bad_line`, `bad_tag`, `bad_timestamp`, `non_finite_value`,
+//! `duplicate_tag_key`, `bad_pickle` -- reach it through [`GraphiteInput::with_diagnostics`],
+//! which propagates into the decoder as well as the driver. The driver adds:
 //!
 //! | Key | Meaning |
 //! |---|---|
 //! | `bound` | info: the socket is open (the shared pre-bind pass, `docs/deploying.md`) |
-//! | `oversize_line` | a TCP plaintext line exceeded `max_line_bytes` with no newline in sight; drained to the next one |
-//! | `oversize_frame` | a pickle frame declared more than `max_frame_bytes`; the connection was closed |
+//! | `framing_error` | TCP: a line past `max_line_bytes` (skipped, connection kept) or a pickle frame declaring more than `max_frame_bytes` (connection closed), or a partial frame discarded by an abrupt close |
+//! | `bad_frame` | TCP: one framed payload the decoder rejected outright -- a pickle frame only, since the plaintext path isolates every failure per line and never returns `Err` |
 //! | `connection_error` | one connection's I/O failed -- never fatal to the listener or its siblings, exactly as `otlp_in`/`logit_in` treat theirs |
-//! | `bad_datagram` | UDP only, and the shared listener's own: a whole datagram that failed to decode |
+//! | `bad_datagram` | UDP only, and the datagram driver's own: a whole datagram that failed to decode |
 //!
 //! ## Telemetry
 //!
-//! Under `transport: udp`, all of it comes from the shared driver
-//! (`logit.input.datagrams`/`.datagram.bytes`, the `logit.component.receive.*` queue gauges,
-//! `logit.input.receive_buffer.bytes`) -- this component adds none of its own, exactly like
-//! `collectd_in`. Under `transport: tcp` there is no such driver, so this module records the
-//! stream's own facts: `logit.input.connections` (gauge), `logit.input.connections.rejected
-//! {reason="limit"}`, `logit.input.lines`/`.line.bytes` (plaintext) or
-//! `logit.input.frames`/`.frame.bytes` (pickle), and `logit.component.receive.flushed{reason}`
-//! from the per-connection batch assembly.
+//! All of it comes from the shared drivers; this component adds none of its own, exactly like
+//! `collectd_in`. Under `transport: udp` that is `logit.input.datagrams`/`.datagram.bytes`, the
+//! `logit.component.receive.*` queue gauges and `logit.input.receive_buffer.bytes`. Under
+//! `transport: tcp` it is `logit.input.connections` (gauge),
+//! `logit.input.connections.rejected{reason="limit"}`, `logit.input.frames`/`.frame.bytes` (one
+//! *frame* is one plaintext line or one pickle payload -- the prefix's own 4 bytes are not counted,
+//! since the decoder never sees them), `logit.input.frames.dropped{reason}`, and
+//! `logit.component.receive.flushed{reason}` from the per-connection batch assembly. The decoder's
+//! own `logit.input.metrics.skipped{reason}` is reported under both.
 
-pub mod tcp;
-
+use crate::tcp::{FramingMode, Oversize, TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use logit_core::{Diagnostics, Resource, Telemetry};
@@ -109,15 +128,10 @@ use logit_pipeline::Fanout;
 use logit_proto::graphite::{
     GraphiteDecoder, Protocol, DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_LINE_BYTES,
 };
+use std::path::Path;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use std::time::Duration;
 use tokio::sync::watch;
-
-/// The most connections one `graphite_in` serves at a time. The same figure and the same argument
-/// as `crates/logit-inputs/src/logit.rs`'s own cap: a bound on this listener's worst-case memory,
-/// since each live connection holds a read buffer of at most `max_line_bytes`/`max_frame_bytes`
-/// plus one `BatchAccumulator`'s worth of events.
-pub const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Which socket a [`GraphiteInput`] listens on. Carbon's own default listener is TCP (plaintext,
 /// port 2003), so [`Transport::Tcp`] is the default here and in `logit_config::GraphiteTransport`.
@@ -132,33 +146,33 @@ pub enum Transport {
     Udp,
 }
 
+/// Which driver a [`GraphiteInput`] is wrapping. Chosen once, by `transport:`
+/// (`crates/logit-cli/src/pipeline.rs`'s `GraphiteIn` arm), and never changed afterwards -- an
+/// enum rather than a `Box<dyn Input>` so each arm keeps its own concrete builder surface
+/// ([`TcpListener::with_tls`], [`UdpListener::with_config`]) reachable through this wrapper.
+/// [`crate::syslog::SyslogInput`]'s own `Inner`, for the same reasons.
+enum Inner {
+    Udp(UdpListener<GraphiteDecoder>),
+    Tcp(TcpListener<GraphiteDecoder>),
+}
+
 /// A carbon receiver: plaintext or pickle, over TCP or UDP. See this module's doc.
 pub struct GraphiteInput {
-    bind: String,
-    transport: Transport,
+    inner: Inner,
+    /// Which carbon wire protocol this listener speaks. Held here as well as inside the decoder
+    /// because it is what picks the TCP framing mode, and the decoder's copy is not reachable
+    /// through the driver.
     protocol: Protocol,
+    /// The two operator-facing frame bounds. Held as fields and applied to the stream driver
+    /// lazily, in [`Input::bind`], rather than at the moment they are set: `with_max_line_bytes`,
+    /// `with_max_frame_bytes` and the protocol together decide one `with_framing` call, and
+    /// applying it eagerly would make the *order* of this type's builder methods load-bearing.
     max_line_bytes: usize,
     max_frame_bytes: usize,
     /// The batch-assembly (and, under UDP, receive-queue) knobs a `receive:` block sets. Held here
-    /// even under `transport: udp`, where [`UdpListener`] also holds its own copy, so
-    /// [`Self::receive_config`] can read it back without knowing which driver is in play.
+    /// as well as inside whichever driver it was pushed into, so [`Self::receive_config`] can read
+    /// it back without knowing which one is in play.
     receive: UdpListenerConfig,
-    max_connections: usize,
-    diag: Diagnostics,
-    telemetry: Telemetry,
-    /// One resource for every event this component ever produces, shared across every TCP
-    /// connection's decoder as well as the UDP one. **Not** one per connection:
-    /// `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so a
-    /// resource per connection would stop two connections' events ever sharing a batch downstream
-    /// ([`logit_proto::graphite::GraphiteDecoder`]'s own `resource` field documents the same
-    /// constraint).
-    resource: Arc<Resource>,
-    /// `Some` only under [`Transport::Udp`] -- the shared datagram driver, built at construction so
-    /// the builders below can chain into it the way `CollectdInput`'s do.
-    udp: Option<UdpListener<GraphiteDecoder>>,
-    /// `Some` only under [`Transport::Tcp`], between [`Input::bind`] and the accept loop taking it
-    /// -- the same "bind leaves it behind, run takes it" handoff `otlp_in` uses.
-    listener: Option<TcpListener>,
 }
 
 impl GraphiteInput {
@@ -167,60 +181,70 @@ impl GraphiteInput {
     /// caller that builds one anyway gets a pickle decoder fed whole datagrams, which is a
     /// meaningful (if unused) thing to do rather than something worth a panic.
     pub fn new(bind: impl Into<String>, transport: Transport, protocol: Protocol) -> Self {
+        // One resource for every event this component ever produces, shared across every TCP
+        // connection's decoder clone as well as the UDP one. **Not** one per connection:
+        // `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so a
+        // resource per connection would stop two connections' events ever sharing a batch
+        // downstream (`GraphiteDecoder`'s own `resource` field documents the same constraint, and
+        // its `Clone` impl is what preserves it across the driver's per-connection clone).
+        let decoder = GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(protocol);
         let bind = bind.into();
-        let resource = Arc::new(Resource::default());
-        let udp = match transport {
-            Transport::Udp => Some(UdpListener::new(
-                bind.clone(),
-                GraphiteDecoder::new(Arc::clone(&resource)).with_protocol(protocol),
-                UdpListenerConfig::default(),
-            )),
-            Transport::Tcp => None,
+        let inner = match transport {
+            Transport::Udp => {
+                Inner::Udp(UdpListener::new(bind, decoder, UdpListenerConfig::default()))
+            }
+            Transport::Tcp => {
+                Inner::Tcp(TcpListener::new(bind, decoder, TcpListenerConfig::default()))
+            }
         };
         Self {
-            bind,
-            transport,
+            inner,
             protocol,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             receive: UdpListenerConfig::default(),
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
-            diag: Diagnostics::default(),
-            telemetry: Telemetry::default(),
-            resource,
-            udp,
-            listener: None,
         }
     }
 
-    /// Attaches a component id to this listener's diagnostics -- and, under `transport: udp`, to
-    /// the [`GraphiteDecoder`] the shared driver wraps, so both report under the same id. Both
-    /// halves matter for exactly [`crate::collectd::CollectdInput::with_diagnostics`]'s reason:
-    /// `UdpListener`'s own `diag` is what a whole-datagram decode failure reports through
-    /// (`bad_datagram`), while the decoder's own carries everything finer-grained (`bad_line`,
-    /// `bad_tag`, `bad_timestamp`, `non_finite_value`, `bad_pickle`) -- two distinct `Diagnostics`
-    /// values that must both carry the same id and telemetry handle, or one whole class of decode
-    /// failure silently reports under no component id and with telemetry disabled. Under
-    /// `transport: tcp` there is no wrapped driver and each connection's decoder is built from
-    /// this same value at accept time ([`tcp::serve_connection`]).
+    /// Attaches a component id to this listener's diagnostics -- and to the [`GraphiteDecoder`]
+    /// the driver wraps, so both report under the same id. Both halves matter for exactly
+    /// [`crate::collectd::CollectdInput::with_diagnostics`]'s reason: the driver's own `diag` is
+    /// what a transport-level failure reports through (`bad_datagram` on UDP;
+    /// `framing_error`/`bad_frame`/`connection_error` on TCP), while the decoder's own carries
+    /// everything finer-grained (`bad_line`, `bad_tag`, `bad_timestamp`, `non_finite_value`,
+    /// `bad_pickle`) -- two distinct `Diagnostics` values that must both carry the same id and
+    /// telemetry handle, or one whole class of decode failure silently reports under no component
+    /// id and with telemetry disabled. On the TCP arm the decoder set here is the one every
+    /// connection's clone is made from, and a `Diagnostics` clone shares its original's throttle
+    /// counts, so `bad_line` throttles per listener rather than per connection.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.udp = self.udp.map(|listener| {
-            listener.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag))
-        });
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(
+                listener.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag)),
+            ),
+            Inner::Tcp(listener) => Inner::Tcp(
+                listener.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag)),
+            ),
+        };
         self
     }
 
-    /// Attaches a telemetry handle -- the shared driver's wire-level datagram counters under UDP,
-    /// this module's own connection/line/frame counters under TCP, and the decoder's own skip
-    /// counters under both (`docs/design/internal-telemetry.md`'s "layer 3").
+    /// Attaches a telemetry handle -- the datagram driver's wire-level counters under UDP, the
+    /// stream driver's connection/frame counters under TCP, and the decoder's own skip counters
+    /// under both (`docs/design/internal-telemetry.md`'s "layer 3").
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.udp = self.udp.map(|listener| {
-            listener
-                .with_telemetry(telemetry.clone())
-                .map_decoder(|d| d.with_telemetry(telemetry.clone()))
-        });
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
+            Inner::Tcp(listener) => Inner::Tcp(
+                listener
+                    .with_telemetry(telemetry.clone())
+                    .map_decoder(|d| d.with_telemetry(telemetry)),
+            ),
+        };
         self
     }
 
@@ -228,9 +252,23 @@ impl GraphiteInput {
     /// a `receive:` config block sets. Defaults to [`UdpListenerConfig::default`] when never
     /// called. Graph rule 17 is what guarantees a TCP listener never arrives here carrying a
     /// queue-bounding field it would silently ignore.
+    ///
+    /// One setter taking the datagram config on both arms, unlike
+    /// [`crate::syslog::SyslogInput::with_receive`]/`with_tcp_receive`: `graphite_in` has always
+    /// had one, `logit-cli`'s `GraphiteIn` arm calls it without branching on transport, and the
+    /// four fields a TCP listener does read mean the same thing in both structs -- so the
+    /// conversion below is total and there is nothing for a caller to get wrong.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.receive = config;
-        self.udp = self.udp.map(|listener| listener.with_config(config));
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_config(config)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_config(TcpListenerConfig {
+                batch_max_events: config.batch_max_events,
+                batch_max_bytes: config.batch_max_bytes,
+                batch_flush_interval: config.batch_flush_interval,
+                shutdown_grace: config.shutdown_grace,
+            })),
+        };
         self
     }
 
@@ -254,52 +292,89 @@ impl GraphiteInput {
         self
     }
 
-    /// The address actually bound, once [`Input::bind`] has run -- lets a caller (a round-trip
-    /// test) learn the OS-assigned port with no bind-drop-rebind race, under either transport.
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        match self.transport {
-            Transport::Udp => self.udp.as_ref().and_then(UdpListener::local_addr),
-            Transport::Tcp => self.listener.as_ref().and_then(|l| l.local_addr().ok()),
+    /// Overrides a **TCP** listener's per-phase pre-message budget (`handshake_timeout:` in
+    /// config): the TLS accept when `tls:` is set, and the wait for the connection's first byte.
+    /// Delegates straight to [`TcpListener::with_handshake_timeout`].
+    ///
+    /// A UDP listener is left untouched rather than failing, exactly as
+    /// [`crate::syslog::SyslogInput::with_handshake_timeout`] does: there is no connection on that
+    /// transport for the value to bound, so there is nothing to apply and nothing to refuse. Graph
+    /// rule 45 is what tells an operator who set a non-default value under `transport: udp` that
+    /// it could never take effect -- unlike `tls:`, whose [`Self::with_tls`] arm does fail,
+    /// because `tls:` has no default and its mere presence is an instruction.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_handshake_timeout(handshake_timeout));
         }
-    }
-
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real TCP connections
-    /// in a test to exercise the cap would be slow and flaky; this makes the cap itself small
-    /// enough to reach with two (`logit.rs`'s own `with_max_connections` plays the same trick).
-    #[cfg(test)]
-    fn with_max_connections(mut self, max_connections: usize) -> Self {
-        self.max_connections = max_connections;
         self
     }
 
-    /// The per-connection settings [`tcp::run_accept_loop`] needs, gathered in one place so the
-    /// accept loop takes one value rather than nine.
-    fn connection_config(&self) -> tcp::ConnectionConfig {
-        tcp::ConnectionConfig {
-            protocol: self.protocol,
-            max_line_bytes: self.max_line_bytes,
-            max_frame_bytes: self.max_frame_bytes,
-            batch_max_events: self.receive.batch_max_events,
-            batch_max_bytes: self.receive.batch_max_bytes,
-            batch_flush_interval: self.receive.batch_flush_interval,
-            max_connections: self.max_connections,
+    /// Terminates TLS on a TCP listener (`tls:` in config) -- delegates straight to
+    /// [`TcpListener::with_tls`], which resolves every path in `settings` against `base_dir`.
+    ///
+    /// A UDP listener fails here rather than ignoring the block: carbon has no DTLS receiver of
+    /// any kind, so there is nothing this could mean. Graph rule 43 rejects the same combination
+    /// at config-validation time and is what an operator actually sees; this arm is the
+    /// belt-and-braces backstop for a caller that skipped validation, not the primary diagnostic.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsServerSettings,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        self.inner = match self.inner {
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Udp(_) => anyhow::bail!(
+                "graphite_in: 'tls:' needs 'transport: tcp' -- carbon has no DTLS receiver \
+                 (docs/adr/graphite-carbon-relay.md)"
+            ),
+        };
+        Ok(self)
+    }
+
+    /// The address actually bound, once [`Input::bind`] has run -- lets a caller (a round-trip
+    /// test) learn the OS-assigned port with no bind-drop-rebind race, under either transport.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match &self.inner {
+            Inner::Udp(listener) => listener.local_addr(),
+            Inner::Tcp(listener) => listener.local_addr(),
+        }
+    }
+
+    /// Test-only override of the driver's connection cap -- opening 1025 real TCP connections in a
+    /// test to exercise it would be slow and flaky; this makes the cap reachable with two. A UDP
+    /// listener has no connections and is left untouched.
+    #[cfg(test)]
+    fn with_max_connections(mut self, max_connections: usize) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
+        }
+        self
+    }
+
+    /// How a TCP connection's messages are delimited, and the bound on one of them -- `protocol:`
+    /// plus whichever of the two size fields it makes meaningful. **Never
+    /// [`FramingMode::Rfc6587Auto`]**: see this module's "Framing" section.
+    fn framing(&self) -> (FramingMode, usize) {
+        match self.protocol {
+            Protocol::Plaintext => {
+                (FramingMode::Lines { oversize: Oversize::DrainToNextLine }, self.max_line_bytes)
+            }
+            Protocol::Pickle => (FramingMode::LengthPrefixed, self.max_frame_bytes),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl Input for GraphiteInput {
+    /// Idempotent, per `Input::bind`'s contract -- and the point at which this component's framing
+    /// decision reaches the stream driver (see the `max_line_bytes` field's doc comment).
     async fn bind(&mut self) -> anyhow::Result<()> {
-        match self.transport {
-            Transport::Udp => self.udp.as_mut().expect("udp transport builds one").bind().await,
-            Transport::Tcp => {
-                if self.listener.is_some() {
-                    return Ok(()); // idempotent, per `Input::bind`'s contract
-                }
-                let listener = TcpListener::bind(&self.bind).await?;
-                self.diag.info("bound", format_args!("listening on {}", self.bind));
-                self.listener = Some(listener);
-                Ok(())
+        let (mode, max_frame_bytes) = self.framing();
+        match &mut self.inner {
+            Inner::Udp(listener) => listener.bind().await,
+            Inner::Tcp(listener) => {
+                listener.set_framing(mode, max_frame_bytes);
+                listener.bind().await
             }
         }
     }
@@ -316,32 +391,16 @@ impl Input for GraphiteInput {
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        match self.transport {
-            Transport::Udp => {
-                self.udp
-                    .as_mut()
-                    .expect("udp transport builds one")
-                    .run_until_shutdown(sink, shutdown)
-                    .await
-            }
-            Transport::Tcp => {
-                self.bind().await?;
-                let listener = self.listener.take().expect("bind() leaves a listener behind");
-                tcp::run_accept_loop(
-                    listener,
-                    sink,
-                    self.connection_config(),
-                    Arc::clone(&self.resource),
-                    self.diag.clone(),
-                    self.telemetry.clone(),
-                    shutdown,
-                )
-                .await
-            }
+        // Explicitly, before delegating: the driver's own `run_until_shutdown` binds too, but only
+        // this one applies the framing, and a caller that never called `bind()` would otherwise
+        // get a stream driver still set to its `Rfc6587Auto` default.
+        self.bind().await?;
+        match &mut self.inner {
+            Inner::Udp(listener) => listener.run_until_shutdown(sink, shutdown).await,
+            Inner::Tcp(listener) => listener.run_until_shutdown(sink, shutdown).await,
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +410,7 @@ mod tests {
     use logit_core::{Event, MetricKind, Value};
     use logit_pipeline::unwrap_batch;
     use logit_proto::Decoder as _;
+    use rustls_pki_types::pem::PemObject;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -541,14 +601,20 @@ mod tests {
     /// `.map_decoder(..)` half compiles fine and silently leaves every decoder-side diagnostic
     /// (`bad_line`, `bad_tag`, `bad_timestamp`, `non_finite_value`) reporting under no component
     /// id and with telemetry disabled.
+    ///
+    /// Both transports, now that both wrap a driver that holds the decoder: on the TCP arm the
+    /// decoder this reads is the one every connection's clone is made from.
     #[test]
-    fn with_diagnostics_reaches_the_wrapped_udp_decoder_too() {
-        let input = GraphiteInput::new("127.0.0.1:0", Transport::Udp, Protocol::Plaintext)
-            .with_diagnostics(Diagnostics::new("my-id"));
-        assert_eq!(
-            input.udp.as_ref().expect("udp transport builds one").decoder().diag().component_id(),
-            "my-id"
-        );
+    fn with_diagnostics_reaches_the_wrapped_decoder_on_both_transports() {
+        for transport in [Transport::Tcp, Transport::Udp] {
+            let input = GraphiteInput::new("127.0.0.1:0", transport, Protocol::Plaintext)
+                .with_diagnostics(Diagnostics::new("my-id"));
+            let id = match &input.inner {
+                Inner::Udp(listener) => listener.decoder().diag().component_id().to_string(),
+                Inner::Tcp(listener) => listener.decoder().diag().component_id().to_string(),
+            };
+            assert_eq!(id, "my-id", "{transport:?}");
+        }
     }
 
     // -- TCP: binding -----------------------------------------------------------------------
@@ -636,10 +702,11 @@ mod tests {
         running.handle.abort();
     }
 
-    /// The `oversize_line` row of the codec's decode table, which is this listener's to enforce: a
+    /// The oversize-line row of this module's framing table, which is the listener's to enforce: a
     /// line past `max_line_bytes` with no newline is abandoned and counted **once**, and -- the
-    /// part that matters -- the next line still decodes, because the reader drains to the newline
-    /// rather than closing or resynchronizing at an arbitrary byte.
+    /// part that matters -- the next line still decodes, because [`Oversize::DrainToNextLine`]
+    /// drains to the newline rather than closing (as [`Oversize::Fatal`] would) or
+    /// resynchronizing at an arbitrary byte.
     #[tokio::test]
     async fn an_oversize_tcp_line_is_skipped_and_the_next_one_still_decodes() {
         let mut running =
@@ -658,9 +725,14 @@ mod tests {
 
         let drained = running.registry.drain(0);
         assert_eq!(
-            metric_sum(&drained, "logit.input.metrics.skipped", Some(("reason", "oversize_line"))),
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
             1.0,
             "counted once when the bound was crossed, not once per byte drained"
+        );
+        assert_eq!(
+            metric_sum(&drained, "logit.component.diagnostics", Some(("key", "framing_error"))),
+            1.0,
+            "and diagnosed on the driver's own framing key"
         );
 
         running.shutdown.send(true).ok();
@@ -691,8 +763,9 @@ mod tests {
     }
 
     /// A connection arriving past the cap is closed immediately and counted. `max_connections: 1`
-    /// rather than the real [`MAX_CONCURRENT_CONNECTIONS`] so two sockets reach it, exactly as
-    /// `logit.rs`'s own cap test does.
+    /// rather than the driver's real 1024 so two sockets reach it, exactly as `logit.rs`'s own cap
+    /// test does. The cap itself is the driver's now; this keeps the wiring pinned from the
+    /// component's side.
     #[tokio::test]
     async fn a_tcp_connection_past_the_cap_is_rejected_and_counted() {
         let mut running =
@@ -721,11 +794,12 @@ mod tests {
         running.handle.abort();
     }
 
-    /// `with_diagnostics`/`with_telemetry` have to reach the *per-connection* decoder, which is
-    /// built at accept time rather than held on the component -- so unlike the UDP case there is
-    /// nothing to introspect, and the only honest assertion is that a decoder-side skip actually
-    /// showed up under this component's handles. A malformed line counts through the decoder's
-    /// telemetry and diagnoses through its `Diagnostics`, so this pins both halves at once.
+    /// `with_diagnostics`/`with_telemetry` have to survive the driver's *per-connection decoder
+    /// clone*, which is made at accept time -- so unlike the static test above this one drives a
+    /// real socket and asserts that a decoder-side skip actually showed up under this component's
+    /// handles. A malformed line counts through the decoder's telemetry and diagnoses through its
+    /// `Diagnostics`, so this pins both halves at once, on the far side of `GraphiteDecoder`'s own
+    /// hand-written `Clone`.
     #[tokio::test]
     async fn with_diagnostics_and_telemetry_reach_a_tcp_connections_decoder() {
         let mut running = start(|input| input, Transport::Tcp, Protocol::Plaintext).await;
@@ -862,76 +936,6 @@ mod tests {
         running.handle.abort();
     }
 
-    /// Rule: a fatal `accept` error has to reach `run_input` **promptly**, even with clients still
-    /// connected. Before the accept loop grew its own teardown signal, the post-loop drain waited
-    /// on serving tasks that were parked in a read race nothing would ever flip -- so one idle
-    /// carbon relay was enough to make the listener silently stop accepting while the process kept
-    /// reporting healthy.
-    ///
-    /// Driven through a real `accept` failure rather than a simulated one. `shutdown(fd, SHUT_RD)`
-    /// on a *listening* socket is Linux's documented way to break an in-flight `accept`: it wakes
-    /// the poll immediately and every subsequent `accept` fails with `EINVAL`. Deliberately not
-    /// `close(fd)` -- the `TcpListener` still owns that descriptor and would close it again on
-    /// drop, and in between another thread could have been handed the same number. Linux-only
-    /// because the behaviour is: `libc` is already this crate's Linux-only dependency (`tail_in`'s
-    /// inotify), and no new one is added for this.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn an_accept_error_returns_promptly_with_an_idle_connection_open() {
-        use std::os::fd::AsRawFd;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("ephemeral bind");
-        let addr = listener.local_addr().expect("a bound listener has an address");
-        let fd = listener.as_raw_fd();
-
-        let (tx, mut rx) = mpsc::channel(8);
-        let fanout = Fanout::new(vec![tx]);
-        let (_shutdown, shutdown_rx) = watch::channel(false);
-        let config = tcp::ConnectionConfig {
-            protocol: Protocol::Plaintext,
-            max_line_bytes: 8192,
-            max_frame_bytes: 1 << 20,
-            batch_max_events: 1000,
-            batch_max_bytes: 1024 * 1024,
-            batch_flush_interval: Duration::from_millis(50),
-            max_connections: MAX_CONCURRENT_CONNECTIONS,
-        };
-        let handle = tokio::spawn(tcp::run_accept_loop(
-            listener,
-            fanout,
-            config,
-            Arc::new(logit_core::Resource::default()),
-            Diagnostics::new("graphite_in"),
-            Telemetry::default(),
-            shutdown_rx,
-        ));
-
-        // A connection that is live and then goes *idle* -- the shape that used to park the drain
-        // forever. Waiting for its batch is what proves the serving task really is sitting in its
-        // read race by the time `accept` breaks.
-        let mut idle = TcpStream::connect(addr).await.expect("the listener should accept");
-        idle.write_all(line("idle.path").as_bytes()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the idle connection's line should be delivered")
-            .expect("the channel should not have closed");
-
-        // SAFETY: `fd` is this listener's own descriptor, still owned and kept open by the
-        // `TcpListener` the accept loop holds -- `shutdown` only changes its state, never closes
-        // it, so the owner's eventual `close` stays correct and no descriptor is ever reused
-        // out from under anyone.
-        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RD) };
-        assert_eq!(rc, 0, "shutdown(SHUT_RD) on a listening socket should succeed on Linux");
-
-        let joined = tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("an accept error must reach run_input promptly, not wait for the last client");
-        let result = joined.expect("the accept loop should not panic");
-        assert!(result.is_err(), "a broken accept is a fatal, reported error: {result:?}");
-
-        drop(idle);
-    }
-
     // -- TCP: pickle framing ----------------------------------------------------------------
 
     /// The pickle framing round trip through a real socket: one length-prefixed frame of three
@@ -962,8 +966,10 @@ mod tests {
         assert_eq!(metric_sum(&drained, "logit.input.frames", None), 1.0, "one frame, not three");
         assert_eq!(
             metric_sum(&drained, "logit.input.frame.bytes", None),
-            frame.len() as f64,
-            "counted as it arrived on the wire, length prefix included"
+            (frame.len() - logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES) as f64,
+            "the payload the decoder was handed -- the shared driver counts the frame, not the \
+             length prefix it stripped to find it (`logit.input.frame.bytes` means the same thing \
+             on every listener on that driver)"
         );
 
         running.shutdown.send(true).ok();
@@ -989,6 +995,159 @@ mod tests {
         assert_eq!(read, 0, "the listener hung up rather than waiting for a megabyte");
         assert!(!running.handle.is_finished(), "and the listener itself is untouched");
 
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "oversize"))),
+            1.0,
+            "and the refusal is counted, not just acted on"
+        );
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    // -- TCP: TLS ---------------------------------------------------------------------------
+    //
+    // `graphite_in` terminates TLS through the shared driver, so these are the *wiring* tests --
+    // that `with_tls` reaches `TcpListener::with_tls` and that a carbon payload survives the
+    // wrapper. The driver's own tests (`crate::tcp`) cover mTLS, the client-certificate cases and
+    // the handshake's own timeout.
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
+        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`,
+        // the same path `crate::tcp`/`crate::logit`'s own TLS tests use.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    fn test_tls_settings() -> TlsServerSettings {
+        TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        }
+    }
+
+    /// A `tokio-rustls` client trusting exactly `ca_file` under `testdata/tls` --
+    /// `other-ca.pem` is what makes the "wrong CA" test a real trust failure rather than a
+    /// certificate-name mismatch.
+    async fn tls_connector(ca_file: &str) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<rustls_pki_types::CertificateDer<'static>> =
+            rustls_pki_types::CertificateDer::pem_file_iter(testdata_dir().join(ca_file))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        roots.add_parsable_certificates(ca);
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// `testdata/tls/server.pem` carries a `localhost` SAN (`testdata/tls/README.md`), so that is
+    /// the name every TLS client here presents.
+    fn server_name() -> rustls_pki_types::ServerName<'static> {
+        rustls_pki_types::ServerName::try_from("localhost").unwrap()
+    }
+
+    /// Carbon plaintext over TLS: the combination `graphite_in` could not express at all before it
+    /// moved onto the shared driver.
+    #[tokio::test]
+    async fn a_tls_connection_round_trips_a_carbon_line() {
+        let mut running = start(
+            |input| input.with_tls(&test_tls_settings(), &testdata_dir()).expect("tcp takes tls"),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+
+        let connector = tls_connector("ca.pem").await;
+        let stream = TcpStream::connect(running.addr).await.expect("the listener should accept");
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name(), stream))
+                .await
+                .expect("the TLS handshake should complete within 5s")
+                .expect("the TLS handshake should succeed");
+        client.write_all(line("over.tls").as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+
+        let batch = running.next_batch("the line sent over TLS").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "over.tls");
+        assert_eq!(batch.events[0].metrics[0].kind, MetricKind::Gauge(1.5));
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// A client that trusts the wrong CA is refused, and -- the half that matters for a relay --
+    /// the listener keeps serving everyone else.
+    #[tokio::test]
+    async fn a_tls_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
+        let mut running = start(
+            |input| input.with_tls(&test_tls_settings(), &testdata_dir()).expect("tcp takes tls"),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+
+        let wrong = tls_connector("other-ca.pem").await;
+        let stream = TcpStream::connect(running.addr).await.expect("the listener should accept");
+        let refused =
+            tokio::time::timeout(Duration::from_secs(5), wrong.connect(server_name(), stream))
+                .await
+                .expect("the handshake should resolve within 5s");
+        assert!(refused.is_err(), "a client trusting only other-ca.pem must not complete");
+
+        let connector = tls_connector("ca.pem").await;
+        let stream = TcpStream::connect(running.addr).await.expect("the listener should accept");
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name(), stream))
+                .await
+                .expect("the TLS handshake should complete within 5s")
+                .expect("the TLS handshake should succeed");
+        client.write_all(line("still.serving").as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        let batch = running.next_batch("a line after the refused handshake").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "still.serving");
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// `handshake_timeout:`'s whole purpose, and the gap `graphite_in` carried in
+    /// `docs/known-gaps.md` until it moved onto this driver: a client that connects and never
+    /// sends a byte must not pin a connection-limit permit. Under `max_connections(1)` the second
+    /// client can only be served if the first one's permit genuinely came back.
+    #[tokio::test]
+    async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
+        let mut running = start(
+            |input| input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50)),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+
+        // Connected, not a byte sent, and held (not dropped) past the deadline -- so nothing but
+        // the deadline itself could free the permit.
+        let mut silent = running.connect().await;
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), silent.read(&mut byte))
+            .await
+            .expect("a silent connection is closed within the handshake timeout, not left hanging")
+            .expect("reading a closed socket is Ok(0), not an error");
+        assert_eq!(read, 0, "the listener hung up on a connection that said nothing");
+
+        let mut client = running.connect().await;
+        client.write_all(line("permit.came.back").as_bytes()).await.unwrap();
+        let batch = running.next_batch("a line on the connection after the silent one").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "permit.came.back");
+
+        drop(silent);
         running.shutdown.send(true).ok();
         running.handle.abort();
     }
@@ -1051,13 +1210,15 @@ mod tests {
         (decoder, registry)
     }
 
-    /// Decodes a whole recorded TCP connection's plaintext stream as **one buffer**, exactly as
-    /// `crates/logit-inputs/src/graphite/tcp.rs`'s connection loop hands `decode_into` everything
-    /// read so far up through the last complete `\n`: `decode_plaintext` (`logit_proto::graphite::
-    /// decode`) splits on `\n` internally, so one recorded connection holding many
-    /// `write_graphite` flush cycles is exactly one call, not one call per line. That is also why
-    /// this fixture is committed whole rather than split into one file per line -- a raw capture
-    /// records what actually arrived on the wire, and what arrived was one connection's stream.
+    /// Decodes a whole recorded TCP connection's plaintext stream as **one buffer**.
+    ///
+    /// A live connection now frames first and hands `decode_into` one line at a time (this
+    /// module's "Framing" section), but `decode_plaintext` (`logit_proto::graphite::decode`)
+    /// splits on `\n` internally either way, so the decoded events are identical and this stays
+    /// the honest shape for a fixture: a raw capture records what actually arrived on the wire,
+    /// and what arrived was one connection's stream, not one file per line. What it exercises is
+    /// the *decoder* against real `write_graphite` bytes; `a_tcp_line_split_across_writes_is_
+    /// reassembled` and the driver's own framer tests cover the framing.
     fn decode_interop_plaintext(name: &str) -> (Vec<Event>, Arc<Registry>) {
         let (mut decoder, registry) = interop_decoder(Protocol::Plaintext);
         let mut events = Vec::new();
@@ -1074,7 +1235,7 @@ mod tests {
     /// `GraphiteDecoder::decode_into`'s pickle path expects one already-**unframed** payload per
     /// call -- framing is the listener's job (`logit_proto::graphite::decode`'s module doc) -- so
     /// this strips each 4-byte big-endian length prefix itself, the same way
-    /// `crates/logit-inputs/src/graphite/tcp.rs`'s `consume_frames` does on a live connection.
+    /// `crate::tcp::Framer`'s `next_length_prefixed` does on a live connection.
     /// Looping rather than assuming exactly one frame is what makes this correct even if a future
     /// re-record's connection ever carries more than one (today's fixtures each hold exactly one).
     fn decode_interop_pickle(name: &str) -> (Vec<Event>, Arc<Registry>) {
