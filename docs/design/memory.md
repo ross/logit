@@ -1050,6 +1050,22 @@ concurrent-map probe on the hot path for a lookup that could be cheaper. Fixed r
 the existing `binary_search_by_key` only on a hit. Pure efficiency win, no behavior change --
 `insert` still calls `intern`, since it may legitimately need to mint a new symbol.
 
+### The per-parser key cache: a second copy, deliberately bounded
+
+The same CPU framing applies to a parser whose keys come from its *input*: `json` can't intern its
+object keys once at construction the way `set`/`csv`/`kv_metrics` do, so every key of every line
+was a hash plus a shard lock on the global table -- the largest cost left in the `json-parse`
+load-test scenario once `kv_metrics` was fixed ([performance.md](performance.md)). Each
+`JsonParser` now owns a `logit_core::interner::KeyCache`: a `&str -> Symbol` memo in first-seen
+order with a cursor, so on a schema-shaped stream every key after the first line is one `memcmp`
+and the interner is never touched. It is a pure fast path -- `get_or_intern(s)` always equals
+`intern(s)`, and the cache holds no symbol the table doesn't.
+
+It is **capped** (64 entries, keys ≤ 128 bytes), unlike the interner itself. The reasoning above
+accepts the interner's unbounded growth once, process-wide; a per-node copy of every key seen
+would double that exposure per parser under the same abuse (`{"req_a1b2c3": …}`), so past the cap a
+new key is interned but not cached -- today's cost, after a bounded scan. Nothing else changes:
+the interner still retains every distinct key forever, and `interner::len()` still reports it.
 
 ### The other unbounded structure
 

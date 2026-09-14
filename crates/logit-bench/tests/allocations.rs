@@ -678,6 +678,11 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
 /// `AttrMap`'s 8-entry inline capacity for this fixture's 6 fields regardless. What's left is the
 /// one allocation from `event.attributes` itself spilling its inline capacity once the merge pushes
 /// the count from 4 to 10.
+///
+/// The warm-up call matters for more than the interner now: it also fills the parser's per-node
+/// key cache (`logit_core::interner::KeyCache`, one `Box<str>` per *first-seen* key), so the
+/// measured call is the steady state -- every key a cache hit, merged by `Symbol`
+/// (`AttrMap::insert_sym`), no interner probe at all. A cold parser would show 6 more.
 #[test]
 fn json_parse_one_event() {
     let mut json = fixtures::json_parser();
@@ -726,6 +731,28 @@ fn json_parse_wide_json_event() {
     let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
     assert_eq!(event.attributes.len(), 32, "28 JSON fields plus 4 syslog.* attributes");
     expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
+}
+
+/// The key cache's off-path: warmed on [`fixtures::NGINX_SYSLOG_LINE`], then fed the same six
+/// keys in the reverse order (`fixtures::NGINX_SYSLOG_LINE_REVERSED_KEYS`). Every key is still a
+/// hit -- found by the cache's wrapping scan rather than at its cursor -- so resynchronising costs
+/// the same single allocation (the `AttrMap` spill) as the in-order line, not a re-intern or a
+/// new cache entry per key.
+#[test]
+fn json_parse_reordered_keys_event() {
+    let mut json = fixtures::json_parser();
+    let resource = fixtures::resource();
+    let mut decoder = fixtures::syslog_decoder();
+    let warm = fixtures::nginx_syslog_datagram(1);
+    let reversed = fixtures::nginx_syslog_datagram_reversed_keys();
+
+    let warm = decoder.decode(warm).expect("should decode").events.pop().expect("one event");
+    drop(json.process(&resource, warm));
+
+    let event = decoder.decode(reversed).expect("should decode").events.pop().expect("one event");
+    let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
+    assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
+    expect_allocs("json: parse + merge 1 event with the keys reordered", stats, 1);
 }
 
 /// `csv`'s counterpart to [`json_parse_one_event`]: seven columns, one a quoted field containing

@@ -7,7 +7,7 @@
 //! `process`, taking the trait's default `flush_interval`/`flush`.
 
 use bytes::Bytes;
-use logit_core::interner::intern;
+use logit_core::interner::KeyCache;
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Value};
 use logit_pipeline::Transform;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -38,11 +38,22 @@ pub struct JsonParser {
     /// `collect_attrmap`) -- only the top-level result, which is merged into `event.attributes`
     /// and thrown away, is worth reusing.
     scratch: Vec<(Symbol, Value)>,
+    /// The second reused buffer: object keys seen so far, memoised `&str -> Symbol` so a repeat
+    /// key (which is every key of every line after the first, for a schema-shaped stream) costs
+    /// one `memcmp` instead of a probe of the process-wide interner. Shared by the top-level
+    /// object and every nested one -- their keys repeat just the same. See `KeyCache`'s docs
+    /// for the shape and the bound; the `json-parse` load-test scenario is why it exists.
+    keys: KeyCache,
 }
 
 impl JsonParser {
     pub fn new(skip_to_brace: bool) -> Self {
-        Self { skip_to_brace, diag: Diagnostics::default(), scratch: Vec::new() }
+        Self {
+            skip_to_brace,
+            diag: Diagnostics::default(),
+            scratch: Vec::new(),
+            keys: KeyCache::new(),
+        }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -83,9 +94,9 @@ impl Transform for JsonParser {
         // parse left behind.
         self.scratch.clear();
         let parsed = if self.skip_to_brace {
-            parse_object_prefix(&body, &mut self.scratch)
+            parse_object_prefix(&body, &mut self.scratch, &mut self.keys)
         } else {
-            parse_object(&body, &mut self.scratch)
+            parse_object(&body, &mut self.scratch, &mut self.keys)
         };
         match parsed {
             Ok(()) => {
@@ -119,9 +130,13 @@ impl Transform for JsonParser {
 
 /// Parses `json` as a single JSON object into `out`, requiring the whole buffer be consumed (only
 /// trailing whitespace allowed) -- the default-mode contract: "the whole line is the JSON data."
-fn parse_object(json: &Bytes, out: &mut Vec<(Symbol, Value)>) -> Result<(), serde_json::Error> {
+fn parse_object(
+    json: &Bytes,
+    out: &mut Vec<(Symbol, Value)>,
+    keys: &mut KeyCache,
+) -> Result<(), serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(json);
-    TopLevelSeed { base: json, out }.deserialize(&mut de)?;
+    TopLevelSeed { base: json, out, keys }.deserialize(&mut de)?;
     de.end()?;
     Ok(())
 }
@@ -132,9 +147,10 @@ fn parse_object(json: &Bytes, out: &mut Vec<(Symbol, Value)>) -> Result<(), serd
 fn parse_object_prefix(
     json: &Bytes,
     out: &mut Vec<(Symbol, Value)>,
+    keys: &mut KeyCache,
 ) -> Result<(), serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(json);
-    TopLevelSeed { base: json, out }.deserialize(&mut de)
+    TopLevelSeed { base: json, out, keys }.deserialize(&mut de)
 }
 
 /// Reconstructs a `Bytes` sharing `base`'s underlying allocation for a `&str` serde_json reported
@@ -160,23 +176,28 @@ fn borrowed_str_bytes(base: &Bytes, s: &str) -> Bytes {
 /// Deserializes a JSON value directly into a [`Value`], rather than through an intermediate
 /// `serde_json::Value` tree and a separate conversion -- halves the allocation per line, and lets
 /// an unescaped string stay a zero-copy slice of `base` (see [`borrowed_str_bytes`]).
-struct ValueSeed<'b> {
+struct ValueSeed<'b, 'k> {
     base: &'b Bytes,
+    /// Carried down so a nested object's keys go through the same [`KeyCache`] as the top
+    /// level's (see [`collect_attrmap`]) -- every seed below the top level is built per value,
+    /// so this is a fresh reborrow each time, never a move of the parser's `&mut`.
+    keys: &'k mut KeyCache,
 }
 
-impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_, '_> {
     type Value = Value;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
-        deserializer.deserialize_any(ValueVisitor { base: self.base })
+        deserializer.deserialize_any(ValueVisitor { base: self.base, keys: self.keys })
     }
 }
 
-struct ValueVisitor<'b> {
+struct ValueVisitor<'b, 'k> {
     base: &'b Bytes,
+    keys: &'k mut KeyCache,
 }
 
-impl<'de> Visitor<'de> for ValueVisitor<'_> {
+impl<'de> Visitor<'de> for ValueVisitor<'_, '_> {
     type Value = Value;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -225,14 +246,16 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
         let mut items = Vec::new();
-        while let Some(item) = seq.next_element_seed(ValueSeed { base: self.base })? {
+        while let Some(item) =
+            seq.next_element_seed(ValueSeed { base: self.base, keys: &mut *self.keys })?
+        {
             items.push(item);
         }
         Ok(Value::Array(items))
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Value, A::Error> {
-        Ok(Value::Map(Box::new(collect_attrmap(map, self.base)?)))
+        Ok(Value::Map(Box::new(collect_attrmap(map, self.base, self.keys)?)))
     }
 }
 
@@ -242,25 +265,31 @@ impl<'de> Visitor<'de> for ValueVisitor<'_> {
 /// ([`ValueVisitor::visit_map`], via [`collect_attrmap`]), the top-level result is never stored on
 /// an `Event` -- it's merged into `event.attributes` and discarded -- so it's collected straight
 /// into the caller's reused `Vec` instead of a freshly-allocated `AttrMap`.
-struct TopLevelSeed<'b, 'o> {
+struct TopLevelSeed<'b, 'o, 'k> {
     base: &'b Bytes,
     out: &'o mut Vec<(Symbol, Value)>,
+    keys: &'k mut KeyCache,
 }
 
-impl<'de> DeserializeSeed<'de> for TopLevelSeed<'_, '_> {
+impl<'de> DeserializeSeed<'de> for TopLevelSeed<'_, '_, '_> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        deserializer.deserialize_map(TopLevelVisitor { base: self.base, out: self.out })
+        deserializer.deserialize_map(TopLevelVisitor {
+            base: self.base,
+            out: self.out,
+            keys: self.keys,
+        })
     }
 }
 
-struct TopLevelVisitor<'b, 'o> {
+struct TopLevelVisitor<'b, 'o, 'k> {
     base: &'b Bytes,
     out: &'o mut Vec<(Symbol, Value)>,
+    keys: &'k mut KeyCache,
 }
 
-impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_> {
+impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -273,8 +302,9 @@ impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_> {
     // existing key rather than adding a second entry -- the same outcome, reached without a
     // binary search per key on a buffer that's thrown away right after.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(key) = map.next_key_seed(KeySeed)? {
-            let value = map.next_value_seed(ValueSeed { base: self.base })?;
+        while let Some(key) = map.next_key_seed(KeySeed { keys: &mut *self.keys })? {
+            let value =
+                map.next_value_seed(ValueSeed { base: self.base, keys: &mut *self.keys })?;
             self.out.push((key, value));
         }
         Ok(())
@@ -283,23 +313,29 @@ impl<'de> Visitor<'de> for TopLevelVisitor<'_, '_> {
 
 /// Deserializes a JSON object key straight to its interned [`Symbol`], rather than the owned
 /// `String` `next_key::<String>()` would otherwise allocate for every key regardless of whether it
-/// needed unescaping. `AttrMap` interns every key on insert anyway, so nothing about the interning
-/// itself changes -- this only removes the `String` that used to exist solely to be interned and
-/// then dropped. Measured: this is where most of `json`'s allocations were (`docs/design/
-/// memory.md`), not the intermediate map itself.
-struct KeySeed;
+/// needed unescaping. Measured: that `String` is where most of `json`'s allocations were
+/// (`docs/design/memory.md`), not the intermediate map itself. The `Symbol` comes from the
+/// parser's [`KeyCache`], so a key this parser has seen before -- every key of every line after
+/// the first, on a schema-shaped stream -- is one `memcmp` and never reaches the process-wide
+/// interner at all; it is interned exactly once, on first sight, and merged by `Symbol` from then
+/// on (`AttrMap::insert_sym` in `process` and [`collect_attrmap`]).
+struct KeySeed<'k> {
+    keys: &'k mut KeyCache,
+}
 
-impl<'de> DeserializeSeed<'de> for KeySeed {
+impl<'de> DeserializeSeed<'de> for KeySeed<'_> {
     type Value = Symbol;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Symbol, D::Error> {
-        deserializer.deserialize_str(KeyVisitor)
+        deserializer.deserialize_str(KeyVisitor { keys: self.keys })
     }
 }
 
-struct KeyVisitor;
+struct KeyVisitor<'k> {
+    keys: &'k mut KeyCache,
+}
 
-impl<'de> Visitor<'de> for KeyVisitor {
+impl<'de> Visitor<'de> for KeyVisitor<'_> {
     type Value = Symbol;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -309,28 +345,32 @@ impl<'de> Visitor<'de> for KeyVisitor {
     // The unescaped case: borrowed straight from the input, never materialized as an owned
     // `String` at all.
     fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Symbol, E> {
-        Ok(intern(v))
+        Ok(self.keys.get_or_intern(v))
     }
 
-    // The escaped case: `v` lives in serde_json's own scratch buffer, not `self.base` -- but
-    // `intern` only needs it long enough to hash and copy (on a never-before-seen key) or look up
-    // (on a repeat), so still no `String` of our own.
+    // The escaped case: `v` lives in serde_json's own scratch buffer, not `self.base` -- but the
+    // cache only needs it long enough to compare (on a repeat) or for `intern` to hash and copy
+    // (on a never-before-seen key), so still no `String` of our own.
     fn visit_str<E>(self, v: &str) -> Result<Symbol, E> {
-        Ok(intern(v))
+        Ok(self.keys.get_or_intern(v))
     }
 
     fn visit_string<E>(self, v: String) -> Result<Symbol, E> {
-        Ok(intern(&v))
+        Ok(self.keys.get_or_intern(&v))
     }
 }
 
 /// Used by [`ValueVisitor::visit_map`] to walk a *nested* JSON object's entries into an owned,
 /// independent `AttrMap` (`Value::Map`) -- unlike the top level, which goes through
 /// [`TopLevelVisitor`] instead and skips building an `AttrMap` at all (see its doc comment).
-fn collect_attrmap<'de, A: MapAccess<'de>>(mut map: A, base: &Bytes) -> Result<AttrMap, A::Error> {
+fn collect_attrmap<'de, A: MapAccess<'de>>(
+    mut map: A,
+    base: &Bytes,
+    keys: &mut KeyCache,
+) -> Result<AttrMap, A::Error> {
     let mut attrs = AttrMap::new();
-    while let Some(key) = map.next_key_seed(KeySeed)? {
-        let value = map.next_value_seed(ValueSeed { base })?;
+    while let Some(key) = map.next_key_seed(KeySeed { keys: &mut *keys })? {
+        let value = map.next_value_seed(ValueSeed { base, keys: &mut *keys })?;
         // Last-writer-wins on a duplicate key within one object -- `insert_sym` overwrites on an
         // equal `Symbol`, same as a parsed key overwriting a pre-existing attribute of the same
         // name. By `Symbol`, not `resolve(key)` -> `insert(&str)`: see `process`'s merge loop.
@@ -342,7 +382,7 @@ fn collect_attrmap<'de, A: MapAccess<'de>>(mut map: A, base: &Bytes) -> Result<A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::interner::intern;
+    use logit_core::interner::{self, intern, resolve};
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanKind};
     use logit_core::{SpanRecord, SpanStatus};
 
@@ -562,6 +602,115 @@ mod tests {
         nested.insert("b", Value::U64(2));
         assert_eq!(attr(&event, "n"), Some(&Value::Map(Box::new(nested))));
         assert_eq!(event.attributes.len(), 2, "a duplicate must overwrite, not add an entry");
+    }
+
+    // -- the per-parser key cache ------------------------------------------------------------
+
+    #[test]
+    fn keys_in_a_different_order_on_the_next_event_resolve_to_the_same_symbols() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let first = log_event(r#"{"a":1,"b":2,"c":3}"#);
+        let first = parser.process(&resource, first).expect("log events pass through");
+        assert_eq!(parser.keys.len(), 3);
+
+        let second = log_event(r#"{"c":30,"a":10}"#);
+        let second = parser.process(&resource, second).expect("log events pass through");
+        let third = log_event(r#"{"b":200,"c":300,"a":100,"d":400}"#);
+        let third = parser.process(&resource, third).expect("log events pass through");
+
+        assert_eq!(attr(&second, "a"), Some(&Value::U64(10)));
+        assert_eq!(attr(&second, "c"), Some(&Value::U64(30)));
+        assert_eq!(attr(&second, "b"), None);
+        assert_eq!(attr(&third, "a"), Some(&Value::U64(100)));
+        assert_eq!(attr(&third, "b"), Some(&Value::U64(200)));
+        assert_eq!(attr(&third, "c"), Some(&Value::U64(300)));
+        assert_eq!(attr(&third, "d"), Some(&Value::U64(400)));
+        // Same key, same `Symbol`, whichever event it came from.
+        for key in ["a", "b", "c"] {
+            let sym =
+                |e: &Event| e.attributes.iter().find(|(k, _)| resolve(*k) == key).map(|(k, _)| k);
+            assert_eq!(sym(&first), sym(&third), "{key}");
+        }
+        assert_eq!(parser.keys.len(), 4, "only the genuinely new key `d` was added");
+    }
+
+    /// `nextest` runs each test in its own process (`docs/design/memory.md` §7), so
+    /// `interner::len()` here reflects only this test.
+    #[test]
+    fn an_optional_key_missing_from_one_event_does_not_touch_the_interner() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let warm = log_event(r#"{"json_opt_a":1,"json_opt_b":2,"json_opt_c":3}"#);
+        drop(parser.process(&resource, warm));
+
+        let before = interner::len();
+        let event = log_event(r#"{"json_opt_a":1,"json_opt_c":3}"#);
+        let event = parser.process(&resource, event).expect("log events pass through");
+        assert_eq!(attr(&event, "json_opt_a"), Some(&Value::U64(1)));
+        assert_eq!(attr(&event, "json_opt_c"), Some(&Value::U64(3)));
+        assert_eq!(interner::len(), before, "every key was a cache hit");
+        assert_eq!(parser.keys.len(), 3);
+    }
+
+    #[test]
+    fn a_nested_key_that_repeats_a_top_level_name_shares_its_symbol_and_cache_entry() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let event = log_event(r#"{"id":1,"user":{"id":2}}"#);
+        let event = parser.process(&resource, event).expect("log events pass through");
+
+        assert_eq!(attr(&event, "id"), Some(&Value::U64(1)));
+        let Some(Value::Map(user)) = attr(&event, "user") else { panic!("user should be a map") };
+        assert_eq!(user.get("id"), Some(&Value::U64(2)));
+        assert_eq!(parser.keys.len(), 2, "`id` and `user` -- the nested `id` is the same entry");
+    }
+
+    #[test]
+    fn an_escaped_key_resolves_to_the_same_symbol_as_its_unescaped_form() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let event = log_event(r#"{"a\nb":1}"#);
+        let event = parser.process(&resource, event).expect("log events pass through");
+        assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(1)));
+        assert_eq!(parser.keys.len(), 1);
+
+        // Escaped and unescaped spellings of the same key are the same key.
+        let event = log_event("{\"a\nb\":2}".replace('\n', "\\u000a").as_str());
+        let event = parser.process(&resource, event).expect("log events pass through");
+        assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(2)));
+        assert_eq!(parser.keys.len(), 1);
+    }
+
+    #[test]
+    fn more_distinct_keys_than_the_cache_holds_still_all_parse() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let n = KeyCache::MAX_ENTRIES + 8;
+        let body: Vec<String> = (0..n).map(|i| format!(r#""json_cap_{i}":{i}"#)).collect();
+        let event = log_event(&format!("{{{}}}", body.join(",")));
+        let event = parser.process(&resource, event).expect("log events pass through");
+
+        assert_eq!(event.attributes.len(), n);
+        for i in 0..n {
+            assert_eq!(attr(&event, &format!("json_cap_{i}")), Some(&Value::U64(i as u64)));
+        }
+        assert_eq!(parser.keys.len(), KeyCache::MAX_ENTRIES);
+    }
+
+    #[test]
+    fn a_failed_parse_leaves_the_cache_usable() {
+        let mut parser = JsonParser::new(false);
+        let resource = default_resource();
+        let bad = log_event(r#"{"a":1,"b":"#);
+        let bad = parser.process(&resource, bad).expect("log events pass through");
+        assert!(bad.attributes.is_empty());
+
+        let good = log_event(r#"{"a":1,"b":2}"#);
+        let good = parser.process(&resource, good).expect("log events pass through");
+        assert_eq!(attr(&good, "a"), Some(&Value::U64(1)));
+        assert_eq!(attr(&good, "b"), Some(&Value::U64(2)));
+        assert_eq!(parser.keys.len(), 2);
     }
 
     #[test]

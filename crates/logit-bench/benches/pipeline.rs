@@ -93,6 +93,21 @@ fn json_parse(bencher: Bencher) {
         .bench_local_values(|event| json.process(&resource, event));
 }
 
+/// [`json_parse`] on the 28-key pino-shaped line (`fixtures::WIDE_JSON_SYSLOG_LINE`) -- the
+/// per-key cost, which is what the parser's key cache is for, at a width where it dominates.
+#[divan::bench]
+fn json_parse_wide(bencher: Bencher) {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::wide_json_syslog_datagram(1);
+    bencher
+        .with_inputs(|| {
+            decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("an event")
+        })
+        .bench_local_values(|event| json.process(&resource, event));
+}
+
 #[divan::bench]
 fn kv_metrics(bencher: Bencher) {
     let resource = fixtures::resource();
