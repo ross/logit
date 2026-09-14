@@ -492,7 +492,9 @@ Worked examples, one per shipped component:
   runs on `logit-inputs::tcp::TcpListener` instead, exactly as a TCP `syslog_in`/`graphite_in`
   does, and records that driver's stream set in place of the datagram pair — nothing statsd-
   specific, and nothing this component writes itself: `logit.input.connections` (gauge) and
-  `logit.input.connections.rejected{reason="limit"}` (count), `logit.input.frames` /
+  `logit.input.connections.rejected{reason="limit"}` (count), `logit.input.connections.closed
+  {reason="idle"}` (count — an operator-configured `idle_timeout:` closed the connection; policy,
+  not a fault, and only ever counted when the field is set), `logit.input.frames` /
   `logit.input.frame.bytes` (count/sum, where one *frame* is one LF-delimited statsd line), and
   `logit.input.frames.dropped{reason}`. Only two of that reason set can occur here: `oversize`, a
   line past the driver's 64 KiB bound — dropped and counted once, the connection kept and the line
@@ -506,7 +508,8 @@ Worked examples, one per shipped component:
   `malformed` cannot occur: it is an octet count RFC 6587's grammar doesn't permit, and
   nothing here ever reads one. Both report on the `framing_error` diagnostic key, distinct from
   `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
-  first byte inside the handshake budget). A line that *parses* badly is not a framing error at
+  first byte inside the handshake budget — never an idle close, which is counted, not diagnosed).
+  A line that *parses* badly is not a framing error at
   all: it is the decoder's own `bad_line`, on either transport, throttled per listener since every
   connection's decoder clone shares one set of counts. The driver's `bad_frame` key fires only for
   the single whole-frame failure `StatsdDecoder::decode_into` can return, a frame that is not valid
@@ -524,6 +527,8 @@ Worked examples, one per shipped component:
   `logit.input.connections.rejected{reason="limit"}` (count), reused verbatim from `logit_in`
   below — the gauge counts permit holders only, and a past-the-cap connection is closed before
   any TLS handshake, since syslog has no in-band reject message to spend one on;
+  `logit.input.connections.closed{reason="idle"}` (count — an operator-configured `idle_timeout:`
+  closed the connection; policy, not a fault, and only ever counted when the field is set);
   `logit.input.frames` / `logit.input.frame.bytes` (count/sum), the stream twin of
   `logit.input.datagrams`/`.datagram.bytes` at the transport's own unit, an RFC 6587 frame; and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` (count) — the same
@@ -536,7 +541,8 @@ Worked examples, one per shipped component:
   EOF is *not* truncation: a terminator-less remainder is an ordinary final message and is
   emitted.) All three report on one `framing_error` diagnostic key, distinct from
   `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
-  first byte inside the handshake budget and so gave its permit back). A frame that *parses*
+  first byte inside the handshake budget and so gave its permit back — never an idle close, which
+  is counted, not diagnosed). A frame that *parses*
   badly is not a framing error at all: `SyslogDecoder::decode_into` is infallible, so a rejected
   syslog message reports as the decoder's own `bad_line` on either transport, and the driver's
   `bad_frame` key — for a decoder that can fail a whole frame — stays unused here.
@@ -577,7 +583,9 @@ Worked examples, one per shipped component:
   That is `logit.input.connections` (gauge, sampled on every connect and disconnect) and
   `logit.input.connections.rejected{reason="limit"}` (count -- the 1024-connection cap actually
   binding, the reject-don't-queue shape, since carbon's wire has no way to say "try later");
-  `logit.input.frames` / `.frame.bytes` under **both** protocols, where one frame is one plaintext
+  `logit.input.connections.closed{reason="idle"}` (count -- an operator-configured
+  `idle_timeout:` closed the connection; policy, not a fault, and only ever counted when the field
+  is set); `logit.input.frames` / `.frame.bytes` under **both** protocols, where one frame is one plaintext
   line or one pickle payload, counted at the size the decoder was handed (a pickle frame's own
   4-byte length prefix is stripped before the count, so it is the payload, not the wire framing);
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`; and
@@ -606,8 +614,9 @@ Worked examples, one per shipped component:
   since the plaintext path isolates every failure per line) and `connection_error` (one
   connection's I/O failing, a TLS accept that failed or timed out, or a connection that produced
   no first byte inside `handshake_timeout` and so gave its permit back -- never fatal to the
-  listener or its siblings). A TLS `graphite_in` adds no metric of its own: a handshake failure
-  surfaces through that same diagnostic.
+  listener or its siblings, and never an idle close, which is counted, not diagnosed). A TLS
+  `graphite_in` adds no metric of its own: a handshake failure surfaces through that same
+  diagnostic.
 - `otlp_in` (`crates/logit-inputs/src/otlp.rs`,
   [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)): **the
   stream-transport pair and nothing at layer 3 below it.** `logit.input.connections` (gauge,
@@ -617,13 +626,18 @@ Worked examples, one per shipped component:
   loop rejects at the cap rather than queueing behind a permit, so there is a refusal to count,
   and the gauge counts permit holders only. A past-the-cap connection is dropped before any TLS
   accept — OTLP has no in-band "try later" to spend a handshake delivering — so a rejection is
-  never also a handshake. There is no frame/request counter under them: this input's unit of
+  never also a handshake. `logit.input.connections.closed{reason="idle"}` (count) is the third
+  point shared with every other listener: an operator-configured `idle_timeout:` closed the
+  connection — `graceful_shutdown()`, a bounded grace, then drop, the same close a stalled request
+  body's `408`/`grpc-status: 4` reaches too — policy, not a fault, and only ever counted when the
+  field is set. There is no frame/request counter under them: this input's unit of
   arrival is an HTTP request or a gRPC call, and `Fanout`'s own per-batch view already sees one
   batch per accepted request, so a counter here would only restate it. `Diagnostics` keys,
   mirrored as `logit.component.diagnostics{key}` by the bridge: `bound`, and `connection_error` —
   one connection's I/O failing, a TLS accept that failed or timed out, or a plaintext connection
   held open past `handshake_timeout` without producing a first byte, which then gave its permit
-  back. A plaintext peer that *closes cleanly* before sending anything is deliberately not counted
+  back — never an idle close, which is counted above, not diagnosed here. A plaintext peer that
+  *closes cleanly* before sending anything is deliberately not counted
   there: that is what a TCP health check looks like, and counting it would put one point per probe
   interval on this key forever. There is no
   TLS-specific metric: a handshake failure surfaces through that same diagnostic.
@@ -654,7 +668,12 @@ Worked examples, one per shipped component:
   on every connect/disconnect) and `logit.input.connections.rejected{reason="limit"}` (count — the
   1024-connection cap actually binding; `otlp_in` and a TCP `syslog_in`/`graphite_in`/`statsd_in`
   on the shared driver record the same pair, all five rejecting at the cap rather than queueing
-  behind a permit).
+  behind a permit). `logit.input.connections.closed{reason="idle"}` (count) is the third point all
+  five share: an operator-configured `idle_timeout:` closed the connection — measured from the
+  last `Ack` written rather than from bytes read, since a peer waiting on a delayed ack is not
+  idle — after writing `Reject{GOING_AWAY, "idle for <dur>"}`, the same signal an ordinary
+  shutdown sends. Policy, not a fault: it returns `Ok(())`, never `logit.proto.errors{reason=
+  "handshake"}` or any other diagnostic here, and is counted, not diagnosed.
 - `generate_in` (`crates/logit-inputs/src/generate.rs`,
   [ADR `load-test-harness`](../adr/load-test-harness.md)): **layer 2 only, no layer-3 points at
   all** — the runtime's own `logit.component.events.sent` on this node's fanout edge already *is*
