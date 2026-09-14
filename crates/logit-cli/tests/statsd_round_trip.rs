@@ -1123,19 +1123,21 @@ mod tcp {
 
 // ---- transport: tls -------------------------------------------------------------------------
 
-/// `statsd_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative case.
+/// `statsd_out` -> `statsd_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative
+/// case, driven by the real sink, exactly the shape `syslog_round_trip.rs`'s `mod tls` has.
 ///
-/// **The input half only.** `statsd_out` has no `tls:` block yet: that is the sink side of
-/// `docs/adr/statsd-output.md`'s own TLS work, landing right after this listener does, and when
-/// it does these tests gain a real `statsd_out -> statsd_in` TLS leg alongside the raw client
-/// below -- exactly the shape `syslog_round_trip.rs`'s `mod tls` already has. Until then the
-/// client is a raw `tokio_rustls` one, driven straight against the listener, which is enough to
-/// pin everything the listener itself is responsible for: that `with_tls` reaches the shared
-/// driver, that a `client_ca_file` really does require a client certificate, and that a client
-/// trusting the wrong CA is refused without taking the listener down with it.
+/// **Two clients, deliberately.** The three round trips run the real `statsd_out` with its own
+/// `tls:` block (`docs/adr/statsd-output.md`'s TLS amendment), which is what a deployment
+/// actually looks like and pins both halves at once. One raw `tokio_rustls` client survives
+/// alongside them, because it asserts something the sink cannot reach: that a *refused* handshake
+/// leaves the listener still serving everyone else. `statsd_out`'s own wrong-CA case asserts the
+/// sink-side `Fault` instead, which a raw client has no concept of -- the two are different
+/// halves of the same failure, not a duplicate.
 mod tls {
     use super::*;
     use logit_inputs::tcp::TlsServerSettings;
+    use logit_outputs::statsd::TlsClientSettings;
+    use logit_pipeline::{classify, Fault};
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::Arc;
@@ -1244,32 +1246,110 @@ mod tls {
         logit_core::interner::resolve(batch.events[0].metrics[0].name)
     }
 
+    /// Sends `batch` through a real TLS `statsd_out` built with `settings` and returns what
+    /// `statsd_in` decoded on the other end (receipt-time `timestamp` fields normalized, exactly
+    /// as every other harness in this file does). `localhost` rather than `127.0.0.1`, since
+    /// `testdata/tls/server.pem`'s SAN is what the sink's own SNI has to match.
+    async fn round_trip_over_tls(
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<Delivered>,
+        settings: TlsClientSettings,
+        batch: &EventBatch,
+    ) -> EventBatch {
+        let mut output =
+            StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(&settings, &testdata_dir())
+                .expect("a tls: block is legal on a tcp statsd_out");
+        output.send(batch).await.expect("send over TLS should succeed");
+        // Dropping it EOFs the listener's connection task, which flushes what it has accumulated
+        // straight away rather than on the 100ms batch timer.
+        drop(output);
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("statsd_in should decode and forward the batch")
+            .expect("the Fanout channel should not have closed");
+        let mut decoded = logit_pipeline::unwrap_batch(delivered);
+        normalize_receipt_time(&mut decoded);
+        decoded
+    }
+
     /// Server TLS only: `statsd_in` presents `server.pem`/`server.key` with no `client_ca_file`,
-    /// so any client is accepted once the handshake itself completes -- and its statsd lines
-    /// decode exactly as they would in the clear, tags and all.
+    /// so any client is accepted once the handshake itself completes -- and a real
+    /// `statsd_out -> statsd_in` relay over it is a fixed point, tags and all, exactly as it is
+    /// in the clear.
     #[tokio::test]
-    async fn server_tls_decodes_a_statsd_line() {
+    async fn server_tls_round_trips_a_batch() {
         let (addr, mut rx) = spawn_tls_input(&server_settings(None)).await;
-        let batch =
-            send_over_tls(&connector("ca.pem", None), addr, &mut rx, b"over.tls:3|c|#env:prod\n")
-                .await;
-        assert_eq!(batch.events.len(), 1);
-        assert_eq!(metric_name(&batch), "over.tls");
-        assert_eq!(batch.events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+        let sent = direct_batch(b"over.tls:3|c|#env:prod\n");
+        let decoded = round_trip_over_tls(
+            addr,
+            &mut rx,
+            TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+            &sent,
+        )
+        .await;
+
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(metric_name(&decoded), "over.tls");
+        assert_eq!(decoded.events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+        assert_eq!(decoded, sent, "TLS changes the transport, not the relayed batch");
     }
 
     /// Mutual TLS: `statsd_in` requires a client certificate chaining to `ca.pem`
-    /// (`client_ca_file`), the client presents `client.pem`/`client.key` -- both signed by the
+    /// (`client_ca_file`), `statsd_out` presents `client.pem`/`client.key` -- both signed by the
     /// same test CA (`testdata/tls/regen.sh`).
     #[tokio::test]
-    async fn mutual_tls_decodes_a_statsd_line() {
+    async fn mutual_tls_round_trips_a_batch() {
         let (addr, mut rx) = spawn_tls_input(&server_settings(Some("ca.pem"))).await;
-        let client = connector("ca.pem", Some(("client.pem", "client.key")));
-        let batch = send_over_tls(&client, addr, &mut rx, b"mutual.tls:1|c\n").await;
-        assert_eq!(metric_name(&batch), "mutual.tls");
+        let sent = direct_batch(b"mutual.tls:1|c\n");
+        let decoded = round_trip_over_tls(
+            addr,
+            &mut rx,
+            TlsClientSettings {
+                ca_file: Some("ca.pem".to_string()),
+                cert_file: Some("client.pem".to_string()),
+                key_file: Some("client.key".to_string()),
+                insecure_skip_verify: false,
+            },
+            &sent,
+        )
+        .await;
+        assert_eq!(metric_name(&decoded), "mutual.tls");
+        assert_eq!(decoded, sent);
     }
 
-    /// The negative case: a client trusting `other-ca.pem`, which never signed `server.pem`, is
+    /// The sink-side negative: `statsd_out` trusts `other-ca.pem`, which never signed
+    /// `server.pem`, so *this* side's own certificate verification fails the handshake before a
+    /// single byte of the batch has left the host -- `Fault::Clean`, and deterministically so.
+    ///
+    /// Deterministic for the same reason `syslog_round_trip.rs`'s twin gives: a *server*-cert
+    /// rejection happens inside the client's own verification, before `TlsConnector::connect`
+    /// even completes, unlike a client-cert rejection, which under TLS 1.3 this write-only sink
+    /// never sees at all.
+    #[tokio::test]
+    async fn a_statsd_out_trusting_the_wrong_ca_is_refused_and_classified_clean() {
+        let (addr, _rx) = spawn_tls_input(&server_settings(None)).await;
+        let mut output =
+            StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
+                .with_tls(
+                    &TlsClientSettings {
+                        ca_file: Some("other-ca.pem".to_string()),
+                        ..Default::default()
+                    },
+                    &testdata_dir(),
+                )
+                .expect("a tls: block is legal on the tcp transport");
+
+        let err = output
+            .send(&direct_batch(b"never.arrives:1|c\n"))
+            .await
+            .expect_err("an untrusted CA must fail the handshake");
+        assert_eq!(classify(&err), Fault::Clean);
+    }
+
+    /// The listener-side half of the same failure, and the one a `statsd_out` cannot assert: a
+    /// raw client trusting `other-ca.pem`, which never signed `server.pem`, is
     /// refused inside its own certificate verification -- and the half that matters for a relay,
     /// the listener keeps serving everyone else afterwards.
     #[tokio::test]
