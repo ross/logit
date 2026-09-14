@@ -14,8 +14,9 @@ Every TCP listener in the tree bounds its *pre*-message phases and nothing past 
 `handshake_timeout:` (`crates/logit-config/src/lib.rs`) is operator-tunable on all five TCP-capable
 listener kinds -- `syslog_in`, `graphite_in`, `statsd_in` (each `transport: tcp`), `logit_in`, and
 `otlp_in` -- and bounds each pre-message phase separately: the TLS accept when `tls:` is set, then
-the wait for the connection's first byte (a `Hello` for `logit_in`, a peeked byte for the other
-four). What none of the five bounds is what happens *after* that: a connection that completes its
+the wait for the connection's first byte (a `Hello` for `logit_in`, the framer's first byte for
+`syslog_in`/`graphite_in`/`statsd_in`, a peeked first byte for `otlp_in`). What none of the five
+bounds is what happens *after* that: a connection that completes its
 handshake (or, on a plaintext listener, delivers at least one byte) and then goes silent holds its
 connection-cap permit -- 1024 on every one of the five -- indefinitely, right up to the cap itself. A
 slow-loris-shaped client can exhaust that cap with connections that will never send another byte.
@@ -68,9 +69,10 @@ an operator turns it on.
 already uses). Absent means today's behaviour, unchanged: no idle bound, a quiet connection is never
 closed for silence alone. A new graph rule (53) enforces the field's only two constraints, sharing
 one rule body across all five match arms rather than five near-duplicate checks: `Some(Duration::ZERO)`
-is rejected ("omit the field to disable the idle timeout" -- the same wording rule 45 uses for
-`handshake_timeout`'s zero case), and a `Some(_)` value under `transport: udp` on `syslog_in`,
-`graphite_in`, or `statsd_in` is rejected too, because a UDP listener has no connection to time out.
+is rejected with "omit the field to disable the idle timeout" (rule 45 also rejects zero, but
+`handshake_timeout` has no off state, so the wording is new here), and a `Some(_)` value under
+`transport: udp` on `syslog_in`, `graphite_in`, or `statsd_in` is rejected too, because a UDP
+listener has no connection to time out.
 
 ### The reset rule: the clock runs only while the listener is waiting on the socket
 
@@ -265,4 +267,4 @@ comment.
   corresponding movement in `connection_error` is the expected, healthy signature of the feature
   doing its job rather than something to investigate.
 - No new crate dependency: `Notify`, `poll_fn`, `ReadBuf`, `Instant::checked_add`/`far_future`, and
-  `BodyExt::frame` are all already in the dependency tree the workstreams below build on.
+  `BodyExt::frame` are all already in the dependency tree the workstreams above build on.
