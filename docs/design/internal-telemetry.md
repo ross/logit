@@ -498,8 +498,12 @@ Worked examples, one per shipped component:
   line past the driver's 64 KiB bound — dropped and counted once, the connection kept and the line
   after it still decoded, since a statsd listener frames `Lines{DrainToNextLine}` and never
   RFC 6587's octet counting (a statsd line may legally begin with a digit) — and `truncated`, a
-  partial line left buffered when a connection ends abruptly or this listener shuts down
-  mid-message. `malformed` cannot: it is an octet count RFC 6587's grammar doesn't permit, and
+  partial line left buffered when a connection ends: abruptly, on shutdown mid-message, **or on a
+  clean close with the final line unterminated**. That last case is where a line protocol parts
+  company with `syslog_in` above: RFC 6587 §3.4.2 explicitly permits a terminator-less final
+  message, statsd does not, and emitting a half-line here would turn a sender dying mid-write into
+  a plausible-looking metric. A whitespace-only remainder is not counted — nothing was lost.
+  `malformed` cannot occur: it is an octet count RFC 6587's grammar doesn't permit, and
   nothing here ever reads one. Both report on the `framing_error` diagnostic key, distinct from
   `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
   first byte inside the handshake budget). A line that *parses* badly is not a framing error at

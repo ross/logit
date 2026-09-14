@@ -34,6 +34,17 @@
 //! statsd line, and latching octet counting on it would reframe the whole connection off a
 //! metric name. `a_tcp_line_starting_with_a_digit_is_not_read_as_an_octet_count` is the pin.
 //!
+//! **The LF is the completeness signal, at the end of the stream too.** A connection that closes
+//! cleanly with an unterminated final line leaves a remainder the driver does *not* emit: it is
+//! dropped and counted `logit.input.frames.dropped{reason="truncated"}` (diagnostic
+//! `framing_error`), the same as an abrupt close or a shutdown mid-line. A whitespace-only
+//! remainder -- trailing padding, a bare `CR` -- is not counted, since nothing was lost. That is
+//! [`FramingMode::Lines`]'s rule in the driver, and the right one here: emitting a half-line would
+//! turn a sender dying mid-write into a metric with a truncated name or a truncated value, which
+//! decodes as a perfectly plausible datapoint rather than as an error. It differs from
+//! `syslog_in`'s, deliberately -- RFC 6587 §3.4.2 explicitly permits a terminator-less final
+//! message, and statsd has no such licence.
+//!
 //! Oversize is **recoverable**, not fatal: a line past the driver's 64 KiB
 //! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) bound is dropped, counted once as
 //! `logit.input.frames.dropped{reason="oversize"}`, and the connection resynchronizes at the next
@@ -1993,6 +2004,7 @@ mod tests {
         rx: tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>,
         shutdown: watch::Sender<bool>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        registry: Arc<logit_core::telemetry::Registry>,
     }
 
     impl RunningTcp {
@@ -2016,11 +2028,16 @@ mod tests {
     /// flush timer, so every delivery is attributable to exactly one line rather than to a
     /// 100ms tick.
     async fn start_tcp(build: impl FnOnce(StatsdInput) -> StatsdInput) -> RunningTcp {
-        let input = StatsdInput::tcp("127.0.0.1:0").with_tcp_receive(TcpListenerConfig {
-            batch_max_events: 1,
-            batch_flush_interval: Duration::ZERO,
-            ..TcpListenerConfig::default()
-        });
+        let registry = logit_core::telemetry::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let input = StatsdInput::tcp("127.0.0.1:0")
+            .with_diagnostics(Diagnostics::new("statsd_in").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+            .with_tcp_receive(TcpListenerConfig {
+                batch_max_events: 1,
+                batch_flush_interval: Duration::ZERO,
+                ..TcpListenerConfig::default()
+            });
         let mut input = build(input);
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() should leave a real address behind");
@@ -2030,7 +2047,28 @@ mod tests {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let handle =
             tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
-        RunningTcp { addr, rx, shutdown, handle }
+        RunningTcp { addr, rx, shutdown, handle, registry }
+    }
+
+    /// The summed value of every counter point named `metric` in an already-drained `events`,
+    /// optionally narrowed to one tag -- `crate::graphite`'s own `metric_sum`, verbatim.
+    fn metric_sum(events: &[Event], metric: &str, tag: Option<(&str, &str)>) -> f64 {
+        events
+            .iter()
+            .filter(|event| match tag {
+                Some((key, value)) => {
+                    event.attributes.get(key).and_then(Value::as_str) == Some(value)
+                }
+                None => true,
+            })
+            .flat_map(|event| &event.metrics)
+            .filter(|m| m.name == intern(metric))
+            .map(|m| match &m.kind {
+                MetricKind::Sum(sum) => sum.value,
+                MetricKind::Gauge(v) => *v,
+                other => panic!("{metric} should be a counter or a gauge, got {other:?}"),
+            })
+            .sum()
     }
 
     fn metric_name(event: &Event) -> &'static str {
@@ -2179,6 +2217,46 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(metric_name(&events[0]), "over.tls");
         assert_eq!(events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// A connection that closes *cleanly* with an unterminated final line loses that line: under
+    /// [`FramingMode::Lines`] the driver's `Framer::finish` returns `Truncated` rather than
+    /// emitting the remainder as a final message (`crate::tcp`, and
+    /// `docs/adr/syslog-tcp-ingress-and-tls.md`'s amendment). Worth a socket test here and not
+    /// only in the framer, for the reason `crate::graphite`'s twin gives: `page.views:1|c` stops
+    /// at a point where what is left still *looks* decodable, so emitting it would silently
+    /// produce a plausible counter rather than a visible error. Every other case in this module
+    /// terminates its lines, which makes this the one place the rule is observable from
+    /// `statsd_in` itself.
+    #[tokio::test]
+    async fn an_unterminated_tail_at_a_clean_close_is_dropped_and_counted_truncated() {
+        let mut running = start_tcp(|input| input).await;
+        let mut client = running.connect().await;
+        // No trailing newline: the sender got this far and stopped.
+        client.write_all(b"page.views:1|c").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client); // a clean FIN, not an RST
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), running.rx.recv()).await.is_err(),
+            "half a line is not a metric -- nothing should be delivered"
+        );
+
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            1.0,
+            "and the loss is counted, exactly as an abrupt close's is"
+        );
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames", None),
+            0.0,
+            "the remainder never became a frame"
+        );
 
         running.shutdown.send(true).ok();
         running.handle.abort();

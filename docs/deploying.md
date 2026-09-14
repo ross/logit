@@ -563,6 +563,13 @@ components:
   counted once (`logit.input.frames.dropped{reason="oversize"}`, diagnostic `framing_error`), the
   reader drains to the next newline, and the line after it still decodes. There is deliberately no
   `max_line_bytes` knob to tune — unlike carbon, no statsd server exposes one for you to match.
+- **An unterminated final line is dropped, not delivered.** A sender that closes with a partial
+  line leaves bytes the listener will not emit: they are counted
+  `logit.input.frames.dropped{reason="truncated"}` and discarded, the same as a connection that
+  dies mid-line. The LF is a statsd line's only completeness signal, and half of `page.views:1|c`
+  still looks like a valid metric — delivering it would be silent corruption. (This is where a
+  line protocol differs from `syslog_in`, whose RFC 6587 framing explicitly permits a
+  terminator-less last message.) Trailing whitespace-only padding is not counted.
 - **`tls:` is TCP-only, and its presence makes TLS required.** There is no plaintext fallback on a
   TLS listener, and `logit validate` rejects a `tls:` block under `transport: udp` (rule 43 — DTLS
   is out of scope everywhere in this project, and no statsd client speaks it). Plain statsd clients
