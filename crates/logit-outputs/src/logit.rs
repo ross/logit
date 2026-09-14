@@ -143,12 +143,20 @@ impl LogitOutput {
     /// Turns on TLS for this connection (`tls:` in config) -- presence turns it on, the
     /// `otlp_in`/`logit_in` server-side precedent, since `endpoint` here is a bare `host:port`
     /// (the `syslog_out` shape) with no scheme to select TLS the way `otlp_out`'s URL-shaped
-    /// endpoint does.
+    /// endpoint does. Warns via `self.diag` when `insecure_skip_verify` is set, the same
+    /// `otlp_out`/`syslog_out`/`prometheus_in` precedent (`logit-config/src/lib.rs`'s
+    /// `TlsClientConfig::insecure_skip_verify` doc comment promises this everywhere).
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
         base_dir: &Path,
     ) -> anyhow::Result<Self> {
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "tls.insecure_skip_verify is set -- the connection is encrypted, but this \
+                 output will accept any certificate the peer presents, self-signed or otherwise",
+            );
+        }
         self.tls = Some(Arc::new(crate::tls::build_client_config(settings, base_dir)?));
         Ok(self)
     }
