@@ -455,6 +455,10 @@ tag set and a timestamp.
 `graphite_in` ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)) is a carbon receiver:
 point a `write_graphite` plugin, a StatsD backend, a `carbon-relay` or anything else that speaks
 carbon at it. It is one component with two settings that change a great deal about how it behaves.
+[`examples/graphite-relay.yaml`](../examples/graphite-relay.yaml) is the like-for-like runnable
+topology (`graphite_in` straight into `graphite_out`, every default present as a commented
+reference); [`examples/statsd-to-graphite.yaml`](../examples/statsd-to-graphite.yaml) is the
+cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out`.
 
 - **`transport:` picks the driver.** `tcp` is the default, matching carbon's own default listener
   (plaintext on port 2003). A TCP listener serves up to 1024 connections at once; one arriving past
@@ -463,6 +467,9 @@ carbon at it. It is one component with two settings that change a great deal abo
   "try later" and a sender holding an accepted-but-unread connection would look healthy while
   delivering nothing. `udp` runs the same shared datagram listener `statsd_in`/`collectd_in`/
   `syslog_in` do, so everything in the receive-queue section above applies to it unchanged.
+  **Known gap:** unlike `syslog_in`/`otlp_in`/`logit_in`, `graphite_in` has no `handshake_timeout`
+  field at all, so a TCP peer that connects and sends nothing holds one of those 1024 permits
+  indefinitely — see `docs/known-gaps.md`'s "`graphite_in` over TCP has no `handshake_timeout`" row.
 - **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
   block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
@@ -550,6 +557,57 @@ reference. Three things worth knowing before deploying one:
   `logit.output.metrics.skipped{reason="no_host"}` with a `no_host` diagnostic. That is deliberate —
   collectd's receiver rejects an empty host, and inventing one would merge every unlabelled sender
   into a single host's metrics.
+
+### `graphite_out`: relaying to Carbon
+
+`graphite_out` is the sink to reach for when the destination is a real Carbon/Graphite listener
+(or anything else speaking its wire protocols) rather than a general time-series database:
+`graphite_in -> graphite_out` is a fixed point modulo the named normalization list in
+[ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md). Unlike `collectd_out`, both transports
+are supported — carbon's own plaintext listener (port 2003) speaks either UDP or TCP — and there is
+a second wire protocol entirely, carbon's length-prefixed pickle batch format (port 2004, **TCP
+only**: a length prefix has no meaning in a datagram, and `logit validate` rejects `protocol:
+pickle` under `transport: udp`). See `graphite_in`'s own section above for the two runnable
+examples pointing at this sink. Four things worth knowing before deploying one:
+
+- **There is no `graphite.*` carrier, unlike `collectd_out`'s `collectd.*` or `syslog_out`'s
+  `syslog.*`.** The wire path *is* [`MetricRecord::name`](design/data-model.md) — there is no
+  separate `prefix:`/`template:` field and nothing to restore identity from if it changes downstream.
+  This means a `lua`/`set` stage that renames a metric between `graphite_in` and `graphite_out`
+  **silently changes the series carbon stores it under** — there is no wire fact left to notice the
+  rename against, unlike a collectd or syslog relay, where the identity attributes ride alongside
+  the (possibly transformed) rest of the event. If a pipeline renames metrics on the way through,
+  that rename *is* the intended new wire path; there is no way to keep the old one going out this
+  sink.
+- **`tags: carbon` (the default) against a pre-1.1 Graphite silently corrupts data on disk.**
+  Carbon versions before 1.1 have no tag support at all, and their whisper backend takes whatever
+  the plaintext path contains straight into a filesystem path — a `;env=prod` tag suffix becomes
+  literal `;` characters in a **whisper directory name**, not a rejected line. There is no error to
+  see; `carbon-cache` simply creates directories nobody intended. If the destination might be an
+  older Graphite, set `tags: drop` — every attribute is then omitted from the wire entirely (counted
+  `logit.output.tags.dropped{reason="dialect"}`), which is the escape hatch this switch exists for.
+  Confirm the destination's tag support before turning `tags: carbon` on against an unfamiliar
+  cluster.
+- **`multi_value: skip` (the default) drops anything carbon's one-number-per-datapoint wire can't
+  carry** — `Samples`, `Distribution`, `Histogram`, `ExponentialHistogram`, `Summary`, `Set`, and
+  `SetMembers` records are all dropped whole and counted
+  `logit.output.metrics.skipped{metric_kind=...}` rather than guessing at a convention. Set
+  `multi_value: expand` to render the dotted sub-paths `logit_proto::graphite`'s module doc tables
+  instead (`.count`, `.sum`, `.q0_5`...`.q0_99`, per-bucket counts, and so on) — an explicit,
+  named convention rather than a silent default, counted
+  `logit.output.metrics.degraded{metric_kind=...}` once per record.
+- **`max_packet_bytes:` (UDP only, default `1432`) bounds a datagram, not a single line**, the same
+  shape as `statsd_out`'s own setting; `max_frame_bytes:` (default `1MiB`, Twisted's own
+  `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame instead, and applies regardless of
+  transport since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) is
+  `statsd_out`'s/`syslog_out`'s own default. This sink is also the first non-HTTP sink with a real
+  destination to report `duplicate_safe: true` (`null_out` reports it trivially, having no
+  destination) — whisper is last-write-wins per `(path, second)`, so a
+  redelivered datapoint on retry simply overwrites itself with the same number rather than
+  double-counting, unlike a collectd COUNTER or a statsd `|c`. That argument is specifically about
+  whisper's own storage semantics, not the carbon wire protocol in the abstract — a non-whisper
+  Graphite-protocol receiver could treat a redelivered datapoint as an addition instead, and this
+  sink has no way to tell the difference.
 
 ## Tailing files and Docker logs
 

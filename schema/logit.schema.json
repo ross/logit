@@ -1575,6 +1575,75 @@
           }
         },
         {
+          "description": "Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay: path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the other end. See `docs/adr/graphite-carbon-relay.md` and `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).",
+          "type": "object",
+          "required": [
+            "endpoint",
+            "type"
+          ],
+          "properties": {
+            "connect_timeout": {
+              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.",
+              "default": "5s",
+              "type": "string"
+            },
+            "endpoint": {
+              "description": "`host:port`. Resolved at send time, never at config-load time -- the same `statsd_out`/`collectd_out` precedent.",
+              "type": "string"
+            },
+            "max_frame_bytes": {
+              "description": "The longest pickle payload this sink will pack into one length-prefixed frame. Defaults to `\"1MiB\"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound carbon's own pickle receiver enforces, so a relay never writes a frame the far end would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and rejects `0`.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "max_packet_bytes": {
+              "description": "Bounds one UDP datagram's worth of packed plaintext lines (several lines newline-joined per send) -- not a single line's length, and ignored under `transport: tcp`, which has no datagram to overflow. Defaults to `\"1432\"`, the same \"commodity Ethernet LAN\" figure `statsd_out`'s own `max_packet_bytes` uses. A string via [`human_bytes`]. Rule 38 rejects `0`.",
+              "default": "1432",
+              "type": "string"
+            },
+            "multi_value": {
+              "description": "What to do with a metric kind carbon's one-number-per-datapoint wire cannot carry. `skip` (the default) drops the record, counted; `expand` renders the dotted sub-paths `crates/logit-proto/src/graphite/mod.rs`'s module doc tables, counted degraded.",
+              "default": "skip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteMultiValue"
+                }
+              ]
+            },
+            "protocol": {
+              "default": "plaintext",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteProtocol"
+                }
+              ]
+            },
+            "tags": {
+              "description": "Whether to render event attributes as carbon tags. `carbon` (the default) writes `;name=value` in ascending rendered-name order; `drop` is the escape hatch for a pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory name silently -- see `docs/deploying.md`'s `graphite_out` section.",
+              "default": "carbon",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteTags"
+                }
+              ]
+            },
+            "transport": {
+              "default": "tcp",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GraphiteTransport"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "graphite_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `targets`/`bind`\" would become a graph rule once it lands, not a new kind.",
           "type": "object",
           "required": [
@@ -1947,16 +2016,32 @@
         }
       ]
     },
+    "GraphiteMultiValue": {
+      "description": "What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot carry. See `crates/logit-proto/src/graphite/mod.rs`'s `MultiValue` doc comment.",
+      "type": "string",
+      "enum": [
+        "skip",
+        "expand"
+      ]
+    },
     "GraphiteProtocol": {
-      "description": "Which carbon wire protocol a `graphite_in` speaks: `plaintext` (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's port 2004). `pickle` requires `transport: tcp` (rule 46). Its own enum for [`GraphiteTransport`]'s reason.",
+      "description": "Which carbon wire protocol `graphite_in`/`graphite_out` speaks: `plaintext` (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's port 2004). `pickle` requires `transport: tcp` (rule 46). Its own enum for [`GraphiteTransport`]'s reason. See `crates/logit-proto/src/graphite/mod.rs`'s module doc for the wire shapes.",
       "type": "string",
       "enum": [
         "plaintext",
         "pickle"
       ]
     },
+    "GraphiteTags": {
+      "description": "Whether `graphite_out` renders attributes as carbon tags at all. See `crates/logit-proto/src/graphite/mod.rs`'s `Tags` doc comment -- this is that same choice, exposed as config.",
+      "type": "string",
+      "enum": [
+        "carbon",
+        "drop"
+      ]
+    },
     "GraphiteTransport": {
-      "description": "`graphite_in`'s transport. TCP is the default, matching carbon's own default listener (plaintext on port 2003); UDP is carbon's other plaintext mode. Deliberately its own enum rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a type's name into the schema's `$defs`, so sharing one would make `graphite_in` document its transport by pointing at a statsd-named type.",
+      "description": "`graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46 rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle framing has no meaning in a datagram. Deliberately its own enum rather than a reused `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out` document their transport by pointing at a statsd-named type.",
       "type": "string",
       "enum": [
         "tcp",
