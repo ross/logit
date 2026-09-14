@@ -663,18 +663,51 @@ pub enum ComponentKind {
         /// on a plaintext listener, which has no TLS accept -- the wait for its very **first
         /// byte**. Applies with or without `tls:`.
         ///
-        /// **What it does not bound.** Once a connection has produced one byte it is inside
-        /// `hyper`'s own read loop, which this listener does not drive, so a client that sends a
-        /// single byte and then goes silent still holds its permit -- and under `protocol: grpc`
-        /// the same is true of a client that sends one byte of the HTTP/2 preface. `hyper`'s own
-        /// `http1().header_read_timeout(..)` is deliberately not installed to close that: it
-        /// re-arms across every idle keep-alive gap, which would make it an idle timeout and
-        /// close a long-interval exporter's pooled connection between exports. See
-        /// `docs/known-gaps.md`'s plaintext-`otlp_in` row and its "no idle-connection timeout on
-        /// a TCP listener" row.
+        /// **Not an idle timeout.** It bounds the pre-request phases and nothing after them:
+        /// once a connection has produced one byte it is inside `hyper`'s own read loop, and what
+        /// bounds the quiet gaps there is `idle_timeout` if one is set, and nothing if it is not.
+        /// `hyper`'s own `http1().header_read_timeout(..)` is deliberately not installed either
+        /// way: it re-arms across every idle keep-alive gap, which makes it an idle timeout
+        /// wearing a first-head name, and it covers `protocol: http`'s HTTP/1.1 case only.
+        ///
+        /// Doubles as the grace period an idle close gives `hyper` to shut the connection down in
+        /// before it is dropped -- see `idle_timeout` below, and
+        /// `docs/adr/idle-connection-timeout.md`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// How long one connection may sit with **no request in flight** before this listener
+        /// closes it and hands back its connection-cap permit. **Off unless set:** with no value,
+        /// a connection that sent one byte and then went silent holds its permit indefinitely,
+        /// which is what every `logit` release so far has done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap; leave it unset for genuinely sparse or bursty
+        /// senders. An OTLP exporter pools its connection between exports, so the value belongs
+        /// well above that export interval -- a conformant exporter also reconnects on its own,
+        /// so a close between exports costs it a reconnect, not a batch.
+        ///
+        /// **What the clock measures.** It runs only while no request is in flight, and it is
+        /// reset by a request *completing* -- time a handler spends blocked on a full downstream
+        /// therefore never counts, so a stalled pipeline can never make a busy connection look
+        /// idle. Unlike the other listeners this one resets on request completion rather than on
+        /// bytes read, because `hyper` owns this connection's reads: a request *head* that takes
+        /// longer than this to arrive on an otherwise idle keep-alive connection is closed. A
+        /// request *body* that stalls mid-upload is bounded per-frame by this same value instead,
+        /// answering `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and then
+        /// closing the connection.
+        ///
+        /// **An idle close is policy, not a fault.** `hyper` is asked to shut the connection
+        /// down gracefully, given `handshake_timeout` to do it, and only then dropped, so a
+        /// response already in flight still goes out; the close is counted
+        /// `logit.input.connections.closed{reason="idle"}` -- counted, never diagnosed as a
+        /// `connection_error`. Rule 53 rejects `0s`: omit the field to disable the idle timeout.
+        /// See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// Tails one or more files as a log source, one line per event -- rotation-, truncation-,
     /// and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the
@@ -3730,11 +3763,12 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout } => {
+            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -3896,6 +3930,13 @@ mod tests {
             ComponentKind::LogitIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
             other => panic!("expected LogitIn, got {other:?}"),
         }
+
+        let otlp: Component =
+            serde_json::from_str(r#"{"type": "otlp_in", "bind": "0.0.0.0:4318"}"#).unwrap();
+        match otlp.kind {
+            ComponentKind::OtlpIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
     }
 
     /// The twin of [`handshake_timeout_parses_on_all_three_tcp_listeners`] for the `Option`
@@ -3948,6 +3989,17 @@ mod tests {
                 assert_eq!(idle_timeout, Some(Duration::from_secs(600)));
             }
             other => panic!("expected LogitIn, got {other:?}"),
+        }
+
+        let otlp: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4318", "idle_timeout": "10m"}"#,
+        )
+        .unwrap();
+        match otlp.kind {
+            ComponentKind::OtlpIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_secs(600)));
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
         }
     }
 

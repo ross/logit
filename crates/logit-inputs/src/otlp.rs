@@ -69,21 +69,59 @@
 //! only the *deadline* (a connection held open saying nothing) and a genuine read error reach
 //! `connection_error`. `crate::tcp` makes the same call for an EOF before its first frame.
 //!
-//! **What it still does not bound, and why no timer is installed to bound it.** A connection that
-//! sends *one* byte and then stops has passed the peek and is inside `hyper`'s own read loop,
-//! which this module does not drive. `hyper`'s `http1().header_read_timeout(..)` is deliberately
-//! **not** installed to cover that: in the pinned hyper 1.11.1 (`src/proto/h1/conn.rs`) the timer
-//! is armed at the *top* of `poll_read_head`, before a single header byte has been parsed, and
-//! `State::idle` sets `notify_read = true` whenever it is configured, with the comment "Next read
-//! will start and poll the header read timeout, so we can close the connection if another header
-//! isn't received in a timely manner" -- so it re-arms across every idle keep-alive gap. That is
-//! an idle timeout wearing a first-head name, and it would close a long-interval OTLP exporter's
-//! pooled connection between exports. No idle timer of any kind belongs on any listener here
-//! until the dedicated effort `docs/known-gaps.md`'s "no idle-connection timeout on a TCP
-//! listener" row describes settles the question. Under `protocol: grpc`
-//! ([`hyper::server::conn::http2::Builder`]) there is no such knob in the first place, and the
-//! residual is the same shape: one preface byte, then silence. Both are the narrowed
-//! plaintext-`otlp_in` row in `docs/known-gaps.md`.
+//! **Idle timeout.** [`OtlpInput::with_idle_timeout`] -- `otlp_in`'s operator-facing
+//! `idle_timeout:` field, and off unless set -- bounds how long a connection may sit with no
+//! request in flight before this listener closes it and hands its permit back
+//! (`docs/adr/idle-connection-timeout.md`). Without it, a connection that sends *one* byte and
+//! then stops has cleared the peek, is inside `hyper`'s own read loop, and holds its permit
+//! indefinitely -- and under `protocol: grpc` the same is true of one byte of the HTTP/2 preface.
+//!
+//! *Tracked at the service, not at the socket.* One [`Activity`] per connection counts the
+//! requests in flight and stamps the instant the last one finished ([`InFlight`], the guard
+//! `service_fn` wraps each handler in, so an early return or an unwind stamps it too); the clock
+//! is armed only while that count is zero. A timer wrapped around the IO instead would be wrong
+//! here: hyper 1.11.1's h1 server polls the socket read *mid-message*
+//! (`mid_message_detect_eof`'s `force_io_read`, so it can notice a peer closing while a handler
+//! is still working), so an IO-level timer would tick during ordinary backpressure and read a
+//! stalled downstream as a silent peer -- the exact failure the shared driver's reset rule exists
+//! to avoid (`crates/logit-inputs/src/tcp.rs`'s "Idle timeout" section), relocated into hyper's
+//! internals where this module could not see it.
+//!
+//! *Reset on request completion, not on bytes.* hyper owns the bytes, so the finest grain this
+//! listener can see is a request starting and finishing. A request *head* that dribbles in more
+//! slowly than `idle_timeout` on an otherwise-quiet keep-alive connection is therefore closed:
+//! a documented narrowing of the one semantic every other listener implements, not a bug. A
+//! request *body* that stalls mid-upload gets a narrower bound of its own instead --
+//! [`collect_with_stall_bound`] puts a per-frame `timeout` on the body, answers `408` (HTTP) or
+//! `grpc-status: 4` (gRPC), and closes the connection once the handler has returned, rather than
+//! leaving a half-uploaded request to the whole-connection deadline.
+//!
+//! *`graceful_shutdown`, then a bounded grace, then drop.* [`drive_with_idle`] never drops a live
+//! socket out from under hyper: it calls `graceful_shutdown`, polls the connection for at most
+//! `handshake_timeout` (reused as the grace -- no new knob), and then drops it whatever that poll
+//! returned. Both steps are load-bearing, verified against the pinned hyper 1.11.1 / hyper-util
+//! 0.1.20 sources rather than assumed: `graceful_shutdown` closes an *idle keep-alive* h1
+//! connection promptly (`disable_keep_alive` calls `state.close()` when the connection's `KA`
+//! state is `Idle`) and GOAWAYs an established h2 one -- the common case for a connection this
+//! tracker considers idle. But a *fresh* h1 connection stopped mid-head is `KA::Busy` and keeps
+//! waiting regardless, hyper-util's own pre-sniff `ReadVersion` future resolves to
+//! `Err("Cancelled")`, and an h2 connection still handshaking only sets an internal
+//! `close_pending` flag. The bounded grace-then-drop step exists for exactly those three, which
+//! is why the post-shutdown result is deliberately ignored.
+//!
+//! *Policy, not a fault.* An idle close counts `logit.input.connections.closed{reason="idle"}`
+//! and returns `Ok(())`, so it never reaches the `connection_error` diagnostic below -- counted,
+//! not diagnosed, the same call `crate::tcp` makes for its own idle closes.
+//!
+//! *Why not `hyper`'s own `http1().header_read_timeout(..)`.* Still rejected, and still not
+//! installed: in the pinned hyper 1.11.1 (`src/proto/h1/conn.rs`) that timer is armed at the
+//! *top* of `poll_read_head`, before a single header byte has been parsed, and `State::idle` sets
+//! `notify_read = true` whenever it is configured, with the comment "Next read will start and
+//! poll the header read timeout, so we can close the connection if another header isn't received
+//! in a timely manner" -- so it re-arms across every idle keep-alive gap. That is an idle timeout
+//! wearing a first-head name, reachable only by also bounding first heads, and h1-only
+//! ([`hyper::server::conn::http2::Builder`] has no equivalent knob). `idle_timeout` is that bound
+//! made explicit, opt-in, and available on both transports.
 //!
 //! **Gzip is supported; nothing else is.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's own
 //! compressed flag plus `grpc-encoding: gzip` are both decoded via [`inflate`]; any other declared
@@ -124,7 +162,7 @@
 //! scope -- tracked in `docs/known-gaps.md`.
 
 use crate::Input;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Frame, Incoming};
@@ -141,10 +179,11 @@ use logit_proto::{Signal, SignalDecoder};
 use rustls_pki_types::pem::PemObject;
 #[cfg(test)]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -185,8 +224,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`), and mirrored by hand in
 /// `logit_config`'s own `default_handshake_timeout`: one number across every TCP listener is one
 /// thing for an operator to learn. Overridden by `otlp_in`'s `handshake_timeout:` config field
-/// through [`OtlpInput::with_handshake_timeout`]. See this module's "Handshake timeout" and
-/// "What it still does not bound" doc sections.
+/// through [`OtlpInput::with_handshake_timeout`]. Reused as the grace period an idle close gives
+/// hyper to shut down in -- see this module's "Handshake timeout" and "Idle timeout" doc
+/// sections.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
@@ -217,6 +257,10 @@ pub struct OtlpInput {
     listener: Option<TcpListener>,
     /// See this module's own "Handshake timeout" doc section.
     handshake_timeout: std::time::Duration,
+    /// `None` -- the default -- means no idle timeout at all, the behaviour this listener had
+    /// before the field existed. See [`Self::with_idle_timeout`] and this module's "Idle timeout"
+    /// doc section.
+    idle_timeout: Option<std::time::Duration>,
     /// [`MAX_CONCURRENT_CONNECTIONS`] unless [`OtlpInput::with_max_connections`] (test-only)
     /// lowers it -- see this module's "Connection limit" doc section.
     max_connections: usize,
@@ -232,6 +276,7 @@ impl OtlpInput {
             tls: None,
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
         }
     }
@@ -279,6 +324,21 @@ impl OtlpInput {
         self
     }
 
+    /// Bounds how long a connection may sit with no request in flight before this listener closes
+    /// it -- `otlp_in`'s `idle_timeout:` config field, and off (`None`) when never called. See
+    /// this module's "Idle timeout" doc section for why the clock lives at the service rather than
+    /// around the socket, why it resets on request *completion* rather than on bytes, and why the
+    /// close is `graceful_shutdown` plus a bounded grace rather than a drop. Graph rule 53 rejects
+    /// `Some(0s)` before it can reach here.
+    ///
+    /// Takes the `Option` rather than a bare `Duration`, exactly like
+    /// `crate::tcp::TcpListener::with_idle_timeout`: the "no idle timeout" case is then one call
+    /// from a config that omitted the field rather than a caller-side `if let`.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
     /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
     /// exercise the cap would be slow and flaky; this makes the cap reachable with two. The twin
     /// of `crate::tcp::TcpListener::with_max_connections`.
@@ -313,6 +373,7 @@ impl Input for OtlpInput {
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
         loop {
             let (stream, _peer) = listener.accept().await?;
 
@@ -369,6 +430,8 @@ impl Input for OtlpInput {
                                     transport,
                                     sink,
                                     telemetry.clone(),
+                                    idle_timeout,
+                                    handshake_timeout,
                                 )
                                 .await
                             }
@@ -409,6 +472,8 @@ impl Input for OtlpInput {
                                     transport,
                                     sink,
                                     telemetry.clone(),
+                                    idle_timeout,
+                                    handshake_timeout,
                                 )
                                 .await
                             }
@@ -439,37 +504,300 @@ impl Input for OtlpInput {
 /// to completion -- generic over the IO type so the plaintext (`TokioIo<TcpStream>`) and TLS
 /// (`TokioIo<tokio_rustls::server::TlsStream<TcpStream>>`) cases share every line of dispatch
 /// below `run`'s own `tls_acceptor` branch.
+///
+/// `idle_timeout` and `grace` are this connection's idle bound and the budget
+/// [`drive_with_idle`] gives hyper to shut down in once that bound fires (`handshake_timeout`,
+/// reused -- this module's "Idle timeout" doc section). With `idle_timeout: None` the connection
+/// is simply awaited, exactly as it was before the field existed.
 async fn serve_connection<IO>(
     io: IO,
     transport: OtlpTransport,
     sink: Fanout,
     telemetry: Telemetry,
+    idle_timeout: Option<std::time::Duration>,
+    grace: std::time::Duration,
 ) -> Result<(), String>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
+    // One tracker per connection, shared between the service (which stamps it as requests start
+    // and finish) and the driver below (which reads it). The body-frame stall bound is
+    // `idle_timeout` as well: a connection with no idle bound configured gets no per-frame one
+    // either, which keeps "no `idle_timeout` means exactly today's behaviour" literally true.
+    let activity = Arc::new(Activity::new());
     match transport {
         OtlpTransport::Http => {
-            let svc = service_fn(move |req| handle_http(req, sink.clone(), telemetry.clone()));
-            auto::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await
-                .map_err(|e| e.to_string())
+            let svc = service_fn({
+                let activity = Arc::clone(&activity);
+                let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                move |req| {
+                    // `enter` here rather than inside the returned future: hyper calls the
+                    // service the moment a request head is parsed, so the in-flight count rises
+                    // then, not whenever the future first happens to be polled.
+                    let in_flight = activity.enter();
+                    let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                    let activity = Arc::clone(&activity);
+                    async move {
+                        let _in_flight = in_flight;
+                        handle_http(req, sink, telemetry, &activity, idle_timeout).await
+                    }
+                }
+            });
+            // Bound to a local: `auto::Connection` borrows its builder (`Connection<'a, ..>`), so
+            // a temporary would not live long enough to be held across `drive_with_idle`'s loop.
+            let builder = auto::Builder::new(TokioExecutor::new());
+            let conn = builder.serve_connection(io, svc);
+            drive_with_idle(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                &activity,
+                idle_timeout,
+                grace,
+                &telemetry,
+            )
+            .await
         }
         OtlpTransport::Grpc => {
-            let svc = service_fn(move |req| handle_grpc(req, sink.clone(), telemetry.clone()));
-            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await
-                .map_err(|e| e.to_string())
+            let svc = service_fn({
+                let activity = Arc::clone(&activity);
+                let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                move |req| {
+                    let in_flight = activity.enter();
+                    let (sink, telemetry) = (sink.clone(), telemetry.clone());
+                    let activity = Arc::clone(&activity);
+                    async move {
+                        let _in_flight = in_flight;
+                        handle_grpc(req, sink, telemetry, &activity, idle_timeout).await
+                    }
+                }
+            });
+            let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc);
+            drive_with_idle(
+                conn,
+                |conn| conn.graceful_shutdown(),
+                &activity,
+                idle_timeout,
+                grace,
+                &telemetry,
+            )
+            .await
         }
     }
+}
+
+/// One connection's idle state, shared between its service and [`drive_with_idle`] -- the
+/// service-level tracker this module's "Idle timeout" doc section explains, and deliberately not
+/// a timer wrapped around the socket.
+struct Activity {
+    /// Requests hyper has handed this connection's service and not yet had a response from.
+    /// While it is non-zero there is no idle deadline at all: the connection is not quiet, it is
+    /// working (and the work may be a `Fanout::send` parked on a full downstream, which must
+    /// never look like a silent peer -- `docs/adr/idle-connection-timeout.md`'s reset rule).
+    in_flight: AtomicUsize,
+    /// When the last request finished, i.e. when the clock was last re-armed. A plain
+    /// `std::sync::Mutex` and never held across an await: the critical section is one `Instant`
+    /// read or write.
+    last_progress: Mutex<tokio::time::Instant>,
+    /// Set by a handler whose request body stalled: close this connection as soon as its
+    /// response is out, rather than leaving it to the idle deadline.
+    close_after: AtomicBool,
+    /// Wakes [`drive_with_idle`] whenever any of the three above changed, so a request
+    /// completing re-arms the deadline and a `close_after` is acted on promptly rather than at
+    /// the next deadline.
+    changed: tokio::sync::Notify,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            last_progress: Mutex::new(tokio::time::Instant::now()),
+            close_after: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Marks one request as started, returning the guard whose `Drop` marks it finished.
+    fn enter(self: &Arc<Self>) -> InFlight {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlight(Arc::clone(self))
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn last_progress(&self) -> tokio::time::Instant {
+        *self.last_progress.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stamps "the connection just finished something" -- the only thing that re-arms the clock.
+    fn stamp_progress(&self) {
+        // `into_inner` on poison rather than `unwrap`: this mutex only ever holds an `Instant`,
+        // so a poisoned one still holds a usable value, and this runs inside [`InFlight::drop`],
+        // where panicking a second time during an unwind would abort the process.
+        let mut last = self.last_progress.lock().unwrap_or_else(PoisonError::into_inner);
+        *last = tokio::time::Instant::now();
+    }
+
+    /// The body-stall path's "close this connection once my response is out".
+    fn request_close(&self) {
+        self.close_after.store(true, Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+
+    fn close_requested(&self) -> bool {
+        self.close_after.load(Ordering::SeqCst)
+    }
+}
+
+/// Held for one request's lifetime by the service wrapper in [`serve_connection`]. A guard rather
+/// than a pair of calls around the handler so that every way out of a handler -- an early
+/// `return` on a 415, a `?`, a panic unwinding through it -- still decrements the count and
+/// re-arms the clock. Stamping progress *here*, when the handler has returned, is what keeps time
+/// spent blocked in `Fanout::send` from ever counting against the peer.
+struct InFlight(Arc<Activity>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.stamp_progress();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_one();
+    }
+}
+
+/// Polls one hyper connection future to completion, closing it if [`Activity`] says it has been
+/// idle for `idle` (or if a handler asked for a close after a stalled body). `shutdown` is the
+/// connection's own `graceful_shutdown`, passed in because `auto::Connection` and
+/// `http2::Connection` share the signature (`self: Pin<&mut Self>`) but no trait.
+///
+/// With `idle: None` this is `conn.await` and nothing else -- the pre-`idle_timeout` path,
+/// unchanged. Otherwise the connection is raced against its own idle deadline; see this module's
+/// "Idle timeout" doc section for the semantics and the hyper evidence behind the close sequence.
+///
+/// **`conn` is polled the whole time, including while waiting for an in-flight request to
+/// finish.** For h1 a handler's future is polled *inside* this connection future, so pausing it
+/// to wait on `changed` alone would stall the very request being waited on -- a deadlock, since
+/// only that request finishing can send the notification.
+async fn drive_with_idle<C, E>(
+    conn: C,
+    shutdown: impl FnOnce(Pin<&mut C>),
+    activity: &Activity,
+    idle: Option<std::time::Duration>,
+    grace: std::time::Duration,
+    telemetry: &Telemetry,
+) -> Result<(), String>
+where
+    C: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut conn = std::pin::pin!(conn);
+    let Some(idle) = idle else {
+        return conn.await.map_err(|e| e.to_string());
+    };
+
+    loop {
+        if activity.in_flight() > 0 {
+            // Working, so no deadline applies -- but keep polling, and wake when the count
+            // changes so the deadline can be re-armed from the instant that request finished.
+            tokio::select! {
+                result = conn.as_mut() => return result.map_err(|e| e.to_string()),
+                () = activity.changed.notified() => continue,
+            }
+        }
+        if activity.close_requested() {
+            break;
+        }
+        // `checked_add` because `last_progress + idle` can overflow for an absurd (but legal)
+        // `idle_timeout`, and rule 53 caps nothing above `0s`; the fallback never arrives.
+        let deadline =
+            activity.last_progress().checked_add(idle).unwrap_or_else(crate::tcp::far_future);
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            result = conn.as_mut() => return result.map_err(|e| e.to_string()),
+            // Both arms loop back round rather than deciding anything here: the deadline is
+            // recomputed from the *current* `last_progress` at the top, so a request that
+            // finished while this slept simply moves the deadline out instead of closing.
+            () = tokio::time::sleep_until(deadline) => continue,
+            () = activity.changed.notified() => continue,
+        }
+    }
+
+    // Idle (or a stalled body asked for this). Ask hyper to close, give it `grace` to do so, and
+    // then drop the connection whatever that returned -- `graceful_shutdown` alone leaves three
+    // real cases parked, and the pre-sniff `ReadVersion` resolves `Err("Cancelled")` rather than
+    // `Ok(())`, which is why the result is deliberately discarded (this module's "Idle timeout"
+    // doc section). Returning from here is the drop: the socket closes with the pinned future.
+    shutdown(conn.as_mut());
+    let _ = tokio::time::timeout(grace, conn.as_mut()).await;
+    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
+    Ok(())
+}
+
+/// Why reading a request body stopped short, distinguished so the caller can answer `408`/gRPC
+/// `DEADLINE_EXCEEDED` for "this body stopped arriving" rather than reusing the `413` path for
+/// everything, the way a bare `Limited::collect` failure forced.
+enum BodyReadError {
+    /// No frame of the body arrived within the per-frame bound.
+    Stalled(std::time::Duration),
+    /// Anything [`Limited`] itself reports: over `MAX_REQUEST_BYTES`, a client vanishing
+    /// mid-upload, a reset h2 stream. Still goes through [`body_read_error_message`].
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// `Limited::collect` with a per-frame stall bound -- the body half of this module's "Idle
+/// timeout" doc section. The bound is per *frame*, never a total: a large body that keeps
+/// arriving in pieces is making progress and is not stalled, however long it takes in aggregate
+/// (the same distinction `logit_in`'s per-`read` body bound draws).
+///
+/// With `stall: None` this is the old `limited.collect().await` in every observable respect,
+/// including which errors reach [`body_read_error_message`].
+async fn collect_with_stall_bound(
+    mut body: Limited<Incoming>,
+    stall: Option<std::time::Duration>,
+) -> Result<Bytes, BodyReadError> {
+    // Frames are accumulated rather than concatenated as they arrive so the overwhelmingly
+    // common single-frame body is handed on without a copy, exactly as `Collected::to_bytes`
+    // would do it.
+    let mut frames: Vec<Bytes> = Vec::new();
+    loop {
+        let next = match stall {
+            Some(stall) => match tokio::time::timeout(stall, body.frame()).await {
+                Ok(next) => next,
+                Err(_elapsed) => return Err(BodyReadError::Stalled(stall)),
+            },
+            None => body.frame().await,
+        };
+        let Some(frame) = next else { break };
+        let frame = frame.map_err(BodyReadError::Failed)?;
+        // Trailers on a request body are legal and carry nothing this input reads; dropping them
+        // is what `Collected::to_bytes` does too.
+        if let Ok(data) = frame.into_data() {
+            frames.push(data);
+        }
+    }
+    Ok(match frames.len() {
+        0 => Bytes::new(),
+        1 => frames.pop().expect("length checked just above"),
+        _ => {
+            let mut joined = BytesMut::with_capacity(frames.iter().map(Bytes::len).sum());
+            for frame in frames {
+                joined.extend_from_slice(&frame);
+            }
+            joined.freeze()
+        }
+    })
 }
 
 async fn handle_http(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    activity: &Activity,
+    stall: Option<std::time::Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
     if req.method() != Method::POST {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
@@ -498,9 +826,19 @@ async fn handle_http(
     };
 
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
-    let bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
+    let bytes = match collect_with_stall_bound(limited, stall).await {
+        Ok(bytes) => bytes,
+        // A body that stopped arriving is the client's clock, not its size: `408`, and the
+        // connection closes once this response is out rather than waiting for the whole-
+        // connection idle deadline (this module's "Idle timeout" doc section).
+        Err(BodyReadError::Stalled(stall)) => {
+            activity.request_close();
+            return Ok(text_response(
+                StatusCode::REQUEST_TIMEOUT,
+                &format!("request body stalled for {stall:?}"),
+            ));
+        }
+        Err(BodyReadError::Failed(err)) => {
             return Ok(text_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 &body_read_error_message(err.as_ref()),
@@ -591,6 +929,8 @@ async fn handle_grpc(
     req: http::Request<Incoming>,
     sink: Fanout,
     telemetry: Telemetry,
+    activity: &Activity,
+    stall: Option<std::time::Duration>,
 ) -> Result<http::Response<GrpcBody>, std::convert::Infallible> {
     if req.method() != Method::POST {
         return Ok(grpc_response(12, "only POST is supported", None));
@@ -617,9 +957,17 @@ async fn handle_grpc(
     }
 
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
-    let framed = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None)),
+    let framed = match collect_with_stall_bound(limited, stall).await {
+        Ok(bytes) => bytes,
+        // `4`, `DEADLINE_EXCEEDED` -- the HTTP `408`'s gRPC twin, and the connection closes once
+        // this response is out (this module's "Idle timeout" doc section).
+        Err(BodyReadError::Stalled(stall)) => {
+            activity.request_close();
+            return Ok(grpc_response(4, &format!("request body stalled for {stall:?}"), None));
+        }
+        Err(BodyReadError::Failed(err)) => {
+            return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None))
+        }
     };
     let Some((compressed, payload)) = grpc_unframe(&framed) else {
         return Ok(grpc_response(3, "malformed gRPC message frame", None));
@@ -901,7 +1249,16 @@ mod tests {
     }
 
     fn fanout_into_channel() -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
-        let (tx, rx) = mpsc::channel(16);
+        fanout_into_channel_with_capacity(16)
+    }
+
+    /// [`fanout_into_channel`] with the channel capacity spelled out. Capacity 1 with nothing
+    /// draining it is how a test parks a handler inside `Fanout::send`: the first batch is
+    /// buffered, the second blocks until something receives.
+    fn fanout_into_channel_with_capacity(
+        capacity: usize,
+    ) -> (Fanout, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let (tx, rx) = mpsc::channel(capacity);
         (Fanout::new(vec![tx]), rx)
     }
 
@@ -2065,5 +2422,444 @@ mod tests {
                 ),
             )],
         }
+    }
+
+    // ---- idle timeout -------------------------------------------------------------------------
+    //
+    // Real durations (50-300ms), never `tokio::time::pause()`: these tests are about a timer
+    // racing hyper's own read loop, and paused time would advance straight past the reads that
+    // loop is sitting in. The "closed within" assertions go through `expect_closed`'s 2s ceiling
+    // against deadlines of at most 300ms; the "still open" ones assert
+    // `timeout(50ms, read) == Err(Elapsed)`, which scheduler lag can only make *more* true.
+
+    /// [`metric_batch`] encoded as one OTLP/protobuf `/v1/metrics` body -- the three lines
+    /// several tests above spell out inline, hoisted for the ones below that need a real request
+    /// more than once.
+    fn metric_body() -> Bytes {
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap().1
+    }
+
+    /// Asserts a connection is still open by reading from it and expecting nothing: this
+    /// listener never speaks unprompted, so a blocked read means the connection is live, while a
+    /// closed one returns `Ok(0)` (or `ECONNRESET`) immediately. The inverse of [`expect_closed`]
+    /// and the twin of `crate::tcp`'s own helper of this name, and lag-proof in the direction
+    /// that matters -- a slow scheduler makes the read *more* likely to time out, never less.
+    async fn expect_still_open<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
+            Err(_elapsed) => {}
+            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
+            Ok(Ok(n)) => panic!("{what}: expected no bytes, got {n}"),
+            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
+        }
+    }
+
+    /// [`post_raw`]'s keep-alive half: writes one complete HTTP/1.1 POST on an already-open
+    /// stream and, crucially, sends **no** `Connection: close`, so hyper parks on the next
+    /// request rather than closing once this one is answered. For the tests that send more than
+    /// one request down one connection, or that keep reading from it afterwards.
+    async fn write_request<S: tokio::io::AsyncWrite + Unpin>(
+        stream: &mut S,
+        addr: &str,
+        path: &str,
+        body: &[u8],
+    ) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
+             application/x-protobuf\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    }
+
+    /// Reads exactly one response head (through the blank line) off a keep-alive connection --
+    /// `read_to_end` would block until the *connection* ends, which is the thing under test here.
+    /// Every response read this way is a protobuf success, whose body is empty
+    /// (`export_response(0, "")`), so the head is all there is to consume before the next
+    /// request.
+    async fn read_response_head<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        what: &str,
+    ) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut byte))
+                .await
+                .unwrap_or_else(|_| panic!("{what}: no complete response head within 5s"))
+                .unwrap_or_else(|err| panic!("{what}: read failed: {err}"));
+            assert_ne!(
+                read,
+                0,
+                "{what}: the connection closed mid-head: {:?}",
+                String::from_utf8_lossy(&head)
+            );
+            head.extend_from_slice(&byte[..read]);
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// [`expect_closed`] for a peer that has already written something of its own: an HTTP/2
+    /// server sends its `SETTINGS` frame the instant a connection arrives, *before* it has read
+    /// the client's preface, so "the next byte off this socket is a close" is simply not true of
+    /// `protocol: grpc`. Reads to EOF instead -- the same assertion, a few frames later.
+    async fn expect_closed_after_draining<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        what: &str,
+    ) {
+        let mut drained = Vec::new();
+        match tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut drained)).await {
+            Err(_elapsed) => panic!("{what}: expected a close within 2s"),
+            Ok(Ok(_)) => {}
+            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN.
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(Err(err)) => panic!("{what}: read failed outright: {err}"),
+        }
+    }
+
+    /// A request body that yields `.0` once and then never yields again *and never wakes* --
+    /// what a client that starts uploading and stalls looks like from the server's side, and the
+    /// only thing [`collect_with_stall_bound`]'s per-frame bound can be driven by. `Pending` with
+    /// no registered waker is the whole point: nothing will ever poll this body again.
+    struct StalledBody(Option<Bytes>);
+
+    impl hyper::body::Body for StalledBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.0.take() {
+                Some(data) => Poll::Ready(Some(Ok(Frame::data(data)))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// The whole point of `idle_timeout:` on this listener: a pooled keep-alive connection that
+    /// finished its export and then went quiet gives up its connection-cap permit instead of
+    /// holding it forever. Proven under `with_max_connections(1)`, so the follow-up request can
+    /// only be served if the first connection's permit genuinely came back.
+    ///
+    /// Also the pin for "policy, not a fault": the close is counted
+    /// `logit.input.connections.closed{reason="idle"}` and the listener's `connection_error`
+    /// diagnostic never fires, which is what `drive_with_idle` returning `Ok(())` rather than an
+    /// `Err` buys (this module's "Idle timeout" doc section). The h1 case here is the one
+    /// `graceful_shutdown` closes on its own -- an idle keep-alive connection is `KA::Idle`, so
+    /// `disable_keep_alive` closes it immediately and the grace is never spent.
+    #[tokio::test]
+    async fn an_idle_keep_alive_http_connection_is_closed_after_the_idle_timeout_and_releases_its_permit(
+    ) {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let diag = logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
+        let listener_diag = diag.clone();
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input
+            .with_telemetry(telemetry)
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One complete export, keep-alive, so the connection settles idle inside hyper with the
+        // first-byte peek long behind it -- the idle clock is the only thing that can end it.
+        let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_request(&mut keep_alive, &addr, "/v1/metrics", &metric_body()).await;
+        let head = read_response_head(&mut keep_alive, "the keep-alive export").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        recv_batch(&mut rx).await;
+
+        expect_closed(&mut keep_alive, "a keep-alive connection quiet past its idle_timeout").await;
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
+            Some(1.0),
+            "an idle close is counted"
+        );
+        assert_eq!(
+            listener_diag.occurrences("connection_error"),
+            0,
+            "and never diagnosed -- an idle close returns Ok(()), so the accept loop's \
+             connection_error path must not see it"
+        );
+
+        // Under `with_max_connections(1)` this can only be answered if the permit came back.
+        let response = post_raw(
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &metric_body(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "permit came back, got: {response}");
+        recv_batch(&mut rx).await;
+
+        drop(keep_alive);
+    }
+
+    /// The narrowing this listener's idle clock carries, made a test: it resets on request
+    /// *completion*, so a connection that produced one head byte and then stopped has never
+    /// completed anything and is closed at the idle deadline measured from the connection's own
+    /// start. This is also the case `graceful_shutdown` alone cannot close -- one byte leaves
+    /// hyper-util's `auto` builder inside its pre-sniff `ReadVersion` (`P` could still begin
+    /// either `POST` or the h2 `PRI` preface), and a fresh h1 connection mid-head is `KA::Busy`
+    /// -- so the bounded grace and the drop after it are what actually end it. The grace is
+    /// `handshake_timeout`, set to 50ms here purely so that bound is visible inside
+    /// `expect_closed`'s 2s ceiling.
+    #[tokio::test]
+    async fn a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One byte, immediately -- enough to clear the first-byte peek, so the close that
+        // follows can only have come from the idle clock, not from `handshake_timeout`.
+        let mut dribbling = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        dribbling.write_all(b"P").await.unwrap();
+
+        expect_closed(&mut dribbling, "a connection that sent one head byte and then stopped")
+            .await;
+    }
+
+    /// The gRPC transport's twin of the keep-alive case: an established h2 connection that
+    /// finished its export and went quiet is GOAWAY'd and closed. "Closed" is observed from the
+    /// client's own connection future ending -- an h2 client has no socket to read directly, and
+    /// its connection task is exactly what a GOAWAY plus a close terminates. `sender` is held
+    /// alive throughout, so nothing on this side could have initiated the shutdown.
+    #[tokio::test]
+    async fn an_idle_grpc_connection_is_closed_after_the_idle_timeout() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Grpc).await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .unwrap();
+        let client_conn = tokio::spawn(conn);
+
+        let payload = one_span_payload();
+        let mut framed = vec![0u8];
+        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        framed.extend_from_slice(&payload);
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Traces.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers")
+            .body(Full::new(Bytes::from(framed)))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        let collected = res.into_body().collect().await.unwrap();
+        assert_eq!(
+            collected.trailers().expect("should carry trailers").get("grpc-status").unwrap(),
+            "0"
+        );
+        recv_batch(&mut rx).await;
+
+        // Either outcome proves the close: hyper's client connection future ends `Ok` on a clean
+        // GOAWAY-then-FIN and `Err` if the socket goes first.
+        let _closed = tokio::time::timeout(Duration::from_secs(2), client_conn)
+            .await
+            .expect("an idle gRPC connection should be closed within 2s")
+            .expect("the client's connection task should not panic");
+
+        // The client's future ends on the GOAWAY, which the server writes *during* its grace
+        // poll -- so the count, which lands after that poll returns, is a moment behind it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
+            Some(1.0),
+            "an idle close is counted on the gRPC transport too"
+        );
+        drop(sender);
+    }
+
+    /// `protocol: grpc`'s equivalent of the one-head-byte case, and the third state
+    /// `graceful_shutdown` cannot close on its own: an h2 connection still `Handshaking` only
+    /// gets an internal `close_pending` flag set, so the bounded grace (`handshake_timeout`,
+    /// 50ms here) and the drop after it are what free the permit.
+    #[tokio::test]
+    async fn a_stalled_h2_preface_is_closed_after_the_idle_timeout() {
+        let (addr, input) = bound_input(OtlpTransport::Grpc).await;
+        let mut input = input
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The first three bytes of the 24-byte h2 preface ("PRI * HTTP/2.0..."), then silence.
+        let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stalled.write_all(b"PRI").await.unwrap();
+
+        expect_closed_after_draining(&mut stalled, "a connection stalled mid-h2-preface").await;
+    }
+
+    /// **The test the reset rule exists for.** A connection whose downstream is full is not
+    /// idle -- it is waiting on *us* -- so a request parked in `Fanout::send` must hold the idle
+    /// clock off entirely, however long that park lasts. A capacity-1 channel with nothing
+    /// draining it puts the second request exactly there, and three idle timeouts' worth of
+    /// sleep must not close the connection. Then the drain happens, the blocked request's
+    /// response arrives, and the same connection serves a third request.
+    ///
+    /// A clock that ran while a request was in flight would close this connection and lose a
+    /// request that had already been fully received.
+    #[tokio::test]
+    async fn a_request_blocked_on_a_full_downstream_is_not_closed_as_idle() {
+        let idle = Duration::from_millis(100);
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_idle_timeout(Some(idle));
+        let (sink, mut rx) = fanout_into_channel_with_capacity(1);
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let body = metric_body();
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+
+        // The first export fills the channel's one slot and completes.
+        write_request(&mut client, &addr, "/v1/metrics", &body).await;
+        let head = read_response_head(&mut client, "the first export").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+
+        // The second, on the same connection, parks in `Fanout::send` with nothing draining.
+        write_request(&mut client, &addr, "/v1/metrics", &body).await;
+        tokio::time::sleep(idle * 3).await;
+        expect_still_open(&mut client, "a request blocked on a full downstream").await;
+
+        // Draining frees the slot, the parked send returns, and its response arrives.
+        recv_batch(&mut rx).await;
+        let head = read_response_head(&mut client, "the blocked export").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        recv_batch(&mut rx).await;
+
+        // And the connection really was untouched: it still serves another request.
+        write_request(&mut client, &addr, "/v1/metrics", &body).await;
+        let head = read_response_head(&mut client, "a third export").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        recv_batch(&mut rx).await;
+    }
+
+    /// The body half of the bound: a request head that arrived in full followed by a body that
+    /// stops mid-upload is answered `408` per *frame* rather than left to the whole-connection
+    /// deadline, and the connection closes behind the response instead of waiting for another
+    /// request that can never come. `read_to_end` asserts both halves at once -- it returns only
+    /// when the peer closes, and what it returns is the response.
+    #[tokio::test]
+    async fn a_request_body_that_stalls_gets_408_and_the_connection_is_closed() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            // The grace `drive_with_idle` gives hyper to write the 408 out and close.
+            .with_handshake_timeout(Duration::from_millis(200));
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A complete head promising a real `Content-Length`, then two of those bytes and silence.
+        let body = metric_body();
+        let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
+             application/x-protobuf\r\n\r\n",
+            body.len()
+        );
+        stalled.write_all(head.as_bytes()).await.unwrap();
+        stalled.write_all(&body[..2]).await.unwrap();
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut buf))
+            .await
+            .expect("a stalled request body should be answered and closed within 5s")
+            .expect("reading the response should not fail outright");
+        let response = String::from_utf8_lossy(&buf);
+        assert!(response.starts_with("HTTP/1.1 408"), "got: {response}");
+        assert!(response.contains("stalled"), "the message should say what happened: {response}");
+    }
+
+    /// [`a_request_body_that_stalls_gets_408_and_the_connection_is_closed`]'s gRPC twin: the same
+    /// per-frame bound, reported as `grpc-status: 4` (`DEADLINE_EXCEEDED`), and the same close
+    /// once the response is out -- observed here through the client's connection future ending,
+    /// since the client still believes it has a request body open.
+    #[tokio::test]
+    async fn a_stalled_grpc_request_body_gets_status_four_and_the_connection_is_closed() {
+        let (addr, input) = bound_input(OtlpTransport::Grpc).await;
+        let mut input = input
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            .with_handshake_timeout(Duration::from_millis(200));
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .unwrap();
+        let client_conn = tokio::spawn(conn);
+
+        // A gRPC frame header promising eight payload bytes that never arrive.
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri(Signal::Traces.grpc_method())
+            .header("content-type", "application/grpc+proto")
+            .header("te", "trailers")
+            .body(StalledBody(Some(Bytes::from_static(&[0u8, 0, 0, 0, 8]))))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        let collected = res.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().expect("should carry trailers");
+        assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "4");
+
+        let _closed = tokio::time::timeout(Duration::from_secs(2), client_conn)
+            .await
+            .expect("the connection should be closed within 2s of the stalled body's response")
+            .expect("the client's connection task should not panic");
+        drop(sender);
+    }
+
+    /// The default, and the promise that turning nothing on changes nothing: with no
+    /// `idle_timeout` configured, a keep-alive connection that finished its export and went
+    /// quiet stays open -- which is exactly what a long-interval OTLP exporter's pooled
+    /// connection looks like between exports.
+    #[tokio::test]
+    async fn no_idle_timeout_leaves_a_keep_alive_connection_open() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_request(&mut keep_alive, &addr, "/v1/metrics", &metric_body()).await;
+        let head = read_response_head(&mut keep_alive, "the keep-alive export").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+        recv_batch(&mut rx).await;
+
+        // Three times the idle timeout every other test in this section configures.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        expect_still_open(&mut keep_alive, "a keep-alive connection with no idle_timeout").await;
     }
 }

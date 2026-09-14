@@ -1436,9 +1436,9 @@ fn now_nanos() -> i64 {
 /// Only ever reached by a listener with no flush interval *and* no idle timeout, since otherwise
 /// the flush tick is the smaller deadline.
 ///
-/// `pub(crate)` because `crate::logit`'s own idle deadline wants the identical fallback and
-/// tokio's copy is out of reach there too -- one definition rather than two 30-year constants
-/// drifting apart.
+/// `pub(crate)` because `crate::logit`'s and `crate::otlp`'s own idle deadlines want the
+/// identical fallback and tokio's copy is out of reach there too -- one definition rather than
+/// multiple 30-year constants drifting apart.
 pub(crate) fn far_future() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
@@ -2654,11 +2654,10 @@ mod tests {
     }
 
     /// A first-byte deadline must not become an idle deadline: once a connection has latched its
-    /// framing, a long gap before the next frame is ordinary. This pins the no-`idle_timeout`
-    /// case specifically -- nothing is configured here, so a latched connection must never be
-    /// closed for silence, however long it stays quiet. With a 50ms budget and a 100ms flush
-    /// interval, it also exercises the interaction the naive wrapper would get wrong -- several
-    /// flush ticks elapse between the two frames.
+    /// framing, a long gap before the next frame is ordinary (this module's "Pre-handshake
+    /// timeout" doc section says there is deliberately no idle timeout). With a 50ms budget and a
+    /// 100ms flush interval, this also exercises the interaction the naive wrapper would get
+    /// wrong -- several flush ticks elapse between the two frames.
     #[tokio::test]
     async fn the_first_byte_deadline_does_not_apply_once_the_framing_has_latched() {
         // The flush timer left on (unlike `one_per_frame`), since a flush tick re-entering the

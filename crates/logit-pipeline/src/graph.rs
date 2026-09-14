@@ -2141,9 +2141,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     //
     // One loop over every kind that carries the field, rule 43's one-rule-for-every-listener
     // shape: the check, the message and the reasoning are identical on all of them and only the
-    // `transport` spelling differs. `logit_in` has no `transport:` at all -- it is TCP by
-    // construction -- so its arm is `false` for the datagram check and only the zero one can ever
-    // fire on it. `otlp_in` joins the same way with the PR that makes it honour the field.
+    // `transport` spelling differs -- and on a kind with no datagram transport at all there is
+    // nothing to spell, which is why `logit_in`'s and `otlp_in`'s arms report `false` rather than
+    // reading a field: `logit_in` has no `transport:` at all (it is TCP by construction), and
+    // `otlp_in`'s `protocol` picks HTTP or gRPC over TCP, not a datagram alternative. Only the
+    // zero check can ever fire on either.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -2156,6 +2158,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 ("statsd_in", *idle_timeout, *transport == StatsdTransport::Udp)
             }
             ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
+            ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
             _ => continue,
         };
         let Some(idle_timeout) = idle_timeout else { continue };
@@ -5494,6 +5497,20 @@ mod tests {
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
             handshake_timeout,
+            idle_timeout: None,
+        }
+    }
+
+    /// [`otlp_in_with_handshake_timeout`] with rule 53's knob exposed instead -- and no
+    /// `transport` parameter, since `otlp_in` has no datagram transport for that half of the rule
+    /// to reject.
+    fn otlp_in_with_idle_timeout(idle_timeout: Option<Duration>) -> ComponentKind {
+        ComponentKind::OtlpIn {
+            bind: "0.0.0.0:4317".to_string(),
+            protocol: logit_config::OtlpProtocol::Http,
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout,
         }
     }
 
@@ -5727,6 +5744,7 @@ mod tests {
                 client_ca_file: None,
             }),
             handshake_timeout: Duration::from_secs(30),
+            idle_timeout: None,
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
@@ -5817,6 +5835,18 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
+    /// `otlp_in` has no datagram transport to reject a value under either, so the zero check is
+    /// the only half of this rule that can fire on it -- and it fires with the identical message,
+    /// off the same loop body.
+    #[test]
+    fn a_zero_idle_timeout_is_rejected_on_an_otlp_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], otlp_in_with_idle_timeout(Some(Duration::ZERO))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
+    }
+
     /// Rule 43's spirit on this field, rule 45's context check one field over: a UDP listener has
     /// no connection to time out, so an `idle_timeout` there could never take effect and
     /// set-but-ignored is an error. One test per kind, since each reads its own `transport`.
@@ -5886,6 +5916,7 @@ mod tests {
             graphite_in_with_idle_timeout(GraphiteTransport::Tcp, Some(Duration::from_secs(300))),
             statsd_in_with_idle_timeout(StatsdTransport::Tcp, Some(Duration::from_secs(300))),
             logit_in_with_idle_timeout(Some(Duration::from_secs(300))),
+            otlp_in_with_idle_timeout(Some(Duration::from_secs(300))),
         ] {
             resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
                 .expect("a TCP listener with a real idle_timeout should resolve");
