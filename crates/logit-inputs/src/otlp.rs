@@ -1775,6 +1775,232 @@ mod tests {
         drop(silent);
     }
 
+    // ---- connection limit, the plaintext first-byte bound, and the connections gauge ----------
+
+    /// Reads one byte, expecting the peer to have closed instead. The twin of `crate::tcp`'s own
+    /// test helper of the same name.
+    async fn expect_closed<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
+        match result {
+            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
+            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN.
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("{what}: read failed outright: {err}"),
+        }
+    }
+
+    /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
+    /// the point carrying `tag` -- copied from `crate::tcp`'s test module.
+    fn sum_of(
+        events: &[logit_core::Event],
+        metric: &str,
+        tag: Option<(&str, &str)>,
+    ) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if let Some((key, value)) = tag {
+                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
+                    return None;
+                }
+            }
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    logit_core::MetricKind::Sum(sum) => Some(sum.value),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// `sum_of`'s gauge twin -- `Telemetry::gauge` is last-write-wins per `(name, tags)` until the
+    /// next drain, so one drain reports whatever value the listener last wrote.
+    fn gauge_of(events: &[logit_core::Event], metric: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    logit_core::MetricKind::Gauge(v) => Some(v),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// The cap rejects rather than queues, and closes before any TLS handshake -- OTLP has no
+    /// in-band "try later" to spend a handshake delivering (this module's "Connection limit" doc
+    /// section). Modelled on `crate::tcp`'s
+    /// `the_connection_cap_drops_a_connection_past_the_limit_and_counts_it`.
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_dropped_and_counted() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry).with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The first connection takes the one permit and holds it. One byte, so it clears the
+        // first-byte peek and settles inside `hyper` rather than being closed by the deadline.
+        let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        first.write_all(b"P").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut second, "a past-the-cap connection").await;
+
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.input.connections.rejected",
+                Some(("reason", "limit"))
+            ),
+            Some(1.0)
+        );
+
+        drop(first);
+    }
+
+    /// The plaintext twin of `a_silent_tls_connection_is_closed_after_the_handshake_timeout`, and
+    /// the case that actually matters in production: `otlp_in` with no `tls:` block is the default
+    /// shape, and until the first-byte peek landed it had no pre-request bound at all. Under
+    /// `with_max_connections(1)` the follow-up request can only be served if the silent
+    /// connection's permit genuinely came back.
+    #[tokio::test]
+    async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input =
+            input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connected, not a byte sent, and held (not dropped) until the close is observed -- so
+        // nothing but the server's own deadline could have closed it.
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut silent, "a plaintext connection that sent no bytes").await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let response = post_raw(
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &body,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+
+        drop(silent);
+    }
+
+    /// A first-byte deadline must not become a request deadline: the peek resolves on the very
+    /// first byte, and everything after it belongs to `hyper`'s own read loop, which this module
+    /// deliberately installs no timer on (this module's "What it still does not bound" section --
+    /// `header_read_timeout` would re-arm across idle keep-alive gaps). So a client that dribbles
+    /// its request head out over four times the budget still gets a 200.
+    #[tokio::test]
+    async fn the_first_byte_deadline_does_not_apply_once_a_request_has_started() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+
+        let head = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
+             application/x-protobuf\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // The first byte immediately -- that is all the peek ever waits for.
+        stream.write_all(&head[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // 4x the budget
+        stream.write_all(&head[1..]).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+        let response = String::from_utf8_lossy(&buf).into_owned();
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+    }
+
+    /// `peek` is `MSG_PEEK`: it consumes nothing, so `auto::Builder`'s own `ReadVersion` sniff
+    /// still sees the full 24-byte HTTP/2 preface and no rewind buffer is needed. h2c
+    /// prior-knowledge is the case that would break first if the bound were an ordinary read.
+    #[tokio::test]
+    async fn an_h2c_prior_knowledge_request_still_negotiates_after_the_first_byte_peek() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+
+        let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .expect("h2c prior-knowledge handshake should succeed");
+        tokio::spawn(conn);
+
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/metrics")
+            .header("content-type", "application/x-protobuf")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        recv_batch(&mut rx).await;
+    }
+
+    /// The gauge counts permit holders: 1 while a connection is being served, back to 0 once it
+    /// ends. `Telemetry::gauge` is last-write-wins until a drain, so each drain reports the value
+    /// the listener last wrote.
+    #[tokio::test]
+    async fn the_connections_gauge_tracks_a_live_connection_and_returns_to_zero() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry);
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One byte, so the connection clears the peek and stays open inside `hyper`.
+        let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        open.write_all(b"P").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(1.0));
+
+        drop(open);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
+    }
+
     fn metric_batch() -> logit_core::EventBatch {
         logit_core::EventBatch {
             resource: std::sync::Arc::new(logit_core::Resource::default()),
