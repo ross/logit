@@ -474,7 +474,7 @@ fn graphite_decode_one_tagged_line() {
 }
 
 /// The listener's actual hot path: `decode_into` against a buffer the read loop reuses across
-/// datagrams (`crate::udp`'s `decode_loop`, and `graphite/tcp.rs`'s per-connection `scratch`).
+/// datagrams (`crate::udp`'s `decode_loop`, and `crate::tcp`'s per-connection `scratch`).
 /// Zero -- there is nothing left to allocate once the caller's `Vec<Event>` keeps its capacity,
 /// which is the strongest statement this codec can make.
 #[test]
@@ -932,9 +932,11 @@ fn logfmt_values_share_the_message_allocation() {
     );
 }
 
-/// Four metrics attached: one `MetricList` spill (past its single inline slot) and one `bins` Vec
-/// for each of the two single-sample `DDSketch` distributions. That is the cost of describing two
-/// `f64`s -- see `docs/design/memory.md` on `MetricKind::Distribution`.
+/// Four metrics attached: exactly the one `MetricList` spill (past its single inline slot),
+/// grown once up front by `process`'s `reserve`. 3 -> 1: the two distributions used to each
+/// build a single-sample `DDSketch` (one `bins` Vec apiece); they are raw inline
+/// `MetricKind::Samples` now (`docs/adr/kv-metrics-semantics.md`), so describing two `f64`s
+/// costs nothing on the heap.
 #[test]
 fn kv_metrics_one_event() {
     let mut kv = fixtures::kv_metrics();
@@ -952,7 +954,7 @@ fn kv_metrics_one_event() {
 
     let (event, stats) = measure(|| kv.process(&resource, event).expect("kv_metrics forwards"));
     assert_eq!(event.metrics.len(), 4);
-    expect_allocs("kv_metrics: derive 4 metrics", stats, 3);
+    expect_allocs("kv_metrics: derive 4 metrics", stats, 1);
 }
 
 /// Free, in allocation terms: `filtered` rebuilds the map, but three surviving attributes fit
@@ -1150,8 +1152,10 @@ fn aggregate_absorb_25_samples_values_into_one_series_samples_mode() {
 // ---------------------------------------------------------------------------------------------
 
 /// What each extra fan-out consumer costs per event: `Fanout::send` deep-clones the batch for
-/// every consumer but the last. Four allocations (the spilled `AttrMap`, the spilled `MetricList`,
-/// and a `bins` Vec per sketch) plus an 800-byte memcpy, per event, per extra branch.
+/// every consumer but the last. Two allocations (the spilled `AttrMap` and the spilled
+/// `MetricList`) plus an 800-byte memcpy, per event, per extra branch. 4 -> 2: the two
+/// distributions were single-sample `DdSketch`es with a `bins` Vec each to clone; they are inline
+/// `Samples` now ([`kv_metrics_one_event`]).
 ///
 /// The `Arc<EventBatch>` copy-on-write change in `docs/design/memory.md` is aimed at exactly this:
 /// a branch that only reads -- every sink -- would pay none of it.
@@ -1162,7 +1166,7 @@ fn clone_one_event() {
 
     let (clone, stats) = measure(|| event.clone());
     assert_eq!(clone.metrics.len(), 4);
-    expect_allocs("Event::clone (nginx shape)", stats, 4);
+    expect_allocs("Event::clone (nginx shape)", stats, 2);
 }
 
 /// The cheap end of the range: a statsd counter with three tags and one metric fits entirely
@@ -1254,19 +1258,20 @@ fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
 
 /// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
 /// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
-/// allocation plus the 4 allocations [`clone_one_event`] measures for the one nginx-shaped event
-/// inside it, so 5 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
+/// allocation plus the 2 allocations [`clone_one_event`] measures for the one nginx-shaped event
+/// inside it, so 3 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
 /// consumer" did for this same two-branch shape. The other branch, once its sibling has already
 /// dropped its handle, costs nothing. **The difference from before this PR is `Arc::new`'s one
-/// extra allocation, not a reduction** -- so the total here (6) is one *more* than the equivalent
-/// pre-`Arc` code would have paid (5), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
+/// extra allocation, not a reduction** -- so the total here (4) is one *more* than the equivalent
+/// pre-`Arc` code would have paid (3), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
 /// which really is a strict improvement; this test exists so that claim isn't quietly assumed to
 /// extend to real fan-outs too, when the numbers say otherwise under the current no-trait-change
 /// design (`docs/adr/arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
-/// section). Six is still far short of two fully independent copies (10, i.e. this same 5 paid by
+/// section). Four is still far short of two fully independent copies (6, i.e. this same 3 paid by
 /// *both* branches, which is what a naive per-`Event` `Arc` or a design with no sharing at all would
 /// cost), so isolation is not getting more expensive as fan-out width grows -- it just isn't getting
-/// cheaper than the code this PR replaces, either.
+/// cheaper than the code this PR replaces, either. (These were 6/5/10 while the nginx event's
+/// clone cost 4 -- see [`clone_one_event`] for the 4 -> 2.)
 ///
 /// Unwraps branch "a" while branch "b" still holds its handle, then "b" last, to pin the
 /// deterministic case rather than the timing-dependent one -- `unwrap_batch`'s doc comment
@@ -1308,7 +1313,7 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     expect_allocs(
         "fanout: send + receive, 2 consumers (1 clones, 1 free, +1 for the Arc)",
         stats,
-        6,
+        4,
     );
 }
 
@@ -1527,20 +1532,22 @@ fn route_batch_all_unrouted_costs_two() {
 /// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to
 /// this shape"): the *same* 64-event host/app split, expressed the way it has to be without
 /// targets -- a `Fanout` to two ordinary `Transform` consumers, each running its own
-/// `has_attributes` over the *whole* batch to keep its one-half. **324**, composed of three
+/// `has_attributes` over the *whole* batch to keep its one-half. **196**, composed of three
 /// directly-measured pieces (each confirmed independently, not assumed from the one-event
 /// numbers elsewhere in this file):
 ///
 /// - **1 `Arc::new`.** `Fanout::deliver`'s once-per-send wrap for a >1-consumer edge
 ///   (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`'s own "+1 for the Arc").
-/// - **321 for the forced `EventBatch` deep clone.** The branch that unwraps first (`a`, while
+/// - **193 for the forced `EventBatch` deep clone.** The branch that unwraps first (`a`, while
 ///   `b`'s handle is still alive) can't take the `Arc`, so it deep-clones: 1 for the clone's own
-///   `Vec<Event>` backing allocation, plus 64 * 5 for the events themselves. That per-event **5**
+///   `Vec<Event>` backing allocation, plus 64 * 3 for the events themselves. That per-event **3**
 ///   is measured directly against *this* fixture (`fixtures::nginx_batch_alternating_stream`),
-///   not assumed from [`clone_one_event`]'s plain-nginx **4** -- one more than the reference
+///   not assumed from [`clone_one_event`]'s plain-nginx **2** -- one more than the reference
 ///   pipeline's own nginx shape, because this fixture's event is `nginx_event` plus one `stream`
 ///   attribute inserted afterward (`fixtures::nginx_event_with_stream`), which changes the
 ///   already-spilled `AttrMap`'s own capacity growth on top of what `kv_metrics` left it with.
+///   (Was 5 and 4 respectively while `kv_metrics` put a `bins` Vec per distribution on every
+///   event; those are inline `Samples` now, [`kv_metrics_one_event`].)
 ///   The other branch (`b`, unwrapping last with nothing else holding the `Arc`) is free, exactly
 ///   as in the one-event case.
 /// - **2 for the two `has_attributes` passes.** `process_batch_through_has_attributes` pins a
@@ -1549,7 +1556,7 @@ fn route_batch_all_unrouted_costs_two() {
 ///   (host_stream's filter, then app_stream's), each over the *whole* 64-event batch since
 ///   neither filter narrows what the other has to scan.
 ///
-/// `1 + 321 + 2 = 324`. The point isn't the exact total -- it's that this shape's cost scales with
+/// `1 + 193 + 2 = 196`. The point isn't the exact total -- it's that this shape's cost scales with
 /// `branches * events`, while
 /// [`route_batch_two_targets_costs_one_vec_per_used_destination`]'s scales with `destinations
 /// used` alone, flat in both event count and branch count.
@@ -1593,7 +1600,7 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
     expect_allocs(
         "today: fan-out (1 Arc + 1 clone of 64 events) + 2 has_attributes passes, same split",
         stats,
-        324,
+        196,
     );
 }
 
@@ -1685,7 +1692,11 @@ fn disk_queue_push_one_batch() {
     // field now being wrapped in `write_field(MR_KIND, ..)` instead of written straight into the
     // record's buffer -- plus one more from `LogRecord.message` gaining the same `write_field`
     // wrapper it didn't have before. 4*2 + 1 = 9.
-    expect_allocs("disk_queue: push one batch (encode + write)", stats, 36);
+    // 36 -> 34: `kv_metrics` emits its two distributions as inline `Samples` rather than
+    // single-sample `DdSketch`es, and the native codec writes a `Samples` straight from its
+    // values where a `Distribution` first serialized its sketch through `to_java_bytes` (one
+    // blob per record) -- same -2 as `native_encode_one_event`.
+    expect_allocs("disk_queue: push one batch (encode + write)", stats, 34);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1777,7 +1788,8 @@ fn fanout_send_mixed_output_and_transform_consumers() {
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output not yet finished (racy outcome A)",
         stats,
-        6,
+        // 6 -> 4 with [`clone_one_event`]'s 4 -> 2: the clone is what this outcome pays.
+        4,
     );
 }
 
@@ -2259,10 +2271,10 @@ fn unwrap_batch_shared_sole_reference() {
 
 /// The documented racy fallback: a sibling branch still holds its own handle to the same `Arc`
 /// when this one unwraps, so `Arc::try_unwrap` fails and `unwrap_batch` falls back to a full
-/// `EventBatch::clone` -- 1 allocation for the cloned `Vec<Event>` plus `clone_one_event`'s 4 for
+/// `EventBatch::clone` -- 1 allocation for the cloned `Vec<Event>` plus `clone_one_event`'s 2 for
 /// the one nginx-shaped `Event` inside it, matching the per-branch cost
 /// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` measures at the `Fanout::send` level
-/// (that test's 6 is this 5 plus the one `Arc::new` per send, which happens outside this measured
+/// (that test's 4 is this 3 plus the one `Arc::new` per send, which happens outside this measured
 /// region).
 #[test]
 fn unwrap_batch_shared_contended() {
@@ -2278,7 +2290,7 @@ fn unwrap_batch_shared_contended() {
     expect_allocs(
         "runtime: unwrap_batch, Delivered::Shared, contended (falls back to clone)",
         stats,
-        5,
+        3,
     );
 }
 
@@ -2511,11 +2523,22 @@ fn send_batch_first_call_after_a_drain() {
 /// straight into reused buffers instead of building a `String` per tag, per field name, per field
 /// value, and per line. See `docs/design/memory.md`.
 ///
-/// What's left is genuinely per-batch rather than per-event: one `Bytes` for the finished body,
-/// one `String` key per *distinct* series on its first sighting, and the growth of the per-series
-/// timestamp maps. Nothing here scales with event count any more, which is the property worth
-/// keeping -- if this number starts tracking the batch size again, something has regressed to
-/// per-line allocation.
+/// What's left of the encoder's *own* cost is genuinely per-batch rather than per-event: one
+/// `Bytes` for the finished body, one `String` key per *distinct* series on its first sighting,
+/// and the growth of the per-series timestamp maps -- the 30 this pinned before `kv_metrics`
+/// changed what it emits. The other 200 are 2 per event and deliberate: the fixture's two
+/// distributions arrive as raw `MetricKind::Samples` now ([`kv_metrics_one_event`],
+/// `docs/adr/kv-metrics-semantics.md`) instead of single-sample `DdSketch`es, and rendering a
+/// `Samples` re-sketches it (`Samples::sketch`'s `bins` Vec, the identical cost
+/// [`graphite_encode_into_100_samples_events_expanded`] documents for the same input). That is the
+/// per-event allocation *moved* out of `kv_metrics` -- which used to pay exactly these two per
+/// event, for every downstream, whether or not anything needed a sketch -- into the one consumer
+/// shape that does: this fixture feeds `kv_metrics` output straight into the encoder with no
+/// `aggregate` between, so the sketch is built here instead. The reference pipeline runs
+/// `aggregate` first and sketches once per series, not per event
+/// ([`aggregate_absorb_one_samples_event_sketch_mode`]: 0). If the *per-batch* 30 starts
+/// tracking batch size, something has regressed to per-line allocation in the encoder itself;
+/// a single-value `Samples` fast path in `render_fields` would take the 200 back.
 #[test]
 fn influx_encode_100_events() {
     let mut encoder = InfluxLineEncoder::default();
@@ -2524,7 +2547,7 @@ fn influx_encode_100_events() {
 
     let (body, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
     assert!(!body.is_empty());
-    expect_allocs("influxdb_out: encode 100 events", stats, 30);
+    expect_allocs("influxdb_out: encode 100 events", stats, 230);
 }
 
 /// Down from 1801 (~18/event) to 101 (~1/event), via the same treatment `influxdb_out` got
@@ -3154,7 +3177,11 @@ fn lua_process_one_event_identity_write_to_scope_name_is_free() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 5 = 1 (decode) + 1 (json) + 3 (kv_metrics) + 0 (keep) + 0 (aggregate).
+/// 3 = 1 (decode) + 1 (json) + 1 (kv_metrics) + 0 (keep) + 0 (aggregate). Was 5 while
+/// `kv_metrics` sketched each distribution per event ([`kv_metrics_one_event`]); `aggregate`
+/// absorbs the raw `Samples` it emits now into its per-series sketch without allocating
+/// ([`aggregate_absorb_one_samples_event_sketch_mode`]), so the two allocations are gone from the chain,
+/// not moved along it.
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -3181,7 +3208,7 @@ fn full_chain_one_line() {
         run!();
     }
     let (_, stats) = measure(|| run!());
-    expect_allocs("full chain: 1 access-log line", stats, 5);
+    expect_allocs("full chain: 1 access-log line", stats, 3);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3309,7 +3336,10 @@ fn native_encode_one_event() {
     // `MetricRecord.kind` is now wrapped in its own `write_field` rather than written straight
     // into the record's buffer) plus 1 for `LogRecord.message` gaining the same wrapper -- `nginx_
     // event` carries 4 metrics and 1 log, so 4*2 + 1 = 9.
-    expect_allocs("native: encode 1 event", stats, 32);
+    // 32 -> 30: the two distributions are inline `Samples` now rather than single-sample
+    // `DdSketch`es ([`kv_metrics_one_event`]); a `Distribution` record serializes its sketch
+    // through `to_java_bytes` (one blob allocation each), a `Samples` writes its values directly.
+    expect_allocs("native: encode 1 event", stats, 30);
 }
 
 /// The decode-side mirror of [`native_encode_one_event`]. `decode_into` appends into a caller-held
@@ -3369,7 +3399,8 @@ fn logit_out_encode_and_frame_one_batch() {
     assert!(!framed.is_empty());
     // 23 -> 32 (W1, metrics-model-v2): same cause as [`native_encode_one_event`] -- this path
     // calls the same `native::encode_batch`.
-    expect_allocs("logit_out: encode + frame 1 batch", stats, 32);
+    // 32 -> 30 alongside `native_encode_one_event`: same two steps, same inline-`Samples` saving.
+    expect_allocs("logit_out: encode + frame 1 batch", stats, 30);
 }
 
 /// `logit_in`'s own read+decode step, exercised through the exact primitives its per-connection

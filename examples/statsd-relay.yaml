@@ -41,7 +41,18 @@ components:
     #                            # resolving them first
     # max_packet_bytes: "1432"   # bounds one UDP datagram's worth of packed lines, not a single
     #                            # line's length -- ignored under transport: tcp
-    # connect_timeout: 5s        # tcp only
+    # connect_timeout: 5s        # tcp only -- bounds the connect and, under tls:, the handshake as
+    #                            # two separate phases, so a TLS connect can take up to twice this
+    # tls:                       # presence turns TLS on and makes it *required* -- `endpoint` is a
+    #                            # bare host:port with no scheme to read a TLS signal from, unlike
+    #                            # otlp_out. transport: tcp only (rule 52); no statsd client speaks
+    #                            # TLS, so this is a logit-to-logit or stunnel-shaped relay hop.
+    #                            # A TLS write failure is never retried (docs/adr/statsd-output.md's
+    #                            # TLS amendment) -- a redelivered counter would double-count.
+    #   ca_file: ca.pem
+    #   cert_file: client.pem    # cert_file/key_file together, for mutual TLS
+    #   key_file: client.key
+    #   insecure_skip_verify: false
     # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
     #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering)

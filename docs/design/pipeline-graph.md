@@ -293,10 +293,10 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` — a config error, not
     something to clamp silently.
 17. A non-default `receive:` block is rejected on any kind that is not a **datagram listener**
-    (`docs/adr/decoupled-listener-io.md`, `statsd_in`/`collectd_in`, and `syslog_in`/`graphite_in`
-    under `transport: udp`), a **stream listener**
-    (`docs/adr/syslog-tcp-ingress-and-tls.md` and `docs/adr/graphite-carbon-relay.md`,
-    `syslog_in`/`graphite_in` under `transport: tcp`), or a **tail
+    (`docs/adr/decoupled-listener-io.md`, `collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`
+    under `transport: udp`), a **stream listener** (one shared driver,
+    `docs/adr/syslog-tcp-ingress-and-tls.md` plus `docs/adr/graphite-carbon-relay.md`'s 2026-09-14
+    amendment: `syslog_in`/`graphite_in`/`statsd_in` under `transport: tcp`), or a **tail
     listener** (`docs/adr/file-tailing-and-docker-json-logs.md`, `tail_in`/`docker_in`). Deliberately not
     "any non-listener": `internal` and `generate_in` are listeners by role but have no socket, no
     queue, and no decoder, so `receive:` on either would be exactly the silently-ignored-setting
@@ -487,14 +487,25 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     resolver can mirror it exactly without depending on `logit-config` (this document's own
     "Crate layout" section). `receive:` on a `generate_in` is rejected by rule 17's own allowlist
     — it is a listener by role, with no socket, queue, or decoder for `receive:` to configure.
-43. A `syslog_in` carrying a `tls:` block must be `transport: tcp`
-    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)). Syslog over TLS
-    (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP, and DTLS (RFC 6012), its
-    UDP-carried sibling, is out of scope — so a `tls:` block under `transport: udp` could never
-    take effect. Rejected rather than ignored, the same call rule 22 makes for a `tls:` block
-    under a plaintext `otlp_out` endpoint: an operator who wrote one meant the connection
-    encrypted, and running it in the clear anyway is the worst of the available outcomes. Nothing
-    here constrains a plaintext TCP listener, which stays perfectly ordinary.
+43. A listener carrying a `tls:` block must be on a stream transport — `transport: tcp` on a
+    `syslog_in` ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), a
+    `graphite_in` ([ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)'s 2026-09-14
+    amendment, which put that listener on the same driver) or a `statsd_in` (that same syslog ADR's
+    own amendment, the driver's third listener). TLS is defined over a reliable ordered
+    byte stream, and its datagram sibling DTLS is out of scope throughout this project (RFC 6012
+    for syslog; neither carbon nor statsd has a DTLS receiver at all) — so a `tls:` block under
+    `transport: udp`
+    could never take effect. Rejected rather than ignored, the same call rule 22 makes for a
+    `tls:` block under a plaintext `otlp_out` endpoint: an operator who wrote one meant the
+    connection encrypted, and running it in the clear anyway is the worst of the available
+    outcomes. Nothing here constrains a plaintext TCP listener, which stays perfectly ordinary.
+
+    **One rule, not one per listener.** The check, the message and the reasoning are identical on
+    every kind it covers; only the kind's own `transport` spelling differs. So a listener that
+    grows a stream transport joins this rule by adding an arm to its match — three have done so
+    now — rather than by claiming another rule number: the opposite convention from the *sink* rules
+    (24/34/44/52), which stay one per sink because each also checks that sink's own `tls:`
+    internals.
 44. A `syslog_out` `tls:` block must be internally consistent — `cert_file`/`key_file` set
     together, no `insecure_skip_verify` alongside `ca_file` — the same two checks rule 34 makes
     for `logit_out`'s own `tls:` block (and rule 24 for `otlp_out`'s), for the same reason: both
@@ -508,26 +519,31 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `graph::resolve` isn't the only possible caller.
 
 45. A `handshake_timeout` must be greater than `0s` on every kind that has one — `syslog_in`,
-    `logit_in`, `otlp_in` — and must be left at its default in the two places it could never take
-    effect: a `syslog_in` with `transport: udp`, and a plaintext `otlp_in` (no `tls:` block).
+    `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` — and must be left at its default where it
+    could never take effect: a `syslog_in`, a `graphite_in` or a `statsd_in` with `transport: udp`.
     `0s` is an impossible budget rather than a tight one: no TLS accept, first-byte read,
     or `Hello` read completes in zero time, so a listener configured with it would accept
     connections only to close each one immediately and would receive nothing at all — the same
     "0 is impossible, not just small" call rules 9/15/18/28 make for a flush interval, a queue
-    bound, and a poll interval. The two context checks are rule 43's reasoning applied to this
-    field instead of `tls:`, in rule 33's "only means anything under X" shape: a UDP `syslog_in`
-    has no connection to hand shake, and a plaintext `otlp_in` has a connection but no phase this
-    field reaches — on that listener the budget bounds the TLS accept *alone* (hyper's own version
-    sniff, which follows it, is not wrapped; see `docs/known-gaps.md`'s plaintext-`otlp_in` row),
-    so with no `tls:` block it is inert. In both cases an operator who set a value meant it to take
-    effect, so set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
+    bound, and a poll interval. The context check is rule 43's reasoning applied to this
+    field instead of `tls:`, in rule 33's "only means anything under X" shape: a UDP `syslog_in`,
+    `graphite_in` or `statsd_in` has no connection to hand shake at all, so an operator who set a value there
+    meant it to take effect and set-but-ignored is an error rather than a silent no-op. Only a *non-default* value
     is rejected, so the field's own default stays legal everywhere and no pre-existing config
     becomes invalid; `graph.rs` imports `logit_config::default_handshake_timeout` to make that
     distinction rather than mirroring the number, and
-    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine`/
-    `a_plaintext_otlp_in_at_the_default_handshake_timeout_resolves_fine` both deserialize a real
-    config rather than constructing the variant, so they exercise the `serde` defaulting path this
+    `a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine` deserializes a real
+    config rather than constructing the variant, so it exercises the `serde` defaulting path this
     comparison has to agree with.
+
+    **A plaintext `otlp_in` was the second such case and no longer is.** That listener's budget
+    once bounded its TLS accept alone, so with no `tls:` block it was inert and a set value was
+    rejected. It now also bounds the wait for a plaintext connection's very first byte — a
+    `TcpStream::peek` under the same budget, which consumes nothing and so leaves hyper's own
+    version sniff untouched (`crates/logit-inputs/src/otlp.rs`, and
+    [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md)'s 2026-09-14
+    amendment) — so the value is live with or without `tls:` and this rule no longer names
+    `otlp_in` in its context check at all, only in the `0s` one.
 
 46. A `graphite_in`'s and a `graphite_out`'s protocol/transport pair and size bounds
     ([ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)). `protocol: pickle` requires
@@ -576,6 +592,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     (it could never name a real target), and, under `by: {attribute: k}`/`{resource: k}`, a
     non-empty `k`: rule 19/20's empty-field-name rejection, applied to the one key a `route` reads
     per event.
+52. A `statsd_out` `tls:` block must be internally consistent — `cert_file`/`key_file` set
+    together, no `insecure_skip_verify` alongside `ca_file` — rule 44's three checks with its
+    messages verbatim, since this sink dials the same bare `host:port` where `tls:`'s mere
+    presence is the only "TLS is wanted" signal there is. Plus that rule's own third check: `tls:`
+    together with `transport: udp` is rejected, since DTLS is out of scope here too
+    ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment). One rule per *sink*
+    (24/34/44/52), unlike rule 43's one-rule-for-every-listener, because each sink also checks its
+    own `tls:` internals. `logit_outputs::statsd::StatsdOutput::with_tls` re-checks the
+    `transport: udp` one itself, since `graph::resolve` isn't the only possible caller.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

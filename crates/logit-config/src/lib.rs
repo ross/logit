@@ -363,8 +363,55 @@ fn default_span_sample_rate() -> f64 {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
-    /// statsd / DogStatsD-style tagged metrics over UDP.
-    StatsdIn { bind: String },
+    /// statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.
+    ///
+    /// Under `transport: tcp` a message is one **LF-delimited line, always** -- there is no
+    /// `framing:` field and no octet-counted alternative the way `syslog_in` has: a statsd line
+    /// may legally begin with an ASCII digit (`1.hits:1|c`), so sniffing a leading digit as a
+    /// length prefix could only ever mis-frame. A line longer than 64 KiB is dropped and counted
+    /// (`logit.input.frames.dropped{reason="oversize"}`); the connection stays open and the line
+    /// after it still decodes. There is deliberately no `max_line_bytes` knob -- no statsd server
+    /// exposes one for an operator to match.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
+    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
+    /// block. Plain statsd clients have no TLS of their own -- this is for a `logit`-to-`logit`
+    /// or stunnel-shaped relay hop, the `statsd_in`/`statsd_out` pair included.
+    ///
+    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
+    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
+    /// apply, scoped **per connection**: N live connections can hold up to N times
+    /// `batch_max_events` in flight, not one shared bound.
+    StatsdIn {
+        bind: String,
+        #[serde(default)]
+        transport: StatsdTransport,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
+        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
+        /// See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
+        /// udp`, where a datagram listener has no connection to time out). How long one
+        /// connection has, **per pre-message phase**, to get somewhere before this listener
+        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
+        /// set, and then the wait for the connection's very first byte. Each phase gets its own
+        /// budget of this length, so a TLS connection that says nothing at all costs up to two
+        /// of them -- 10s at the default.
+        ///
+        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
+        /// on the gap before the next line -- a long-lived, mostly-quiet statsd client is
+        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
+        /// holds its permit indefinitely; that is a known, deliberately separate gap
+        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+    },
     /// collectd's binary "`network` plugin" protocol over UDP
     /// (`docs/adr/collectd-binary-relay.md`; `crates/logit-inputs/src/collectd.rs` is the
     /// listener, `crates/logit-proto/src/collectd/` the codec).
@@ -409,15 +456,43 @@ pub enum ComponentKind {
     /// 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:`
     /// block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length
     /// prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.
+    ///
+    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
+    /// fallback on a TLS listener. Like `syslog_in`'s, it applies to `transport: tcp` only (rule
+    /// 43): carbon has no DTLS receiver of any kind, so `tls:` under `transport: udp` is a config
+    /// error rather than a silently ignored block. Plain carbon senders have no TLS of their own
+    /// either -- this is for a `logit`-to-`logit` or stunnel-shaped relay hop.
     GraphiteIn {
         bind: String,
         #[serde(default)]
         transport: GraphiteTransport,
         #[serde(default)]
         protocol: GraphiteProtocol,
+        /// Terminates TLS on this listener when present; plaintext when omitted. Requires
+        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
+        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
+        /// See [`TlsServerConfig`].
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
+        /// udp`, where a datagram listener has no connection to time out). How long one
+        /// connection has, **per pre-message phase**, to get somewhere before this listener
+        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
+        /// set, and then the wait for the connection's very first byte. Each phase gets its own
+        /// budget of this length, so a TLS connection that says nothing at all costs up to two
+        /// of them -- 10s at the default.
+        ///
+        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
+        /// on the gap before the next datapoint -- a carbon relay that flushes once a minute is
+        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
+        /// holds its permit indefinitely; that is a known, deliberately separate gap
+        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
         /// The longest plaintext line this listener will assemble before giving up on it and
-        /// draining to the next newline (counted once as `logit.input.metrics.skipped
-        /// {reason="oversize_line"}`; the line *after* it still decodes). Defaults to `"8192"` --
+        /// draining to the next newline (counted once as `logit.input.frames.dropped
+        /// {reason="oversize"}`; the line *after* it still decodes). Defaults to `"8192"` --
         /// carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so
         /// 8 KiB is comfortably past any real tagged path while keeping one hostile connection
         /// from growing an unbounded read buffer. A string via [`human_bytes`], exactly like
@@ -427,8 +502,9 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_line_bytes: u64,
         /// The largest pickle frame this listener will accept. A frame declaring more than this
-        /// closes the connection (diagnostic `oversize_frame`): a length-framed stream has no
-        /// resync point, so there is nothing to skip forward to. Defaults to `"1MiB"`, Twisted's
+        /// closes the connection (`logit.input.frames.dropped{reason="oversize"}`, diagnostic
+        /// `framing_error`): a length-framed stream has no resync point, so there is nothing to
+        /// skip forward to. Defaults to `"1MiB"`, Twisted's
         /// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits
         /// -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and
         /// anything outside `1024..=16MiB`. `protocol: pickle` only.
@@ -497,23 +573,20 @@ pub enum ComponentKind {
         /// present; plaintext when omitted. See [`TlsServerConfig`].
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// How long one connection has to finish its **TLS accept** before this listener closes
-        /// it and hands back its connection-cap permit. **`tls:` only** -- a plaintext listener
-        /// has no phase for it to bound, so rule 45 rejects a non-default value on one rather
-        /// than accepting a guaranteed no-op.
+        /// How long one connection has, per pre-request phase, before this listener closes it and
+        /// hands back its connection-cap permit: its **TLS accept** when `tls:` is set, and --
+        /// on a plaintext listener, which has no TLS accept -- the wait for its very **first
+        /// byte**. Applies with or without `tls:`.
         ///
-        /// **Narrower here than on `syslog_in`/`logit_in`, deliberately.** On those two the same
-        /// field also bounds the wait for the first byte *after* the handshake, because their
-        /// accept loops read that byte themselves. This listener hands the accepted stream
-        /// straight to `hyper`, whose `hyper_util::server::conn::auto::Builder` reads the first
-        /// bytes itself to tell HTTP/1.1 from h2 -- a read this listener never sees and cannot
-        /// wrap without reimplementing that sniff, and one `hyper`'s own
-        /// `http1().header_read_timeout(..)` does not cover either (it starts only once the
-        /// version is already known). Under `protocol: grpc` there is no such knob at all.
-        /// So on `otlp_in` a handshaken-then-silent connection still holds its permit (the same
-        /// open row as the post-handshake idle case, `docs/known-gaps.md`'s "no idle-connection
-        /// timeout on a TCP listener"), and a plaintext one is not bounded at any point at all
-        /// (`docs/known-gaps.md`'s "a plaintext `otlp_in` has no pre-first-byte bound").
+        /// **What it does not bound.** Once a connection has produced one byte it is inside
+        /// `hyper`'s own read loop, which this listener does not drive, so a client that sends a
+        /// single byte and then goes silent still holds its permit -- and under `protocol: grpc`
+        /// the same is true of a client that sends one byte of the HTTP/2 preface. `hyper`'s own
+        /// `http1().header_read_timeout(..)` is deliberately not installed to close that: it
+        /// re-arms across every idle keep-alive gap, which would make it an idle timeout and
+        /// close a long-interval exporter's pooled connection between exports. See
+        /// `docs/known-gaps.md`'s plaintext-`otlp_in` row and its "no idle-connection timeout on
+        /// a TCP listener" row.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
@@ -1188,10 +1261,24 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_packet_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) is allowed to take before `send` reports it as a failure.
+        /// dropped connection) is allowed to take before `send` reports it as a failure. Also
+        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS connect
+        /// can take up to twice this value, exactly as `syslog_out`'s own `connect_timeout` does.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// Turns on TLS for this connection when present. Presence turns it on and makes it
+        /// *required* (there is no plaintext fallback), the same shape as `syslog_out`'s and
+        /// `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to read that
+        /// signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means TLS with
+        /// the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope, and
+        /// `tls:` alongside `transport: udp` is a config error (rule 52), not silently ignored.
+        /// No statsd client in the wild speaks TLS, so this is for a `logit`-to-`logit` (or
+        /// stunnel-shaped) relay hop rather than for an application's own DogStatsD client. See
+        /// [`TlsClientConfig`] for path resolution (relative to the config file's own directory)
+        /// and `!env` compatibility, both identical here.
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
     },
     /// collectd binary-protocol (`network` plugin) egress -- the mirror of `collectd_in`, and a
     /// real relay: identity, values, and kinds round-trip through the real decoder on the other
@@ -1855,11 +1942,15 @@ pub struct SyslogStructuredData {
     pub sd_id: String,
 }
 
-/// `statsd_out`'s transport. UDP (the default) matches classic statsd and DogStatsD clients;
-/// TCP is what makes `Fault` classification meaningful for this sink, same as `SyslogTransport`.
-/// Deliberately its own enum rather than reusing `SyslogTransport`: schemars publishes a type's
-/// own name into the schema's `$defs`, so sharing one would make `statsd_out` document its
-/// transport by pointing at a syslog-named type.
+/// `statsd_in`'s and `statsd_out`'s transport. UDP (the default) matches classic statsd and
+/// DogStatsD clients; TCP is the reliable, framed one -- on the way out it is what makes `Fault`
+/// classification meaningful for the sink (same as `SyslogTransport`), and on the way in it is
+/// what a `tls:` block needs underneath it, since DTLS is out of scope. Both directions frame a
+/// TCP message the same way, as one LF-delimited line: there is no statsd equivalent of RFC
+/// 6587's octet counting to choose between. Deliberately its own enum rather than reusing
+/// `SyslogTransport`: schemars publishes a type's own name into the schema's `$defs`, so sharing
+/// one would make `statsd_in`/`statsd_out` document their transport by pointing at a syslog-named
+/// type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsdTransport {
@@ -3269,7 +3360,8 @@ mod tests {
 
     /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own:
     /// TCP plaintext (its default listener is plaintext on 2003), an 8 KiB line bound and
-    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound.
+    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound -- plus no TLS and the
+    /// shared 5s `handshake_timeout` the other TCP listeners default to.
     #[test]
     fn graphite_in_component_defaults_to_tcp_plaintext_with_carbons_bounds() {
         let component: Component =
@@ -3279,16 +3371,43 @@ mod tests {
                 bind,
                 transport,
                 protocol,
+                tls,
+                handshake_timeout,
                 max_line_bytes,
                 max_frame_bytes,
             } => {
                 assert_eq!(bind, "0.0.0.0:2003");
                 assert_eq!(transport, GraphiteTransport::Tcp);
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
+                assert_eq!(tls, None, "plaintext unless a tls: block says otherwise");
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
                 assert_eq!(max_line_bytes, 8192);
                 assert_eq!(max_frame_bytes, 1 << 20);
             }
             other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+    }
+
+    /// `tls:` and `handshake_timeout:` round-trip on a `graphite_in`, the twin of `syslog_in`'s
+    /// own test -- both reach `GraphiteInput` through `logit-cli`'s `build_spec`, and both are
+    /// rejected on `transport: udp` by graph rules 43/45.
+    #[test]
+    fn graphite_in_component_parses_tls_and_handshake_timeout() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003",
+                "handshake_timeout": "2s",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::GraphiteIn { tls: Some(tls), handshake_timeout, .. } => {
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected GraphiteIn with tls set, got {other:?}"),
         }
     }
 
@@ -3666,6 +3785,7 @@ mod tests {
                 relative_gauges,
                 max_packet_bytes,
                 connect_timeout,
+                tls,
             } => {
                 assert_eq!(endpoint, "127.0.0.1:8125");
                 assert_eq!(transport, StatsdTransport::Udp);
@@ -3673,6 +3793,7 @@ mod tests {
                 assert!(!relative_gauges);
                 assert_eq!(max_packet_bytes, 1432);
                 assert_eq!(connect_timeout, Duration::from_secs(5));
+                assert_eq!(tls, None);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
         }
@@ -3908,6 +4029,52 @@ mod tests {
             ComponentKind::StatsdOut { transport, connect_timeout, .. } => {
                 assert_eq!(transport, StatsdTransport::Tcp);
                 assert_eq!(connect_timeout, Duration::from_secs(30));
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    /// `tls:` is additive here exactly as it is on `syslog_out`: absent means plaintext, and
+    /// presence (even an empty block) means TLS with the bundled Mozilla roots -- so an empty
+    /// `tls: {}` is meaningful rather than equivalent to omitting it (`StatsdOut::tls`'s own doc
+    /// comment, `docs/adr/statsd-output.md`'s TLS amendment).
+    #[test]
+    fn statsd_out_tls_defaults_to_none_and_an_empty_block_is_distinct_from_absent() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => assert_eq!(tls, None),
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "relay:8125",
+                "transport": "tcp", "tls": {}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => {
+                assert_eq!(tls, Some(TlsClientConfig::default()));
+                assert!(tls.unwrap().is_empty(), "an empty block still means TLS is on");
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "relay:8125",
+                "transport": "tcp",
+                "tls": {"ca_file": "ca.pem", "cert_file": "client.pem", "key_file": "client.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => {
+                let tls = tls.expect("a set tls: block parses");
+                assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+                assert_eq!(tls.cert_file.as_deref(), Some("client.pem"));
+                assert_eq!(tls.key_file.as_deref(), Some("client.key"));
+                assert!(!tls.insecure_skip_verify);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
         }
@@ -4576,5 +4743,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(component.targets, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `statsd_in`'s three new fields all default, and all round-trip when set: the bare
+    /// `{"type": "statsd_in", "bind": ...}` shape every pre-TCP config in the wild already has
+    /// must keep deserializing unchanged (`component_with_no_sources_defaults_to_empty` above is
+    /// the other half of that pin), and a `transport: tcp` listener must be able to carry a
+    /// `tls:` block and a `handshake_timeout` (`docs/adr/syslog-tcp-ingress-and-tls.md`, whose
+    /// driver this listener now shares).
+    #[test]
+    fn statsd_in_round_trips_transport_tls_and_handshake_timeout() {
+        let bare: Component =
+            serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
+        match bare.kind {
+            ComponentKind::StatsdIn { bind, transport, tls, handshake_timeout } => {
+                assert_eq!(bind, "0.0.0.0:8125");
+                assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+
+        let full: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp",
+                "tls": {"cert_file": "server.pem", "key_file": "server.key",
+                        "client_ca_file": "ca.pem"},
+                "handshake_timeout": "2s"}"#,
+        )
+        .unwrap();
+        match full.kind {
+            ComponentKind::StatsdIn { transport, tls: Some(tls), handshake_timeout, .. } => {
+                assert_eq!(transport, StatsdTransport::Tcp);
+                assert_eq!(tls.cert_file, "server.pem");
+                assert_eq!(tls.key_file, "server.key");
+                assert_eq!(tls.client_ca_file, Some("ca.pem".to_string()));
+                assert_eq!(handshake_timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected StatsdIn with tls set, got {other:?}"),
+        }
+
+        // `transport` alone must not imply TLS -- the same pin `syslog_in_with_transport_tcp_
+        // deserializes` makes.
+        let plaintext_tcp: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match plaintext_tcp.kind {
+            ComponentKind::StatsdIn { transport, tls, .. } => {
+                assert_eq!(transport, StatsdTransport::Tcp);
+                assert_eq!(tls, None);
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
     }
 }

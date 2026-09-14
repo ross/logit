@@ -6,11 +6,17 @@
 //! in how they get there -- splitting a line on whitespace, or walking a restricted pickle stack
 //! ([`super::pickle`]).
 //!
-//! **Framing is not this decoder's job.** `graphite_in` owns the read buffer, the `max_line_bytes`
-//! drain-to-newline state and the 4-byte pickle length prefix; [`GraphiteDecoder::decode_into`] is
-//! handed either a datagram/complete-lines slice or one already-unframed pickle payload. That is
-//! why the `oversize_line`/`oversize_frame` rows of [`super`]'s decode table are counted there
-//! rather than here.
+//! **Framing is not this decoder's job.** `graphite_in`'s listener owns the read buffer, the
+//! `max_line_bytes` drain-to-newline state and the 4-byte pickle length prefix -- since W5 of the
+//! connection-follow-ups effort, through the shared TCP driver's `Framer`
+//! (`crates/logit-inputs/src/tcp.rs`). [`GraphiteDecoder::decode_into`] is handed either a whole
+//! datagram (UDP, which may hold several lines) or exactly one delimited message: one plaintext
+//! line, or one already-unframed pickle payload. That is why the two oversize rows of [`super`]'s
+//! decode table are counted there rather than here.
+//!
+//! Line splitting stays on regardless, and is not redundant: a UDP datagram genuinely may carry
+//! several LF-separated lines, and on the framed TCP path the split is a single iteration over a
+//! buffer with no `\n` in it.
 //!
 //! Every tag value is a zero-copy [`Bytes::slice`] of the input, so an event's attributes share the
 //! receive buffer's allocation instead of copying out of it (`docs/design/memory.md` §2) -- the
@@ -51,6 +57,38 @@ pub struct GraphiteDecoder {
     /// Reusable pickle machine -- stack, arenas and memo cleared per frame, never reallocated, so a
     /// warm pickle decode allocates only the caller's `Vec<Event>`.
     pickle: PickleReader,
+}
+
+/// Hand-written, not derived: [`PickleReader`] is a reusable *scratch* machine, and a clone must
+/// get a fresh one rather than a copy of whatever the original last left in it.
+///
+/// `Clone` at all because `graphite_in` runs on the shared TCP driver
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section), which hands
+/// every accepted connection its own decoder -- the pickle stack, arenas and memo are per-stream
+/// state and must not be shared between connections. Deriving would be *correct* today only by
+/// accident: every one of those five `Vec`s is cleared at the start of each frame
+/// (`PickleReader::parse`'s five `clear()`s), so no cross-frame state survives to copy -- but the
+/// derive would
+/// also copy each one's spare capacity into every new connection, which is the opposite of the
+/// point, and would silently start carrying real state the day the reader keeps anything across
+/// frames. [`PickleReader::new`] instead: a connection warms its own arenas on its first frame.
+///
+/// `resource` stays one shared [`Arc`], deliberately: `logit_pipeline::BatchAccumulator::absorb`
+/// keys accumulation on `Arc::ptr_eq`, so a resource per connection would stop two connections'
+/// events ever sharing a batch downstream (the `resource` field's own doc). `diag` and
+/// `telemetry` are shared handles too -- a `Diagnostics` clone shares its original's throttle
+/// counts (`logit_core::Diagnostics`' type doc), which is what makes `bad_line` throttle per
+/// listener rather than per connection.
+impl Clone for GraphiteDecoder {
+    fn clone(&self) -> Self {
+        Self {
+            protocol: self.protocol,
+            resource: Arc::clone(&self.resource),
+            diag: self.diag.clone(),
+            telemetry: self.telemetry.clone(),
+            pickle: PickleReader::new(),
+        }
+    }
 }
 
 impl GraphiteDecoder {

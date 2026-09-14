@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-14
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -127,8 +127,10 @@ every connection.
 mirroring `udp::UdpListener<D>` closely enough that `statsd_in` can adopt it later without a second
 driver being written -- but only `syslog_in` is wired to it in this decision; `statsd_in` stays on
 UDP-only until a real TCP statsd need appears. `D: Clone` is load-bearing, not incidental: a future
-decoder with real per-connection scratch state needs its own clone per connection the same way this
-one's `SyslogDecoder` will.
+decoder with real per-connection scratch state needs its own clone per connection. `SyslogDecoder`
+itself has no such state — its `Diagnostics` is a shared handle, so `bad_line` throttles
+listener-wide (see [ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s
+2026-09-14 amendment).
 
 The accept loop is copied from `logit_in`'s (`crates/logit-inputs/src/logit.rs`,
 [ADR `native-transport-handshake-and-ack`](native-transport-handshake-and-ack.md)): a
@@ -328,3 +330,52 @@ a differently-shaped metric for the same event.
   rsyslog-tcp-000.raw`) closes `testdata/interop/syslog/README.md`'s existing "TCP framing... not
   covered (yet)" note. TLS interop is proven in-process against `testdata/tls/`, the same way
   `logit_in`/`logit_out`'s own TLS tests are, rather than via a second recorded fixture.
+
+## Amendment: the driver serves more than one listener now (2026-09-14)
+
+This decision built `crates/logit-inputs/src/tcp.rs` as a shared driver but wired exactly one
+listener to it. `graphite_in` is the second ([ADR `graphite-carbon-relay`](graphite-carbon-relay.md)'s
+2026-09-14 amendment deletes its own 490-line accept loop in favour of this one), and `statsd_in`
+is the third -- the adoption "A generic TCP+TLS listener driver, syslog-only for now" above held
+out until a real need appeared, now landed as `transport: tcp` plus a `tls:` block on that
+listener, adding no code to the driver at all beyond what the two changes below already required.
+Three things that were tacitly "what syslog needs" have had to become explicit as a result.
+
+**Framing is chosen per listener, not sniffed by the driver.** The driver latched RFC 6587's two
+framings from each connection's first byte, reading a leading ASCII digit as an octet count. That
+is sound for syslog and only for syslog, where a non-transparent message always begins `<`; a
+carbon path or a statsd metric name may legitimately begin with a digit, and the sniff would
+reframe the whole connection on it. So `TcpListener::with_framing` now takes a `FramingMode`:
+`Rfc6587Auto` (the default, and `syslog_in`'s — byte-identical behaviour to before),
+`Lines { oversize }`, or `LengthPrefixed`. A builder rather than a `TcpListenerConfig` field, since
+that struct is the image of the `receive:` block an operator writes and framing is not something
+an operator sets.
+
+**A frame bound is per listener too.** `MAX_FRAME_BYTES` stays the default and stays
+non-configurable on `syslog_in`, for the reason its own doc gives. But `graphite_in` has two
+operator-facing bounds that carbon's own receivers expose (`max_line_bytes`, and `max_frame_bytes`
+defaulting to Twisted's megabyte), so `Framer::new` takes the bound alongside the mode and
+`Framer`'s `Default` is gone: both arguments are real decisions, and a default would silently pick
+syslog's.
+
+**Not every framing failure is fatal.** `FrameError` gained `OversizeSkipped`, the one variant with
+`is_fatal() == false`: under `Oversize::DrainToNextLine` an over-bound line is dropped, counted as
+`frames.dropped{reason="oversize"}` like its fatal sibling, and the framer resynchronizes at the
+next `LF` instead of the connection closing. `syslog_in` keeps `Oversize::Fatal`, so nothing about
+its behaviour changes. This is carbon's own recoverable-oversize rule, moved into the driver as a
+mode rather than reimplemented outside it.
+
+**The first-byte deadline's predicate changed, and had to.** It was `framer.framing().is_none()` —
+"has this connection latched a framing yet", which is only ever a first-byte question under
+`Rfc6587Auto`. Under either explicit mode the framing is known at construction, so that predicate
+reads "already framed" on a connection that has said nothing, and `handshake_timeout` would
+silently never fire on `graphite_in` or `statsd_in` while continuing to work perfectly on
+`syslog_in`. It is now `Framer::first_byte_seen()`, and
+`the_first_byte_deadline_applies_under_every_framing_mode` pins it across all three modes.
+
+**`frame_diag` is gone.** The driver kept an `Arc<Mutex<Diagnostics>>` beside the per-connection
+clone, so that `framing_error` and `bad_frame` throttled listener-wide while the clone's other keys
+did not. `Diagnostics` now shares its counts across every clone of one component's value
+([ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s 2026-09-14
+amendment), which is the general form of what that workaround bought for two keys, so the
+connection's own `&mut Diagnostics` is threaded through instead and the `Mutex` is deleted.

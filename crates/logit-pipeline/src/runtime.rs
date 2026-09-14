@@ -1360,6 +1360,10 @@ pub fn process_batch(
             None => absorbed += 1,
         }
     }
+    // Inside the timer on purpose: whatever a transform defers to `end_batch` is still its own
+    // per-batch work (`Transform::end_batch`'s doc comment), and attribution
+    // (`docs/design/internal-telemetry.md`) should keep charging it to this node.
+    transform.end_batch();
     drop(process_timer);
     if absorbed > 0 {
         telemetry.count(
@@ -2254,7 +2258,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -2368,7 +2377,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -2519,7 +2533,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         // `Json` is only a graph-arity placeholder here -- the runtime doesn't check that a
@@ -2696,7 +2715,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -3069,7 +3093,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -3177,7 +3206,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -3306,7 +3340,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         let script = r#"
@@ -3401,7 +3440,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         let script = r#"
@@ -3518,7 +3562,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -3619,7 +3668,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         let script = "n = 0\n\
@@ -3724,7 +3778,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -3948,7 +4007,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -4059,7 +4123,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -4123,7 +4192,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -4188,7 +4262,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -5295,7 +5374,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -5315,7 +5399,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -5520,7 +5609,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -5540,7 +5634,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(
@@ -5657,7 +5756,12 @@ mod tests {
     }
 
     fn statsd_in() -> ComponentKind {
-        ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }
+        ComponentKind::StatsdIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport: logit_config::StatsdTransport::default(),
+            tls: None,
+            handshake_timeout: logit_config::default_handshake_timeout(),
+        }
     }
 
     fn plain_component(sources: Vec<String>, kind: ComponentKind) -> Component {
@@ -6548,7 +6652,17 @@ mod tests {
     #[tokio::test]
     async fn a_router_partitions_a_batch_across_two_targets() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -6627,7 +6741,17 @@ mod tests {
     #[tokio::test]
     async fn unrouted_events_reach_the_routers_ordinary_consumers() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -6682,7 +6806,17 @@ mod tests {
     #[tokio::test]
     async fn unrouted_events_are_counted_when_a_router_has_no_ordinary_consumers() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -6763,7 +6897,17 @@ mod tests {
     #[tokio::test]
     async fn previous_downstream_of_a_target_is_the_targets_id_and_origin_is_untouched() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -6876,7 +7020,17 @@ mod tests {
     #[tokio::test]
     async fn a_router_exiting_closes_its_targets_consumers_inboxes() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -6943,7 +7097,17 @@ mod tests {
     #[tokio::test]
     async fn two_routers_directing_at_one_target_both_deliver() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split_a",
                 vec!["in"],
@@ -7107,7 +7271,17 @@ mod tests {
     #[tokio::test]
     async fn a_lua_router_splits_a_batch_two_ways() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -7184,7 +7358,17 @@ mod tests {
     #[tokio::test]
     async fn an_unmarked_event_reaches_the_lua_routers_ordinary_consumers() {
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -7249,7 +7433,17 @@ mod tests {
             end
         "#;
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "split",
                 vec!["in"],
@@ -7365,7 +7559,17 @@ mod tests {
             end
         "#;
         let g = routed_graph(vec![
-            ("in", vec![], vec![], ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() }),
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
+            ),
             (
                 "windowed",
                 vec!["in"],

@@ -129,7 +129,12 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
             receive: ReceiveConfig::default(),
             sources: vec![],
             targets: Vec::new(),
-            kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            kind: ComponentKind::StatsdIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport: logit_config::StatsdTransport::default(),
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+            },
         },
     );
     components.insert(

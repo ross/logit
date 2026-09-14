@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-12
+updated: 2026-09-14
 ---
 
 # statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral
@@ -658,3 +658,66 @@ identical tag bytes after flush, and an `influxdb_out` fixture case pins `team=b
 fixtures and two allocation rows, `statsd_in: decode 1 line with a repeated tag key` and
 `statsd_in: decode 1 multi-value counter line with a repeated tag key`, asserted at whatever
 allocation count was actually measured.
+
+## Amendment: TLS (2026-09-14)
+
+`transport: tcp` gains an optional `tls:` block (`TlsClientConfig`), the twin of the one
+[ADR `syslog-output`](syslog-output.md)'s own TLS amendment added to `syslog_out`
+([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md) for that design). This changes
+what two sections above say.
+
+**"### Transport: both UDP and TCP" gains TLS on the TCP arm.** `transport: tcp` can now carry
+`tls:` — presence turns TLS on and makes it *required*, with no plaintext fallback, the same shape
+`syslog_out`'s and `logit_out`'s blocks already use and for the same reason: `endpoint` here is a
+bare `host:port` with no scheme to read a TLS signal from the way `otlp_out`'s URL has one. That
+section's reasoning for why TCP makes `Fault` classification meaningful is unchanged and now covers
+the TLS case too: a failed `TlsConnector::connect` is `Fault::Clean` for exactly the reason a
+failed plain TCP connect already was — nothing of the batch has been written yet. DTLS is out of
+scope, so `tls:` under `transport: udp` is a config error (`graph::resolve`'s **rule 52**,
+`docs/design/pipeline-graph.md`) as well as an error inside `StatsdOutput::with_tls` itself, since
+`graph::resolve` is not the only possible caller. Rule 52 is rule 44's three checks with its
+messages verbatim; sink `tls:` rules stay one per sink (24/34/44/52) because each also validates
+that sink's own block.
+
+No statsd client in the wild speaks TLS — not the Etsy reference server, not the Datadog agent — so
+this is not for an application's own DogStatsD client. It is for the `logit`-to-`logit` (or
+stunnel-shaped) relay hop, the same niche the `statsd_in` listener's `tls:` block serves from the
+other end.
+
+**"### `duplicate_safe()` is `false`" now has a second consequence, on the wire rather than in the
+retry posture.** `send_tcp`'s "never resend once a byte has left the host" property was, on
+plaintext, backed by a real proof: one `AsyncWriteExt::write` is one `write(2)`, so an `Err` means
+zero bytes of that call were accepted and the whole frame can safely be retried on a fresh
+connection. TLS removes that proof. `tokio_rustls`' `poll_write` copies plaintext into the rustls
+session and loops socket writes until one returns `Pending`; it can therefore fail having already
+put complete records — each a run of complete, LF-terminated statsd lines a receiver keeps and
+counts — on the wire. So on TLS this sink does **no** internal reconnect-and-retry, and every
+failure at or after the first application write is `Fault::Ambiguous`; `Fault::Clean` survives only
+for failures inside the dial itself. On plaintext the pre-existing behaviour is unchanged: one
+reconnect-and-retry after a zero-byte failure, `Fault::Clean` if the retry fails too. Given
+`duplicate_safe() == false`, the cost of getting this wrong is a destination counter incremented
+twice, not a duplicated log line — which is why the guard is pinned by a test of its own
+(`a_tls_write_failure_is_ambiguous_and_never_retried`).
+
+**The success path flushes on both transports** before a batch may be called delivered, and the
+connection is returned to the sink only after the flush succeeds. TLS requires it (without it a
+batch could be committed off the sink queue,
+[ADR `buffered-sink-delivery`](buffered-sink-delivery.md), with its records still in the rustls
+buffer, to be discarded with the boxed stream by the next reconnect or cancelled attempt); on
+plaintext a `TcpStream`'s `poll_flush` is a documented no-op, so it costs a function call and
+cannot change behaviour; and one delivery rule for both transports is the safer one to have
+precisely because nothing this sink reports delivered is ever retried. A failed flush is
+`Fault::Ambiguous` and the connection is dropped rather than reused. `Output::flush` (the
+close-time one) is unchanged and stays belt-and-braces.
+
+**Two smaller consequences.** `Conn::Tcp`'s stream becomes a `Box<dyn AsyncStream>` (the erasure
+`crate::tls` already defines for `syslog_out`/`logit_out`) so one variant covers both cases without
+making `StatsdOutput` generic; and the sink gains `logit.output.reconnects`, counted on every
+connect after the first, on plaintext and TLS alike since both take the one `TcpDial::connect`
+path (`docs/design/internal-telemetry.md`). `connect_timeout` bounds the TCP connect and the TLS
+handshake as two *separate* phases, so a TLS connect can take up to twice the configured value —
+`syslog_out`'s arrangement, and `logit_out`'s before it.
+
+This closes `docs/known-gaps.md`'s "`statsd_out` has no TLS/DTLS" entry, whose other half
+(`statsd_in`'s ingress side adopting the shared TCP listener driver) closed alongside it. DTLS
+itself stays out of scope on both halves.

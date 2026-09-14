@@ -766,8 +766,8 @@ mod tcp {
 // ---- transport: tls (RFC 5425) -------------------------------------------------------------
 
 /// `syslog_out`/`syslog_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative case,
-/// modelled on `logit_round_trip.rs`'s own `mod tls`, but using `bind()`+`local_addr()` for
-/// readiness (available here, unlike `LogitInput`) rather than `ephemeral_addr()` plus a sleep.
+/// modelled on `logit_round_trip.rs`'s own `mod tls` -- both use `bind()`+`local_addr()` for
+/// readiness rather than a probe socket plus a sleep.
 /// `docs/adr/syslog-tcp-ingress-and-tls.md`.
 mod tls {
     use super::*;

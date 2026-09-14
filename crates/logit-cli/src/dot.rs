@@ -66,7 +66,12 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec![],
                 targets: Vec::new(),
-                kind: ComponentKind::StatsdIn { bind: "x".to_string() },
+                kind: ComponentKind::StatsdIn {
+                    bind: "x".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                },
             },
         );
         components.insert(

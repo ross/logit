@@ -31,33 +31,59 @@
 //! request, and can't block the accept loop from serving the next connection
 //! (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
 //!
-//! **Handshake timeout.** That TLS accept is bounded by [`OtlpInput::handshake_timeout`] (a
-//! field, defaulted to [`HANDSHAKE_TIMEOUT`] and set from config by
-//! [`OtlpInput::with_handshake_timeout`]), copied from `logit_in`'s accept loop
-//! (`crates/logit-inputs/src/logit.rs`'s "Pre-`Hello` timeout" section): without it a client that
-//! completes the TCP connect and then never sends a ClientHello pinned a
-//! `MAX_CONCURRENT_CONNECTIONS` permit forever, and since this listener *blocks* on
-//! `acquire_owned` rather than rejecting, enough such connections stop the accept loop draining
-//! its backlog at all.
+//! **Connection limit: reject, don't queue.** A [`tokio::sync::Semaphore`] capped at
+//! [`MAX_CONCURRENT_CONNECTIONS`], acquired with `try_acquire_owned` -- at capacity the accepted
+//! stream is dropped immediately and counted as
+//! `logit.input.connections.rejected{reason="limit"}`, rather than being parked behind a permit
+//! that may never come. Exactly `syslog_in`'s driver
+//! (`crates/logit-inputs/src/tcp.rs`'s "Connection limit" section) and `logit_in`, and the
+//! rejection happens *before* any TLS accept: OTLP has no in-band "try later" of its own to
+//! deliver, so there is nothing to say and no reason to spend a handshake saying it. The
+//! `logit.input.connections` gauge counts permit holders only. This replaces an earlier blocking
+//! `acquire_owned().await`, under which a connection past the cap stalled the accept loop itself
+//! -- enough silent connections then stopped this listener draining its backlog at all.
 //!
-//! **It bounds that one phase and no other -- narrower than `logit_in`/`syslog_in`.** Those two
-//! read the first post-handshake message themselves, so the same knob bounds that wait too. Here
-//! the accepted stream goes straight to `hyper`: [`hyper_util::server::conn::auto::Builder`]
-//! reads the connection's first bytes itself (`ReadVersion`, up to 24 of them) to tell HTTP/1.1
-//! from an HTTP/2 preface, and that read is not this module's to wrap -- bounding it would mean
-//! reimplementing the sniff over a `Rewind`-shaped buffer. `hyper`'s own
-//! `http1().header_read_timeout(..)` is not that bound either: it starts only once the version is
-//! already decided, so a connection that says *nothing* never reaches it (and under
-//! `protocol: grpc`, served by `hyper::server::conn::http2::Builder`, there is no such knob at
-//! all). So a handshaken-then-silent TLS connection here still holds its permit, the same open
-//! question as the post-handshake idle case (`docs/known-gaps.md`'s "no idle-connection timeout on
-//! a TCP listener," deliberately left to its own effort rather than half-built per transport) --
-//! and a **plaintext** listener, which has no TLS accept for this field to bound, has no
-//! pre-message bound at any point: `docs/known-gaps.md`'s "a plaintext `otlp_in` has no
-//! pre-first-byte bound" row, which also records why that one is worse here than on
-//! `logit_in`/`syslog_in` (this loop *blocks* on `acquire_owned` rather than rejecting at the cap)
-//! and what closing it would take. Graph rule 45 rejects a non-default `handshake_timeout` on a
-//! plaintext `otlp_in` rather than letting it look as though it does something.
+//! **Handshake timeout.** [`OtlpInput::handshake_timeout`] (a field, defaulted to
+//! [`HANDSHAKE_TIMEOUT`] and set from config by [`OtlpInput::with_handshake_timeout`]) bounds each
+//! of a connection's pre-request phases, the same shape `syslog_in`'s driver uses
+//! (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake timeout" section): on a TLS listener the
+//! TLS accept, and on a plaintext one -- which has no TLS accept for it to bound -- the wait for
+//! the connection's very first byte. Without either, a client that completes the TCP connect and
+//! then never speaks pins a connection-limit permit forever.
+//!
+//! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
+//! `recv(..., MSG_PEEK)`: it waits for the first byte to become *available* and leaves it in the
+//! socket's receive queue, so the stream handed to `hyper` afterwards is byte-for-byte the one it
+//! would have been with no bound at all. [`hyper_util::server::conn::auto::Builder`]'s own
+//! `ReadVersion` sniff (up to 24 bytes, telling HTTP/1.1 from an h2 preface) then reads those
+//! bytes itself and needs no rewind buffer -- which is the whole reason the bound is a peek and
+//! not a wrapper around the sniff, since wrapping the sniff would mean reimplementing it. The TLS
+//! arm deliberately gets no peek: `acceptor.accept` already waits on that connection's first
+//! bytes under the same budget, so a peek ahead of it would bound nothing the handshake does not.
+//!
+//! **A peer that closes cleanly before sending anything is not a fault.** That is what every TCP
+//! health check looks like -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
+//! `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` -- and
+//! before this peek existed `auto::Builder`'s `ReadVersion` read the immediate EOF as
+//! `Version::H1` and the connection ended silently. So a `peek` of `Ok(0)` returns `Ok(())`, and
+//! only the *deadline* (a connection held open saying nothing) and a genuine read error reach
+//! `connection_error`. `crate::tcp` makes the same call for an EOF before its first frame.
+//!
+//! **What it still does not bound, and why no timer is installed to bound it.** A connection that
+//! sends *one* byte and then stops has passed the peek and is inside `hyper`'s own read loop,
+//! which this module does not drive. `hyper`'s `http1().header_read_timeout(..)` is deliberately
+//! **not** installed to cover that: in the pinned hyper 1.11.1 (`src/proto/h1/conn.rs`) the timer
+//! is armed at the *top* of `poll_read_head`, before a single header byte has been parsed, and
+//! `State::idle` sets `notify_read = true` whenever it is configured, with the comment "Next read
+//! will start and poll the header read timeout, so we can close the connection if another header
+//! isn't received in a timely manner" -- so it re-arms across every idle keep-alive gap. That is
+//! an idle timeout wearing a first-head name, and it would close a long-interval OTLP exporter's
+//! pooled connection between exports. No idle timer of any kind belongs on any listener here
+//! until the dedicated effort `docs/known-gaps.md`'s "no idle-connection timeout on a TCP
+//! listener" row describes settles the question. Under `protocol: grpc`
+//! ([`hyper::server::conn::http2::Builder`]) there is no such knob in the first place, and the
+//! residual is the same shape: one preface byte, then silence. Both are the narrowed
+//! plaintext-`otlp_in` row in `docs/known-gaps.md`.
 //!
 //! **Gzip is supported; nothing else is.** `Content-Encoding: gzip` (HTTP) and a gRPC frame's own
 //! compressed flag plus `grpc-encoding: gzip` are both decoded via [`inflate`]; any other declared
@@ -83,8 +109,8 @@
 //! default `max_recv_msg_size`; a request over that is rejected (`413`/`grpc-status: 8`,
 //! `RESOURCE_EXHAUSTED`) before it can grow an unbounded buffer. That bounds one connection's
 //! worst case, not the listener's as a whole -- `MAX_CONCURRENT_CONNECTIONS` bounds how many
-//! connections `run` serves at once, so total worst-case memory stays a real (if generous) number
-//! rather than unbounded.
+//! connections `run` serves at once (rejecting past it, see "Connection limit" above), so total
+//! worst-case memory stays a real (if generous) number rather than unbounded.
 //!
 //! **The response's `partial_success` is always empty on a successful decode.** OTLP's own
 //! `Export*ServiceResponse.partial_success` exists to report *which* records within an otherwise-
@@ -117,6 +143,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
@@ -126,13 +153,18 @@ use tokio_rustls::TlsAcceptor;
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bounds the number of connections [`Input::run`] serves concurrently -- without this, the
-/// per-request cap [`MAX_REQUEST_BYTES`] bounds only *one* connection's worst case, and this is
-/// the first listener in this codebase (every other one is UDP, with no concept of a
-/// "connection" at all) where an unbounded number of them can each be holding that much. 1024 is
+/// per-request cap [`MAX_REQUEST_BYTES`] bounds only *one* connection's worst case, and an
+/// unbounded number of them can each be holding that much. 1024 is
 /// the same order of magnitude `logit_pipeline::SinkQueueConfig::default`'s `max_batches` already
 /// uses elsewhere in this codebase for "a generous but real bound, not unlimited" -- worst case
-/// `1024 * MAX_REQUEST_BYTES` = 4 GiB in flight, not unbounded. Not (yet) operator-tunable; revisit
+/// `1024 * MAX_REQUEST_BYTES` = 4 GiB in flight, not unbounded. The same number `logit_in` and
+/// `syslog_in` use: there is no protocol reason for an OTLP listener to differ, and one shared
+/// figure is one thing for an operator to learn. Not (yet) operator-tunable; revisit
 /// as a config field if a real deployment needs a different number.
+///
+/// **A connection past the cap is rejected, not queued** -- see this module's "Connection limit"
+/// doc section. [`OtlpInput::with_max_connections`] overrides this in tests, so the cap is
+/// reachable with two connections instead of 1025.
 ///
 /// **That 4 GiB figure is the protobuf path's worst case, not the JSON one's.** An OTLP/JSON
 /// request (`docs/adr/otlp-json-decoding.md`) is parsed into a `serde_json::Value` tree before it
@@ -146,14 +178,15 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// `docs/known-gaps.md` for whoever needs a measured one.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-/// Default for [`OtlpInput::handshake_timeout`] -- how long a connection has to finish its TLS
-/// accept before this listener gives up on it and releases its
-/// [`MAX_CONCURRENT_CONNECTIONS`] permit. The same 5s `logit_in` and `syslog_in` default to
+/// Default for [`OtlpInput::handshake_timeout`] -- how long a connection has, per pre-request
+/// phase, before this listener gives up on it and releases its
+/// [`MAX_CONCURRENT_CONNECTIONS`] permit: its TLS accept on a TLS listener, its first byte on a
+/// plaintext one. The same 5s `logit_in` and `syslog_in` default to
 /// (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`), and mirrored by hand in
 /// `logit_config`'s own `default_handshake_timeout`: one number across every TCP listener is one
 /// thing for an operator to learn. Overridden by `otlp_in`'s `handshake_timeout:` config field
-/// through [`OtlpInput::with_handshake_timeout`]. See this module's "Handshake timeout" doc
-/// section for what it does *not* bound.
+/// through [`OtlpInput::with_handshake_timeout`]. See this module's "Handshake timeout" and
+/// "What it still does not bound" doc sections.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Which OTLP wire transport this listener accepts. See `logit_outputs::otlp::OtlpTransport`'s
@@ -184,6 +217,9 @@ pub struct OtlpInput {
     listener: Option<TcpListener>,
     /// See this module's own "Handshake timeout" doc section.
     handshake_timeout: std::time::Duration,
+    /// [`MAX_CONCURRENT_CONNECTIONS`] unless [`OtlpInput::with_max_connections`] (test-only)
+    /// lowers it -- see this module's "Connection limit" doc section.
+    max_connections: usize,
 }
 
 impl OtlpInput {
@@ -196,6 +232,7 @@ impl OtlpInput {
             tls: None,
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_connections: MAX_CONCURRENT_CONNECTIONS,
         }
     }
 
@@ -231,13 +268,23 @@ impl OtlpInput {
         Ok(self)
     }
 
-    /// Overrides [`HANDSHAKE_TIMEOUT`], the bound on this listener's TLS accept -- what
-    /// `otlp_in`'s `handshake_timeout:` config field sets. The constant stays the default when
-    /// this is never called; a test uses it to observe a silent connection actually being closed
-    /// without a multi-second sleep. Graph rule 45 rejects `0s` before it can reach here. Only
-    /// the TLS accept is bounded -- see this module's "Handshake timeout" doc section.
+    /// Overrides [`HANDSHAKE_TIMEOUT`] for both pre-request budgets -- the TLS accept on a TLS
+    /// listener, the first-byte peek on a plaintext one -- which is what `otlp_in`'s
+    /// `handshake_timeout:` config field sets. The constant stays the default when this is never
+    /// called; a test uses it to observe a silent connection actually being closed without a
+    /// multi-second sleep. Graph rule 45 rejects `0s` before it can reach here. See this module's
+    /// "Handshake timeout" doc section.
     pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
+        self
+    }
+
+    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
+    /// exercise the cap would be slow and flaky; this makes the cap reachable with two. The twin
+    /// of `crate::tcp::TcpListener::with_max_connections`.
+    #[cfg(test)]
+    fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
         self
     }
 }
@@ -260,48 +307,59 @@ impl Input for OtlpInput {
         // Bounds this input's worst-case memory the same way `MAX_REQUEST_BYTES` bounds one
         // request's -- see [`MAX_CONCURRENT_CONNECTIONS`]'s own doc comment for the reasoning and
         // the resulting worst case.
-        let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+        let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
         // Built once outside the loop -- `TlsAcceptor::from` just wraps the `Arc<ServerConfig>`,
         // so cloning it per connection below is cheap (an `Arc` clone, not a config rebuild).
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
+        let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         loop {
             let (stream, _peer) = listener.accept().await?;
-            // Acquired *after* `accept`, not before: the kernel's own accept backlog still
-            // absorbs a burst of new connections while every permit is held, so a connection
-            // isn't refused outright at the cap -- its handler just doesn't start (and doesn't
-            // read a single byte, so it can't yet be holding any of `MAX_REQUEST_BYTES`) until an
-            // earlier connection finishes and its permit is released back (on drop, at the end of
-            // the spawned task below). This is real backpressure to the accept loop itself: the
-            // next `accept().await` above doesn't run until this acquire resolves, so the
-            // listener stops draining its backlog at all once the backlog itself fills, same
-            // shape as this crate's other listeners eventually blocking on a full downstream
-            // `Fanout` (`docs/design/pipeline-graph.md`'s backpressure section).
-            let permit = connection_limit
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("this semaphore is never closed");
+
+            // Non-blocking (`try_acquire_owned`, not `acquire_owned`): at capacity the connection
+            // is closed immediately rather than queued behind a permit that may never come. And
+            // it is closed *here*, before any TLS accept -- see this module's "Connection limit"
+            // doc section. Copied from `crate::tcp`'s accept loop.
+            let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+                self.telemetry.count(
+                    "logit.input.connections.rejected",
+                    1.0,
+                    &[("reason", "limit")],
+                );
+                drop(stream);
+                continue;
+            };
+
             let sink = sink.clone();
             let transport = self.transport;
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let live_connections = Arc::clone(&live_connections);
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
+
+                // Published from the read-modify-write's own return value, not a separate `load`:
+                // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an
+                // add and a load would leave the stale one as the published value until the next
+                // transition. `crate::tcp`'s own accept loop publishes this gauge the same way.
+                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // The TLS handshake itself runs here, inside the spawned task and after the
                 // permit above -- a slow or hostile handshake stalls only this connection and
                 // counts against `MAX_CONCURRENT_CONNECTIONS` like any other slow request, rather
                 // than blocking `run`'s own accept loop (this module's doc comment).
                 let result = match tls_acceptor {
-                    // Bounded exactly the way `logit_in`'s accept loop bounds its own
-                    // (`crates/logit-inputs/src/logit.rs`): an unbounded accept lets a client
-                    // that connects and then sends no ClientHello pin this permit forever. Both
-                    // the failure and the timeout fall through to the `warn_throttled(
-                    // "connection_error", ..)` below, and the permit comes back because this task
-                    // ends -- no explicit release needed. This is the only phase bounded here;
-                    // see this module's "Handshake timeout" doc section for why.
+                    // Bounded exactly the way `logit_in`/`syslog_in` bound their own
+                    // (`crates/logit-inputs/src/logit.rs`, `crates/logit-inputs/src/tcp.rs`): an
+                    // unbounded accept lets a client that connects and then sends no ClientHello
+                    // pin this permit forever. Both the failure and the timeout fall through to
+                    // the `warn_throttled("connection_error", ..)` below, and the permit comes
+                    // back because this task ends -- no explicit release needed. No first-byte
+                    // peek on this arm: `acceptor.accept` is already waiting on this connection's
+                    // first bytes under this same budget, so a peek ahead of it would bound
+                    // nothing the handshake does not (this module's "peek, not a read" section).
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
                         {
@@ -310,7 +368,7 @@ impl Input for OtlpInput {
                                     TokioIo::new(tls_stream),
                                     transport,
                                     sink,
-                                    telemetry,
+                                    telemetry.clone(),
                                 )
                                 .await
                             }
@@ -320,10 +378,51 @@ impl Input for OtlpInput {
                             )),
                         }
                     }
+                    // The plaintext arm's equivalent budget. `peek` is `recv(..., MSG_PEEK)`: it
+                    // waits for the first byte to be *available* and consumes nothing, so
+                    // `auto::Builder`'s own `ReadVersion` sniff below still sees a pristine
+                    // stream and needs no `Rewind`-shaped buffer -- the reason this is the bound
+                    // rather than a wrapper around the sniff, which would mean reimplementing it.
+                    // A read error and the deadline become an `Err(String)` on the same
+                    // `connection_error` path as the TLS arm's. A *clean* close before the first
+                    // byte (`Ok(0)`) does not: that is what every TCP health check looks like --
+                    // `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` probing
+                    // `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe,
+                    // `nc -z` -- and before this peek existed hyper-util's `ReadVersion` read the
+                    // immediate EOF as `Version::H1` and the connection ended silently. Turning it
+                    // into a warn would log one line and one `connection_error` count per probe
+                    // interval, forever. The shared driver makes the same call (`crate::tcp`'s
+                    // `ReadStep::Eof` before any frame is `Ok(())`, and only the deadline is an
+                    // error). The permit comes back on either path, when this task ends.
                     None => {
-                        serve_connection(TokioIo::new(stream), transport, sink, telemetry).await
+                        // Bound to a local rather than matched on directly: the scrutinee's
+                        // temporaries (including `peek`'s borrow of `stream`) would otherwise
+                        // outlive the arms, and the success arm moves `stream` into `hyper`.
+                        let first_byte =
+                            tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
+                                .await;
+                        match first_byte {
+                            Ok(Ok(0)) => Ok(()), // a health-check probe, not a fault
+                            Ok(Ok(_)) => {
+                                serve_connection(
+                                    TokioIo::new(stream),
+                                    transport,
+                                    sink,
+                                    telemetry.clone(),
+                                )
+                                .await
+                            }
+                            Ok(Err(err)) => Err(format!("waiting for a first byte failed: {err}")),
+                            Err(_elapsed) => {
+                                Err(format!("no first byte received within {handshake_timeout:?}"))
+                            }
+                        }
                     }
                 };
+
+                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
+
                 // One connection's I/O error (a client disconnecting mid-request, a malformed
                 // TLS-looking preamble on a plaintext port, ...) shouldn't be fatal to the
                 // listener or its sibling connections -- only `TcpListener::accept` failing in
@@ -1636,11 +1735,11 @@ mod tests {
 
     /// The handshake timeout's whole purpose (this module's "Handshake timeout" doc section):
     /// a client that completes the TCP connect and never sends a ClientHello must not pin a
-    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. `OtlpInput` has no test hook for the cap
-    /// itself (unlike `logit_in`/`syslog_in`, whose loops reject at the cap rather than block on
-    /// it), so what is asserted here is the observable half: the silent connection is *closed*
-    /// from the server side inside the budget, and the listener is still serving afterwards.
-    /// Modelled on `crate::tcp`'s
+    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. What is asserted here is the observable half
+    /// -- the silent connection is *closed* from the server side inside the budget, and the
+    /// listener is still serving TLS traffic afterwards. Its plaintext twin,
+    /// `a_silent_plaintext_connection_is_closed_after_the_handshake_timeout`, goes on to prove
+    /// the permit itself came back, under `with_max_connections(1)`. Modelled on `crate::tcp`'s
     /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
     #[tokio::test]
     async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
@@ -1685,6 +1784,272 @@ mod tests {
         recv_batch(&mut rx).await;
 
         drop(silent);
+    }
+
+    // ---- connection limit, the plaintext first-byte bound, and the connections gauge ----------
+
+    /// Reads one byte, expecting the peer to have closed instead. The twin of `crate::tcp`'s own
+    /// test helper of the same name.
+    async fn expect_closed<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, what: &str) {
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: expected a close within 2s"));
+        match result {
+            Ok(n) => assert_eq!(n, 0, "{what}: expected a close, got a byte"),
+            // A close with bytes still unread in the peer's receive queue is an RST, not a FIN.
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("{what}: read failed outright: {err}"),
+        }
+    }
+
+    /// The value of `metric`'s `Sum` in a drained `Registry` snapshot, optionally restricted to
+    /// the point carrying `tag` -- copied from `crate::tcp`'s test module.
+    fn sum_of(
+        events: &[logit_core::Event],
+        metric: &str,
+        tag: Option<(&str, &str)>,
+    ) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if let Some((key, value)) = tag {
+                if e.attributes.get(key).and_then(|v| v.as_str()) != Some(value) {
+                    return None;
+                }
+            }
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    logit_core::MetricKind::Sum(sum) => Some(sum.value),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// `sum_of`'s gauge twin -- `Telemetry::gauge` is last-write-wins per `(name, tags)` until the
+    /// next drain, so one drain reports whatever value the listener last wrote.
+    fn gauge_of(events: &[logit_core::Event], metric: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    logit_core::MetricKind::Gauge(v) => Some(v),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// The cap rejects rather than queues, and closes before any TLS handshake -- OTLP has no
+    /// in-band "try later" to spend a handshake delivering (this module's "Connection limit" doc
+    /// section). Modelled on `crate::tcp`'s
+    /// `the_connection_cap_drops_a_connection_past_the_limit_and_counts_it`.
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_dropped_and_counted() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry).with_max_connections(1);
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The first connection takes the one permit and holds it. One byte, so it clears the
+        // first-byte peek and settles inside `hyper` rather than being closed by the deadline.
+        let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        first.write_all(b"P").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut second, "a past-the-cap connection").await;
+
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.input.connections.rejected",
+                Some(("reason", "limit"))
+            ),
+            Some(1.0)
+        );
+
+        drop(first);
+    }
+
+    /// A TCP health check -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
+    /// `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` --
+    /// connects and closes without sending a byte, at whatever interval it is configured with.
+    /// Before the first-byte peek existed, `auto::Builder`'s own `ReadVersion` read that immediate
+    /// EOF as `Version::H1` and the connection ended silently; the peek must not turn it into a
+    /// warn plus a `connection_error` count per probe. Only the *deadline* (and a real read error)
+    /// is a fault on that arm -- the same call `crate::tcp` makes for an EOF before its first
+    /// frame.
+    #[tokio::test]
+    async fn a_plaintext_probe_that_closes_before_sending_is_not_a_connection_error() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_diagnostics(
+            logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone()),
+        );
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Three probes, so a throttle that reports on powers of two could not hide a regression
+        // behind suppression: `warn_throttled` counts `logit.component.diagnostics` on *every*
+        // occurrence, reported or not.
+        for _ in 0..3 {
+            let probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            drop(probe);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.component.diagnostics",
+                Some(("key", "connection_error"))
+            ),
+            None,
+            "a probe that connects and closes cleanly is not a connection error"
+        );
+    }
+
+    /// The plaintext twin of `a_silent_tls_connection_is_closed_after_the_handshake_timeout`, and
+    /// the case that actually matters in production: `otlp_in` with no `tls:` block is the default
+    /// shape, and until the first-byte peek landed it had no pre-request bound at all. Under
+    /// `with_max_connections(1)` the follow-up request can only be served if the silent
+    /// connection's permit genuinely came back.
+    #[tokio::test]
+    async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input =
+            input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Connected, not a byte sent, and held (not dropped) until the close is observed -- so
+        // nothing but the server's own deadline could have closed it.
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut silent, "a plaintext connection that sent no bytes").await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+        let response = post_raw(
+            &addr,
+            "/v1/metrics",
+            "Content-Type: application/x-protobuf\r\nConnection: close\r\n",
+            &body,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+
+        drop(silent);
+    }
+
+    /// A first-byte deadline must not become a request deadline: the peek resolves on the very
+    /// first byte, and everything after it belongs to `hyper`'s own read loop, which this module
+    /// deliberately installs no timer on (this module's "What it still does not bound" section --
+    /// `header_read_timeout` would re-arm across idle keep-alive gaps). So a client that dribbles
+    /// its request head out over four times the budget still gets a 200.
+    #[tokio::test]
+    async fn the_first_byte_deadline_does_not_apply_once_a_request_has_started() {
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+
+        let head = format!(
+            "POST /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
+             application/x-protobuf\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // The first byte immediately -- that is all the peek ever waits for.
+        stream.write_all(&head[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // 4x the budget
+        stream.write_all(&head[1..]).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+        let response = String::from_utf8_lossy(&buf).into_owned();
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        recv_batch(&mut rx).await;
+    }
+
+    /// `peek` is `MSG_PEEK`: it consumes nothing, so `auto::Builder`'s own `ReadVersion` sniff
+    /// still sees the full 24-byte HTTP/2 preface and no rewind buffer is needed. h2c
+    /// prior-knowledge is the case that would break first if the bound were an ordinary read.
+    #[tokio::test]
+    async fn an_h2c_prior_knowledge_request_still_negotiates_after_the_first_byte_peek() {
+        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
+        let (sink, mut rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut encoder = logit_proto::otlp::OtlpEncoder::new();
+        let payloads =
+            logit_proto::SignalEncoder::encode_signals(&mut encoder, &metric_batch()).unwrap();
+        let (_, body) = payloads.into_iter().find(|(s, _)| *s == Signal::Metrics).unwrap();
+
+        let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .expect("h2c prior-knowledge handshake should succeed");
+        tokio::spawn(conn);
+
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/metrics")
+            .header("content-type", "application/x-protobuf")
+            .body(Full::new(body))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        recv_batch(&mut rx).await;
+    }
+
+    /// The gauge counts permit holders: 1 while a connection is being served, back to 0 once it
+    /// ends. `Telemetry::gauge` is last-write-wins until a drain, so each drain reports the value
+    /// the listener last wrote.
+    #[tokio::test]
+    async fn the_connections_gauge_tracks_a_live_connection_and_returns_to_zero() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_telemetry(telemetry);
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // One byte, so the connection clears the peek and stays open inside `hyper`.
+        let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        open.write_all(b"P").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(1.0));
+
+        drop(open);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(gauge_of(&registry.drain(0), "logit.input.connections"), Some(0.0));
     }
 
     fn metric_batch() -> logit_core::EventBatch {

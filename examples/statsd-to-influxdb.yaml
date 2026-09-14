@@ -14,10 +14,25 @@ components:
   statsd_in:
     type: statsd_in
     bind: 0.0.0.0:8125
+    # transport: udp              # udp (the default, classic statsd) | tcp -- tls: below needs tcp.
+    #                             # A tcp listener frames one LF-delimited line per message (there is
+    #                             # no octet-counted alternative: a statsd name may start with a digit)
+    #                             # and has no receive *queue* at all -- only the four batch/shutdown
+    #                             # fields below apply to one, per connection.
+    # tls:                        # tcp only; presence turns TLS on and makes it *required* -- there is
+    #                             # no plaintext fallback once a tls: block is configured. DTLS is out
+    #                             # of scope, so tls: under transport: udp is a config error.
+    #   cert_file: server.pem     # resolved against this config file's directory
+    #   key_file: server.key
+    #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
+    # handshake_timeout: 5s       # tcp only; bounds each pre-message phase *separately* -- the TLS
+    #                             # accept, then the wait for the connection's first byte. NOT an idle
+    #                             # timeout: the gap before a *later* line is unbounded.
     # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
     # block is exactly the values shown here, commented out purely as a reference for tuning a
-    # real deployment. `receive:` is meaningful only on a datagram listener (statsd_in, syslog_in);
-    # `logit-pipeline`'s graph validation rejects it on any other component kind.
+    # real deployment. `receive:` is meaningful only on a datagram, stream or tail listener;
+    # `logit-pipeline`'s graph validation rejects it on any other component kind, and rejects the
+    # four queue-bounding fields below on a stream listener (a TCP statsd_in included) by name.
     # receive:
     #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
     #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
