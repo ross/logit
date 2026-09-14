@@ -145,8 +145,10 @@ question is genuinely rare in its intended workload.
 Neither is. **`Box`ing the `DdSketch` is not free, and an earlier draft of this document said it
 was** — the reasoning was that a sketch "already allocates," but it doesn't, at construction;
 `sketches_ddsketch`'s `Store::new` starts with `Vec::new()`, and the bins are allocated on the
-first `add`. Measured: `kv_metrics` costs 3 allocations for 4 metrics (one `MetricList` spill plus
-one bins `Vec` per distribution); boxing made that 5, and on the project's own reference config —
+first `add`. Measured at the time: `kv_metrics` cost 3 allocations for 4 metrics (one `MetricList`
+spill plus one bins `Vec` per distribution — since reduced to 1 by emitting raw `Samples` instead of
+a per-event sketch, [ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md); the boxing
+argument below is unchanged); boxing made that 5, and on the project's own reference config —
 which carries 2 distributions per event — the headline ingest number this document tracks went
 from 5 to 7 allocations per line. That's not a rare-workload edge case; it's the flagship config.
 **`Box`ing `SpanRecord`** was reverted for the same reason applied consistently rather than
@@ -243,7 +245,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `csv` parse + merge (7-column access line, one quoted-but-unescaped field) | **0** | interned columns, `insert_sym`, `Bytes::slice` throughout -- fits `AttrMap`'s inline capacity |
 | `csv` parse + merge (one doubled-quote field) | **1** | `unescape`'s own copy -- the only path in `csv` that allocates (`crates/logit-transforms/src/csv.rs`) |
 | `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
-| `kv_metrics` derive 4 metrics | **3** | `MetricList` spill + one `bins` Vec per sketch |
+| `kv_metrics` derive 4 metrics | **1** | the `MetricList` spill, grown once via `reserve`; was 3 while each distribution sketched per event -- they are raw inline `MetricKind::Samples` now ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)) |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
@@ -258,15 +260,15 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `aggregate` flush 100 cumulative sum series (spilled attrs) | **209** | `temporality: cumulative` — identical to the retained-gauge row above, on purpose: see below |
 | `aggregate` absorb 1 `Samples` event (`distributions: sketch`, the default) | **0** | every value sketches directly into the series' `DdSketch` via `Samples::sketch`'s weighting -- no raw values are ever retained, so absorbing into an already-open sketch is as free as `distributions_merge_via_ddsketch` already is |
 | `aggregate` absorb 25 `Samples` values into one series (`distributions: samples`) | **1** | `SAMPLES_INLINE` is 19 -- a series already holding a few inline values that then absorbs 25 more in one record spills the accumulator's `SmallVec` on that call; the warm/still-inline case (a few values) pays nothing |
-| **full ingest chain, 1 line** | **5** | decode → aggregate; was 11 before `json`'s fix |
-| `Event::clone` (nginx shape) | **4** | what each extra fan-out branch costs |
+| **full ingest chain, 1 line** | **3** | decode → aggregate; was 11 before `json`'s fix, 5 before `kv_metrics` stopped sketching per event |
+| `Event::clone` (nginx shape) | **2** | what each extra fan-out branch costs -- the spilled `AttrMap` and `MetricList`; was 4 with a `bins` Vec per `kv_metrics` sketch |
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
 | `Event::clone` (distribution-heavy, 5 metrics) | **6** | 1 `MetricList` spill + 1 `bins` Vec per sketch |
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
-| `influxdb_out` encode 100 events | **30** | ~0.3/event — see below |
+| `influxdb_out` encode 100 events | **230** | 30 of the encoder's own (~0.3/event — see below) + 200 = 2/event re-sketching the fixture's two raw `Samples` distributions (`Samples::sketch`'s `bins` Vec, the same cost the `graphite_out` `Samples` row further down documents). Those 2/event are the allocations `kv_metrics` used to pay for *every* downstream, moved into the one topology that needs a sketch -- an encoder fed straight from `kv_metrics` with no `aggregate` between ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)); the reference pipeline's `aggregate` sketches once per series instead |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
-| `disk_queue`: push one batch (encode + write) | **36** | `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place; 27 -> 36 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s TLV-framed records (same +9 as `NativeEncoder::encode` below) |
+| `disk_queue`: push one batch (encode + write) | **34** | 36 -> 34 once `kv_metrics`'s two distributions became inline `Samples` (no `to_java_bytes` blob per record; same -2 as `NativeEncoder::encode` below); `native::encode_batch_v2` + `frame::write_frame` + one `write_all` -- breaks the zero-clone `Arc<EventBatch>` property by design, see `docs/adr/disk-backed-sink-buffer.md`; 25 -> 27 once `encode_batch_v2` (the provenance trailer, `docs/adr/batch-provenance-on-delivered.md`) replaced `encode_batch` here -- it builds v1's payload as its own `Bytes`, then copies it into a fresh `BytesMut` alongside the trailer rather than extending in place; 27 -> 36 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)'s TLV-framed records (same +9 as `NativeEncoder::encode` below) |
 | `disk_queue`: peek, cached (no re-decode) | **0** | `write_loop`'s retry loop calls `peek` once per attempt; only the first (uncached) peek after a push touches disk |
 | accumulator: absorb into a warm buffer | **0** | `BatchAccumulator::absorb`, ADR `decoupled-listener-io` -- see below |
 | `syslog_out` encode_into 100 events | **100** | ~1/event -- reused struct-held scratch buffers, was 401, see below |
@@ -448,7 +450,9 @@ None of it was about the data model. It was all in how lines were built:
 - `allocate_timestamp` built a fresh `Vec` for its path-compression walk, allocating on every
   timestamp collision — and a statsd multi-value datagram collides on essentially every line.
 
-**Now 30 allocations per 100-event batch, from 18,024 — a 600× reduction.** The changes were
+**Now 30 allocations per 100-event batch, from 18,024 — a 600× reduction.** (The pin reads 230
+today: those 30 are still all the encoder's own; the other 200 are re-sketching the raw `Samples`
+`kv_metrics` emits since it stopped sketching per event — the §2 table row explains.) The changes were
 mechanical and stayed inside `influxdb.rs`: escape and format straight into reused buffers held on
 the encoder, merge-join the resource and event attribute maps instead of cloning and re-inserting,
 borrow the series key for the lookup and only allocate it on a miss, and reuse the path-compression
@@ -481,10 +485,11 @@ scratch buffers rather than inventing a new pattern — brought it to 100 (exact
 `format_rfc3339_utc`-per-call residual `stdio_out` already carries and already documents above.
 
 **With the encoder no longer dominant, the ingest chain is the cost again — and it dropped too**:
-`json`'s own fix (item 4) took the full ingest chain from 11 allocations to 5. `kv_metrics` is now
-the single most allocation-hungry ingest-side stage at 3, and `Event::clone`'s 4 per extra fan-out
-branch is comparable to or larger than any individual ingest stage. The recommendations in §8 are
-ordered accordingly.
+`json`'s own fix (item 4) took the full ingest chain from 11 allocations to 5, and `kv_metrics`
+emitting raw `Samples` instead of a per-event `DdSketch` ([ADR
+`kv-metrics-semantics`](../adr/kv-metrics-semantics.md)) took it from 5 to 3 -- every ingest stage
+now costs at most 1, and `Event::clone`'s 2 per extra fan-out branch is comparable to any individual
+ingest stage. The recommendations in §8 are ordered accordingly.
 
 ### Runtime: the node loops, not just the components they call
 
@@ -531,7 +536,7 @@ draft actually established:
 | `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |
 | `unwrap_batch` (`Delivered::Owned`) | **0** | no `Arc` was ever involved |
 | `unwrap_batch` (`Delivered::Shared`, sole reference) | **0** | `Arc::try_unwrap` succeeds |
-| `unwrap_batch` (`Delivered::Shared`, contended) | **5** | falls back to `EventBatch::clone` — 1 for the `Vec<Event>` + `Event::clone`'s 4 (nginx shape) |
+| `unwrap_batch` (`Delivered::Shared`, contended) | **3** | falls back to `EventBatch::clone` — 1 for the `Vec<Event>` + `Event::clone`'s 2 (nginx shape) |
 | `send_batch` through a no-op `Output`, telemetry disabled | **1** | `#[async_trait]` boxing its future (below) — nothing to do with telemetry |
 | `send_batch`, telemetry live, **steady state** | **1** | same 1 as disabled — telemetry adds nothing on top of the box |
 | `send_batch`, **first call after an `internal` drain** | **3** | the box (1) + the same `HashMap`/`DdSketch` rebuild as `process_batch`'s (2) |
@@ -790,8 +795,8 @@ the way `NativeDecoder::decode_into` does, since `Fanout::send` takes the `Event
 
 | Stage | allocs | Notes |
 |---|---:|---|
-| `NativeEncoder::encode`, 1 event | **32** | dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields -- 23 -> 32 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md), which TLV-framed every record too: the fixture's four metrics each pay one scratch buffer for their `kind` field and one length prefix as a list entry (+8), and the log's `message` one (+1) (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
-| `logit_out`: encode + frame, 1 event | **32** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
+| `NativeEncoder::encode`, 1 event | **30** | 32 -> 30 once `kv_metrics`'s two distributions became inline `Samples` -- a `Distribution` record serializes its sketch via `to_java_bytes` (one blob each), a `Samples` writes its values directly; dictionary build + the per-field TLV scratch buffers `native::record::write_field` allocates for each of `Event`'s up-to-five fields -- 23 -> 32 with [ADR `metrics-model-v2`](../adr/metrics-model-v2.md), which TLV-framed every record too: the fixture's four metrics each pay one scratch buffer for their `kind` field and one length prefix as a list entry (+8), and the log's `message` one (+1) (`docs/adr/native-wire-format-encoding.md`'s own Decision section notes this as a known, unoptimized cost of the field-level skip-unknown framing) |
+| `logit_out`: encode + frame, 1 event | **30** | `encode_batch` + `write_frame_with_flags` directly — same cost as `NativeEncoder::encode` above, since it's the same two steps; pinned separately so a future change to just this sink's path is caught here |
 | `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
 | `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
@@ -829,12 +834,17 @@ three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`, PR #33) — worth read
 how much the initial "strictly no worse anywhere" framing had to be corrected against real
 measurement. The honest result, by fan-out shape:
 
-| Fan-out shape (2 consumers) | Allocations | vs. `main`'s flat 5 |
+| Fan-out shape (2 consumers) | Allocations | vs. the pre-`Arc` code's flat 3 |
 |---|---:|---|
 | Single consumer (any kind) | **0** | strictly better |
 | Both `Output` | **1** | strictly better |
-| One `Output`, one `Transform`/Lua | **1 or 6** | scheduling-dependent, either direction |
-| Both `Transform`/Lua-style, no `Output` | **6** | 1 worse, always |
+| One `Output`, one `Transform`/Lua | **1 or 4** | scheduling-dependent, either direction |
+| Both `Transform`/Lua-style, no `Output` | **4** | 1 worse, always |
+
+(The clone-bearing rows were 6 against a flat 5 when this was written; `Event::clone` on the
+nginx shape has since dropped from 4 to 2 -- `kv_metrics`'s distributions are inline `Samples` now
+-- and every number in this section that includes that clone moved down by 2 with it. The
+relative story is unchanged.)
 
 **What's unconditionally better**: a single-consumer edge — the common case, every shipped
 listener's first hop, and every interior edge of a linear chain — costs nothing, via a
@@ -849,10 +859,10 @@ clone" saving originally claimed, delivered — for this shape.
 
 **What's genuinely racy, not deterministic in either direction**: a fan-out with one `Output`
 branch and one mutating (`Transform`/`ScriptWorker`) branch — the actually-common shape, matching
-the nginx reference config's `tap`/`trimmed` split — costs **1 or 6**, decided by real tokio
-scheduling, never something in between and never `main`'s flat 5. Whether the mutating sibling's
+the nginx reference config's `tap`/`trimmed` split — costs **1 or 4**, decided by real tokio
+scheduling, never something in between and never the pre-`Arc` code's flat 3. Whether the mutating sibling's
 `unwrap_batch` call finds the `Output` branch's handle already gone (free, cost 1) or still alive
-(clone, cost 6) depends on which finishes first — genuinely reachable both ways, confirmed by two
+(clone, cost 4) depends on which finishes first — genuinely reachable both ways, confirmed by two
 tests that manually pin each ordering
 (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
 
@@ -941,11 +951,11 @@ logarithm.
 
 Against that, the shape a router replaces — an N-way `Fanout` plus N `has_attributes` filters, each
 scanning the *whole* batch to keep its own slice — costs `fan_out_plus_two_has_attributes_for_the_
-same_split`'s **324** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
-`Arc::new` (`Fanout::deliver`'s once-per-send wrap) + 321 for the forced `EventBatch` deep clone
-that a fan-out with no `Output` branch always pays (1 for the clone's own `Vec<Event>`, plus 64 × 5
-for this fixture's own per-event clone cost — see the test's doc comment for why that's 5, not the
-reference nginx shape's 4) + 2 for the two `has_attributes` passes (1 allocation per batch each,
+same_split`'s **196** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
+`Arc::new` (`Fanout::deliver`'s once-per-send wrap) + 193 for the forced `EventBatch` deep clone
+that a fan-out with no `Output` branch always pays (1 for the clone's own `Vec<Event>`, plus 64 × 3
+for this fixture's own per-event clone cost — see the test's doc comment for why that's 3, not the
+reference nginx shape's 2) + 2 for the two `has_attributes` passes (1 allocation per batch each,
 `process_batch_through_has_attributes`'s own number). The two numbers aren't directly comparable
 per-event (`route`'s inputs are borrowed, never cloned, and its output partition is exactly sized
 to the split; the fan-out's cost is paid whether or not that branch's filter keeps anything) — the
@@ -1028,7 +1038,8 @@ key no event carries. In practice this was never a growth path. There were exact
 production `get` call sites in the tree:
 
 - `kv_metrics.rs` (twice), keyed by `m.field` -- a **config** string, fixed at startup. Hit or
-  miss, it's interned once and never again.
+  miss, it's interned once and never again. (Since moved off `get` entirely: the field is interned
+  at construction and read through `AttrMap::get_sym`, no per-event probe of the interner at all.)
 - `proxy.rs`'s `AttrsProxy::__index`, keyed by whatever a Lua script indexes -- normally a literal
   in the script, so also a bounded set. Unbounded only for a script that builds keys out of event
   data, which is unusual and is trusted config besides.
@@ -1329,9 +1340,9 @@ might regress a workload the fixtures don't cover.
    over three rounds (`docs/adr/arc-eventbatch-copy-on-write.md`), each correcting an
    overclaim the previous one made. Single-consumer edges and all-`Output` fan-outs are
    unconditionally better (0 and 1 allocations respectively, both strict wins). A fan-out mixing
-   one `Output` branch with one mutating branch is genuinely racy — 1 or 6, decided by scheduling,
-   never `main`'s flat 5 either way. A fan-out with no `Output` branch at all doesn't improve —
-   still 6, one worse than `main`, deterministically. Read §3 in full before citing a single number
+   one `Output` branch with one mutating branch is genuinely racy — 1 or 4, decided by scheduling,
+   never the pre-`Arc` code's flat 3 either way. A fan-out with no `Output` branch at all doesn't improve —
+   still 4, one worse than that code, deterministically. Read §3 in full before citing a single number
    from this item; which one applies depends entirely on fan-out shape.
 8. ~~**Re-pick `AttrMap`'s inline capacity — down.**~~ **Decided: don't shrink** (§1). Dropping
    capacity 8 → 4 only ever costs an allocation across every shape measured, never saves one.
