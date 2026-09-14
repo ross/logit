@@ -47,6 +47,11 @@ logit-script.workspace = true
 # `syslog.rs`'s relay test (decodes with a real `SyslogDecoder`) and `logit.rs`'s round-trip
 # tests (drive a real `LogitInput` rather than hand-rolling the wire protocol on both ends).
 logit-inputs.workspace = true
+# `syslog.rs`'s TLS tests assert on the `insecure_skip_verify` warning itself, which
+# `Diagnostics::warn` reports through `tracing` and nothing else -- so a test needs a subscriber
+# to capture it. Dev-only, and `logit-outputs` still never picks a subscriber itself; same shape
+# and same reason as `logit-inputs`' own override.
+tracing-subscriber.workspace = true
 # `syslog.rs`'s pure-codec fixed-point property test (docs/plans/lossless-transit.md's W5):
 # generates small RFC 5424 STRUCTURED-DATA grammars and asserts
 # `decode(encode(decode(x))) == decode(x)`.

@@ -101,10 +101,12 @@ tagged userdata wrapper was considered and rejected, and every known residual ga
 copies, nested container elements, empty-container ambiguity) — each deliberate and
 regression-tested, not an oversight.
 
-**A criterion benchmark against plain table conversion is still outstanding** — tracked as a
-follow-up now that the proxy above exists to benchmark against a baseline. The design commits to
-the proxy on the reasoning above; the benchmark is to confirm the expected win with numbers, not to
-leave the choice open.
+**Confirmed with numbers, not just reasoning.** `script/bench`'s `lua::proxy`/`lua::to_table` divan
+arms (`crates/logit-bench/benches/pipeline.rs`) measure the proxy against the rejected
+full-table-conversion design directly: the proxy wins, widening in its favor for scripts that read
+few attributes, since `to_table` converts everything regardless of what the script touches — see
+[`docs/known-gaps.md`](../known-gaps.md) for the closed follow-up and
+[`memory.md`](memory.md) §2/§8 for the allocation side of the same comparison.
 
 ## Script contract
 

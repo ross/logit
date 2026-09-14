@@ -25,10 +25,14 @@ testdata/interop/
                          one file per datagram (each one packs many value lists)
   otlp/README.md      -- provenance table for otlp/*.json
   otlp/*.json         -- OTLP/JSON as re-emitted by the Collector's own `file` exporter
+  graphite/README.md  -- provenance table for graphite/*.raw
+  graphite/*.raw      -- raw captured TCP connection streams: real carbon plaintext (collectd's
+                         `write_graphite` plugin) and real carbon pickle frames (a stdlib Python
+                         producer), one file per accepted connection
 ```
 
-`syslog/*.raw`/`collectd/*.raw` and `otlp/*.json` are captured differently on purpose, not
-inconsistently -- see each subdirectory's own README for why.
+`syslog/*.raw`/`collectd/*.raw`/`graphite/*.raw` and `otlp/*.json` are captured differently on
+purpose, not inconsistently -- see each subdirectory's own README for why.
 
 ## Regenerating
 
@@ -67,10 +71,12 @@ creeping in (padding, verbose repeated attributes, an accidentally-large `--coun
 
 Tests that read these files should assert on **identifiable decoded values** (the message content,
 a hostname, a trace id, a span name) rather than on the raw bytes changing or not changing --
-see `crates/logit-inputs/src/syslog.rs`'s and `crates/logit-inputs/src/collectd.rs`'s
-`interop_fixture_*` tests for the pattern (the collectd ones assert a list's data-source count and
-kinds, its `collectd.*` identity and its interval -- never a measured value, which is different
-every run). The fixtures
+see `crates/logit-inputs/src/syslog.rs`'s, `crates/logit-inputs/src/collectd.rs`'s and
+`crates/logit-inputs/src/graphite/mod.rs`'s `interop_fixture_*` tests for the pattern (the
+collectd ones assert a list's data-source count and kinds, its `collectd.*` identity and its
+interval; the graphite ones assert a decoded path prefix, that every kind is a bare `Gauge`, and
+the pickle fixtures' exact datapoints -- never a measured value, which is different every run).
+The fixtures
 themselves are allowed to change shape on a re-record (different container hostname, different
 timestamp); a test asserting byte-for-byte fixture equality would be testing this directory's own
 stability, not `logit`'s decoder.

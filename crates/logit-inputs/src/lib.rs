@@ -9,6 +9,7 @@
 pub mod collectd;
 pub mod docker;
 pub mod generate;
+pub mod graphite;
 pub mod internal;
 pub mod logit;
 pub mod otlp;
@@ -16,6 +17,7 @@ pub mod prometheus;
 pub mod statsd;
 pub mod syslog;
 pub mod tail;
+pub mod tcp;
 mod tls;
 pub mod udp;
 

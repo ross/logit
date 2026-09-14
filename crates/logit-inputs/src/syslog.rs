@@ -1,8 +1,17 @@
-//! RFC 3164 / RFC 5424 syslog over UDP -- the log-producing input the nginx integration rests on
-//! (nginx's `access_log syslog:` writer speaks this).
+//! RFC 3164 / RFC 5424 syslog over UDP or TCP -- the log-producing input the nginx integration
+//! rests on (nginx's `access_log syslog:` writer speaks this, over UDP).
 //!
-//! **UDP only.** nginx's `syslog:` writer is UDP-only, so a TCP accept loop would buy this
-//! integration nothing; see `docs/known-gaps.md`.
+//! **Both transports, one decoder.** UDP is the default, and is what the nginx integration uses;
+//! `transport: tcp` (`docs/adr/syslog-tcp-ingress-and-tls.md`) runs this same [`SyslogDecoder`]
+//! behind [`crate::tcp::TcpListener`] instead of [`crate::udp::UdpListener`], which is what adds
+//! an accept loop, RFC 6587 framing (octet-counting or LF-delimited, auto-detected from each
+//! connection's first byte) and, with a `tls:` block, TLS termination -- RFC 5425 syslog over TLS
+//! being nothing more than RFC 6587 framing carried over TLS over TCP. The decoder itself differs
+//! in exactly one respect between the two: **line splitting**. A UDP datagram may carry several
+//! LF-separated messages, so the UDP arm splits on `\n`; a TCP frame is already exactly one
+//! message, and an octet-counted one may legally *contain* a `\n` as ordinary MSG content, so
+//! [`SyslogInput::tcp`] turns splitting off ([`SyslogDecoder::with_line_splitting`]) and lets the
+//! framer be the sole delimiter.
 //!
 //! **Dialect disambiguation** happens per message, right after `<PRI>`: a leading version digit
 //! followed by a space (`1 `) means RFC 5424; anything else is parsed as RFC 3164. This sniff is
@@ -112,6 +121,7 @@
 //! technically end in `:` -- silently eating part of the body as a fake tag. Restricting the
 //! character class rules that out: `{"status"` contains `{`/`"`, which no real tag ever does.
 
+use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
@@ -121,74 +131,191 @@ use logit_core::{
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// Thin wrapper over [`UdpListener<SyslogDecoder>`] -- the read/decode split and datagram-\>batch
-/// assembly all live there (`docs/adr/decoupled-listener-io.md`); this type is just the
+/// Which driver a [`SyslogInput`] is wrapping. Chosen once, by `transport:`
+/// (`crates/logit-cli/src/pipeline.rs`'s `SyslogIn` arm), and never changed afterwards -- an enum
+/// rather than a `Box<dyn Input>` so each arm keeps its own concrete builder surface
+/// ([`TcpListener::with_tls`], [`UdpListener::with_config`]) reachable through this wrapper.
+enum Inner {
+    Udp(UdpListener<SyslogDecoder>),
+    Tcp(TcpListener<SyslogDecoder>),
+}
+
+/// Thin wrapper over [`UdpListener<SyslogDecoder>`] or [`TcpListener<SyslogDecoder>`] -- the
+/// read/decode split and datagram-\>batch assembly (`docs/adr/decoupled-listener-io.md`), and on
+/// the TCP side the accept loop, RFC 6587 framing and TLS termination
+/// (`docs/adr/syslog-tcp-ingress-and-tls.md`), all live in the drivers; this type is just the
 /// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
 /// module's own tests already depend on.
 pub struct SyslogInput {
-    inner: UdpListener<SyslogDecoder>,
+    inner: Inner,
 }
 
 impl SyslogInput {
+    /// A UDP listener -- the default transport, and what every caller that doesn't ask for TCP
+    /// gets. The decoder keeps its line splitting: one datagram may carry several LF-separated
+    /// messages.
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
-            inner: UdpListener::new(
+            inner: Inner::Udp(UdpListener::new(
                 bind,
                 SyslogDecoder::new(Arc::new(Resource::default())),
                 UdpListenerConfig::default(),
-            ),
+            )),
+        }
+    }
+
+    /// A TCP listener (`transport: tcp`), plaintext until [`Self::with_tls`] is called.
+    ///
+    /// The decoder is built with [`SyslogDecoder::with_line_splitting`] **off**: on this path the
+    /// framer has already delimited exactly one message per frame, and an octet-counted frame's
+    /// MSG may legally contain a `\n` that re-splitting would shred into spurious events (see
+    /// this module's own doc comment and `docs/adr/syslog-tcp-ingress-and-tls.md`). That holds
+    /// for both RFC 6587 framings, not just octet-counting -- under LF framing the `\n` is gone
+    /// by the time the decoder sees the frame anyway, so splitting could only ever be a no-op or
+    /// a bug.
+    pub fn tcp(bind: impl Into<String>) -> Self {
+        Self {
+            inner: Inner::Tcp(TcpListener::new(
+                bind,
+                SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false),
+                TcpListenerConfig::default(),
+            )),
         }
     }
 
     /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
-    /// wraps, so both report under the same id. Both halves matter: `UdpListener`'s own
-    /// `diag` is what a whole-datagram decode failure reports through
-    /// (`decode_loop`'s `bad_datagram`); the decoder's own `diag` field is what a malformed
-    /// *line* inside an otherwise-valid datagram reports through (`bad_line`) -- two distinct
-    /// `Diagnostics` values that must both carry the same id and telemetry handle, or one class
-    /// of decode failure silently reports under no component id and with telemetry disabled.
+    /// wraps, so both report under the same id. Both halves matter on either transport: the
+    /// driver's own `diag` is what a transport-level failure reports through (`decode_loop`'s
+    /// `bad_datagram`, the TCP driver's `framing_error`/`connection_error`); the decoder's own
+    /// `diag` field is what a rejected syslog message reports through (`bad_line`) -- for a whole
+    /// frame on TCP just as much as for one line inside a multi-line datagram, since
+    /// [`Decoder::decode_into`] is infallible here and never hands the driver a frame to report
+    /// as its own `bad_frame` (that key is for a fallible decoder). Two distinct `Diagnostics`
+    /// values that must both carry the same id and telemetry handle, or one class of decode
+    /// failure silently reports under no component id and with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.inner =
-            self.inner.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag));
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(
+                listener.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag)),
+            ),
+            Inner::Tcp(listener) => Inner::Tcp(
+                listener.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag)),
+            ),
+        };
         self
     }
 
     /// Attaches a telemetry handle -- component-specific detail beyond the runtime's uniform
     /// layer-2 metrics (`docs/design/internal-telemetry.md`'s "layer 3"): how many datagrams and
-    /// bytes actually arrived on the wire, mirroring `StatsdInput`'s own worked example.
+    /// bytes actually arrived on the wire (UDP), or how many connections and frames (TCP),
+    /// mirroring `StatsdInput`'s own worked example.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.inner = self.inner.with_telemetry(telemetry);
+        self.inner = match self.inner {
+            Inner::Udp(listener) => Inner::Udp(listener.with_telemetry(telemetry)),
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_telemetry(telemetry)),
+        };
         self
     }
 
-    /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
-    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] --
-    /// today's behaviour -- when never called.
+    /// Overrides a **UDP** listener's receive-queue/batching/shutdown-grace knobs from a
+    /// `receive:` config block (`docs/adr/decoupled-listener-io.md`). Defaults to
+    /// [`UdpListenerConfig::default`] when never called.
+    ///
+    /// Two transport-specific setters rather than one taking an either-or enum: the two configs
+    /// genuinely aren't interchangeable -- a TCP listener has no receive queue at all, which is
+    /// why graph rule 17 rejects `receive:`'s queue fields on one outright -- so a single setter
+    /// would have to decide at runtime what to do with a queue bound its listener cannot honour.
+    /// The one production caller (`crates/logit-cli/src/pipeline.rs`'s `SyslogIn` arm) already
+    /// branches on `transport:` to pick a constructor, so it picks the matching setter in the
+    /// same `match`. This one leaves a TCP listener untouched; [`Self::with_tcp_receive`] is its
+    /// counterpart.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
-        self.inner = self.inner.with_config(config);
+        if let Inner::Udp(listener) = self.inner {
+            self.inner = Inner::Udp(listener.with_config(config));
+        }
         self
     }
 
-    /// Passthrough to the wrapped [`UdpListener::local_addr`] -- lets a caller (`crates/
+    /// [`Self::with_receive`]'s TCP counterpart -- see its doc comment for why these are two
+    /// methods. Leaves a UDP listener untouched.
+    pub fn with_tcp_receive(mut self, config: TcpListenerConfig) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_config(config));
+        }
+        self
+    }
+
+    /// Overrides a **TCP** listener's per-phase pre-message budget (`handshake_timeout:` in
+    /// config): the TLS accept when `tls:` is set, and the wait for the connection's first byte.
+    /// Delegates straight to [`TcpListener::with_handshake_timeout`], whose own doc comment and
+    /// this module's driver ("Pre-handshake timeout") describe what each phase covers.
+    ///
+    /// A UDP listener is left untouched rather than failing, exactly like [`Self::with_receive`]/
+    /// [`Self::with_tcp_receive`]: there is no connection on that transport for the value to
+    /// bound, so there is nothing to apply and nothing to refuse. Graph rule 45 is what tells an
+    /// operator who set a non-default value under `transport: udp` that it could never take
+    /// effect -- unlike `tls:`, whose [`Self::with_tls`] arm does fail, because `tls:` has no
+    /// default and its mere presence is an instruction.
+    pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_handshake_timeout(handshake_timeout));
+        }
+        self
+    }
+
+    /// Terminates TLS on a TCP listener (`tls:` in config, RFC 5425) -- delegates straight to
+    /// [`TcpListener::with_tls`], which resolves every path in `settings` against `base_dir`.
+    ///
+    /// A UDP listener fails here rather than ignoring the block: DTLS (RFC 6012) is out of scope
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives), so there is nothing this could
+    /// mean. Graph rule 43 rejects the same combination at config-validation time and is what an
+    /// operator actually sees; this arm is the belt-and-braces backstop for a caller that skipped
+    /// validation, not the primary diagnostic.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsServerSettings,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        self.inner = match self.inner {
+            Inner::Tcp(listener) => Inner::Tcp(listener.with_tls(settings, base_dir)?),
+            Inner::Udp(_) => anyhow::bail!(
+                "syslog_in: 'tls:' needs 'transport: tcp' -- there is no syslog-over-DTLS support \
+                 (docs/adr/syslog-tcp-ingress-and-tls.md)"
+            ),
+        };
+        Ok(self)
+    }
+
+    /// Passthrough to the wrapped driver's own `local_addr` -- lets a caller (`crates/
     /// logit-cli/tests/syslog_round_trip.rs`) learn the real ephemeral port after `bind()`,
     /// mirroring `otlp_round_trip.rs`'s own `Input::bind`-then-`local_addr` readiness pattern,
     /// with no bind-drop race.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner.local_addr()
+        match &self.inner {
+            Inner::Udp(listener) => listener.local_addr(),
+            Inner::Tcp(listener) => listener.local_addr(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Input for SyslogInput {
     async fn bind(&mut self) -> anyhow::Result<()> {
-        self.inner.bind().await
+        match &mut self.inner {
+            Inner::Udp(listener) => listener.bind().await,
+            Inner::Tcp(listener) => listener.bind().await,
+        }
     }
 
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        self.inner.run(sink).await
+        match &mut self.inner {
+            Inner::Udp(listener) => listener.run(sink).await,
+            Inner::Tcp(listener) => listener.run(sink).await,
+        }
     }
 
     async fn run_until_shutdown(
@@ -196,25 +323,67 @@ impl Input for SyslogInput {
         sink: Fanout,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        self.inner.run_until_shutdown(sink, shutdown).await
+        match &mut self.inner {
+            Inner::Udp(listener) => listener.run_until_shutdown(sink, shutdown).await,
+            Inner::Tcp(listener) => listener.run_until_shutdown(sink, shutdown).await,
+        }
     }
 }
 
-/// Decodes raw syslog datagram bytes into an [`EventBatch`]. Split out from [`SyslogInput`] so
-/// the parsing logic is directly unit-testable without a socket.
+/// Decodes raw syslog bytes into an [`EventBatch`]. Split out from [`SyslogInput`] so the parsing
+/// logic is directly unit-testable without a socket.
+///
+/// `Clone` because [`TcpListener`] hands every accepted connection its own decoder
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section) -- this one's
+/// clonable state is its `Diagnostics` throttle, which is per-connection in exactly the way that
+/// driver wants.
+#[derive(Clone)]
 pub struct SyslogDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// See [`Self::with_line_splitting`].
+    line_splitting: bool,
 }
 
 impl SyslogDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default() }
+        Self { resource, diag: Diagnostics::default(), line_splitting: true }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
+    }
+
+    /// Whether [`Decoder::decode_into`] splits its input on `\n` into several messages (the
+    /// default, and what UDP needs) or treats the whole buffer as exactly one
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    ///
+    /// Off is for a caller whose transport has *already* delimited the message -- today
+    /// [`SyslogInput::tcp`], whose [`crate::tcp::Framer`] does RFC 6587 framing. Splitting there
+    /// would be actively wrong, not merely redundant: an octet-counted frame's MSG may contain a
+    /// `\n` as ordinary content, and re-splitting on it would turn one multiline message into
+    /// several half-messages, most of them missing a PRI and so dropped as `bad_line`.
+    pub fn with_line_splitting(mut self, line_splitting: bool) -> Self {
+        self.line_splitting = line_splitting;
+        self
+    }
+
+    /// Parses one already-delimited message and appends it to `out`, or reports it as a
+    /// throttled `bad_line`. Shared by both arms of [`Decoder::decode_into`] so a split line and
+    /// a whole frame go through identical parsing, error handling and diagnostics.
+    fn absorb_line(&mut self, line: Bytes, received_at: i64, out: &mut Vec<Event>) {
+        // Only a truly empty record (a bare newline used as a separator, or an empty frame) is
+        // skipped here -- *not* whitespace-only content, which is real MSG data, not framing.
+        if line.is_empty() {
+            return;
+        }
+        match parse_line(&line, received_at, &mut self.diag) {
+            Ok(event) => out.push(event),
+            Err(err) => {
+                self.diag.warn_throttled("bad_line", err);
+            }
+        }
     }
 
     /// Test-only: confirms `SyslogInput::with_diagnostics` actually reached this decoder's own
@@ -232,11 +401,37 @@ impl Decoder for SyslogDecoder {
         received_at: i64,
         out: &mut Vec<Event>,
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
+        // Splitting happens on the raw bytes; there is no whole-line UTF-8 validation here any
+        // more -- `parse_line` validates each header field individually and only MSG is allowed
+        // to carry non-UTF-8 bytes (see the module doc).
+        if !self.line_splitting {
+            // One message, already delimited by the caller's framer
+            // (`Self::with_line_splitting`). The only bytes to remove are a terminator the
+            // sender counted *inside* the frame: an octet-counted MSG-LEN may legally cover a
+            // trailing `\r\n`, and taking it off here is what makes such a frame decode
+            // identically to the same line arriving in a UDP datagram. One `\n`, then one `\r`
+            // behind it -- exactly what the splitting arm below does at each line break, and
+            // what `crate::tcp::Framer` does for LF framing.
+            //
+            // The `\r` comes off **only** when an `\n` did. An LF-framed frame reaches here
+            // already terminator-free (the framer consumed the `\n` and one `\r`), so a `\r`
+            // still at its end is payload -- a message genuinely ending in CR, sent as
+            // `...msg\r\r\n` -- and stripping it unconditionally would eat a byte on TCP that
+            // the same bytes keep over UDP. (A counted lone `\r` with no `\n` is therefore kept
+            // too; nothing in RFC 6587 makes a bare CR a terminator.)
+            let mut line = bytes;
+            if line.ends_with(b"\n") {
+                line = line.slice(..line.len() - 1);
+                if line.ends_with(b"\r") {
+                    line = line.slice(..line.len() - 1);
+                }
+            }
+            self.absorb_line(line, received_at, out);
+            return Ok((self.resource.clone(), None));
+        }
         // Per line, not per datagram -- exactly `StatsdDecoder::decode_into`'s precedent. nginx's
         // `escape=json` guarantees no raw newline inside an access-log body, so this split is
-        // safe for the target workload. Splitting happens on the raw bytes; there is no
-        // whole-line UTF-8 validation here any more -- `parse_line` validates each header field
-        // individually and only MSG is allowed to carry non-UTF-8 bytes (see the module doc).
+        // safe for the target workload.
         let mut start = 0usize;
         while start <= bytes.len() {
             let nl = bytes[start..].iter().position(|&b| b == b'\n');
@@ -245,16 +440,7 @@ impl Decoder for SyslogDecoder {
             if line.ends_with(b"\r") {
                 line = line.slice(..line.len() - 1);
             }
-            // Only a truly empty record (a bare newline used as a separator) is skipped here --
-            // *not* whitespace-only content, which is real MSG data, not framing.
-            if !line.is_empty() {
-                match parse_line(&line, received_at, &mut self.diag) {
-                    Ok(event) => out.push(event),
-                    Err(err) => {
-                        self.diag.warn_throttled("bad_line", err);
-                    }
-                }
-            }
+            self.absorb_line(line, received_at, out);
             match nl {
                 Some(i) => start += i + 1,
                 None => break,
@@ -904,6 +1090,7 @@ fn parse_5424(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn decode(datagram: &str) -> Vec<Event> {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
@@ -922,7 +1109,34 @@ mod tests {
     #[test]
     fn with_diagnostics_reaches_the_wrapped_decoder_too() {
         let input = SyslogInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
-        assert_eq!(input.inner.decoder().diag().component_id(), "my-id");
+        match &input.inner {
+            Inner::Udp(listener) => {
+                assert_eq!(listener.decoder().diag().component_id(), "my-id");
+                assert_eq!(listener.diag().component_id(), "my-id");
+            }
+            Inner::Tcp(_) => panic!("SyslogInput::new must build a UDP listener"),
+        }
+    }
+
+    /// The same regression on the TCP arm: `Inner::Tcp` has its own `map_decoder` call, and
+    /// nothing about the UDP arm being right would catch this one being dropped.
+    #[test]
+    fn with_diagnostics_reaches_the_wrapped_decoder_on_the_tcp_arm_too() {
+        let input = SyslogInput::tcp("127.0.0.1:0").with_diagnostics(Diagnostics::new("tcp-id"));
+        match &input.inner {
+            Inner::Tcp(listener) => {
+                assert_eq!(listener.decoder().diag().component_id(), "tcp-id");
+                // The driver half too: `with_diagnostics` has to reach both, and the decoder
+                // being right says nothing about the listener's own `framing_error`/
+                // `connection_error` handle having been set.
+                assert_eq!(listener.diag().component_id(), "tcp-id");
+                assert!(
+                    !listener.decoder().line_splitting,
+                    "with_diagnostics must not undo SyslogInput::tcp's line-splitting choice"
+                );
+            }
+            Inner::Udp(_) => panic!("SyslogInput::tcp must build a TCP listener"),
+        }
     }
 
     /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
@@ -1552,6 +1766,317 @@ mod tests {
         let mut sd = AttrMap::new();
         sd.insert("ex@32473", Value::Map(Box::new(params)));
         assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+    }
+
+    // ---- line splitting off (the TCP framing path) --------------------------------------------
+
+    /// `SyslogInput::tcp`'s whole reason for turning splitting off: the framer has already
+    /// delimited the message, and an octet-counted MSG may contain a `\n` as ordinary content.
+    #[test]
+    fn with_line_splitting_off_treats_the_whole_buffer_as_one_line() {
+        let mut decoder =
+            SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false);
+        let mut out = Vec::new();
+        decoder
+            .decode_into(
+                Bytes::from_static(b"<134>1 - - - - - - first\nsecond\nthird"),
+                7,
+                &mut out,
+            )
+            .expect("decode should succeed");
+        assert_eq!(out.len(), 1, "the embedded newlines are message content, not delimiters");
+        assert_eq!(message_str(&out[0]), "first\nsecond\nthird");
+    }
+
+    /// `decode_into` with splitting off, for reuse across the terminator cases below.
+    fn decode_framed(frame: &[u8]) -> Vec<Event> {
+        let mut decoder =
+            SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false);
+        let mut out = Vec::new();
+        decoder
+            .decode_into(Bytes::copy_from_slice(frame), 7, &mut out)
+            .expect("decode should succeed");
+        out
+    }
+
+    /// An octet-counted sender may legally count its own `\r\n` terminator inside MSG-LEN, so
+    /// the frame arrives with it attached -- and must then decode exactly like the same line in a
+    /// UDP datagram, which the splitting arm strips at the line break.
+    #[test]
+    fn with_line_splitting_off_strips_a_counted_crlf_terminator() {
+        assert_eq!(
+            message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\r\n"))),
+            "hello"
+        );
+        assert_eq!(
+            message_str(&only_event(decode("<134>1 - - - - - - hello\r\n"))),
+            "hello",
+            "the identical bytes over UDP must agree"
+        );
+    }
+
+    /// A counted bare `\n` comes off too -- same terminator, one of the two spellings.
+    #[test]
+    fn with_line_splitting_off_strips_a_counted_lf_terminator() {
+        assert_eq!(message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\n"))), "hello");
+    }
+
+    /// The regression the unconditional `\r` strip caused: an LF-framed frame reaches the decoder
+    /// already terminator-free (`crate::tcp::Framer` consumed the `\n` and one `\r`), so a `\r`
+    /// still at its end is payload -- a message genuinely ending in CR, sent `...hello\r\r\n`.
+    /// It used to lose that byte on TCP while the same bytes kept it over UDP.
+    #[test]
+    fn with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped() {
+        // What `Framer::next_line` hands the decoder for the wire bytes `...hello\r\r\n`.
+        assert_eq!(
+            message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\r"))),
+            "hello\r"
+        );
+        // And the same wire bytes through the UDP arm, which is what it has to agree with.
+        assert_eq!(message_str(&only_event(decode("<134>1 - - - - - - hello\r\r\n"))), "hello\r");
+    }
+
+    #[test]
+    fn with_line_splitting_off_skips_an_empty_buffer() {
+        let mut decoder =
+            SyslogDecoder::new(Arc::new(Resource::default())).with_line_splitting(false);
+        let mut out = Vec::new();
+        decoder
+            .decode_into(Bytes::from_static(b""), 7, &mut out)
+            .expect("an empty frame is not an error");
+        assert!(out.is_empty(), "an empty frame carries no message");
+    }
+
+    /// Splitting stays on by default -- every existing UDP caller depends on it.
+    #[test]
+    fn line_splitting_is_on_by_default() {
+        assert_eq!(decode("<13>a\n<13>b\n").len(), 2);
+    }
+
+    // ---- TCP end to end (`transport: tcp`) ----------------------------------------------------
+
+    /// Binds an ephemeral TCP port through `Input::bind`, then starts the listener -- the
+    /// `bind()`-then-`local_addr()` readiness shape with no bind-drop race
+    /// (`crates/logit-inputs/src/tcp.rs`'s own driver tests use the same one).
+    async fn running_tcp_input(
+        tls: Option<&TlsServerSettings>,
+    ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>)
+    {
+        let mut input = SyslogInput::tcp("127.0.0.1:0").with_tcp_receive(TcpListenerConfig {
+            // One event per frame, no interval timer: every delivery is attributable to exactly
+            // one frame, so a multiline message arriving as two events would fail loudly here
+            // rather than merely arriving in one batch.
+            batch_max_events: 1,
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        });
+        if let Some(settings) = tls {
+            input = input
+                .with_tls(settings, &testdata_tls_dir())
+                .expect("the committed testdata/tls fixtures should load");
+        }
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            // The sender is moved in and held for the task's life: dropping it would resolve
+            // every `changed()` await inside the driver with an error the moment this helper
+            // returned. The test ends the listener by aborting the handle instead.
+            let _shutdown_tx = shutdown_tx;
+            let _ = input.run_until_shutdown(sink, shutdown_rx).await;
+        });
+        (addr, handle, rx)
+    }
+
+    async fn recv_events(
+        rx: &mut tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>,
+    ) -> Vec<Event> {
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a batch should be delivered within 5s")
+            .expect("the fanout should not have closed");
+        logit_pipeline::unwrap_batch(delivered).events
+    }
+
+    fn assert_nginx_line(event: &Event) {
+        assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
+        assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Info)); // 134 % 8 = 6
+        assert_eq!(message_str(event), "hello over tcp");
+    }
+
+    /// rsyslog's `omfwd` default framing (RFC 6587 section 3.4.2) through a real listener.
+    #[tokio::test]
+    async fn tcp_decodes_an_lf_framed_message_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\n",
+        )
+        .await
+        .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_nginx_line(&events[0]);
+        handle.abort();
+    }
+
+    /// `syslog_out`'s own TCP framing (RFC 6587 section 3.4.1) through the same listener -- the
+    /// framing is detected from the leading digit, with nothing configured.
+    #[tokio::test]
+    async fn tcp_decodes_an_octet_counted_message_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let msg = "<134>Aug 30 10:00:00 myhost nginx: hello over tcp";
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_nginx_line(&events[0]);
+        handle.abort();
+    }
+
+    /// Finding 1's end-to-end case: a message genuinely ending in CR, LF-framed on the wire as
+    /// `...\r\r\n`, keeps that byte -- the framer takes the `\n` and one `\r`, and the decoder
+    /// leaves what is left alone. The same bytes over UDP decode the same way (the decoder-level
+    /// twin of this is `with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped`).
+    #[tokio::test]
+    async fn tcp_keeps_a_payload_cr_on_an_lf_framed_message_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\r\r\n",
+        )
+        .await
+        .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(message_str(&events[0]), "hello over tcp\r");
+        handle.abort();
+    }
+
+    /// Finding 1's other end-to-end case: an octet-counted sender whose MSG-LEN covers its own
+    /// `\r\n` terminator gets the terminator stripped, so the message matches what the same line
+    /// would decode to over UDP.
+    #[tokio::test]
+    async fn tcp_strips_a_counted_crlf_terminator_end_to_end() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let msg = "<134>Aug 30 10:00:00 myhost nginx: hello over tcp\r\n";
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_nginx_line(&events[0]);
+        handle.abort();
+    }
+
+    /// The regression `SyslogDecoder::with_line_splitting` exists for, end to end: an
+    /// octet-counted MSG containing a newline is **one** event with the newline intact. Before
+    /// the flag, the decoder re-split it into a first half plus a PRI-less remainder that was
+    /// then dropped as `bad_line` -- a silently truncated log line.
+    #[tokio::test]
+    async fn tcp_keeps_a_multiline_octet_counted_message_as_exactly_one_event() {
+        let (addr, handle, mut rx) = running_tcp_input(None).await;
+        let msg = "<134>Aug 30 10:00:00 myhost nginx: line one\nline two\nline three";
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
+            .await
+            .unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1, "a multiline MSG must not be shredded into several events");
+        assert_eq!(message_str(&events[0]), "line one\nline two\nline three");
+
+        // With `batch_max_events: 1` a second event would arrive as its own batch -- nothing more
+        // may follow.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
+            "the multiline message must produce exactly one event"
+        );
+        handle.abort();
+    }
+
+    /// `crates/logit-inputs` is two levels under the repo root, where the committed TLS fixtures
+    /// live (`testdata/tls/README.md`) -- the same helper shape `crate::tcp`'s own tests use.
+    fn testdata_tls_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// RFC 5425 end to end: a real `TlsConnector` trusting exactly `testdata/tls/ca.pem` hands an
+    /// octet-counted frame to a TLS-terminating `syslog_in`.
+    #[tokio::test]
+    async fn tcp_over_tls_decodes_a_message_end_to_end() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let (addr, handle, mut rx) = running_tcp_input(Some(&settings)).await;
+
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<rustls_pki_types::CertificateDer<'static>> =
+            <rustls_pki_types::CertificateDer as rustls_pki_types::pem::PemObject>::pem_file_iter(
+                testdata_tls_dir().join("ca.pem"),
+            )
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        roots.add_parsable_certificates(ca);
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // `testdata/tls/server.pem` carries a `localhost` SAN.
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let mut client = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+            .await
+            .expect("the TLS handshake should complete within 5s")
+            .expect("the TLS handshake should succeed");
+
+        let msg = "<134>Aug 30 10:00:00 myhost nginx: hello over tcp";
+        tokio::io::AsyncWriteExt::write_all(&mut client, format!("{} {msg}", msg.len()).as_bytes())
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+
+        let events = recv_events(&mut rx).await;
+        assert_eq!(events.len(), 1);
+        assert_nginx_line(&events[0]);
+        handle.abort();
+    }
+
+    /// Graph rule 43 is what an operator actually sees, but the builder refuses the same
+    /// combination rather than silently ignoring a `tls:` block -- DTLS is out of scope.
+    #[test]
+    fn with_tls_on_a_udp_listener_is_a_clear_error() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        // `SyslogInput` isn't `Debug`, so `expect_err` is out -- match the `Result` by hand.
+        let err = match SyslogInput::new("127.0.0.1:0").with_tls(&settings, &testdata_tls_dir()) {
+            Ok(_) => panic!("tls on a UDP syslog listener must not be accepted"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:?}").contains("transport: tcp"), "got: {err:?}");
     }
 
     // ---- recorded interop fixtures (testdata/interop/syslog/) ---------------------------------
