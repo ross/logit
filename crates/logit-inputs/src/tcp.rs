@@ -60,9 +60,32 @@
 //! handshake and then send nothing would hold every permit forever, at a cost to the peer of 1024
 //! SYNs and no bytes. The bound is on the *first* byte specifically -- i.e. until
 //! [`Framer::first_byte_seen`] is true -- because that is the phase with no legitimate reason to
-//! be slow; after it there is deliberately *no* idle timeout, so a connection that sent one frame
-//! and then went quiet holds its permit indefinitely, the same known gap `otlp_in` has
-//! (`docs/known-gaps.md`).
+//! be slow. What bounds the gaps *after* it is the separate, opt-in idle timeout below.
+//!
+//! **Idle timeout.** [`TcpListener::with_idle_timeout`] -- `syslog_in`/`graphite_in`/`statsd_in`'s
+//! operator-facing `idle_timeout:` field -- is off unless set, and when set bounds how long a
+//! connection may stay quiet before this listener closes it and hands its permit back
+//! (`docs/adr/idle-connection-timeout.md`). It shares the one next-byte deadline with the
+//! first-byte bound: whichever phase the connection is in supplies that deadline, so there is only
+//! ever one clock on the read.
+//!
+//! *What resets it.* The deadline is `last_progress + idle_timeout`, and `last_progress` advances
+//! on exactly two things: bytes read from the peer (set after the inner frame loop drains, which
+//! also covers an [`absorb_frame`] emit returning), and this connection's own interval flush
+//! actually emitting a batch. A flush tick with nothing to emit reaches neither, so the clock is
+//! not quietly re-armed by this process's own timer.
+//!
+//! *Why time blocked downstream never counts.* [`emit`] awaits `Fanout::send`, which awaits a
+//! bounded channel's capacity; a connection parked there is not idle, it is waiting on *us*.
+//! Because `last_progress` is stamped when that await *returns* and the deadline is only ever
+//! consulted while this task is in the read, a full downstream can never make a busy connection
+//! look quiet -- the timer is not running while the send is blocked.
+//!
+//! *Why `Ok(())`.* An idle close is policy, not a fault: it returns `Ok(())` rather than an
+//! `Err`, so it never reaches the accept loop's `connection_error` diagnostic. It is counted
+//! `logit.input.connections.closed{reason="idle"}` instead -- counted, not diagnosed. On the way
+//! out, complete accumulated events are flushed [`FlushReason::Closed`] and a buffered *partial*
+//! frame is reported through [`report_buffered_tail`], exactly as the shutdown and RST paths do.
 //!
 //! `first_byte_seen`, and not "has the framer latched a [`Framing`] yet": only
 //! [`FramingMode::Rfc6587Auto`] has anything to latch, so under either explicit mode a
@@ -741,6 +764,10 @@ pub struct TcpListener<D: Decoder + Clone + Send + 'static> {
     listener: Option<TokioTcpListener>,
     max_connections: usize,
     handshake_timeout: Duration,
+    /// `None` -- the default -- means no idle timeout at all, the behaviour this driver had before
+    /// the field existed. See [`Self::with_idle_timeout`] and this module's "Idle timeout" doc
+    /// section.
+    idle_timeout: Option<Duration>,
 }
 
 impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
@@ -757,6 +784,7 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
             listener: None,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
         }
     }
 
@@ -872,6 +900,22 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
         self.handshake_timeout = handshake_timeout;
         self
     }
+
+    /// Bounds how long a connection may stay quiet once it is past the first-byte phase --
+    /// `syslog_in`/`graphite_in`/`statsd_in`'s `idle_timeout:` config field, and off (`None`)
+    /// when never called. See this module's "Idle timeout" doc section for what resets the clock,
+    /// why time blocked in `Fanout::send` never counts, and why an idle close is counted rather
+    /// than diagnosed. Graph rule 53 rejects `Some(0s)` (and any value on a UDP listener) before
+    /// it can reach here.
+    ///
+    /// Takes the `Option` rather than a bare `Duration`, so the "no idle timeout" case is one
+    /// call from a config that omitted the field rather than a caller-side `if let`: every
+    /// wrapper (`crate::syslog`, `crate::statsd`, `crate::graphite`) and
+    /// `logit-cli`'s `build_spec` can pass what it has straight through.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -906,6 +950,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         let tls_acceptor = self.tls.clone().map(TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
         let config = self.config;
         let framing = self.framing;
         let max_frame_bytes = self.max_frame_bytes;
@@ -967,6 +1012,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                                     framer,
                                     config,
                                     handshake_timeout,
+                                    idle_timeout,
                                     sink,
                                     telemetry.clone(),
                                     &mut diag,
@@ -990,6 +1036,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
                             framer,
                             config,
                             handshake_timeout,
+                            idle_timeout,
                             sink,
                             telemetry.clone(),
                             &mut diag,
@@ -1066,6 +1113,9 @@ async fn read_step<S: AsyncRead + Unpin + Send>(
 ///
 /// `handshake_timeout` bounds the wait for this connection's *first* byte -- see this module's
 /// "Pre-handshake timeout" doc section. Passed on both arms of the accept loop, TLS or not.
+/// `idle_timeout`, when `Some`, bounds every gap *after* that first byte -- this module's "Idle
+/// timeout" section. The two share one next-byte deadline, since a connection is in exactly one of
+/// the two phases at any moment.
 #[allow(clippy::too_many_arguments)] // one connection's whole context; a params struct would only move it
 async fn serve_connection<S, D>(
     mut stream: S,
@@ -1073,6 +1123,7 @@ async fn serve_connection<S, D>(
     mut framer: Framer,
     config: TcpListenerConfig,
     handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
     sink: Fanout,
     telemetry: Telemetry,
     diag: &mut Diagnostics,
@@ -1086,7 +1137,11 @@ where
     // on every `batch_flush_interval` tick (the `Err(_elapsed) => continue` arm), so a per-read
     // budget would be reset by each 100ms tick and never actually fire. Only ever consulted while
     // `framer` has not seen a byte, i.e. before this connection's first one.
-    let first_byte_deadline = tokio::time::Instant::now() + handshake_timeout;
+    // The idle clock's origin, and the only mutable half of the next-byte deadline: advanced when
+    // bytes are read from the peer and when this connection's own interval flush really emits --
+    // see this module's "Idle timeout" doc section for why those two and nothing else.
+    let mut last_progress = tokio::time::Instant::now();
+    let first_byte_deadline = last_progress + handshake_timeout;
     // Reused across every read, cleared (not replaced) between them, so its allocated capacity
     // survives from one read to the next.
     let mut read_buf = BytesMut::with_capacity(READ_BUFFER_BYTES);
@@ -1107,6 +1162,11 @@ where
             if deadline <= now_instant {
                 if let Some(batch) = accumulator.take() {
                     emit(&sink, &telemetry, batch, FlushReason::Interval).await;
+                    // Work this connection finished, so the idle clock restarts -- and stamped
+                    // *after* the send returns, so time blocked on a full downstream is not
+                    // counted against the peer. A tick with nothing to emit deliberately does not
+                    // reach this: this process's own timer must not keep a silent connection alive.
+                    last_progress = tokio::time::Instant::now();
                 }
                 next_flush = Some(BatchAccumulator::next_deadline(
                     deadline,
@@ -1130,45 +1190,62 @@ where
 
         read_buf.clear();
         // Two independent deadlines can bound this read: the flush tick (recurring, benign) and
-        // the first-byte deadline (once, fatal). Race whichever comes first, then decide which it
-        // was -- `timeout_at`, not `timeout`, so the first-byte deadline stays absolute across
-        // however many flush ticks elapse before it.
+        // the *next-byte* deadline (fatal to the connection). Race whichever comes first, then
+        // decide which it was -- `timeout_at`, not `timeout`, so the next-byte deadline stays
+        // absolute across however many flush ticks elapse before it.
+        //
+        // One next-byte deadline covers both phases, because a connection is in exactly one of
+        // them: before its first byte it is the (absolute) first-byte deadline, after it the idle
+        // deadline, `last_progress + idle_timeout`. With no `idle_timeout` configured the second
+        // phase's deadline is [`far_future`], which never arrives -- so the code below has no "is
+        // there an idle timeout" branch at all, only a deadline that may be unreachable.
+        // `checked_add` because `last_progress + idle` can overflow for an absurd (but legal)
+        // `idle_timeout`, and rule 53 caps nothing above `0s`.
+        //
         // `first_byte_seen`, never `framing().is_none()`: under an explicit `FramingMode` the
         // framing is known from construction, so the latch-shaped predicate would read "already
-        // framed" here and this deadline would never fire at all (this module's "Pre-handshake
-        // timeout" doc section; `the_first_byte_deadline_applies_under_every_framing_mode`).
+        // framed" here and the first-byte deadline would never fire at all -- this module's
+        // "Pre-handshake timeout" doc section, pinned by the driver test named for it.
         let awaiting_first_byte = !framer.first_byte_seen();
-        let read_deadline = match (next_flush, awaiting_first_byte) {
-            (Some(flush), true) => Some(flush.min(first_byte_deadline)),
-            (Some(flush), false) => Some(flush),
-            (None, true) => Some(first_byte_deadline),
-            (None, false) => None,
+        let next_byte_deadline = if awaiting_first_byte {
+            first_byte_deadline
+        } else {
+            idle_timeout.and_then(|idle| last_progress.checked_add(idle)).unwrap_or_else(far_future)
         };
-        let step = match read_deadline {
-            None => read_step(&mut stream, &mut read_buf, &mut shutdown).await,
-            Some(deadline) => {
-                match tokio::time::timeout_at(
-                    deadline,
-                    read_step(&mut stream, &mut read_buf, &mut shutdown),
-                )
-                .await
-                {
-                    Ok(step) => step,
-                    Err(_elapsed) => {
-                        // Checked against the clock rather than inferred from which deadline was
-                        // smaller, so a flush tick landing on the same instant can't mask it.
-                        // Returning `Err` is what routes this through the accept loop's
-                        // `connection_error` diagnostic and drops the permit.
-                        if awaiting_first_byte && tokio::time::Instant::now() >= first_byte_deadline
-                        {
-                            return Err(anyhow::anyhow!(
-                                "the peer sent no bytes within {handshake_timeout:?}"
-                            ));
-                        }
-                        // The flush deadline won -- loop back round to the interval trigger above.
-                        continue;
+        let read_deadline =
+            next_flush.map_or(next_byte_deadline, |flush| flush.min(next_byte_deadline));
+        let step = match tokio::time::timeout_at(
+            read_deadline,
+            read_step(&mut stream, &mut read_buf, &mut shutdown),
+        )
+        .await
+        {
+            Ok(step) => step,
+            Err(_elapsed) => {
+                // Checked against the clock rather than inferred from which deadline was smaller,
+                // so a flush tick landing on the same instant can't mask it.
+                if tokio::time::Instant::now() >= next_byte_deadline {
+                    // No first byte: a fault, returned as `Err` so it routes through the accept
+                    // loop's `connection_error` diagnostic.
+                    if awaiting_first_byte {
+                        return Err(anyhow::anyhow!(
+                            "the peer sent no bytes within {handshake_timeout:?}"
+                        ));
                     }
+                    // Idle: policy, not a fault. Whatever is complete goes downstream, a buffered
+                    // partial frame is counted `truncated` the way the shutdown and RST paths
+                    // count it, the close is counted, and this returns `Ok(())` so the accept
+                    // loop never reports a `connection_error` for it (this module's "Idle
+                    // timeout" doc section).
+                    report_buffered_tail(&framer, &telemetry, diag);
+                    if let Some(batch) = accumulator.take() {
+                        emit(&sink, &telemetry, batch, FlushReason::Closed).await;
+                    }
+                    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
+                    return Ok(());
                 }
+                // The flush deadline won -- loop back round to the interval trigger above.
+                continue;
             }
         };
 
@@ -1259,6 +1336,13 @@ where
                 }
             }
         }
+
+        // Bytes came off the peer's socket and every frame they completed has been absorbed, so
+        // the idle clock restarts here -- one stamp covering both halves of "progress": the read
+        // itself, and `absorb_frame`'s own `emit` (a full batch) having returned. Stamped after
+        // the loop rather than before it so time spent blocked in that `emit` is not charged to
+        // the peer (this module's "Idle timeout" doc section).
+        last_progress = tokio::time::Instant::now();
     }
 }
 
@@ -1341,6 +1425,18 @@ async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: F
 /// listeners stamp `received_at` identically.
 fn now_nanos() -> i64 {
     crate::udp::now_nanos()
+}
+
+/// A deadline far enough out that it never arrives -- what the next-byte deadline becomes on a
+/// connection with no `idle_timeout` (and on the arithmetic overflow of an absurd one), so
+/// [`serve_connection`]'s read races *one* deadline rather than an `Option` of one.
+///
+/// Local rather than `tokio::time::Instant::far_future`, which is `pub(crate)` to tokio; the
+/// horizon is tokio's own (30 years, chosen there because 100 years overflows on some platforms).
+/// Only ever reached by a listener with no flush interval *and* no idle timeout, since otherwise
+/// the flush tick is the smaller deadline.
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
 
 #[cfg(test)]
@@ -2668,6 +2764,321 @@ mod tests {
         client.write_all(b"<13>permit came back\n").await.unwrap();
         client.flush().await.unwrap();
         assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>permit came back"]);
+
+        handle.abort();
+    }
+
+    // ---- driver: idle timeout -----------------------------------------------------------------
+    //
+    // Real durations (50-200ms), never `tokio::time::pause()`: these tests are about a timer
+    // racing a socket read, and paused time would advance past the read the driver is actually
+    // sitting in. The "closed within" assertions go through `expect_closed`'s 2s ceiling against
+    // deadlines of at most 200ms, and the "still open" ones assert
+    // `timeout(50ms, read) == Err(Elapsed)`, which scheduler lag can only make *more* true.
+
+    /// Asserts a client connection is still open, by reading from it and expecting nothing: this
+    /// driver never writes to a peer, so a blocked read means the connection is live, while a
+    /// closed one returns `Ok(0)` (or `ECONNRESET`) immediately. The inverse of
+    /// [`expect_closed`], and lag-proof in the direction that matters -- a slow scheduler makes
+    /// the read *more* likely to time out, never less.
+    async fn expect_still_open<S: AsyncRead + Unpin>(stream: &mut S, what: &str) {
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
+            Err(_elapsed) => {}
+            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
+            Ok(Ok(n)) => panic!("{what}: expected no bytes, got {n}"),
+            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
+        }
+    }
+
+    /// The whole point of `idle_timeout:`: a connection that sent one frame and then went quiet
+    /// gives up its connection-cap permit instead of holding it forever. Proven under
+    /// `with_max_connections(1)`, so the second connection can only be served if the first one's
+    /// permit genuinely came back.
+    ///
+    /// Also the pin for "policy, not a fault": the close is counted
+    /// `logit.input.connections.closed{reason="idle"}` and the listener's `connection_error`
+    /// diagnostic never fires, which is what `serve_connection` returning `Ok(())` rather than an
+    /// `Err` buys (this module's "Idle timeout" doc section).
+    #[tokio::test]
+    async fn an_idle_connection_is_closed_after_the_idle_timeout_and_releases_its_permit() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let diag = Diagnostics::new("syslog_in");
+        let listener_diag = diag.clone();
+        let mut listener = listener
+            .with_telemetry(telemetry)
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        // One frame, so the first-byte deadline is behind us and only the idle clock can close
+        // this -- then nothing at all, with the socket held open.
+        let mut quiet = connect(&addr).await;
+        quiet.write_all(b"<13>hello\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>hello"]);
+
+        expect_closed(&mut quiet, "a connection quiet past its idle_timeout").await;
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
+            Some(1.0),
+            "an idle close is counted"
+        );
+        assert_eq!(
+            listener_diag.occurrences("connection_error"),
+            0,
+            "and never diagnosed -- an idle close returns Ok(()), so the accept loop's \
+             connection_error path must not see it"
+        );
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>permit came back\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>permit came back"]);
+
+        drop(quiet);
+        handle.abort();
+    }
+
+    /// **The test the whole design of the reset rule exists for.** A connection whose downstream
+    /// is full is not idle -- it is waiting on *us* -- so the idle clock must not be running while
+    /// this task is parked in `Fanout::send`. A capacity-1 channel with nothing draining it puts
+    /// the connection task exactly there, and three idle timeouts' worth of sleep must not close
+    /// it. Then the drain happens and every frame, including one written while the task was
+    /// blocked, is delivered in order.
+    ///
+    /// A timer armed *before* the send (or one re-armed by the flush tick) would fire here and
+    /// lose real data that was already on the socket.
+    #[tokio::test]
+    async fn a_connection_blocked_on_a_full_downstream_is_not_closed_as_idle() {
+        let idle = Duration::from_millis(100);
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_idle_timeout(Some(idle));
+        // Capacity 1: the first send is buffered, the second blocks until something receives.
+        let (sink, mut rx) = fanout_into_channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>one\n").await.unwrap();
+        client.write_all(b"<13>two\n").await.unwrap();
+
+        // Long enough that a clock running across the blocked send would have fired three times.
+        tokio::time::sleep(idle * 3).await;
+        expect_still_open(&mut client, "a connection blocked on a full downstream").await;
+
+        // Written while the task is still parked in `Fanout::send`, so these bytes sit in the
+        // socket buffer -- proving the connection was never closed underneath them.
+        client.write_all(b"<13>three\n").await.unwrap();
+
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>one"]);
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>two"]);
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>three"]);
+
+        handle.abort();
+    }
+
+    /// An idle close is a close like any other on the way out: whatever is accumulated goes
+    /// downstream (`FlushReason::Closed`), and a buffered *partial* frame is counted
+    /// `truncated` -- the same accounting `Framer::finish` gives a FIN and
+    /// `report_buffered_tail` gives an RST or a shutdown. Without both, an idle timeout would
+    /// silently lose a complete frame *and* a partial one.
+    #[tokio::test]
+    async fn an_idle_close_flushes_the_accumulated_batch_and_counts_a_buffered_partial_frame_truncated(
+    ) {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        // No interval timer and a bound far above one event, so the complete frame can only reach
+        // the sink through the idle close's own flush.
+        let config = TcpListenerConfig {
+            batch_flush_interval: Duration::ZERO,
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener =
+            listener.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>complete\n<13>half a mes").await.unwrap();
+
+        assert_eq!(
+            payloads(&recv_batch(&mut rx).await),
+            vec!["<13>complete"],
+            "the accumulated batch is flushed on the way out, not dropped"
+        );
+        expect_closed(&mut client, "a connection quiet past its idle_timeout").await;
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            sum_of(&drained, "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            Some(1.0),
+            "the partial frame the idle close discarded must still be counted"
+        );
+        assert_eq!(
+            sum_of(&drained, "logit.component.receive.flushed", Some(("reason", "closed"))),
+            Some(1.0)
+        );
+        assert_eq!(
+            sum_of(&drained, "logit.input.connections.closed", Some(("reason", "idle"))),
+            Some(1.0)
+        );
+
+        handle.abort();
+    }
+
+    /// The idle clock is reset by *progress*, not by this process's own timer: a
+    /// `batch_flush_interval` tick that finds nothing to emit must not re-arm it. With a 20ms
+    /// interval against a 100ms idle timeout, several ticks land inside every idle window, so a
+    /// tick-shaped reset would keep this connection alive forever and `expect_closed` would time
+    /// out at its 2s ceiling.
+    #[tokio::test]
+    async fn a_flush_tick_does_not_reset_the_idle_clock() {
+        let config = TcpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::from_millis(20),
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        let mut listener = listener.with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>hello\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>hello"]);
+
+        expect_closed(&mut client, "a quiet connection under a fast flush interval").await;
+
+        handle.abort();
+    }
+
+    /// The other half of the reset rule: progress is *bytes*, not frames. A sender dribbling one
+    /// byte at a time has not completed a frame and so has emitted nothing, but it is plainly not
+    /// idle -- the clock has to restart on the read itself. Five 100ms gaps against a 200ms idle
+    /// timeout, then the terminator, and the whole line must arrive intact.
+    #[tokio::test]
+    async fn bytes_that_complete_no_frame_still_reset_the_idle_clock() {
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_idle_timeout(Some(Duration::from_millis(200)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>").await.unwrap();
+        for byte in b"drib" {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            client.write_all(&[*byte]).await.unwrap();
+        }
+        // 500ms of wall clock has passed on a 200ms idle timeout, with no frame ever completed.
+        client.write_all(b"ble\n").await.unwrap();
+
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>dribble"]);
+
+        handle.abort();
+    }
+
+    /// The idle deadline shares one code path with the first-byte deadline, so it inherits that
+    /// one's framing-mode hazard: every mode has to be checked, not just `syslog_in`'s. The twin
+    /// of `the_first_byte_deadline_applies_under_every_framing_mode`, one phase later --
+    /// `with_max_connections(1)` and a second client that can only be served if the quiet one's
+    /// permit really came back.
+    #[tokio::test]
+    async fn the_idle_timeout_applies_under_every_framing_mode() {
+        let length_prefixed = {
+            let mut wire = 9u32.to_be_bytes().to_vec();
+            wire.extend_from_slice(b"<13>hello");
+            wire
+        };
+        let cases: Vec<(FramingMode, Vec<u8>)> = vec![
+            (FramingMode::Rfc6587Auto, b"<13>hello\n".to_vec()),
+            (FramingMode::Lines { oversize: Oversize::Fatal }, b"<13>hello\n".to_vec()),
+            (FramingMode::Lines { oversize: Oversize::DrainToNextLine }, b"<13>hello\n".to_vec()),
+            (FramingMode::LengthPrefixed, length_prefixed),
+        ];
+
+        for (mode, wire) in cases {
+            let (addr, listener) = bound_listener(one_per_frame()).await;
+            let mut listener = listener
+                .with_framing(mode, MAX_FRAME_BYTES)
+                .with_max_connections(1)
+                .with_idle_timeout(Some(Duration::from_millis(50)));
+            let (sink, mut rx) = fanout_into_channel(16);
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let handle =
+                tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+            let mut quiet = connect(&addr).await;
+            quiet.write_all(&wire).await.unwrap();
+            assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>hello"]);
+            expect_closed(&mut quiet, &format!("a quiet connection under {mode:?}")).await;
+
+            let mut client = connect(&addr).await;
+            client.write_all(&wire).await.unwrap();
+            assert_eq!(
+                payloads(&recv_batch(&mut rx).await),
+                vec!["<13>hello"],
+                "the permit must have come back under {mode:?}"
+            );
+
+            drop(quiet);
+            handle.abort();
+        }
+    }
+
+    /// The default, and what every config without an `idle_timeout:` keeps getting: no bound at
+    /// all on the gap between frames. The `Option`'s `None` arm has to produce a deadline that
+    /// never fires, and the discriminating case is the one
+    /// `the_first_byte_deadline_does_not_apply_once_the_framing_has_latched` also runs -- several
+    /// flush ticks between two frames -- with the additional assertion that no idle close was
+    /// counted.
+    #[tokio::test]
+    async fn no_idle_timeout_means_a_quiet_connection_is_never_closed() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let config = TcpListenerConfig {
+            batch_max_events: 1,
+            batch_flush_interval: Duration::from_millis(20),
+            ..TcpListenerConfig::default()
+        };
+        let (addr, listener) = bound_listener(config).await;
+        // No `with_idle_timeout` call at all -- the shape every caller that never sets the field
+        // produces.
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>first\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>first"]);
+
+        // Fifteen flush ticks of silence -- longer than any of this section's idle timeouts.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        expect_still_open(&mut client, "a quiet connection with no idle_timeout").await;
+        client.write_all(b"<13>much later\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>much later"]);
+
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
+            None,
+            "nothing was closed as idle, so the counter was never touched"
+        );
 
         handle.abort();
     }

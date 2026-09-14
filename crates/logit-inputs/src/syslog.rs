@@ -267,6 +267,36 @@ impl SyslogInput {
         self
     }
 
+    /// Bounds how long a **TCP** connection may stay quiet once it is past its first byte
+    /// (`idle_timeout:` in config) before this listener closes it and hands its permit back --
+    /// delegates straight to [`TcpListener::with_idle_timeout`], whose doc comment and the
+    /// driver module's "Idle timeout" section describe what resets the clock. `None` (the
+    /// default) is no idle timeout at all.
+    ///
+    /// A UDP listener is left untouched for exactly the reason
+    /// [`Self::with_handshake_timeout`] leaves it untouched: there is no connection on that
+    /// transport to time out. Graph rule 53 is what tells an operator who set the field under
+    /// `transport: udp` that it could never take effect.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
+        }
+        self
+    }
+
+    /// Test-only override of the driver's connection cap -- opening 1025 real TCP connections in
+    /// a test to exercise it would be slow and flaky; this makes the cap reachable with two. The
+    /// same helper [`crate::statsd::StatsdInput`] and [`crate::graphite::GraphiteInput`] carry,
+    /// for the same reason: proving a permit really came back needs a cap a test can fill. A UDP
+    /// listener has no connections and is left untouched.
+    #[cfg(test)]
+    fn with_max_connections(mut self, max_connections: usize) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_max_connections(max_connections));
+        }
+        self
+    }
+
     /// Terminates TLS on a TCP listener (`tls:` in config, RFC 5425) -- delegates straight to
     /// [`TcpListener::with_tls`], which resolves every path in `settings` against `base_dir`.
     ///
@@ -2064,6 +2094,58 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
             "the multiline message must produce exactly one event"
         );
+        handle.abort();
+    }
+
+    /// `idle_timeout:` reaching the shared driver through this wrapper. When the clock fires,
+    /// what resets it and why a blocked downstream never counts are all the driver's own tests'
+    /// business (`crates/logit-inputs/src/tcp.rs`, `docs/adr/idle-connection-timeout.md`); what
+    /// is under test here is `SyslogInput::with_idle_timeout` reaching it at all -- a wrapper
+    /// whose method did nothing would leave the second client waiting on a permit forever, since
+    /// `with_max_connections(1)` means the quiet connection's permit is the only one there is.
+    #[tokio::test]
+    async fn an_idle_tcp_connection_releases_its_permit_after_the_idle_timeout() {
+        const LINE: &[u8] = b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\n";
+
+        let mut input = SyslogInput::tcp("127.0.0.1:0")
+            .with_tcp_receive(TcpListenerConfig {
+                batch_max_events: 1,
+                batch_flush_interval: Duration::ZERO,
+                ..TcpListenerConfig::default()
+            })
+            .with_max_connections(1)
+            .with_idle_timeout(Some(Duration::from_millis(50)));
+        input.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _shutdown_tx = shutdown_tx;
+            let _ = input.run_until_shutdown(sink, shutdown_rx).await;
+        });
+
+        // One frame, so the first-byte deadline is behind us and only the idle clock can close
+        // this -- then nothing, with the socket held open.
+        let mut quiet = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut quiet, LINE).await.unwrap();
+        assert_nginx_line(&recv_events(&mut rx).await[0]);
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut quiet, &mut byte),
+        )
+        .await
+        .expect("a connection quiet past its idle_timeout is closed, not left hanging")
+        .expect("reading a closed socket is Ok(0), not an error");
+        assert_eq!(read, 0, "the listener hung up on a connection that went quiet");
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, LINE).await.unwrap();
+        assert_nginx_line(&recv_events(&mut rx).await[0]);
+
+        drop(quiet);
         handle.abort();
     }
 
