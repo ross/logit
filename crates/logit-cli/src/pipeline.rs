@@ -324,15 +324,29 @@ fn build_spec(
         .map(|r| r.telemetry_for(id, component.kind_name(), component.role().as_str()))
         .unwrap_or_default();
     let spec = match &component.kind {
-        StatsdIn { bind } => NodeSpec::Input(
-            Box::new(
-                StatsdInput::new(bind.clone())
-                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                    .with_telemetry(telemetry.clone())
-                    .with_receive(receive_config(&component.receive)),
-            ),
-            input_runtime_config(&component.receive),
-        ),
+        // The transport picks both the constructor and the matching `receive:` translation, the
+        // same shape the `SyslogIn` arm below uses: a TCP listener has no receive queue, so it
+        // takes `tcp_receive_config`'s four batching/shutdown fields, not `receive_config`'s eight
+        // (graph rule 17). `tls:` is TCP-only -- rule 43 has already rejected it under UDP, and
+        // `StatsdInput::with_tls` refuses it again on that arm.
+        StatsdIn { bind, transport, tls, handshake_timeout } => {
+            let mut input = match transport {
+                logit_config::StatsdTransport::Udp => {
+                    StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
+                }
+                logit_config::StatsdTransport::Tcp => StatsdInput::tcp(bind.clone())
+                    .with_tcp_receive(tcp_receive_config(&component.receive)),
+            }
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry.clone())
+            // A no-op on the UDP arm, which has no connection to bound -- rule 45 has already
+            // rejected a non-default value there, so nothing is silently discarded here.
+            .with_handshake_timeout(*handshake_timeout);
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
         // `types_db` paths resolve against the config file's directory, exactly as `tail_in`'s
         // `paths` and `lua_file`'s script do, and are read **here**, at startup: an unreadable or
         // unparseable file is a config error that stops the process before it reports ready, not a
@@ -1398,7 +1412,12 @@ mod tests {
             receive: logit_config::ReceiveConfig::default(),
             sources: vec![],
             targets: Vec::new(),
-            kind: ComponentKind::StatsdIn { bind: "127.0.0.1:0".to_string() },
+            kind: ComponentKind::StatsdIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport: logit_config::StatsdTransport::default(),
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+            },
         }
     }
 
@@ -3360,5 +3379,72 @@ mod tests {
             build_spec("drop_provenance", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// A `statsd_in` component at whichever transport, with or without TLS -- the shapes the
+    /// `StatsdIn` arm branches on, the twin of [`syslog_in_component`] above.
+    fn statsd_in_component(
+        transport: logit_config::StatsdTransport,
+        tls: Option<logit_config::TlsServerConfig>,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::StatsdIn {
+                bind: "127.0.0.1:0".to_string(),
+                transport,
+                tls,
+                handshake_timeout: Duration::from_secs(5),
+            },
+        }
+    }
+
+    #[test]
+    fn build_spec_builds_a_tcp_statsd_input() {
+        let component = statsd_in_component(logit_config::StatsdTransport::Tcp, None);
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The TLS arm actually loads `testdata/tls/server.{pem,key}` -- `graph::resolve`'s rule 43
+    /// never touches the filesystem, so `build_spec` is where a bad path would first fail. The
+    /// missing-file half is what really pins the `with_tls` call (the positive assertion above
+    /// would still pass with it deleted), exactly as
+    /// `build_spec_reports_a_missing_syslog_tls_cert_file_clearly` argues.
+    #[test]
+    fn build_spec_builds_a_tls_statsd_input() {
+        let component = statsd_in_component(
+            logit_config::StatsdTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "server.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        assert!(matches!(
+            build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+
+        let missing = statsd_in_component(
+            logit_config::StatsdTransport::Tcp,
+            Some(logit_config::TlsServerConfig {
+                cert_file: "does-not-exist.pem".to_string(),
+                key_file: "server.key".to_string(),
+                client_ca_file: None,
+            }),
+        );
+        let err = match build_spec("in", &missing, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.cert_file to fail build_spec"),
+            Err(err) => err,
+        };
+        let err = format!("{err:?}");
+        assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
     }
 }
