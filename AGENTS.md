@@ -270,6 +270,44 @@ rebase.** A rebase rewrites the branch's commits, which means a force-push to up
 disruptive for an open PR (review-comment associations, anyone else with the branch checked out)
 for no real benefit here. A merge commit costs nothing extra and pushes normally.
 
+### Branches and PR titles
+
+Work that belongs to a plan in `docs/plans/` is grouped by a **stream key**: one short lowercase
+token (`[a-z0-9-]`, abbreviations welcome, need not match the plan slug) the plan states in its
+`## Workstreams` section as `Key: <key>`, chosen at W0 and unique across `docs/plans/`. The key
+and the workstream number then appear identically in the branch and the PR title:
+
+| Kind | Branch | PR title |
+|---|---|---|
+| Workstream PR | `<key>/w<N>[<letter>]` | `<branch>: <summary>` |
+| Follow-up to a closed plan | `<key>/<slug>` | `<branch>: <summary>` |
+| One-off outside any plan | `<type>/<slug>` | `<type>(<scope>): <summary>` |
+
+```
+graphite/w0                graphite/w0: ADR and plan for a lossless Graphite/Carbon relay
+graphite/w2                graphite/w2: graphite_in — carbon plaintext/pickle over UDP and TCP
+graphite/w4a               graphite/w4a: recorded Graphite interop fixtures
+targets/review-followups   targets/review-followups: route/target review follow-ups
+fix/ci-test-flakes         fix(cli): remove two CI-only test races
+```
+
+- **Workstream branches carry no `feat/` prefix and no trailing slug** — the plan table already
+  says what W2 is, and `<key>/` is the namespace: `git branch --list 'graphite/*'` lists the
+  stack, and a PR list sorted by title reads as one. Letters (`w4a`, `w4b`) are sibling PRs the
+  plan defines to land in parallel off the same parent. Don't repeat the number at the end of the
+  title (`… (W2)`) — it's already the prefix.
+- **The PR title is the branch name, a colon, and the summary** — no conventional-commit type.
+  The type still goes on every commit message (`feat(inputs): …`); merges to `main` are real merge
+  commits, so the PR title never becomes a commit subject.
+- **One-off work keeps conventional-commit style throughout.** `type` is one of
+  `feat|fix|docs|test|chore|perf`; untyped branches (`dev-loop-speed`, `worktree-…`) are out.
+- **Stacked PRs:** `<key>/w<N>` branches from its parent workstream's branch and its PR targets
+  that branch; retarget to `main` once the parent merges. Stack-internal merge commits are
+  `merge <key>/w<N> into <key>/w<M>`.
+
+Existing plans get a `Key:` line the next time they're touched, not retroactively; merged
+branches and PRs are never renamed to fit.
+
 ## Conventions to hold to
 
 - **A new design decision worth remembering gets an ADR** (`docs/adr/<slug>.md`, copied from
@@ -277,7 +315,9 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
   the file after the decision, not a number: parallel branches racing for "the next number" was a
   recurring source of merge churn (see [`docs/adr/README.md`](docs/adr/README.md) for the full
   index and the `created`/`updated` frontmatter that orders it). Check the existing ADRs before
-  re-deciding something they already settled. `docs/plans/` follows the same convention.
+  re-deciding something they already settled. `docs/plans/` follows the same convention. A plan's
+  `## Workstreams` section states its `Key:` — the branch/PR-title prefix under
+  [Branches and PR titles](#branches-and-pr-titles).
 - **`rustfmt.toml`/`clippy.toml` are enforced**, not advisory — `script/cibuild` fails the build on
   either. Run `script/format` before committing rather than hand-formatting.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together**
