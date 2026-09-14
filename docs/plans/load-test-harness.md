@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-13
+updated: 2026-09-14
 ---
 
 # Enabling plan: a load-test harness for the real `logit` binary
@@ -160,11 +160,17 @@ runnable by hand, and now carries one real recorded run
   the scenario's own updated comment, and `docs/known-gaps.md`'s new entry. That's exactly the
   kind of thing this plan's "build the harness only, how it runs in the process is TBD" scoping
   was for: a real finding from real use, not a decision to reverse-engineer from a design doc.
+- **The quiet-machine follow-up this section used to defer has landed:** `buffered`'s harness-side
+  spool-clearing fix (W8, #165) is now confirmed idle and on battery, not only on a busy box —
+  `performance.md`'s quiet-machine run closes out the spool-accumulation variance, leaving only a
+  narrower, product-side question (`DiskQueue::open`'s double-read startup scan) open in
+  `docs/known-gaps.md`.
 - **What's left is exactly what the ADR left open, plus the one bug first use surfaced** — all
   tracked in `docs/known-gaps.md` rather than newly discovered here: `generate_in`'s `rate:`
   millisecond pacing granularity above ~1k batches/s (a known limitation nothing shipped
-  currently exercises), `compare`'s lack of a cross-run noise model, `buffered`'s variance and the
-  harness-side spool-clearing fix it needs (a follow-up, not done in this plan), and — the ADR's
-  own explicitly-deferred decision — when and how this harness runs in the ongoing development
+  currently exercises), `compare`'s lack of a cross-run noise model (`aggregate`'s own ordinary
+  variance trips it, not just `buffered`'s old one), `DiskQueue::open`'s double-read startup scan
+  (the narrowed, product-side remainder of `buffered`'s investigation), and — the ADR's own
+  explicitly-deferred decision — when and how this harness runs in the ongoing development
   process. None of these block using the harness by hand today, which is all this plan ever
   promised.

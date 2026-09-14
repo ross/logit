@@ -28,13 +28,15 @@
 # left exactly that behind, and throughput degraded monotonically within a single `--repeat N`
 # invocation as a measured result.
 #
-# W8 fixed this on the harness side: `script/perf run`/`attribute`/`flamegraph` now clear this
-# scenario's spool (`../results/spool`, gitignored) before every spawn, every repeat -- manually
-# deleting it first is no longer necessary. A post-fix `--repeat 5` no longer degrades
-# monotonically and peak RSS no longer climbs across the run (docs/design/performance.md §3 has the
-# numbers), though that run was itself taken on a busy machine and a quiet-machine confirmation is
-# still open (docs/known-gaps.md's `buffered` entry). `DiskQueue::open`'s own double-read startup
-# scan is unchanged by this fix and remains a product-side item, not a harness one.
+# W8 (#165) fixed this on the harness side: `script/perf run`/`attribute`/`flamegraph` now clear
+# this scenario's spool (`../results/spool`, gitignored) before every spawn, every repeat --
+# manually deleting it first is no longer necessary. A post-fix `--repeat 5` no longer degrades
+# monotonically and peak RSS no longer climbs across the run, confirmed both on a busy machine and,
+# since, on a quiet/idle one (docs/design/performance.md §3 has both runs' numbers) -- this
+# variance is resolved. What remains, narrower than before: a roughly 1.4x spread within five
+# repeats even solo and idle, and whether `DiskQueue::open`'s own double-read startup scan explains
+# any of it -- a product-side item (crates/logit-pipeline/src/disk_queue.rs), no longer suspected
+# as the main cause (docs/known-gaps.md's `buffered` entry).
 components:
   gen:
     type: generate_in
