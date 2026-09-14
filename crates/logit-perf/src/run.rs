@@ -5,6 +5,7 @@
 use crate::result::{GitInfo, RunReport, Sample, ScenarioReport};
 use crate::rusage;
 use crate::scenario::{self, Scenario};
+use crate::spool;
 use anyhow::{bail, Context};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead};
@@ -64,14 +65,24 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         let mut samples = Vec::with_capacity(args.repeat as usize);
         let mut scenario_failed = false;
         for repeat in 1..=args.repeat {
+            // Fresh spool every repeat, not just every invocation -- `crate::spool`'s own doc
+            // comment has the mechanism (`DiskQueue::open`'s O(segment size) startup scan,
+            // `docs/known-gaps.md`'s `buffered` entry): left alone, the second repeat already
+            // re-validates the first repeat's spool, and it only grows from there.
+            if let Err(err) = spool::clear(root, scenario) {
+                eprintln!("   repeat {repeat}/{}: FAILED: {err:#}", args.repeat);
+                scenario_failed = true;
+                break;
+            }
             match run_one(&logit_bin, scenario, args.settle, args.timeout, args.shutdown_timeout) {
                 Ok(sample) => {
                     println!(
-                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS",
+                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS, {} startup",
                         args.repeat,
                         sample.events_per_s,
                         sample.cpu_us_per_event,
                         sample.max_rss_bytes as f64 / (1024.0 * 1024.0),
+                        format_startup(sample.startup_s),
                     );
                     samples.push(sample);
                 }
@@ -140,11 +151,20 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
 }
 
 /// One spawned scenario's completion signal: the instant its `generation complete` line arrived,
-/// and the `events` field that line carried (`None` if the line parsed as JSON but that field was
-/// missing or not an unsigned integer -- a format this harness can't trust).
+/// the `events` field that line carried (`None` if the line parsed as JSON but that field was
+/// missing or not an unsigned integer -- a format this harness can't trust), and the instant its
+/// own `ready` line arrived, if the reader thread ever saw one.
+///
+/// `ready_at` rides along on this same message rather than a channel of its own: the reader thread
+/// processes stderr strictly in line order, so by the time it matches the completion line and
+/// sends this struct, it has already updated its local `ready_at` if the `ready` line appeared
+/// earlier in the stream -- which, for any healthy `logit` process, it always does (`ready` is
+/// logged once the bind pass and every node spawn have succeeded,
+/// `crates/logit-pipeline/src/runtime.rs`, long before `generate_in` could possibly finish).
 struct Completion {
     at: Instant,
     events: Option<u64>,
+    ready_at: Option<Instant>,
 }
 
 /// `None` if `line` isn't the completion line at all; `Some(events)` if it is -- `generate_in`'s
@@ -159,6 +179,18 @@ fn parse_completion_line(line: &str) -> Option<Option<u64>> {
         return None;
     }
     Some(json.get("events").and_then(serde_json::Value::as_u64))
+}
+
+/// Whether `line` is the process's own readiness line: `tracing::info!(target: "logit", "ready")`,
+/// logged once the bind pass has opened every listener's socket and every node has been spawned
+/// (`crates/logit-pipeline/src/runtime.rs`) -- the point past which the process is doing real work
+/// rather than starting up. Under `--log-format json` that renders as `{"message":"ready", ...}`
+/// alongside the usual level/target/timestamp fields, so, matching [`parse_completion_line`]'s own
+/// reasoning, this parses the whole line as JSON and requires an *exact* `message` match rather
+/// than a substring one.
+fn is_ready_line(line: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+    json.get("message").and_then(serde_json::Value::as_str) == Some("ready")
 }
 
 /// Accumulates a child's stderr, capped to the last 64 KiB -- a hung or unexpectedly chatty
@@ -313,12 +345,16 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
     let stderr_reader = std::thread::spawn(move || -> String {
         let mut capture = StderrCapture::new();
         let mut sent = false;
+        let mut ready_at: Option<Instant> = None;
         for line in io::BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
+            if ready_at.is_none() && is_ready_line(&line) {
+                ready_at = Some(Instant::now());
+            }
             if !sent {
                 if let Some(events) = parse_completion_line(&line) {
                     sent = true;
-                    let _ = completion_tx.send(Completion { at: Instant::now(), events });
+                    let _ = completion_tx.send(Completion { at: Instant::now(), events, ready_at });
                 }
             }
             capture.push(line);
@@ -336,7 +372,23 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
             );
         }
     };
-    let wall = completion.at - spawned_at;
+    // Wall is measured from `ready`, not from spawn: spawn -> ready is process startup (loading
+    // the binary, opening every listener's socket in the bind pass, spawning every node), which
+    // `generate_in` doesn't even begin sending into until it's done -- folding it into `wall`
+    // would count it as part of the graph's own per-event cost. `ready` missing at all (a binary
+    // built without the log line, or a race this harness doesn't expect) falls back to the old
+    // spawn -> completion measurement, loudly, rather than silently reporting a startup-inflated
+    // number.
+    let (startup, wall) = match completion.ready_at {
+        Some(ready_at) => (Some(ready_at.duration_since(spawned_at)), completion.at - ready_at),
+        None => {
+            eprintln!(
+                "warning: no `ready` line observed before the completion line -- wall_s falls \
+                 back to spawn -> completion, and startup_s is not recorded for this repeat"
+            );
+            (None, completion.at - spawned_at)
+        }
+    };
 
     let events = match completion.events {
         Some(events) => events,
@@ -410,7 +462,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
         None => bail!("terminated by signal (raw status {}); stderr:\n{stderr_text}", usage.status),
     }
 
-    Ok(Sample::from_usage(count, usage.wall, usage.user, usage.sys, usage.max_rss_bytes))
+    Ok(Sample::from_usage(count, startup, usage.wall, usage.user, usage.sys, usage.max_rss_bytes))
 }
 
 /// Builds `logit` under `profile` (unless `no_build`) and returns the path to the binary,
@@ -614,16 +666,26 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn print_table(report: &RunReport) {
-    println!("\n{:<22} {:>12} {:>14} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
+    println!(
+        "\n{:<22} {:>12} {:>14} {:>12} {:>10}",
+        "scenario", "events/s", "us/event", "peak RSS", "startup"
+    );
     for (name, scenario) in &report.scenarios {
         println!(
-            "{:<22} {:>12.0} {:>14.3} {:>9.1} MiB",
+            "{:<22} {:>12.0} {:>14.3} {:>9.1} MiB {:>10}",
             name,
             scenario.median.events_per_s,
             scenario.median.cpu_us_per_event,
             scenario.median.max_rss_bytes as f64 / (1024.0 * 1024.0),
+            format_startup(scenario.median.startup_s),
         );
     }
+}
+
+/// Renders an optional startup time the way every "unknown" numeric field in this crate's output
+/// reads -- never a bare Rust `None`. Shared by the per-repeat line and the summary table.
+fn format_startup(startup_s: Option<f64>) -> String {
+    startup_s.map(|s| format!("{s:.3}s")).unwrap_or_else(|| "n/a".to_string())
 }
 
 #[cfg(test)]
@@ -672,6 +734,17 @@ mod tests {
     #[test]
     fn parse_completion_line_reports_a_missing_events_field_as_some_none() {
         assert_eq!(parse_completion_line(r#"{"message":"generation complete"}"#), Some(None));
+    }
+
+    #[test]
+    fn is_ready_line_requires_an_exact_message_match() {
+        assert!(is_ready_line(r#"{"message":"ready"}"#));
+        assert!(is_ready_line(r#"{"level":"INFO","target":"logit","message":"ready"}"#));
+        assert!(!is_ready_line(r#"{"message":"generation complete","events":100}"#));
+        // A message that merely contains the word must not match -- exact equality only, same
+        // reasoning as `parse_completion_line`.
+        assert!(!is_ready_line(r#"{"message":"getting ready to bind"}"#));
+        assert!(!is_ready_line("not json at all"));
     }
 
     #[test]

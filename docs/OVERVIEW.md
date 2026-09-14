@@ -25,14 +25,15 @@ edges.
 
 A stated property of that internal event model: data of the same protocol should transit `logit`
 losslessly — `statsd_in` to `statsd_out`, `otlp_in` to `otlp_out`, `syslog_in` to `syslog_out`,
-`prometheus_in` to `prometheus_out`, `collectd_in` to `collectd_out` are each meant to be a
-transparent relay, with regrouping and summing allowed but no information dropped, per
-[ADR `lossless-transit`](adr/lossless-transit.md).
+`prometheus_in` to `prometheus_out`, `collectd_in` to `collectd_out`, `graphite_in` to
+`graphite_out` are each meant to be a transparent relay, with regrouping and summing allowed but no
+information dropped, per [ADR `lossless-transit`](adr/lossless-transit.md).
 
 ## Scope (v1 direction)
 
-- **Ingest:** UDP/TCP listeners for statsd and DogStatsD-style tagged metrics, collectd, syslog
-  (RFC 3164/5424), OTLP (logs/metrics/traces). File tailing for logs (rotation- and
+- **Ingest:** UDP/TCP listeners for statsd and DogStatsD-style tagged metrics, collectd,
+  Graphite/Carbon (plaintext and pickle), syslog (RFC 3164/5424), OTLP (logs/metrics/traces). File
+  tailing for logs (rotation- and
   checkpoint-aware, `tail_in`), including Docker's json-file container logs enriched with
   per-container identity (`docker_in`, no docker socket,
   [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). More

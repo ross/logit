@@ -54,7 +54,18 @@ pub struct ScenarioReport {
 /// The numbers derived from one repeat's wall time and `wait4` rusage.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
+    /// Wall time from the process's own `ready` line to the completion line --
+    /// `crate::run::spawn_and_measure`'s doc has the mechanism. Falls back to spawn -> completion
+    /// (with a printed warning) on the rare repeat where `ready` was never observed; `startup_s`
+    /// distinguishes that case from a real, fast startup.
     pub wall_s: f64,
+    /// Spawn -> the process's own `ready` line: `tracing::info!(target: "logit", "ready")`, logged
+    /// once the bind pass has opened every listener's socket and every node has been spawned
+    /// (`crates/logit-pipeline/src/runtime.rs`). `None` (rendered as JSON `null`, matching this
+    /// crate's other "the source couldn't answer" fields -- `GitInfo`'s doc has the same
+    /// reasoning) when that line never arrived before the completion line, rather than a
+    /// confident-looking `0.0`.
+    pub startup_s: Option<f64>,
     pub user_s: f64,
     pub sys_s: f64,
     pub max_rss_bytes: u64,
@@ -68,6 +79,7 @@ pub struct Sample {
 impl Sample {
     pub fn from_usage(
         count: u64,
+        startup: Option<Duration>,
         wall: Duration,
         user: Duration,
         sys: Duration,
@@ -78,6 +90,7 @@ impl Sample {
         let count_f = count as f64;
         Sample {
             wall_s,
+            startup_s: startup.map(|d| d.as_secs_f64()),
             user_s: user.as_secs_f64(),
             sys_s: sys.as_secs_f64(),
             max_rss_bytes,
@@ -127,12 +140,28 @@ fn min_u64(values: &[u64]) -> u64 {
     values.iter().copied().min().unwrap_or(0)
 }
 
+/// [`median_f64`] over just the repeats that actually observed a `ready` line -- `None` only when
+/// *none* of them did, matching [`Sample::startup_s`]'s own "the source couldn't answer" meaning
+/// rather than folding a missing repeat in as if it measured zero.
+fn median_f64_opt(values: &[Option<f64>]) -> Option<f64> {
+    let present: Vec<f64> = values.iter().filter_map(|v| *v).collect();
+    (!present.is_empty()).then(|| median_f64(&present))
+}
+
+/// [`min_f64`] over just the repeats that actually observed a `ready` line -- same reasoning as
+/// [`median_f64_opt`].
+fn min_f64_opt(values: &[Option<f64>]) -> Option<f64> {
+    let present: Vec<f64> = values.iter().filter_map(|v| *v).collect();
+    (!present.is_empty()).then(|| min_f64(&present))
+}
+
 /// Builds the per-field median [`Sample`] across `samples`. Each field's median is computed
 /// independently of the others -- the result is not, and isn't meant to be, any single repeat
 /// that actually ran; it's a per-metric summary, exactly what `compare.rs` diffs.
 pub fn median_sample(samples: &[Sample]) -> Sample {
     Sample {
         wall_s: median_f64(&samples.iter().map(|s| s.wall_s).collect::<Vec<_>>()),
+        startup_s: median_f64_opt(&samples.iter().map(|s| s.startup_s).collect::<Vec<_>>()),
         user_s: median_f64(&samples.iter().map(|s| s.user_s).collect::<Vec<_>>()),
         sys_s: median_f64(&samples.iter().map(|s| s.sys_s).collect::<Vec<_>>()),
         max_rss_bytes: median_u64(&samples.iter().map(|s| s.max_rss_bytes).collect::<Vec<_>>()),
@@ -148,6 +177,7 @@ pub fn median_sample(samples: &[Sample]) -> Sample {
 pub fn min_sample(samples: &[Sample]) -> Sample {
     Sample {
         wall_s: min_f64(&samples.iter().map(|s| s.wall_s).collect::<Vec<_>>()),
+        startup_s: min_f64_opt(&samples.iter().map(|s| s.startup_s).collect::<Vec<_>>()),
         user_s: min_f64(&samples.iter().map(|s| s.user_s).collect::<Vec<_>>()),
         sys_s: min_f64(&samples.iter().map(|s| s.sys_s).collect::<Vec<_>>()),
         max_rss_bytes: min_u64(&samples.iter().map(|s| s.max_rss_bytes).collect::<Vec<_>>()),
@@ -163,6 +193,7 @@ mod tests {
     fn sample(wall_s: f64, cpu_us_per_event: f64, max_rss_bytes: u64) -> Sample {
         Sample {
             wall_s,
+            startup_s: Some(wall_s / 10.0),
             user_s: wall_s / 2.0,
             sys_s: wall_s / 2.0,
             max_rss_bytes,
@@ -176,8 +207,36 @@ mod tests {
         let samples = vec![sample(3.0, 30.0, 300), sample(1.0, 10.0, 100), sample(2.0, 20.0, 200)];
         let median = median_sample(&samples);
         assert_eq!(median.wall_s, 2.0);
+        assert_eq!(median.startup_s, Some(0.2));
         assert_eq!(median.cpu_us_per_event, 20.0);
         assert_eq!(median.max_rss_bytes, 200);
+    }
+
+    #[test]
+    fn startup_s_median_ignores_repeats_that_never_saw_a_ready_line() {
+        let mut missing_ready = sample(2.0, 20.0, 200);
+        missing_ready.startup_s = None;
+        let samples = vec![sample(1.0, 10.0, 100), missing_ready, sample(3.0, 30.0, 300)];
+        // Only the two repeats with a real startup_s (0.1, 0.3) participate -- their median, not a
+        // three-way median that would treat the missing one as if it measured zero.
+        assert_eq!(median_sample(&samples).startup_s, Some(0.2));
+    }
+
+    #[test]
+    fn startup_s_median_is_none_when_no_repeat_observed_a_ready_line() {
+        let mut a = sample(1.0, 10.0, 100);
+        a.startup_s = None;
+        let mut b = sample(2.0, 20.0, 200);
+        b.startup_s = None;
+        assert_eq!(median_sample(&[a, b]).startup_s, None);
+    }
+
+    #[test]
+    fn startup_s_min_ignores_repeats_that_never_saw_a_ready_line() {
+        let mut missing_ready = sample(1.0, 10.0, 100); // startup_s would be 0.1, the smallest
+        missing_ready.startup_s = None;
+        let samples = vec![missing_ready, sample(2.0, 20.0, 200)];
+        assert_eq!(min_sample(&samples).startup_s, Some(0.2));
     }
 
     #[test]
@@ -216,16 +275,31 @@ mod tests {
     fn sample_from_usage_derives_events_per_s_and_cpu_us_per_event() {
         let sample = Sample::from_usage(
             1_000_000,
+            Some(Duration::from_millis(300)),
             Duration::from_secs(2),
             Duration::from_millis(1_500),
             Duration::from_millis(500),
             123 * 1024,
         );
         assert_eq!(sample.wall_s, 2.0);
+        assert_eq!(sample.startup_s, Some(0.3));
         assert_eq!(sample.events_per_s, 500_000.0);
         // (1.5s + 0.5s) * 1e6us / 1_000_000 events = 2.0 us/event.
         assert_eq!(sample.cpu_us_per_event, 2.0);
         assert_eq!(sample.max_rss_bytes, 123 * 1024);
+    }
+
+    #[test]
+    fn sample_from_usage_records_no_startup_when_ready_was_never_observed() {
+        let sample = Sample::from_usage(
+            1_000_000,
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(1_500),
+            Duration::from_millis(500),
+            123 * 1024,
+        );
+        assert_eq!(sample.startup_s, None);
     }
 
     #[test]

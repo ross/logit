@@ -56,7 +56,11 @@ for `aggregate`'s windowing semantics. Any field on any component can pull its v
 environment with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
 [ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md). For deploying `logit` outside this repo's dev stack —
 getting the image, running it, `logit validate` as a preflight, signal/restart behavior — see
-[docs/deploying.md](docs/deploying.md).
+[docs/deploying.md](docs/deploying.md). An out-of-CI load-test harness (`generate_in`/`null_out`,
+`crates/logit-perf`, `script/perf run|compare|attribute|flamegraph`) spawns the real release
+binary against `perf/scenarios/*.yaml` to measure throughput, CPU per event, and peak RSS, and to
+attribute time per pipeline node — see [ADR `load-test-harness`](docs/adr/load-test-harness.md) and
+[docs/design/performance.md](docs/design/performance.md) for the first recorded results.
 
 ## Development
 
@@ -124,9 +128,13 @@ crates/
   logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
+  logit-perf        dev-only: the out-of-CI load-test harness binary (script/perf)
 docs/
   OVERVIEW.md       project scope, ~1 page
   adr/              architecture decision records
   design/           the event model, Lua API, pipeline component graph, wire protocol, and memory design docs
   plans/            staged implementation plans for larger, multi-session pieces of work
+perf/
+  scenarios/        logit-perf's shipped YAML scenarios (generate_in -> ... -> null_out or a real sink)
+  results/          gitignored: script/perf run/attribute/flamegraph output
 ```
