@@ -241,9 +241,9 @@
 //!     at all on a UDP `syslog_in`, `graphite_in` or `statsd_in`, which have no connection to time
 //!     out (`docs/adr/idle-connection-timeout.md`). One rule over all five kinds that carry the
 //!     field -- `syslog_in`, `graphite_in`, `statsd_in`, `logit_in` and `otlp_in` -- rule 43's
-//!     one-rule-for-every-listener shape rather than one number per kind; the `logit_in` and
-//!     `otlp_in` arms follow with the PRs that make those two listeners honour the field, so no
-//!     landed state accepts a set-but-ignored `idle_timeout`. `0s` is rules 9/15/18/28/45's
+//!     one-rule-for-every-listener shape rather than one number per kind; every kind's arm landed
+//!     in the same PR that made that listener honour the field, so no landed state ever accepted a
+//!     set-but-ignored `idle_timeout`. `0s` is rules 9/15/18/28/45's
 //!     impossible bound again: it would close every connection the instant the listener stopped
 //!     reading from it. Unlike rule 45's field this one is an `Option` with no default to tell
 //!     apart from a set value, so there is nothing to compare against and the message says what to

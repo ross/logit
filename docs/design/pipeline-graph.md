@@ -613,9 +613,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
 
     **One rule, five kinds — and no default to exempt.** Like rule 43 (and unlike the per-sink
     rules 24/34/44/52) the check, the message and the reasoning are identical on every kind it
-    covers, so a listener joins by adding an arm to its match. Each kind's arm lands with the PR
-    that makes that listener *honour* the field, so no released state accepts a set-but-ignored
-    `idle_timeout`. Where rule 45 has to tell a defaulted `handshake_timeout` from a set one,
+    covers, so a listener joins by adding an arm to its match. Each kind's arm landed in the same
+    PR that made that listener *honour* the field, so no released state ever accepted a
+    set-but-ignored `idle_timeout`. Where rule 45 has to tell a defaulted `handshake_timeout` from a set one,
     this field is an `Option`: absent *is* "no idle timeout", so every `Some` is a set value and
     the UDP check rejects any of them rather than only a non-default one. That is also why the
     zero message names the fix — "omit the field to disable the idle timeout" — instead of a legal
