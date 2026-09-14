@@ -98,7 +98,9 @@ pub enum MetricKind {
     /// `docs/adr/relative-gauge-adjustments.md`.
     GaugeDelta(f64),
     /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- `statsd_in` decodes `ms`/`h`/`d`
-    /// to it since W3 (`docs/plans/lossless-transit.md`).
+    /// to it since W3 (`docs/plans/lossless-transit.md`), and `kv_metrics` derives its
+    /// `distributions:` entries to it, one value per event
+    /// (`docs/adr/kv-metrics-semantics.md`).
     Samples(Samples),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::Samples`].
     Distribution(DdSketch),
