@@ -206,9 +206,10 @@ crate dependency) -- with a `multi_value: skip | expand` switch for the metric k
 one-number-per-datapoint wire can't carry natively and `tags: carbon | drop` for whether attributes
 render as carbon's own `;k=v` segment; `graphite_in`'s TCP listener has no receive queue at all
 (TCP's own flow control is the backpressure, unlike the UDP-only decoupled-listener-io queue every
-other datagram listener shares) and runs its own accept loop rather than the shared stream driver
-`syslog_in` uses (`crates/logit-inputs/src/tcp.rs`) -- porting it onto that driver is follow-up
-work, not a decision. So `graphite_in -> graphite_out` is a fixed point modulo its own named
+other datagram listener shares) and runs on the shared stream driver `syslog_in` uses
+(`crates/logit-inputs/src/tcp.rs`), which is where its framing, connection cap, TLS termination and
+`handshake_timeout` all come from -- so a TCP `graphite_in` takes the same `tls:` block a TCP
+`syslog_in` does. So `graphite_in -> graphite_out` is a fixed point modulo its own named
 normalization list
 ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
 [examples/graphite-relay.yaml](examples/graphite-relay.yaml)). `generate_in`/`null_out`

@@ -377,10 +377,24 @@ impl Framer {
         }
     }
 
-    /// Whatever is left when the peer closes. Under LF-delimited framing a terminator-less
-    /// remainder is an ordinary final message and is returned; under octet counting or a length
-    /// prefix a partial payload is [`FrameError::Truncated`], since its declared length says bytes
-    /// are missing.
+    /// Whatever is left when the peer closes. What a terminator-less remainder means depends on
+    /// the framing, and the split is the point:
+    ///
+    /// - Octet counting or a length prefix: [`FrameError::Truncated`] -- the declared length says
+    ///   bytes are missing.
+    /// - [`FramingMode::Rfc6587Auto`] under LF framing: an ordinary final message, returned. RFC
+    ///   6587 §3.4.2 permits one, and `docs/design/internal-telemetry.md`'s `syslog_in` text pins
+    ///   it.
+    /// - [`FramingMode::Lines`]: [`FrameError::Truncated`] as well, for a non-whitespace
+    ///   remainder. A line protocol's `LF` is its only completeness signal, so half a carbon line
+    ///   is a truncation rather than a short datapoint. A whitespace-only remainder is dropped
+    ///   silently -- nothing was lost.
+    ///
+    /// Under every framing, then, a clean FIN and an abrupt RST agree about the same bytes: the
+    /// `ReadStep::Eof` arm routes this `Err` through `report_frame_error`, and
+    /// [`report_buffered_tail`] reports the RST case identically. The one case with no counter
+    /// either way is a drain in progress, whose bytes were already counted when the bound was
+    /// crossed.
     pub fn finish(&mut self) -> Result<Option<Bytes>, FrameError> {
         if self.buf.is_empty() {
             return Ok(None);
@@ -432,7 +446,38 @@ impl Framer {
                 let line = self.buf.split_to(self.buf.len()).freeze();
                 self.scanned = 0;
                 let line = strip_cr(line);
-                Ok(if line.is_empty() { None } else { Some(line) })
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                match self.mode {
+                    // RFC 6587 §3.4.2 has no way to distinguish "the sender finished and closed"
+                    // from "the sender died mid-message", and permits a final message with no
+                    // terminator -- so this stays an ordinary message. `internal-telemetry.md`'s
+                    // `syslog_in` text pins that reading.
+                    FramingMode::Rfc6587Auto | FramingMode::LengthPrefixed => Ok(Some(line)),
+                    // A line protocol's terminator *is* its completeness signal, so a remainder
+                    // without one is a truncated frame, not a short message. Carbon's own receiver
+                    // discards it, and so did the bespoke `graphite_in` loop this driver replaced
+                    // (it only ever decoded through the last `\n`). Emitting it here would turn a
+                    // sender dying mid-line into a datapoint with a truncated path or a truncated
+                    // timestamp -- silent corruption -- and would make a clean FIN and an RST
+                    // disagree about the same bytes, since `report_buffered_tail` already counts
+                    // the RST case `truncated`.
+                    FramingMode::Lines { .. } => {
+                        // Whitespace only -- trailing padding, a bare `CR`, a keepalive. Nothing
+                        // was lost, so nothing is counted; the same call `next_frame` makes for an
+                        // empty line mid-stream.
+                        if line.iter().all(|b| b.is_ascii_whitespace()) {
+                            return Ok(None);
+                        }
+                        Err(FrameError::Truncated(format!(
+                            "the peer closed with a {}-byte unterminated line buffered; a \
+                             line-framed stream's LF is its only completeness signal, so the \
+                             remainder is dropped",
+                            line.len()
+                        )))
+                    }
+                }
             }
         }
     }
@@ -1253,11 +1298,14 @@ fn report_frame_error(err: &FrameError, telemetry: &Telemetry, diag: &mut Diagno
 /// a peer RST mid-message, or this listener shutting down before the sender finished one.
 ///
 /// Dropping those bytes is correct (nobody ever sent a complete message, and on shutdown the
-/// sender has not finished), but dropping them *silently* is the gap: the identical bytes followed
-/// by a FIN would be emitted by [`Framer::finish`] under non-transparent framing or counted
-/// `truncated` under octet counting, and `logit.input.frames.dropped{reason="truncated"}` exists
-/// precisely to make this class visible. A no-op when nothing is buffered, which is the ordinary
-/// case on both paths.
+/// sender has not finished), but dropping them *silently* is the gap, and
+/// `logit.input.frames.dropped{reason="truncated"}` exists precisely to make this class visible.
+///
+/// This deliberately agrees with what the identical bytes followed by a FIN would do
+/// ([`Framer::finish`]): counted `truncated` under octet counting, a length prefix, and
+/// [`FramingMode::Lines`]; the one framing where a FIN instead *emits* the remainder as an
+/// ordinary final message is [`FramingMode::Rfc6587Auto`]'s LF arm, where RFC 6587 says it is one.
+/// A no-op when nothing is buffered, which is the ordinary case on both paths.
 fn report_buffered_tail(framer: &Framer, telemetry: &Telemetry, diag: &mut Diagnostics) {
     let held = framer.buffered();
     if held == 0 {
@@ -1604,6 +1652,49 @@ mod tests {
         assert_eq!(err.reason(), "oversize", "{err}");
         assert!(!err.is_fatal(), "{err}");
         assert_eq!(push_and_drain(&mut terminated, b""), vec!["survivor"]);
+    }
+
+    /// A line protocol's `LF` is its only completeness signal, so a terminator-less remainder at a
+    /// clean EOF is a truncation, not a final message -- carbon's own receiver drops it, and so
+    /// did the bespoke `graphite_in` loop this driver replaced (it decoded only through the last
+    /// `\n`). Emitting it would turn a sender dying mid-line into a datapoint with a truncated
+    /// path or timestamp, and would make a FIN and an RST disagree about identical bytes.
+    ///
+    /// `Rfc6587Auto` keeps the opposite behaviour, asserted alongside so the split is visible in
+    /// one place: RFC 6587 §3.4.2 permits a terminator-less final message, and
+    /// `a_trailing_partial_line_at_eof_is_emitted_as_a_final_message` is its own pin.
+    #[test]
+    fn a_line_only_framer_drops_an_unterminated_tail_at_eof_as_truncated() {
+        let mut framer = Framer::new(
+            FramingMode::Lines { oversize: Oversize::DrainToNextLine },
+            MAX_FRAME_BYTES,
+        );
+        assert_eq!(
+            push_and_drain(&mut framer, b"svc.web01.cpu 1 17000\nsvc.web01.cpu 42.5 17000"),
+            vec!["svc.web01.cpu 1 17000"],
+            "only the terminated line frames"
+        );
+        let err = framer.finish().expect_err("an unterminated tail is truncated, not a datapoint");
+        assert_eq!(err.reason(), "truncated", "{err}");
+        assert!(err.is_fatal(), "the connection is already over; nothing to resynchronize");
+        assert_eq!(framer.buffered(), 0, "and the remainder is consumed either way");
+
+        // Whitespace only: trailing padding, a stray space, a keepalive. Nothing was lost, so
+        // nothing is counted. (Mid-stream, a whitespace-only *line* is still framed and handed to
+        // the decoder, which skips it uncounted -- only a truly empty one is skipped here. This is
+        // about the remainder at EOF, where there is no decoder call to absorb it.)
+        let mut padded =
+            Framer::new(FramingMode::Lines { oversize: Oversize::Fatal }, MAX_FRAME_BYTES);
+        assert_eq!(push_and_drain(&mut padded, b"a.b 1 17000\n\n \t"), vec!["a.b 1 17000"]);
+        assert_eq!(padded.finish(), Ok(None), "whitespace padding is not a truncated frame");
+
+        // The contrast this test exists to make visible.
+        let mut syslog = Framer::new(FramingMode::Rfc6587Auto, MAX_FRAME_BYTES);
+        syslog.push(b"<13>no terminator");
+        assert_eq!(
+            syslog.finish().expect("RFC 6587 permits a terminator-less final message"),
+            Some(Bytes::from_static(b"<13>no terminator"))
+        );
     }
 
     #[test]
