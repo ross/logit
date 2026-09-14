@@ -446,11 +446,12 @@ fn build_spec(
                 .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        LogitIn { bind, tls, max_frame_bytes, handshake_timeout } => {
+        LogitIn { bind, tls, max_frame_bytes, handshake_timeout, idle_timeout } => {
             let mut input = LogitInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_handshake_timeout(*handshake_timeout);
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -2435,6 +2436,7 @@ mod tests {
                 tls: None,
                 max_frame_bytes: None,
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
             },
         };
         assert!(matches!(
@@ -2460,6 +2462,7 @@ mod tests {
                 }),
                 max_frame_bytes: Some(32 * 1024 * 1024),
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
             },
         };
         assert!(matches!(
@@ -2544,6 +2547,7 @@ mod tests {
                 tls: None,
                 max_frame_bytes: None,
                 handshake_timeout: Duration::from_millis(50),
+                idle_timeout: None,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -2674,6 +2678,94 @@ mod tests {
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
         assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
+    }
+
+    /// `logit_in`'s own arm, which needs a handshake rather than a line before the idle clock is
+    /// even armed -- and, unlike the three plaintext listeners above, tells its peer *why* it is
+    /// closing. So this asserts the `Reject{GOING_AWAY}` specifically: with `handshake_timeout`
+    /// left at its 5s default, the only thing that can write that frame is the 50ms idle clock,
+    /// so a missing `.with_idle_timeout(..)` in the `LogitIn` arm shows up as a 1s read timeout
+    /// here.
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_a_logit_input() {
+        use logit_proto::frame;
+        use logit_proto::native::{self, control};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::LogitIn {
+                bind: addr.clone(),
+                tls: None,
+                max_frame_bytes: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: Some(Duration::from_millis(50)),
+            },
+        };
+        let NodeSpec::Input(mut input, _) =
+            build_spec("in", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected NodeSpec::Input")
+        };
+        tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        /// Reads one whole control frame off a connection and decodes it -- the listener's own
+        /// `write_control` in reverse, hand-rolled here rather than reached for through
+        /// `logit_out` (a real sink would probe and transparently reconnect, hiding exactly the
+        /// close this test is about).
+        async fn read_control_frame(stream: &mut tokio::net::TcpStream) -> control::ControlMessage {
+            let mut header_buf = [0u8; frame::HEADER_LEN];
+            stream.read_exact(&mut header_buf).await.unwrap();
+            let mut header_bytes = bytes::Bytes::copy_from_slice(&header_buf);
+            let header = frame::FrameHeader::read(&mut header_bytes).unwrap();
+            let mut body = vec![0u8; header.compressed_len as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let mut full = Vec::with_capacity(frame::HEADER_LEN + body.len());
+            full.extend_from_slice(&header_buf);
+            full.extend_from_slice(&body);
+            let mut full = bytes::Bytes::from(full);
+            let (_header, mut payload) = frame::read_frame_with_header(&mut full).unwrap();
+            control::ControlMessage::decode(&mut payload).unwrap()
+        }
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let hello = control::Hello {
+            version: control::PROTOCOL_VERSION,
+            codecs: vec![native::CODEC_NATIVE_V1],
+            compressions: vec![0],
+            max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+            window: 1,
+        };
+        let framed = frame::write_frame_with_flags(
+            0,
+            NativeCompression::None,
+            frame::FLAG_CONTROL,
+            &hello.encode(),
+        )
+        .unwrap();
+        client.write_all(&framed).await.unwrap();
+        assert!(
+            matches!(read_control_frame(&mut client).await, control::ControlMessage::HelloAck(_)),
+            "the handshake itself must succeed"
+        );
+
+        // Now go quiet. Nothing else on this listener can write to the peer.
+        let reject = tokio::time::timeout(Duration::from_secs(1), read_control_frame(&mut client))
+            .await
+            .expect("a configured 50ms idle_timeout should close a quiet connection within 1s");
+        match reject {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY);
+                assert!(reject.message.contains("idle for"), "got: {}", reject.message);
+            }
+            other => panic!("expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
     }
 
     #[test]
