@@ -74,6 +74,14 @@
 //! frame and keeps the connection: unlike an oversize length, a *decoded* length has already told
 //! the reader where the next frame starts.
 //!
+//! **A terminator-less line at EOF is dropped, not ingested.** Carbon's `\n` is the only signal a
+//! line is complete, so a sender that dies mid-line leaves a truncation, not a short datapoint --
+//! and `svc.web01.cpu 42.5 17000` without its newline would otherwise parse perfectly and produce
+//! a gauge stamped 1970. [`FramingMode::Lines`] therefore makes [`crate::tcp::Framer::finish`]
+//! return `Truncated` (the driver counts `logit.input.frames.dropped{reason="truncated"}`), so a
+//! clean FIN and an abrupt RST agree about identical bytes. [`FramingMode::Rfc6587Auto`] does the
+//! opposite, because RFC 6587 §3.4.2 says a final syslog message needs no terminator.
+//!
 //! **One `decode_into` per line, not per read.** The driver frames first and hands the decoder one
 //! delimited message at a time, where the old bespoke loop handed it everything through the read
 //! buffer's last `\n` in a single call. `decode_plaintext` splits on `\n` internally either way, so
@@ -892,6 +900,54 @@ mod tests {
             metric_sum(&drained, "logit.component.receive.flushed", Some(("reason", "shutdown"))),
             0.0,
             "the listener is still running -- nothing here is a shutdown"
+        );
+
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// A sender that dies mid-line and then closes **cleanly** must not have its half-line
+    /// ingested. Carbon's own receiver drops a terminator-less tail, and so did the bespoke loop
+    /// this listener replaced -- it only ever decoded through the last `\n`. The shared driver's
+    /// `Framer::finish` would emit it under `Rfc6587Auto` (RFC 6587 says a final message needs no
+    /// terminator), which is why `FramingMode::Lines` overrides that and returns `Truncated`.
+    ///
+    /// What makes this worth a socket test rather than only a framer one: the bytes below are a
+    /// *valid* carbon line up to the point they stop. `svc.web01.cpu 42.5 17000` parses as three
+    /// whitespace-separated fields, so emitting it produces a perfectly well-formed gauge stamped
+    /// 1970-01-01 -- silent corruption, not a visible error. And a clean FIN has to agree with the
+    /// RST case below, which `report_buffered_tail` already counts `truncated`.
+    #[tokio::test]
+    async fn an_unterminated_tail_at_a_clean_close_is_dropped_and_counted_truncated() {
+        let running = start(
+            |input| input.with_receive(no_flush_timer()),
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+        let mut running = running;
+        let mut stream = running.connect().await;
+        // No trailing newline: the sender got this far and stopped.
+        stream.write_all(b"svc.web01.cpu 42.5 17000").await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(stream); // a clean FIN, not an RST
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), running.rx.recv()).await.is_err(),
+            "half a line is not a datapoint -- nothing should be delivered"
+        );
+
+        let drained = running.registry.drain(0);
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames.dropped", Some(("reason", "truncated"))),
+            1.0,
+            "and the loss is counted, exactly as an abrupt close's is"
+        );
+        assert_eq!(
+            metric_sum(&drained, "logit.input.frames", None),
+            0.0,
+            "the remainder never became a frame"
         );
 
         running.shutdown.send(true).ok();

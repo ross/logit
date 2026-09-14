@@ -402,6 +402,18 @@ remains what a listener that never calls `with_framing` gets. `Oversize::DrainTo
 ADR's original recoverable-oversize behaviour, moved into the driver as a mode rather than
 reimplemented — it is a non-fatal `FrameError` the frame loop continues past.
 
+`FramingMode::Lines` also decides what a **terminator-less remainder at EOF** means, and it is not
+what the driver did for syslog: it is `FrameError::Truncated`, counted
+`logit.input.frames.dropped{reason="truncated"}` and dropped, rather than emitted as a final
+message. Carbon's `\n` is the only completeness signal a line carries, so a sender that dies
+mid-line has truncated, not finished — and the failure is silent if you get it wrong, since
+`svc.web01.cpu 42.5 17000` with its newline missing still parses as three fields and yields a
+well-formed gauge stamped 1970-01-01. This preserves carbon parity (its own receiver discards such
+a tail, as did the accept loop deleted here, which only ever decoded through the last `\n`) and
+makes a clean FIN agree with an abrupt RST, which `report_buffered_tail` already counted
+`truncated`. A whitespace-only remainder is still dropped uncounted. `FramingMode::Rfc6587Auto`
+keeps emitting, because RFC 6587 §3.4.2 says a final syslog message needs no terminator.
+
 **What `graphite_in` gains.** `tls:` and `handshake_timeout:`, both the driver's and both TCP-only
 (graph rules 43 and 45 now cover this listener). The second closes the known gap this listener
 carried: a peer that connected and sent nothing held one of its 1024 permits indefinitely. Neither
