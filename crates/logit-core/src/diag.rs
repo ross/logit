@@ -8,19 +8,38 @@
 use crate::telemetry::Telemetry;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::sync::{Arc, Mutex};
 
 /// Attached to a component (an input, transform, or output) via that component's
 /// `with_diagnostics` builder -- mirrors the existing `with_timeout`/`with_retry` idiom rather
 /// than changing any constructor. A component that never gets one keeps the placeholder id from
 /// [`Diagnostics::default`], which is still safe to log -- just not attributable to a specific
 /// running instance.
+///
+/// **A throttle's scope is the component, not the clone.** [`Diagnostics::warn_throttled`]'s
+/// per-key counts live behind an [`Arc`], so every clone of one component's `Diagnostics` --
+/// the clone a stream listener hands each connection task, the one a listener pushes into its
+/// per-connection decoder, the one a transform hands a helper -- throttles against the same
+/// running totals. That is what "throttled" has to mean for a component whose work is spread
+/// over short-lived tasks: a peer looping connect / send-something-bad / close would otherwise
+/// report its 1st occurrence forever, one warning per connection, which is precisely the flood
+/// the throttle exists to bound (`docs/adr/service-lifecycle-and-output-retry.md`'s
+/// "Diagnostics" section and its 2026-09-14 amendment).
+///
+/// A genuinely independent throttle -- one piece of a component that must count on its own
+/// cadence -- is spelled by building a second value rather than by cloning:
+/// `Diagnostics::new(id).with_telemetry(telemetry)`. Nothing in the tree needs one today.
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
     component_id: String,
     /// Per-key occurrence counts for [`Diagnostics::warn_throttled`]. Independent keys never
     /// interfere with each other's throttling -- a component with two distinct failure modes
     /// (e.g. `json`'s "no brace found" and "parse failed") reports each on its own cadence.
-    counts: HashMap<&'static str, u64>,
+    ///
+    /// Shared across clones (see the type's own doc comment). A `std::sync::Mutex`, not tokio's:
+    /// it is locked only on a diagnostic's error branch, never on a happy path, and the guard
+    /// never outlives the statement that takes it, so it is never held across an `.await`.
+    counts: Arc<Mutex<HashMap<&'static str, u64>>>,
     /// Mirrors every [`Diagnostics::warn_throttled`] occurrence into a
     /// `logit.component.diagnostics{key=...}` counter -- every occurrence, not just the throttled
     /// log subset, since that's exactly the volume a metric (unlike a log stream) is good at
@@ -39,7 +58,9 @@ impl Diagnostics {
     pub fn new(component_id: impl Into<String>) -> Self {
         Self {
             component_id: component_id.into(),
-            counts: HashMap::new(),
+            // A fresh `Arc` per `new`: two components never share a throttle, only clones of one
+            // component's value do.
+            counts: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Telemetry::default(),
         }
     }
@@ -83,18 +104,25 @@ impl Diagnostics {
         &self.component_id
     }
 
-    /// How many times `key` has been reported through [`Diagnostics::warn_throttled`] on *this*
-    /// value -- the running total the throttle itself keys on, including the occurrences it
-    /// suppressed.
+    /// How many times `key` has been reported through [`Diagnostics::warn_throttled`] on this
+    /// component -- the running total the throttle itself keys on, including the occurrences it
+    /// suppressed. Read through the shared counts, so any clone answers for all of them (see the
+    /// type's own doc comment).
     ///
     /// Mainly for tests, and not `#[cfg(test)]` for the same reason [`Diagnostics::component_id`]
-    /// isn't: the tests that need it live in dependent crates. Specifically, it is how
-    /// `logit_inputs::tcp` asserts that its per-frame keys throttle listener-wide -- a count that
-    /// stays at 1 no matter how many connections report is exactly the bug that the one shared
-    /// `Diagnostics` behind its connection tasks exists to prevent, and `warn_throttled`'s own
-    /// return value can't distinguish the two from outside.
+    /// isn't: the tests that need it live in dependent crates. It is the one observable that
+    /// distinguishes "throttled component-wide" from "each task counted 1 in its own copy" from
+    /// outside -- `warn_throttled`'s return value can't, since those reports happen on spawned
+    /// tasks.
     pub fn occurrences(&self, key: &str) -> u64 {
-        self.counts.get(key).copied().unwrap_or(0)
+        self.lock_counts().get(key).copied().unwrap_or(0)
+    }
+
+    /// The shared counts, tolerating a poisoned lock. A poisoned lock means some other holder of
+    /// this component's `Diagnostics` panicked mid-report; the counts themselves are still
+    /// perfectly usable, and losing the throttle entirely would be the worse outcome.
+    fn lock_counts(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, u64>> {
+        self.counts.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Reports the 1st, 2nd, 4th, 8th, ... occurrence of `key` (each naming the running total) and
@@ -111,12 +139,21 @@ impl Diagnostics {
     ///
     /// The suppressed path never touches `tracing`, reads a clock, or allocates beyond the
     /// `HashMap::entry` below -- `crates/logit-bench/tests/allocations.rs`'s live-telemetry rows
-    /// depend on that.
+    /// depend on that. The counts are shared across clones, so the entry is reached through a
+    /// lock; it is taken on this call only and dropped before the report below.
+    ///
+    /// Takes `&mut self` even though the shared counts no longer require it. The exclusive borrow
+    /// is what all ~190 call sites already hold, and it says the honest thing about the call: it
+    /// mutates the component's diagnostic state. What the borrow does *not* scope is the throttle
+    /// -- that is the component's, shared by every clone of this value (see the type's doc
+    /// comment) -- so holding `&mut` here buys no isolation and none is intended.
     pub fn warn_throttled(&mut self, key: &'static str, msg: impl Display) -> bool {
         self.telemetry.count("logit.component.diagnostics", 1.0, &[("key", key)]);
-        let count = self.counts.entry(key).or_insert(0);
+        let mut counts = self.lock_counts();
+        let count = counts.entry(key).or_insert(0);
         *count += 1;
-        let count = *count; // copied out so `self.counts`'s borrow ends before the report below
+        let count = *count; // copied out so the guard can be dropped before the report below
+        drop(counts);
         let should_report = count.is_power_of_two();
         if should_report {
             tracing::warn!(
@@ -253,6 +290,49 @@ mod tests {
             diag.warn_throttled("b", "y"),
             "b's 1st occurrence reports regardless of a's count"
         );
+    }
+
+    /// The scope of a throttle is the component, not the value that happens to hold it: a clone
+    /// (what a stream listener hands each connection task, what a listener pushes into a
+    /// per-connection decoder) counts against the same running totals as its original. Without
+    /// this, a component whose work is spread over short-lived tasks reports every occurrence's
+    /// "1st" forever -- see the type's doc comment and
+    /// `docs/adr/service-lifecycle-and-output-retry.md`'s 2026-09-14 amendment.
+    #[test]
+    fn a_clone_shares_the_throttle_with_its_original() {
+        let diag = Diagnostics::new("syslog_in");
+        let mut clone = diag.clone();
+        assert!(clone.warn_throttled("bad_line", "x"), "the 1st occurrence reports");
+        assert!(
+            clone.warn_throttled("bad_line", "x"),
+            "the 2nd reports too -- 2 is a power of two"
+        );
+        assert!(
+            !clone.warn_throttled("bad_line", "x"),
+            "the 3rd is suppressed, which it could not be if the clone counted on its own"
+        );
+        assert_eq!(
+            diag.occurrences("bad_line"),
+            3,
+            "the original reads the clone's occurrences: one shared count, not two"
+        );
+    }
+
+    /// The other half of the same property: sharing is per component, so two `Diagnostics::new`
+    /// values never interfere -- `Diagnostics::new` builds a fresh count map every time.
+    #[test]
+    fn two_components_do_not_share() {
+        let mut first = Diagnostics::new("syslog_in");
+        let mut second = Diagnostics::new("statsd_in");
+        for _ in 0..3 {
+            first.warn_throttled("bad_line", "x");
+        }
+        assert!(
+            second.warn_throttled("bad_line", "x"),
+            "a second component's 1st occurrence reports regardless of the first's count"
+        );
+        assert_eq!(first.occurrences("bad_line"), 3);
+        assert_eq!(second.occurrences("bad_line"), 1);
     }
 
     #[test]
