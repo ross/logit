@@ -1567,7 +1567,7 @@
           ],
           "properties": {
             "connect_timeout": {
-              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure.",
+              "description": "TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a dropped connection) is allowed to take before `send` reports it as a failure. Also bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS connect can take up to twice this value, exactly as `syslog_out`'s own `connect_timeout` does.",
               "default": "5s",
               "type": "string"
             },
@@ -1593,6 +1593,18 @@
               "description": "Encodes a `MetricKind::GaugeDelta` (statsd/DogStatsD's own `+n`/`-n` relative-gauge syntax) natively as a signed value, instead of dropping it with a `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching *any* sink means the pipeline is missing an `aggregate` component (`docs/adr/relative-gauge- adjustments.md`) -- this is the one sink able to round-trip a delta losslessly, so it's an opt-in relay behavior, not a silent default across every sink.",
               "default": false,
               "type": "boolean"
+            },
+            "tls": {
+              "description": "Turns on TLS for this connection when present. Presence turns it on and makes it *required* (there is no plaintext fallback), the same shape as `syslog_out`'s and `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to read that signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope, and `tls:` alongside `transport: udp` is a config error (rule 52), not silently ignored. No statsd client in the wild speaks TLS, so this is for a `logit`-to-`logit` (or stunnel-shaped) relay hop rather than for an application's own DogStatsD client. See [`TlsClientConfig`] for path resolution (relative to the config file's own directory) and `!env` compatibility, both identical here.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "transport": {
               "default": "udp",

@@ -1261,10 +1261,24 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         max_packet_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) is allowed to take before `send` reports it as a failure.
+        /// dropped connection) is allowed to take before `send` reports it as a failure. Also
+        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS connect
+        /// can take up to twice this value, exactly as `syslog_out`'s own `connect_timeout` does.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
+        /// Turns on TLS for this connection when present. Presence turns it on and makes it
+        /// *required* (there is no plaintext fallback), the same shape as `syslog_out`'s and
+        /// `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to read that
+        /// signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means TLS with
+        /// the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope, and
+        /// `tls:` alongside `transport: udp` is a config error (rule 52), not silently ignored.
+        /// No statsd client in the wild speaks TLS, so this is for a `logit`-to-`logit` (or
+        /// stunnel-shaped) relay hop rather than for an application's own DogStatsD client. See
+        /// [`TlsClientConfig`] for path resolution (relative to the config file's own directory)
+        /// and `!env` compatibility, both identical here.
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
     },
     /// collectd binary-protocol (`network` plugin) egress -- the mirror of `collectd_in`, and a
     /// real relay: identity, values, and kinds round-trip through the real decoder on the other
@@ -3771,6 +3785,7 @@ mod tests {
                 relative_gauges,
                 max_packet_bytes,
                 connect_timeout,
+                tls,
             } => {
                 assert_eq!(endpoint, "127.0.0.1:8125");
                 assert_eq!(transport, StatsdTransport::Udp);
@@ -3778,6 +3793,7 @@ mod tests {
                 assert!(!relative_gauges);
                 assert_eq!(max_packet_bytes, 1432);
                 assert_eq!(connect_timeout, Duration::from_secs(5));
+                assert_eq!(tls, None);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
         }
@@ -4013,6 +4029,52 @@ mod tests {
             ComponentKind::StatsdOut { transport, connect_timeout, .. } => {
                 assert_eq!(transport, StatsdTransport::Tcp);
                 assert_eq!(connect_timeout, Duration::from_secs(30));
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+    }
+
+    /// `tls:` is additive here exactly as it is on `syslog_out`: absent means plaintext, and
+    /// presence (even an empty block) means TLS with the bundled Mozilla roots -- so an empty
+    /// `tls: {}` is meaningful rather than equivalent to omitting it (`StatsdOut::tls`'s own doc
+    /// comment, `docs/adr/statsd-output.md`'s TLS amendment).
+    #[test]
+    fn statsd_out_tls_defaults_to_none_and_an_empty_block_is_distinct_from_absent() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "127.0.0.1:8125"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => assert_eq!(tls, None),
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "relay:8125",
+                "transport": "tcp", "tls": {}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => {
+                assert_eq!(tls, Some(TlsClientConfig::default()));
+                assert!(tls.unwrap().is_empty(), "an empty block still means TLS is on");
+            }
+            other => panic!("expected StatsdOut, got {other:?}"),
+        }
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "statsd_out", "sources": ["in"], "endpoint": "relay:8125",
+                "transport": "tcp",
+                "tls": {"ca_file": "ca.pem", "cert_file": "client.pem", "key_file": "client.key"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::StatsdOut { tls, .. } => {
+                let tls = tls.expect("a set tls: block parses");
+                assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+                assert_eq!(tls.cert_file.as_deref(), Some("client.pem"));
+                assert_eq!(tls.key_file.as_deref(), Some("client.key"));
+                assert!(!tls.insecure_skip_verify);
             }
             other => panic!("expected StatsdOut, got {other:?}"),
         }

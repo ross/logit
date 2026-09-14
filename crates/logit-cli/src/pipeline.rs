@@ -785,6 +785,7 @@ fn build_spec(
             relative_gauges,
             max_packet_bytes,
             connect_timeout,
+            tls,
         } => {
             // Eager for UDP, lazy for TCP -- same reasoning as `SyslogOut` above.
             let output = match transport {
@@ -795,11 +796,18 @@ fn build_spec(
             };
             let encoder =
                 StatsdEncoder::new(statsd_format(*format)).with_relative_gauges(*relative_gauges);
-            let output = output
+            let mut output = output
                 .with_encoder(encoder)
                 .with_max_packet_bytes(*max_packet_bytes as usize)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
+            // TCP only, and `graph::resolve`'s rule 52 already rejected a `tls:` block under
+            // `transport: udp` (`with_tls` errors on the UDP arm anyway). After
+            // `with_diagnostics`, so the `insecure_skip_verify` warning lands on this component's
+            // own diagnostics -- the `SyslogOut` arm's ordering above.
+            if let (logit_config::StatsdTransport::Tcp, Some(tls)) = (transport, tls) {
+                output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
+            }
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -3445,6 +3453,62 @@ mod tests {
         };
         let err = format!("{err:?}");
         assert!(err.contains("tls.cert_file"), "got: {err}");
+        assert!(err.contains("does-not-exist.pem"), "got: {err}");
+    }
+
+    fn statsd_out_component(
+        transport: logit_config::StatsdTransport,
+        tls: Option<logit_config::TlsClientConfig>,
+    ) -> ResolvedComponent {
+        ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec![],
+            kind: ComponentKind::StatsdOut {
+                endpoint: "127.0.0.1:8125".to_string(),
+                transport,
+                format: logit_config::StatsdFormat::default(),
+                relative_gauges: false,
+                max_packet_bytes: 1432,
+                connect_timeout: Duration::from_secs(5),
+                tls,
+            },
+        }
+    }
+
+    /// The sink twin of `build_spec_builds_a_tls_statsd_input`: `graph::resolve`'s rule 52 never
+    /// touches the filesystem, so `build_spec` is where a bad `tls.ca_file` path first fails --
+    /// and the missing-file half is what really pins the `with_tls` call, since the positive
+    /// assertion would still pass with it deleted.
+    #[test]
+    fn build_spec_builds_a_tls_statsd_output() {
+        let component = statsd_out_component(
+            logit_config::StatsdTransport::Tcp,
+            Some(logit_config::TlsClientConfig {
+                ca_file: Some("ca.pem".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(
+            build_spec("out", &component, &testdata_tls_dir(), None).unwrap().0,
+            NodeSpec::Output(..)
+        ));
+
+        let missing = statsd_out_component(
+            logit_config::StatsdTransport::Tcp,
+            Some(logit_config::TlsClientConfig {
+                ca_file: Some("does-not-exist.pem".to_string()),
+                ..Default::default()
+            }),
+        );
+        let err = match build_spec("out", &missing, &testdata_tls_dir(), None) {
+            Ok(_) => panic!("expected a missing tls.ca_file to fail build_spec"),
+            Err(err) => err,
+        };
+        let err = format!("{err:?}");
+        assert!(err.contains("tls.ca_file"), "got: {err}");
         assert!(err.contains("does-not-exist.pem"), "got: {err}");
     }
 }
