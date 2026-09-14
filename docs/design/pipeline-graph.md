@@ -590,6 +590,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     (it could never name a real target), and, under `by: {attribute: k}`/`{resource: k}`, a
     non-empty `k`: rule 19/20's empty-field-name rejection, applied to the one key a `route` reads
     per event.
+52. A `statsd_out` `tls:` block must be internally consistent — `cert_file`/`key_file` set
+    together, no `insecure_skip_verify` alongside `ca_file` — rule 44's three checks with its
+    messages verbatim, since this sink dials the same bare `host:port` where `tls:`'s mere
+    presence is the only "TLS is wanted" signal there is. Plus that rule's own third check: `tls:`
+    together with `transport: udp` is rejected, since DTLS is out of scope here too
+    ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment). One rule per *sink*
+    (24/34/44/52), unlike rule 43's one-rule-for-every-listener, because each sink also checks its
+    own `tls:` internals. `logit_outputs::statsd::StatsdOutput::with_tls` re-checks the
+    `transport: udp` one itself, since `graph::resolve` isn't the only possible caller.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

@@ -229,6 +229,14 @@
 //!     value (it could never name a real target), and, under `by: {attribute: k}`/
 //!     `{resource: k}`, a non-empty `k`: rule 19/20's empty-field-name rejection, applied to the
 //!     one key a `route` reads per event.
+//! 52. A `statsd_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
+//!     together, no `insecure_skip_verify` alongside `ca_file` -- rule 44's three checks with its
+//!     messages verbatim, since this sink dials the same bare `host:port` where `tls:`'s mere
+//!     presence is the only "TLS is wanted" signal there is. Plus that rule's own third check:
+//!     `tls:` together with `transport: udp` is rejected, since DTLS is out of scope here too
+//!     (`docs/adr/statsd-output.md`'s TLS amendment). One rule per *sink* (24/34/44/52), unlike
+//!     rule 43's one-rule-for-every-listener, because each sink also checks its own `tls:`
+//!     internals.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -2017,6 +2025,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 52: `statsd_out`'s `tls:` block -- rule 44's three checks, with its messages verbatim,
+    // for the same reason it shares them with rule 34: this sink dials the same bare `host:port`
+    // shape where `tls:`'s mere presence is the only signal TLS is wanted, so one grep still
+    // finds every sink making these checks. Kept a rule of its own rather than folded into rule
+    // 44's loop -- the sink rules stay one per sink (24/34/44/52), the opposite convention from
+    // rule 43's one-rule-for-every-listener, because each sink also validates its own `tls:`
+    // internals. `StatsdOutput::with_tls` re-checks the `transport: udp` one itself, since
+    // `graph::resolve` isn't the only possible caller.
+    for (id, component) in &components {
+        let ComponentKind::StatsdOut { tls: Some(tls), transport, .. } = &component.kind else {
+            continue;
+        };
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        if *transport == StatsdTransport::Udp {
+            anyhow::bail!("component '{id}': DTLS is out of scope; 'tls:' needs 'transport: tcp'");
+        }
+    }
+
     // Rule 45: every TCP listener's `handshake_timeout` must be non-zero, and on a UDP
     // `syslog_in` it must be left at its default. `0s` is an impossible budget, not a tight one --
     // the phase it bounds (a TLS accept, a first-byte read, a `Hello` read) cannot complete in
@@ -2628,6 +2666,7 @@ mod tests {
             relative_gauges: false,
             max_packet_bytes,
             connect_timeout: Duration::from_secs(5),
+            tls: None,
         }
     }
 
@@ -5430,6 +5469,87 @@ mod tests {
             ),
         ]));
         assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    // ---- Rule 52: `statsd_out`'s `tls:` block ---------------------------------------------------
+
+    fn statsd_out_with_tls(
+        transport: StatsdTransport,
+        tls: Option<logit_config::TlsClientConfig>,
+    ) -> ComponentKind {
+        ComponentKind::StatsdOut {
+            endpoint: "relay:8125".to_string(),
+            transport,
+            format: logit_config::StatsdFormat::default(),
+            relative_gauges: false,
+            max_packet_bytes: 1432,
+            connect_timeout: Duration::from_secs(5),
+            tls,
+        }
+    }
+
+    #[test]
+    fn a_statsd_out_with_cert_file_but_no_key_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            cert_file: Some("client.pem".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("cert_file") && err.contains("key_file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_statsd_out_with_insecure_skip_verify_and_ca_file_is_rejected() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]));
+        assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
+    }
+
+    /// Rule 52's own third check, rule 44's verbatim: DTLS is out of scope here too, so a `tls:`
+    /// block under `transport: udp` is rejected rather than silently ignored -- which would leave
+    /// an operator who asked for encryption with a plaintext datagram socket.
+    #[test]
+    fn a_statsd_out_with_tls_under_transport_udp_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                statsd_out_with_tls(
+                    StatsdTransport::Udp,
+                    Some(logit_config::TlsClientConfig::default()),
+                ),
+            ),
+        ]));
+        assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
+    }
+
+    /// The positive case: a consistent `tls:` block on the TCP transport resolves, so the three
+    /// rejections above are pinning a real distinction rather than rejecting every `tls:` block
+    /// that reaches this sink.
+    #[test]
+    fn a_statsd_out_with_a_consistent_tls_block_over_tcp_resolves() {
+        let tls = logit_config::TlsClientConfig {
+            ca_file: Some("ca.pem".to_string()),
+            cert_file: Some("client.pem".to_string()),
+            key_file: Some("client.key".to_string()),
+            insecure_skip_verify: false,
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], statsd_out_with_tls(StatsdTransport::Tcp, Some(tls))),
+        ]))
+        .expect("a mutual-TLS statsd_out over tcp is a legal config");
     }
 
     // ---- Rule 45: `handshake_timeout` on the three TCP listeners --------------------------------
