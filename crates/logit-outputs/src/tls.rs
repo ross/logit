@@ -3,15 +3,22 @@
 //! both build a `rustls::ClientConfig` from the same operator-facing settings via
 //! [`build_client_config`]. Extracted from `otlp.rs` (`docs/plans/native-transport.md` workstream
 //! B) -- a pure refactor, no behaviour change for `otlp_out`.
+//!
+//! Also home to the TLS-adjacent pieces every raw-TCP sink shares regardless of whether TLS is
+//! actually on: [`AsyncStream`], [`host_only`], and [`poll_pending_close`], the one-poll probe
+//! each pooled sink runs on a reused connection before writing to it.
 
+use std::future::poll_fn;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use anyhow::Context;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::PrivateKeyDer;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait so a sink's connection
 /// field doesn't need to be generic (a sink field can't be, without making the whole sink type
@@ -36,6 +43,73 @@ pub(crate) fn host_only(endpoint: &str) -> &str {
         .unwrap_or(endpoint)
         .trim_start_matches('[')
         .trim_end_matches(']')
+}
+
+/// What one poll of a pooled stream found -- [`poll_pending_close`]'s answer.
+pub(crate) enum PendingClose {
+    /// Nothing readable at this instant. On every protocol these sinks speak the peer is silent
+    /// unless it is answering something, so this is the healthy case: the connection is still
+    /// there and the write can go ahead.
+    Open,
+    /// The peer closed its end (an immediate end-of-file), or the poll failed outright -- the two
+    /// are the same thing to a caller about to write: this connection is finished.
+    Eof,
+    /// The peer sent something unprompted. On `logit_in` that is a `Reject{GOING_AWAY}` -- the
+    /// close-is-coming signal, from a graceful shutdown or an idle timeout
+    /// (`docs/adr/idle-connection-timeout.md`); on the line-oriented sinks there is nothing a
+    /// receiver ever sends at all. Either way the pooled connection is not one to write a batch
+    /// into.
+    Bytes(usize),
+}
+
+impl std::fmt::Display for PendingClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PendingClose::Open => f.write_str("still open"),
+            PendingClose::Eof => f.write_str("closed by the peer"),
+            PendingClose::Bytes(n) => write!(f, "carrying {n} unsolicited byte(s) from the peer"),
+        }
+    }
+}
+
+/// Polls `stream` for readability **exactly once** and reports what it found, without ever
+/// waiting: the check every pooled sink runs on a *reused* connection before the first write of a
+/// send attempt, so a batch is not written into a socket whose peer already closed it
+/// (`docs/adr/idle-connection-timeout.md`'s "The client-side probe" decision).
+///
+/// **Why one `poll_read` and not `tokio::time::timeout(stream.read(..))`.** A timeout around a
+/// real read is a *cancellable* read: when the timer wins, the read future is dropped, and on a
+/// TLS stream that can discard a partially-received record that `tokio_rustls` had already taken
+/// off the socket -- bytes gone from the kernel and from the session both. The same hazard
+/// applies through the `Box<dyn AsyncStream>` these sinks hold, where the caller cannot even tell
+/// which kind of stream it has. One `poll_read` that returns `Poll::Pending` has, by contrast,
+/// consumed nothing: `Pending` is precisely "no bytes were available," so the [`PendingClose::Open`]
+/// answer -- the one where the connection is kept and written to -- is the one answer that
+/// provably takes nothing off the stream. The two answers that *may* consume something
+/// ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both end with the connection dropped, so
+/// there is nothing left to have corrupted.
+///
+/// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works as directly as a `&mut
+/// TcpStream` does -- the sinks hold both shapes.
+///
+/// This is inherently point-in-time: a FIN arriving between this poll and the write that follows
+/// is unchanged from today (`Fault::Ambiguous` for `logit_out`, silent for the line-oriented
+/// sinks). What it closes is the common case -- a peer that closed some time ago and whose FIN is
+/// already sitting in this host's receive queue.
+pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> PendingClose {
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buf);
+        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Pending => Poll::Ready(PendingClose::Open),
+            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => Poll::Ready(PendingClose::Eof),
+            Poll::Ready(Ok(())) => Poll::Ready(PendingClose::Bytes(read_buf.filled().len())),
+            Poll::Ready(Err(_)) => Poll::Ready(PendingClose::Eof),
+        }
+    })
+    .await
 }
 
 /// Client-side TLS tuning for a sink's `tls:` config block. Mirrors `logit_config::
