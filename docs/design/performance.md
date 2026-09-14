@@ -64,7 +64,9 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   makes it the number `script/perf compare --threshold` gates a regression on.
 - **peak RSS** — `ru_maxrss` (kibibytes on Linux, converted to bytes). Reported for every scenario,
   especially informative for `buffered` (real segment-file I/O and buffering), but never gates
-  `compare`'s exit code unless `--rss-threshold` is passed explicitly.
+  `compare`'s exit code unless `--rss-threshold` is passed explicitly. **In a short run this
+  number is roughly half jemalloc's freed-but-not-yet-purged pages** — see §1's "Peak RSS" sub-
+  section for the paired measurement and how to read a scenario's RSS against its live data.
 - **startup_s** — spawn → `ready`, alongside the other three (a column in `run`'s table, a field
   next to `wall_s` in the results JSON). `compare` *warns* — never gates the exit code — on a
   startup regression past `--threshold`: process bring-up is a different question from the graph's
@@ -184,21 +186,12 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   RSS against `passthrough`'s 38 MiB is jemalloc retention, not buffered events.** The live-data
   bound is small: the router's 64-slot inbox holds at most 64 × 100 events × 864 B ≈ 5.5 MiB, the
   four sink inboxes another ≈ 5.5 MiB between them, and `attribute` showed every sink queue
-  essentially empty (`buf max` 0.00). Re-running all three scenarios with
-  `_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0` (purge freed pages immediately instead
-  of over jemalloc's default 10 s decay) gave peak RSS of 14.4 MiB (`fanout`), 17.5 MiB
-  (`passthrough`) and 23.9 MiB (`route`) — the 6 MiB `route` − `passthrough` gap there *is* the
-  extra in-flight data, and everything above it in the default run is freed pages not yet
-  returned to the kernel. `route` accumulates more of them than `passthrough` because it churns
-  more page-sized allocations: every batch's 86 KiB `Vec<Event>` is freed by the router after its
-  events are moved into four fresh `reserve_exact` vectors, which four sink tasks then free on
-  whichever worker threads they happen to run on, so dirty pages pile up across more arenas
-  before decay purges them. (The purge-immediately run also roughly doubled CPU µs/event for
-  `route`, 0.668 → 1.23, which is the `madvise` cost of those per-batch page frees — a measure of
-  how much page-level churn the topology has, not a setting to run with.) Read every peak-RSS
-  number in this table with that in mind: for a short, generator-bound run it is mostly a
-  function of allocation churn and thread placement, and `compare` is right not to gate on it
-  by default.
+  essentially empty (`buf max` 0.00). Under immediate purge (the "Peak RSS" sub-section below)
+  `route` is 24 MiB to `passthrough`'s 17.5 — that 6 MiB *is* the extra in-flight data. `route`
+  retains more than any other scenario because it churns more page-sized allocations: every
+  batch's 86 KiB `Vec<Event>` is freed by the router after its events are moved into four fresh
+  `reserve_exact` vectors, which four sink tasks then free on whichever worker threads they happen
+  to run on, so dirty pages pile up across more arenas before decay purges them.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
@@ -245,6 +238,52 @@ per-scenario threshold so a flush-tick scenario can carry a wider band than `pas
 Raising `--repeat` specifically for flush-tick scenarios, so the reported median is less exposed to
 any one repeat's tick alignment, is a third, cheaper option worth trying before either.
 `docs/known-gaps.md`'s harness entry carries the same recommendation.
+
+### Peak RSS: what is live data and what is jemalloc retention
+
+`logit` runs on jemalloc (ADR `jemalloc-global-allocator`), which returns freed pages to the kernel
+on a decay schedule (`dirty_decay_ms` = 10 s by default) rather than at `free`. A scenario that
+runs for 5–10 s therefore reports a peak RSS that includes most of what it freed along the way,
+not just what it held at its high-water mark. To separate the two, the whole suite was run twice
+at `a9c00c1` (host idle, on battery, `--repeat 3`, release): once as-is, once with
+`_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`, which purges at `free` and makes peak RSS
+a close proxy for peak live data. Medians:
+
+| Scenario | Peak RSS, default decay | Peak RSS, immediate purge | Reading |
+|---|---:|---:|---|
+| `aggregate` | 47.1 MiB | 24.1 MiB | 1000 live `SeriesKey`s + window state |
+| `buffered` | 25.7 MiB | 18.3 MiB | disk spool; little in memory |
+| `encode-human-devnull` | 181.7 MiB | 85.0 MiB | **sink queue full** (see below) |
+| `encode-native-devnull` | 211.5 MiB | 84.9 MiB | **sink queue full** |
+| `fanout` | 12.3 MiB | 14.5 MiB | nothing retained: one shared batch, freed once |
+| `json-parse` | 39.9 MiB | 22.8 MiB | post-#187/#189, nothing backs up |
+| `lua` | 27.8 MiB | 19.4 MiB | |
+| `native-relay` | 136.7 MiB | 86.5 MiB | **`logit_out`'s sink queue full** (ack-bound) |
+| `passthrough` | 37.2 MiB | 17.5 MiB | one 64-slot inbox ≈ 5.5 MiB + baseline |
+| `route` | 80.6 MiB | 24.4 MiB | five 64-slot inboxes ≈ 11 MiB + baseline |
+
+Two things fall out:
+
+- **Where the sink is slower than the generator, RSS really is queue depth**, and it is the
+  sink queue's default `buffer.max_bytes` of 64 MiB that sets it: a 100-event batch of this
+  shape weighs ~87 KiB by `estimated_heap_bytes`, so the byte bound trips at ~770 batches, well
+  before the 1024-batch bound; add the 64-slot inbox and the process baseline and you get the
+  ~85 MiB the three sink-bound scenarios (`encode-*`, `native-relay`) all converge on under
+  immediate purge. Their default-decay numbers are that plus what jemalloc hadn't returned yet.
+  So the "in-flight buffering at default `buffer:` is large" observation stands for those, and the
+  bound doing it is `max_bytes`, not `max_batches` or the channels.
+- **Where the sink keeps up, RSS is mostly retention.** `passthrough`, `route`, `aggregate`,
+  `json-parse` and `lua` all drop by half or more under immediate purge, down to a number that
+  matches their in-flight channel data plus process baseline. `route` is the extreme case
+  (80 → 24 MiB) because it churns more page-sized allocations per batch than anything else
+  (its own reading above); `fanout` the opposite (no re-allocation between generator and sinks,
+  the shared batch freed exactly once).
+
+The immediate-purge run's CPU numbers are *not* comparable to anything else in this document —
+purging at `free` costs an `madvise` per page-sized free and roughly doubled CPU µs/event for the
+churn-heavy scenarios (`route` 0.645 → 1.239, `aggregate` 0.273 → 0.599). It is a diagnostic
+setting for reading RSS, not a configuration to run with. When a peak-RSS number looks
+surprising, re-run that one scenario with decay 0 before concluding anything about queue bounds.
 
 ## 2. Attribution: where a scenario's time actually goes
 

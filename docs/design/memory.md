@@ -1440,7 +1440,10 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
   InfluxDB throughout. That rules out a leak and shows pages are being returned. It does **not**
   isolate jemalloc from glibc: the same soak has not been run with `--no-default-features`, and
   the drift ADR `jemalloc-global-allocator` is really about takes days, not minutes, to show up. The escape hatch exists
-  so that comparison stays one build away.
+  so that comparison stays one build away. One related, now-measured fact: over a 5–10 s
+  `script/perf` run, jemalloc's default 10 s `dirty_decay_ms` means peak RSS carries roughly as
+  much freed-but-unpurged memory as live data for any scenario whose sink keeps up — see
+  `performance.md` §1's "Peak RSS" sub-section for the paired default/immediate-purge table.
 - **Is there a compact `Event` representation** worth having — one that doesn't reserve span and
   sketch space on a bare log line? Boxing the rare variants (§8 items 9-10) is the cheap answer, but
   it only pays where the variant really is rare, and "rare" is workload-dependent: a sketch is the
