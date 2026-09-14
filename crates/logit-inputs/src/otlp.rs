@@ -338,11 +338,11 @@ impl Input for OtlpInput {
             let live_connections = Arc::clone(&live_connections);
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
-                                      // Published from the read-modify-write's own return value, not a separate
-                                      // `load`: `Telemetry::gauge` is last-write-wins per key, so two tasks that
-                                      // interleave an add and a load would leave the stale one as the published value
-                                      // until the next transition. `crate::graphite::tcp::gauge_connections` does the
-                                      // same.
+
+                // Published from the read-modify-write's own return value, not a separate `load`:
+                // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an
+                // add and a load would leave the stale one as the published value until the next
+                // transition. `crate::graphite::tcp::gauge_connections` does the same.
                 let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
                 telemetry.gauge("logit.input.connections", live as f64, &[]);
 
