@@ -683,6 +683,49 @@ examples pointing at this sink. Four things worth knowing before deploying one:
   Graphite-protocol receiver could treat a redelivered datapoint as an addition instead, and this
   sink has no way to tell the difference.
 
+### `statsd_out`: `transport: tcp` and TLS
+
+`statsd_out` defaults to UDP, like every statsd client, and
+[`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml) is the runnable topology with every
+default present as a commented reference. `transport: tcp` swaps the packed datagram for one
+LF-terminated line per metric on a lazily-opened connection, and is what a `tls:` block requires:
+
+```yaml
+components:
+  statsd_out:
+    type: statsd_out
+    sources: [enrich]
+    endpoint: relay.internal:8125
+    transport: tcp                  # udp (the default) | tcp -- tls: below requires tcp
+    connect_timeout: 5s             # the default; bounds the connect and the handshake separately
+    tls:                            # presence turns TLS on and makes it *required*
+      ca_file: /etc/logit/tls/ca.pem          # trust this CA instead of the bundled Mozilla set
+      cert_file: /etc/logit/tls/client.pem    # mutual TLS; needs key_file too
+      key_file: /etc/logit/tls/client.key
+```
+
+- **`tls:` is TCP-only, and its presence makes TLS required.** There is no plaintext fallback, and
+  `logit validate` rejects a `tls:` block under `transport: udp` (rule 52 — DTLS is out of scope
+  everywhere in this project). No statsd client in the wild speaks TLS, so — exactly like
+  `statsd_in`'s own listener block — this is for a `logit`-to-`logit` or stunnel-shaped relay hop,
+  not for an application's DogStatsD client. See ["TLS"](#tls) below for the full field reference.
+- **`connect_timeout:` bounds the TCP connect and the TLS handshake as two separate phases**, not
+  one combined deadline, so a TLS connect can take up to twice the configured value —
+  `syslog_out`'s arrangement. Size it accordingly if raising it from the default.
+- **A retry never redelivers a batch over TLS.** On plaintext a write that fails having accepted
+  zero bytes is provably retryable, so this sink reconnects once and rewrites the frame
+  (`Fault::Clean`). A TLS write gives no such proof — rustls may already have put complete records
+  on the wire — so every failure at or after the first write is `Fault::Ambiguous` and the batch is
+  never resent ([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment). That is deliberately
+  conservative: `statsd_out` reports `duplicate_safe: false` because a redelivered `hits:5|c`
+  *increments the destination counter a second time*. Expect a TLS relay to drop a batch where a
+  plaintext one would have retried it, and watch `logit.component.batches.dropped` accordingly.
+- **What to watch.** `logit.output.requests{class="ok"|"error"}` (one per attempt) and, on TCP,
+  `logit.output.reconnects` — it should stay near zero in steady state; a climbing count means the
+  peer or the network, not this sink, is unstable. It is counted identically on a plaintext and a
+  TLS connection, since both take the same connect path. `logit.output.datagrams` exists only
+  under `transport: udp`.
+
 ## Tailing files and Docker logs
 
 `tail_in` reads one or more files line by line; `docker_in` builds on the same driver to tail
@@ -1045,6 +1088,31 @@ TLS"](#statsd_in-transport-tcp-and-tls) above for the listener's own framing and
 Plain statsd clients speak no TLS either, so this too is a `logit`-to-`logit` or stunnel-shaped
 relay hop rather than something an application's statsd client dials directly. What to watch is
 again `syslog_in`'s set.
+
+**`statsd_out` completes that pair**, and is the sink half of the same hop
+([ADR `statsd-output`](adr/statsd-output.md)'s TLS amendment): the identical `TlsClientConfig`
+`syslog_out`/`logit_out` take, `transport: tcp` only, presence turns TLS on and makes it required,
+`connect_timeout` bounding the connect and the handshake as two separate phases, and
+`insecure_skip_verify` behaving (and warning) exactly as it does on those sinks. See
+["`statsd_out`: `transport: tcp` and TLS"](#statsd_out-transport-tcp-and-tls) above for the one
+behaviour that is *not* shared with the other sinks — a TLS write failure is `Fault::Ambiguous` and
+the batch is never resent, because a redelivered statsd counter corrupts a value rather than
+duplicating a line.
+
+Which component takes which block, in one place:
+
+| Component | Block | Turned on by | Notes |
+|---|---|---|---|
+| `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 22 |
+| `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
+| `prometheus_in` | `TlsClientConfig` | an `https://` scrape target | a scrape client, not a listener; a set block with no `https://` target is rule 40 |
+| `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
+| `syslog_in`, `graphite_in`, `statsd_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
+
+`TlsClientConfig` is `ca_file`/`cert_file`/`key_file`/`insecure_skip_verify`; `TlsServerConfig` is
+`cert_file`/`key_file`/`client_ca_file`. Every path resolves relative to the config file's own
+directory and accepts `!env`. There is no `collectd_out`/`graphite_out` row: collectd's `network`
+plugin is UDP-only, and carbon's own senders speak no TLS.
 
 ## Forwarding between `logit` nodes
 

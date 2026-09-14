@@ -669,12 +669,6 @@ already built that have a known, accepted rough edge.
   and count `logit.output.{tags,labels}.normalized{reason="multi_value"}` once per attribute. See
   [ADR `statsd-output`](adr/statsd-output.md)'s amendment and
   [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment.
-- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only. `syslog_out`'s own TLS support closed
-  against `crates/logit-outputs/src/tls.rs::build_client_config` and the boxed-`AsyncStream`
-  `Conn::Tcp` shape (`docs/adr/syslog-tcp-ingress-and-tls.md`); the same generic TCP driver
-  (`logit-inputs::tcp::TcpListener`) `syslog_in` now runs on would carry `statsd_in`'s ingress side
-  too, per that ADR's Consequences. That's the adoption path here as well, not a design decision to
-  redo — DTLS stays out of scope on both sinks either way.
 - **Closed: a non-UTF-8 syslog MSG decodes to a `Value::Bytes` event instead of being rejected** —
   RFC 5424's `MSG-ANY` permits arbitrary octets, and `logit-core::Value`'s `Bytes` variant now
   carries it. `parse_line`/`parse_5424`/`parse_3164` (`crates/logit-inputs/src/syslog.rs`) parse

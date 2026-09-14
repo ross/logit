@@ -831,7 +831,12 @@ Worked examples, one per shipped component:
   changing after lossy UTF-8 plus sanitization. A `MetricKind::GaugeDelta` reaching this encoder
   with `relative_gauges: false` reports under
   `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the identical key `influxdb_out`
-  uses, so one grep finds both sinks. Retry stays a Layer 2 metric here too.
+  uses, so one grep finds both sinks. **New**, `logit.output.reconnects` (count, TCP only) —
+  incremented on every connect *after* the first, exactly as `syslog_out`'s above: a climbing
+  count in steady state means the peer or the network, not this sink, is unstable. Counted on a
+  plaintext and a TLS connection alike, since both take the same `TcpDial::connect` path
+  ([ADR `statsd-output`](../adr/statsd-output.md)'s TLS amendment); UDP is connectionless and
+  never reports it. Retry stays a Layer 2 metric here too.
 - `collectd_out` (`crates/logit-outputs/src/collectd.rs`, `docs/adr/collectd-binary-relay.md`):
   **the codec emits its own counters and diagnostics directly** (`logit_proto::collectd`'s module
   doc has the full mapping-to-counter table: `logit.output.metrics.skipped{metric_kind|reason}`,
