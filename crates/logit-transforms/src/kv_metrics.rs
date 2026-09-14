@@ -5,13 +5,14 @@
 //! coercion rules, and the deliberate absence of a `tags:` field on this config surface -- tag
 //! selection is `keep`'s job (`crate::keep`), not something restated on every metrics producer.
 //!
-//! Stateless -- like `json`, only `process` is overridden; `flush_interval`/`flush` keep the
-//! `Transform` trait's defaults.
+//! Stateless as far as events go -- like `json`, `flush_interval`/`flush` keep the `Transform`
+//! trait's defaults. The one piece of state it does carry is a per-batch telemetry tally
+//! ([`Tally`]), emitted from `end_batch` rather than per event.
 
 use crate::numeric;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
-    AttrMap, DdSketch, Diagnostics, Event, MetricKind, MetricRecord, Resource, Symbol, Telemetry,
+    AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Samples, Symbol, Telemetry,
 };
 use logit_pipeline::Transform;
 use std::sync::Arc;
@@ -33,10 +34,16 @@ pub struct MetricSpec {
 }
 
 /// [`MetricSpec`], interned once at construction ([`KvMetrics::new`]) rather than per event --
-/// `intern`/`resolve` are hash lookups, and this runs on the hot path once per metric per event.
+/// `intern`/`lookup`/`resolve` are all hash probes on the process-wide interner, and this runs on
+/// the hot path once per metric per event. `field` included: it is a config string fixed at
+/// startup, so interning it here lets `process` read the attribute through
+/// [`AttrMap::get_sym`] -- a plain binary search on the event's own map -- instead of
+/// `AttrMap::get`'s lookup-hash-then-search round trip. The interner-growth argument
+/// `AttrMap::get` makes for *not* interning arbitrary keys (`docs/design/memory.md` §4) doesn't
+/// apply to a bounded, operator-written set of field names.
 struct CompiledMetric {
     name: Symbol,
-    field: Option<String>,
+    field: Option<Symbol>,
     unit: Option<Symbol>,
 }
 
@@ -44,9 +51,80 @@ impl From<MetricSpec> for CompiledMetric {
     fn from(spec: MetricSpec) -> Self {
         CompiledMetric {
             name: intern(&spec.name),
-            field: spec.field,
+            field: spec.field.as_deref().map(intern),
             unit: spec.unit.as_deref().map(intern),
         }
+    }
+}
+
+/// The three metric kinds this transform derives, as an index into [`Tally`] and the
+/// `metric_kind` tag value each one reports under.
+#[derive(Clone, Copy)]
+enum Kind {
+    Counter = 0,
+    Gauge = 1,
+    Distribution = 2,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::Counter, Kind::Gauge, Kind::Distribution];
+
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Counter => "counter",
+            Kind::Gauge => "gauge",
+            Kind::Distribution => "distribution",
+        }
+    }
+}
+
+/// Per-batch `derived`/`skipped` counts, one pair per [`Kind`], accumulated by `process` as
+/// plain integer increments and emitted by [`KvMetrics::end_batch`] with at most six
+/// `Telemetry::count` calls per *batch*. Before this existed `process` called `Telemetry::count`
+/// once per configured metric per event -- four calls on the reference config, each a
+/// `PointKey` build, a mutex acquire and a hash-map upsert
+/// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::upsert`) -- a cost the `json-parse`
+/// load-test flamegraph showed and `crates/logit-bench`'s `kv_metrics` bench never saw, because
+/// its fixture carries no telemetry handle. The counters' names, tags and sum-coalescing
+/// semantics are unchanged; only the point at which the coalescing happens moved from per-call
+/// to per-batch, which is invisible to a reader of the drained points (they were already summed
+/// until the next drain).
+#[derive(Default)]
+struct Tally {
+    derived: [u64; 3],
+    skipped: [u64; 3],
+}
+
+impl Tally {
+    fn record(&mut self, kind: Kind, derived: bool) {
+        if derived {
+            self.derived[kind as usize] += 1;
+        } else {
+            self.skipped[kind as usize] += 1;
+        }
+    }
+
+    /// Emits and resets. Emits only the non-zero cells so a config with no gauges never
+    /// manufactures a zero-valued `gauge` point.
+    fn flush(&mut self, telemetry: &Telemetry) {
+        for kind in Kind::ALL {
+            let i = kind as usize;
+            if self.derived[i] > 0 {
+                telemetry.count(
+                    "logit.transform.derived",
+                    self.derived[i] as f64,
+                    &[("metric_kind", kind.tag())],
+                );
+            }
+            if self.skipped[i] > 0 {
+                telemetry.count(
+                    "logit.transform.derived.skipped",
+                    self.skipped[i] as f64,
+                    &[("metric_kind", kind.tag())],
+                );
+            }
+        }
+        *self = Tally::default();
     }
 }
 
@@ -56,6 +134,7 @@ pub struct KvMetrics {
     distributions: Vec<CompiledMetric>,
     diag: Diagnostics,
     telemetry: Telemetry,
+    tally: Tally,
 }
 
 impl KvMetrics {
@@ -70,6 +149,7 @@ impl KvMetrics {
             distributions: distributions.into_iter().map(CompiledMetric::from).collect(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            tally: Tally::default(),
         }
     }
 
@@ -91,48 +171,51 @@ impl Transform for KvMetrics {
     /// then distributions) -- never replacing what's already there, and never dropping the event:
     /// this always returns `Some`. `log`/`span`/`attributes`/`timestamp` are untouched.
     ///
-    /// Records `logit.transform.derived{metric_kind}`/`.derived.skipped{metric_kind}` for every
+    /// Tallies `logit.transform.derived{metric_kind}`/`.derived.skipped{metric_kind}` for every
     /// configured metric, whether or not `metric_value`/`numeric` below actually produced a value
     /// -- the skipped-vs-derived ratio is the visible signal for the documented silent-skip path
     /// (a missing field, a non-numeric value) this transform deliberately never turns into a
-    /// diagnostic (`docs/design/internal-telemetry.md`). Tagged `metric_kind`, not `kind` -- `kind`
+    /// diagnostic (`docs/design/internal-telemetry.md`). Emitted once per batch from `end_batch`,
+    /// not here ([`Tally`]'s doc comment says why). Tagged `metric_kind`, not `kind` -- `kind`
     /// is reserved for a point's own component-kind identity
     /// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::drain`).
     fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+        // One `MetricList` growth for the whole append, not one per doubling: `MetricList` keeps
+        // a single record inline (`crates/logit-core/src/event.rs`), so on the reference config
+        // (four metrics) the second push would spill to the heap and a later push regrow it.
+        let total = self.counters.len() + self.gauges.len() + self.distributions.len();
+        event.metrics.reserve(total);
+
         for m in &self.counters {
-            if let Some(value) = metric_value(m, &event.attributes) {
-                let mut record = MetricRecord::new(m.name, MetricKind::counter(value));
-                record.unit = m.unit;
-                event.metrics.push(record);
-                self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "counter")]);
-            } else {
-                self.telemetry.count(
-                    "logit.transform.derived.skipped",
-                    1.0,
-                    &[("metric_kind", "counter")],
-                );
-            }
+            let derived = match metric_value(m, &event.attributes) {
+                Some(value) => {
+                    let mut record = MetricRecord::new(m.name, MetricKind::counter(value));
+                    record.unit = m.unit;
+                    event.metrics.push(record);
+                    true
+                }
+                None => false,
+            };
+            self.tally.record(Kind::Counter, derived);
         }
         for m in &self.gauges {
-            if let Some(value) = metric_value(m, &event.attributes) {
-                let mut record = MetricRecord::new(m.name, MetricKind::Gauge(value));
-                record.unit = m.unit;
-                event.metrics.push(record);
-                self.telemetry.count("logit.transform.derived", 1.0, &[("metric_kind", "gauge")]);
-            } else {
-                self.telemetry.count(
-                    "logit.transform.derived.skipped",
-                    1.0,
-                    &[("metric_kind", "gauge")],
-                );
-            }
+            let derived = match metric_value(m, &event.attributes) {
+                Some(value) => {
+                    let mut record = MetricRecord::new(m.name, MetricKind::Gauge(value));
+                    record.unit = m.unit;
+                    event.metrics.push(record);
+                    true
+                }
+                None => false,
+            };
+            self.tally.record(Kind::Gauge, derived);
         }
         for m in &self.distributions {
             // Graph validation (`crates/logit-pipeline/src/graph.rs`) already rejects a
             // fieldless distribution before a config carrying one ever reaches `build_spec` --
             // this is defense in depth for a direct `KvMetrics::new` caller (e.g. a test) that
             // bypasses graph resolution, not a path a real config can take.
-            let Some(field) = &m.field else {
+            let Some(field) = m.field else {
                 self.diag.warn_throttled(
                     "distribution_no_field",
                     format_args!(
@@ -143,26 +226,31 @@ impl Transform for KvMetrics {
                 );
                 continue;
             };
-            if let Some(value) = event.attributes.get(field).and_then(numeric) {
-                let mut sketch = DdSketch::new();
-                sketch.add(value);
-                let mut record = MetricRecord::new(m.name, MetricKind::Distribution(sketch));
-                record.unit = m.unit;
-                event.metrics.push(record);
-                self.telemetry.count(
-                    "logit.transform.derived",
-                    1.0,
-                    &[("metric_kind", "distribution")],
-                );
-            } else {
-                self.telemetry.count(
-                    "logit.transform.derived.skipped",
-                    1.0,
-                    &[("metric_kind", "distribution")],
-                );
-            }
+            let derived = match event.attributes.get_sym(field).and_then(numeric) {
+                Some(value) => {
+                    // A raw single-observation `Samples`, not a one-sample `DdSketch`: the
+                    // sketch is `aggregate`'s summarization to make (`MetricKind::Distribution`'s
+                    // own doc comment, `docs/adr/lossless-transit.md`), and a `Samples` of one
+                    // value sits entirely inline -- no bins `Vec` per distribution per event.
+                    // `docs/adr/kv-metrics-semantics.md` records the change.
+                    let mut record =
+                        MetricRecord::new(m.name, MetricKind::Samples(Samples::new([value])));
+                    record.unit = m.unit;
+                    event.metrics.push(record);
+                    true
+                }
+                None => false,
+            };
+            self.tally.record(Kind::Distribution, derived);
         }
         Some(event)
+    }
+
+    /// Emits the batch's tallied `derived`/`skipped` counts -- see [`Tally`]. A disabled handle
+    /// makes each `Telemetry::count` an immediate return, so the tally is still reset but nothing
+    /// else happens.
+    fn end_batch(&mut self) {
+        self.tally.flush(&self.telemetry);
     }
 }
 
@@ -173,9 +261,9 @@ impl Transform for KvMetrics {
 /// path, not an edge case: nginx's `$upstream_response_time` is `-` on a non-proxied request and a
 /// comma-separated list on a retried one.
 fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
-    match &m.field {
+    match m.field {
         None => Some(1.0),
-        Some(field) => attrs.get(field).and_then(numeric),
+        Some(field) => attrs.get_sym(field).and_then(numeric),
     }
 }
 
@@ -265,12 +353,13 @@ mod tests {
         assert_eq!(counter_value(metric_named(&event, "bytes").unwrap()), 512.0);
         assert_eq!(gauge_value(metric_named(&event, "conns").unwrap()), 3.0);
         match &metric_named(&event, "request_time").unwrap().kind {
-            MetricKind::Distribution(sketch) => {
-                assert_eq!(sketch.count(), 1);
-                let q = sketch.quantile(0.5).expect("single-sample sketch has a median");
-                assert!((q - 0.012).abs() < 0.001, "got {q}");
+            // Raw, unsampled, exactly one observation -- summarizing is `aggregate`'s job.
+            MetricKind::Samples(samples) => {
+                assert_eq!(samples.values.as_slice(), &[0.012]);
+                assert_eq!(samples.sample_rate, 1.0);
+                assert!(!samples.values.spilled(), "one value must sit inline, no heap");
             }
-            other => panic!("expected Distribution, got {other:?}"),
+            other => panic!("expected Samples, got {other:?}"),
         }
     }
 
@@ -455,9 +544,48 @@ mod tests {
         let resource = default_resource();
         kv.process(&resource, event_with_attrs(&[])).unwrap();
 
+        // Nothing is emitted until the batch closes -- the tally is per batch, not per event.
+        assert!(registry.drain(0).is_empty(), "no telemetry before end_batch");
+        kv.end_batch();
+
         let events = registry.drain(0);
         assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), Some(1.0));
         assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "counter"), None);
+    }
+
+    #[test]
+    fn a_batch_of_events_emits_one_summed_point_per_kind() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("derive", "kv_metrics", "transform");
+        let mut kv = KvMetrics::new(
+            vec![spec("hits", None), spec("bytes", Some("body_bytes_sent"))],
+            vec![],
+            vec![spec("rt", Some("request_time"))],
+        )
+        .with_telemetry(telemetry);
+        let resource = default_resource();
+        for i in 0..5 {
+            // `bytes` is present on the even events only; `rt` never.
+            let attrs: Vec<(&str, Value)> =
+                if i % 2 == 0 { vec![("body_bytes_sent", Value::U64(1))] } else { vec![] };
+            kv.process(&resource, event_with_attrs(&attrs)).unwrap();
+        }
+        kv.end_batch();
+
+        let events = registry.drain(0);
+        assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), Some(8.0));
+        assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "counter"), Some(2.0));
+        assert_eq!(
+            derived_count(&events, "logit.transform.derived.skipped", "distribution"),
+            Some(5.0)
+        );
+        assert_eq!(derived_count(&events, "logit.transform.derived", "distribution"), None);
+        assert_eq!(derived_count(&events, "logit.transform.derived", "gauge"), None);
+        assert_eq!(derived_count(&events, "logit.transform.derived.skipped", "gauge"), None);
+
+        // The tally reset: a second, empty batch emits nothing new.
+        kv.end_batch();
+        assert!(registry.drain(0).is_empty(), "flushed tally must not re-emit");
     }
 
     #[test]
@@ -468,6 +596,7 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
         kv.process(&resource, event_with_attrs(&[])).unwrap();
+        kv.end_batch();
 
         let events = registry.drain(0);
         assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), None);
@@ -487,6 +616,7 @@ mod tests {
         let resource = default_resource();
         let event = event_with_attrs(&[("a", Value::U64(1)), ("request_time", Value::F64(0.5))]);
         kv.process(&resource, event).unwrap();
+        kv.end_batch();
 
         let events = registry.drain(0);
         assert_eq!(derived_count(&events, "logit.transform.derived", "counter"), Some(1.0));
