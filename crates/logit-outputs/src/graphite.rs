@@ -95,8 +95,9 @@
 //! last-write-wins **per `(path, second)`** -- a redelivered datapoint for a second whisper already
 //! holds a value for simply overwrites it with the same number, rather than accumulating like a
 //! collectd COUNTER or a statsd `|c` would (`influxdb.rs:191-199`'s identical argument for
-//! InfluxDB's own idempotent-overwrite semantics). This is the first non-HTTP sink in the repo to
-//! claim `true`. **The boundary**: this is whisper's behavior specifically, not a property of the
+//! InfluxDB's own idempotent-overwrite semantics). This is the first non-HTTP sink with a real
+//! destination to claim `true` (`null_out` claims it too, but trivially -- it has no destination
+//! to redeliver to). **The boundary**: this is whisper's behavior specifically, not a property of the
 //! carbon wire protocol itself -- a non-whisper Graphite-protocol receiver (a different storage
 //! engine listening on the same wire) could treat a redelivered datapoint as an addition instead,
 //! and this sink would have no way to tell. State this plainly rather than silently assuming every

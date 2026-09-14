@@ -1181,7 +1181,7 @@ pub enum ComponentKind {
         #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_frame_bytes: u64,
-        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 43 rejects `0s`.
+        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.
         #[serde(default = "default_graphite_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,

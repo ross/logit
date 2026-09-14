@@ -1538,7 +1538,7 @@
           ],
           "properties": {
             "connect_timeout": {
-              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 43 rejects `0s`.",
+              "description": "TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.",
               "default": "5s",
               "type": "string"
             },
