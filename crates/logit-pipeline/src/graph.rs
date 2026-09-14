@@ -177,11 +177,10 @@
 //!     (`docs/adr/syslog-tcp-ingress-and-tls.md`), so silently ignoring the block would leave an
 //!     operator who asked for encryption on a plaintext datagram socket.
 //! 45. Every TCP listener's `handshake_timeout` must be greater than `0s`, and a *non-default*
-//!     value is rejected where nothing could consult it -- on a UDP `syslog_in` (no connection to
-//!     hand shake) and on a plaintext `otlp_in` (the field bounds that listener's TLS accept and
-//!     nothing else). `0s` is an impossible budget, not a tight one -- rules 9/15/18/28's call
-//!     again -- and set-but-ignored is rule 33's shape for an "only means anything under X" field
-//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//!     value is rejected where nothing could consult it -- on a UDP `syslog_in`, which has no
+//!     connection to hand shake. `0s` is an impossible budget, not a tight one -- rules
+//!     9/15/18/28's call again -- and set-but-ignored is rule 33's shape for an "only means
+//!     anything under X" field (`docs/adr/syslog-tcp-ingress-and-tls.md`).
 //! 46. A `graphite_in`'s and a `graphite_out`'s protocol/transport combination and size bounds
 //!     (`docs/adr/graphite-carbon-relay.md`). `protocol: pickle` requires `transport: tcp` on
 //!     both kinds: carbon's pickle wire is a 4-byte big-endian length prefix around each batch
@@ -2005,22 +2004,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // would accept nothing at all: the same "0 is impossible, not just small" call rules 9/15/18/28
     // already make for a flush interval, a queue bound, and a poll interval.
     //
-    // The two context checks are rule 43's spirit applied to this field instead of `tls:`, and
-    // rule 33's shape for an "only means anything under X" field: where nothing could ever consult
-    // the value, an operator who set one meant it to take effect, so set-but-ignored is an error
-    // rather than a silent no-op. Only a *non-default* value is rejected in either case, so the
-    // field can carry its default on every `syslog_in`/`otlp_in` without making `transport: udp`
-    // or a plaintext `otlp_in` a config error.
+    // The context check is rule 43's spirit applied to this field instead of `tls:`, and rule 33's
+    // shape for an "only means anything under X" field: where nothing could ever consult the
+    // value, an operator who set one meant it to take effect, so set-but-ignored is an error
+    // rather than a silent no-op. A UDP `syslog_in` has no connection at all to hand shake. Only a
+    // *non-default* value is rejected, so the field can carry its default on every `syslog_in`
+    // without making `transport: udp` a config error.
     //
-    // - A UDP `syslog_in` has no connection at all to hand shake.
-    // - A *plaintext* `otlp_in` has a connection but no phase this field reaches: the value bounds
-    //   that listener's TLS accept and nothing else, because after it the accepted stream goes
-    //   straight to `hyper_util`'s `auto::Builder`, whose own version sniff this codebase does not
-    //   wrap (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout" section, and
-    //   `docs/known-gaps.md`'s plaintext-`otlp_in` row). With no `tls:` block there is no TLS
-    //   accept, so the field is inert -- which is worth saying out loud, since an operator
-    //   reaching for it on a plaintext listener is probably reaching for the idle/first-byte bound
-    //   that listener does not have.
+    // A *plaintext* `otlp_in` used to be the second such case -- that listener's budget once
+    // bounded its TLS accept and nothing else. It now bounds the wait for a plaintext
+    // connection's first byte too (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout" and
+    // "peek, not a read" sections), so the value is live with or without a `tls:` block and there
+    // is nothing left to reject.
     for (id, component) in &components {
         let handshake_timeout = match &component.kind {
             ComponentKind::SyslogIn { handshake_timeout, .. }
@@ -2037,16 +2032,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if handshake_timeout == default_handshake_timeout() {
             continue; // a defaulted value is not a set one -- see this rule's comment
         }
-        match &component.kind {
-            ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. } => anyhow::bail!(
+        if let ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. } = &component.kind {
+            anyhow::bail!(
                 "component '{id}': 'handshake_timeout' needs 'transport: tcp' -- a UDP syslog_in \
                  has no connection to hand shake, so the value could never take effect"
-            ),
-            ComponentKind::OtlpIn { tls: None, .. } => anyhow::bail!(
-                "component '{id}': 'handshake_timeout' needs 'tls:' -- on otlp_in it bounds the \
-                 TLS accept only, so on a plaintext listener there is no phase for it to bound"
-            ),
-            _ => {}
+            );
         }
     }
 
@@ -5456,16 +5446,18 @@ mod tests {
         assert!(err.contains("handshake_timeout") && err.contains("transport: tcp"), "got: {err}");
     }
 
-    /// The `otlp_in` half of the same check, and the one rule 33 is the closest precedent for:
-    /// that listener's budget bounds its TLS accept alone, so with no `tls:` block there is no
-    /// phase for it to reach and a set value is a guaranteed no-op.
+    /// A plaintext `otlp_in` used to be the second context check here -- rejected, because that
+    /// listener's budget once bounded its TLS accept alone. It now also bounds the wait for a
+    /// plaintext connection's first byte (`crates/logit-inputs/src/otlp.rs`'s "peek, not a read"
+    /// section), so a real value there is live rather than a no-op and the rule no longer names
+    /// `otlp_in` at all. The twin of the removed rejection test.
     #[test]
-    fn a_non_default_handshake_timeout_on_a_plaintext_otlp_in_is_rejected() {
-        let err = expect_err(cfg(vec![
+    fn a_non_default_handshake_timeout_on_a_plaintext_otlp_in_resolves_fine() {
+        resolve(cfg(vec![
             ("in", vec![], otlp_in_with_handshake_timeout(Duration::from_secs(30))),
             ("out", vec!["in"], sink()),
-        ]));
-        assert!(err.contains("handshake_timeout") && err.contains("tls:"), "got: {err}");
+        ]))
+        .expect("a plaintext otlp_in with a real handshake_timeout should resolve");
     }
 
     /// And the same value on an `otlp_in` that really terminates TLS is ordinary -- the check is
@@ -5484,17 +5476,6 @@ mod tests {
         };
         resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
-    }
-
-    /// A plaintext `otlp_in` left at the default stays valid -- the default is not a set value,
-    /// which is what keeps every existing `otlp_in:` config in the wild resolving.
-    #[test]
-    fn a_plaintext_otlp_in_at_the_default_handshake_timeout_resolves_fine() {
-        let component: logit_config::Component =
-            serde_json::from_str(r#"{"type": "otlp_in", "bind": "127.0.0.1:0"}"#)
-                .expect("should deserialize");
-        resolve(cfg(vec![("in", vec![], component.kind), ("out", vec!["in"], sink())]))
-            .expect("a defaulted handshake_timeout on a plaintext otlp_in should resolve");
     }
 
     /// The other side of that check, and what keeps every existing UDP `syslog_in:` config in the
