@@ -76,7 +76,8 @@ use tokio_rustls::TlsAcceptor;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// See this module's own doc comment's "Connection limit" section for why this listener rejects
-/// outright rather than queuing, unlike `otlp_in`.
+/// outright rather than queuing, and for the one thing it does differently from `otlp_in` and
+/// `syslog_in`'s driver, which reject at the same cap: the `Reject` goes out after the TLS wrap.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// `crate::tls::TlsServerSettings`, re-exported here for symmetry with `crate::otlp`'s own path
