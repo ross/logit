@@ -379,3 +379,20 @@ did not. `Diagnostics` now shares its counts across every clone of one component
 ([ADR `service-lifecycle-and-output-retry`](service-lifecycle-and-output-retry.md)'s 2026-09-14
 amendment), which is the general form of what that workaround bought for two keys, so the
 connection's own `&mut Diagnostics` is threaded through instead and the `Mutex` is deleted.
+
+## Amendment: idle-connection timeout closes the gap this ADR held out (2026-09-14)
+
+The "Pre-handshake timeout" section above and the Consequences list both named a specific gap this
+decision deliberately did not close: `handshake_timeout` bounds only the pre-message phases, and a
+connection that gets past them and then goes quiet held its connection-cap permit indefinitely,
+with "closing that gap is its own effort with its own ADR" the explicit call at the time. That
+effort is done: [ADR `idle-connection-timeout`](idle-connection-timeout.md) adds an opt-in
+`idle_timeout:` field to `syslog_in` (`transport: tcp`) and the same TCP driver's other listeners,
+closing exactly the row this ADR opened. The reset rule answers the design question this ADR's own
+no-receive-queue posture raised without settling: the clock runs only while the driver is waiting
+on the peer's socket, reset by bytes read and by an interval flush actually emitting a batch, so
+time blocked handing a batch to a full downstream never counts against a peer -- a connection
+stalled on backpressure is never mistaken for a silent one. See
+[`docs/deploying.md`'s "`idle_timeout` on a TCP listener"](../deploying.md#idle_timeout-on-a-tcp-listener)
+for the operator-facing account, including the recommendation to enable it wherever consistent
+traffic is expected.
