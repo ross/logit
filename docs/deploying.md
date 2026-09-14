@@ -600,8 +600,9 @@ examples pointing at this sink. Four things worth knowing before deploying one:
   shape as `statsd_out`'s own setting; `max_frame_bytes:` (default `1MiB`, Twisted's own
   `Int32StringReceiver.MAX_LENGTH`) bounds one pickle frame instead, and applies regardless of
   transport since pickle is TCP-only anyway. `connect_timeout:` (TCP only, default `5s`) is
-  `statsd_out`'s/`syslog_out`'s own default. This sink is also the first non-HTTP sink in the repo
-  to report `duplicate_safe: true` — whisper is last-write-wins per `(path, second)`, so a
+  `statsd_out`'s/`syslog_out`'s own default. This sink is also the first non-HTTP sink with a real
+  destination to report `duplicate_safe: true` (`null_out` reports it trivially, having no
+  destination) — whisper is last-write-wins per `(path, second)`, so a
   redelivered datapoint on retry simply overwrites itself with the same number rather than
   double-counting, unlike a collectd COUNTER or a statsd `|c`. That argument is specifically about
   whisper's own storage semantics, not the carbon wire protocol in the abstract — a non-whisper
