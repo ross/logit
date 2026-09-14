@@ -329,7 +329,7 @@ fn build_spec(
         // takes `tcp_receive_config`'s four batching/shutdown fields, not `receive_config`'s eight
         // (graph rule 17). `tls:` is TCP-only -- rule 43 has already rejected it under UDP, and
         // `StatsdInput::with_tls` refuses it again on that arm.
-        StatsdIn { bind, transport, tls, handshake_timeout } => {
+        StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
                     StatsdInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -339,9 +339,10 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // A no-op on the UDP arm, which has no connection to bound -- rule 45 has already
-            // rejected a non-default value there, so nothing is silently discarded here.
-            .with_handshake_timeout(*handshake_timeout);
+            // Both are a no-op on the UDP arm, which has no connection to bound -- rules 45 and
+            // 53 have already rejected a value there, so nothing is silently discarded here.
+            .with_handshake_timeout(*handshake_timeout)
+            .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -370,16 +371,18 @@ fn build_spec(
         // which picks its own shared driver from `transport`: `UdpListener` under `udp`,
         // `TcpListener` under `tcp`. `with_receive` is safe to call either way -- graph rule 17
         // has already rejected a queue-bounding field on the TCP case, so what reaches the stream
-        // driver is only the batch-assembly half it actually reads. `handshake_timeout` is a no-op
-        // on the UDP arm, which has no connection to bound (rule 45 has already rejected a
-        // non-default value there); `tls:` is TCP-only -- rule 43 has already rejected it under
-        // UDP, and `GraphiteInput::with_tls` refuses it again on that arm.
+        // driver is only the batch-assembly half it actually reads. `handshake_timeout` and
+        // `idle_timeout` are both no-ops on the UDP arm, which has no connection to bound (rules
+        // 45 and 53 have already rejected a value there); `tls:` is TCP-only -- rule 43 has
+        // already rejected it under UDP, and `GraphiteInput::with_tls` refuses it again on that
+        // arm.
         GraphiteIn {
             bind,
             transport,
             protocol,
             tls,
             handshake_timeout,
+            idle_timeout,
             max_line_bytes,
             max_frame_bytes,
         } => {
@@ -393,7 +396,8 @@ fn build_spec(
             .with_receive(receive_config(&component.receive))
             .with_max_line_bytes(*max_line_bytes as usize)
             .with_max_frame_bytes(*max_frame_bytes as usize)
-            .with_handshake_timeout(*handshake_timeout);
+            .with_handshake_timeout(*handshake_timeout)
+            .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -404,7 +408,7 @@ fn build_spec(
         // batching/shutdown fields, not `receive_config`'s eight (graph rule 17,
         // `docs/adr/syslog-tcp-ingress-and-tls.md`). `tls:` is TCP-only -- rule 43 has already
         // rejected it under UDP, and `SyslogInput::with_tls` refuses it again on that arm.
-        SyslogIn { bind, transport, tls, handshake_timeout } => {
+        SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
                     SyslogInput::new(bind.clone()).with_receive(receive_config(&component.receive))
@@ -414,9 +418,10 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // A no-op on the UDP arm, which has no connection to bound -- rule 45 has already
-            // rejected a non-default value there, so nothing is silently discarded here.
-            .with_handshake_timeout(*handshake_timeout);
+            // Both are a no-op on the UDP arm, which has no connection to bound -- rules 45 and
+            // 53 have already rejected a value there, so nothing is silently discarded here.
+            .with_handshake_timeout(*handshake_timeout)
+            .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }
@@ -1425,6 +1430,7 @@ mod tests {
                 transport: logit_config::StatsdTransport::default(),
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: None,
             },
         }
     }
@@ -1955,6 +1961,7 @@ mod tests {
                 protocol,
                 tls,
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
                 max_line_bytes: 8192,
                 max_frame_bytes: 1 << 20,
             },
@@ -2328,6 +2335,7 @@ mod tests {
                 transport,
                 tls,
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
             },
         }
     }
@@ -2515,6 +2523,7 @@ mod tests {
                 transport: logit_config::SyslogTransport::Tcp,
                 tls: None,
                 handshake_timeout: Duration::from_millis(50),
+                idle_timeout: None,
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
@@ -2565,6 +2574,106 @@ mod tests {
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
         assert_closes_a_silent_connection(spec, &addr).await;
+    }
+
+    // ---- `idle_timeout` reaches each of the three TCP listeners that honour it ------------------
+    //
+    // The same "assert something only the real call could produce" shape as the
+    // `handshake_timeout` tests above, one phase later: a 50ms `idle_timeout`, a client that
+    // sends one complete frame and then goes quiet, and the server-side close it must produce.
+    // `handshake_timeout` is deliberately left at its 5s default in all three, so the close can
+    // only have come from the idle clock -- delete `.with_idle_timeout(..)` from a `build_spec`
+    // arm and that test fails on its 1s read.
+
+    /// Spawns a built `NodeSpec::Input`, sends `wire` (one complete frame for that listener's
+    /// protocol), then asserts the server closes the connection within a second of it going
+    /// quiet -- well inside a 5s `handshake_timeout` and well outside a 50ms `idle_timeout`.
+    async fn assert_closes_a_quiet_connection(spec: NodeSpec, addr: &str, wire: &[u8]) {
+        let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
+        tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut quiet = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut quiet, wire).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut quiet, &mut buf),
+        )
+        .await
+        .expect("a configured 50ms idle_timeout should close a quiet connection within 1s");
+        match result {
+            Ok(n) => assert_eq!(n, 0, "expected a close, got a byte"),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("read failed outright: {err}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_a_tcp_syslog_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::SyslogIn {
+                bind: addr.clone(),
+                transport: logit_config::SyslogTransport::Tcp,
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: Some(Duration::from_millis(50)),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_quiet_connection(spec, &addr, b"<13>hello\n").await;
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_a_tcp_graphite_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::GraphiteIn {
+                bind: addr.clone(),
+                transport: logit_config::GraphiteTransport::Tcp,
+                protocol: logit_config::GraphiteProtocol::Plaintext,
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: Some(Duration::from_millis(50)),
+                max_line_bytes: 8192,
+                max_frame_bytes: 1 << 20,
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_quiet_connection(spec, &addr, b"some.path 1 1700000000\n").await;
+    }
+
+    #[tokio::test]
+    async fn build_spec_wires_idle_timeout_into_a_tcp_statsd_input() {
+        let addr = free_port().await;
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::StatsdIn {
+                bind: addr.clone(),
+                transport: logit_config::StatsdTransport::Tcp,
+                tls: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: Some(Duration::from_millis(50)),
+            },
+        };
+        let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
+        assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
     }
 
     #[test]
@@ -3406,6 +3515,7 @@ mod tests {
                 transport,
                 tls,
                 handshake_timeout: Duration::from_secs(5),
+                idle_timeout: None,
             },
         }
     }

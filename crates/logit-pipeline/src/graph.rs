@@ -237,6 +237,17 @@
 //!     (`docs/adr/statsd-output.md`'s TLS amendment). One rule per *sink* (24/34/44/52), unlike
 //!     rule 43's one-rule-for-every-listener, because each sink also checks its own `tls:`
 //!     internals.
+//! 53. A TCP listener's `idle_timeout`, where set, must be greater than `0s`, and must not be set
+//!     at all on a UDP `syslog_in`, `graphite_in` or `statsd_in`, which have no connection to time
+//!     out (`docs/adr/idle-connection-timeout.md`). One rule over all five kinds that carry the
+//!     field -- `syslog_in`, `graphite_in`, `statsd_in`, `logit_in` and `otlp_in` -- rule 43's
+//!     one-rule-for-every-listener shape rather than one number per kind; the `logit_in` and
+//!     `otlp_in` arms follow with the PRs that make those two listeners honour the field, so no
+//!     landed state accepts a set-but-ignored `idle_timeout`. `0s` is rules 9/15/18/28/45's
+//!     impossible bound again: it would close every connection the instant the listener stopped
+//!     reading from it. Unlike rule 45's field this one is an `Option` with no default to tell
+//!     apart from a set value, so there is nothing to compare against and the message says what to
+//!     do instead -- omit the field to disable the idle timeout.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -2112,6 +2123,54 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 53: a TCP listener's `idle_timeout`, where set, must be non-zero and must be on a kind
+    // and transport that has a connection to time out (`docs/adr/idle-connection-timeout.md`).
+    // Rule 45's two checks one field over, with two differences worth naming.
+    //
+    // First, the field is an `Option`, not a defaulted `Duration`: absent *is* "no idle timeout",
+    // so there is no `default_*` value to tell apart from a set one and no
+    // `handshake_timeout`-shaped "a defaulted value is not a set one" escape hatch. Every `Some`
+    // is a set value, which is why the UDP check below rejects any value rather than only a
+    // non-default one -- and why the zero message names the fix (`omit the field`) rather than a
+    // legal value to use instead.
+    //
+    // Second, `0s` is impossible for a different reason than rule 45's: not "no handshake
+    // completes in zero time" but "a connection is momentarily idle every time this listener is
+    // waiting on its next byte", so a zero budget would close every connection the instant it
+    // stopped sending -- rules 9/15/18/28/45's impossible-bound call either way.
+    //
+    // One loop over every kind that carries the field, rule 43's one-rule-for-every-listener
+    // shape: the check, the message and the reasoning are identical on all of them and only the
+    // `transport` spelling differs. `logit_in` and `otlp_in` join by adding an arm with the PR
+    // that makes each honour the field.
+    for (id, component) in &components {
+        let (kind_name, idle_timeout, datagram) = match &component.kind {
+            ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
+                ("syslog_in", *idle_timeout, *transport == SyslogTransport::Udp)
+            }
+            ComponentKind::GraphiteIn { idle_timeout, transport, .. } => {
+                ("graphite_in", *idle_timeout, *transport == GraphiteTransport::Udp)
+            }
+            ComponentKind::StatsdIn { idle_timeout, transport, .. } => {
+                ("statsd_in", *idle_timeout, *transport == StatsdTransport::Udp)
+            }
+            _ => continue,
+        };
+        let Some(idle_timeout) = idle_timeout else { continue };
+        if idle_timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': 'idle_timeout' must be greater than 0s -- omit the field to \
+                 disable the idle timeout"
+            );
+        }
+        if datagram {
+            anyhow::bail!(
+                "component '{id}': 'idle_timeout' needs 'transport: tcp' -- a UDP {kind_name} has \
+                 no connection to time out, so the value could never take effect"
+            );
+        }
+    }
+
     // Rule 46: `graphite_in`'s and `graphite_out`'s protocol/transport pair and size bounds
     // (`docs/adr/graphite-carbon-relay.md`). Carbon's pickle wire is a 4-byte big-endian length
     // prefix around each batch (Twisted's `Int32StringReceiver`), which has no meaning in a
@@ -2579,6 +2638,7 @@ mod tests {
             transport: StatsdTransport::default(),
             tls: None,
             handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
         }
     }
 
@@ -4946,6 +5006,21 @@ mod tests {
                 client_ca_file: None,
             }),
             handshake_timeout,
+            idle_timeout: None,
+        }
+    }
+
+    /// [`syslog_in`] with rule 53's knob exposed instead -- the `Option` that rule reads.
+    fn syslog_in_with_idle_timeout(
+        transport: SyslogTransport,
+        idle_timeout: Option<Duration>,
+    ) -> ComponentKind {
+        ComponentKind::SyslogIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport,
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout,
         }
     }
 
@@ -5552,7 +5627,7 @@ mod tests {
         .expect("a mutual-TLS statsd_out over tcp is a legal config");
     }
 
-    // ---- Rule 45: `handshake_timeout` on the three TCP listeners --------------------------------
+    // ---- Rule 45: `handshake_timeout` on the five TCP listeners ---------------------------------
 
     /// `0s` cannot be met by any handshake, so a listener configured with it would accept
     /// connections only to close each one immediately -- an impossible bound, rejected the way
@@ -5670,6 +5745,136 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]))
         .expect("a TCP syslog_in with a real handshake_timeout should resolve");
+    }
+
+    // ---- Rule 53: `idle_timeout` on a TCP listener ----------------------------------------------
+    //
+    // Rule 45's tests one field over. The shapes differ in one way worth seeing in the test
+    // names: because `idle_timeout` is an `Option`, *any* value under `transport: udp` is
+    // rejected, not just a non-default one -- there is no default to exempt.
+
+    /// `0s` would close a connection the instant this listener stopped reading from it -- every
+    /// connection is momentarily idle between frames. An impossible bound, rejected the way rules
+    /// 9/15/18/28/45 reject theirs, with a message naming the fix, since the way to turn the
+    /// feature off is to omit the field rather than to set a sentinel value. One test per kind,
+    /// because the rule reads the field off three separate variants.
+    #[test]
+    fn a_zero_idle_timeout_is_rejected_on_a_syslog_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], syslog_in_with_idle_timeout(SyslogTransport::Tcp, Some(Duration::ZERO))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_idle_timeout_is_rejected_on_a_graphite_in() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_with_idle_timeout(GraphiteTransport::Tcp, Some(Duration::ZERO)),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_zero_idle_timeout_is_rejected_on_a_statsd_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], statsd_in_with_idle_timeout(StatsdTransport::Tcp, Some(Duration::ZERO))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
+    }
+
+    /// Rule 43's spirit on this field, rule 45's context check one field over: a UDP listener has
+    /// no connection to time out, so an `idle_timeout` there could never take effect and
+    /// set-but-ignored is an error. One test per kind, since each reads its own `transport`.
+    #[test]
+    fn a_set_idle_timeout_under_transport_udp_is_rejected_on_a_syslog_in() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                syslog_in_with_idle_timeout(SyslogTransport::Udp, Some(Duration::from_secs(300))),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(
+            err.contains("idle_timeout")
+                && err.contains("transport: tcp")
+                && err.contains("syslog_in"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_set_idle_timeout_under_transport_udp_is_rejected_on_a_graphite_in() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                graphite_in_with_idle_timeout(
+                    GraphiteTransport::Udp,
+                    Some(Duration::from_secs(300)),
+                ),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(
+            err.contains("idle_timeout")
+                && err.contains("transport: tcp")
+                && err.contains("graphite_in"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_set_idle_timeout_under_transport_udp_is_rejected_on_a_statsd_in() {
+        let err = expect_err(cfg(vec![
+            (
+                "in",
+                vec![],
+                statsd_in_with_idle_timeout(StatsdTransport::Udp, Some(Duration::from_secs(300))),
+            ),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(
+            err.contains("idle_timeout")
+                && err.contains("transport: tcp")
+                && err.contains("statsd_in"),
+            "got: {err}"
+        );
+    }
+
+    /// And the ordinary case on every kind: a real value on the transport that actually has a
+    /// connection to time out.
+    #[test]
+    fn a_set_idle_timeout_on_a_tcp_listener_resolves_fine() {
+        for kind in [
+            syslog_in_with_idle_timeout(SyslogTransport::Tcp, Some(Duration::from_secs(300))),
+            graphite_in_with_idle_timeout(GraphiteTransport::Tcp, Some(Duration::from_secs(300))),
+            statsd_in_with_idle_timeout(StatsdTransport::Tcp, Some(Duration::from_secs(300))),
+        ] {
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .expect("a TCP listener with a real idle_timeout should resolve");
+        }
+    }
+
+    /// The other side of the context check, and what keeps every existing UDP config in the wild
+    /// valid: the field is absent by default, and absent is not a set value. Deliberately
+    /// deserializes a real config rather than constructing the variant by hand, so it exercises
+    /// `serde`'s `#[serde(default)]` path -- the thing rule 53's `Option` match actually has to
+    /// agree with.
+    #[test]
+    fn a_udp_syslog_in_with_no_idle_timeout_resolves_fine() {
+        let component: logit_config::Component =
+            serde_json::from_str(r#"{"type": "syslog_in", "bind": "127.0.0.1:0"}"#)
+                .expect("should deserialize");
+        resolve(cfg(vec![("in", vec![], component.kind), ("out", vec!["in"], sink())]))
+            .expect("an absent idle_timeout under UDP should resolve");
     }
 
     #[test]
@@ -6536,8 +6741,26 @@ mod tests {
                 client_ca_file: None,
             }),
             handshake_timeout,
+            idle_timeout: None,
             max_line_bytes,
             max_frame_bytes,
+        }
+    }
+
+    /// [`graphite_in`] with rule 53's knob exposed -- the `Option` that rule reads.
+    fn graphite_in_with_idle_timeout(
+        transport: GraphiteTransport,
+        idle_timeout: Option<Duration>,
+    ) -> ComponentKind {
+        ComponentKind::GraphiteIn {
+            bind: "0.0.0.0:2003".to_string(),
+            transport,
+            protocol: GraphiteProtocol::Plaintext,
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout,
+            max_line_bytes: 8192,
+            max_frame_bytes: 1 << 20,
         }
     }
 
@@ -7277,6 +7500,21 @@ mod tests {
                 client_ca_file: None,
             }),
             handshake_timeout,
+            idle_timeout: None,
+        }
+    }
+
+    /// [`statsd_in_full`] with rule 53's knob exposed instead -- the `Option` that rule reads.
+    fn statsd_in_with_idle_timeout(
+        transport: StatsdTransport,
+        idle_timeout: Option<Duration>,
+    ) -> ComponentKind {
+        ComponentKind::StatsdIn {
+            bind: "127.0.0.1:0".to_string(),
+            transport,
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout,
         }
     }
 

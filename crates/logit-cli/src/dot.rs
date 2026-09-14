@@ -71,6 +71,7 @@ mod tests {
                     transport: logit_config::StatsdTransport::default(),
                     tls: None,
                     handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
                 },
             },
         );
