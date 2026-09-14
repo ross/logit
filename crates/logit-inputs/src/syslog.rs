@@ -1926,8 +1926,9 @@ mod tests {
     /// `bad_line` throttles listener-wide, not per connection: the decoder clone each connection
     /// gets shares its `Diagnostics`' counts with every other clone of the component's value
     /// (`logit_core::Diagnostics`' type doc), so two connections rejecting two messages each
-    /// leave the component at 4. Counting per connection would leave this at 2 -- each
-    /// connection having counted to 2 in a copy that died with it.
+    /// leave the component at 4. Counting per connection would leave this at 0 -- `diag` here is
+    /// the value handed to `with_diagnostics`, and each connection would have counted to 2 in a
+    /// throwaway decoder clone of its own that died with the connection.
     ///
     /// The well-formed line written last on each connection is what orders the assertion after
     /// both connections' rejects: frames arriving on one connection are decoded in order, so
@@ -1960,7 +1961,8 @@ mod tests {
             diag.occurrences("bad_line"),
             4,
             "two connections rejecting two messages each must count on one listener-wide \
-             throttle; a per-connection count would leave this at 2"
+             throttle -- a decoder clone with counts of its own would leave this at 0, having \
+             counted 2 in each throwaway copy"
         );
         handle.abort();
     }
