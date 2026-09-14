@@ -1747,7 +1747,7 @@ mod tests {
         let diag = Diagnostics::new("syslog_in");
         // Held before the listener moves into its task: a clone of the very value it was given,
         // sharing the counts every connection task's own clone reports through.
-        let frame_diag = diag.clone();
+        let listener_diag = diag.clone();
         let listener = listener.with_telemetry(telemetry).with_diagnostics(diag);
         let (sink, _rx) = fanout_into_channel(16);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1764,7 +1764,7 @@ mod tests {
         }
 
         assert_eq!(
-            frame_diag.occurrences("framing_error"),
+            listener_diag.occurrences("framing_error"),
             3,
             "all three connections must count on the one listener-wide Diagnostics -- a clone \
              with counts of its own would leave this at 0, having counted 1 in each throwaway copy"
