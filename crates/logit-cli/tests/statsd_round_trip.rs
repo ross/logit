@@ -134,6 +134,13 @@
 //! two-line idiom, and a DogStatsD event/service check with no reordering to canonicalize -- is not
 //! a normalization at all: it relays byte-for-byte (modulo (3)/(4)/(9) above) because nothing about
 //! it needs to change.
+//!
+//! `mod tcp`/`mod tls` below add no new entry to this list -- `transport: tcp` (and TLS on top of
+//! it) changes framing and, for TLS, transport security, never message content. The one framing
+//! difference is mechanical: UDP newline-*joins* a batch's lines into one datagram, TCP
+//! newline-*terminates* each of them, so the captured TCP bytes are the UDP bytes plus one final
+//! `\n` (`mod tcp::strip_lf_framing`). Every normalization above still applies unchanged, since
+//! both transports share the same `StatsdEncoder`/`StatsdDecoder`.
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
@@ -870,4 +877,415 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
         "_sc|Redis connection|2|d:1700000000|#env:dev|m:Redis connection timed out after 10s",
         "the _sc line should survive the window exactly, d: and m: included"
     );
+}
+
+// ---- transport: tcp -----------------------------------------------------------------------
+
+/// `statsd_out(transport: tcp) -> statsd_in(transport: tcp)`, over the same fixture corpus the
+/// UDP tests above use, plus the two cases only a stream transport can exercise at all: a raw
+/// client whose line straddles two writes, and a line whose first byte is an ASCII digit (which a
+/// listener framing RFC 6587-style would read as an octet count and mis-frame the connection on).
+///
+/// The module doc's permitted-normalization list gains **no new entry** here: `transport: tcp`
+/// changes framing and nothing else. On UDP a batch's lines are newline-*joined* into one
+/// datagram with no trailing separator; on TCP each line is newline-*terminated*, so the captured
+/// frame is exactly the UDP bytes plus one final `\n`, which [`strip_lf_framing`] takes back off
+/// before the byte-for-byte comparison. Content, decode and every normalization above are shared:
+/// both transports run the same `StatsdEncoder`/`StatsdDecoder`.
+mod tcp {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
+
+    /// TCP twin of the top-level [`Harness`]: same `bind()`-then-`local_addr()` readiness for the
+    /// live `statsd_in`, plus a raw TCP "capture" listener standing in for the UDP capture socket
+    /// above -- it accepts one connection per round trip and reads it to EOF, since a fresh
+    /// `StatsdOutput::tcp` per call closes its connection (and so EOFs the peer) the moment it is
+    /// dropped. Modelled line for line on `syslog_round_trip.rs`'s own `mod tcp::TcpHarness`.
+    struct TcpHarness {
+        capture_addr: SocketAddr,
+        capture_rx: mpsc::Receiver<Vec<u8>>,
+        input_addr: SocketAddr,
+        rx: mpsc::Receiver<Delivered>,
+    }
+
+    impl TcpHarness {
+        async fn new() -> Self {
+            let capture =
+                TokioTcpListener::bind("127.0.0.1:0").await.expect("binding the capture listener");
+            let capture_addr =
+                capture.local_addr().expect("capture listener should have a local addr");
+            let (capture_tx, capture_rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = capture.accept().await else { break };
+                    let tx = capture_tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let _ = stream.read_to_end(&mut buf).await;
+                        let _ = tx.send(buf).await;
+                    });
+                }
+            });
+
+            let mut input = StatsdInput::tcp("127.0.0.1:0");
+            input.bind().await.expect("binding the tcp statsd_in listener");
+            let input_addr = input.local_addr().expect("bind() should leave a real address behind");
+
+            let (tx, rx) = mpsc::channel(16);
+            let sink = Fanout::new(vec![tx]);
+            tokio::spawn(async move {
+                let _ = input.run(sink).await;
+            });
+
+            Self { capture_addr, capture_rx, input_addr, rx }
+        }
+
+        /// Sends `batch` through a fresh TCP [`StatsdOutput`] built from `encoder()` -- once at
+        /// the raw capture listener, once at the live `statsd_in` -- and returns the captured
+        /// wire bytes alongside the [`EventBatch`] the real input decoded from them (receipt-time
+        /// `timestamp` fields already normalized). Mirrors the UDP [`Harness::round_trip`]
+        /// exactly, modulo the transport.
+        async fn round_trip(
+            &mut self,
+            batch: &EventBatch,
+            encoder: impl Fn() -> StatsdEncoder,
+        ) -> (Vec<u8>, EventBatch) {
+            let mut to_capture =
+                StatsdOutput::tcp(self.capture_addr.to_string(), Duration::from_secs(2))
+                    .with_encoder(encoder());
+            to_capture.send(batch).await.expect("send to the capture listener");
+            drop(to_capture); // closes the connection, EOFing the capture task's read_to_end
+            let framed = tokio::time::timeout(Duration::from_millis(500), self.capture_rx.recv())
+                .await
+                .expect("capture listener should receive the frame")
+                .expect("the capture channel should not have closed");
+
+            let mut to_input =
+                StatsdOutput::tcp(self.input_addr.to_string(), Duration::from_secs(2))
+                    .with_encoder(encoder());
+            to_input.send(batch).await.expect("send to the live statsd_in");
+            // Dropping it EOFs the listener's connection task, which flushes whatever it has
+            // accumulated straight away rather than on the 100ms batch timer.
+            drop(to_input);
+            let delivered = tokio::time::timeout(Duration::from_millis(500), self.rx.recv())
+                .await
+                .expect("statsd_in should decode and forward the batch")
+                .expect("the Fanout channel should not have closed");
+            let mut decoded = logit_pipeline::unwrap_batch(delivered);
+            normalize_receipt_time(&mut decoded);
+            (framed, decoded)
+        }
+    }
+
+    /// Strips the single trailing `LF` `statsd_out`'s TCP transport terminates its last line with,
+    /// asserting it was there -- the one framing difference between the two transports, and the
+    /// only thing a TCP round trip needs to account for that the UDP path above doesn't.
+    fn strip_lf_framing(frame: &[u8]) -> &[u8] {
+        let (last, rest) = frame.split_last().expect("a TCP frame is never empty");
+        assert_eq!(*last, b'\n', "statsd_out's TCP transport terminates every line with LF");
+        rest
+    }
+
+    /// TCP twin of the top-level `assert_byte_for_byte`: same fixture, same `.expected` bytes, but
+    /// the captured wire bytes are LF-terminated lines rather than a bare UDP datagram.
+    async fn assert_byte_for_byte_tcp(
+        harness: &mut TcpHarness,
+        fixture: &str,
+        encoder: impl Fn() -> StatsdEncoder,
+    ) {
+        let raw = read_fixture(fixture, "in");
+        let batch = direct_batch(&raw); // already receipt-time normalized
+        let expected = expected_bytes(fixture, &raw);
+        let (framed, decoded) = harness.round_trip(&batch, encoder).await;
+        assert_eq!(
+            strip_lf_framing(&framed),
+            expected.as_slice(),
+            "{fixture}: the LF-framed lines should match .expected (modulo the module doc's \
+             permitted normalizations)"
+        );
+        assert_eq!(
+            decoded, batch,
+            "{fixture}: decode(sink_output) should equal the original decode, as a whole EventBatch"
+        );
+    }
+
+    /// `statsd_out(transport: tcp) -> statsd_in(transport: tcp)`, over the same corpus the UDP
+    /// tests above use -- the framing changes (LF-terminated lines), the content and permitted
+    /// normalizations don't (this file's module doc). One test rather than three so the corpus
+    /// shares a single harness, the way the UDP tests share theirs.
+    #[tokio::test]
+    async fn fixture_corpus_round_trips_over_tcp() {
+        let mut harness = TcpHarness::new().await;
+        let cases: &[&str] = &[
+            // The DogStatsD docs' own worked examples.
+            "dogstatsd-counter",
+            "dogstatsd-gauge",
+            "dogstatsd-histogram-sampled",
+            "dogstatsd-set",
+            "dogstatsd-counter-tag",
+            "dogstatsd-distribution-tag",
+            "dogstatsd-gauge-timestamp",
+            "dogstatsd-counter-container-id",
+            "dogstatsd-event",
+            "dogstatsd-service-check",
+            // The hand-written grammar/normalization corpus.
+            "multi-value-timer",
+            "bare-tag-counter",
+            "tag-value-with-colon",
+            "packed-multi-line-datagram",
+            "all-segments-together",
+            "multi-tag-preserves-wire-order",
+            "dogstatsd-event-all-fields",
+            "event-text-with-pipe-and-escaped-newline",
+            "event-multibyte-title-lengths",
+            "event-title-contains-pipe",
+            "service-check-all-fields",
+            "service-check-no-message",
+            "packed-datagram-counter-event-service-check",
+            "event-text-trailing-space",
+            "service-check-message-trailing-space",
+            // The `.expected`-differs-from-`.in` normalizations.
+            "sampled-counter-rate-folded",
+            "explicit-rate-one-omitted",
+            "number-formatting-trailing-zeros",
+            "event-fields-reordered-canonicalized",
+            "repeated-tag-key-round-trips",
+            "repeated-tag-exact-duplicate-deduped",
+            "bare-tag-exact-duplicate-deduped",
+        ];
+        for name in cases {
+            assert_byte_for_byte_tcp(&mut harness, name, || StatsdEncoder::new(Format::DogStatsd))
+                .await;
+        }
+    }
+
+    /// The pin for `statsd_in`'s framing choice, end to end through the real component: a statsd
+    /// line may legally begin with an ASCII digit, which RFC 6587's auto-detecting framing (the
+    /// shared driver's default, and what `syslog_in` wants) would latch as an octet count and
+    /// reframe the whole connection on. No `statsd_out` involved -- a raw client, so the bytes on
+    /// the wire are exactly what is asserted.
+    #[tokio::test]
+    async fn a_raw_client_line_starting_with_a_digit_decodes_as_a_metric_name() {
+        let mut input = StatsdInput::tcp("127.0.0.1:0");
+        input.bind().await.expect("binding the tcp statsd_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("the listener should accept");
+        client.write_all(b"1.hits:7|c\n").await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("statsd_in should decode and forward the line")
+            .expect("the Fanout channel should not have closed");
+        let batch = logit_pipeline::unwrap_batch(delivered);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "1.hits");
+    }
+
+    /// A line whose `\n` only arrives in the second write: the driver's framer buffers across
+    /// reads, so this is one event rather than two halves rejected as malformed. The stream-only
+    /// case the UDP corpus cannot express at all, since a datagram is always whole.
+    #[tokio::test]
+    async fn a_line_split_across_two_writes_is_one_event() {
+        let mut input = StatsdInput::tcp("127.0.0.1:0");
+        input.bind().await.expect("binding the tcp statsd_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("the listener should accept");
+        client.write_all(b"halves.joined:4").await.unwrap();
+        client.flush().await.unwrap();
+        client.write_all(b"2|c\n").await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("statsd_in should decode and forward the reassembled line")
+            .expect("the Fanout channel should not have closed");
+        let batch = logit_pipeline::unwrap_batch(delivered);
+        assert_eq!(batch.events.len(), 1, "one line, not two malformed halves");
+        assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "halves.joined");
+    }
+}
+
+// ---- transport: tls -------------------------------------------------------------------------
+
+/// `statsd_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative case.
+///
+/// **The input half only.** `statsd_out` has no `tls:` block yet: that is the sink side of
+/// `docs/adr/statsd-output.md`'s own TLS work, landing right after this listener does, and when
+/// it does these tests gain a real `statsd_out -> statsd_in` TLS leg alongside the raw client
+/// below -- exactly the shape `syslog_round_trip.rs`'s `mod tls` already has. Until then the
+/// client is a raw `tokio_rustls` one, driven straight against the listener, which is enough to
+/// pin everything the listener itself is responsible for: that `with_tls` reaches the shared
+/// driver, that a `client_ca_file` really does require a client certificate, and that a client
+/// trusting the wrong CA is refused without taking the listener down with it.
+mod tls {
+    use super::*;
+    use logit_inputs::tcp::TlsServerSettings;
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    fn testdata_dir() -> std::path::PathBuf {
+        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
+        // `testdata/tls` -- two levels up from `CARGO_MANIFEST_DIR`, exactly
+        // `syslog_round_trip.rs`'s own `mod tls::testdata_dir`.
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    /// Stands up a TLS-terminating TCP `statsd_in` with `settings`, returning its bound address
+    /// and the `Fanout` receiver every decoded batch lands on -- `bind()`-then-`local_addr()`
+    /// readiness, the same idiom every harness in this file uses, no sleep needed.
+    async fn spawn_tls_input(
+        settings: &TlsServerSettings,
+    ) -> (SocketAddr, mpsc::Receiver<Delivered>) {
+        let mut input = StatsdInput::tcp("127.0.0.1:0")
+            .with_tls(settings, &testdata_dir())
+            .expect("a tls: block is legal on a tcp statsd_in");
+        input.bind().await.expect("binding the tls statsd_in listener");
+        let addr = input.local_addr().expect("bind() should leave a real address behind");
+        let (tx, rx) = mpsc::channel(16);
+        let sink = Fanout::new(vec![tx]);
+        tokio::spawn(async move {
+            let _ = input.run(sink).await;
+        });
+        (addr, rx)
+    }
+
+    /// A `tokio-rustls` client trusting exactly `ca_file` under `testdata/tls` -- `other-ca.pem`
+    /// is what makes the "wrong CA" case a real trust failure rather than a name mismatch.
+    /// `client_cert` is `(cert, key)` for the mTLS cases, `None` for a client presenting nothing.
+    fn connector(ca_file: &str, client_cert: Option<(&str, &str)>) -> tokio_rustls::TlsConnector {
+        let dir = testdata_dir();
+        let mut roots = rustls::RootCertStore::empty();
+        let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(dir.join(ca_file))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        roots.add_parsable_certificates(ca);
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+        let cfg = match client_cert {
+            Some((cert_file, key_file)) => {
+                let chain: Vec<CertificateDer<'static>> =
+                    CertificateDer::pem_file_iter(dir.join(cert_file))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                let key = PrivateKeyDer::from_pem_file(dir.join(key_file)).unwrap();
+                builder.with_client_auth_cert(chain, key).unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        };
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// `testdata/tls/server.pem` carries a `localhost` SAN (`testdata/tls/README.md`), so that is
+    /// the name every TLS client here presents.
+    fn server_name() -> rustls_pki_types::ServerName<'static> {
+        rustls_pki_types::ServerName::try_from("localhost").unwrap()
+    }
+
+    fn server_settings(client_ca_file: Option<&str>) -> TlsServerSettings {
+        TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: client_ca_file.map(str::to_string),
+        }
+    }
+
+    /// Writes `line` over a completed TLS handshake and returns the batch `statsd_in` decoded
+    /// from it. The connection is dropped afterwards, which EOFs the listener's connection task
+    /// and flushes the accumulator immediately rather than on its 100ms timer.
+    async fn send_over_tls(
+        connector: &tokio_rustls::TlsConnector,
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<Delivered>,
+        line: &[u8],
+    ) -> EventBatch {
+        let stream = TcpStream::connect(addr).await.expect("the listener should accept");
+        let mut client =
+            tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name(), stream))
+                .await
+                .expect("the TLS handshake should complete within 5s")
+                .expect("the TLS handshake should succeed");
+        client.write_all(line).await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        let delivered = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("statsd_in should decode and forward the line")
+            .expect("the Fanout channel should not have closed");
+        logit_pipeline::unwrap_batch(delivered)
+    }
+
+    fn metric_name(batch: &EventBatch) -> &'static str {
+        logit_core::interner::resolve(batch.events[0].metrics[0].name)
+    }
+
+    /// Server TLS only: `statsd_in` presents `server.pem`/`server.key` with no `client_ca_file`,
+    /// so any client is accepted once the handshake itself completes -- and its statsd lines
+    /// decode exactly as they would in the clear, tags and all.
+    #[tokio::test]
+    async fn server_tls_decodes_a_statsd_line() {
+        let (addr, mut rx) = spawn_tls_input(&server_settings(None)).await;
+        let batch =
+            send_over_tls(&connector("ca.pem", None), addr, &mut rx, b"over.tls:3|c|#env:prod\n")
+                .await;
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(metric_name(&batch), "over.tls");
+        assert_eq!(batch.events[0].attributes.get("env").and_then(Value::as_str), Some("prod"));
+    }
+
+    /// Mutual TLS: `statsd_in` requires a client certificate chaining to `ca.pem`
+    /// (`client_ca_file`), the client presents `client.pem`/`client.key` -- both signed by the
+    /// same test CA (`testdata/tls/regen.sh`).
+    #[tokio::test]
+    async fn mutual_tls_decodes_a_statsd_line() {
+        let (addr, mut rx) = spawn_tls_input(&server_settings(Some("ca.pem"))).await;
+        let client = connector("ca.pem", Some(("client.pem", "client.key")));
+        let batch = send_over_tls(&client, addr, &mut rx, b"mutual.tls:1|c\n").await;
+        assert_eq!(metric_name(&batch), "mutual.tls");
+    }
+
+    /// The negative case: a client trusting `other-ca.pem`, which never signed `server.pem`, is
+    /// refused inside its own certificate verification -- and the half that matters for a relay,
+    /// the listener keeps serving everyone else afterwards.
+    #[tokio::test]
+    async fn a_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
+        let (addr, mut rx) = spawn_tls_input(&server_settings(None)).await;
+
+        let wrong = connector("other-ca.pem", None);
+        let stream = TcpStream::connect(addr).await.expect("the listener should accept");
+        let refused =
+            tokio::time::timeout(Duration::from_secs(5), wrong.connect(server_name(), stream))
+                .await
+                .expect("the handshake should resolve within 5s");
+        assert!(refused.is_err(), "a client trusting only other-ca.pem must not complete");
+
+        let batch =
+            send_over_tls(&connector("ca.pem", None), addr, &mut rx, b"still.serving:1|c\n").await;
+        assert_eq!(metric_name(&batch), "still.serving");
+    }
 }
