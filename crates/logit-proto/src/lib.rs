@@ -9,6 +9,7 @@
 pub mod buffer;
 pub mod collectd;
 pub mod frame;
+pub mod graphite;
 pub mod msgbuf;
 pub mod native;
 pub mod otlp;

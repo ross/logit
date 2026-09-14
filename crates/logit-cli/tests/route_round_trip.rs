@@ -128,7 +128,12 @@ async fn central_graph() -> (graph::Graph, String) {
         "central_in".to_string(),
         component(
             vec![],
-            ComponentKind::LogitIn { bind: addr.clone(), tls: None, max_frame_bytes: None },
+            ComponentKind::LogitIn {
+                bind: addr.clone(),
+                tls: None,
+                max_frame_bytes: None,
+                handshake_timeout: logit_config::default_handshake_timeout(),
+            },
         ),
     );
     components.insert(

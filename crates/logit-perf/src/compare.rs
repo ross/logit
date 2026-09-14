@@ -36,6 +36,10 @@ pub struct Deltas {
     pub events_per_s_pct: f64,
     pub cpu_us_per_event_pct: f64,
     pub max_rss_bytes_pct: f64,
+    /// `None` when either side's median `startup_s` is itself `None` (no repeat on that side ever
+    /// observed a `ready` line) -- a delta needs both ends, and there is nothing to warn about
+    /// when one is missing.
+    pub startup_s_pct: Option<f64>,
 }
 
 impl Deltas {
@@ -44,6 +48,10 @@ impl Deltas {
             events_per_s_pct: pct_change(a.events_per_s, b.events_per_s),
             cpu_us_per_event_pct: pct_change(a.cpu_us_per_event, b.cpu_us_per_event),
             max_rss_bytes_pct: pct_change(a.max_rss_bytes as f64, b.max_rss_bytes as f64),
+            startup_s_pct: match (a.startup_s, b.startup_s) {
+                (Some(a), Some(b)) => Some(pct_change(a, b)),
+                _ => None,
+            },
         }
     }
 
@@ -52,12 +60,23 @@ impl Deltas {
     /// gating reason. `pub`: `main.rs`'s table printer calls this directly to mark which rows
     /// tripped the threshold, the same verdict [`CompareReport::has_regression`] gates the exit
     /// code on.
+    ///
+    /// `startup_s_pct` deliberately never participates here -- see [`Deltas::startup_regressed`].
     pub fn is_regression(&self, threshold_pct: f64, rss_threshold_pct: Option<f64>) -> bool {
         let events_regressed = self.events_per_s_pct < -threshold_pct;
         let cpu_regressed = self.cpu_us_per_event_pct > threshold_pct;
         let rss_regressed =
             rss_threshold_pct.is_some_and(|rss_threshold| self.max_rss_bytes_pct > rss_threshold);
         events_regressed || cpu_regressed || rss_regressed
+    }
+
+    /// Whether startup time rose by more than `threshold_pct` -- `main.rs` prints a warning for
+    /// this, but it is never folded into [`Deltas::is_regression`] or
+    /// [`CompareReport::has_regression`]: startup is spawn -> ready, process bring-up rather than
+    /// the graph's own per-event cost, so a regression here is worth a human's attention without
+    /// failing a `compare --threshold` gate meant for throughput/CPU/RSS.
+    pub fn startup_regressed(&self, threshold_pct: f64) -> bool {
+        self.startup_s_pct.is_some_and(|pct| pct > threshold_pct)
     }
 }
 
@@ -164,8 +183,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn sample(events_per_s: f64, cpu_us_per_event: f64, max_rss_bytes: u64) -> Sample {
+        sample_with_startup(events_per_s, cpu_us_per_event, max_rss_bytes, Some(0.1))
+    }
+
+    fn sample_with_startup(
+        events_per_s: f64,
+        cpu_us_per_event: f64,
+        max_rss_bytes: u64,
+        startup_s: Option<f64>,
+    ) -> Sample {
         Sample {
             wall_s: 1.0,
+            startup_s,
             user_s: 0.5,
             sys_s: 0.5,
             max_rss_bytes,
@@ -180,6 +209,16 @@ mod tests {
         max_rss_bytes: u64,
     ) -> ScenarioReport {
         let sample = sample(events_per_s, cpu_us_per_event, max_rss_bytes);
+        ScenarioReport { count: 1_000_000, repeats: vec![sample], median: sample, min: sample }
+    }
+
+    fn scenario_report_with_startup(
+        events_per_s: f64,
+        cpu_us_per_event: f64,
+        max_rss_bytes: u64,
+        startup_s: Option<f64>,
+    ) -> ScenarioReport {
+        let sample = sample_with_startup(events_per_s, cpu_us_per_event, max_rss_bytes, startup_s);
         ScenarioReport { count: 1_000_000, repeats: vec![sample], median: sample, min: sample }
     }
 
@@ -325,6 +364,49 @@ mod tests {
 
         let cmp = compare(&report("h", "c", before), &report("h", "c", after));
         assert!(cmp.warnings.iter().any(|w| w.contains("count differs")));
+    }
+
+    #[test]
+    fn a_startup_regression_is_reported_in_the_delta_but_never_gates_the_verdict() {
+        let mut before = BTreeMap::new();
+        before.insert(
+            "passthrough".to_string(),
+            scenario_report_with_startup(1_000_000.0, 2.0, 1024, Some(0.010)),
+        );
+        let mut after = BTreeMap::new();
+        after.insert(
+            "passthrough".to_string(),
+            // Ten times slower to reach `ready` -- a huge regression by any threshold.
+            scenario_report_with_startup(1_000_000.0, 2.0, 1024, Some(0.100)),
+        );
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        let deltas = cmp.scenarios[0].deltas.unwrap();
+        assert!((deltas.startup_s_pct.unwrap() - 900.0).abs() < 1e-9);
+        assert!(deltas.startup_regressed(5.0));
+        assert!(
+            !cmp.has_regression(5.0, None),
+            "startup must never gate the overall verdict, however large the regression"
+        );
+    }
+
+    #[test]
+    fn startup_delta_is_none_when_either_side_never_observed_a_ready_line() {
+        let mut before = BTreeMap::new();
+        before.insert(
+            "passthrough".to_string(),
+            scenario_report_with_startup(1_000_000.0, 2.0, 1024, None),
+        );
+        let mut after = BTreeMap::new();
+        after.insert(
+            "passthrough".to_string(),
+            scenario_report_with_startup(1_000_000.0, 2.0, 1024, Some(0.05)),
+        );
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        let deltas = cmp.scenarios[0].deltas.unwrap();
+        assert_eq!(deltas.startup_s_pct, None);
+        assert!(!deltas.startup_regressed(0.0), "no delta means nothing to warn about");
     }
 
     #[test]

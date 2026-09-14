@@ -101,10 +101,12 @@ tagged userdata wrapper was considered and rejected, and every known residual ga
 copies, nested container elements, empty-container ambiguity) — each deliberate and
 regression-tested, not an oversight.
 
-**A criterion benchmark against plain table conversion is still outstanding** — tracked as a
-follow-up now that the proxy above exists to benchmark against a baseline. The design commits to
-the proxy on the reasoning above; the benchmark is to confirm the expected win with numbers, not to
-leave the choice open.
+**Confirmed with numbers, not just reasoning.** `script/bench`'s `lua::proxy`/`lua::to_table` divan
+arms (`crates/logit-bench/benches/pipeline.rs`) measure the proxy against the rejected
+full-table-conversion design directly: the proxy wins, widening in its favor for scripts that read
+few attributes, since `to_table` converts everything regardless of what the script touches — see
+[`docs/known-gaps.md`](../known-gaps.md) for the closed follow-up and
+[`memory.md`](memory.md) §2/§8 for the allocation side of the same comparison.
 
 ## Script contract
 
@@ -749,7 +751,7 @@ what `event:to(id)` resolves against ("Routing to a target" above). It sits besi
 the component, not inside the `script:`/`lua_file:` field set, and a non-empty `targets:` is legal
 only on `lua`/`lua_file` -- `route` is the graph's other router kind, but it declares its targets
 through `routes:`' values instead and must leave `targets:` empty, the same as every non-router
-kind (`docs/design/pipeline-graph.md`'s validation rule 43). Omitted, the component has no targets
+kind (`docs/design/pipeline-graph.md`'s validation rule 47). Omitted, the component has no targets
 and every event it emits goes to its own consumers.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without

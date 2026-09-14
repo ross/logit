@@ -95,13 +95,24 @@ already built that have a known, accepted rough edge.
     `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) depends on
     every listener eventually releasing. Not fixed here — `logit_in`'s design is the pattern to
     follow when this is addressed.
-  - **`otlp_in`'s TLS accept has no timeout.** `crate::otlp::run`'s `acceptor.accept(stream).await`
-    is unbounded, same gap `logit_in` had until this was fixed there: a client that completes TCP
-    connect and then sends nothing pins a connection-limit permit forever. `logit_in`'s pattern
-    (`LogitInput::handshake_timeout`, wrapping the TLS accept itself in
-    `tokio::time::timeout` in its accept loop, not just the post-TLS `Hello`/request read) is the
-    one to follow here too. Not fixed for `otlp_in` in the same change — out of scope for the
-    finding that fixed it for `logit_in`.
+  - ~~**`otlp_in`'s TLS accept has no timeout.**~~ — **closed as of 2026-09-13** for the TLS
+    accept itself, which is all this row ever claimed. `crate::otlp::run`'s
+    `acceptor.accept(stream)` is now wrapped in `tokio::time::timeout` against an
+    `OtlpInput::handshake_timeout` field, exactly the pattern `logit_in` already used; the timeout
+    and a handshake failure both surface through the same per-connection `connection_error`
+    diagnostic, and the permit comes back because the task ends. `handshake_timeout:` is an
+    operator-facing field on `syslog_in`, `logit_in`, and `otlp_in` alike now, 5s by default,
+    non-zero per graph rule 45. **What it does not close, on `otlp_in`:** it bounds the TLS accept
+    and nothing after it, because this listener hands each accepted stream straight to `hyper`,
+    whose `hyper_util::server::conn::auto::Builder` reads the connection's first bytes itself to
+    tell HTTP/1.1 from an h2 preface — a read this module never sees and cannot wrap without
+    reimplementing that sniff, and one `http1().header_read_timeout(..)` does not cover either
+    (that starts only once the version is already decided; `protocol: grpc`, on
+    `hyper::server::conn::http2::Builder`, has no equivalent knob at all). So a *TLS* `otlp_in`
+    connection that finishes its handshake and then says nothing still holds its permit — the
+    post-handshake idle case, in the idle-connection-timeout row below — and a *plaintext*
+    `otlp_in` connection is not bounded at any point at all, which is its own row further down
+    ("a plaintext `otlp_in` has no pre-first-byte bound"), not something this row covers.
 - **Output buffering: closed for the sink side, in-memory only.** `crates/logit-proto/src/buffer.rs`'s
   `Buffer`/`InMemoryBuffer` are implemented (`push`/`peek`/`commit`, `DropOldest`/`DropNewest`), and
   every sink now sits behind a bounded, byte-aware `SinkQueue`
@@ -528,11 +539,15 @@ already built that have a known, accepted rough edge.
   substituted a placeholder for a missing variable was tried and reverted (ADR `env-yaml-tag`'s
   Alternatives) — visualizing a config's shape without its production secrets set needs a copy of
   the config with dummy values filled in, not a feature of `logit graph` itself.
-- **`syslog_in` is UDP-only** — nginx's `syslog:` writer is UDP-only, so a TCP accept loop would
-  buy the driving integration nothing. `syslog_out` (the egress side, `docs/adr/syslog-output.md`)
-  supports both UDP and TCP, and that asymmetry is deliberate, not a sign this entry needs closing
-  to match. Stays additive-later on the *input* side specifically. **Closed: `syslog_in` no longer
-  skips RFC 5424 STRUCTURED-DATA** — `parse_structured_data`
+- ~~**`syslog_in` is UDP-only**~~ — **closed as of 2026-09-13.** `syslog_in` gains
+  `transport: tcp`, running on the same generic stream driver (`logit-inputs::tcp::TcpListener`)
+  `syslog_out`'s own TCP transport already used from the egress side — RFC 6587 framing
+  (octet-counting or non-transparent, auto-detected per connection), and `tls:` on top of it for
+  RFC 5425 syslog over TLS. The asymmetry this entry and
+  [ADR `syslog-output`](adr/syslog-output.md)'s "that asymmetry is deliberate" note both called
+  out no longer holds; see
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). **Closed: `syslog_in` no
+  longer skips RFC 5424 STRUCTURED-DATA** — `parse_structured_data`
   (`crates/logit-inputs/src/syslog.rs`) is a real, quote-aware parser into `syslog.sd`; see
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
 - **Closed: `syslog_out` now emits RFC 5424 STRUCTURED-DATA** — every `syslog.sd` element an
@@ -570,13 +585,14 @@ already built that have a known, accepted rough edge.
   JSON message body and break a `| json` LogQL filter on every line). Consequence: a message that
   genuinely contained the literal two characters `\`/`n` is indistinguishable on the wire from one
   that contained a real newline. Accepted in `docs/adr/syslog-output.md`.
-- **`syslog_out` has no TLS** — plaintext UDP/TCP only; RFC 5425 (syslog over TLS) and RFC 6012
-  (DTLS) are both out of scope. A `logit -> remote collector` hop over an untrusted network has no
-  transport security today. `otlp_out`/`otlp_in` gained `tls:` config
-  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) via a
-  `TlsClientConfig`/`TlsServerConfig` pair in `logit-config` designed to be reusable by any other
-  protocol — `syslog_out`'s own TLS support, if it lands, is a config-plumbing exercise against
-  those same types, not a design decision to redo.
+- ~~**`syslog_out` has no TLS**~~ — **closed as of 2026-09-13** for RFC 5425 (syslog over TLS over
+  TCP): `syslog_out` gains `tls:` (`TlsClientConfig`), and `syslog_in` gains the matching
+  `transport: tcp`/`tls:` (`TlsServerConfig`) on the ingress side, both against the same
+  `logit_out`/`otlp_in`-shaped config-plumbing this entry already named as the fix; see
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md). **Still open: RFC 6012
+  (DTLS, syslog over TLS over UDP)** — out of scope for that ADR (see its Alternatives); a `tls:`
+  block under `transport: udp` is a config error on both `syslog_in` and `syslog_out` rather than
+  silently ignored, so this remains a real gap, not a documentation one.
 - ~~**`logit_proto::Encoder`'s single-`Bytes`-per-batch contract doesn't fit a sink that needs
   per-message framing**~~ — **closed as of 2026-09-12.** `syslog_out` needs one UDP datagram or
   one octet-counted TCP frame per *message*, and `statsd_out` needs one statsd line per metric
@@ -653,9 +669,12 @@ already built that have a known, accepted rough edge.
   and count `logit.output.{tags,labels}.normalized{reason="multi_value"}` once per attribute. See
   [ADR `statsd-output`](adr/statsd-output.md)'s amendment and
   [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment.
-- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only, same gap as `syslog_out`'s above, and
-  the same `TlsClientConfig`/`TlsServerConfig` pair would be the config-plumbing exercise if it
-  lands.
+- **`statsd_out` has no TLS/DTLS** — plaintext UDP/TCP only. `syslog_out`'s own TLS support closed
+  against `crates/logit-outputs/src/tls.rs::build_client_config` and the boxed-`AsyncStream`
+  `Conn::Tcp` shape (`docs/adr/syslog-tcp-ingress-and-tls.md`); the same generic TCP driver
+  (`logit-inputs::tcp::TcpListener`) `syslog_in` now runs on would carry `statsd_in`'s ingress side
+  too, per that ADR's Consequences. That's the adoption path here as well, not a design decision to
+  redo — DTLS stays out of scope on both sinks either way.
 - **Closed: a non-UTF-8 syslog MSG decodes to a `Value::Bytes` event instead of being rejected** —
   RFC 5424's `MSG-ANY` permits arbitrary octets, and `logit-core::Value`'s `Bytes` variant now
   carries it. `parse_line`/`parse_5424`/`parse_3164` (`crates/logit-inputs/src/syslog.rs`) parse
@@ -666,15 +685,19 @@ already built that have a known, accepted rough edge.
   (`sanitize_msg_bytes`), never lossy-decoded. See
   [ADR `syslog-structured-data-convention`](adr/syslog-structured-data-convention.md).
 
-  **UTF-8 rejection was never the only thing standing between a syslog line and an arbitrary-binary
-  payload, and closing it above doesn't change that.** `SyslogDecoder::decode_into`
-  (`crates/logit-inputs/src/syslog.rs`) still splits a datagram on `\n` *before* any UTF-8 check
-  runs, so a binary payload containing a `0x0A` byte is still cut mid-value by the framing — see the
-  HAProxy CBOR entry below, where this framing gap is what actually blocks the case that motivated
-  writing it down. `Value::Bytes` MSG closes the UTF-8 half of the gap; a binary payload that isn't
-  newline-safe by construction (nginx's `escape=json` output happens to be; not every binary format
-  is) still needs an escaped-binary encoding or an opt-out of `syslog_in`'s newline splitting to
-  round-trip.
+  **Narrowed: UTF-8 rejection was never the only thing standing between a syslog line and an
+  arbitrary-binary payload, and closing it above didn't fully close this one either — though the
+  framing half has since caught up on one transport.** `SyslogDecoder::decode_into`
+  (`crates/logit-inputs/src/syslog.rs`) still splits on `\n` *before* any UTF-8 check runs on
+  `syslog_in`'s UDP transport, so a binary payload containing a `0x0A` byte is still cut mid-value
+  by the framing there — see the HAProxy CBOR entry below. Over `transport: tcp`, though, this is
+  no longer true: `SyslogInput::tcp` turns line splitting off
+  (`SyslogDecoder::with_line_splitting(false)`) and hands framing to
+  `logit-inputs::tcp::TcpListener`'s octet-counting `Framer`
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)), which delimits by
+  declared length, not `\n` — a `0x0A` inside an octet-counted MSG now survives intact end to end.
+  `Value::Bytes` MSG (closed above) plus this framing clear the "reachable" bar on TCP; see the
+  HAProxy CBOR entry for what's still missing there (a decoder, not a transport).
 - **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
   source its access logs and deliberately not pursued** — a considered "not now," not an
   unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
@@ -684,15 +707,23 @@ already built that have a known, accepted rough edge.
     indefinite-length map rendered as hex text, ~2 bytes on the wire per payload byte. Only
     `%{+cbor+bin}o` emits raw binary, which is the mode that would actually be more compact than
     the demo's hand-rolled JSON — but see the next point.
-  - **Binary CBOR cannot reach `logit` over any transport it has today.** Beyond the non-UTF-8
-    rejection above, `syslog_in` splits every datagram on `\n` before any UTF-8 check runs at all
-    (`crates/logit-inputs/src/syslog.rs:190-197`), and `0x0A` occurs freely inside CBOR — it's the
-    encoding of the integer 10, and turns up throughout length headers and float payloads — so a
-    binary payload is chopped mid-value by the framing itself, independent of the UTF-8 question.
-    `tail_in`/`docker_in` are line-framed too, and Docker's json-file driver wraps each line in a
-    JSON string that can't carry arbitrary octets at all. Nothing in the tree offers
-    length-delimited framing, which is the actual prerequisite; a `cbor_in` listener, a unix-socket
-    input, or an opt-out of `syslog_in`'s newline splitting would each qualify.
+  - **Narrowed: binary CBOR can now reach `logit` intact over one transport, just not decode once
+    it arrives.** `syslog_in`'s UDP transport still splits every datagram on `\n` before any UTF-8
+    check runs at all (`crates/logit-inputs/src/syslog.rs`), and `0x0A` occurs freely inside CBOR —
+    it's the encoding of the integer 10, and turns up throughout length headers and float payloads
+    — so a binary payload sent over UDP is still chopped mid-value by the framing itself,
+    independent of the UTF-8 question. `tail_in`/`docker_in` are line-framed too, and Docker's
+    json-file driver wraps each line in a JSON string that can't carry arbitrary octets at all.
+    `transport: tcp` no longer has this problem, though:
+    `logit-inputs::tcp::TcpListener`'s octet-counting `Framer` delimits by declared length rather
+    than `\n`, and `SyslogInput::tcp` turns off the decoder's own line splitting to match
+    ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) — length-delimited
+    framing, the prerequisite this finding originally said nothing in the tree offered, now exists
+    for that one transport. What remains missing isn't a transport but a decoder: nothing parses
+    CBOR itself, so a binary payload that made it through intact would land as an opaque
+    `Value::Bytes` MSG, not `trace.*`/`span.*` attributes — a `cbor_in`-shaped codec (or a
+    `syslog_in` opt-in decode path) is the piece this entry is really about, and it remains
+    unbuilt.
   - **HAProxy's log-format item-name grammar rejects a literal `.` in a custom name, and `%{+json}o`
     and `%{+cbor}o` share that grammar** (already recorded at `demo/haproxy/haproxy.cfg:99-117`,
     confirmed empirically against `haproxy -c`) — but the two encodings aren't equally stuck by it.
@@ -707,7 +738,7 @@ already built that have a known, accepted rough edge.
     arbitrary UTF-8 and handle dots fine — every constraint above belongs to HAProxy's log-format
     grammar or to `logit`'s current transports, not to CBOR as a format.
 
-  If length-delimited framing ever lands and this is revisited, three design constraints are
+  If a CBOR decoder is ever built and this is revisited, three design constraints are
   already known and don't need rediscovering: `Value::as_str` **panics** on an invalid-UTF-8
   `Value::Str` (`crates/logit-core/src/value.rs:33-41`), so CBOR's only-nominally-UTF-8 text-string
   type would need validation before becoming one; a hand-rolled decoder needs an explicit recursion
@@ -1026,7 +1057,11 @@ already built that have a known, accepted rough edge.
   (`crates/logit-proto/src/collectd/`, [ADR `collectd-binary-relay`](adr/collectd-binary-relay.md)),
   whose module doc is the authority for every one of them — the first wire model here with *fewer*
   numeric kinds than this one rather than a differently-shaped set, which is why its rows are mostly
-  "no wire form exists" rather than "the nearest shape loses something." Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
+  "no wire form exists" rather than "the nearest shape loses something." It has grown once more: the
+  `encode (Graphite)` rows are the Graphite/Carbon codec's half
+  (`crates/logit-proto/src/graphite/`, [ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)),
+  whose module doc is likewise the authority — the narrowest wire model of the lot, since a carbon
+  datapoint is one untyped number at one whole second and nothing else. Tracked as debt against [ADR `lossless-transit`](adr/lossless-transit.md);
   see [`docs/plans/lossless-transit.md`](plans/lossless-transit.md) for the closing assessment's residual-debt list. Every
   mapping below is deliberate, counted, and documented at its own call site — this entry exists so
   the list is in one place too:
@@ -1062,6 +1097,13 @@ already built that have a known, accepted rough edge.
   | encode (collectd) | `MetricRecord`'s `unit`, `description`, `start_timestamp` and `exemplars`; `EventBatch::scope`; `Resource::schema_url`; every `dropped_attributes_count`; and every attribute outside the `collectd.` namespace | none for the first group (documented); `logit.output.tags.dropped{reason="no_wire_form"}` for the attributes | The protocol has no field for any of them: a value list is an identity five-tuple, a time, an interval and N numbers, full stop. The attribute case is the one worth stating plainly — **collectd has no tag concept at all**, so a DogStatsD tag or an OTLP resource attribute reaching `collectd_out` has nowhere to go and is counted rather than folded into the type instance (which would collide with the real one and change the series identity a receiver keys on). `host.name` is counted here too: the host resolution reads it, but the attribute itself still has no wire form. |
   | encode/decode (collectd) | A value list of more than `MAX_VALUES_PER_LIST` (64) data sources → on decode the part is malformed and the rest of the datagram is abandoned; on encode the list is dropped whole | `logit.component.diagnostics{key="bad_part"}` or `CodecError::Malformed` (decode) / `logit.output.metrics.skipped{reason="too_many_values"}` + diagnostic key `too_many_values` (encode) | The wire allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3, `if_octets` 2, `disk_io_time` 2). The cap is deliberately pair-wide rather than decode-only: an over-long list fits easily under `max_packet_bytes`, so without the encode-side half a relay would emit lists that any receiver running this codec rejects — abandoning every unrelated list packed behind them in the same datagram — and `aggregate`/`kv_metrics` can both put far more than 64 records on one event. What the constant bounds is the decoder's per-part work and the per-list record-name suffix fan-out (`<plugin>.<type>.<i>`); it is **not** a bound on interner growth, whose unbounded axis is distinct `<plugin>`/`<type>` strings — the same exposure `statsd_in`'s wire-chosen metric names have, accepted on `docs/design/memory.md` §4's "listeners are private" premise. A legitimate producer hitting the cap would be a real gap worth raising the constant for; nothing known does. |
   | encode (collectd) | A `log`-only event's `collectd.severity` outside `{1, 2, 4}` (present but the wrong `Value` type, or `Value::U64` out of that set) → the notification is **dropped** whole | `logit.output.metrics.skipped{reason="notification_dropped"}`, throttled diagnostic key `notification_dropped` | collectd's own wire only ever carries `1` (FAILURE), `2` (WARNING) or `4` (OKAY) in a Severity part; there is no "unknown severity" value to fall back to, and inventing one (clamping to the nearest, or defaulting to WARNING) would put a severity on the wire nothing upstream actually reported. Distinct from an event with **no** `collectd.severity` attribute at all, which is not a notification attempt in the first place and is counted `skipped_no_metrics` instead — this row is specifically the case where the attribute is present but unusable. |
+  | encode (Graphite) | `MetricKind::Samples`/`Distribution`/`Histogram`/`ExponentialHistogram`/`Summary`/`Set`/`SetMembers` → **skipped** under `multi_value: skip` (the default), or **expanded** into dotted sub-paths (`.count`, `.sum`, `.q0_5`…`.q0_99`, `.bucket_<b>`, `.zero_count`) under `multi_value: expand` | `logit.output.metrics.skipped{metric_kind="samples"\|"distribution"\|"histogram"\|"exponential_histogram"\|"summary"\|"set"\|"set_members"}` / `logit.output.metrics.degraded{metric_kind=…}` once per record | A carbon datapoint is **one number at one second** — there is no bucket, quantile, sketch or member-set wire form to degrade into, and unlike `prometheus_out` there is not even a typed gauge to render a cardinality estimate onto honestly. Skipping is the default because the alternative is a *naming convention* nothing at the far end knows about: `x.q0_99` is a series called `x.q0_99`, not a quantile of `x`, and Graphite cannot tell the two apart. `expand` is therefore opt-in and named (ADR `lossless-transit`'s "summarization is opt-in and named" rule applied to a *rendering* rather than a summarization), and what it loses is mergeability: two relays' `.count` series cannot be recombined the way their `DdSketch`es could. An `ExponentialHistogram`'s buckets are deliberately **not** expanded even under `expand` — materializing `base^i` bounds would be exactly the lossy conversion that kind exists to avoid, and would mint an unbounded number of wire paths from one record. |
+  | encode (Graphite) | A `Sum`'s `temporality` and `monotonic` → **dropped**; the value goes on the wire bare | none (a named normalization, not a skip) | Carbon's wire has no opinion about either — every datapoint is just a number at a second — so unlike `prometheus_out`, which *skips* a delta `Sum` because exposition has a competing cumulative meaning that would make every `rate()` wrong, there is nothing here for the value to be misread as. The number is carried faithfully and only the model's extra facts are lost, which is why this is normalization 12 in the codec's own list rather than a drop. It does mean `otlp_in -> graphite_out -> graphite_in` turns a cumulative counter into a gauge. |
+  | encode (Graphite) | A non-finite value (NaN, ±inf) → **dropped** | `logit.output.metrics.skipped{reason="unencodable_value"}`, throttled diagnostic key `unencodable_value` | Carbon's own receiver drops a NaN on receipt, and there is no wire spelling for an infinity at all — `inf` in the value field is a string carbon's `float()` would accept but whisper cannot store. Substituting zero would fabricate a reading. The decode side rejects the same values symmetrically (`logit.input.metrics.skipped{reason="non_finite_value"}`), so a relay never emits one either. |
+  | encode (Graphite) | A `MetricRecord` flagged `NO_RECORDED_VALUE` → **skipped** | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The rule every sink with no no-value wire form follows (the `sinks with no no-value wire form / `aggregate`` row above). Carbon has no marker for "no reading this interval" — unlike collectd, whose GAUGE `NaN` means exactly that — so writing the flag's default numeric payload would report a sample the producer never sent, and Graphite's own "no data" is the absence of a datapoint. |
+  | encode (Graphite) | `MetricRecord`'s `unit`, `description`, `start_timestamp` and `exemplars`; `EventBatch::scope`; `Resource::schema_url`; every `dropped_attributes_count` | none (documented) | The protocol has no field for any of them: a datapoint is a path, an optional tag set, a number and a second, full stop. `otlp_in -> graphite_out` therefore loses instrumentation-scope identity and unit metadata; `otlp_in -> otlp_out` does not. Unlike the Prometheus rows, there is not even a comment syntax to hang them on — carbon's plaintext line has no metadata channel, and the pickle batch protocol is a list of three-tuples. |
+  | encode (Graphite) | **Resource** attributes are rendered as carbon tags, indistinguishable from event ones | none (documented) | The same rule `influxdb_out` and `statsd_out` follow: a sink's wire has one tag set, and dropping the resource half would lose `service.name`/`host.name` entirely. Within the pair this is invisible — a bare `graphite_in` resource is empty, so `graphite_in -> graphite_out` stays a fixed point — but cross-protocol it is real: `otlp_in -> graphite_out -> graphite_in` returns every resource attribute as an *event* attribute, and the resource/event distinction is gone. Carbon has no second tag scope to put them in. |
+  | encode (Graphite) | A path component longer than **255 bytes** → written unchanged, and rejected by whisper | none (documented) | Carbon itself has no path length bound, and the codec deliberately does **not** truncate: a truncated path is a *different, silently wrong* series, where an over-long one fails visibly at the storage layer. The 255 bytes is a filesystem limit (whisper stores `a.b.c` as `a/b/c.wsp`), so it binds only whisper-backed Graphites and not, say, `go-carbon` with a ClickHouse backend — which is exactly why enforcing it in the codec would be wrong. `/` and `\` *are* substituted with `_`, since those would create a nested directory rather than a series segment. A length check belongs in an operator-side `lua` stage if a deployment needs one. |
   | encode (Prometheus) | A `MetricRecord` flagged `NO_RECORDED_VALUE` → **skipped** | `logit.output.metrics.skipped{reason="no_recorded_value"}` | The same rule every sink with no no-value wire form follows (the `sinks with no no-value wire form / `aggregate`` row above): exposition has no "no value here" marker, so emitting the flag's default numeric payload would fabricate a reading the producer never sent. Prometheus's own staleness handling is a scrape-level concept (a series that stops appearing), which a relay cannot synthesize from one flagged point. |
 
   One residual, narrower gap in the same codec, not yet worth its own table row: `BodyFormat` has
@@ -1086,6 +1128,37 @@ already built that have a known, accepted rough edge.
   [ADR `committed-pregenerated-otlp-protobuf`](adr/committed-pregenerated-otlp-protobuf.md)'s Consequences section for that
   qualification stated plainly, and `crates/logit-proto/src/otlp/metrics.rs`'s module doc for the
   full encode/decode tables this summarizes.
+
+- **`prometheus_out`'s "a sketch has no sum" claim is stale.** The `encode (Prometheus)`
+  `MetricKind::Distribution`/`Samples` row above says the rendered OpenMetrics `summary` omits
+  `_sum` because "a `DDSketch` has no sum to report" — that was true when the row was written, but
+  `logit_core::DdSketch::sum` (`crates/logit-core/src/metric.rs`) is exact now (the inner crate
+  accumulates it as a plain `f64` alongside the bins, and adds the two sums on `merge`), a fact
+  `crates/logit-proto/src/graphite/mod.rs`'s module doc leans on directly: `graphite_out`'s own
+  `multi_value: expand` **does** emit `.sum` for the identical sketch. So `prometheus_out` could
+  emit a real `_sum` line for the same summary today with no new computation, only a changed
+  `write!`. Filed here rather than fixed as part of the Graphite/Carbon relay effort that noticed
+  it (`docs/plans/graphite-carbon-relay.md`'s W4b closeout) — a candidate follow-up for whoever
+  next touches `crates/logit-proto/src/prometheus/mod.rs`, not a bug in this effort's own scope.
+- **`graphite_in` over TCP has no `handshake_timeout`; a peer that connects and sends nothing holds
+  one of its 1024 connection permits indefinitely.** The shared TCP driver
+  (`crates/logit-inputs/src/tcp.rs`) bounds the first byte with `handshake_timeout` (graph rule 45)
+  for `syslog_in`/`otlp_in`/`logit_in` alike, but `graphite_in` runs its own accept loop
+  (`crates/logit-inputs/src/graphite/tcp.rs`), written concurrently before the shared driver
+  existed — [ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)'s "`graphite_in`'s TCP
+  listener: no `ReceiveQueue`, and no shared driver yet" section names the extraction trigger (a
+  second line-oriented TCP listener, which `syslog_in` over TCP has since become,
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) without `graphite_in`
+  having been ported onto it yet. The intended fix is porting `graphite_in` onto the shared
+  driver, not a second, listener-local timeout: plaintext adopts the driver's newline framing
+  as-is, and pickle needs a 4-byte big-endian length-prefix mode added to `tcp::Framer` (carbon's
+  own `Int32StringReceiver` framing — the constant already exists as
+  `crates/logit-proto/src/graphite/pickle.rs`'s `LENGTH_PREFIX_BYTES`, just not wired into
+  `tcp::Framer` yet) — porting also brings TLS along, since `graphite_in` has none today. A
+  listener-local timeout is deliberately not being added first, to avoid implementing the same
+  bound twice. What porting would not change: the post-first-byte idle gap is the same accepted
+  one every TCP listener has — this file's "No idle-connection timeout on a TCP listener after a
+  successful handshake" entry below.
 
 - **`otlp_in`'s `partial_success` response is always empty.** OTLP's
   `Export*ServiceResponse.partial_success` field exists so a receiver can accept most of a request
@@ -1211,21 +1284,126 @@ already built that have a known, accepted rough edge.
   operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
   `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
-- **TLS certificates (`otlp_out`'s `tls:`, `otlp_in`'s `tls:`) are loaded once at startup; rotation
-  needs a restart.** `OtlpOutput::with_tls`/`OtlpInput::with_tls`
-  (`crates/logit-outputs/`/`crates/logit-inputs/src/otlp.rs`) read every PEM file at construction
-  time (`logit run` startup) and build a static `rustls::ClientConfig`/`ServerConfig` from it — a
-  renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued one) has no effect until
-  the process restarts. [ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)
-  files this as deliberately out of scope; closing it means `rustls::ServerConfig`'s
-  `ResolvesServerCert` (a file-watcher hook) on the server side, or an equivalent reload on the
-  client side, either behind a SIGHUP or a poll.
-- **`otlp_out`'s TLS client has no `server_name` override.** Useful when an endpoint is reached by
-  IP or through a proxy whose certificate names something else (OTel's own
-  `tls.server_name_override` knob). Cheap to add via `hyper-rustls`'s
-  `HttpsConnectorBuilder::with_server_name_resolver` and an equivalent override on the `reqwest`
-  side; left out of the initial TLS work to keep it small
-  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)).
+- **Every TLS-capable component's certificates are loaded once at startup; rotation needs a
+  restart.** `otlp_in`/`otlp_out`, `logit_in`/`logit_out`, `syslog_in`/`syslog_out`, and
+  `prometheus_in` alike (`with_tls`, one per component, all built on
+  `crates/logit-inputs/src/tls.rs::build_server_config`/`crates/logit-outputs/src/tls.rs::
+  build_client_config`) read every PEM file at construction time (`logit run` startup) and build a
+  static `rustls::ClientConfig`/`ServerConfig` (or, for `prometheus_in`'s `reqwest` client, its
+  equivalent) from it — a renewed certificate (a 90-day Let's Encrypt cert, a `cert-manager`-issued
+  one) has no effect until the process restarts. Originally filed against `otlp_in`/`otlp_out` alone
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md)) as deliberately
+  out of scope; every TLS component built since shares the same construction-time-only shape, so the
+  gap generalizes rather than needing a fresh entry per component
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)). Closing it means
+  `rustls::ServerConfig`'s `ResolvesServerCert` (a file-watcher hook) on the server side, or an
+  equivalent reload on the client side, either behind a SIGHUP or a poll.
+- **No TLS client on any sink has a `server_name` override.** `otlp_out`, `logit_out`, and
+  `syslog_out` alike derive the `ServerName` a peer's certificate is checked against from the
+  configured `endpoint`'s own host — useful to override when an endpoint is reached by IP or
+  through a proxy whose certificate names something else (OTel's own `tls.server_name_override`
+  knob). Cheap to add per sink via `hyper-rustls`'s
+  `HttpsConnectorBuilder::with_server_name_resolver` (`otlp_out`), an equivalent override on the
+  `reqwest` side (`prometheus_in`, the one TLS *client* on the input side), and a plain
+  `ServerName` override ahead of `host_only(endpoint)` (`logit_out`/`syslog_out`, both built on
+  `crates/logit-outputs/src/tls.rs`); left out of the initial TLS work on each to keep it small
+  ([ADR `otlp-tls-and-pooled-grpc-client`](adr/otlp-tls-and-pooled-grpc-client.md),
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)).
+- **No idle-connection timeout on a TCP listener after a successful handshake (or, on plaintext,
+  after the first byte).** `syslog_in` (`transport: tcp`) and `logit_in` bound every *pre*-message
+  phase they have, and the budget is operator-tunable on all three — `handshake_timeout:`, 5s by
+  default, applied per phase (the TLS accept, then the first-byte/`Hello` read). `otlp_in` is the
+  exception and has its own row, immediately below: its budget reaches the TLS accept alone, so a
+  plaintext `otlp_in` bounds nothing at any point. What none of the three bounds is what happens
+  *after*: a connection that completes its handshake (or, on a plaintext
+  listener, delivers at least one byte and then stops) goes silent forever and holds its
+  connection-cap permit indefinitely, right up to the cap itself (1024 on all three;
+  [ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s "Pre-handshake timeout"
+  section names this explicitly as a known gap `syslog_in` shares with `otlp_in`, not one it
+  introduces fresh). A slow-loris-shaped client can exhaust the cap with connections that will
+  never send another byte. Closing it means an idle-read timeout per connection, reset on every
+  frame/line/request actually read — no such timer exists on any of the three listeners today.
+
+  **Deliberately a separate effort with its own ADR, not a second use of `handshake_timeout`**
+  (recorded 2026-09-13, when that field landed and this was explicitly *not* built alongside it).
+  An idle timer is not the same shape as a pre-message one, and it raises three design questions a
+  knob can't answer:
+
+  - **It must not fire on a connection that is silent because of *this* process's own
+    backpressure.** A connection task blocked in `Fanout::send` — waiting on a full downstream
+    channel, which is exactly the backpressure a stream transport is supposed to apply — stops
+    reading its socket, so to a naive idle timer it looks identical to a slow-loris peer. Killing
+    it would turn a downstream stall into dropped connections and lost data, the opposite of what
+    the no-receive-queue design
+    ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) is for. The timer has
+    to distinguish "the peer sent nothing" from "we haven't read yet."
+  - **`logit_in`'s per-batch ack semantics.** A `logit_out` peer legitimately waits for an `Ack`
+    before sending its next frame
+    ([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)), and
+    that ack is deliberately delayed by a slow downstream. On that listener an idle gap is not
+    merely tolerable, it is a protocol state — and whether "idle" should be measured from the last
+    frame read, the last ack written, or something else is a wire-protocol question, not a timer
+    detail.
+  - **`otlp_in` is hyper-driven.** Its connections' read loop belongs to
+    `hyper_util::server::conn::auto::Builder`, not to any loop in this codebase, so its idle
+    handling belongs in that builder's own configuration (keep-alive/idle settings, with a
+    `TokioTimer`) rather than in a wrapper we would have to invent around it. Half-building the
+    feature in our own accept loops for two listeners and in hyper's for the third is exactly the
+    per-transport divergence an ADR should settle before any of it is written.
+- **A plaintext `otlp_in` has no pre-first-byte bound at all — a connection that sends zero bytes
+  holds a connection-cap permit indefinitely, and because that accept loop *blocks* rather than
+  rejecting, enough of them stop it draining the backlog.** The narrowed remainder of the closed
+  "`otlp_in`'s TLS accept has no timeout" row above, recorded 2026-09-13 when
+  `handshake_timeout:` landed: that field wraps `acceptor.accept` and nothing else, so with no
+  `tls:` block (the default shape) there is no phase for it to bound — which is why graph rule 45
+  rejects a non-default value on a plaintext `otlp_in` rather than implying one is doing something.
+  Each connection task then sits in `hyper_util::server::conn::auto::Builder`'s own `ReadVersion`,
+  an unbounded read of up to 24 bytes that decides HTTP/1.1 versus an h2 preface (verified against
+  the pinned hyper-util 0.1.20 / hyper 1.11.1 sources), and `hyper`'s own 30s HTTP/1
+  header-read default is inert here because no `Timer` is installed (`Time::check` logs "timeout
+  has default, but no timer set" and returns `None`; configuring one *without* a timer panics).
+  This is worse than the idle case above rather than a variant of it: `otlp_in`'s accept loop uses
+  a blocking `acquire_owned().await` instead of `logit_in`/`syslog_in`'s
+  `try_acquire_owned`-and-reject ([ADR `native-transport-handshake-and-ack`](adr/native-transport-handshake-and-ack.md)'s
+  "Connection limit"), so 1024 connections that complete the TCP handshake and send nothing — no
+  crypto, no bytes — stop the loop accepting anything further, where on the other two listeners
+  the 1025th peer at least gets an immediate refusal. Pre-existing behaviour, not introduced by
+  the `handshake_timeout` work; tracked here because that work retired the row that used to cover
+  it.
+
+  Two independent halves to closing it, and neither is the timeout knob:
+
+  - **The post-sniff header read** *can* be bounded with a pattern already in this tree:
+    `prometheus_out` installs `hyper_util::rt::TokioTimer` alongside
+    `header_read_timeout` on its own `http1::Builder`
+    (`crates/logit-outputs/src/prometheus.rs`, its "Two deadlines, not one" comment). The same two
+    lines on `otlp_in`'s `auto::Builder` would bound a client that sends a *partial* request head
+    — but not the zero-byte case, since `ReadVersion` resolves before any of that applies, and
+    not `protocol: grpc` at all (`http2::Builder` has no equivalent).
+  - **The zero-byte case** needs either a `try_acquire_owned`-and-close accept loop like
+    `logit_in`'s (so a silent connection can no longer starve the backlog even while it holds a
+    permit) or wrapping the version sniff itself — peeking the first byte under a deadline and
+    handing `hyper` a rewound stream, which is reimplementing `auto::Builder`'s own detection.
+    Either is a real change to how this listener accepts, which is why it is a row rather than a
+    follow-up commit.
+- **A write-only TLS sink (`syslog_out`, and `logit_out` before its per-batch ack) cannot observe a
+  peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
+  `Finished` included, before it ever sees the client's certificate message — so a client-cert
+  rejection (a `client_ca_file`-requiring collector, no matching cert presented) arrives as an
+  alert *after* `TlsConnector::connect` has already returned success on this side. `syslog_out`
+  now flushes before a batch may be reported delivered
+  ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)'s 2026-09-13 amendment),
+  so the bytes are genuinely off this host by the time `send` reports success — but a local flush
+  only proves the write left this process, never that the peer accepted it: the server's rejection
+  alert is independent of, and unaffected by, whether this side has flushed. `send` still reports
+  the batch delivered, and this sink never reads from the connection again to learn otherwise (PR
+  #159's finding). `logit_out` is exposed to the same window only up to its own ack read — once a
+  batch's ack has actually been read back, a rejection can no longer hide behind it. A
+  *server*-certificate rejection is unaffected: that verification happens inside the client's own
+  handshake, before any write is attempted, so it always surfaces as `Fault::Clean` (see
+  `crates/logit-cli/tests/syslog_round_trip.rs`'s `mod tls`). Closing the client-cert case would
+  mean this sink reading and interpreting TLS alerts (or application-level acks) it currently
+  never looks at — out of scope for either ADR that introduced these sinks.
 
 - **`docker_in` never notices a `docker rename` after a container's log file is first opened.**
   `container.name` is read once, from `config.v2.json`, at open time, and never re-read for the
@@ -1343,3 +1521,58 @@ already built that have a known, accepted rough edge.
   `MAX_LOGS_PER_COMPONENT`'s bound-and-drop. Not built now — nothing shipped needs it, and the
   throttle already covers the actual hot path (a malformed line, a parse failure) this would
   otherwise protect.
+
+- **`generate_in`'s `rate:` pacing is millisecond-granular above roughly 1k batches/s.** The
+  wall-clock catch-up loop (`due = elapsed * rate`; sleep until `start + (sent+n)/rate` when
+  ahead) can't subdivide a single OS sleep below about 1ms, so a configured `rate` above roughly
+  1,000 batches/s (the default `batch: 100`, so above ~100k events/s) is accurate on average but
+  bursty within any one millisecond rather than smooth. Named as a risk at design time
+  ([ADR `load-test-harness`](adr/load-test-harness.md), `docs/plans/load-test-harness.md`), not
+  fixed: none of `perf/scenarios/*.yaml` sets `rate:` at all (every scenario measures unthrottled,
+  backpressure-only throughput), so nothing shipped is affected by it today.
+- **`script/perf compare` has no cross-run noise model.** It diffs two results files' medians
+  directly against `--threshold`, with no notion of how much run-to-run variance either file's own
+  `repeats:` already show. A scenario whose own repeats already spread more than `--threshold`
+  (`buffered` far more than any other, see below) can trip a "regression" on nothing but scheduling
+  luck, and a real regression smaller than that scenario's noise floor can pass silently. `compare`
+  already warns on a host/CPU-model mismatch between the two files; it has no equivalent warning
+  for "this scenario's own repeats disagree by more than the threshold you're gating on" — worth
+  closing before this harness ever gates anything automatically, not before ([ADR
+  `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open question).
+- **`buffered`'s events/s was the least reproducible number this harness reported; the harness-side
+  fix has landed (W8), and one remaining product-side item is tracked below.**
+  `crates/logit-pipeline/src/disk_queue.rs`'s `DiskQueue::open` pays an un-cleared spool's cost twice
+  at every startup: it reads and CRC-walks the *active* segment in full to validate it for a torn
+  tail (a cost bounded by the default `segment_bytes` rotation threshold, 64MiB — on its own, not
+  obviously large enough to explain a multi-second swing), then reads every segment at or after the
+  read cursor a *second* time to count what's left to replay — real work whenever the cursor hasn't
+  caught up to the end of what's on disk. `perf/scenarios/buffered.yaml`'s spool
+  (`perf/results/spool/`, gitignored) used to accumulate across every repeat and every invocation
+  that reused it, uncleared: a solo `script/perf run --repeat 5 --scenario buffered` against a spool
+  already left over from a prior run degraded monotonically, 134k → 75k → 53k → 38k → 27k events/s,
+  with peak RSS climbing 56 → 110 MiB alongside it; deleting `perf/results/spool/` first and
+  re-running showed the same shape from a higher starting point (615k → 939k → 289k → 126k → 80k) —
+  still degrading within the one invocation, because the harness's own repeats shared the same spool
+  directory and never reset it either. See [`docs/design/performance.md`](design/performance.md) §3
+  for the full account, including this run's own numbers.
+
+  **Harness-side fix, landed:** `script/perf run`/`attribute`/`flamegraph` now clear every
+  `buffer.disk.path` directory a scenario declares before each spawn — every repeat, not just once
+  per invocation (`crates/logit-perf/src/spool.rs`), refusing to remove anything outside
+  `perf/results/`. A post-fix solo `--repeat 5` (taken on a busy machine — other work was running on
+  the host concurrently, so read this as indicative, not `buffered`'s steady-state number):
+  885k → 510k → 838k → 863k → 792k events/s, peak RSS flat at 24.8–30.6 MiB and `startup_s`
+  (spawn → `ready`) a small 2.6–4.4 ms throughout — no monotonic decay, no RSS climb, in contrast to
+  every pre-fix sequence above. **What remains open:** whether the leftover ~510k–885k spread in that
+  run is ordinary scheduling noise from the busy machine it was measured on, or something the fix
+  doesn't fully address, isn't settled yet — a quiet-machine re-measurement
+  (`script/perf run --repeat 5 --scenario buffered --label quiet`) is the pending follow-up. Separately,
+  `DiskQueue::open`'s double-read startup scan itself (the active-segment validation pass, and the
+  second pass counting what's left to replay) is unchanged — the harness fix removes the *accumulated*
+  cost a stale spool added on top of it, not that per-startup scan's own cost, which stays a
+  product-side item (`crates/logit-pipeline/src/disk_queue.rs`) nobody has picked up.
+- **When and how the load-test harness runs in the ongoing development process is deliberately
+  undecided.** [ADR `load-test-harness`](adr/load-test-harness.md)'s own "Open question" section:
+  nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
+  cadence entirely is real future work this effort didn't answer, not an oversight — the harness is
+  built and runnable by hand, and nothing wires it into CI, a pre-merge gate, or a schedule yet.
