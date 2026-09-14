@@ -335,8 +335,11 @@ a differently-shaped metric for the same event.
 
 This decision built `crates/logit-inputs/src/tcp.rs` as a shared driver but wired exactly one
 listener to it. `graphite_in` is the second ([ADR `graphite-carbon-relay`](graphite-carbon-relay.md)'s
-2026-09-14 amendment deletes its own 490-line accept loop in favour of this one), with `statsd_in`
-next. Three things that were tacitly "what syslog needs" have had to become explicit as a result.
+2026-09-14 amendment deletes its own 490-line accept loop in favour of this one), and `statsd_in`
+is the third -- the adoption "A generic TCP+TLS listener driver, syslog-only for now" above held
+out until a real need appeared, now landed as `transport: tcp` plus a `tls:` block on that
+listener, adding no code to the driver at all beyond what the two changes below already required.
+Three things that were tacitly "what syslog needs" have had to become explicit as a result.
 
 **Framing is chosen per listener, not sniffed by the driver.** The driver latched RFC 6587's two
 framings from each connection's first byte, reading a leading ASCII digit as an octet count. That

@@ -484,11 +484,29 @@ picture per component, not two.
 Worked examples, one per shipped component:
 
 - `statsd_in` (`crates/logit-inputs/src/statsd.rs`): `logit.input.datagrams`,
-  `logit.input.datagram.bytes` — per-datagram detail `Fanout`'s per-batch view can't see, plus
-  decode failures free via the `Diagnostics` bridge. Both listeners are now thin wrappers over
-  `logit-inputs::udp::UdpListener` (`docs/adr/decoupled-listener-io.md`), which is where the
-  `ReceiveQueue`/`receive_buffer.*` table above actually gets recorded — free for both, no
-  per-listener code. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
+  `logit.input.datagram.bytes`, **under `transport: udp`** — per-datagram detail `Fanout`'s
+  per-batch view can't see, plus decode failures free via the `Diagnostics` bridge. Both listeners
+  are thin wrappers over `logit-inputs::udp::UdpListener` on that transport
+  (`docs/adr/decoupled-listener-io.md`), which is where the `ReceiveQueue`/`receive_buffer.*` table
+  above actually gets recorded — free for both, no per-listener code. Under `transport: tcp` it
+  runs on `logit-inputs::tcp::TcpListener` instead, exactly as a TCP `syslog_in`/`graphite_in`
+  does, and records that driver's stream set in place of the datagram pair — nothing statsd-
+  specific, and nothing this component writes itself: `logit.input.connections` (gauge) and
+  `logit.input.connections.rejected{reason="limit"}` (count), `logit.input.frames` /
+  `logit.input.frame.bytes` (count/sum, where one *frame* is one LF-delimited statsd line), and
+  `logit.input.frames.dropped{reason}`. Only two of that reason set can occur here: `oversize`, a
+  line past the driver's 64 KiB bound — dropped and counted once, the connection kept and the line
+  after it still decoded, since a statsd listener frames `Lines{DrainToNextLine}` and never
+  RFC 6587's octet counting (a statsd line may legally begin with a digit) — and `truncated`, a
+  partial line left buffered when a connection ends abruptly or this listener shuts down
+  mid-message. `malformed` cannot: it is an octet count RFC 6587's grammar doesn't permit, and
+  nothing here ever reads one. Both report on the `framing_error` diagnostic key, distinct from
+  `connection_error` (I/O, a TLS handshake that failed or timed out, or a connection that sent no
+  first byte inside the handshake budget). A line that *parses* badly is not a framing error at
+  all: it is the decoder's own `bad_line`, on either transport, throttled per listener since every
+  connection's decoder clone shares one set of counts. The driver's `bad_frame` key fires only for
+  the single whole-frame failure `StatsdDecoder::decode_into` can return, a frame that is not valid
+  UTF-8. A sampled `ms`/`h`/`d` line whose `@<rate>` implied a weight above
   `MAX_SAMPLE_WEIGHT` (the decode-time sample-rate extrapolation's bound on how far one value can
   inflate a `Distribution`'s `count()`) clamps rather than extrapolating unboundedly, reported via
   that same `Diagnostics` bridge as `logit.component.diagnostics{key="sample_rate_clamped"}` — no
