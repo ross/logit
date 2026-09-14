@@ -61,6 +61,14 @@
 //! arm deliberately gets no peek: `acceptor.accept` already waits on that connection's first
 //! bytes under the same budget, so a peek ahead of it would bound nothing the handshake does not.
 //!
+//! **A peer that closes cleanly before sending anything is not a fault.** That is what every TCP
+//! health check looks like -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
+//! `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` -- and
+//! before this peek existed `auto::Builder`'s `ReadVersion` read the immediate EOF as
+//! `Version::H1` and the connection ended silently. So a `peek` of `Ok(0)` returns `Ok(())`, and
+//! only the *deadline* (a connection held open saying nothing) and a genuine read error reach
+//! `connection_error`. `crate::tcp` makes the same call for an EOF before its first frame.
+//!
 //! **What it still does not bound, and why no timer is installed to bound it.** A connection that
 //! sends *one* byte and then stops has passed the peek and is inside `hyper`'s own read loop,
 //! which this module does not drive. `hyper`'s `http1().header_read_timeout(..)` is deliberately
@@ -330,12 +338,13 @@ impl Input for OtlpInput {
             let live_connections = Arc::clone(&live_connections);
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
-                live_connections.fetch_add(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
+
+                // Published from the read-modify-write's own return value, not a separate `load`:
+                // `Telemetry::gauge` is last-write-wins per key, so two tasks that interleave an
+                // add and a load would leave the stale one as the published value until the next
+                // transition. `crate::graphite::tcp::gauge_connections` does the same.
+                let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // The TLS handshake itself runs here, inside the spawned task and after the
                 // permit above -- a slow or hostile handshake stalls only this connection and
@@ -374,9 +383,17 @@ impl Input for OtlpInput {
                     // `auto::Builder`'s own `ReadVersion` sniff below still sees a pristine
                     // stream and needs no `Rewind`-shaped buffer -- the reason this is the bound
                     // rather than a wrapper around the sniff, which would mean reimplementing it.
-                    // All three failure shapes -- the peer closing (`Ok(0)`), a read error, and
-                    // the deadline -- become an `Err(String)` on the same `connection_error` path
-                    // as the TLS arm's, so the permit comes back when this task ends.
+                    // A read error and the deadline become an `Err(String)` on the same
+                    // `connection_error` path as the TLS arm's. A *clean* close before the first
+                    // byte (`Ok(0)`) does not: that is what every TCP health check looks like --
+                    // `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` probing
+                    // `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe,
+                    // `nc -z` -- and before this peek existed hyper-util's `ReadVersion` read the
+                    // immediate EOF as `Version::H1` and the connection ended silently. Turning it
+                    // into a warn would log one line and one `connection_error` count per probe
+                    // interval, forever. The shared driver makes the same call (`crate::tcp`'s
+                    // `ReadStep::Eof` before any frame is `Ok(())`, and only the deadline is an
+                    // error). The permit comes back on either path, when this task ends.
                     None => {
                         // Bound to a local rather than matched on directly: the scrutinee's
                         // temporaries (including `peek`'s borrow of `stream`) would otherwise
@@ -385,9 +402,7 @@ impl Input for OtlpInput {
                             tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
                                 .await;
                         match first_byte {
-                            Ok(Ok(0)) => {
-                                Err("connection closed before sending a first byte".to_string())
-                            }
+                            Ok(Ok(0)) => Ok(()), // a health-check probe, not a fault
                             Ok(Ok(_)) => {
                                 serve_connection(
                                     TokioIo::new(stream),
@@ -405,12 +420,8 @@ impl Input for OtlpInput {
                     }
                 };
 
-                live_connections.fetch_sub(1, Ordering::Relaxed);
-                telemetry.gauge(
-                    "logit.input.connections",
-                    live_connections.load(Ordering::Relaxed) as f64,
-                    &[],
-                );
+                let live = live_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+                telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 // One connection's I/O error (a client disconnecting mid-request, a malformed
                 // TLS-looking preamble on a plaintext port, ...) shouldn't be fatal to the
@@ -1724,11 +1735,11 @@ mod tests {
 
     /// The handshake timeout's whole purpose (this module's "Handshake timeout" doc section):
     /// a client that completes the TCP connect and never sends a ClientHello must not pin a
-    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. `OtlpInput` has no test hook for the cap
-    /// itself (unlike `logit_in`/`syslog_in`, whose loops reject at the cap rather than block on
-    /// it), so what is asserted here is the observable half: the silent connection is *closed*
-    /// from the server side inside the budget, and the listener is still serving afterwards.
-    /// Modelled on `crate::tcp`'s
+    /// `MAX_CONCURRENT_CONNECTIONS` permit forever. What is asserted here is the observable half
+    /// -- the silent connection is *closed* from the server side inside the budget, and the
+    /// listener is still serving TLS traffic afterwards. Its plaintext twin,
+    /// `a_silent_plaintext_connection_is_closed_after_the_handshake_timeout`, goes on to prove
+    /// the permit itself came back, under `with_max_connections(1)`. Modelled on `crate::tcp`'s
     /// `a_silent_connection_releases_its_permit_after_the_handshake_timeout`.
     #[tokio::test]
     async fn a_silent_tls_connection_is_closed_after_the_handshake_timeout() {
@@ -1866,6 +1877,46 @@ mod tests {
         );
 
         drop(first);
+    }
+
+    /// A TCP health check -- `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against
+    /// `demo/logit.yaml`'s plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z` --
+    /// connects and closes without sending a byte, at whatever interval it is configured with.
+    /// Before the first-byte peek existed, `auto::Builder`'s own `ReadVersion` read that immediate
+    /// EOF as `Version::H1` and the connection ended silently; the peek must not turn it into a
+    /// warn plus a `connection_error` count per probe. Only the *deadline* (and a real read error)
+    /// is a fault on that arm -- the same call `crate::tcp` makes for an EOF before its first
+    /// frame.
+    #[tokio::test]
+    async fn a_plaintext_probe_that_closes_before_sending_is_not_a_connection_error() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input.with_diagnostics(
+            logit_core::Diagnostics::new("otlp_in").with_telemetry(telemetry.clone()),
+        );
+        let (sink, _rx) = fanout_into_channel();
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Three probes, so a throttle that reports on powers of two could not hide a regression
+        // behind suppression: `warn_throttled` counts `logit.component.diagnostics` on *every*
+        // occurrence, reported or not.
+        for _ in 0..3 {
+            let probe = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            drop(probe);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            sum_of(
+                &registry.drain(0),
+                "logit.component.diagnostics",
+                Some(("key", "connection_error"))
+            ),
+            None,
+            "a probe that connects and closes cleanly is not a connection error"
+        );
     }
 
     /// The plaintext twin of `a_silent_tls_connection_is_closed_after_the_handshake_timeout`, and

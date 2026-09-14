@@ -172,7 +172,13 @@ timeout: it waits for a byte to become *available* and consumes nothing, so the 
 detection over a pristine socket. That is the whole reason the bound is a peek: wrapping the sniff
 itself would mean reimplementing it behind a `Rewind`-shaped buffer. The TLS arm deliberately gets
 no peek — `acceptor.accept` is already waiting on that connection's first bytes under the same
-budget. Graph rule 45 correspondingly no longer rejects a non-default `handshake_timeout` on a
+budget. A peer that closes *cleanly* before sending anything is not a fault: that is what a TCP
+health check is (`demo/haproxy/haproxy.cfg`'s `check` against `demo/logit.yaml`'s plaintext
+`browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`), and it ended silently before this peek
+existed because `ReadVersion` read the immediate EOF as `Version::H1`. So a `peek` of `Ok(0)`
+returns `Ok(())`; only the deadline and a genuine read error reach `connection_error`, the same
+split the shared TCP driver makes for an EOF before its first frame. Graph rule 45 correspondingly
+no longer rejects a non-default `handshake_timeout` on a
 plaintext `otlp_in`; the value is live with or without `tls:`, and only the `0s` check still names
 that kind (`docs/design/pipeline-graph.md`).
 
