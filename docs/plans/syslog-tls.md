@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-14
 ---
 
 # Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`
@@ -260,8 +260,34 @@ read the field back off). Done: `cibuild` clean, `script/schema` no diff after c
   `script/audit` unaffected (no new dependency anywhere in this plan).
 - `allocations.rs`/`type_sizes.rs` must not move; if either does, that's a new TCP-framer case to
   add, not a pin to relax, and `docs/design/memory.md` gets updated in the same commit.
-- Manual smoke (W5): a real `rsyslogd` `omfwd protocol="tcp"` → `examples/syslog-relay.yaml`, then
-  again with `TCP_Framing="octet-counted"`, then over TLS with `testdata/tls` on both ends.
+- Manual smoke (W8, 2026-09-14): a real `rsyslogd` 8.2302.0 (Debian bookworm's packaged build,
+  `rsyslog-gnutls` for the `gtls` netstream driver) forwarding to a TLS `syslog_in`
+  (`transport: tcp`, `tls: { cert_file: testdata/tls/server.pem, key_file:
+  testdata/tls/server.key }`) feeding `stdio_out`, both containers on the dev compose network,
+  reached by alias. Three runs, two `logger`-generated messages each:
+  - **TLS, rsyslog's default (non-transparent/LF) framing:**
+    `action(type="omfwd" target="logit-w8" port="6514" protocol="tcp" StreamDriver="gtls"
+    StreamDriverMode="1" StreamDriverAuthMode="x509/certvalid")`, `DefaultNetstreamDriverCAFile`
+    set to `testdata/tls/ca.pem` (the leaf's `DNS:localhost`/`IP:127.0.0.1` SANs don't cover the
+    container's own hostname, so `x509/name` was not reachable; `x509/certvalid` still validates
+    the chain, unlike `anon`). TLS handshake completed (`decided upon suite
+    TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`), both messages arrived intact with correct
+    `syslog.*` attributes, and the listener's `connection_error` diagnostic fired exactly once
+    and correctly at teardown (`peer closed connection without sending TLS close_notify`, `logit`
+    warns and drops the connection rather than hanging).
+  - **TLS, `TCP_Framing="octet-counted"`:** same action plus `TCP_Framing="octet-counted"`. Same
+    handshake, both messages arrived byte-correct in order with no `framing_error`/`bad_frame`
+    diagnostic, which is decisive: a mis-parsed octet count would either desync the stream (empty
+    `<` never lands as the frame's first byte once garbled) or trip `framing_error`, neither of
+    which happened.
+  - **Plaintext TCP control (no `tls:` on `syslog_in`, plain `protocol="tcp"` `omfwd`, no
+    `StreamDriver`):** both messages arrived, `bound` logged, no diagnostics at all -- the
+    baseline the two TLS runs are compared against.
+  All three ran against the release `logit-cli` binary (`cargo build --release -p logit-cli`) via
+  throwaway scratchpad configs/scripts, not committed. `logger`'s own `imuxsock` escapes an
+  embedded newline in the message text (`\n` -> `#012`) before it ever reaches `omfwd`, so an
+  embedded-newline probe can't distinguish the two TCP framings this way; the byte-correct
+  two-message-per-connection result above is the framing evidence instead.
 
 ## Open risks
 
