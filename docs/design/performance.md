@@ -41,7 +41,7 @@ For continuity: the previous recorded run this table carried, taken 2026-09-13 o
 machine (`c75399d8bccc`, `perf/results/20260913T104956Z-c75399d8bccc-recorded.json`), was 14–27%
 slower across the board in events/s than this quiet run, scenario for scenario — except `aggregate`
 (an apparent -15%, which the noise sub-section below shows is run-to-run variance rather than a
-real slowdown) and `fanout` (-5% against its retuned 55M count, essentially flat). `buffered`'s own
+real slowdown) and `fanout` (-5% against its then-current 55M count, essentially flat). `buffered`'s own
 before/after story is its own section, §3.
 
 ## 0. What this measures, and what it doesn't
@@ -102,7 +102,7 @@ noise sub-section right after this table for what it means when that range is wi
 | `buffered` | 1.2M | 1,087,248 | 1,079,632 – 1,099,616 | 1.522 | 26.6 MiB | 1.10 s |
 | `encode-human-devnull` | 8M | 999,423 | 974,599 – 1,014,536 | 1.330 | 176.8 MiB | 8.00 s |
 | `encode-native-devnull` | 8M | 1,189,960 | 1,165,315 – 1,224,892 | 1.180 | 168.9 MiB | 6.72 s |
-| `fanout` | 55M | 5,675,019 | 5,297,478 – 5,895,784 | 0.466 | 131.5 MiB | 9.69 s |
+| `fanout` (old one-attribute shape, superseded — see below) | 55M | 5,675,019 | 5,297,478 – 5,895,784 | 0.466 | 131.5 MiB | 9.69 s |
 | `json-parse` | 7M | 945,491 | 795,169 – 991,003 | 2.054 | 294.5 MiB | 7.40 s |
 | `lua` | 4M | 628,380 | 554,182 – 776,491 | 2.085 | 29.4 MiB | 6.37 s |
 | `native-relay` | 7M | 1,164,963 | 691,884 – 1,465,330 | 1.118 | 130.0 MiB | 6.01 s |
@@ -111,13 +111,42 @@ noise sub-section right after this table for what it means when that range is wi
 A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures:
 
 - **`passthrough`** (0.478 µs/event) is the runtime floor every other scenario is read relative to:
-  scheduling, the `Fanout` channel hop, layer-2 telemetry, no parsing or encoding.
-- **`fanout`**'s count was retuned 25M → 55M during the 2026-09-13 solo run (this table already
-  reflects that retuned count — see `docs/plans/load-test-harness.md`'s scenario table for the full
-  history). At this count its CPU cost per event (0.466 µs) lands close to `passthrough`'s own
-  (0.478 µs) despite doing strictly *more* work per event (three sends instead of one) — consistent
-  with `memory.md`'s own finding that an all-`Output` fan-out is a strict win (0/1 allocations), so
-  three sends costs barely more than one here.
+  scheduling, the `Fanout` channel hop, layer-2 telemetry, no parsing or encoding. **Most of that
+  floor is the generator, not the runtime.** A 2026-09-14 `attribute` pass on `passthrough` (after
+  #189, busy box) had `gen` blocked in `Fanout::send` for only 0.36 s of a ~9.3 s run and the
+  sink's queue never above 5% of its 1024-batch bound — `null_out` keeps up and `generate_in`'s
+  own render loop sets the pace. The matching flamegraph splits the same way: the `generate_in`
+  task is ~30% of samples (`render_one` ~14%, the six sorted `AttrMap::insert_sym`s ~3.4%, the
+  two templated `Bytes::copy_from_slice`s ~1%); the whole sink task is ~17.5%, and of that ~11.3%
+  is dropping the batch after delivery (freeing 200 `Bytes` + the `Vec<Event>` per 100-event
+  batch — the cost of owning the data, not of the channel) and ~3.6% is `estimated_heap_bytes`
+  at `SinkQueue` admission. Everything else on the single-consumer path — the `mpsc` hop, the
+  one `Arc::new` in `drain_inbox`, the queue's two lock/notify pairs, `deliver_with_retry`'s
+  timeout registration — is under 3% of samples combined. So a change to the delivery path can
+  move this number by a few percent at most; a cheaper generator would move it more.
+- **`fanout`** was re-shaped on 2026-09-14 (after this run). The row above is the *old* shape: a
+  one-attribute event (`host: web-{seq%20}`) at 55M, which this section used to read as "three
+  sends costs barely more than one" because 0.466 µs landed under `passthrough`'s 0.478 µs. That
+  reading was wrong: the two scenarios generated different events, and `passthrough`'s six
+  attributes (two templated) cost the generator roughly 6× more per event than `fanout`'s one, which
+  is more than the two extra sinks cost. A 2×2 that crossed both topologies with both event
+  templates (same busy box, same invocation, `--repeat 3`, medians, CPU µs per *generated* event,
+  after #189) makes the actual relationship plain — one consumer is cheaper than three whichever
+  event shape is held fixed:
+
+  | CPU µs / generated event | one-attribute event | six-attribute event |
+  |---|---:|---:|
+  | 1 × `null_out` | 0.304 | 0.624 |
+  | 3 × `null_out` | 0.488 | 0.920 |
+
+  `fanout.yaml` now generates `passthrough.yaml`'s exact event at `passthrough`'s exact count
+  (20M), so the two differ only in consumer count — which is what the scenario was always meant to
+  isolate. Read `fanout` − `passthrough` as the marginal cost of two more sinks (per-edge `Arc`
+  clone plus one more `drain_inbox → SinkQueue → write_loop` hop each), and halve it for one. Note
+  that `cpu_us_per_event` divides by `generate_in.count` — *generated* events — for every
+  scenario; a fan-out scenario delivers `count × consumers` batch-events, so its per-delivery cost
+  is that much lower than the column shows. The re-shaped `fanout` has not yet been re-measured on
+  a quiet machine; the next quiet `--repeat 3` run should replace this row.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of

@@ -76,7 +76,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 7M | ~0.78M/s |
 | `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~2.8-3.6M/s |
 | `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.48-0.50M/s |
-| `fanout` | `generate_in` → 3 × `null_out` | `Arc`-based fan-out to multiple sinks | 55M | ~5.7-6.2M/s |
+| `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 20M | ~2.0-2.1M/s (busy box; see note) |
 | `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.79-1.37M/s |
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~0.83-1.24M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
@@ -101,6 +101,15 @@ expect its wall time to vary more than every other scenario's when re-run.
 ([`docs/design/performance.md`](../design/performance.md)) showed it clearing 25M events in ~3.2s
 — comfortably under this table's target band once nothing else was loading the machine at the same
 time. Every other scenario's original count held up under that same solo run.
+
+`fanout` was then re-shaped on 2026-09-14 to generate `passthrough`'s exact six-attribute event
+at `passthrough`'s exact count (20M), rather than its original one-attribute event at 55M. The
+original shape made `fanout` look cheaper per event than `passthrough` (0.466 vs 0.478 µs on the
+quiet run), which was read as the delivery path being cheap — it was actually a 6× lighter
+generator. Holding the event shape fixed, one consumer is cheaper than three in both directions
+(`performance.md` §1). The two scenarios now differ only in consumer count, which is what the
+scenario was always meant to isolate; its throughput dropped accordingly, and the count landed
+back in the target band without a further retune.
 
 ## Verification
 
