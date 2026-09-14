@@ -1,7 +1,7 @@
 //! End-to-end proof of `docs/adr/target-components.md`'s headline topology: a real `logit_in`
 //! feeding a real `route` router, splitting onto two `target`s, with the router's own outbound
 //! edge catching whatever nothing claims. Modelled on `logit_round_trip.rs`'s in-process pattern
-//! (`ephemeral_addr`, `round_trip_with_provenance`'s `observe_batch`-then-`send` idiom) for the
+//! (`bound_input`, `round_trip_with_provenance`'s `observe_batch`-then-`send` idiom) for the
 //! wire side, and `durable_buffer_restart.rs`'s `Config` -> `graph::resolve` -> `NodeSpec`s ->
 //! `logit_pipeline::run` pattern for the central side -- a real graph, not a hand-rolled `Fanout`
 //! chain, so this exercises the actual `Router`/`Target` runtime wiring
@@ -27,7 +27,7 @@ use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Provenance, 
 use logit_inputs::logit::LogitInput;
 use logit_outputs::logit::LogitOutput;
 use logit_pipeline::{
-    graph, run, BatchContext, InputRuntimeConfig, NodeSpec, Output, SinkQueueConfig,
+    graph, run, BatchContext, Input, InputRuntimeConfig, NodeSpec, Output, SinkQueueConfig,
     SinkStoreConfig, TraceContext, WriteLoopConfig,
 };
 use logit_transforms::Route;
@@ -35,13 +35,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-/// Same bind-drop-rebind idiom `logit_round_trip.rs` uses to learn a free port before
-/// constructing the component that will actually bind it.
-async fn ephemeral_addr() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().to_string()
-}
 
 /// One log event naming which leg of the split it should end up on, so a received batch's own
 /// content confirms placement independent of which channel it arrived on.
@@ -110,15 +103,18 @@ fn component(sources: Vec<&str>, kind: ComponentKind) -> Component {
     }
 }
 
-/// A real, resolved graph for the topology in this module's doc comment, plus the ephemeral
-/// address `central_in` is bound to. Sink kinds are `null_out` -- only their *shape* (a sink, one
-/// source) matters to `graph::resolve`; their actual runtime behaviour comes from the
-/// [`RecordingOutput`] `NodeSpec`s built separately, exactly as `durable_buffer_restart.rs`'s
-/// `graph_and_topology` pairs an `influxdb_out`-shaped `Config` with a hand-rolled `NodeSpec`
-/// (spec kind and config kind are independent at the runtime layer,
+/// The `bind:` `central_in` is configured with. Port 0 is deliberate: the real address is the one
+/// the OS hands back through `LogitInput::local_addr()` after the test binds the concrete input
+/// below -- nothing here reads the config's own string, since the `NodeSpec` is hand-rolled.
+const EPHEMERAL_BIND: &str = "127.0.0.1:0";
+
+/// A real, resolved graph for the topology in this module's doc comment. Sink kinds are
+/// `null_out` -- only their *shape* (a sink, one source) matters to `graph::resolve`; their actual
+/// runtime behaviour comes from the [`RecordingOutput`] `NodeSpec`s built separately, exactly as
+/// `durable_buffer_restart.rs`'s `graph_and_topology` pairs an `influxdb_out`-shaped `Config` with
+/// a hand-rolled `NodeSpec` (spec kind and config kind are independent at the runtime layer,
 /// `crates/logit-pipeline/src/runtime.rs`'s own tests make the same trade for `Router`/`Target`).
-async fn central_graph() -> (graph::Graph, String) {
-    let addr = ephemeral_addr().await;
+fn central_graph() -> graph::Graph {
     let mut routes = BTreeMap::new();
     routes.insert("edge_host".to_string(), "host_stream".to_string());
     routes.insert("edge_app".to_string(), "app_stream".to_string());
@@ -129,7 +125,7 @@ async fn central_graph() -> (graph::Graph, String) {
         component(
             vec![],
             ComponentKind::LogitIn {
-                bind: addr.clone(),
+                bind: EPHEMERAL_BIND.to_string(),
                 tls: None,
                 max_frame_bytes: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
@@ -152,9 +148,7 @@ async fn central_graph() -> (graph::Graph, String) {
     components
         .insert("forward_sink".to_string(), component(vec!["split"], ComponentKind::NullOut {}));
 
-    let graph = graph::resolve(Config { components, ..Default::default() })
-        .expect("topology should resolve");
-    (graph, addr)
+    graph::resolve(Config { components, ..Default::default() }).expect("topology should resolve")
 }
 
 /// Drives the whole graph: three batches over one `LogitOutput` connection to `central_in`, each
@@ -165,7 +159,7 @@ async fn central_graph() -> (graph::Graph, String) {
 /// instead of hanging it.
 #[tokio::test]
 async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
-    let (graph, addr) = central_graph().await;
+    let graph = central_graph();
 
     // `component.targets` is the graph's own resolved slot order for `split`
     // (`graph::targets_of`'s output, `docs/adr/target-components.md`) -- read back rather than
@@ -186,10 +180,18 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     let (mut app_rx, app_output) = recording_sink();
     let (mut forward_rx, forward_output) = recording_sink();
 
+    // Bound here, before it is boxed into the `NodeSpec`, so `local_addr()` can hand the client
+    // below the OS-assigned port with no readiness sleep. `run_with_telemetry`'s own pre-spawn
+    // `Input::bind` pass still runs over this input and no-ops on it -- `Input::bind` is
+    // idempotent by contract (`crates/logit-pipeline/src/input.rs`).
+    let mut central_in = LogitInput::new(EPHEMERAL_BIND);
+    central_in.bind().await.expect("binding an ephemeral port should succeed");
+    let addr = central_in.local_addr().expect("bind() leaves a real address behind").to_string();
+
     let mut specs: HashMap<String, NodeSpec> = HashMap::new();
     specs.insert(
         "central_in".to_string(),
-        NodeSpec::Input(Box::new(LogitInput::new(addr.clone())), InputRuntimeConfig::default()),
+        NodeSpec::Input(Box::new(central_in), InputRuntimeConfig::default()),
     );
     specs.insert("split".to_string(), NodeSpec::Router(Box::new(route)));
     specs.insert("host_stream".to_string(), NodeSpec::Target);
@@ -199,10 +201,6 @@ async fn a_route_component_splits_a_real_logit_in_stream_onto_its_targets() {
     specs.insert("forward_sink".to_string(), output_spec(forward_output));
 
     tokio::spawn(run(graph, specs));
-    // Gives `central_in`'s pre-spawn `Input::bind` pass time to actually open the socket before
-    // the client below tries to connect -- same idiom, same duration, as `logit_round_trip.rs`'s
-    // `round_trip`/`round_trip_with_provenance`.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut output = LogitOutput::new(addr);
 
