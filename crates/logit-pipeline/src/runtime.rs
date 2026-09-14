@@ -79,16 +79,12 @@ pub enum NodeSpec {
     Target,
     /// Built here, not by the caller: `ScriptWorker` is `!Send` (`docs/design/lua-api.md`'s
     /// concurrency section), so it can't be constructed anywhere but the dedicated thread it
-    /// will live on.
+    /// will live on. Carries no `targets` of its own: the Lua spawn arm resolves both the VM's
+    /// name -> slot table and its target `Fanout`s from `ResolvedComponent::targets`, exactly as
+    /// the `Router` arm resolves its own -- one source of slot order, not two.
     Lua {
         script: String,
         interval: Option<Duration>,
-        /// The `target` ids this Lua component may direct events into, in
-        /// [`crate::graph::targets_of`] slot order -- `event:to("..")`'s name -> slot table
-        /// (`ScriptWorker::with_targets`), and the same slot order `run_lua` resolves its target
-        /// `Fanout`s in. Empty for an ordinary `lua`/`lua_file` component, which then has exactly
-        /// one destination and behaves as it always has.
-        targets: Vec<String>,
     },
 }
 
@@ -389,12 +385,13 @@ pub async fn run_with_telemetry(
                 // layer, nothing checks they agree -- in which case doing nothing is the honest
                 // outcome, not a panic. Nothing is spawned for a target by design.
             }
-            NodeSpec::Lua { script, interval, targets } => {
+            NodeSpec::Lua { script, interval } => {
                 // A Lua node is a router too (`docs/adr/target-components.md`): the ids in
-                // `targets` become `event:to("..")`'s name -> slot table inside the VM, and these
-                // `Fanout`s are the same slots on the Rust side -- resolved exactly as the
-                // `Router` arm above resolves its own, from the same pre-spawn map, so
+                // `component.targets` become `event:to("..")`'s name -> slot table inside the VM,
+                // and these `Fanout`s are the same slots on the Rust side -- resolved exactly as
+                // the `Router` arm above resolves its own, from the same pre-spawn map, so
                 // `Destination::To(n)` and the script's n-th target id mean the same thing.
+                let targets = component.targets.clone();
                 let target_routes =
                     resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -1484,10 +1481,9 @@ async fn run_router(
 /// batch), `resource`/`scope` are refcount bumps, and a destination that received nothing
 /// allocates nothing at all -- which is what makes that number an integer rather than a curve.
 ///
-/// An out-of-range `Destination::To(n)` is a programming error in the `Router` implementation
-/// (slots come from `graph::targets_of`, which is what sized this scratch): `debug_assert!` in
-/// development, and in release a `tracing::warn!` plus treating the event as `Forward`. Never a
-/// panic -- a buggy router must not take its node, and therefore the process, down.
+/// An out-of-range `Destination::To(n)` is a programming error in a `Router` impl (slots come
+/// from `graph::targets_of`, which is what sized this scratch) -- a `debug_assert!` in debug
+/// builds, treated as unrouted with a warning in release; never reachable from a resolved graph.
 pub fn route_batch(
     router: &mut (dyn Router + Send),
     scratch: &mut RouterScratch,
@@ -2315,7 +2311,6 @@ mod tests {
                     r#"function process(event) event.attributes.tagged = "yes" return event end"#
                         .to_string(),
                 interval: None,
-                targets: Vec::new(),
             },
         );
         specs.insert(
@@ -3231,7 +3226,6 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) return {event, event:clone()} end".to_string(),
                 interval: None,
-                targets: Vec::new(),
             },
         );
         specs.insert(
@@ -3360,10 +3354,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert(
-            "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, targets: Vec::new() },
-        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3458,10 +3449,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert(
-            "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, targets: Vec::new() },
-        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3579,7 +3567,6 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) error('boom') end".to_string(),
                 interval: None,
-                targets: Vec::new(),
             },
         );
         specs.insert(
@@ -3680,10 +3667,7 @@ mod tests {
                 InputRuntimeConfig::default(),
             ),
         );
-        specs.insert(
-            "enrich".to_string(),
-            NodeSpec::Lua { script, interval: None, targets: Vec::new() },
-        );
+        specs.insert("enrich".to_string(), NodeSpec::Lua { script, interval: None });
         specs.insert(
             "out".to_string(),
             NodeSpec::Output(
@@ -3779,7 +3763,6 @@ mod tests {
             NodeSpec::Lua {
                 script: "function process(event) return event end".to_string(),
                 interval: Some(Duration::from_secs(3600)),
-                targets: Vec::new(),
             },
         );
         let (result_tx, _result_rx) = std::sync::mpsc::channel();
@@ -7160,11 +7143,7 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua {
-                script: SPLIT_SCRIPT.to_string(),
-                interval: None,
-                targets: vec!["a".to_string(), "b".to_string()],
-            },
+            NodeSpec::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("b".to_string(), NodeSpec::Target);
@@ -7233,11 +7212,7 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua {
-                script: SPLIT_SCRIPT.to_string(),
-                interval: None,
-                targets: vec!["a".to_string(), "b".to_string()],
-            },
+            NodeSpec::Lua { script: SPLIT_SCRIPT.to_string(), interval: None },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("b".to_string(), NodeSpec::Target);
@@ -7307,11 +7282,7 @@ mod tests {
         );
         specs.insert(
             "split".to_string(),
-            NodeSpec::Lua {
-                script: script.to_string(),
-                interval: None,
-                targets: vec!["a".to_string()],
-            },
+            NodeSpec::Lua { script: script.to_string(), interval: None },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("sink_a".to_string(), recording_sink(tx_a));
@@ -7424,11 +7395,7 @@ mod tests {
         );
         specs.insert(
             "windowed".to_string(),
-            NodeSpec::Lua {
-                script: script.to_string(),
-                interval: Some(Duration::from_secs(3600)),
-                targets: vec!["a".to_string()],
-            },
+            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
         );
         specs.insert("a".to_string(), NodeSpec::Target);
         specs.insert("sink_a".to_string(), recording_sink(tx_a));

@@ -499,21 +499,16 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
-        // `component.targets` (`docs/adr/target-components.md`) is what `run_lua` turns into
-        // `event:to("..")`'s name -> slot table inside the VM, and what it resolves its
-        // slot-ordered target `Fanout`s from. Not `graph::targets_of(component)`: this function
-        // takes a `ResolvedComponent`, whose `targets` field *is* that call's output, already
-        // slot-ordered and de-duplicated by `graph::resolve`.
-        Lua { script, interval } => NodeSpec::Lua {
-            script: script.clone(),
-            interval: *interval,
-            targets: component.targets.clone(),
-        },
+        // `component.targets` (`docs/adr/target-components.md`) is what the `NodeSpec::Lua` spawn
+        // arm turns into `run_lua`'s name -> slot table inside the VM, and what it resolves its
+        // slot-ordered target `Fanout`s from -- both from this same `ResolvedComponent` field, not
+        // carried on `NodeSpec::Lua` itself.
+        Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
             let script = std::fs::read_to_string(&script_path)
                 .with_context(|| format!("reading lua_file {}", script_path.display()))?;
-            NodeSpec::Lua { script, interval: *interval, targets: component.targets.clone() }
+            NodeSpec::Lua { script, interval: *interval }
         }
         Aggregate {
             interval,

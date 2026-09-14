@@ -445,7 +445,7 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     the consumer that mode exists for. `series_retention: 0` stays legal under the default
     `temporality: delta`, where it is the documented opt-out from gauge retention
     (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
-40. A `prometheus_in` `targets` must name at least one absolute `http://`/`https://` scrape URL with
+40. A `prometheus_in` `scrape_targets` must name at least one absolute `http://`/`https://` scrape URL with
     a non-empty authority — `logit-pipeline` doesn't depend on `reqwest`/`url` (this document's own
     "Crate layout" section), so this is a small hand-rolled scheme/authority check, not a full URL
     parse. `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's `interval`
@@ -901,6 +901,10 @@ logit-core   logit-config   logit-script
            \            |            /
                     logit-cli                        — CLI + the kind → impl registry
 ```
+
+Not drawn above: `logit-transforms` also depends on `logit-config` directly, for `route`'s
+`RouteBy` type (`docs/adr/target-components.md`) — an impl crate reading a config type it needs is
+unremarkable; only `logit-pipeline` itself is barred from depending on the impl crates.
 
 `logit-pipeline`:
 - Moves `Input` and `Output` out of `logit-inputs`/`logit-outputs` (which then hold only impls), and
