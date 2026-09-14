@@ -1970,7 +1970,7 @@ mod tests {
             .method(Method::POST)
             .uri("/v1/metrics")
             .header("content-type", "application/x-protobuf")
-            .body(Full::new(Bytes::from(body)))
+            .body(Full::new(body))
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
