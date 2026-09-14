@@ -180,9 +180,25 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   fan-out delivering it three times, because `fanout`'s extra work is refcount bumps and
   `null_out`'s empty `send`, while `route` does real per-event work. Wall throughput
   (3.75M events/s) is in the same band as `passthrough`'s, and `gen` was blocked in send only
-  0.30 s of the run — still generator-bound, with the router on its own task. The 82 MiB peak RSS
-  against `passthrough`'s 38 MiB is the four sink queues plus the router's inbox holding batches
-  in flight at once.
+  0.30 s of the run — still generator-bound, with the router on its own task. **The 82 MiB peak
+  RSS against `passthrough`'s 38 MiB is jemalloc retention, not buffered events.** The live-data
+  bound is small: the router's 64-slot inbox holds at most 64 × 100 events × 864 B ≈ 5.5 MiB, the
+  four sink inboxes another ≈ 5.5 MiB between them, and `attribute` showed every sink queue
+  essentially empty (`buf max` 0.00). Re-running all three scenarios with
+  `_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0` (purge freed pages immediately instead
+  of over jemalloc's default 10 s decay) gave peak RSS of 14.4 MiB (`fanout`), 17.5 MiB
+  (`passthrough`) and 23.9 MiB (`route`) — the 6 MiB `route` − `passthrough` gap there *is* the
+  extra in-flight data, and everything above it in the default run is freed pages not yet
+  returned to the kernel. `route` accumulates more of them than `passthrough` because it churns
+  more page-sized allocations: every batch's 86 KiB `Vec<Event>` is freed by the router after its
+  events are moved into four fresh `reserve_exact` vectors, which four sink tasks then free on
+  whichever worker threads they happen to run on, so dirty pages pile up across more arenas
+  before decay purges them. (The purge-immediately run also roughly doubled CPU µs/event for
+  `route`, 0.668 → 1.23, which is the `madvise` cost of those per-batch page frees — a measure of
+  how much page-level churn the topology has, not a setting to run with.) Read every peak-RSS
+  number in this table with that in mind: for a short, generator-bound run it is mostly a
+  function of allocation churn and thread placement, and `compare` is right not to gate on it
+  by default.
 - **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
   single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
   cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
