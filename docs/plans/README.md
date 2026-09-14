@@ -2,10 +2,10 @@
 
 Each plan is a single Markdown file named after the workstream (`slug.md`, no number). A slug is
 permanent once written — other docs and PR descriptions cite it by path. `created`/`updated` in
-each file's frontmatter is what orders this index, not the filename. Each plan's `## Workstreams`
-section states a `Key:` — one short, lowercase token, unique across this directory — that names
-its branches (`<key>/w<N>`) and prefixes its PR titles; see
-[Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
+each file's frontmatter is what orders this index, not the filename. A plan's workstreams share a
+stream key that names their branches (`<key>/w<N>`) and prefixes their PR titles; the key is
+picked when the work is planned and may be noted in the plan, but the branches and PRs are its
+record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
