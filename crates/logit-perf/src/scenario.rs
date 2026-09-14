@@ -32,6 +32,13 @@ pub struct Scenario {
     /// When true, `run.rs` waits `--settle` after the completion line, then sends SIGTERM, rather
     /// than waiting for the process to exit on its own.
     pub needs_sigterm: bool,
+    /// Every `buffer.disk.path` this scenario declares, one per disk-backed sink, **as written in
+    /// the YAML** -- relative to this scenario's own file, exactly like every other path a
+    /// component config carries, and not yet resolved against it. `crate::spool::resolve_spool_dirs`
+    /// does that resolution the same way `logit` itself does
+    /// (`crates/logit-cli/src/pipeline.rs`'s `queue_config`), since it also needs to check the
+    /// result stays inside `perf/results/` before anything touches the filesystem.
+    pub disk_spool_paths: Vec<PathBuf>,
 }
 
 /// Discovers every `*.yaml` in `dir`, sorted by name for deterministic output. A single bad
@@ -62,8 +69,9 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
             .with_context(|| format!("{}: no file stem", path.display()))?;
         let yaml =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let (count, needs_sigterm) = parse(&yaml).with_context(|| format!("{}", path.display()))?;
-        scenarios.push(Scenario { name, path, count, needs_sigterm });
+        let (count, needs_sigterm, disk_spool_paths) =
+            parse(&yaml).with_context(|| format!("{}", path.display()))?;
+        scenarios.push(Scenario { name, path, count, needs_sigterm, disk_spool_paths });
     }
     scenarios.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(scenarios)
@@ -82,7 +90,7 @@ pub fn find(dir: &Path, name: &str) -> anyhow::Result<Scenario> {
 
 /// The parsing logic proper, split out from [`discover`] so it's testable against inline YAML
 /// strings with no filesystem involved.
-fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
+fn parse(yaml: &str) -> anyhow::Result<(u64, bool, Vec<PathBuf>)> {
     let value: Value = serde_norway::from_str(yaml).context("parsing YAML")?;
     let components = value
         .get("components")
@@ -92,6 +100,7 @@ fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
     let mut count: Option<u64> = None;
     let mut found_generate_in = false;
     let mut needs_sigterm = false;
+    let mut disk_spool_paths = Vec::new();
 
     for (id, component) in components {
         let kind = component
@@ -108,6 +117,9 @@ fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
         } else if kind == "internal" || kind.ends_with("_in") {
             needs_sigterm = true;
         }
+        if let Some(path) = disk_spool_path(component) {
+            disk_spool_paths.push(path);
+        }
     }
 
     if !found_generate_in {
@@ -121,7 +133,17 @@ fn parse(yaml: &str) -> anyhow::Result<(u64, bool)> {
         bail!("`generate_in.count` is 0 -- graph rule 42 already rejects this at `logit validate` time");
     }
 
-    Ok((count, needs_sigterm))
+    Ok((count, needs_sigterm, disk_spool_paths))
+}
+
+/// `component.buffer.disk.path`, if present -- the raw string as written in the YAML, unresolved.
+/// Any component can carry a `buffer:` block (graph validation rejects one on a non-sink kind, but
+/// this reads the bare `Value` before that check ever runs), so this simply looks for the shape
+/// and ignores anything that doesn't have it, rather than restricting itself to `type: null_out`
+/// or any other specific kind -- a disk-backed sink under any implemented kind spools the same
+/// way. See `crate::spool` for what resolves and validates this path before it's ever removed.
+fn disk_spool_path(component: &Value) -> Option<PathBuf> {
+    component.get("buffer")?.get("disk")?.get("path")?.as_str().map(PathBuf::from)
 }
 
 /// Renders a YAML mapping key for an error message -- the key is almost always a plain string
@@ -142,17 +164,18 @@ mod tests {
 
     #[test]
     fn extracts_count_from_a_bare_generate_in_to_null_out() {
-        let (count, needs_sigterm) = parse(&yaml(
+        let (count, needs_sigterm, disk_spool_paths) = parse(&yaml(
             "  gen:\n    type: generate_in\n    count: 5000000\n  out:\n    type: null_out\n    sources: [gen]\n",
         ))
         .unwrap();
         assert_eq!(count, 5_000_000);
         assert!(!needs_sigterm);
+        assert!(disk_spool_paths.is_empty());
     }
 
     #[test]
     fn a_socket_listener_alongside_generate_in_needs_sigterm() {
-        let (_, needs_sigterm) = parse(&yaml(
+        let (_, needs_sigterm, _) = parse(&yaml(
             "  gen:\n    type: generate_in\n    count: 100\n  relay_in:\n    type: logit_in\n    bind: \"127.0.0.1:0\"\n  out:\n    type: null_out\n    sources: [gen, relay_in]\n",
         ))
         .unwrap();
@@ -161,7 +184,7 @@ mod tests {
 
     #[test]
     fn an_internal_component_alongside_generate_in_needs_sigterm() {
-        let (_, needs_sigterm) = parse(&yaml(
+        let (_, needs_sigterm, _) = parse(&yaml(
             "  gen:\n    type: generate_in\n    count: 100\n  self:\n    type: internal\n    interval: 1s\n  out:\n    type: null_out\n    sources: [gen, self]\n",
         ))
         .unwrap();
@@ -170,11 +193,41 @@ mod tests {
 
     #[test]
     fn a_plain_transform_does_not_need_sigterm() {
-        let (_, needs_sigterm) = parse(&yaml(
+        let (_, needs_sigterm, _) = parse(&yaml(
             "  gen:\n    type: generate_in\n    count: 100\n  j:\n    type: json\n    sources: [gen]\n  out:\n    type: null_out\n    sources: [j]\n",
         ))
         .unwrap();
         assert!(!needs_sigterm);
+    }
+
+    #[test]
+    fn extracts_a_disk_spool_path_from_a_sinks_buffer() {
+        let (_, _, disk_spool_paths) = parse(&yaml(
+            "  gen:\n    type: generate_in\n    count: 100\n  out:\n    type: null_out\n    sources: [gen]\n    buffer:\n      disk:\n        path: ../results/spool\n",
+        ))
+        .unwrap();
+        assert_eq!(disk_spool_paths, vec![PathBuf::from("../results/spool")]);
+    }
+
+    #[test]
+    fn a_memory_buffer_with_no_disk_block_has_no_spool_path() {
+        let (_, _, disk_spool_paths) = parse(&yaml(
+            "  gen:\n    type: generate_in\n    count: 100\n  out:\n    type: null_out\n    sources: [gen]\n    buffer:\n      max_batches: 10\n",
+        ))
+        .unwrap();
+        assert!(disk_spool_paths.is_empty());
+    }
+
+    #[test]
+    fn collects_a_disk_spool_path_from_every_disk_backed_sink() {
+        let (_, _, disk_spool_paths) = parse(&yaml(
+            "  gen:\n    type: generate_in\n    count: 100\n  a:\n    type: null_out\n    sources: [gen]\n    buffer:\n      disk:\n        path: ../results/a-spool\n  b:\n    type: null_out\n    sources: [gen]\n    buffer:\n      disk:\n        path: ../results/b-spool\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            disk_spool_paths,
+            vec![PathBuf::from("../results/a-spool"), PathBuf::from("../results/b-spool")]
+        );
     }
 
     #[test]

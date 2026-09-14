@@ -224,6 +224,11 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `collectd_in` decode 1 three-data-source value list (`load`) | **2** | 1 as above + one `MetricList` spill: `MetricList` is a `SmallVec` inlined at 1, so a multi-data-source list moves its records to the heap exactly once, not once per record |
 | `collectd_in` decode a 25-list datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a collectd datagram has no header naming its value-list count, so `decode_into` cannot size the `Vec` up front |
 | `collectd_in` decode 1 three-data-source list, `types_db` resolving its names | **2** | **the same as without a `types.db`** -- the lookup is one `HashMap::get` per Values part returning a borrowed slice, and resolved names go into the same reused scratch `String` before interning |
+| `graphite_in` decode 1 plaintext line | **1** | just the `Vec<Event>`, same as `syslog_in`/`collectd_in` -- the path is interned, the value is an `f64` in the record, and one `Gauge` fits `MetricList`'s inline capacity |
+| `graphite_in` decode 1 tagged line (2 carbon tags) | **1** | **the same as untagged** -- every tag value is a zero-copy `Bytes::slice` of the datagram (`logit_proto::graphite::decode`'s `slice_of`, the trick `statsd_in`'s own `slice_of` plays) and two entries still fit `AttrMap`'s inline capacity |
+| `graphite_in` `decode_into` into a warm buffer | **0** | ADR `decoupled-listener-io` -- nothing at all is left once the caller's `Vec<Event>` keeps its capacity, on the TCP path (`graphite/tcp.rs`'s per-connection `scratch`) as much as the UDP one |
+| `graphite_in` decode a 25-line datagram | **1** | + 3 reallocs (`Vec<Event>` growing 4 → 8 → 16 → 32); a carbon datagram has no header naming its line count, so `decode_into` cannot size the `Vec` up front -- the same shape as `collectd_in`'s 25-list row |
+| `graphite_in` decode a 100-datapoint pickle frame | **1** | + 5 reallocs (4 → 8 → … → 128). The restricted pickle reader's stack, arenas and memo are decoder *fields*, cleared per frame rather than rebuilt (`logit_proto::graphite::pickle::PickleReader`), so walking a hundred datapoints through the stack machine allocates nothing of its own -- which is exactly why they are fields |
 | `prometheus_in` decode 1 scrape (11 series: 2 counter families, 1 gauge, 1 histogram, 1 summary) | **161** | `text::parse_with` + `families_to_events`, no `Decoder` trait (ADR `prometheus-scrape-and-exposition`'s "No `logit_proto::Encoder`") -- ~14.6/series, dominated by one `String`/`AttrMap` per label pair (labels are decoded as owned `String`s, not sliced from the scrape body, unlike syslog/statsd's zero-copy `Bytes` fields) plus one `Vec` per family's series list; not yet optimized the way syslog/statsd's decode paths were, tracked as follow-up work rather than fixed here |
 | `generate_in` render 100 events (all-literal template) | **1** | just the batch's `Vec<Event>` -- nothing at all per event. No placeholder anywhere means one prototype `Event` is rendered once at construction and `clone`d per event with only `timestamp` overwritten, and *this* shape's `Event::clone` is free: one attribute fits `AttrMap`'s 8-entry inline capacity, one metric fits `MetricList`'s inline capacity of 1, and the log body's `Bytes` is a refcount bump rather than a copy (contrast the `Event::clone (nginx shape)` row below, whose attributes have spilled). The generator is effectively free next to whatever a scenario puts downstream of it, which is the point of having this path at all |
 | `generate_in` render 100 events (2 templated fields) | **201** | 1 as above + exactly one `Bytes::copy_from_slice` per templated field per event (`{seq%50}` in the log body, `{seq%10}` in one attribute). Nothing else: the scratch `String` every rendering goes through never reallocates once warm (`logit_core::template::Compiled::render`'s own guarantee), and the literal fields alongside them -- the interned metric name, the `Arc`-shared resource -- still cost nothing. This is [ADR `load-test-harness`](../adr/load-test-harness.md)'s named risk, measured rather than feared: a placeholder is a cardinality knob, not decoration, and each one costs an allocation per event forever |
@@ -268,6 +273,10 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `statsd_out` encode_into 100 events | **0** | measured through the same `FramedEncoder::encode_into` call as the syslog row (ADR `framed-encoder`), over 100 single-counter DogStatsD events: every per-metric buffer was a reused struct field from the start, and a statsd line has no timestamp to format, so a warm `MessageBuf` never touches the allocator |
 | `prometheus_out` encode 100 series (1 gauge family) | **414** | `events_to_families` + `text::write`, no `Encoder` trait (same ADR as the decode row above) -- ~4.1/series: one `String` label key/value pair, one `MetricFamily`/`Series` entry, and the rendered text line's own buffer growth per series; not yet optimized, tracked as follow-up work alongside the decode row above |
 | `collectd_out` encode_into 100 events, warm | **0** | fixed, was 300 (~3/event) -- `CollectdEncoder` (`crates/logit-proto/src/collectd/encode.rs`) already held its own reused `packet`/`list`/`values` scratch, but `pack_list`'s `last.clone_from(cur)` fell through to `Clone`'s *default* `clone_from` (`#[derive(Clone)]` only generates `clone()`), which is `*self = source.clone()` -- a fresh `Vec` allocation per non-empty identity field (host/plugin/type, here), every single list, with the old one dropped right behind it. A hand-written `clone_from` that clears and `extend_from_slice`s each field in place fixed it; `MessageBuf<usize>` (ADR `framed-encoder`) is unrelated to this and was already warm |
+| `graphite_out` encode_into 100 plaintext events | **0** | every per-record buffer (`tag_suffix`/`path`/`line`/...) is a reused struct field from the start (`crates/logit-proto/src/graphite/encode.rs`'s own doc comment), so a warm plaintext encode of 100 single-gauge events never touches the allocator |
+| `graphite_out` encode_into 100 pickle events | **0** | pickle packing writes into the same reused `frame`/`datapoint` `Vec<u8>` fields, patching the 4-byte length prefix in place rather than copying -- no additional cost over the plaintext row above |
+| `graphite_out` encode_into 100 `Distribution` events, `multi_value: expand` | **0** | expanding into `.count`/`.sum`/`.q*` sub-paths reads an already-built `DdSketch` in place (`expand_sketch`) -- no new sketch is built, so this costs exactly what the plaintext row above costs |
+| `graphite_out` encode_into 100 `Samples` events, `multi_value: expand` | **100** | not zero, and not meant to be: expanding a raw `Samples` record first calls `Samples::sketch()`, which builds a fresh `DdSketch` accumulator from the record's raw values -- inherent to re-summarizing on the way out, and the identical cost `influxdb_out`'s own `Samples` expansion already pays. `crate::graphite::encode`'s own module doc names this as one of its two deliberate per-record-allocation exceptions; the other, a `SetMembers` expansion's de-duplication `Vec`, has no pinned row here since nothing in this effort's fixtures exercises it, but is called out for the same reason a future fixture would need to account for it too |
 
 And the corresponding times:
 
@@ -322,7 +331,13 @@ accounting as is rather than moving both producers' weights for a reason unrelat
 > `collectd_decode_one_list_with_types_db_resolution` pin. The two `generate_in` render rows are
 > the newest one, also with no wall-clock figure -- pinned by `generate_render_literal_100_events`/
 > `generate_render_templated_100_events`, with matching `generate_render_literal`/
-> `generate_render_templated` arms in `benches/pipeline.rs` for anyone who wants the timing.
+> `generate_render_templated` arms in `benches/pipeline.rs` for anyone who wants the timing. The
+> four `graphite_out` rows are the same kind of exception again, no wall-clock figure -- their
+> counts are what `graphite_encode_into_100_plaintext_events`/
+> `graphite_encode_into_100_pickle_events`/
+> `graphite_encode_into_100_distribution_events_expanded`/
+> `graphite_encode_into_100_samples_events_expanded`
+> (`crates/logit-bench/tests/allocations.rs`) pin.
 
 ### Listener I/O decoupling: the `decode_into` buffer-reuse win (ADR `decoupled-listener-io`)
 
@@ -336,8 +351,8 @@ so the original numbers stand unchanged. `decode_into` called directly against a
 cheaper call shape, because the one thing `decode()` couldn't avoid (allocating the output buffer)
 is exactly what the reused buffer removes. `statsd_in` drops from 2 to 1 (`parse_line`'s per-line
 `Vec<Event>` is still real -- internal to `decode_into`, not something the caller's buffer can
-absorb); `syslog_in` drops from 1 to 0 (nothing else was allocating), and `collectd_in` likewise
-drops from 1 to 0.
+absorb); `syslog_in` drops from 1 to 0 (nothing else was allocating), and `collectd_in` and
+`graphite_in` likewise drop from 1 to 0.
 
 This is the plan's one strict *improvement* to the hot path, not a neutral refactor, and it exists
 *because* `BatchAccumulator::absorb` needed it: `absorb` takes `&mut Vec<Event>` and merges via
@@ -1163,7 +1178,12 @@ matters is **no cross-thread hop** (a `tokio::spawn`, a multi-thread runtime, a 
 tests (thread-local `CountingAlloc`, same reasoning) independently confirm the same numbers this
 module reports. What a full multi-node graph costs end to end, spread across the real worker
 threads and OS threads `run_with_shutdown` actually spawns, is still a separate question needing a
-load generator, not a microbenchmark.
+load generator, not a microbenchmark — **answered now** by the out-of-CI load-test harness
+(`crates/logit-perf`, `script/perf`): see [`performance.md`](performance.md) for methodology and
+the first recorded run against the real release binary. That closes the end-to-end *measurement*
+gap this section describes; it says nothing about capacity planning for a given deployment's real
+traffic shape, which is a different, still-open question (this document's own "Open questions",
+below).
 
 **Spans are the one live-registry cost only partly covered by either of the two layers above.**
 Most of `crates/logit-bench/tests/allocations.rs`'s span-adjacent constants (`fanout_send_*`) use
@@ -1379,6 +1399,10 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 
 ## Open questions
 
+- **What does a full multi-node graph cost end to end, on the real runtime?** Answered — see §7's
+  pointer to [`performance.md`](performance.md), the out-of-CI load-test harness's methodology and
+  first recorded run. What stays open is *capacity planning* against a real deployment's traffic
+  shape, not the measurement mechanism: the two questions immediately below.
 - **What is the real attribute/metric-count distribution** across the inputs `logit` will
   actually see? Partly answered: four representative shapes are now measured (statsd 0-4, nginx
   10, logs-only 6, wide-JSON 32), enough to rule out shrinking `AttrMap`'s inline capacity (§1, §8

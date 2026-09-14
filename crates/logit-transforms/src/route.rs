@@ -81,7 +81,7 @@ pub struct Route {
 impl Route {
     /// `targets` is the slot order (`logit_pipeline::graph::targets_of`'s output for this
     /// component, `ResolvedComponent::targets`) -- every `routes` value is resolved to its
-    /// position in it, once, here. Panics if a value isn't in `targets`: rules 44/47 guarantee
+    /// position in it, once, here. Panics if a value isn't in `targets`: rules 48/51 guarantee
     /// every `routes:` value names a target this router directs at, so that can only happen if a
     /// caller builds a `Route` from a `routes`/`targets` pair that didn't come from a resolved
     /// graph.
@@ -93,7 +93,7 @@ impl Route {
                 .unwrap_or_else(|| {
                     panic!(
                         "route target '{target}' is not among this router's targets {targets:?} \
-                         -- rules 44/47 should have guaranteed this resolves"
+                         -- rules 48/51 should have guaranteed this resolves"
                     )
                 })
                 .try_into()
