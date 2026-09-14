@@ -1,9 +1,13 @@
 //! Robustness/mutation testing over every decoder that will read untrusted bytes off a socket:
 //! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`, and
 //! `collectd::CollectdDecoder` (a UDP listener's datagrams are as untrusted as a `logit_in`
-//! connection's frames, and rather easier to spoof). Workstream A of
+//! connection's frames, and rather easier to spoof), and `graphite::GraphiteDecoder` in **both**
+//! its wire protocols -- the pickle half of which is the highest-risk parser in the repo, a format
+//! whose stated purpose is arbitrary object construction, fed from a socket
+//! (`docs/plans/graphite-carbon-relay.md`'s open risks). Workstream A of
 //! `docs/plans/native-transport.md`: this gate must exist and pass *before* `logit_in` listens on a
-//! real network -- and `docs/plans/collectd-binary-relay.md` holds `collectd_in` to the same bar.
+//! real network -- and `docs/plans/collectd-binary-relay.md`/`docs/plans/graphite-carbon-relay.md`
+//! hold `collectd_in`/`graphite_in` to the same bar.
 //!
 //! What's checked, for each decoder: every single-byte truncation of a valid input; several
 //! thousand seeded bit flips; a length-bearing field inflated to a value far past what the input
@@ -28,6 +32,7 @@
 use bytes::{Bytes, BytesMut};
 use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
 use logit_proto::frame::{self, Compression};
+use logit_proto::graphite::{GraphiteDecoder, Protocol};
 use logit_proto::native::control::{self, Ack, Hello, HelloAck, Reject};
 use logit_proto::native::varint::write_uvarint;
 use logit_proto::native::{self, NativeDecoder};
@@ -515,6 +520,186 @@ fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds
     // 65535 data sources would be ~590 KB before a single byte of it was read; anything under a few
     // KB proves the declared count was checked against the part's own length first.
     assert!(peak < 4096, "peak live bytes {peak} suggests the values count was trusted");
+}
+
+// -- graphite -----------------------------------------------------------------------------------
+
+/// A realistic carbon plaintext datagram: several `\n`-separated lines, tagged and untagged, with
+/// a `\r\n` ending and a trailing blank line -- so a truncation or a bit flip can land in a path,
+/// a tag segment, a value, a timestamp or a line boundary.
+const GRAPHITE_PLAINTEXT: &[u8] = b"robustness.host.cpu;env=prod;dc=iad 0.5 1700000000\nrobustness.host.mem 2 1700000001\r\nrobustness.host.disk;mount=_root -1.25 1700000002\n\n";
+
+/// `p = 'robustness.host.cpu;env=prod'; pickle.dumps([(p, (1700000000, 0.5)),
+/// ('robustness.host.mem', (1700000001, 2**31 + 5)), (p, (1700000002, -1.25))], protocol=2)`,
+/// produced by CPython on the host and hexdumped -- so the mutation sweep runs over bytes a real
+/// sender actually emits: `BINUNICODE`, `BINPUT`, `BINGET`, `BININT`, `LONG1`, `BINFLOAT`,
+/// `TUPLE2`, `MARK`/`APPENDS`.
+const GRAPHITE_PICKLE: &[u8] = &[
+    0x80, 0x02, 0x5d, 0x71, 0x00, 0x28, 0x58, 0x1c, 0x00, 0x00, 0x00, 0x72, 0x6f, 0x62, 0x75, 0x73,
+    0x74, 0x6e, 0x65, 0x73, 0x73, 0x2e, 0x68, 0x6f, 0x73, 0x74, 0x2e, 0x63, 0x70, 0x75, 0x3b, 0x65,
+    0x6e, 0x76, 0x3d, 0x70, 0x72, 0x6f, 0x64, 0x71, 0x01, 0x4a, 0x00, 0xf1, 0x53, 0x65, 0x47, 0x3f,
+    0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x71, 0x02, 0x86, 0x71, 0x03, 0x58, 0x13, 0x00,
+    0x00, 0x00, 0x72, 0x6f, 0x62, 0x75, 0x73, 0x74, 0x6e, 0x65, 0x73, 0x73, 0x2e, 0x68, 0x6f, 0x73,
+    0x74, 0x2e, 0x6d, 0x65, 0x6d, 0x71, 0x04, 0x4a, 0x01, 0xf1, 0x53, 0x65, 0x8a, 0x05, 0x05, 0x00,
+    0x00, 0x80, 0x00, 0x86, 0x71, 0x05, 0x86, 0x71, 0x06, 0x68, 0x01, 0x4a, 0x02, 0xf1, 0x53, 0x65,
+    0x47, 0xbf, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86, 0x71, 0x07, 0x86, 0x71, 0x08, 0x65,
+    0x2e,
+];
+
+/// Runs `GraphiteDecoder::decode_into` over `bytes` with a fresh decoder, returning whether it
+/// failed. Fresh per call for [`decode_collectd`]'s reason: one mutation must not colour the next.
+fn decode_graphite(bytes: &Bytes, protocol: Protocol) -> bool {
+    let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(protocol);
+    let mut events = Vec::new();
+    decoder.decode_into(bytes.clone(), 0, &mut events).is_err()
+}
+
+/// The **weaker** helper, for [`collectd_decode_survives_every_single_byte_truncation`]'s reason
+/// one level simpler: a carbon plaintext datagram is a sequence of self-delimiting lines, so a
+/// prefix ending on a line boundary is a shorter, perfectly valid datagram, and a prefix ending
+/// mid-line costs that line alone. `decode_into` correctly returns `Ok` in both cases.
+#[test]
+fn graphite_plaintext_survives_every_single_byte_truncation() {
+    assert_every_truncation_never_panics(GRAPHITE_PLAINTEXT, |bytes| {
+        decode_graphite(bytes, Protocol::Plaintext)
+    });
+}
+
+#[test]
+fn graphite_plaintext_survives_seeded_bit_flips() {
+    assert_bit_flips_never_panic(GRAPHITE_PLAINTEXT, 4000, |bytes| {
+        decode_graphite(bytes, Protocol::Plaintext)
+    });
+}
+
+/// The **stronger** helper genuinely holds for pickle: a payload is only complete at its `STOP`
+/// opcode, which is its last byte, so no proper prefix of a valid payload can itself be valid.
+#[test]
+fn graphite_pickle_fails_cleanly_on_every_single_byte_truncation() {
+    assert_every_truncation_fails_cleanly(GRAPHITE_PICKLE, |bytes| {
+        decode_graphite(bytes, Protocol::Pickle)
+    });
+}
+
+#[test]
+fn graphite_pickle_survives_seeded_bit_flips() {
+    assert_bit_flips_never_panic(GRAPHITE_PICKLE, 6000, |bytes| {
+        decode_graphite(bytes, Protocol::Pickle)
+    });
+}
+
+/// A `BINUNICODE` declaring `u32::MAX` bytes over a 5-byte payload: the length is attacker-chosen
+/// and must be checked against the remaining input *before* anything is sized from it. Four GiB
+/// would be a fatal allocation; the reader stores string values as ranges and never copies at all,
+/// so the peak here is bounded by the reader's own small `Vec`s.
+#[test]
+fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_holds() {
+    let mut hostile = vec![0x80, 0x02, 0x58];
+    hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+    hostile.extend_from_slice(b"short");
+    hostile.push(0x2e);
+    let bytes = Bytes::from(hostile);
+    assert!(decode_graphite(&bytes, Protocol::Pickle), "an impossible length must be rejected");
+
+    let peak = peak_live_bytes(|| {
+        let _ = decode_graphite(&bytes, Protocol::Pickle);
+    });
+    assert!(peak < 4096, "peak live bytes {peak} suggests the declared length was trusted");
+}
+
+/// The same property for the two eight-byte length opcodes protocol 4/5 adds (`BINUNICODE8`,
+/// `BINBYTES8`), whose declared length does not even fit a `u32`.
+#[test]
+fn graphite_pickle_rejects_a_64_bit_string_length() {
+    for opcode in [0x8du8, 0x8e] {
+        let mut hostile = vec![0x80, 0x05, opcode];
+        hostile.extend_from_slice(&u64::MAX.to_le_bytes());
+        hostile.extend_from_slice(b"short");
+        hostile.push(0x2e);
+        let bytes = Bytes::from(hostile);
+        assert!(decode_graphite(&bytes, Protocol::Pickle), "opcode {opcode:#04x}");
+
+        let peak = peak_live_bytes(|| {
+            let _ = decode_graphite(&bytes, Protocol::Pickle);
+        });
+        assert!(peak < 4096, "opcode {opcode:#04x}: peak live bytes {peak}");
+    }
+}
+
+/// The depth cap's edge, from both sides: `MAX_PICKLE_DEPTH` open marks is refused only for leaving
+/// values on the stack, while one more is refused *as* a depth violation -- so the cap fires where
+/// it is documented to, not one level early or late. And a crafted 100k-deep payload must not
+/// recurse: the reader is a flat loop over a `Vec` stack, so depth bounds work, never call frames.
+#[test]
+fn graphite_pickle_rejects_nesting_past_the_depth_cap() {
+    let depth = logit_proto::graphite::MAX_PICKLE_DEPTH;
+    for marks in [depth, depth + 1, 100_000] {
+        let mut hostile = vec![0x80u8, 0x02];
+        hostile.extend(std::iter::repeat_n(0x28u8, marks));
+        hostile.push(0x2e);
+        let bytes = Bytes::from(hostile);
+        assert!(decode_graphite(&bytes, Protocol::Pickle), "{marks} marks must be rejected");
+    }
+}
+
+/// A `LONG4` declaring a 2 GB magnitude, and an inflated `FRAME` length: two more attacker-chosen
+/// lengths that must be compared, never trusted.
+#[test]
+fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
+    let mut long4 = vec![0x80u8, 0x02, 0x8b];
+    long4.extend_from_slice(&0x7fff_ffffu32.to_le_bytes());
+    long4.push(0x2e);
+    assert!(decode_graphite(&Bytes::from(long4), Protocol::Pickle));
+
+    let mut frame = vec![0x80u8, 0x05, 0x95];
+    frame.extend_from_slice(&u64::MAX.to_le_bytes());
+    frame.push(0x2e);
+    assert!(decode_graphite(&Bytes::from(frame), Protocol::Pickle));
+}
+
+/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` -- 9 bytes. Before the memo-key ordinal check,
+/// this `resize`d the reader's memo to 500,000 `Option<PValue>` slots (~8 MB) from a key with
+/// nothing behind it, the one `Vec` in the reader sized from a declared index rather than input
+/// actually consumed. It must now be rejected, and cost no more peak memory than the sibling
+/// pickle cases above.
+#[test]
+fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
+    let hostile = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
+    let bytes = Bytes::from(hostile);
+    assert!(
+        decode_graphite(&bytes, Protocol::Pickle),
+        "a memo key skipping ahead must be rejected"
+    );
+
+    let peak = peak_live_bytes(|| {
+        let _ = decode_graphite(&bytes, Protocol::Pickle);
+    });
+    assert!(peak < 4096, "peak live bytes {peak} suggests the memo key sized the memo");
+}
+
+/// Every opcode byte that is not on the allowlist must be refused, one at a time -- the property
+/// the allowlist exists for, asserted exhaustively rather than on a handful of samples.
+#[test]
+fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
+    const PERMITTED: &[u8] = &[
+        0x28, 0x29, 0x2e, 0x42, 0x43, 0x47, 0x4a, 0x4b, 0x4d, 0x4e, 0x54, 0x55, 0x58, 0x5d, 0x61,
+        0x65, 0x68, 0x6a, 0x6c, 0x71, 0x72, 0x74, 0x80, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b,
+        0x8c, 0x8d, 0x8e, 0x94, 0x95,
+    ];
+    for opcode in 0u8..=255 {
+        if PERMITTED.contains(&opcode) {
+            continue;
+        }
+        // `PROTO 2`, the opcode under test, then enough trailing bytes that a permitted opcode
+        // would have had operands to read -- so a failure here is the allowlist, not a short read.
+        let mut hostile = vec![0x80u8, 0x02, opcode];
+        hostile.extend_from_slice(&[0u8; 16]);
+        hostile.push(0x2e);
+        assert!(
+            decode_graphite(&Bytes::from(hostile), Protocol::Pickle),
+            "opcode {opcode:#04x} must not be accepted"
+        );
+    }
 }
 
 // -- control messages -----------------------------------------------------------------------

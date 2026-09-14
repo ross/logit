@@ -1,11 +1,19 @@
 #!/bin/bash
-# Entrypoint for script/record-fixtures's `collectd` producer container (debian:bookworm-slim, with
-# collectd-core installed fresh at record time -- see record_collectd's comment in
-# script/record-fixtures for why there's no pre-baked image). Installs collectd-core, prints the
-# exact package version (which is what testdata/interop/collectd/README.md's provenance table
-# records), then runs collectd in the foreground against the mounted config long enough for its
-# `network` plugin to fill and flush several datagrams to the "capture" container.
+# Entrypoint for script/record-fixtures's `collectd`/`graphite` producer containers
+# (debian:bookworm-slim, with collectd-core installed fresh at record time -- see
+# record_collectd's comment in script/record-fixtures for why there's no pre-baked image).
+# Installs collectd-core, prints the exact package version (which is what
+# testdata/interop/{collectd,graphite}/README.md's provenance tables record), then runs collectd
+# in the foreground against the mounted config long enough for its output plugin to flush several
+# times to the "capture" container.
+#
+# `RUN_SECONDS` (default 10, `record_collectd`'s original figure) is how long collectd stays up
+# before this script kills it -- overridable so `record_graphite`'s `write_graphite` capture,
+# which (unlike `network`'s UDP datagrams) keeps one TCP connection open for as long as collectd
+# runs, doesn't have to commit ten seconds' worth of `Interval 1` read cycles just to get a few:
+# testdata/interop/README.md's size discipline applies here too.
 set -e
+RUN_SECONDS="${RUN_SECONDS:-10}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null
 apt-get install -y -qq collectd-core
@@ -18,12 +26,12 @@ echo "collectd-core version: $(dpkg-query -W -f='${Version}' collectd-core)"
 collectd -C /etc/collectd-fixture.conf -f &
 collectd_pid=$!
 
-# Long enough for several read cycles at `Interval 1` to pack and flush the network plugin's send
-# buffer more than three times over -- which takes about four seconds, so this is generous on
-# purpose rather than tuned. The capture container stops on its own `--count`, well before this
-# sleep ends; the SIGTERM below is only so collectd (and therefore this container) exits cleanly
+# Long enough for several read cycles at `Interval 1` to fill and flush an output plugin's buffer
+# (or, for `write_graphite`'s TCP connection, to just write several times) more than once over.
+# `record_collectd`'s two captures stop on their own `--count`, well before the default 10s
+# elapses; the SIGTERM below is only so collectd (and therefore this container) exits cleanly
 # instead of being killed with the container. Whatever collectd flushes on its way out lands after
 # the capture has already gone, so it is *not* part of the corpus.
-sleep 10
+sleep "${RUN_SECONDS}"
 kill "${collectd_pid}" 2>/dev/null || true
 wait "${collectd_pid}" 2>/dev/null || true

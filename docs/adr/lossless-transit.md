@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-12
+updated: 2026-09-13
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -188,4 +188,13 @@ for the workstreams closing it.
 [ADR `collectd-binary-relay`](collectd-binary-relay.md) for the transport, the model mapping,
 the `collectd.*` attribute convention, and the permitted normalizations, and
 [`docs/plans/collectd-binary-relay.md`](../plans/collectd-binary-relay.md) for the workstreams
+closing it.
+
+## Amendment: a sixth like pair (2026-09-13)
+
+`graphite_in -> graphite_out` is a sixth like-protocol pair in scope under this ADR, alongside
+`statsd`, `otlp`, `syslog`, `prometheus`, and `collectd`. See
+[ADR `graphite-carbon-relay`](graphite-carbon-relay.md) for the transports (plaintext and pickle,
+over TCP or UDP), the model mapping, the restricted pickle codec, and the permitted normalizations,
+and [`docs/plans/graphite-carbon-relay.md`](../plans/graphite-carbon-relay.md) for the workstreams
 closing it.
