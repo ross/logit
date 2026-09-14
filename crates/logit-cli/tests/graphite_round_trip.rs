@@ -436,6 +436,35 @@ fn counted(registry: &Registry, metric: &str, tag: (&str, &str)) -> bool {
     })
 }
 
+/// Polls `registry` on a 10ms tick, accumulating every destructive [`Registry::drain`] into one
+/// vec and matching against the whole thing, until a point named `metric` carrying `tag` appears
+/// or [`TIMEOUT`] elapses -- for the decode-only cases, where `send_raw` returns once the write is
+/// flushed, well before the live `graphite_in` has read, decoded or counted anything, and there is
+/// no batch for `drain_decoded` to wait on instead (a NaN or malformed line delivers nothing). A
+/// bare `sleep` before one `counted()` call raced that decode with no way to recover if it lost;
+/// this can only time out, never false-pass, so it trades a flake for a clear failure.
+async fn wait_for_counted(registry: &Registry, metric: &str, tag: (&str, &str)) {
+    let mut accumulated = Vec::new();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        accumulated.extend(registry.drain(0));
+        let found = accumulated.iter().any(|event: &Event| {
+            event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
+                && event.attributes.get(tag.0).and_then(Value::as_str) == Some(tag.1)
+        });
+        if found {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out after {TIMEOUT:?} waiting for {metric}{{{}=\"{}\"}} to be counted",
+                tag.0, tag.1
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // -- byte for byte, TCP plaintext, default configuration ------------------------------------------
 
 /// One deterministic byte-for-byte case over the default TCP-plaintext harness: the fixture's own
@@ -695,11 +724,8 @@ async fn a_nan_value_is_skipped_and_counted() {
     let (harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("nan-value", "in")).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        counted(&registry, "logit.input.metrics.skipped", ("reason", "non_finite_value")),
-        "the drop must be counted, not silent"
-    );
+    wait_for_counted(&registry, "logit.input.metrics.skipped", ("reason", "non_finite_value"))
+        .await;
 }
 
 /// A line with fewer than three whitespace-separated fields is skipped, counted `bad_line`.
@@ -708,11 +734,7 @@ async fn a_malformed_line_is_skipped_and_counted() {
     let (harness, registry) = diagnostic_harness().await;
     harness.send_raw(&read_fixture("bad-line", "in")).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        counted(&registry, "logit.input.metrics.skipped", ("reason", "bad_line")),
-        "the drop must be counted, not silent"
-    );
+    wait_for_counted(&registry, "logit.input.metrics.skipped", ("reason", "bad_line")).await;
 }
 
 // -- cross-protocol ---------------------------------------------------------------------------
@@ -829,10 +851,51 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
         })
         .await;
     let text = std::str::from_utf8(&captured).expect("ascii output");
-    for suffix in [".count", ".sum", ".q0_5", ".q0_75", ".q0_9", ".q0_95", ".q0_99"] {
+    // Parsed into (path, value) pairs rather than a substring `contains` check, which would pass
+    // just as happily against `page.latency.count 0`/`.sum 0` -- with inputs 10/20/30ms the
+    // values are deterministic (`statsd_in` pushes the parsed values verbatim into `Samples`,
+    // `aggregate`'s default sketch adds each with weight 1, and both `DdSketch::count`/`::sum` are
+    // exact), so this pins the expansion's *data*, not just its shape.
+    let lines: Vec<(&str, f64)> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let path = fields.next().unwrap_or_else(|| panic!("no path field in {line:?}"));
+            let value: f64 = fields
+                .next()
+                .unwrap_or_else(|| panic!("no value field in {line:?}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("{line:?}'s value field should parse: {e}"));
+            (path, value)
+        })
+        .collect();
+    let value_of = |suffix: &str| -> f64 {
+        let path = format!("page.latency{suffix}");
+        lines
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("expected a {path} line, got:\n{text}"))
+    };
+
+    assert_eq!(value_of(".count"), 3.0, "three timer samples");
+    assert_eq!(value_of(".sum"), 60.0, "10 + 20 + 30");
+
+    // The five quantiles carry `DdSketch`'s relative-error bound rather than an exact value, so
+    // pin the two properties that bound is guaranteed to hold: non-decreasing, and within the
+    // sample range.
+    let quantiles: Vec<f64> = [".q0_5", ".q0_75", ".q0_9", ".q0_95", ".q0_99"]
+        .iter()
+        .map(|suffix| value_of(suffix))
+        .collect();
+    for window in quantiles.windows(2) {
+        assert!(window[0] <= window[1], "quantiles should be non-decreasing, got {quantiles:?}");
+    }
+    for q in &quantiles {
         assert!(
-            text.contains(&format!("page.latency{suffix} ")),
-            "expected a page.latency{suffix} line, got:\n{text}"
+            (10.0..=30.0).contains(q),
+            "quantile {q} outside the sample range, got {quantiles:?}"
         );
     }
 }
