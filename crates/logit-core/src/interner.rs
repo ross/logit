@@ -15,10 +15,21 @@ use std::sync::OnceLock;
 /// An interned string. Cheap to copy, compare, and hash.
 pub type Symbol = Spur;
 
-static INTERNER: OnceLock<ThreadedRodeo> = OnceLock::new();
+/// `ThreadedRodeo` is two `DashMap`s (`&str -> Symbol` for `intern`/`lookup`, `Symbol -> &str`
+/// for `resolve`), so every call hashes with this -- `ahash` rather than `std`'s default SipHash
+/// because every per-event caller that can't front the table with a [`KeyCache`] (`resolve` in
+/// every encoder, `insert(&str)` in the syslog/statsd inputs, `lookup` behind `AttrMap::get`)
+/// pays the hash on each probe. Still a *keyed* hash, so an input that controls key strings
+/// can't engineer collisions: `docs/design/memory.md` §4's "listeners are private" premise is
+/// leaned on for the table's growth, deliberately not for its hashing. (`rustc-hash`'s Fx would
+/// be faster still and was rejected for exactly that reason.) The hasher doesn't affect `Symbol`
+/// values -- `ThreadedRodeo` hands those out from a counter in first-intern order.
+type Hasher = ahash::RandomState;
 
-fn interner() -> &'static ThreadedRodeo {
-    INTERNER.get_or_init(ThreadedRodeo::new)
+static INTERNER: OnceLock<ThreadedRodeo<Spur, Hasher>> = OnceLock::new();
+
+fn interner() -> &'static ThreadedRodeo<Spur, Hasher> {
+    INTERNER.get_or_init(|| ThreadedRodeo::with_hasher(Hasher::new()))
 }
 
 /// Intern a key/value string, returning its `Symbol`. Safe to call concurrently from any worker.

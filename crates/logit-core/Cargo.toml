@@ -10,6 +10,8 @@ description = "Internal event model: Event, Value, Resource, metric kinds, attri
 bytes.workspace = true
 smallvec.workspace = true
 lasso = { version = "0.7", features = ["multi-threaded"] }
+# `ThreadedRodeo`'s hasher -- see `interner.rs`.
+ahash.workspace = true
 sketches-ddsketch.workspace = true
 # `HyperLogLog`'s underlying cardinality estimator (docs/plans/lossless-transit.md's W2).
 cardinality-estimator.workspace = true

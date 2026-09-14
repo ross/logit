@@ -45,6 +45,11 @@ lz4_flex = { version = "0.14", default-features = false, features = ["safe-encod
 # software fallback, no C dependency.
 crc32c = "0.6"
 smallvec = { version = "1", features = ["union"] }
+# The interner's hasher (crates/logit-core/src/interner.rs): keyed like `std`'s SipHash, so still
+# HashDoS-resistant, at a fraction of the cost per probe. Already present transitively (via
+# hashbrown) at this exact version -- pinning it as a direct dependency adds no new crate to the
+# graph.
+ahash = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
