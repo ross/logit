@@ -21,6 +21,7 @@
 //!       cert_file: server.pem
 //!       key_file: server.key
 //!     handshake_timeout: 5s          # tcp only; per pre-message phase
+//!     idle_timeout: 5m               # tcp only; optional, off unless set
 //!     receive:                       # optional; see "Transports" below for which half applies
 //!       batch_max_events: 1000
 //! ```
@@ -96,8 +97,9 @@
 //! connection closed immediately and counted `logit.input.connections.rejected{reason="limit"}`
 //! (carbon's wire has no way to say "try later"). `handshake_timeout:` bounds each pre-message
 //! phase independently -- the TLS accept when `tls:` is set, then the wait for the connection's
-//! very first byte -- and is **not** an idle timeout: once a connection has sent a byte there is
-//! no bound on the gap before the next datapoint (`docs/known-gaps.md`).
+//! very first byte -- and is **not** an idle timeout. The gaps *after* that first byte are
+//! bounded by the separate, opt-in `idle_timeout:`, off unless set
+//! (`docs/adr/idle-connection-timeout.md`, and the driver module's "Idle timeout" section).
 //!
 //! ## Diagnostics
 //!
@@ -313,6 +315,23 @@ impl GraphiteInput {
     pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_handshake_timeout(handshake_timeout));
+        }
+        self
+    }
+
+    /// Bounds how long a **TCP** connection may stay quiet once it is past its first byte
+    /// (`idle_timeout:` in config) before this listener closes it and hands its permit back --
+    /// delegates straight to [`TcpListener::with_idle_timeout`], whose doc comment and the driver
+    /// module's "Idle timeout" section describe what resets the clock. `None` (the default) is no
+    /// idle timeout at all.
+    ///
+    /// A UDP listener is left untouched for exactly the reason
+    /// [`Self::with_handshake_timeout`] leaves it untouched: there is no connection on that
+    /// transport to time out. Graph rule 53 is what tells an operator who set the field under
+    /// `transport: udp` that it could never take effect.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        if let Inner::Tcp(listener) = self.inner {
+            self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
         }
         self
     }
@@ -1204,6 +1223,46 @@ mod tests {
         assert_eq!(resolve(batch.events[0].metrics[0].name), "permit.came.back");
 
         drop(silent);
+        running.shutdown.send(true).ok();
+        running.handle.abort();
+    }
+
+    /// The `idle_timeout:` twin of the test above, and for the same reason: when the clock fires
+    /// and what resets it are the driver's own tests' business
+    /// (`docs/adr/idle-connection-timeout.md`); what is under test here is
+    /// `GraphiteInput::with_idle_timeout` reaching that driver at all -- a wrapper whose method
+    /// did nothing would leave the second client waiting on a permit forever.
+    #[tokio::test]
+    async fn an_idle_tcp_connection_releases_its_permit_after_the_idle_timeout() {
+        let mut running = start(
+            |input| {
+                input.with_max_connections(1).with_idle_timeout(Some(Duration::from_millis(50)))
+            },
+            Transport::Tcp,
+            Protocol::Plaintext,
+        )
+        .await;
+
+        // One datapoint, so the first-byte deadline is behind us and only the idle clock can
+        // close this -- then nothing, with the socket held open.
+        let mut quiet = running.connect().await;
+        quiet.write_all(line("quiet.then.idle").as_bytes()).await.unwrap();
+        let batch = running.next_batch("the datapoint before going quiet").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "quiet.then.idle");
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), quiet.read(&mut byte))
+            .await
+            .expect("a connection quiet past its idle_timeout is closed, not left hanging")
+            .expect("reading a closed socket is Ok(0), not an error");
+        assert_eq!(read, 0, "the listener hung up on a connection that went quiet");
+
+        let mut client = running.connect().await;
+        client.write_all(line("permit.came.back").as_bytes()).await.unwrap();
+        let batch = running.next_batch("a line on the connection after the quiet one").await;
+        assert_eq!(resolve(batch.events[0].metrics[0].name), "permit.came.back");
+
+        drop(quiet);
         running.shutdown.send(true).ok();
         running.handle.abort();
     }
