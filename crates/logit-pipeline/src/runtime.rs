@@ -1753,9 +1753,15 @@ fn run_lua(
     let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
     let reporter = diag.clone();
 
+    // Interned here, where `id` still lives: the loop has no `String` to intern (everything it
+    // touches is moved in by value, `run_lua_loop`'s own doc comment) and only ever needs the
+    // `Symbol` -- the same one `Fanout::with_component` interned for this node's own edge.
+    let me = logit_core::interner::intern(&id);
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         run_lua_loop(
             worker,
+            me,
             configured_interval,
             inbox,
             fanout,
@@ -1817,6 +1823,7 @@ async fn watch_lua_thread(
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
+    me: logit_core::Symbol,
     configured_interval: Option<Duration>,
     mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
@@ -1826,7 +1833,7 @@ fn run_lua_loop(
     mut diag: Diagnostics,
 ) {
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
-    // The root a `flush()` runs in (this function's own doc comment): one empty resource shared
+    // The root a `flush()` runs in (`run_lua`'s own doc comment): one empty resource shared
     // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
     // own id as both halves of the provenance -- the identical value `Fanout::stamp` fills an
     // empty provenance in with on this node's *own* outbound edge, pre-filled here so what the
@@ -1838,7 +1845,6 @@ fn run_lua_loop(
     // there, exactly as it does for a marked event on the `process()` path
     // (`docs/adr/target-components.md`). `origin`, filled in here, survives that hop untouched.
     let root_resource = Arc::new(Resource::default());
-    let me = logit_core::interner::intern(&id);
     let flush_provenance = logit_core::Provenance { origin: Some(me), previous: Some(me) };
 
     // The same node-owned, reused per-destination buffers a native `Router` uses
