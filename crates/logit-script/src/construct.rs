@@ -1356,6 +1356,19 @@ mod tests {
         assert_eq!(out, metric_event(gauge_kind()));
     }
 
+    /// The non-finite residual `docs/design/lua-api.md` records: `prometheus_in` and `otlp_in`
+    /// both admit a NaN/infinite point, `to_table()` emits the raw float, and the finiteness
+    /// rule refuses it on the way back -- a rebuild must fix or drop the value.
+    #[test]
+    fn new_of_to_table_rejects_a_non_finite_gauge_value() {
+        let w = worker(REBUILD);
+        let err = process_err(&w, metric_event(MetricKind::Gauge(f64::NAN)));
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a finite number, got NaN"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn new_of_to_table_round_trips_a_samples_metric_event_whole() {
         let w = worker(REBUILD);

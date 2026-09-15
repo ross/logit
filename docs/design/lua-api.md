@@ -868,8 +868,12 @@ branch `Timestamp` takes) and which comes back `Value::Str` (`Value::I64(9007199
 returns as `Value::Str("9007199254740993")`), nor an *integral* `F64` such as `3.0`, which
 LuaJIT's dual-number mode canonicalizes to a Lua integer so it comes back `Value::I64(3)` (a
 fractional `F64` is unaffected). A `Value::Null` `message`, which `to_table()` emits as an absent
-key, is rejected as missing on the way back. Every case in this list is that ADR's recorded
-residual, not an oversight.
+key, is rejected as missing on the way back. A `sum`/`gauge`/`samples`/exemplar `value` (or a
+`sample_rate`) that is NaN or an infinity is rejected by the finiteness rule above rather than
+rebuilt: `to_table()` emits the raw float, and the pipeline does admit such a point --
+`prometheus_in` carries OpenMetrics `NaN`/`+Inf` through verbatim and `otlp_in` passes an
+`AsDouble` through unfiltered -- so a script rebuilding a scraped event must fix or drop the
+offending value. Every case in this list is that ADR's recorded residual, not an oversight.
 
 ## Config shape
 
