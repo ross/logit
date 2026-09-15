@@ -74,6 +74,12 @@
 //! than two readings of the same missing byte, and it is why time blocked in `Fanout::send` can
 //! never count against a peer.
 //!
+//! *A header that has started arriving is progress too.* The clock's absolute deadline bounds
+//! only the wait for a frame's **first** byte; once one byte of the header has landed, the
+//! remaining header bytes are read under the same per-`read` bound a body gets, so a frame whose
+//! first byte arrives a moment before the deadline is read rather than rejected mid-header
+//! ([`read_header`]'s [`IdleBounds`]).
+//!
 //! *A frame body gets its own bound*, per `read` rather than in total ([`read_frame_body`]'s
 //! `stall` argument): a large frame arriving slowly but steadily is not idle either, while a peer
 //! that sends a header, half a body, and then nothing is. Both cases end the same way.
@@ -476,12 +482,16 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         //
         // The header read is also where the idle clock is consulted -- an idle connection is one
         // parked in exactly this read, and nothing else in the loop below waits on the peer for
-        // an unbounded time. [`read_header_before_idle`] supplies the deadline, if there is one.
+        // an unbounded time. [`IdleBounds`] is the deadline pair, if this connection has one: an
+        // absolute one for the header's first byte, a per-`read` one for the rest of it.
         let header_buf = tokio::select! {
-            result = read_header_before_idle(&mut stream, last_progress, idle_timeout) => {
+            result = read_header(&mut stream, IdleBounds::new(last_progress, idle_timeout)) => {
                 match result {
-                    Ok(header_buf) => header_buf?,
-                    Err(idle) => return close_idle(&mut stream, &telemetry, idle).await,
+                    Ok(header_buf) => header_buf,
+                    Err(HeaderReadError::Idle(idle)) => {
+                        return close_idle(&mut stream, &telemetry, idle).await
+                    }
+                    Err(err) => return Err(err.into_inner()),
                 }
             }
             _ = shutdown.changed() => {
@@ -613,31 +623,6 @@ async fn close_idle<S: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// [`read_header`] under this connection's idle deadline, when it has one. `Err(idle)` means that
-/// deadline arrived with no header -- carrying the configured duration back so the caller can name
-/// it in the `Reject` rather than re-deriving it.
-///
-/// The deadline is `last_progress + idle_timeout` (`checked_add`, falling back to
-/// [`crate::tcp::far_future`] for an absurd but legal value -- rule 53 caps nothing above `0s`),
-/// and `timeout_at` rather than `timeout` so it stays absolute: this is a deadline measured from
-/// the last `Ack`, not a fresh budget per read. With no `idle_timeout` configured the read is
-/// simply not wrapped at all, which is exactly the behaviour this listener had before the field
-/// existed.
-async fn read_header_before_idle<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    last_progress: tokio::time::Instant,
-    idle_timeout: Option<Duration>,
-) -> Result<anyhow::Result<Option<[u8; frame::HEADER_LEN]>>, Duration> {
-    let Some(idle) = idle_timeout else {
-        return Ok(read_header(stream).await);
-    };
-    let deadline = last_progress.checked_add(idle).unwrap_or_else(crate::tcp::far_future);
-    match tokio::time::timeout_at(deadline, read_header(stream)).await {
-        Ok(result) => Ok(result),
-        Err(_elapsed) => Err(idle),
-    }
-}
-
 /// Reads and negotiates the connection handshake: expects `Hello` within `handshake_timeout`
 /// (a *fresh* timeout of that length, not the remainder of one shared with the accept loop's TLS
 /// accept -- which is bounded by the same knob independently, so the two together are the
@@ -650,7 +635,9 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_timeout: Duration,
 ) -> anyhow::Result<Negotiated> {
     let read = tokio::time::timeout(handshake_timeout, async {
-        let Some(header_buf) = read_header(stream).await? else {
+        let Some(header_buf) =
+            read_header(stream, None).await.map_err(HeaderReadError::into_inner)?
+        else {
             anyhow::bail!("connection closed before sending Hello");
         };
         // `None`: the whole `Hello` read, header and body alike, is already inside
@@ -725,24 +712,112 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(Negotiated { compression, codec })
 }
 
+/// The two idle bounds a header read gets on a connection that has an `idle_timeout` -- `None`
+/// everywhere it doesn't, which is unbounded, the behaviour [`read_header`] had before either
+/// bound existed.
+///
+/// Two, and not one, because "the peer has sent nothing" and "the peer is part-way through
+/// sending a header" are different states: see [`read_header`]'s own doc comment.
+struct IdleBounds {
+    /// Absolute -- `last_progress + idle_timeout` -- and so measured from the last `Ack` rather
+    /// than restarted by each read. The deadline for the header's *first* byte only.
+    first_byte: tokio::time::Instant,
+    /// The per-`read` budget for every byte *after* the first: the configured `idle_timeout`
+    /// itself, exactly as [`read_frame_body`]'s `stall` bounds each read of a body.
+    stall: Duration,
+}
+
+impl IdleBounds {
+    /// `None` when this connection has no `idle_timeout` at all. `checked_add` because
+    /// `last_progress + idle` can overflow for an absurd (but legal) value, and rule 53 caps
+    /// nothing above `0s`.
+    fn new(last_progress: tokio::time::Instant, idle_timeout: Option<Duration>) -> Option<Self> {
+        let idle = idle_timeout?;
+        Some(Self {
+            first_byte: last_progress.checked_add(idle).unwrap_or_else(crate::tcp::far_future),
+            stall: idle,
+        })
+    }
+}
+
+/// Why [`read_header`] produced no header -- [`FrameReadError`]'s shape one step earlier in the
+/// frame, and for the same reason: an idle bound elapsing is not an error at all, it is the idle
+/// close, so a caller has to be able to tell it apart without re-parsing a message.
+enum HeaderReadError {
+    Io(anyhow::Error),
+    /// A bound elapsed -- either the wait for the header's first byte reached the connection's
+    /// absolute idle deadline, or one `read` after that byte made no progress for the whole
+    /// per-`read` budget. Carries the configured `idle_timeout` so `close_idle` can name it.
+    /// Only reachable when [`IdleBounds`] were passed.
+    Idle(Duration),
+}
+
+impl HeaderReadError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            HeaderReadError::Io(err) => err,
+            // Only for the callers that flatten both variants into one error (the handshake and
+            // the test helpers), none of which pass any bounds in the first place.
+            HeaderReadError::Idle(idle) => {
+                anyhow::anyhow!("a frame header stopped arriving for {idle:?}")
+            }
+        }
+    }
+}
+
 /// Reads exactly [`frame::HEADER_LEN`] bytes off `stream`, distinguishing "the peer closed
 /// cleanly with nothing pending" (`Ok(None)`) from "the peer closed mid-header" (a real error) --
 /// the distinction `read_exact` alone can't make, since it only reports success or failure, never
 /// how many bytes it managed before EOF. This is also exactly the step `serve_connection`'s
 /// per-frame `select!` races against `shutdown`: an idle connection is one blocked here, in the
 /// very first read of a frame boundary.
+///
+/// **Why `bounds` is two deadlines and not one.** [`IdleBounds::first_byte`] is absolute, so the
+/// wait for a frame that never starts is measured from the last `Ack` (this module's "Idle
+/// timeout" doc section) rather than restarted by each read. But once the first byte has arrived
+/// the header *is* arriving, which is progress, so every remaining read is bounded by
+/// [`IdleBounds::stall`] instead -- one `idle_timeout` budget per `read`, the same rule
+/// [`read_frame_body`] applies to a body one step later.
+///
+/// A single absolute deadline around the whole header would instead reject a frame whose first
+/// byte landed a moment before it -- discarding those bytes and answering
+/// `Reject{GOING_AWAY}` to a peer that had already started writing, which costs a `logit_out`
+/// exactly the `Fault::Ambiguous` batch the idle timeout's client-side probe exists to avoid.
+/// Nothing is lost when the first-byte deadline itself fires, since by definition no byte of this
+/// header has been read.
 async fn read_header<S: AsyncRead + Unpin>(
     stream: &mut S,
-) -> anyhow::Result<Option<[u8; frame::HEADER_LEN]>> {
+    bounds: Option<IdleBounds>,
+) -> Result<Option<[u8; frame::HEADER_LEN]>, HeaderReadError> {
     let mut buf = [0u8; frame::HEADER_LEN];
     let mut filled = 0usize;
     loop {
-        let n = stream.read(&mut buf[filled..]).await?;
+        let read = match &bounds {
+            None => stream.read(&mut buf[filled..]).await,
+            Some(bounds) if filled == 0 => {
+                match tokio::time::timeout_at(bounds.first_byte, stream.read(&mut buf[filled..]))
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(_elapsed) => return Err(HeaderReadError::Idle(bounds.stall)),
+                }
+            }
+            Some(bounds) => {
+                match tokio::time::timeout(bounds.stall, stream.read(&mut buf[filled..])).await {
+                    Ok(read) => read,
+                    Err(_elapsed) => return Err(HeaderReadError::Idle(bounds.stall)),
+                }
+            }
+        };
+        let n = read.map_err(|err| HeaderReadError::Io(anyhow::Error::new(err)))?;
         if n == 0 {
             if filled == 0 {
                 return Ok(None);
             }
-            anyhow::bail!("connection closed mid-header ({filled}/{} bytes)", frame::HEADER_LEN);
+            return Err(HeaderReadError::Io(anyhow::anyhow!(
+                "connection closed mid-header ({filled}/{} bytes)",
+                frame::HEADER_LEN
+            )));
         }
         filled += n;
         if filled == frame::HEADER_LEN {
@@ -993,8 +1068,11 @@ mod tests {
     /// Reads one whole frame off `stream` with no bound (test client trusts the server) --
     /// returns the header (so a test can check `flags`) and the decoded payload bytes.
     async fn read_frame_raw(stream: &mut TcpStream) -> (FrameHeader, Bytes) {
-        let header_buf =
-            read_header(stream).await.unwrap().expect("expected a frame, got a clean close");
+        let header_buf = read_header(stream, None)
+            .await
+            .map_err(HeaderReadError::into_inner)
+            .unwrap()
+            .expect("expected a frame, got a clean close");
         read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
             .await
             .map_err(FrameReadError::into_inner)
@@ -1509,8 +1587,11 @@ mod tests {
     async fn read_control_response_over<S: AsyncRead + Unpin>(
         stream: &mut S,
     ) -> control::ControlMessage {
-        let header_buf =
-            read_header(stream).await.unwrap().expect("expected a frame, got a clean close");
+        let header_buf = read_header(stream, None)
+            .await
+            .map_err(HeaderReadError::into_inner)
+            .unwrap()
+            .expect("expected a frame, got a clean close");
         let (header, mut payload) =
             read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
                 .await
@@ -1792,6 +1873,89 @@ mod tests {
         // gap that can reach 200ms.
         expect_reject_going_away_for_idleness(&mut client, "a connection that stopped sending")
             .await;
+    }
+
+    /// **The other side of the stall test below.** A header whose *first* byte lands just inside
+    /// the idle deadline and whose remaining bytes land just outside it must be read, not
+    /// rejected: the header arriving at all is progress, so from that byte on the bound is
+    /// per-`read` rather than the absolute deadline ([`read_header`]'s [`IdleBounds`]).
+    ///
+    /// A single absolute deadline around the whole header fails this twice over -- it discards
+    /// the bytes already read *and* answers `Reject{GOING_AWAY}` to a peer that had already
+    /// started writing a frame, which a `logit_out` reads as `Fault::Ambiguous` for a batch it
+    /// then drops under the default at-most-once posture. Exactly the loss the client-side probe
+    /// exists to avoid, reintroduced from the listener side.
+    ///
+    /// 80ms then 60ms against a 100ms idle timeout: the first byte lands comfortably inside the
+    /// deadline and the rest comfortably outside it, with each gap well under the 100ms
+    /// per-`read` budget that now applies.
+    #[tokio::test]
+    async fn a_frame_header_that_starts_arriving_at_the_idle_deadline_is_read_not_rejected() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let mut encoder = NativeEncoder::new(Compression::None);
+        let framed = encoder.encode(&sample_batch()).unwrap();
+
+        // 80ms of the 100ms deadline spent, then one byte of the header -- progress.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client.write_all(&framed[..1]).await.unwrap();
+        // 60ms more, so 140ms since the handshake: past the absolute deadline, but only 60ms
+        // since the byte that reset the per-`read` budget.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.write_all(&framed[1..]).await.unwrap();
+
+        assert_eq!(
+            read_ack(&mut client).await.seq,
+            1,
+            "a frame whose header started arriving before the deadline must be acked"
+        );
+        assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            None,
+            "and nothing closed as idle"
+        );
+    }
+
+    /// And the failure side of that same per-`read` bound: a header that starts arriving and then
+    /// stops is still closed. Switching to the per-`read` budget after the first byte must not
+    /// turn a half-written header into an unbounded wait -- that would hand back the very permit
+    /// leak the feature exists to close, one byte inside a frame.
+    #[tokio::test]
+    async fn a_frame_header_that_starts_and_then_stalls_is_closed_as_idle() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let mut encoder = NativeEncoder::new(Compression::None);
+        let framed = encoder.encode(&sample_batch()).unwrap();
+        // One byte of the header, then nothing at all -- progress once, and never again.
+        client.write_all(&framed[..1]).await.unwrap();
+
+        expect_reject_going_away_for_idleness(&mut client, "a header that stopped arriving").await;
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            Some(1.0)
+        );
+        assert!(rx.try_recv().is_err(), "a one-byte header must never produce a batch");
     }
 
     /// A frame body that stops arriving part-way through is the same condition as a gap between
