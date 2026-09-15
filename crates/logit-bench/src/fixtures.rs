@@ -934,6 +934,16 @@ function process(event)
 end
 "#;
 
+/// As [`LUA_EVENT_NEW_LOG_SCRIPT`], minting the smallest useful metric event instead: one
+/// `gauge` record with nothing but its required fields, the shape the plan's `flush(now)` smoke
+/// test emits (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_constructing_a_gauge_event`).
+pub const LUA_EVENT_NEW_GAUGE_SCRIPT: &str = r#"
+function process(event)
+  return Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}
+end
+"#;
+
 /// A metric-only event carrying one `MetricKind::Sum` record -- a counter, the shape
 /// `kv_metrics`'s `nginx.requests` spec (`fn kv_metrics` above) produces on the wire, and the
 /// fixture the Lua `event.metrics[i].value`/`#event.metrics` surface

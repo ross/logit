@@ -649,12 +649,17 @@ mint a sketch or a cardinality estimate by hand. This mirrors `AGENTS.md`'s "met
 stay mergeable" rule for the Rust side of this model: `distribution` (`DdSketch`) and `set`
 (`HyperLogLog`) carry real merge invariants a naive field write could violate, and `samples`/
 `set_members` are raw pre-aggregation collections `aggregate` still needs to fold correctly --
-none of these have a script-safe partial-write surface today, so none get one.
+none of these have a script-safe partial-write surface today, so none get one. The raw kinds
+*can* be built whole, though: `Event.new` constructs a `sum`, `gauge`, `samples` or `set_members`
+record (exemplars included) from the table shape this proxy's `to_table()` emits, and refuses the
+two sketches by name -- see "Constructing events" below.
 
 `exemplars` is a read-only snapshot table, one entry per `logit_core::Exemplar`: `{timestamp=
-<nanos-string>, value=<number>, trace_id=<hex-or-nil>, span_id=<hex-or-nil>, attributes=<table>}`
--- there is no way to add, remove, or mutate an individual exemplar from Lua, only to read the
-whole list as it currently stands.
+<nanos-string>, value=<number>, trace_id=<hex-or-nil>, span_id=<hex-or-nil>,
+trace_flags=<integer-or-nil>, attributes=<table>}` (`trace_flags` is `nil` exactly when
+`trace_id` is, the same rule `event.log.trace_flags` follows) -- there is no way to add, remove,
+or mutate an individual exemplar in place from Lua, only to read the whole list as it currently
+stands, or to rebuild the record with `Event.new`.
 
 ## Reading `event.span`
 
@@ -748,8 +753,8 @@ The top-level table:
 | `timestamp` | decimal-nanos string, the same rule as `event.timestamp` (a Lua number is the same error `event.timestamp = 1` is) | **required** |
 | `attributes` | table of string keys; every value converts the way an `event.attributes.k = v` write does | optional, default empty |
 | `log` | table, below | optional |
-| `metrics` | array of metric tables -- **not constructible yet**: an empty array is accepted (it's what `to_table()` emits for an event with no metrics), a non-empty one is `Event.new: metrics[1] is not constructible yet` until W3-W4 of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md) | optional |
-| `span` | table -- **not constructible yet**: `Event.new: span is not constructible yet` until W5 of the same plan | optional |
+| `metrics` | array of metric tables, below, in order | optional, default empty (which is what `to_table()` emits for an event with no metrics) |
+| `span` | table -- **not constructible yet**: `Event.new: span is not constructible yet` until W5 of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md) | optional |
 | `has_log`, `has_metrics`, `has_span` | boolean | optional; accepted because `to_table()` emits them, **values ignored** -- the payload keys are the truth |
 
 The `log` table, `to_table().log`'s shape:
@@ -766,6 +771,72 @@ The `log` table, `to_table().log`'s shape:
 | `observed_timestamp` | decimal-nanos string | optional, default `0` |
 | `dropped_attributes_count` | non-negative integer | optional, default `0` |
 
+### `metrics`
+
+Each entry of `metrics` is a metric table in `to_table().metrics[i]`'s shape: the fields every
+kind carries, plus the payload fields of its `kind`. `kind` is read first and decides which
+payload keys are fields at all -- `monotonic` is a field on a `sum` and `Event.new:
+metrics[1].monotonic is not a field` on a `gauge` -- so a typo in `kind` is reported as a bad
+kind, never as its payload keys being unknown.
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `name` | string (interned -- the same cardinality caution as the `event.metrics[i].name` write) | **required** |
+| `kind` | `"sum"`, `"gauge"`, `"samples"` or `"set_members"` (the others below) | **required** |
+| `unit`, `description` | string (interned) or `nil` | optional, default absent |
+| `start_timestamp` | decimal-nanos string | optional, default `0` (unknown, OTLP's own convention) |
+| `flags` | non-negative integer, the OTLP `DataPointFlags` mask | optional, default `0` |
+| `is_no_recorded_value` | boolean -- sugar for the flag bit: `true` ORs `MetricRecord::FLAG_NO_RECORDED_VALUE` onto `flags`, `false` leaves `flags` untouched (so `{flags = 1, is_no_recorded_value = false}` keeps the bit, and a round-trip of a flagged record is exact) | optional |
+| `exemplars` | array of exemplar tables, below | optional, default empty |
+
+Per kind -- and only that kind's keys are accepted:
+
+| `kind` | Key | Type / encoding | Required? |
+|---|---|---|---|
+| `sum` | `value` | finite number (NaN and the infinities are the same error a `value` write raises) | **required** |
+| | `temporality` | `"delta"` or `"cumulative"` | optional, default `"delta"` |
+| | `monotonic` | boolean | optional, default `true` |
+| `gauge` | `value` | finite number | **required** |
+| `samples` | `values` | array of finite numbers | optional, default empty |
+| | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
+| `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
+
+A `sum` given only its `value` is `MetricKind::counter` -- delta, monotonic -- so `{name = "hits",
+kind = "sum", value = 1}` is exactly the counter `statsd_in`'s `c` or a `kv_metrics` `counters:`
+entry emits. Every other default above is one core documents; nothing is invented.
+
+An exemplar table, `to_table()`'s exemplar snapshot shape (the `event.metrics` section above):
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `timestamp` | decimal-nanos string | **required** |
+| `value` | finite number | **required** |
+| `trace_id` | 32-char hex string, not all-zero | optional, default no trace context |
+| `span_id` | 16-char hex string, not all-zero; only with `trace_id` | optional |
+| `trace_flags` | integer 0-255; only with `trace_id` | optional, default `0` |
+| `attributes` | table of string keys, the exemplar's filtered attributes, converted like `attributes` above | optional, default empty |
+
+Errors carry the full path: `Event.new: metrics[2].value must be a finite number, got NaN`,
+`Event.new: metrics[1].values[3] must be a number, got string`, `Event.new: metrics[1].members[1]
+must be a string, got integer`, `Event.new: metrics[1].exemplars[1].span_id can't be set without a
+trace_id`, `Event.new: metrics[1].exemplars[1].flags is not a field`. A non-table entry is
+`Event.new: metrics[1] must be a table, got integer`; `metrics`, `exemplars`, `values` and
+`members` must each be a contiguous array (`{[2] = 1}` is `Event.new: metrics[1].values must be a
+contiguous array-like table`).
+
+**Kinds a script can't build.** An unknown `kind` lists the constructible ones: `Event.new:
+metrics[1].kind must be one of sum, gauge, samples, set_members, histogram, exponential_histogram,
+summary, got "counter"`. Of that list, `histogram`, `exponential_histogram` and `summary` are
+`Event.new: metrics[1].kind "histogram" is not constructible yet` until W4 of
+[`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md). Three kinds are
+deliberately absent from the list and never will be constructible, each saying why:
+`distribution` and `set` are `is not constructible from Lua -- a merged sketch; build a "samples"
+metric and let aggregate summarize it` (`"set_members"` for `set`) -- `to_table()` emits only a
+`count` or an `estimate` for them, never the DDSketch or HyperLogLog state, so there is no shape
+to invert, and a sketch rebuilt from a count alone would lie about its contents. `gauge_delta` is
+`is not constructible from Lua -- aggregate's private intermediate, never valid at a sink`
+([`docs/known-gaps.md`](../known-gaps.md)'s relative-gauge-adjustments entry).
+
 **Every mistake is a runtime error at the call, prefixed with the dotted path:** `Event.new:
 log.severty is not a field` (unknown keys are rejected everywhere, top level and sub-tables --
 the same strictness the proxies apply to an unknown field on read or write), `Event.new: timestamp
@@ -773,7 +844,8 @@ is required`, `Event.new: log.severity must be one of trace, debug, info, warn, 
 nil), got "warning"`, `Event.new: log.span_id can't be set without a trace_id`, `Event.new:
 attributes has a non-string key (integer)`. Table access is raw, so a metatable on the input can't
 make the key check and the field reads disagree. Defaults exist only where core already documents
-one (`BodyFormat::Raw`, the two zeros above); nothing else is invented.
+one (`BodyFormat::Raw`, the zeros above, `MetricKind::counter`'s temporality and monotonicity,
+`Samples::new`'s `sample_rate`); nothing else is invented.
 
 **Targets resolve at call time, not at script load.** A constructed event's `to(id)` checks the
 worker's `targets:` list as it stands when `Event.new` runs -- inside `process()` or `flush()`,
@@ -913,7 +985,7 @@ them a route to the host.
 | `event.attributes`, `event:to_table()` (proxy vs. table conversion) | [`memory.md`](memory.md) §2, §8 |
 | `resource`, `scope` (copy-on-write, read vs. write path) | [`memory.md`](memory.md) §2 |
 | `event.metrics`, `event.span` (per-access `MetricProxy`, `to_table()` growth) | [`memory.md`](memory.md) §2 |
-| `Event.new` (a constructed log event from a literal table; a script that never calls it pays nothing) | [`memory.md`](memory.md) §2 |
+| `Event.new` (a constructed log event and a constructed gauge event, each from a literal table; a script that never calls it pays nothing) | [`memory.md`](memory.md) §2 |
 
 Every number for the surfaces above is measured in `crates/logit-bench/tests/allocations.rs`, not
 estimated here -- this table intentionally carries none, so it can't drift out of date the moment

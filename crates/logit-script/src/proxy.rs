@@ -997,6 +997,16 @@ fn exemplar_to_table<'lua>(lua: &'lua Lua, exemplar: &Exemplar) -> mlua::Result<
             None => LuaValue::Nil,
         },
     )?;
+    // `nil` without a trace, the same rule `event.log.trace_flags` follows -- and present at
+    // all so `Event.new(e:to_table())` (`crate::construct`'s `exemplar_from_table`) rebuilds
+    // the exemplar's `TraceRef` exactly rather than with its flags zeroed.
+    table.set(
+        "trace_flags",
+        match exemplar.trace {
+            Some(t) => LuaValue::Integer(i64::from(t.flags)),
+            None => LuaValue::Nil,
+        },
+    )?;
     table.set("attributes", attrmap_to_lua_table(lua, &exemplar.filtered_attributes)?)?;
     Ok(table)
 }
@@ -2108,6 +2118,7 @@ mod tests {
                 assert(e.value == 42.0)
                 assert(e.trace_id == string.rep("33", 16))
                 assert(e.span_id == string.rep("44", 8))
+                assert(e.trace_flags == 1)
                 assert(e.attributes.dropped == "yes")
                 assert(m.values == nil)
                 assert(m.buckets == nil)

@@ -3233,6 +3233,40 @@ fn lua_process_one_event_constructing_a_log_event() {
     expect_allocs("lua: Event.new log event from a literal table", stats, 17);
 }
 
+/// `Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}` returned
+/// from `process()` in place of the incoming event -- the smallest useful constructed *metric*
+/// event, the shape a `flush(now)` tick emits. Same method and baseline as
+/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way.
+///
+/// **16**, broken down by measuring narrower scripts against this one, not derived:
+///
+/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
+///   `ProcessOutcome::Emit`: 11, exactly the log row's first three terms.
+/// - **+1** for the `metrics` array table (`metrics = {}` lands at 12; an empty list costs no
+///   `MetricList`/`Vec` growth -- `with_capacity(0)` and the one-record case both stay inline).
+/// - **+4** for the one metric: 1 for its own sub-table; 1 for `validated_sequence_len`'s key
+///   `Vec` over the array (paid once per event, not per metric -- a second metric adds 3 plus
+///   the `MetricList` spill past its one inline slot, 20 in all); 1 for the `format!`'d
+///   `metrics[i]` path each record's field errors are prefixed with (the same script with a
+///   static path lands at 15 -- the one deliberate per-metric cost, cheaper than threading the
+///   index through every helper); and 1 that every non-empty *record* sub-table carries beyond
+///   its own table and fields, the same bucket the log row folds into `message` -- `log =
+///   {message = 1}` lands at 13 against 12 for an empty sub-table, and a second field adds
+///   nothing. `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk and
+///   every nil-defaulted field allocate nothing; `unit = "ms"` and an empty `exemplars = {}`
+///   add 0 and 1 (the table) respectively.
+#[test]
+fn lua_process_one_event_constructing_a_gauge_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_EVENT_NEW_GAUGE_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new gauge event from a literal table", stats, 16);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

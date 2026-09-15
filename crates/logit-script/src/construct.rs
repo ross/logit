@@ -18,19 +18,27 @@
 //!   `__index` nor `__pairs` (which LuaJIT lacks anyway) can make the key check and the field
 //!   reads disagree about what the table holds.
 //! - **Defaults only where core already documents one** (`BodyFormat::Raw`, `observed_timestamp`
-//!   and `dropped_attributes_count` of `0`, empty `attributes`); `timestamp` and `log.message`
-//!   are required, exactly as the ADR lists.
+//!   and `dropped_attributes_count` of `0`, empty `attributes`; a metric's `start_timestamp`/
+//!   `flags` of `0`, `MetricKind::counter`'s temporality and monotonicity for a bare `sum`,
+//!   `Samples::new`'s `sample_rate` of `1.0`); `timestamp`, `log.message`, a metric's `name`/
+//!   `kind` and its kind's own payload are required, exactly as the ADR lists.
 //!
 //! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...`; the shared
-//! helpers at the bottom take the path as an argument so the metric (W3/W4) and span (W5)
-//! parsers of `docs/plans/lua-event-constructor.md` can reuse them unchanged. `metrics` and
-//! `span` are recognized here but not yet constructible -- each says so.
+//! helpers at the bottom take the path as an argument so the metric and span parsers of
+//! `docs/plans/lua-event-constructor.md` reuse them unchanged. `metrics` builds the four raw
+//! kinds (`sum`, `gauge`, `samples`, `set_members`) with their exemplars; the three
+//! pre-aggregated kinds are recognized but not yet constructible (W4), the two sketches and
+//! `gauge_delta` never will be, and `span` is not yet constructible (W5) -- each says so.
 
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_table_to_attrmap, lua_to_value, validated_sequence_len};
-use logit_core::interner::intern;
+use bytes::Bytes;
+use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
-use logit_core::{AttrMap, BodyFormat, Event, LogRecord, Severity, Value};
+use logit_core::{
+    AttrMap, BodyFormat, Event, Exemplar, LogRecord, MetricKind, MetricList, MetricRecord, Samples,
+    Severity, Sum, Temporality, Value,
+};
 use mlua::{Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -52,6 +60,29 @@ const LOG_KEYS: &[&str] = &[
     "observed_timestamp",
     "dropped_attributes_count",
 ];
+
+/// The keys `metric_to_table` emits for every kind. A kind's own payload keys
+/// ([`RawKind::keys`]) are added to these for the key check, once the kind is known.
+const METRIC_KEYS: &[&str] = &[
+    "name",
+    "kind",
+    "unit",
+    "description",
+    "start_timestamp",
+    "flags",
+    "is_no_recorded_value",
+    "exemplars",
+];
+
+/// The keys `exemplar_to_table` emits.
+const EXEMPLAR_KEYS: &[&str] =
+    &["timestamp", "value", "trace_id", "span_id", "trace_flags", "attributes"];
+
+/// The kinds the unknown-`kind` error names: the ones `Event.new` builds, plus the three W4 of
+/// `docs/plans/lua-event-constructor.md` adds -- deliberately *not* the sketches or
+/// `gauge_delta`, which are never constructible and get their own message each.
+const CONSTRUCTIBLE_KINDS: &str =
+    "sum, gauge, samples, set_members, histogram, exponential_histogram, summary";
 
 /// Installs the `Event` global -- a table holding one function, `new` -- following
 /// `telemetry::install`'s shape. `targets` is the worker's routing table *cell*
@@ -86,39 +117,44 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
         LuaValue::Nil => return Err(required("", "timestamp")),
         value => nanos_string(value, "", "timestamp")?,
     };
-    let attributes = match t.raw_get::<_, LuaValue>("attributes")? {
-        LuaValue::Nil => AttrMap::new(),
-        LuaValue::Table(attrs) => attributes_from_table(attrs, "attributes")?,
-        other => {
-            return Err(runtime_error(format!(
-                "Event.new: attributes must be a table (or nil), got {}",
-                other.type_name()
-            )))
-        }
-    };
+    let attributes = attributes_field(t.raw_get("attributes")?, "", "attributes")?;
     for key in ["has_log", "has_metrics", "has_span"] {
         // Accepted because `to_table()` emits them; ignored because the payload keys below are
         // the truth (ADR `lua-event-constructor`). Still type-checked, so a script that wrote
         // `has_log = "yes"` hears about it.
         boolean_field(&t, "", key)?;
     }
-    match t.raw_get::<_, LuaValue>("metrics")? {
-        LuaValue::Nil => {}
+    let metrics = match t.raw_get::<_, LuaValue>("metrics")? {
+        LuaValue::Nil => MetricList::new(),
         LuaValue::Table(metrics) => match validated_sequence_len(&metrics)? {
             // `to_table()` always emits `metrics`, empty when the event carries none, so the
-            // empty sequence must be accepted for the round-trip to hold.
-            Some(0) => {}
-            // W3/W4 of `docs/plans/lua-event-constructor.md` replace this arm with
-            // `metric_from_table` per kind.
-            Some(_) => {
-                return Err(runtime_error(
-                    "Event.new: metrics[1] is not constructible yet".to_string(),
-                ))
+            // empty sequence is accepted (and costs nothing: `with_capacity(0)` stays inline,
+            // as does the one-record case `MetricList`'s inline slot is sized for).
+            Some(len) => {
+                let mut list = MetricList::with_capacity(len);
+                for i in 1..=len {
+                    match metrics.raw_get::<_, LuaValue>(i)? {
+                        // One small `String` per metric for its path: every field error
+                        // beneath needs `metrics[i]` as a prefix, and building it once here is
+                        // cheaper than threading the index through every helper. Accounted
+                        // for in the `lua: Event.new gauge event ..` pin.
+                        LuaValue::Table(m) => {
+                            list.push(metric_from_table(m, &format!("metrics[{i}]"))?)
+                        }
+                        other => {
+                            return Err(runtime_error(format!(
+                                "Event.new: metrics[{i}] must be a table, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                }
+                list
             }
-            None => return Err(metrics_not_a_sequence()),
+            None => return Err(not_a_sequence("", "metrics")),
         },
-        _ => return Err(metrics_not_a_sequence()),
-    }
+        _ => return Err(not_a_sequence("", "metrics")),
+    };
     match t.raw_get::<_, LuaValue>("span")? {
         LuaValue::Nil => {}
         // W5 of `docs/plans/lua-event-constructor.md` replaces this arm with `span_from_table`.
@@ -144,6 +180,7 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
     };
     let mut event = Event::empty(timestamp, attributes);
     event.log = log;
+    event.metrics = metrics;
     Ok(event)
 }
 
@@ -178,17 +215,7 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         t.raw_get("trace_flags")?,
         path,
     )?;
-    let event_name = match t.raw_get::<_, LuaValue>("event_name")? {
-        LuaValue::Nil => None,
-        LuaValue::String(s) => Some(intern(s.to_str()?)),
-        other => {
-            return Err(runtime_error(format!(
-                "Event.new: {} must be a string or nil, got {}",
-                dotted(path, "event_name"),
-                other.type_name()
-            )))
-        }
-    };
+    let event_name = symbol_field(t.raw_get("event_name")?, path, "event_name")?;
     let observed_timestamp = match t.raw_get::<_, LuaValue>("observed_timestamp")? {
         LuaValue::Nil => 0,
         value => nanos_string(value, path, "observed_timestamp")?,
@@ -204,6 +231,266 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         observed_timestamp,
         dropped_attributes_count,
     })
+}
+
+/// Builds a [`MetricRecord`] from a table in `metric_to_table`'s shape. `path` is the table's
+/// own path (`metrics[i]`).
+fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
+    // `kind` first: it decides which payload keys are fields at all, so an unknown kind is
+    // reported as such rather than as its payload keys "not being fields", and a `sum`'s
+    // `monotonic` is a field while a `gauge`'s is not. `to_string_lossy` borrows a valid UTF-8
+    // Lua string, so the name costs nothing on the success path.
+    let kind_name = match t.raw_get::<_, LuaValue>("kind")? {
+        LuaValue::Nil => return Err(required(path, "kind")),
+        LuaValue::String(s) => s,
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a string, got {}",
+                dotted(path, "kind"),
+                other.type_name()
+            )))
+        }
+    };
+    let kind = RawKind::parse(&kind_name.to_string_lossy(), path)?;
+    expect_keys_of(&t, &[METRIC_KEYS, kind.keys()], path)?;
+    let name = match t.raw_get::<_, LuaValue>("name")? {
+        LuaValue::Nil => return Err(required(path, "name")),
+        LuaValue::String(s) => intern(s.to_str()?),
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a string, got {}",
+                dotted(path, "name"),
+                other.type_name()
+            )))
+        }
+    };
+    let unit = symbol_field(t.raw_get("unit")?, path, "unit")?;
+    let description = symbol_field(t.raw_get("description")?, path, "description")?;
+    let start_timestamp = match t.raw_get::<_, LuaValue>("start_timestamp")? {
+        LuaValue::Nil => 0,
+        value => nanos_string(value, path, "start_timestamp")?,
+    };
+    let mut flags = u32_field(t.raw_get("flags")?, path, "flags")?;
+    // `is_no_recorded_value` is sugar for the flag bit (ADR `lua-event-constructor`): `true`
+    // ORs it on, `false` is a no-op rather than a clear, so `to_table()`'s `{flags = 1,
+    // is_no_recorded_value = true}` rebuilds as exactly `flags == 1` and a script that sets
+    // `flags` by hand isn't second-guessed.
+    match t.raw_get::<_, LuaValue>("is_no_recorded_value")? {
+        LuaValue::Nil | LuaValue::Boolean(false) => {}
+        LuaValue::Boolean(true) => flags |= MetricRecord::FLAG_NO_RECORDED_VALUE,
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a boolean (or nil), got {}",
+                dotted(path, "is_no_recorded_value"),
+                other.type_name()
+            )))
+        }
+    }
+    let exemplars = match t.raw_get::<_, LuaValue>("exemplars")? {
+        LuaValue::Nil => Vec::new(),
+        LuaValue::Table(list) => match validated_sequence_len(&list)? {
+            // `with_capacity(0)` is `Vec::new()`: the empty list `to_table()` always emits
+            // costs nothing to rebuild.
+            Some(len) => {
+                let mut exemplars = Vec::with_capacity(len);
+                for j in 1..=len {
+                    match list.raw_get::<_, LuaValue>(j)? {
+                        LuaValue::Table(e) => exemplars
+                            .push(exemplar_from_table(e, &format!("{path}.exemplars[{j}]"))?),
+                        other => {
+                            return Err(runtime_error(format!(
+                                "Event.new: {path}.exemplars[{j}] must be a table, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                }
+                exemplars
+            }
+            None => return Err(not_a_sequence(path, "exemplars")),
+        },
+        _ => return Err(not_a_sequence(path, "exemplars")),
+    };
+    let kind = match kind {
+        RawKind::Sum => {
+            // The defaults are `MetricKind::counter`'s -- delta, monotonic -- so
+            // `{kind = "sum", value = 1}` is exactly the counter `kv_metrics`/`statsd_in` emit.
+            let value = finite_field(t.raw_get("value")?, path, "value")?;
+            let temporality = enum_field(
+                t.raw_get("temporality")?,
+                path,
+                "temporality",
+                &Temporality::NAMES,
+                Temporality::from_name,
+            )?
+            .unwrap_or(Temporality::Delta);
+            let monotonic = match t.raw_get::<_, LuaValue>("monotonic")? {
+                LuaValue::Nil => true,
+                LuaValue::Boolean(b) => b,
+                other => {
+                    return Err(runtime_error(format!(
+                        "Event.new: {} must be a boolean (or nil), got {}",
+                        dotted(path, "monotonic"),
+                        other.type_name()
+                    )))
+                }
+            };
+            MetricKind::Sum(Sum { value, temporality, monotonic })
+        }
+        RawKind::Gauge => MetricKind::Gauge(finite_field(t.raw_get("value")?, path, "value")?),
+        RawKind::Samples => {
+            // `Samples::new`'s `sample_rate` of `1.0` is the default core documents; `values`
+            // are pushed straight onto the record's own `SmallVec`, so up to `SAMPLES_INLINE`
+            // of them allocate nothing beyond the record.
+            let mut samples = Samples::new(std::iter::empty());
+            match t.raw_get::<_, LuaValue>("values")? {
+                LuaValue::Nil => {}
+                LuaValue::Table(values) => match validated_sequence_len(&values)? {
+                    Some(len) => {
+                        samples.values.reserve(len);
+                        for k in 1..=len {
+                            samples.values.push(finite(values.raw_get(k)?, || {
+                                format!("{}[{k}]", dotted(path, "values"))
+                            })?);
+                        }
+                    }
+                    None => return Err(not_a_sequence(path, "values")),
+                },
+                _ => return Err(not_a_sequence(path, "values")),
+            }
+            match t.raw_get::<_, LuaValue>("sample_rate")? {
+                LuaValue::Nil => {}
+                value => samples.sample_rate = finite(value, || dotted(path, "sample_rate"))?,
+            }
+            MetricKind::Samples(samples)
+        }
+        RawKind::SetMembers => {
+            let members = match t.raw_get::<_, LuaValue>("members")? {
+                LuaValue::Nil => Vec::new(),
+                LuaValue::Table(list) => match validated_sequence_len(&list)? {
+                    Some(len) => {
+                        let mut members = Vec::with_capacity(len);
+                        for k in 1..=len {
+                            match list.raw_get::<_, LuaValue>(k)? {
+                                // A member is opaque bytes on the record (`statsd_in`'s `s`
+                                // payload), so a Lua string copies over as-is, UTF-8 or not.
+                                LuaValue::String(s) => {
+                                    members.push(Bytes::copy_from_slice(s.as_bytes()))
+                                }
+                                other => {
+                                    return Err(runtime_error(format!(
+                                        "Event.new: {}[{k}] must be a string, got {}",
+                                        dotted(path, "members"),
+                                        other.type_name()
+                                    )))
+                                }
+                            }
+                        }
+                        members
+                    }
+                    None => return Err(not_a_sequence(path, "members")),
+                },
+                _ => return Err(not_a_sequence(path, "members")),
+            };
+            MetricKind::SetMembers(members)
+        }
+    };
+    Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind })
+}
+
+/// The metric kinds `Event.new` builds today -- the raw, pre-aggregation ones -- and the payload
+/// keys each adds to [`METRIC_KEYS`]. [`RawKind::parse`] is where every kind that *isn't* one
+/// of these gets its own message.
+#[derive(Clone, Copy)]
+enum RawKind {
+    Sum,
+    Gauge,
+    Samples,
+    SetMembers,
+}
+
+impl RawKind {
+    fn parse(name: &str, path: &str) -> mlua::Result<Self> {
+        Ok(match name {
+            "sum" => RawKind::Sum,
+            "gauge" => RawKind::Gauge,
+            "samples" => RawKind::Samples,
+            "set_members" => RawKind::SetMembers,
+            // W4 of `docs/plans/lua-event-constructor.md` replaces this arm.
+            "histogram" | "exponential_histogram" | "summary" => {
+                return Err(runtime_error(format!(
+                    "Event.new: {} \"{name}\" is not constructible yet",
+                    dotted(path, "kind")
+                )))
+            }
+            // `to_table()` is deliberately lossy for the two sketches (a `count`, an `estimate`
+            // -- never the DDSketch or HyperLogLog state), so there is no shape to invert; the
+            // raw kind `aggregate` folds into each is the way to get one.
+            "distribution" => {
+                return Err(not_constructible(
+                    path,
+                    name,
+                    "a merged sketch; build a \"samples\" metric and let aggregate summarize it",
+                ))
+            }
+            "set" => {
+                return Err(not_constructible(
+                    path,
+                    name,
+                    "a merged sketch; build a \"set_members\" metric and let aggregate \
+                     summarize it",
+                ))
+            }
+            "gauge_delta" => {
+                return Err(not_constructible(
+                    path,
+                    name,
+                    "aggregate's private intermediate, never valid at a sink",
+                ))
+            }
+            _ => {
+                return Err(runtime_error(format!(
+                    "Event.new: {} must be one of {CONSTRUCTIBLE_KINDS}, got \"{name}\"",
+                    dotted(path, "kind")
+                )))
+            }
+        })
+    }
+
+    fn keys(self) -> &'static [&'static str] {
+        match self {
+            RawKind::Sum => &["value", "temporality", "monotonic"],
+            RawKind::Gauge => &["value"],
+            RawKind::Samples => &["values", "sample_rate"],
+            RawKind::SetMembers => &["members"],
+        }
+    }
+}
+
+fn not_constructible(path: &str, name: &str, why: &str) -> mlua::Error {
+    runtime_error(format!(
+        "Event.new: {} \"{name}\" is not constructible from Lua -- {why}",
+        dotted(path, "kind")
+    ))
+}
+
+/// Builds an [`Exemplar`] from a table in `exemplar_to_table`'s shape. `path` is the table's
+/// own path (`metrics[i].exemplars[j]`).
+fn exemplar_from_table(t: Table, path: &str) -> mlua::Result<Exemplar> {
+    expect_keys(&t, EXEMPLAR_KEYS, path)?;
+    let timestamp = match t.raw_get::<_, LuaValue>("timestamp")? {
+        LuaValue::Nil => return Err(required(path, "timestamp")),
+        value => nanos_string(value, path, "timestamp")?,
+    };
+    let value = finite_field(t.raw_get("value")?, path, "value")?;
+    let trace = trace_ref_from_fields(
+        t.raw_get("trace_id")?,
+        t.raw_get("span_id")?,
+        t.raw_get("trace_flags")?,
+        path,
+    )?;
+    let filtered_attributes = attributes_field(t.raw_get("attributes")?, path, "attributes")?;
+    Ok(Exemplar { timestamp, value, trace, filtered_attributes })
 }
 
 // -- shared helpers -----------------------------------------------------------------------------
@@ -222,8 +509,11 @@ fn required(path: &str, key: &str) -> mlua::Error {
     runtime_error(format!("Event.new: {} is required", dotted(path, key)))
 }
 
-fn metrics_not_a_sequence() -> mlua::Error {
-    runtime_error("Event.new: metrics must be a contiguous array-like table".to_string())
+/// A field that must be a sequence (`validated_sequence_len`'s contiguous-from-one rule) but is
+/// either a non-table or a table with other keys: `metrics`, a metric's `exemplars`/`values`/
+/// `members`.
+fn not_a_sequence(path: &str, key: &str) -> mlua::Error {
+    runtime_error(format!("Event.new: {} must be a contiguous array-like table", dotted(path, key)))
 }
 
 /// `<path>.<key>`, or just `<key>` at the top level (`path == ""`).
@@ -247,6 +537,12 @@ fn describe(path: &str) -> &str {
 /// -- and any non-string key at all. Iterates with `Table::pairs`, which is raw in mlua 0.9
 /// (`lua_next` under the hood, see the module doc), matching the `raw_get` reads that follow.
 fn expect_keys(t: &Table, allowed: &[&str], path: &str) -> mlua::Result<()> {
+    expect_keys_of(t, &[allowed], path)
+}
+
+/// [`expect_keys`] against the union of several key lists, without building the union: a
+/// metric's common keys plus the payload keys of its own kind.
+fn expect_keys_of(t: &Table, allowed: &[&[&str]], path: &str) -> mlua::Result<()> {
     for pair in t.clone().pairs::<LuaValue, LuaValue>() {
         let (key, _) = pair?;
         let LuaValue::String(key) = key else {
@@ -257,7 +553,7 @@ fn expect_keys(t: &Table, allowed: &[&str], path: &str) -> mlua::Result<()> {
             )));
         };
         let key = key.to_string_lossy();
-        if !allowed.contains(&key.as_ref()) {
+        if !allowed.iter().any(|set| set.contains(&key.as_ref())) {
             return Err(runtime_error(format!("Event.new: {} is not a field", dotted(path, &key))));
         }
     }
@@ -440,18 +736,82 @@ fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
     }
 }
 
+/// An optional interned-string field (`log.event_name`, a metric's `unit`/`description`):
+/// `nil` is `None`, a string is interned -- the same cardinality caution the proxy's writes to
+/// these fields carry.
+fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<Symbol>> {
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(s) => Ok(Some(intern(s.to_str()?))),
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be a string or nil, got {}",
+            dotted(path, key),
+            other.type_name()
+        ))),
+    }
+}
+
+/// A required finite number (a `sum`/`gauge`/exemplar `value`): `nil` is "is required", and
+/// anything else goes through [`finite`].
+fn finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
+    match value {
+        LuaValue::Nil => Err(required(path, key)),
+        value => finite(value, || dotted(path, key)),
+    }
+}
+
+/// The rule `crate::proxy`'s `require_finite_number` applies to a `value` write, with a lazily
+/// built field name so a `values[k]` element costs no `format!` on the success path: a Lua
+/// integer or number that is finite. NaN and the infinities are rejected as loudly as a string
+/// is, rather than stored into a metric a sink or `aggregate` would then have to defend against.
+fn finite(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<f64> {
+    let v = match value {
+        LuaValue::Integer(i) => i as f64,
+        LuaValue::Number(n) => n,
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a number, got {}",
+                field(),
+                other.type_name()
+            )))
+        }
+    };
+    if !v.is_finite() {
+        return Err(runtime_error(format!(
+            "Event.new: {} must be a finite number, got {v}",
+            field()
+        )));
+    }
+    Ok(v)
+}
+
+/// An optional attributes table (the top level's `attributes`, an exemplar's): `nil` is empty,
+/// a table goes through [`attributes_from_table`].
+fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<AttrMap> {
+    match value {
+        LuaValue::Nil => Ok(AttrMap::new()),
+        LuaValue::Table(attrs) => attributes_from_table(attrs, path, key),
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be a table (or nil), got {}",
+            dotted(path, key),
+            other.type_name()
+        ))),
+    }
+}
+
 /// An [`AttrMap`] from a table of string keys. Stricter than `event.attributes.x = {..}`'s
 /// `lua_table_to_attrmap` alone, which coerces a numeric key to its decimal string the way
 /// mlua's `String` conversion does: a constructor's input is `to_table()`'s output, where every
 /// attribute key is a string, so a non-string key here is a mistake worth naming. The key check
 /// is its own raw pass; the values then convert through the shared helper.
-fn attributes_from_table(t: Table, path: &str) -> mlua::Result<AttrMap> {
+fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
     for pair in t.clone().pairs::<LuaValue, LuaValue>() {
-        let (key, _) = pair?;
-        if !matches!(key, LuaValue::String(_)) {
+        let (k, _) = pair?;
+        if !matches!(k, LuaValue::String(_)) {
             return Err(runtime_error(format!(
-                "Event.new: {path} has a non-string key ({})",
-                key.type_name()
+                "Event.new: {} has a non-string key ({})",
+                dotted(path, key),
+                k.type_name()
             )));
         }
     }
@@ -537,6 +897,71 @@ mod tests {
             round_trippable_attributes(),
             log_record_with_everything(),
         )
+    }
+
+    /// `proxy.rs`'s `metric_record`: non-default values on every kind-independent field (unit,
+    /// description, start_timestamp, flags, one exemplar carrying a full trace context --
+    /// `flags` included, which is what `exemplar_to_table`'s `trace_flags` exists for -- and an
+    /// attribute) -- callers fill in `kind`.
+    fn metric_record(kind: MetricKind) -> MetricRecord {
+        let mut record = MetricRecord::new(intern("test.metric"), kind);
+        record.unit = Some(intern("ms"));
+        record.description = Some(intern("a test metric"));
+        record.start_timestamp = 1_700_000_000_000_000_000;
+        record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        record.exemplars = vec![Exemplar {
+            timestamp: 1_700_000_000_500_000_000,
+            value: 42.0,
+            trace: Some(TraceRef { trace_id: [0x33; 16], span_id: Some([0x44; 8]), flags: 1 }),
+            filtered_attributes: {
+                let mut m = AttrMap::new();
+                m.insert("dropped", "yes");
+                m
+            },
+        }];
+        record
+    }
+
+    fn metric_event(kind: MetricKind) -> Event {
+        Event::metric(1_700_000_000_000_000_000, round_trippable_attributes(), metric_record(kind))
+    }
+
+    fn sum_kind() -> MetricKind {
+        MetricKind::Sum(Sum { value: 12.5, temporality: Temporality::Cumulative, monotonic: false })
+    }
+
+    fn gauge_kind() -> MetricKind {
+        MetricKind::Gauge(3.25)
+    }
+
+    fn samples_kind() -> MetricKind {
+        let mut samples = Samples::new([1.0, 2.0, 3.5]);
+        samples.sample_rate = 0.5;
+        MetricKind::Samples(samples)
+    }
+
+    fn set_members_kind() -> MetricKind {
+        MetricKind::SetMembers(vec![Bytes::from_static(b"alice"), Bytes::from_static(b"bob")])
+    }
+
+    /// A one-record metric event with `name = "m"` and the given literal fields, minted from
+    /// `timestamp = "1"` and no attributes -- the shape every "this literal yields this record"
+    /// test below asserts against.
+    fn minted_metric(record: MetricRecord) -> Event {
+        Event::metric(1, AttrMap::new(), record)
+    }
+
+    /// `process()`'s result for `Event.new{timestamp = "1", metrics = {{name = "m", <fields>}}}`.
+    fn mint_metric(fields: &str) -> Event {
+        let w = worker(&format!(
+            r#"function process(event) return Event.new{{timestamp = "1", metrics = {{{{name = "m", {fields}}}}}}} end"#
+        ));
+        emitted(w.process(Event::empty(0, AttrMap::new())).unwrap())
+    }
+
+    /// The error for `Event.new{timestamp = "1", metrics = {{<fields>}}}`.
+    fn metric_err(fields: &str) -> String {
+        new_err(&format!(r#"{{timestamp = "1", metrics = {{{{{fields}}}}}}}"#))
     }
 
     const REBUILD: &str = "function process(event) return Event.new(event:to_table()) end";
@@ -860,12 +1285,6 @@ mod tests {
     }
 
     #[test]
-    fn a_non_empty_metrics_list_is_not_constructible_yet() {
-        let err = new_err(r#"{timestamp = "1", metrics = {{}}}"#);
-        assert!(err.contains("Event.new: metrics[1] is not constructible yet"), "got: {err}");
-    }
-
-    #[test]
     fn a_span_is_not_constructible_yet() {
         let err = new_err(r#"{timestamp = "1", span = {}}"#);
         assert!(err.contains("Event.new: span is not constructible yet"), "got: {err}");
@@ -876,6 +1295,331 @@ mod tests {
         let err = new_err(r#"{timestamp = "1", metrics = {[2] = {}}}"#);
         assert!(
             err.contains("Event.new: metrics must be a contiguous array-like table"),
+            "got: {err}"
+        );
+    }
+
+    // -- metrics ------------------------------------------------------------------------------
+
+    #[test]
+    fn new_of_to_table_round_trips_a_sum_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(sum_kind())).unwrap());
+        assert_eq!(out, metric_event(sum_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_gauge_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(gauge_kind())).unwrap());
+        assert_eq!(out, metric_event(gauge_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_samples_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(samples_kind())).unwrap());
+        assert_eq!(out, metric_event(samples_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_set_members_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(set_members_kind())).unwrap());
+        assert_eq!(out, metric_event(set_members_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_multi_metric_event_in_order() {
+        let mut event = metric_event(sum_kind());
+        event.metrics.push(metric_record(gauge_kind()));
+        let w = worker(REBUILD);
+        let out = emitted(w.process(event.clone()).unwrap());
+        assert_eq!(out, event);
+        assert_eq!(out.metrics[0].kind, sum_kind());
+        assert_eq!(out.metrics[1].kind, gauge_kind());
+    }
+
+    /// The `exemplar_to_table` addition this workstream makes: without `trace_flags` in the
+    /// table, a flagged exemplar would rebuild with `flags: 0` and the whole-event round-trips
+    /// above would fail. Proven from a literal too, so the field is known to be *read*, not
+    /// just emitted.
+    #[test]
+    fn an_exemplar_round_trips_its_trace_flags() {
+        let out = mint_metric(
+            r#"kind = "gauge", value = 1, exemplars = {{timestamp = "5", value = 2, trace_id = string.rep("33", 16), span_id = string.rep("44", 8), trace_flags = 1}}"#,
+        );
+        let mut record = MetricRecord::new(intern("m"), MetricKind::Gauge(1.0));
+        record.exemplars = vec![Exemplar {
+            timestamp: 5,
+            value: 2.0,
+            trace: Some(TraceRef { trace_id: [0x33; 16], span_id: Some([0x44; 8]), flags: 1 }),
+            filtered_attributes: AttrMap::new(),
+        }];
+        assert_eq!(out, minted_metric(record));
+    }
+
+    #[test]
+    fn a_bare_sum_is_a_counter() {
+        // `MetricKind::counter`'s defaults: delta, monotonic.
+        let out = mint_metric(r#"kind = "sum", value = 1"#);
+        assert_eq!(out, minted_metric(MetricRecord::new(intern("m"), MetricKind::counter(1.0))));
+    }
+
+    #[test]
+    fn a_sum_takes_its_temporality_and_monotonicity() {
+        let out = mint_metric(
+            r#"kind = "sum", value = 1, temporality = "cumulative", monotonic = false"#,
+        );
+        assert_eq!(
+            out.metrics[0].kind,
+            MetricKind::Sum(Sum {
+                value: 1.0,
+                temporality: Temporality::Cumulative,
+                monotonic: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_bare_samples_metric_gets_cores_defaults() {
+        // No `values` is empty; no `sample_rate` is `Samples::new`'s 1.0.
+        let out = mint_metric(r#"kind = "samples""#);
+        assert_eq!(out.metrics[0].kind, MetricKind::Samples(Samples::new(std::iter::empty())));
+    }
+
+    #[test]
+    fn a_bare_set_members_metric_is_empty() {
+        let out = mint_metric(r#"kind = "set_members""#);
+        assert_eq!(out.metrics[0].kind, MetricKind::SetMembers(Vec::new()));
+    }
+
+    #[test]
+    fn is_no_recorded_value_true_sets_the_flag_bit() {
+        let out =
+            mint_metric(r#"kind = "gauge", value = 1, flags = 0, is_no_recorded_value = true"#);
+        assert!(out.metrics[0].is_no_recorded_value());
+        assert_eq!(out.metrics[0].flags, MetricRecord::FLAG_NO_RECORDED_VALUE);
+    }
+
+    #[test]
+    fn is_no_recorded_value_false_leaves_flags_alone() {
+        let out =
+            mint_metric(r#"kind = "gauge", value = 1, flags = 1, is_no_recorded_value = false"#);
+        assert!(out.metrics[0].is_no_recorded_value());
+        assert_eq!(out.metrics[0].flags, 1);
+    }
+
+    #[test]
+    fn an_unknown_metric_kind_lists_the_constructible_ones() {
+        let err = metric_err(r#"name = "m", kind = "counter", value = 1"#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].kind must be one of sum, gauge, samples, set_members, \
+                 histogram, exponential_histogram, summary, got \"counter\""
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_reported_before_its_payload_keys() {
+        // `value` isn't a field of any known kind's key set here, but the kind error wins.
+        let err = metric_err(r#"name = "m", kind = "nope", value = 1"#);
+        assert!(err.contains("metrics[1].kind must be one of"), "got: {err}");
+    }
+
+    #[test]
+    fn the_sketch_kinds_name_their_raw_kind() {
+        let err = metric_err(r#"name = "m", kind = "distribution", count = 3"#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].kind \"distribution\" is not constructible from Lua -- a \
+                 merged sketch; build a \"samples\" metric and let aggregate summarize it"
+            ),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "set", estimate = 3"#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].kind \"set\" is not constructible from Lua -- a merged \
+                 sketch; build a \"set_members\" metric and let aggregate summarize it"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn gauge_delta_is_never_constructible() {
+        let err = metric_err(r#"name = "m", kind = "gauge_delta", value = 1"#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].kind \"gauge_delta\" is not constructible from Lua -- \
+                 aggregate's private intermediate, never valid at a sink"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_pre_aggregated_kinds_are_not_constructible_yet() {
+        for kind in ["histogram", "exponential_histogram", "summary"] {
+            let err = metric_err(&format!(r#"name = "m", kind = "{kind}""#));
+            assert!(
+                err.contains(&format!(
+                    "Event.new: metrics[1].kind \"{kind}\" is not constructible yet"
+                )),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_value_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = "x""#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a number, got string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_value_is_required() {
+        let err = metric_err(r#"name = "m", kind = "sum""#);
+        assert!(err.contains("Event.new: metrics[1].value is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_finite_value_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 0/0"#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a finite number, got NaN"),
+            "got: {err}"
+        );
+        let err = metric_err(r#"name = "m", kind = "sum", value = math.huge"#);
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a finite number, got inf"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_sequence_values_table_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "samples", values = {[2] = 1}"#);
+        assert!(
+            err.contains("Event.new: metrics[1].values must be a contiguous array-like table"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_sample_is_rejected_by_index() {
+        let err = metric_err(r#"name = "m", kind = "samples", values = {1, "two"}"#);
+        assert!(
+            err.contains("Event.new: metrics[1].values[2] must be a number, got string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_member_is_rejected_by_index() {
+        let err = metric_err(r#"name = "m", kind = "set_members", members = {1}"#);
+        assert!(
+            err.contains("Event.new: metrics[1].members[1] must be a string, got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_sample_rate_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "samples", sample_rate = "fast""#);
+        assert!(
+            err.contains("Event.new: metrics[1].sample_rate must be a number, got string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_exemplar_span_id_without_a_trace_id_is_rejected_with_its_path() {
+        let err = metric_err(
+            r#"name = "m", kind = "gauge", value = 1, exemplars = {{timestamp = "1", value = 1, span_id = "4444444444444444"}}"#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].exemplars[1].span_id can't be set without a trace_id"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_exemplar_key_is_not_a_field() {
+        let err = metric_err(
+            r#"name = "m", kind = "gauge", value = 1, exemplars = {{timestamp = "1", value = 1, flags = 1}}"#,
+        );
+        assert!(
+            err.contains("Event.new: metrics[1].exemplars[1].flags is not a field"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_exemplar_without_a_timestamp_is_required() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, exemplars = {{value = 1}}"#);
+        assert!(
+            err.contains("Event.new: metrics[1].exemplars[1].timestamp is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_table_exemplar_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, exemplars = {1}"#);
+        assert!(
+            err.contains("Event.new: metrics[1].exemplars[1] must be a table, got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_metric_key_is_not_a_field() {
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, bogus = 1"#);
+        assert!(err.contains("Event.new: metrics[1].bogus is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_payload_key_of_another_kind_is_not_a_field() {
+        // `monotonic` is a `sum` field; on a `gauge` it's unknown.
+        let err = metric_err(r#"name = "m", kind = "gauge", value = 1, monotonic = true"#);
+        assert!(err.contains("Event.new: metrics[1].monotonic is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_metric_without_a_name_is_required() {
+        let err = metric_err(r#"kind = "gauge", value = 1"#);
+        assert!(err.contains("Event.new: metrics[1].name is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_metric_without_a_kind_is_required() {
+        let err = metric_err(r#"name = "m", value = 1"#);
+        assert!(err.contains("Event.new: metrics[1].kind is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_table_metric_is_rejected() {
+        let err = new_err(r#"{timestamp = "1", metrics = {5}}"#);
+        assert!(err.contains("Event.new: metrics[1] must be a table, got integer"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_temporality_lists_the_names() {
+        let err = metric_err(r#"name = "m", kind = "sum", value = 1, temporality = "total""#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].temporality must be one of delta, cumulative (or nil), \
+                 got \"total\""
+            ),
             "got: {err}"
         );
     }
