@@ -1886,16 +1886,19 @@ mod tests {
     /// then drops under the default at-most-once posture. Exactly the loss the client-side probe
     /// exists to avoid, reintroduced from the listener side.
     ///
-    /// 80ms then 60ms against a 100ms idle timeout: the first byte lands comfortably inside the
-    /// deadline and the rest comfortably outside it, with each gap well under the 100ms
-    /// per-`read` budget that now applies.
+    /// 220ms then 160ms against a 300ms idle timeout. Both margins are deliberately wide, since
+    /// a `sleep` can only *overshoot*: the first byte lands 80ms inside the absolute deadline
+    /// (scheduler lag would have to eat all of that to push it past), the rest lands 80ms outside
+    /// it (lag only makes that more true), and each gap sits 140ms under the 300ms per-`read`
+    /// budget that applies from the first byte on. The earlier 100ms/80ms/60ms version left only
+    /// ~20ms of slack on the one assertion lag could actually break.
     #[tokio::test]
     async fn a_frame_header_that_starts_arriving_at_the_idle_deadline_is_read_not_rejected() {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
         let (addr, input) = bound_input().await;
         let mut input =
-            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(300)));
         let (sink, mut rx) = fanout_into_channel(16);
         tokio::spawn(async move { input.run(sink).await });
 
@@ -1906,12 +1909,13 @@ mod tests {
         let mut encoder = NativeEncoder::new(Compression::None);
         let framed = encoder.encode(&sample_batch()).unwrap();
 
-        // 80ms of the 100ms deadline spent, then one byte of the header -- progress.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // 220ms of the 300ms deadline spent, then one byte of the header -- progress, with 80ms
+        // of slack against a sleep that can only overshoot.
+        tokio::time::sleep(Duration::from_millis(220)).await;
         client.write_all(&framed[..1]).await.unwrap();
-        // 60ms more, so 140ms since the handshake: past the absolute deadline, but only 60ms
-        // since the byte that reset the per-`read` budget.
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // 160ms more, so 380ms since the handshake: 80ms past the absolute deadline, and 140ms
+        // inside the per-`read` budget the byte above re-armed.
+        tokio::time::sleep(Duration::from_millis(160)).await;
         client.write_all(&framed[1..]).await.unwrap();
 
         assert_eq!(
@@ -1997,9 +2001,9 @@ mod tests {
 
     /// The default, and what every config without an `idle_timeout:` keeps getting: no bound at
     /// all on the gap between frames, so a handshaken `logit_out` peer with nothing to send stays
-    /// connected indefinitely. The `None` arm has to produce a deadline that never fires --
-    /// `read_header_before_idle`'s unwrapped read -- and the connection has to still *work*
-    /// afterward, not merely be unclosed.
+    /// connected indefinitely. `IdleBounds::new` returns `None` here, which takes
+    /// [`read_header`]'s unbounded arm -- and the connection has to still *work* afterward, not
+    /// merely be unclosed.
     #[tokio::test]
     async fn no_idle_timeout_leaves_a_handshaken_connection_open() {
         let registry = Registry::new();
