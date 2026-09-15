@@ -17,8 +17,8 @@ use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_
 use logit_core::interner::{intern, resolve};
 use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
 use logit_core::{
-    BodyFormat, Event, Exemplar, LogRecord, MetricKind, MetricRecord, Severity, SpanEvent,
-    SpanKind, SpanLink, SpanRecord, SpanStatus, Temporality, TraceRef,
+    Event, Exemplar, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanLink, SpanRecord,
+    Temporality, TraceRef,
 };
 use mlua::{
     AnyUserData, Lua, MetaMethod, RegistryKey, Table, UserData, UserDataMethods, Value as LuaValue,
@@ -565,12 +565,10 @@ impl UserData for LogProxy {
                 },
                 "message" => value_to_lua(lua, &log.message),
                 "severity" => match log.severity {
-                    Some(s) => Ok(LuaValue::String(lua.create_string(severity_name(s))?)),
+                    Some(s) => Ok(LuaValue::String(lua.create_string(s.as_str())?)),
                     None => Ok(LuaValue::Nil),
                 },
-                "body_format" => {
-                    Ok(LuaValue::String(lua.create_string(body_format_name(log.body_format))?))
-                }
+                "body_format" => Ok(LuaValue::String(lua.create_string(log.body_format.as_str())?)),
                 // OTLP's `LogRecord.event_name` -- an interned `Symbol`, like every other
                 // string-shaped attribute-ish field crossing the Lua boundary.
                 "event_name" => match log.event_name {
@@ -749,11 +747,11 @@ fn log_to_table<'lua>(lua: &'lua Lua, log: &LogRecord) -> mlua::Result<Table<'lu
     table.set(
         "severity",
         match log.severity {
-            Some(s) => LuaValue::String(lua.create_string(severity_name(s))?),
+            Some(s) => LuaValue::String(lua.create_string(s.as_str())?),
             None => LuaValue::Nil,
         },
     )?;
-    table.set("body_format", body_format_name(log.body_format))?;
+    table.set("body_format", log.body_format.as_str())?;
     table.set(
         "event_name",
         match log.event_name {
@@ -764,28 +762,6 @@ fn log_to_table<'lua>(lua: &'lua Lua, log: &LogRecord) -> mlua::Result<Table<'lu
     table.set("observed_timestamp", log.observed_timestamp.to_string())?;
     table.set("dropped_attributes_count", log.dropped_attributes_count as i64)?;
     Ok(table)
-}
-
-/// Lowercase severity names for Lua -- matches `crates/logit-outputs/src/stdio.rs`'s own
-/// rendering of the same values, so `event.log.severity == "info"` reads the way the `stdio_out`
-/// line a script is looking at already does.
-fn severity_name(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Trace => "trace",
-        Severity::Debug => "debug",
-        Severity::Info => "info",
-        Severity::Warn => "warn",
-        Severity::Error => "error",
-        Severity::Fatal => "fatal",
-    }
-}
-
-fn body_format_name(format: BodyFormat) -> &'static str {
-    match format {
-        BodyFormat::Raw => "raw",
-        BodyFormat::Json => "json",
-        BodyFormat::Structured => "structured",
-    }
 }
 
 // -- `event.metrics` -----------------------------------------------------------------------
@@ -950,30 +926,8 @@ fn metric_ro_error(index: usize, field: &str, kind: &MetricKind) -> mlua::Error 
     mlua::Error::RuntimeError(format!(
         "event.metrics[{}].{field} is read-only on a {} metric",
         index + 1,
-        metric_kind_name(kind)
+        kind.name()
     ))
-}
-
-fn metric_kind_name(kind: &MetricKind) -> &'static str {
-    match kind {
-        MetricKind::Sum(_) => "sum",
-        MetricKind::Gauge(_) => "gauge",
-        MetricKind::GaugeDelta(_) => "gauge_delta",
-        MetricKind::Samples(_) => "samples",
-        MetricKind::Distribution(_) => "distribution",
-        MetricKind::SetMembers(_) => "set_members",
-        MetricKind::Set(_) => "set",
-        MetricKind::Histogram(_) => "histogram",
-        MetricKind::ExponentialHistogram(_) => "exponential_histogram",
-        MetricKind::Summary(_) => "summary",
-    }
-}
-
-fn temporality_name(t: Temporality) -> &'static str {
-    match t {
-        Temporality::Delta => "delta",
-        Temporality::Cumulative => "cumulative",
-    }
 }
 
 /// As [`lua_to_value`]'s string branch reasoning, but simpler: a nil-able `f64` reaches Lua as a
@@ -1008,14 +962,15 @@ fn require_finite_number(value: LuaValue, field: &str) -> mlua::Result<f64> {
 
 fn parse_temporality(value: &LuaValue, index: usize) -> mlua::Result<Temporality> {
     match value {
-        LuaValue::String(s) => match s.to_str()? {
-            "delta" => Ok(Temporality::Delta),
-            "cumulative" => Ok(Temporality::Cumulative),
-            other => Err(mlua::Error::RuntimeError(format!(
-                "event.metrics[{}].temporality must be \"delta\" or \"cumulative\", got \"{other}\"",
-                index + 1
-            ))),
-        },
+        LuaValue::String(s) => {
+            let name = s.to_str()?;
+            Temporality::from_name(name).ok_or_else(|| {
+                mlua::Error::RuntimeError(format!(
+                    "event.metrics[{}].temporality must be \"delta\" or \"cumulative\", got \"{name}\"",
+                    index + 1
+                ))
+            })
+        }
         other => Err(mlua::Error::RuntimeError(format!(
             "event.metrics[{}].temporality must be a string, got {}",
             index + 1,
@@ -1098,7 +1053,7 @@ impl UserData for MetricProxy {
                 }
                 "flags" => Ok(LuaValue::Integer(m.flags as i64)),
                 "is_no_recorded_value" => Ok(LuaValue::Boolean(m.is_no_recorded_value())),
-                "kind" => Ok(LuaValue::String(lua.create_string(metric_kind_name(&m.kind))?)),
+                "kind" => Ok(LuaValue::String(lua.create_string(m.kind.name())?)),
                 "exemplars" => {
                     let t = lua.create_table()?;
                     for (i, e) in m.exemplars.iter().enumerate() {
@@ -1113,13 +1068,13 @@ impl UserData for MetricProxy {
                 },
                 "temporality" => match &m.kind {
                     MetricKind::Sum(s) => {
-                        Ok(LuaValue::String(lua.create_string(temporality_name(s.temporality))?))
+                        Ok(LuaValue::String(lua.create_string(s.temporality.as_str())?))
                     }
                     MetricKind::Histogram(h) => {
-                        Ok(LuaValue::String(lua.create_string(temporality_name(h.temporality))?))
+                        Ok(LuaValue::String(lua.create_string(h.temporality.as_str())?))
                     }
                     MetricKind::ExponentialHistogram(e) => {
-                        Ok(LuaValue::String(lua.create_string(temporality_name(e.temporality))?))
+                        Ok(LuaValue::String(lua.create_string(e.temporality.as_str())?))
                     }
                     _ => Ok(LuaValue::Nil),
                 },
@@ -1402,7 +1357,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
     table.set("start_timestamp", record.start_timestamp.to_string())?;
     table.set("flags", record.flags as i64)?;
     table.set("is_no_recorded_value", record.is_no_recorded_value())?;
-    table.set("kind", metric_kind_name(&record.kind))?;
+    table.set("kind", record.kind.name())?;
     let exemplars = lua.create_table()?;
     for (i, e) in record.exemplars.iter().enumerate() {
         exemplars.set(i + 1, exemplar_to_table(lua, e)?)?;
@@ -1412,7 +1367,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
     match &record.kind {
         MetricKind::Sum(s) => {
             table.set("value", s.value)?;
-            table.set("temporality", temporality_name(s.temporality))?;
+            table.set("temporality", s.temporality.as_str())?;
             table.set("monotonic", s.monotonic)?;
         }
         MetricKind::Gauge(v) => table.set("value", *v)?,
@@ -1445,7 +1400,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
                 buckets.set(i + 1, row)?;
             }
             table.set("buckets", buckets)?;
-            table.set("temporality", temporality_name(h.temporality))?;
+            table.set("temporality", h.temporality.as_str())?;
             table.set("sum", opt_number(h.sum))?;
             table.set("min", opt_number(h.min))?;
             table.set("max", opt_number(h.max))?;
@@ -1456,7 +1411,7 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
             table.set("zero_threshold", e.zero_threshold)?;
             table.set("positive", exp_buckets_table(lua, &e.positive)?)?;
             table.set("negative", exp_buckets_table(lua, &e.negative)?)?;
-            table.set("temporality", temporality_name(e.temporality))?;
+            table.set("temporality", e.temporality.as_str())?;
             table.set("count", e.count as i64)?;
             table.set("sum", opt_number(e.sum))?;
             table.set("min", opt_number(e.min))?;
@@ -1513,8 +1468,8 @@ impl UserData for SpanProxy {
                     None => Ok(LuaValue::Nil),
                 },
                 "name" => value_to_lua(lua, &span.name),
-                "kind" => Ok(LuaValue::String(lua.create_string(span_kind_name(span.kind))?)),
-                "status" => Ok(LuaValue::String(lua.create_string(span_status_name(span.status))?)),
+                "kind" => Ok(LuaValue::String(lua.create_string(span.kind.as_str())?)),
+                "status" => Ok(LuaValue::String(lua.create_string(span.status.as_str())?)),
                 "status_message" => match span.ext.as_ref().and_then(|e| e.status_message.as_ref())
                 {
                     Some(m) => Ok(LuaValue::String(lua.create_string(m)?)),
@@ -1566,24 +1521,6 @@ impl UserData for SpanProxy {
     }
 }
 
-fn span_kind_name(kind: SpanKind) -> &'static str {
-    match kind {
-        SpanKind::Internal => "internal",
-        SpanKind::Server => "server",
-        SpanKind::Client => "client",
-        SpanKind::Producer => "producer",
-        SpanKind::Consumer => "consumer",
-    }
-}
-
-fn span_status_name(status: SpanStatus) -> &'static str {
-    match status {
-        SpanStatus::Unset => "unset",
-        SpanStatus::Ok => "ok",
-        SpanStatus::Error => "error",
-    }
-}
-
 fn span_event_to_table<'lua>(lua: &'lua Lua, ev: &SpanEvent) -> mlua::Result<Table<'lua>> {
     let table = lua.create_table()?;
     table.set("timestamp", ev.timestamp.to_string())?;
@@ -1624,8 +1561,8 @@ fn span_to_table<'lua>(lua: &'lua Lua, span: &SpanRecord) -> mlua::Result<Table<
         },
     )?;
     table.set("name", value_to_lua(lua, &span.name)?)?;
-    table.set("kind", span_kind_name(span.kind))?;
-    table.set("status", span_status_name(span.status))?;
+    table.set("kind", span.kind.as_str())?;
+    table.set("status", span.status.as_str())?;
     table.set(
         "status_message",
         match span.ext.as_ref().and_then(|e| e.status_message.as_ref()) {
@@ -1770,8 +1707,8 @@ mod tests {
     use crate::{ProcessOutcome, ScriptWorker};
     use bytes::Bytes;
     use logit_core::{
-        AttrMap, DdSketch, ExpHistogram, Histogram, HyperLogLog, Samples, SpanExt, Sum, Summary,
-        Value,
+        AttrMap, BodyFormat, DdSketch, ExpHistogram, Histogram, HyperLogLog, Samples, Severity,
+        SpanExt, SpanKind, SpanStatus, Sum, Summary, Value,
     };
 
     fn worker(source: &str) -> ScriptWorker {

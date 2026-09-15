@@ -51,12 +51,69 @@ pub enum Severity {
     Fatal,
 }
 
+impl Severity {
+    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
+    /// render and accept.
+    pub const NAMES: [&'static str; 6] = ["trace", "debug", "info", "warn", "error", "fatal"];
+
+    /// The lowercase name the Lua API and `stdio_out` render this severity as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Trace => "trace",
+            Severity::Debug => "debug",
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+            Severity::Fatal => "fatal",
+        }
+    }
+
+    /// The inverse of [`Severity::as_str`]: an exact lowercase match, no case folding or aliases.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "trace" => Severity::Trace,
+            "debug" => Severity::Debug,
+            "info" => Severity::Info,
+            "warn" => Severity::Warn,
+            "error" => Severity::Error,
+            "fatal" => Severity::Fatal,
+            _ => return None,
+        })
+    }
+}
+
 /// How a log record's body was found; a hint to downstream parsers/transforms, not a guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyFormat {
     Raw,
     Json,
     Structured,
+}
+
+impl BodyFormat {
+    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
+    /// render and accept.
+    pub const NAMES: [&'static str; 3] = ["raw", "json", "structured"];
+
+    /// The lowercase name the Lua API and `stdio_out` render this format as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyFormat::Raw => "raw",
+            BodyFormat::Json => "json",
+            BodyFormat::Structured => "structured",
+        }
+    }
+
+    /// The inverse of [`BodyFormat::as_str`]: an exact lowercase match, no case folding or
+    /// aliases.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "raw" => BodyFormat::Raw,
+            "json" => BodyFormat::Json,
+            "structured" => BodyFormat::Structured,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,4 +136,36 @@ pub struct LogRecord {
     /// unset.
     pub observed_timestamp: i64,
     pub dropped_attributes_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_names_round_trip_in_variant_order() {
+        let variants = [
+            Severity::Trace,
+            Severity::Debug,
+            Severity::Info,
+            Severity::Warn,
+            Severity::Error,
+            Severity::Fatal,
+        ];
+        for (name, v) in Severity::NAMES.iter().zip(variants) {
+            assert_eq!(v.as_str(), *name);
+            assert_eq!(Severity::from_name(v.as_str()), Some(v));
+        }
+        assert_eq!(Severity::from_name("Warn"), None);
+    }
+
+    #[test]
+    fn body_format_names_round_trip_in_variant_order() {
+        let variants = [BodyFormat::Raw, BodyFormat::Json, BodyFormat::Structured];
+        for (name, v) in BodyFormat::NAMES.iter().zip(variants) {
+            assert_eq!(v.as_str(), *name);
+            assert_eq!(BodyFormat::from_name(v.as_str()), Some(v));
+        }
+        assert_eq!(BodyFormat::from_name("Json"), None);
+    }
 }
