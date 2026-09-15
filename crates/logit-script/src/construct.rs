@@ -25,17 +25,19 @@
 //!   `timestamp`, `log.message`, a metric's `name`/`kind` and its kind's own payload, and a
 //!   span's `trace_id`/`span_id`/`name` are required, exactly as the ADR lists.
 //!
-//! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...`; the shared
-//! helpers at the bottom take the path as an argument so the log, metric and span parsers reuse
-//! them unchanged. `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`,
-//! `set_members`) and the three pre-aggregated ones (`histogram`, `exponential_histogram`,
-//! `summary`), exemplars included; the two sketches and `gauge_delta` are never constructible,
-//! and each says so. `span` builds a whole [`SpanRecord`], its `events` and `links` included --
-//! the one way a script mints a span, since `event.span` itself stays read-only in place
-//! (`crate::proxy`'s `SpanProxy`).
+//! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...` down to the
+//! field; the one exception is a malformed value *inside* a nested attribute table, which reports
+//! the shared attribute-conversion error (`lua_to_value`'s, unprefixed), since nested tables
+//! convert through the same helper the proxy write path uses. The shared helpers at the bottom
+//! take the path as an argument so the log, metric and span parsers reuse them unchanged.
+//! `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`, `set_members`) and the three
+//! pre-aggregated ones (`histogram`, `exponential_histogram`, `summary`), exemplars included; the
+//! two sketches and `gauge_delta` are never constructible, and each says so. `span` builds a
+//! whole [`SpanRecord`], its `events` and `links` included -- the one way a script mints a span,
+//! since `event.span` itself stays read-only in place (`crate::proxy`'s `SpanProxy`).
 
 use crate::proxy::{EventProxy, TargetTable};
-use crate::value::{lua_table_to_attrmap, lua_to_value, validated_sequence_len};
+use crate::value::{lua_to_value, validated_sequence_len};
 use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
@@ -240,6 +242,7 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         "severity",
         &Severity::NAMES,
         Severity::from_name,
+        true,
     )?;
     let body_format = enum_field(
         t.raw_get("body_format")?,
@@ -247,6 +250,7 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         "body_format",
         &BodyFormat::NAMES,
         BodyFormat::from_name,
+        true,
     )?
     .unwrap_or(BodyFormat::Raw);
     let trace = trace_ref_from_fields(
@@ -362,6 +366,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
                 "temporality",
                 &Temporality::NAMES,
                 Temporality::from_name,
+                true,
             )?
             .unwrap_or(Temporality::Delta);
             let monotonic = match t.raw_get::<_, LuaValue>("monotonic")? {
@@ -572,6 +577,7 @@ fn temporality_field(t: &Table, path: &str) -> mlua::Result<Temporality> {
         "temporality",
         &Temporality::NAMES,
         Temporality::from_name,
+        false,
     )?
     .ok_or_else(|| required(path, "temporality"))
 }
@@ -673,14 +679,16 @@ fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord>
         LuaValue::Nil => return Err(required(path, "name")),
         value => value_field(value, path, "name")?,
     };
-    let kind = enum_field(t.raw_get("kind")?, path, "kind", &SpanKind::NAMES, SpanKind::from_name)?
-        .unwrap_or(SpanKind::Internal);
+    let kind =
+        enum_field(t.raw_get("kind")?, path, "kind", &SpanKind::NAMES, SpanKind::from_name, true)?
+            .unwrap_or(SpanKind::Internal);
     let status = enum_field(
         t.raw_get("status")?,
         path,
         "status",
         &SpanStatus::NAMES,
         SpanStatus::from_name,
+        true,
     )?
     .unwrap_or(SpanStatus::Unset);
     let end_timestamp = match t.raw_get::<_, LuaValue>("end_timestamp")? {
@@ -999,15 +1007,19 @@ fn i32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<i32> {
     }
 }
 
-/// An optional enum-valued field named by its lowercase name: `nil` is `None`, a string is looked
-/// up through `parse` (one of the `from_name`s `logit-core` provides), anything else is an error
-/// listing `names` (the matching `NAMES` table) so the message can't drift from the enum.
+/// An enum-valued field named by its lowercase name: `nil` is `None` (the caller decides whether
+/// that is a default or `required`), a string is looked up through `parse` (one of the
+/// `from_name`s `logit-core` provides), anything else is an error listing `names` (the matching
+/// `NAMES` table) so the message can't drift from the enum. `optional` says whether the messages
+/// offer `nil`: a *required* field ([`temporality_field`]) must not tell the author nil is
+/// allowed and then reject it as missing.
 fn enum_field<T>(
     value: LuaValue,
     path: &str,
     key: &str,
     names: &[&str],
     parse: fn(&str) -> Option<T>,
+    optional: bool,
 ) -> mlua::Result<Option<T>> {
     match value {
         LuaValue::Nil => Ok(None),
@@ -1015,15 +1027,17 @@ fn enum_field<T>(
             let s = s.to_string_lossy();
             parse(&s).map(Some).ok_or_else(|| {
                 runtime_error(format!(
-                    "Event.new: {} must be one of {} (or nil), got \"{s}\"",
+                    "Event.new: {} must be one of {}{}, got \"{s}\"",
                     dotted(path, key),
-                    names.join(", ")
+                    names.join(", "),
+                    if optional { " (or nil)" } else { "" }
                 ))
             })
         }
         other => Err(runtime_error(format!(
-            "Event.new: {} must be a string or nil, got {}",
+            "Event.new: {} must be a string{}, got {}",
             dotted(path, key),
+            if optional { " or nil" } else { "" },
             other.type_name()
         ))),
     }
@@ -1240,22 +1254,30 @@ fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Attr
 }
 
 /// An [`AttrMap`] from a table of string keys. Stricter than `event.attributes.x = {..}`'s
-/// `lua_table_to_attrmap` alone, which coerces a numeric key to its decimal string the way
-/// mlua's `String` conversion does: a constructor's input is `to_table()`'s output, where every
-/// attribute key is a string, so a non-string key here is a mistake worth naming. The key check
-/// is its own raw pass; the values then convert through the shared helper.
+/// `lua_table_to_attrmap`, which coerces a numeric key to its decimal string the way mlua's
+/// `String` conversion does and surfaces a non-UTF-8 key as mlua's own conversion error: a
+/// constructor's input is `to_table()`'s output, where every attribute key is a UTF-8 string,
+/// so either is a mistake worth naming with the table's path. One raw pass: each key is checked,
+/// then its value goes through [`value_field`] so a bad value is `Event.new: <path>.<key>.<k>
+/// ...` too. A nested table still converts through the shared `lua_to_value`, so a malformed
+/// value *inside* one reports that helper's unprefixed attribute-conversion error.
 fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
-    for pair in t.clone().pairs::<LuaValue, LuaValue>() {
-        let (k, _) = pair?;
-        if !matches!(k, LuaValue::String(_)) {
+    let table_path = dotted(path, key);
+    let mut map = AttrMap::new();
+    for pair in t.pairs::<LuaValue, LuaValue>() {
+        let (k, value) = pair?;
+        let LuaValue::String(k) = k else {
             return Err(runtime_error(format!(
-                "Event.new: {} has a non-string key ({})",
-                dotted(path, key),
+                "Event.new: {table_path} has a non-string key ({})",
                 k.type_name()
             )));
-        }
+        };
+        let Ok(k) = k.to_str() else {
+            return Err(runtime_error(format!("Event.new: {table_path} has a non-UTF-8 key")));
+        };
+        map.insert(k, value_field(value, &table_path, k)?);
     }
-    lua_table_to_attrmap(t)
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -1320,8 +1342,9 @@ mod tests {
 
     /// Attributes whose every `Value` variant survives `to_table()` and back unchanged: `Str`,
     /// `I64`, a *fractional* `F64` (an integral one is canonicalized to a Lua integer by LuaJIT
-    /// and comes back `I64`), `Bool`. The variants that flatten (`U64`, `Timestamp`, UTF-8
-    /// `Bytes`) are the ADR's recorded residual -- see the test named for it below.
+    /// and comes back `I64`), `Bool`. The shapes that flatten (`U64`, `Timestamp`, UTF-8
+    /// `Bytes`, an `I64` past 2^53, an integral `F64`) are the ADR's recorded residuals -- see
+    /// the two tests named for them below.
     fn round_trippable_attributes() -> AttrMap {
         let mut attrs = AttrMap::new();
         attrs.insert("host", "web-01");
@@ -1549,6 +1572,21 @@ mod tests {
         event.attributes.insert("count", Value::U64(5));
         let out = emitted(w.process(event).unwrap());
         assert_eq!(out.attributes.get("count"), Some(&Value::I64(5)));
+    }
+
+    /// The other two attribute residuals `docs/design/lua-api.md` lists: an `I64` past 2^53 is
+    /// emitted by `to_table()` as a decimal string (`exact_i64_to_lua`'s fallback, the branch
+    /// `Timestamp` takes) and comes back `Str`; an integral `F64` is a Lua number LuaJIT's
+    /// dual-number mode canonicalizes to an integer, so it comes back `I64`.
+    #[test]
+    fn new_of_to_table_flattens_a_wide_i64_to_str_and_an_integral_f64_to_i64() {
+        let w = worker(REBUILD);
+        let mut event = log_event();
+        event.attributes.insert("wide", Value::I64(9_007_199_254_740_993));
+        event.attributes.insert("whole", Value::F64(3.0));
+        let out = emitted(w.process(event).unwrap());
+        assert_eq!(out.attributes.get("wide"), Some(&Value::str("9007199254740993")));
+        assert_eq!(out.attributes.get("whole"), Some(&Value::I64(3)));
     }
 
     #[test]
@@ -1842,6 +1880,20 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_attribute_key_is_rejected() {
+        let err = new_err(r#"{timestamp = "1", attributes = {["\255"] = 1}}"#);
+        assert!(err.contains("Event.new: attributes has a non-UTF-8 key"), "got: {err}");
+    }
+
+    /// A bad attribute *value* is prefixed and located like every other mistake, rather than
+    /// surfacing `lua_to_value`'s bare "can't use a Lua function as an event attribute value".
+    #[test]
+    fn a_bad_attribute_value_names_its_dotted_path() {
+        let err = new_err(r#"{timestamp = "1", attributes = {cb = tostring}}"#);
+        assert!(err.contains("Event.new: attributes.cb can't be a Lua function"), "got: {err}");
+    }
+
+    #[test]
     fn a_non_boolean_has_flag_is_rejected() {
         let err = new_err(r#"{timestamp = "1", has_log = "yes"}"#);
         assert!(err.contains("Event.new: has_log must be a boolean, got string"), "got: {err}");
@@ -1870,6 +1922,19 @@ mod tests {
         let w = worker(REBUILD);
         let out = emitted(w.process(metric_event(gauge_kind())).unwrap());
         assert_eq!(out, metric_event(gauge_kind()));
+    }
+
+    /// The non-finite residual `docs/design/lua-api.md` records: `prometheus_in` and `otlp_in`
+    /// both admit a NaN/infinite point, `to_table()` emits the raw float, and the finiteness
+    /// rule refuses it on the way back -- a rebuild must fix or drop the value.
+    #[test]
+    fn new_of_to_table_rejects_a_non_finite_gauge_value() {
+        let w = worker(REBUILD);
+        let err = process_err(&w, metric_event(MetricKind::Gauge(f64::NAN)));
+        assert!(
+            err.contains("Event.new: metrics[1].value must be a finite number, got NaN"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -2358,6 +2423,26 @@ mod tests {
     fn a_histogram_without_a_temporality_is_required() {
         let err = metric_err(r#"name = "m", kind = "histogram", buckets = {}"#);
         assert!(err.contains("Event.new: metrics[1].temporality is required"), "got: {err}");
+    }
+
+    /// A required field's errors must not offer `nil` and then reject it as missing.
+    #[test]
+    fn a_histograms_bad_temporality_does_not_offer_nil() {
+        let err =
+            metric_err(r#"name = "m", kind = "histogram", buckets = {}, temporality = "total""#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].temporality must be one of delta, cumulative, got \"total\""
+            ),
+            "got: {err}"
+        );
+        assert!(!err.contains("or nil"), "got: {err}");
+        let err = metric_err(r#"name = "m", kind = "histogram", buckets = {}, temporality = 5"#);
+        assert!(
+            err.contains("Event.new: metrics[1].temporality must be a string, got integer"),
+            "got: {err}"
+        );
+        assert!(!err.contains("or nil"), "got: {err}");
     }
 
     #[test]
