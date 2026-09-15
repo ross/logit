@@ -82,6 +82,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.16M/s (median; see note) |
 | `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 20M | ~3.7M/s |
+| `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` (no `kv_metrics`) | Three parsers contending on the process-wide interner at once, read against `json-parse` | 7M | ~0.6-1.5M/s (generated; each parsed 3×) |
 
 Counts target roughly 5-10 seconds of wall time each on the dev box; tuned against a first real
 `script/perf run --repeat 1 --profile release` pass per scenario, as recorded in this table, rather
