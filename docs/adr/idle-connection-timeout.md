@@ -124,7 +124,11 @@ write, not merely on bytes read; a peer that has sent a frame and is patiently w
 while a slow downstream drains is never closed as idle no matter how long that ack takes. What *is*
 bounded is the read itself: `read_frame_body`'s fill loop gets a per-`read` stall bound (not a total
 one, since a large, slowly-arriving frame that keeps making incremental progress is not idle either).
-Either an idle gap between frames or a stalled body read ends the same way: a `Reject{GOING_AWAY,
+A frame header whose first byte has already arrived is progress, not silence: the absolute idle
+deadline bounds only the wait for that first byte, and the rest of the header -- like the body -- is
+read under the per-`read` stall bound, so a frame that starts arriving right at the deadline is read
+and acked rather than rejected after the peer has already written it. Either an idle gap between
+frames or a stalled body read ends the same way: a `Reject{GOING_AWAY,
 "idle for <dur>"}` control message, written before the connection closes -- the same signal
 `logit_in` already sends on ordinary shutdown, so a `logit_out` peer needs no new case to handle it.
 
@@ -142,9 +146,14 @@ anything hyper's own read loop is doing underneath.
 
 When that tracker's deadline fires with no request in flight, the connection is closed by asking
 hyper to close it, not by dropping the socket out from under it: `graceful_shutdown()` is called,
-the connection is polled for up to `handshake_timeout` (reused as the grace period -- no new knob),
-and then it is dropped regardless of what that poll returned. This two-step shape is deliberate and
-was verified against the pinned `hyper 1.11.1`/`hyper-util 0.1.20` sources, not assumed:
+the connection is polled for up to `handshake_timeout` (reused as the grace period -- no new knob).
+If that grace elapses with nothing in flight, the connection is dropped regardless of what the poll
+returned; if a request arrived inside the grace and is now being served -- on HTTP/1, inside the
+connection future itself -- the connection is kept until that request completes rather than dropped
+out from under it, since dropping it would discard a batch already blocked in `Fanout::send`. A
+stalled body is still bounded by the per-frame stall timeout below, so this wait can never be held
+open by a silent peer. This two-step shape is deliberate and was verified against the pinned
+`hyper 1.11.1`/`hyper-util 0.1.20` sources, not assumed:
 `graceful_shutdown` closes an idle keep-alive H1 connection promptly (`disable_keep_alive` calls
 `state.close()` immediately when the connection's `KA` state is `Idle`) and sends a GOAWAY on an H2
 connection -- both the common case for a connection this tracker considers idle. But a *fresh* H1
