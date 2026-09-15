@@ -25,8 +25,13 @@ components:
     # handshake_timeout: 5s        # bounds each pre-Hello phase *separately* -- the TLS accept,
     #                                then the Hello read -- so a TLS peer that connects and sends
     #                                no Hello costs up to twice this before its connection-cap
-    #                                slot is released. Not an idle timeout: an established,
-    #                                quiet connection is never closed for being quiet.
+    #                                slot is released. Not an idle timeout: see idle_timeout below.
+    # idle_timeout: 5m              # off by default. Bounds how long a handshaken connection may
+    #                                stay quiet before this listener closes it (Reject{GOING_AWAY}
+    #                                first, so logit_out reconnects rather than losing a batch) and
+    #                                releases its permit. Recommended wherever consistent traffic
+    #                                is expected, sized above the sender's longest normal gap
+    #                                (docs/adr/idle-connection-timeout.md).
 
   windowed:
     type: aggregate

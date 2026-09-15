@@ -147,7 +147,9 @@ config block it introduces. `syslog_in`, `graphite_in` and `statsd_in` can each 
 `transport: tcp` on a second, generic stream driver, `logit-inputs::tcp::TcpListener` — an accept
 loop, a connection cap, per-listener framing (RFC 6587's auto-detecting pair for `syslog_in`,
 LF-delimited lines for `statsd_in` and carbon plaintext, carbon's 4-byte length prefix for pickle),
-a `handshake_timeout:` bounding each pre-message phase, and a `tls:` block (RFC 5425 for syslog, a
+a `handshake_timeout:` bounding each pre-message phase, an opt-in `idle_timeout:` bounding the
+quiet gaps after them (off by default; [ADR `idle-connection-timeout`](docs/adr/idle-connection-timeout.md)),
+and a `tls:` block (RFC 5425 for syslog, a
 `logit`-to-`logit` or stunnel-shaped relay hop for the other two) — see
 [ADR `syslog-tcp-ingress-and-tls`](docs/adr/syslog-tcp-ingress-and-tls.md) and its amendment.
 `logit` now has an operator surface: leveled, structured self-logging through `tracing`
@@ -277,16 +279,18 @@ for no real benefit here. A merge commit costs nothing extra and pushes normally
 
 ### Branches and PR titles
 
-Work that belongs to a plan in `docs/plans/` is grouped by a **stream key**: one short lowercase
-token (`[a-z0-9-]`, abbreviations welcome, need not match the plan slug) the plan states in its
-`## Workstreams` section as `Key: <key>`, chosen at W0 and unique across `docs/plans/`. The key
-and the workstream number then appear identically in the branch and the PR title:
+Work that lands as a series of related PRs (a workstream) is grouped by a **stream key**: one
+short lowercase token (`[a-z0-9-]`, abbreviations welcome) picked when the work is planned, before
+the first branch is cut, and not already in use by another stream. It lives in the branch names
+and PR titles themselves; nothing else has to record it (a plan in `docs/plans/` may mention it,
+but most workstreams won't have one). The key and the workstream number then appear identically
+in the branch and the PR title:
 
 | Kind | Branch | PR title |
 |---|---|---|
 | Workstream PR | `<key>/w<N>[<letter>]` | `<branch>: <summary>` |
-| Follow-up to a closed plan | `<key>/<slug>` | `<branch>: <summary>` |
-| One-off outside any plan | `<type>/<slug>` | `<type>(<scope>): <summary>` |
+| Follow-up to a finished stream | `<key>/<slug>` | `<branch>: <summary>` |
+| One-off outside any stream | `<type>/<slug>` | `<type>(<scope>): <summary>` |
 
 ```
 graphite/w0                graphite/w0: ADR and plan for a lossless Graphite/Carbon relay
@@ -296,11 +300,11 @@ targets/review-followups   targets/review-followups: route/target review follow-
 fix/ci-test-flakes         fix(cli): remove two CI-only test races
 ```
 
-- **Workstream branches carry no `feat/` prefix and no trailing slug** — the plan table already
+- **Workstream branches carry no `feat/` prefix and no trailing slug** — the PR summary already
   says what W2 is, and `<key>/` is the namespace: `git branch --list 'graphite/*'` lists the
-  stack, and a PR list sorted by title reads as one. Letters (`w4a`, `w4b`) are sibling PRs the
-  plan defines to land in parallel off the same parent. Don't repeat the number at the end of the
-  title (`… (W2)`) — it's already the prefix.
+  stack, and a PR list sorted by title reads as one. Letters (`w4a`, `w4b`) are sibling PRs meant
+  to land in parallel off the same parent. Don't repeat the number at the end of the title
+  (`… (W2)`) — it's already the prefix.
 - **The PR title is the branch name, a colon, and the summary** — no conventional-commit type.
   The type still goes on every commit message (`feat(inputs): …`); merges to `main` are real merge
   commits, so the PR title never becomes a commit subject.
@@ -310,8 +314,7 @@ fix/ci-test-flakes         fix(cli): remove two CI-only test races
   that branch; retarget to `main` once the parent merges. Stack-internal merge commits are
   `merge <key>/w<N> into <key>/w<M>`.
 
-Existing plans get a `Key:` line the next time they're touched, not retroactively; merged
-branches and PRs are never renamed to fit.
+Merged branches and PRs are never renamed to fit.
 
 ## Conventions to hold to
 
@@ -320,9 +323,7 @@ branches and PRs are never renamed to fit.
   the file after the decision, not a number: parallel branches racing for "the next number" was a
   recurring source of merge churn (see [`docs/adr/README.md`](docs/adr/README.md) for the full
   index and the `created`/`updated` frontmatter that orders it). Check the existing ADRs before
-  re-deciding something they already settled. `docs/plans/` follows the same convention. A plan's
-  `## Workstreams` section states its `Key:` — the branch/PR-title prefix under
-  [Branches and PR titles](#branches-and-pr-titles).
+  re-deciding something they already settled. `docs/plans/` follows the same convention.
 - **`rustfmt.toml`/`clippy.toml` are enforced**, not advisory — `script/cibuild` fails the build on
   either. Run `script/format` before committing rather than hand-formatting.
 - **Every config type derives `Serialize + Deserialize + JsonSchema` together**

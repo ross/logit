@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-13
+updated: 2026-09-14
 ---
 
 # Native transport: handshake, implicit sequencing, and per-batch acknowledgement
@@ -134,3 +134,29 @@ idle keep-alive connection's `Fanout` clone open past shutdown — a real gap, t
   describes here, closing `docs/known-gaps.md`'s "`otlp_in`'s TLS accept has no timeout" row.
   Graph rule 45 keeps the value non-zero. The *shutdown grace* named just above is a different
   knob and stays fixed at 5s -- still open, still tracked in `docs/known-gaps.md`.
+
+## Amendment: `GOING_AWAY` is now also the idle-close signal, and `logit_out` probes for it (2026-09-14)
+
+`LogitIn` gained an opt-in `idle_timeout:` field ([ADR `idle-connection-timeout`](idle-connection-timeout.md)):
+a handshaken connection that stays quiet longer than the configured value is closed the same way
+this ADR's own shutdown path already closes one -- `Reject{GOING_AWAY, "idle for <dur>"}` written
+first, then the connection drops -- so a `logit_out` peer needs no new case to tell an idle close
+from an ordinary shutdown; both arrive as the identical control message. The clock is measured from
+the last `Ack` written (or the handshake, on a connection that has sent nothing yet), never from
+the last frame read: a peer waiting on an `Ack` this listener is deliberately delaying for a slow
+downstream is, by this ADR's own ack-as-backpressure design, not idle, so time blocked in
+`Fanout::send` never counts against it. A frame body gets the same bound per `read` rather than in
+total.
+
+This closes a real loss window on the client side. `logit_out` pools one connection per remote and
+reuses it across batches; before this amendment, a peer that idle-timed-out and closed some time
+ago left a stale pooled connection that the next `send` would write into, landing exactly the
+`Fault::Ambiguous` case this ADR's own "reachable, not just theoretical" paragraph above already
+names for the shutdown race. `logit_out` (and every other pooled TCP sink -- `syslog_out`,
+`statsd_out`, `graphite_out`) now probes a *reused* pooled connection once before its first write
+of a send attempt: one non-cancellable `poll_read`, never a `tokio::time::timeout(read)` that could
+cancel mid-TLS-record and discard bytes already received. An immediate EOF or unsolicited bytes --
+on this protocol, that is exactly `Reject{GOING_AWAY}` arriving unprompted -- drops the pooled
+connection and dials a fresh one before anything is written, the ordinary `Clean`/reconnect path
+rather than a lost or ambiguous batch. The residual case is unchanged: a FIN racing the probe
+itself, the peer closing *while* this sink is writing, is still today's `Fault::Ambiguous`.

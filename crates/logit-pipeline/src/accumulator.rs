@@ -27,7 +27,9 @@ pub enum FlushReason {
     /// the way out: a tailed file rotated away, removed, or drained past EOF
     /// (`logit_inputs::tail`), or one TCP connection on the shared stream driver
     /// (`logit_inputs::tcp`, which every stream listener runs on) reaching EOF, being reset by its
-    /// client, or hitting a fatal framing error. Distinct from [`FlushReason::Shutdown`]: this fires while
+    /// client, hitting a fatal framing error, or being closed as idle (its configured
+    /// `idle_timeout:` elapsing with the peer silent, `docs/adr/idle-connection-timeout.md`).
+    /// Distinct from [`FlushReason::Shutdown`]: this fires while
     /// the listener keeps running, for one source among several it may be tracking, not for the
     /// whole component's own shutdown. Keeping the two apart is what stops a healthy listener from
     /// reporting `receive.flushed{reason="shutdown"}` every time a client hangs up.

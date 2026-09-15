@@ -294,9 +294,10 @@ read the field back off). Done: `cibuild` clean, `script/schema` no diff after c
 - Framing auto-detection is a heuristic (leading whitespace or a stray newline before the first
   message would mis-latch); mitigated by loud per-connection failure rather than silent
   misinterpretation. The ADR cites the `go-syslog`/Alloy precedent for the same detection.
-- No idle-connection timeout: a handshaken-then-silent connection holds a concurrency-cap permit
+- ~~No idle-connection timeout: a handshaken-then-silent connection holds a concurrency-cap permit
   forever, the same gap `otlp_in` already has -- one shared `known-gaps.md` row for both rather
-  than two.
+  than two.~~ Closed 2026-09-14 by an opt-in `idle_timeout:` field on `syslog_in` and every other
+  TCP-capable listener kind ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)).
 - Per-connection batching means N connections × `batch_max_events` events can be in flight at once;
   documented directly on the config field so an operator sizing the bound accounts for connection
   count, not just a single stream's rate.
