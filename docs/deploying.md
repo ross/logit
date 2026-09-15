@@ -401,14 +401,17 @@ it never quietly re-arms the clock on its own.
 | Kind | What resets the clock | How the close happens |
 |---|---|---|
 | `syslog_in`, `graphite_in`, `statsd_in` (`transport: tcp`, the shared driver) | bytes read from the peer; an interval flush that actually emits a batch | the connection is closed directly; any complete buffered batch is flushed first |
-| `logit_in` | the handshake completing, and every `Ack` this listener writes — *not* bytes read, since a peer waiting on a delayed ack is by definition not idle; a frame body also gets a per-`read` stall bound | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
-| `otlp_in` | a request *completing* — hyper owns the bytes, so this is the finest grain visible here; a request head that dribbles in slower than `idle_timeout` on an otherwise-quiet keep-alive connection is closed by this rule, a documented narrowing; a stalled request *body* gets its own bound, `idle_timeout` itself, per read frame | `graceful_shutdown()` is called, the connection is polled for up to `handshake_timeout` (reused as the grace period — no new knob) and then dropped regardless of what that poll returned; a stalled body instead answers `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and closes the connection once the handler returns — that close is counted the same `reason="idle"` as any other, one policy close reached one path earlier |
+| `logit_in` | the handshake completing, and every `Ack` this listener writes; a peer waiting on a delayed ack is by definition not idle. A frame header whose first byte has already arrived is progress too: the absolute idle deadline bounds only the wait for that first byte, and the rest of the header — like the body — is read under the per-`read` stall bound instead, so a frame that starts arriving right at the deadline is read and acked rather than rejected after the peer already wrote it | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
+| `otlp_in` | a request *completing* — hyper owns the bytes, so this is the finest grain visible here; a request head that dribbles in slower than `idle_timeout` on an otherwise-quiet keep-alive connection is closed by this rule, a documented narrowing; a stalled request *body* gets its own bound, `idle_timeout` itself, per read frame | `graceful_shutdown()` is called and the connection is polled for up to `handshake_timeout` (reused as the grace period — no new knob); if that grace elapses with nothing in flight the connection is dropped regardless of what the poll returned, and if a request arrives inside the grace instead, see the note below the table; a stalled body instead answers `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and closes the connection once the handler returns — that close is counted the same `reason="idle"` as any other, one policy close reached one path earlier |
 
-A request that starts right at the idle deadline can still be served inside that grace window: its
-events already reached the `Fanout` before the deadline expires, but if the handler outlives the
-bounded grace, the connection is dropped before the response is written. The cost is a client
-retry (and a possible duplicate under the exporter's own retry policy), not lost data — the events
-themselves are not undone by the connection going away underneath them.
+A request that arrives inside the bounded grace is served to completion, not dropped underneath
+it: the connection is kept open while a request is in flight, and the grace runs again once that
+request completes so its response actually reaches the wire — dropping it mid-flight would discard
+a batch already handed to `Fanout::send`. The cost is at most a reconnect for the *next* request on
+that connection, not a lost response or a lost batch. A silent peer cannot exploit this to hold the
+connection open indefinitely: with nothing in flight the drop still happens at the end of the
+grace, and a request body that stalls mid-upload is bounded by the same per-frame stall timeout
+regardless.
 
 **An idle close is policy, not a fault.** All five listeners return `Ok(())` from the connection
 task the same success path a graceful shutdown takes, so an idle close never reaches the

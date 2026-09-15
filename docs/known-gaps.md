@@ -1322,12 +1322,15 @@ already built that have a known, accepted rough edge.
   bytes, so the finest grain `idle_timeout` can see is a request starting and finishing, not
   individual bytes read. A request head that dribbles in more slowly than `idle_timeout` on an
   otherwise-quiet keep-alive connection is therefore still closed — a documented cost, not a bug,
-  and distinct from the case this row used to track. A narrower edge case sits inside the grace
-  window itself: a request whose head arrives right at the idle deadline can start being served
-  during the bounded grace (`graceful_shutdown` then poll for up to `handshake_timeout`), and if
-  its handler outlives that grace the connection is dropped before the response is written. The
-  events themselves already reached the `Fanout` before the drop, so the cost is a client retry
-  (and a possible duplicate under the exporter's own retry policy), not lost data.
+  and distinct from the case this row used to track. A request whose head arrives right at the
+  idle deadline is not a further gap: it is served to completion inside the bounded grace
+  (`graceful_shutdown` then poll for up to `handshake_timeout`) rather than dropped underneath it
+  — the connection is kept open while that request is in flight, and the grace runs again once it
+  completes so the response actually reaches the wire, since dropping it mid-flight would discard
+  a batch already handed to `Fanout::send`. The cost is at most a reconnect for the *next* request,
+  never a lost response or a lost batch, and a silent peer cannot exploit this to hold the
+  connection open indefinitely: with nothing in flight the drop still happens at the end of the
+  grace, and a stalled body is bounded by the same per-frame stall timeout regardless.
 - **A write-only TLS sink (`syslog_out`, and `logit_out` before its per-batch ack) cannot observe a
   peer's post-handshake rejection.** Under TLS 1.3 the server sends its entire handshake flight,
   `Finished` included, before it ever sees the client's certificate message — so a client-cert
