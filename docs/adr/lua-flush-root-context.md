@@ -38,9 +38,12 @@ resets the script's batch-scoped globals to what a stand-alone emission genuinel
 - `trace.trace_id`/`trace.span_id` -- the fresh root the emission is sent under (the same ids the
   node's own `flush` span records).
 - `provenance.origin`/`provenance.previous` -- this component, both of them; i.e.
-  `provenance.origin == provenance.previous == provenance.component`. This is exactly what
-  `Fanout::stamp` writes on the outgoing batch, pre-filled on the `BatchContext` so what the
-  script reads and what the batch carries are one value, not two code paths agreeing.
+  `provenance.origin == provenance.previous == provenance.component`. This is what this node's
+  own outbound edge stamps, pre-filled on the `BatchContext` so what the script reads and what
+  the batch carries are one value, not two code paths agreeing. An event the script marked for a
+  `target` takes one hop more, and that target's `Fanout` rewrites `previous` to the target's id
+  exactly as it does on the `process()` path
+  ([ADR `target-components`](target-components.md)); `origin` stays this node.
 - `resource` -- empty. `scope` -- none (the all-clear defaults `scope` documents).
 
 A script is free to change what it can already change: a write to `resource` or `scope` inside
@@ -79,5 +82,12 @@ The per-batch `process()` path is untouched.
   [ADR `aggregation-window-semantics`](aggregation-window-semantics.md)'s "stamped with whichever
   resource the worker most recently saw" sentence is superseded.
 - A script reading `provenance.origin` inside `flush()` to decide what to do now sees its own id,
-  which is what the emitted batch will be stamped with -- the specific mismatch the old
-  provenance entry called out.
+  which is what its emission goes out stamped with on this node's own edge -- the specific
+  mismatch the old provenance entry called out.
+- A flushed event marked for a `target` (`e:to("a")`) now reaches the target's consumers with
+  `origin` naming the flushing Lua node; it used to be the *target's* id, since the flush context
+  carried an empty `origin` for the target's `Fanout` to `get_or_insert` into. The new value is
+  the one [ADR `batch-provenance-on-delivered`](batch-provenance-on-delivered.md) and
+  [ADR `target-components`](target-components.md) already specify -- "`previous` downstream of a
+  target is the target's id, `origin` is untouched" -- so this is the target rule finally
+  applying to the flush path too, not a new rule.

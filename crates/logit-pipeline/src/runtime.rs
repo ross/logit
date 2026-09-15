@@ -1674,8 +1674,10 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// result of no one event or batch, so before every `flush()` call this node resets the script's
 /// four batch-scoped globals to what a stand-alone emission genuinely is -- `trace` to the fresh
 /// root the emission is sent under, `provenance` to this component as both `origin` and
-/// `previous` (exactly what `Fanout::stamp` writes on the outgoing batch), `resource` to empty,
-/// and `scope` to none. A script that writes `resource` and/or `scope` inside `flush()`
+/// `previous` (what this node's own outbound edge stamps; an event marked for a `target` takes a
+/// further hop, and that target's `Fanout` rewrites `previous` to the target's id exactly as it
+/// does on the `process()` path, leaving `origin` this node), `resource` to empty, and `scope` to
+/// none. A script that writes `resource` and/or `scope` inside `flush()`
 /// (`crates/logit-script/src/resource.rs`, `crates/logit-script/src/scope.rs`) gives the emission
 /// a real identity; one that doesn't emits under the empty root -- see `flush_now`'s
 /// `take_resource`/`take_scope` calls below. Nothing from the most recently processed batch
@@ -1727,11 +1729,15 @@ fn run_lua(
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     // The root a `flush()` runs in (this function's own doc comment): one empty resource shared
     // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
-    // own id as both halves of the provenance -- the identical value `Fanout::stamp` would fill
-    // an empty provenance in with, pre-filled here so what the script reads as
-    // `provenance.origin`/`.previous` *is* what the emitted batch carries, by construction rather
-    // than by two code paths agreeing (`stamp` is idempotent over it: `get_or_insert` on an
-    // already-set `origin`, and `previous` overwritten with the same id).
+    // own id as both halves of the provenance -- the identical value `Fanout::stamp` fills an
+    // empty provenance in with on this node's *own* outbound edge, pre-filled here so what the
+    // script reads as `provenance.origin`/`.previous` is what a batch leaving that edge carries,
+    // by construction rather than by two code paths agreeing (`stamp` is idempotent over it:
+    // `get_or_insert` on an already-set `origin`, and `previous` overwritten with the same id).
+    // An event the script marked for a `target` takes one more hop first: that target's `Fanout`
+    // is built `with_component(<target id>)`, so `stamp` rewrites `previous` to the target's id
+    // there, exactly as it does for a marked event on the `process()` path
+    // (`docs/adr/target-components.md`). `origin`, filled in here, survives that hop untouched.
     let root_resource = Arc::new(Resource::default());
     let me = logit_core::interner::intern(&id);
     let flush_provenance = logit_core::Provenance { origin: Some(me), previous: Some(me) };
@@ -7897,6 +7903,94 @@ mod tests {
         assert_ne!(
             flush_ctx.trace_id, process_ctx.trace_id,
             "a flush is a new root, unrelated to the batch that fed it"
+        );
+    }
+
+    /// A flushed event marked for a `target` keeps this node as `origin` and takes the target as
+    /// `previous`: the flush pre-fills both halves of the provenance
+    /// (`docs/adr/lua-flush-root-context.md`), and the target's own `Fanout` then applies the one
+    /// unchanged stamping rule (`docs/adr/batch-provenance-on-delivered.md`) it applies on the
+    /// `process()` path -- `previous` becomes the target, `origin` is untouched
+    /// (`docs/adr/target-components.md`). Before the root context an empty `origin` reached the
+    /// target unset, so the *target* named itself as the origin of a flushed batch.
+    #[tokio::test]
+    async fn lua_flush_through_a_target_keeps_this_node_as_origin_and_the_target_as_previous() {
+        let script = r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    return {e:to("a")}
+                end
+                return {}
+            end
+        "#;
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                },
+            ),
+            (
+                "windowed",
+                vec!["in"],
+                vec!["a"],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("watcher", vec!["a"], vec![], ComponentKind::Json { skip_to_brace: false }),
+        ]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput {
+                    batch: Some(one_batch(vec![tagged_event("stashed", None)])),
+                }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("watcher".to_string(), NodeSpec::Transform(Box::new(RecordProvenance { tx })));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let provenance = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the flushed batch should reach the target's consumer");
+        assert_eq!(
+            symbol_name(provenance.origin).as_deref(),
+            Some("windowed"),
+            "the flushing node stays the origin -- the target never overwrites an already-set one"
+        );
+        assert_eq!(
+            symbol_name(provenance.previous).as_deref(),
+            Some("a"),
+            "the target's Fanout rewrote previous, exactly as it does on the process() path"
         );
     }
 }

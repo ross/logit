@@ -350,9 +350,12 @@ no field" split `event.has_log`/`event.log`'s fields already use, so a write to 
 `process()` -- the same timing `trace` uses. `provenance.component` is fixed for this worker's
 whole lifetime, set once when the pipeline starts. **Inside `flush()`, `origin` and `previous` are
 both this component** -- `provenance.origin == provenance.previous == provenance.component` -- the
-root a flush-driven emission runs in, and exactly what the flushed batch is stamped with on the
-way out ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)); see "Reading trace
-context" above for the same rule on `trace`.
+root a flush-driven emission runs in, and what this component's own outbound edge stamps the
+flushed batch with on the way out
+([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)). An event the flush marked for
+a `target` (`event:to("a")`) takes one hop more, and that target rewrites `previous` to its own id
+just as it does on the `process()` path ([ADR `target-components`](../adr/target-components.md));
+`origin` stays this component. See "Reading trace context" above for the same rule on `trace`.
 
 `provenance` carries no application meaning on its own -- a script that wants it in the outgoing
 data copies it into an attribute explicitly (`event.attributes["source.origin"] =
