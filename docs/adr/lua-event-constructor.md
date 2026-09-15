@@ -173,7 +173,9 @@ Concretely:
   (`to_table()` emits it as a decimal string), and an integral `F64` such as `3.0` comes back
   `I64` (LuaJIT canonicalizes it to an integer); a `sum`/`gauge`/`samples`/exemplar value that is
   NaN or an infinity is rejected by the finiteness rule rather than rebuilt (`prometheus_in`'s
-  OpenMetrics `NaN`/`+Inf` and `otlp_in`'s unfiltered `AsDouble` both admit such a point). In-place
-  `event.log.message`/
-  `severity`/`body_format` writes are the named follow-up.
+  OpenMetrics `NaN`/`+Inf` and `otlp_in`'s unfiltered `AsDouble` both admit such a point); a
+  wire-decoded span whose `end_timestamp` precedes the event's `timestamp` or whose
+  `trace_id`/`span_id`/`parent_span_id`/link id is all-zero (both decoders check length only) is
+  rejected by the constructor's rules above, so a rebuilding script must fix or drop that field.
+  In-place `event.log.message`/`severity`/`body_format` writes are the named follow-up.
 - Landed by [plan `lua-event-constructor`](../plans/lua-event-constructor.md), stream key `mint`.

@@ -2630,6 +2630,31 @@ mod tests {
         assert_eq!(out, event);
     }
 
+    /// The two wire-decodable span shapes `docs/design/lua-api.md`'s `### span` residual note
+    /// records: a decoder carries an out-of-order `end_timestamp` and an all-zero id through
+    /// unchecked, `to_table()` emits them as they are, and the constructor's rules refuse them on
+    /// the way back -- a rebuild must fix or drop the field.
+    #[test]
+    fn new_of_to_table_rejects_a_wire_span_whose_end_precedes_its_start() {
+        let w = worker(REBUILD);
+        let mut event = span_event();
+        event.span.as_mut().unwrap().end_timestamp = event.timestamp - 1;
+        let err = process_err(&w, event);
+        assert!(err.contains("Event.new: span.end_timestamp precedes timestamp"), "got: {err}");
+    }
+
+    #[test]
+    fn new_of_to_table_rejects_a_wire_span_with_an_all_zero_parent() {
+        let w = worker(REBUILD);
+        let mut event = span_event();
+        event.span.as_mut().unwrap().parent_span_id = Some([0; 8]);
+        let err = process_err(&w, event);
+        assert!(
+            err.contains("Event.new: span.parent_span_id must be a 16-character hex string (or nil), and not all-zero"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn an_end_timestamp_before_the_timestamp_is_rejected() {
         let err = span_err(

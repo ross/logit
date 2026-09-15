@@ -914,7 +914,16 @@ span.attributes is not a field`. `SpanRecord.ext` (`status_message`, `trace_stat
 logit-proto`'s `ext_from_wire` already applies to a decoded span -- so a minimal constructed span
 costs what a minimal decoded one does, and `dropped_events_count = 0` written out explicitly
 earns no box. A `Value::Null` span or span-event `name` is the same residual as a `Value::Null`
-`message`: `to_table()` emits it as an absent key, and `Event.new` rejects it as missing.
+`message`: `to_table()` emits it as an absent key, and `Event.new` rejects it as missing. Two
+more span shapes a wire decoder can produce are recorded residuals of the same kind, deliberately
+rejected rather than rebuilt: an `end_timestamp` before the event's `timestamp` (`otlp_in` and
+the native codec carry the wire value through unchecked, a missing end decodes as `0`, and
+`stdio_out` renders such a span with a saturating duration) is `Event.new: span.end_timestamp
+precedes timestamp`; an all-zero `trace_id`/`span_id`/`parent_span_id` or link id (both decoders
+check length only, so an exporter that pads a root span's parent with eight zero bytes yields
+`parent_span_id = "0000000000000000"`) is the `not all-zero` error above. A script rebuilding
+such an event through `Event.new(event:to_table())` must fix or drop the offending field first --
+`t.span.parent_span_id = nil`, say, or `t.span.end_timestamp = t.timestamp`.
 
 ```lua
 -- a script minting a span from a line trace_context can't lift (say, a two-timestamp line
