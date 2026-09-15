@@ -5835,9 +5835,9 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
-    /// `otlp_in` has no datagram transport to reject a value under, so the zero check is the only
-    /// half of this rule that can fire on it -- and it fires with the identical message, off the
-    /// same loop body.
+    /// `otlp_in` has no datagram transport to reject a value under either, so the zero check is
+    /// the only half of this rule that can fire on it -- and it fires with the identical message,
+    /// off the same loop body.
     #[test]
     fn a_zero_idle_timeout_is_rejected_on_an_otlp_in() {
         let err = expect_err(cfg(vec![

@@ -107,7 +107,12 @@
 //! waiting regardless, hyper-util's own pre-sniff `ReadVersion` future resolves to
 //! `Err("Cancelled")`, and an h2 connection still handshaking only sets an internal
 //! `close_pending` flag. The bounded grace-then-drop step exists for exactly those three, which
-//! is why the post-shutdown result is deliberately ignored.
+//! is why the post-shutdown result is deliberately ignored. The one thing the drop waits for is
+//! a request that *started* inside the grace window and has not returned: dropping the
+//! connection while its handler is parked in `Fanout::send` would discard a batch that never
+//! reached the fanout, so [`drive_with_idle`] polls that request out and then lets the grace run
+//! again for its response. Nothing a *silent* peer does can extend the window -- only being
+//! served can.
 //!
 //! *Policy, not a fault.* An idle close counts `logit.input.connections.closed{reason="idle"}`
 //! and returns `Ok(())`, so it never reaches the `connection_error` diagnostic below -- counted,
@@ -732,7 +737,38 @@ where
     // `Ok(())`, which is why the result is deliberately discarded (this module's "Idle timeout"
     // doc section). Returning from here is the drop: the socket closes with the pinned future.
     shutdown(conn.as_mut());
-    let _ = tokio::time::timeout(grace, conn.as_mut()).await;
+    loop {
+        if tokio::time::timeout(grace, conn.as_mut()).await.is_ok() {
+            break;
+        }
+        if activity.in_flight() == 0 {
+            // Nothing in flight, so the drop costs nothing: this is the case the grace exists
+            // for (a `KA::Busy` head, a cancelled pre-sniff, an h2 still handshaking).
+            break;
+        }
+        // A request *started* inside the grace window and its handler has not returned -- most
+        // likely parked in `Fanout::send` on a full downstream. Dropping now would discard a
+        // batch that never reached the fanout, which is precisely the backpressure-causes-loss
+        // outcome this whole feature is built to avoid, so the request is waited out instead:
+        // `conn` keeps being polled (on h1 the handler's own future is polled inside it) until
+        // the count falls back to zero, and then the grace runs again so the response reaches
+        // the wire. A stalled body is still bounded by its own per-frame timeout, and a
+        // connection with nothing in flight is closed immediately, so no misbehaving peer can
+        // hold this open by staying silent -- only by continuing to be served.
+        let mut connection_finished = false;
+        while activity.in_flight() > 0 {
+            tokio::select! {
+                _ = conn.as_mut() => {
+                    connection_finished = true;
+                    break;
+                }
+                () = activity.changed.notified() => {}
+            }
+        }
+        if connection_finished {
+            break;
+        }
+    }
     telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
     Ok(())
 }
@@ -2839,6 +2875,84 @@ mod tests {
             .expect("the connection should be closed within 2s of the stalled body's response")
             .expect("the client's connection task should not panic");
         drop(sender);
+    }
+
+    /// The grace window's one real hazard, closed. A request that *starts* inside the grace --
+    /// after `graceful_shutdown` has been called, before the connection has actually gone -- must
+    /// be served, not dropped: on h1 the handler's own future is polled inside the connection
+    /// future, so dropping the connection while that handler is parked in `Fanout::send` would
+    /// discard a batch that never reached the fanout, the backpressure-causes-loss outcome
+    /// `docs/adr/idle-connection-timeout.md` exists to prevent.
+    ///
+    /// **Two bytes at the start, not one.** One byte leaves hyper-util's `auto` builder inside
+    /// its pre-sniff `ReadVersion` (`P` could still begin either `POST` or the h2 `PRI` preface),
+    /// which `graceful_shutdown` cancels outright -- that is
+    /// [`a_fresh_http_connection_that_sent_one_head_byte_is_closed_after_the_idle_timeout`]'s
+    /// case, and it has nothing in flight to wait for. `PO` commits the sniff to HTTP/1.1, so
+    /// what this test closes is a real h1 connection stopped mid-head: `KA::Busy`, which
+    /// `graceful_shutdown` leaves running, which is exactly the state that can still pick a
+    /// request up during the grace.
+    ///
+    /// The pre-filled capacity-1 channel is what parks the handler, and the batch it holds is a
+    /// metric while the request carries a span, so "the request's batch arrived" is a distinct
+    /// assertion from "the pre-filled one drained".
+    #[tokio::test]
+    async fn a_request_that_starts_inside_the_grace_window_is_served_not_dropped() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("otlp_in", "otlp_in", "listener");
+        let (addr, input) = bound_input(OtlpTransport::Http).await;
+        let mut input = input
+            .with_telemetry(telemetry)
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            // Doubles as the grace, kept short so every deadline here is visible inside a
+            // fraction of a second.
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, mut rx) = fanout_into_channel_with_capacity(1);
+        // Pre-filled, so the handler's own `Fanout::send` parks until this test drains it.
+        sink.send(metric_batch()).await;
+        tokio::spawn(async move { input.run(sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let body = one_span_payload();
+        let head = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
+             application/x-protobuf\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+
+        let mut late = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        late.write_all(&head[..2]).await.unwrap();
+
+        // Past the 100ms idle deadline: `graceful_shutdown` has been called and the 50ms grace
+        // is running or already spent. The rest of the request lands anyway.
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        late.write_all(&head[2..]).await.unwrap();
+        late.write_all(&body).await.unwrap();
+
+        // Six graces' worth of parked handler. Under a close that dropped on grace expiry, this
+        // connection and this batch would both be long gone.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let prefilled = recv_batch(&mut rx).await;
+        assert!(prefilled.events[0].span.is_none(), "the pre-filled batch drains first");
+        let served = recv_batch(&mut rx).await;
+        assert!(
+            served.events[0].span.is_some(),
+            "the request that started inside the grace window must reach the fanout"
+        );
+
+        let response = read_response_head(&mut late, "a request served inside the grace").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+
+        // And it still closes afterwards -- waiting the request out defers the close, it does
+        // not cancel it.
+        expect_closed(&mut late, "a connection that served a request inside its grace").await;
+        assert_eq!(
+            sum_of(&registry.drain(0), "logit.input.connections.closed", Some(("reason", "idle"))),
+            Some(1.0),
+            "the deferred close is still counted once, as an idle close"
+        );
     }
 
     /// The default, and the promise that turning nothing on changes nothing: with no
