@@ -441,8 +441,11 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
         }
         Kind::Histogram => {
             // `buckets` is required even when empty: `to_table()` always emits it, and an empty
-            // histogram round-trips as one. Each row is `{bound, count}`, checked strictly.
-            let buckets = sequence_field(t.raw_get("buckets")?, path, "buckets", bucket_from_row)?;
+            // histogram round-trips as one. Each row is `{bound, count}`, checked strictly;
+            // the rows' layout is then checked (and the overflow bucket appended) as a whole.
+            let mut buckets =
+                sequence_field(t.raw_get("buckets")?, path, "buckets", bucket_from_row)?;
+            validate_buckets(&mut buckets, path)?;
             MetricKind::Histogram(Histogram {
                 buckets,
                 temporality: temporality_field(&t, path)?,
@@ -452,7 +455,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             })
         }
         Kind::ExponentialHistogram => MetricKind::ExponentialHistogram(ExpHistogram {
-            scale: i32_field(t.raw_get("scale")?, path, "scale")?,
+            scale: scale_field(t.raw_get("scale")?, path)?,
             zero_count: count_field(t.raw_get("zero_count")?, path, "zero_count")?,
             zero_threshold: finite_field(t.raw_get("zero_threshold")?, path, "zero_threshold")?,
             positive: exp_buckets_from_table(t.raw_get("positive")?, path, "positive")?,
@@ -594,16 +597,70 @@ fn bucket_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(
     Ok((bound, count))
 }
 
-/// One `{quantile=, value=}` row of a `summary`'s `quantiles`. A `quantile` outside `[0, 1]` is
-/// accepted as-is: `Summary` doesn't constrain it, and neither does any producer, so the
-/// constructor doesn't invent a rule the model lacks.
+/// One `{quantile=, value=}` row of a `summary`'s `quantiles`. `quantile` is held to `[0, 1]`,
+/// the range OTLP gives `SummaryDataPoint.ValueAtQuantile.quantile` and the only one a quantile
+/// means anything in. The rows need not be sorted: neither `Summary` nor OTLP orders them.
 fn quantile_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(f64, f64)> {
     let row = row_table(value, path)?;
     let path = path();
     expect_keys(&row, QUANTILE_KEYS, &path)?;
     let quantile = finite_field(row.raw_get("quantile")?, &path, "quantile")?;
+    if !(0.0..=1.0).contains(&quantile) {
+        return Err(runtime_error(format!(
+            "Event.new: {} must be between 0 and 1, got {quantile}",
+            dotted(&path, "quantile")
+        )));
+    }
     let value = finite_field(row.raw_get("value")?, &path, "value")?;
     Ok((quantile, value))
+}
+
+/// The layout `Histogram` documents and `logit-proto`'s OTLP encoder relies on, checked over the
+/// parsed `buckets` of the metric at `path` once every row has passed [`bucket_from_row`]:
+/// bounds strictly increasing, and `math.huge` only as the last row's bound. The encoder splits
+/// the rows into `explicit_bounds` (the finite bounds) and `bucket_counts` (every count), and
+/// OTLP requires the latter to be exactly one longer than the former with the extra count last:
+/// a `+Inf` row anywhere else would shift every count after it onto the wrong bound on the wire,
+/// and a missing one would ship equal-length arrays no receiver accepts. A duplicate or
+/// out-of-order bound is caught here rather than left for `aggregate`'s bitwise layout match to
+/// silently never merge.
+///
+/// A non-empty sequence whose last bound is finite gets `(f64::INFINITY, 0)` appended: the
+/// overflow bucket with no observations. This is the one normalisation the constructor performs.
+/// It loses nothing -- a script that listed only finite bounds observed nothing above the last
+/// one, so the count it would have written is 0 -- and it is what keeps the OTLP shape valid.
+/// `to_table()` always emits the `+Inf` row, so `Event.new(e:to_table())` never takes this path;
+/// an *empty* `buckets` stays empty, because that is what `to_table()` emits for an empty
+/// histogram and appending to it would break that round-trip.
+fn validate_buckets(buckets: &mut Vec<(f64, u64)>, path: &str) -> mlua::Result<()> {
+    let len = buckets.len();
+    let mut prev: Option<f64> = None;
+    for (idx, &(bound, _)) in buckets.iter().enumerate() {
+        let k = idx + 1;
+        if bound == f64::INFINITY && k != len {
+            return Err(runtime_error(format!(
+                "Event.new: {}.bound is math.huge but buckets[{k}] is not the last bucket",
+                indexed(path, "buckets", k)
+            )));
+        }
+        if let Some(prev) = prev {
+            if bound <= prev {
+                return Err(runtime_error(format!(
+                    "Event.new: {}.bound must be greater than buckets[{}].bound (got {bound} \
+                     after {prev})",
+                    indexed(path, "buckets", k),
+                    k - 1
+                )));
+            }
+        }
+        prev = Some(bound);
+    }
+    if let Some(&(last, _)) = buckets.last() {
+        if last.is_finite() {
+            buckets.push((f64::INFINITY, 0));
+        }
+    }
+    Ok(())
 }
 
 /// An entry of a sequence that must itself be a table (a bucket or quantile row).
@@ -981,6 +1038,20 @@ fn count(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<u64> {
         LuaValue::Number(n) => Err(reject(n.to_string())),
         other => Err(reject(other.type_name().to_string())),
     }
+}
+
+/// An `exponential_histogram`'s `scale`: an [`i32_field`] further held to `[-10, 20]`, the range
+/// OTLP gives `ExponentialHistogramDataPoint.scale` (the parse error names `i32`'s range, so
+/// the range check has its own message).
+fn scale_field(value: LuaValue, path: &str) -> mlua::Result<i32> {
+    let scale = i32_field(value, path, "scale")?;
+    if !(-10..=20).contains(&scale) {
+        return Err(runtime_error(format!(
+            "Event.new: {} must be between -10 and 20, got {scale}",
+            dotted(path, "scale")
+        )));
+    }
+    Ok(scale)
 }
 
 /// A *required* integer that fits an `i32` (an exponential histogram's `scale`, a side's
@@ -2337,15 +2408,139 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_quantile_outside_the_unit_interval_is_accepted_as_is() {
-        // The model doesn't constrain `quantile`, so neither does the constructor.
+    fn a_summary_quantile_must_lie_in_the_unit_interval() {
+        // OTLP's `ValueAtQuantile.quantile` range; both ends are in, and the rows need not be
+        // sorted.
+        for q in ["1.5", "-0.1"] {
+            let err = metric_err(&format!(
+                r#"name = "m", kind = "summary", quantiles = {{{{quantile = {q}, value = 3}}}}, count = 1, sum = 3"#
+            ));
+            assert!(
+                err.contains(&format!(
+                    "Event.new: metrics[1].quantiles[1].quantile must be between 0 and 1, got {q}"
+                )),
+                "got: {err}"
+            );
+        }
         let out = mint_metric(
-            r#"kind = "summary", quantiles = {{quantile = 1.5, value = 3}}, count = 1, sum = 3"#,
+            r#"kind = "summary", quantiles = {{quantile = 1, value = 3}, {quantile = 0, value = 1}}, count = 1, sum = 3"#,
         );
         assert_eq!(
             out.metrics[0].kind,
-            MetricKind::Summary(Summary { quantiles: vec![(1.5, 3.0)], count: 1, sum: 3.0 })
+            MetricKind::Summary(Summary {
+                quantiles: vec![(1.0, 3.0), (0.0, 1.0)],
+                count: 1,
+                sum: 3.0
+            })
         );
+    }
+
+    #[test]
+    fn an_exponential_histogram_scale_must_lie_in_otlps_range() {
+        // `[-10, 20]`, both ends in; the `i32` parse is a separate, earlier error.
+        let fields = |scale: &str| {
+            format!(
+                r#"kind = "exponential_histogram", scale = {scale}, zero_count = 0, zero_threshold = 0, positive = {{offset = 0, counts = {{}}}}, negative = {{offset = 0, counts = {{}}}}, temporality = "delta", count = 0"#
+            )
+        };
+        for scale in ["21", "-11"] {
+            let err = metric_err(&format!(r#"name = "m", {}"#, fields(scale)));
+            assert!(
+                err.contains(&format!(
+                    "Event.new: metrics[1].scale must be between -10 and 20, got {scale}"
+                )),
+                "got: {err}"
+            );
+        }
+        for scale in [20, -10] {
+            let out = mint_metric(&fields(&scale.to_string()));
+            let MetricKind::ExponentialHistogram(e) = &out.metrics[0].kind else {
+                panic!("expected an exponential histogram")
+            };
+            assert_eq!(e.scale, scale);
+        }
+    }
+
+    /// `metrics[1].kind`'s `Histogram` with the given `buckets` literal, `temporality = "delta"`.
+    fn histogram_buckets(literal: &str) -> Vec<(f64, u64)> {
+        let out = mint_metric(&format!(
+            r#"kind = "histogram", buckets = {literal}, temporality = "delta""#
+        ));
+        let MetricKind::Histogram(h) = &out.metrics[0].kind else { panic!("expected a histogram") };
+        h.buckets.clone()
+    }
+
+    /// The error for a `histogram` with the given `buckets` literal.
+    fn histogram_buckets_err(literal: &str) -> String {
+        metric_err(&format!(
+            r#"name = "m", kind = "histogram", buckets = {literal}, temporality = "delta""#
+        ))
+    }
+
+    #[test]
+    fn histogram_bounds_must_be_strictly_increasing() {
+        let err = histogram_buckets_err("{{bound = 5, count = 1}, {bound = 1, count = 2}}");
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[2].bound must be greater than buckets[1].bound \
+                 (got 1 after 5)"
+            ),
+            "got: {err}"
+        );
+        // Equal is not greater.
+        let err = histogram_buckets_err(
+            "{{bound = 1, count = 1}, {bound = 2, count = 2}, {bound = 2, count = 3}}",
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[3].bound must be greater than buckets[2].bound \
+                 (got 2 after 2)"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_math_huge_bound_may_only_be_the_last_buckets() {
+        let err = histogram_buckets_err(
+            "{{bound = 1, count = 1}, {bound = math.huge, count = 2}, {bound = 5, count = 3}}",
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[2].bound is math.huge but buckets[2] is not the \
+                 last bucket"
+            ),
+            "got: {err}"
+        );
+        // Two `+Inf` rows: the first is the one that isn't last, and that is the message --
+        // not a confusing "inf must be greater than inf".
+        let err = histogram_buckets_err(
+            "{{bound = 1, count = 1}, {bound = math.huge, count = 2}, {bound = math.huge, count = 3}}",
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[2].bound is math.huge but buckets[2] is not the \
+                 last bucket"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_histogram_without_an_overflow_bucket_gets_an_empty_one_appended() {
+        // The constructor's one normalisation: only-finite bounds observed nothing above the
+        // last one, so the `+Inf` row OTLP needs is added with count 0.
+        assert_eq!(
+            histogram_buckets("{{bound = 1, count = 3}, {bound = 5, count = 2}}"),
+            vec![(1.0, 3), (5.0, 2), (f64::INFINITY, 0)]
+        );
+        // A `+Inf`-last input is untouched (so `Event.new(e:to_table())` never grows a row)...
+        assert_eq!(
+            histogram_buckets("{{bound = 1, count = 3}, {bound = math.huge, count = 2}}"),
+            vec![(1.0, 3), (f64::INFINITY, 2)]
+        );
+        // ...and so is an empty one, which is what `to_table()` emits for an empty histogram.
+        assert_eq!(histogram_buckets("{}"), Vec::<(f64, u64)>::new());
     }
 
     #[test]
