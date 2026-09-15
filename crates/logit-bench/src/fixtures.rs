@@ -924,6 +924,16 @@ function process(event)
 end
 "#;
 
+/// Drops the incoming event and returns one minted from a literal table through `Event.new`
+/// (`crates/logit-script/src/construct.rs`, `docs/adr/lua-event-constructor.md`): one attribute
+/// and a minimal log, the smallest useful constructed event
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_constructing_a_log_event`).
+pub const LUA_EVENT_NEW_LOG_SCRIPT: &str = r#"
+function process(event)
+  return Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}
+end
+"#;
+
 /// A metric-only event carrying one `MetricKind::Sum` record -- a counter, the shape
 /// `kv_metrics`'s `nginx.requests` spec (`fn kv_metrics` above) produces on the wire, and the
 /// fixture the Lua `event.metrics[i].value`/`#event.metrics` surface

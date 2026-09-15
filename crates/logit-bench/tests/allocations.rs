@@ -3196,6 +3196,43 @@ fn lua_process_one_event_identity_write_to_scope_name_is_free() {
     expect_allocs("lua: set_scope + process (scope.name = scope.name) + take_scope", stats, 5);
 }
 
+/// `Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}` returned
+/// from `process()` in place of the incoming event (`crates/logit-script/src/construct.rs`,
+/// `docs/adr/lua-event-constructor.md`) -- the smallest useful constructed event, measured the
+/// same way as every row above. Additive: a script that never calls `Event.new` pays nothing
+/// new, which is what every other `lua:` pin in this section staying put guarantees.
+///
+/// **17**, broken down by measuring narrower scripts against this one (the same method
+/// [`lua_process_one_event`] used), not derived:
+///
+/// - **4** for any call at all (`lua_process_one_event`'s baseline, confirmed again here with a
+///   `return nil` script).
+/// - **+6** for `Event.new{timestamp = "1"}` itself, whether or not the result is returned
+///   (constructing one and returning `nil` lands at 10): the `Rc<RefCell<Event>>` and the
+///   `EventProxy` userdata a fresh handle costs -- the same pair the incoming event's proxy
+///   accounts for in the baseline -- plus what mlua spends calling into a Rust closure and
+///   handing its userdata result back to Lua; not attributable line by line, the same caveat
+///   the baseline's own bookkeeping carries. `raw_get`/`pairs` over the argument table and the
+///   `timestamp` parse allocate nothing, and every error-path `format!` is lazy.
+/// - **+1** for the `Box` on `ProcessOutcome::Emit` (returning it: 11).
+/// - **+3** for `attributes = {env = "prod"}`: 1 for the sub-table (an empty `attributes = {}`
+///   lands at 12) and 2 for its one entry, one of which is `lua_to_value`'s `Bytes` for `"prod"`
+///   -- a second attribute adds exactly 1 more, so the other 1 is the map's first insert, not
+///   per-entry.
+/// - **+3** for `log = {message = "hi"}`, symmetrically: 1 for the sub-table and 2 for
+///   `message`, `lua_to_value`'s `Bytes` for `"hi"` among them. `LogRecord` is inline in
+///   `Event`, so there is no box for the record itself.
+#[test]
+fn lua_process_one_event_constructing_a_log_event() {
+    let worker = ScriptWorker::new(fixtures::LUA_EVENT_NEW_LOG_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new log event from a literal table", stats, 17);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

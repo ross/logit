@@ -390,9 +390,9 @@ impl UserData for EventProxy {
         );
 
         // An independent deep copy, for fan-out: `return {a, b}` needs a second event distinct
-        // from the first, and there's no `Event.new(...)` constructor yet (docs/adr and the
-        // v0.1-lua-engine PR both call this out as a deliberate follow-up, not an oversight).
-        // Carries the routing mark over and shares the target table -- see `cloned_from`.
+        // from the first -- derived from this one, where `Event.new(t)` (`crate::construct`)
+        // builds one from scratch. Carries the routing mark over and shares the target table --
+        // see `cloned_from`.
         methods.add_method("clone", |_, this, ()| Ok(EventProxy::cloned_from(this)));
 
         // `event:to(id)` -- *mark* this event for one of this component's `targets:`, and return
@@ -2658,7 +2658,7 @@ mod tests {
             "#,
         );
         emitted(w.process(metric_event(sum_kind())).unwrap());
-        let err = match w.flush() {
+        let err = match w.flush(0) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("expected flush() to reject the stashed metric handle"),
         };

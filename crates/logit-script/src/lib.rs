@@ -15,6 +15,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod construct;
 mod provenance;
 mod proxy;
 mod resource;
@@ -99,11 +100,18 @@ pub struct ScriptWorker {
     /// `resource_state`. See `crate::provenance`'s module doc.
     provenance_state: Rc<RefCell<provenance::ProvenanceState>>,
     /// This component's `targets:` (`docs/adr/target-components.md`), as the name -> slot table
-    /// `event:to(id)` resolves against -- built **once**, here, and shared by `Rc` with every
-    /// [`EventProxy`] this worker mints, never rebuilt per event. Empty (the shared,
-    /// allocation-free empty table -- see `proxy::no_targets`) unless
-    /// [`ScriptWorker::with_targets`] was called.
-    targets: Rc<proxy::TargetTable>,
+    /// `event:to(id)` resolves against -- built **once** ([`ScriptWorker::with_targets`]) and
+    /// shared by `Rc` with every [`EventProxy`] this worker mints, never rebuilt per event. Empty
+    /// (the shared, allocation-free empty table -- see `proxy::no_targets`) unless
+    /// `with_targets` was called.
+    ///
+    /// Behind a `RefCell` (the `resource_state` shape) because two readers need it: `process`
+    /// here, and the `Event.new` global (`crate::construct`), installed in `new` *before*
+    /// `with_targets` can run and reading the table through this cell on every call rather than
+    /// capturing the empty one it was installed with. `process` borrows and bumps the `Rc` -- no
+    /// allocation, so `crates/logit-bench/tests/allocations.rs`'s `lua: process 1 event` pin is
+    /// unmoved by the cell.
+    targets: Rc<RefCell<Rc<proxy::TargetTable>>>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
@@ -159,6 +167,13 @@ impl ScriptWorker {
         let scope_state = scope::install(&lua)?;
         // Same "before `.exec()`" reasoning again -- see `crate::provenance`'s module doc.
         let provenance_state = provenance::install(&lua)?;
+        // Same "before `.exec()`" reasoning again: `Event` is an unconditional global, and a
+        // top-level `local E = Event` must see the table, not `nil`. The constructor reads the
+        // targets *cell* at call time (`crate::construct::install`), so `with_targets` running
+        // later still holds -- an `Event.new` executed at script top level, during `.exec()`
+        // itself, sees the empty table, documented in `docs/design/lua-api.md`.
+        let targets = Rc::new(RefCell::new(proxy::TargetTable::empty()));
+        construct::install(&lua, targets.clone())?;
         lua.load(source).exec()?;
         let process_fn = match lua.globals().get::<_, LuaValue>("process")? {
             LuaValue::Function(f) => f,
@@ -184,7 +199,7 @@ impl ScriptWorker {
             resource_state,
             scope_state,
             provenance_state,
-            targets: proxy::TargetTable::empty(),
+            targets,
             _not_send_sync: PhantomData,
         })
     }
@@ -281,15 +296,19 @@ impl ScriptWorker {
     ///
     /// A builder, not a `new()` parameter, for the same "don't touch every existing call site"
     /// reason as `with_telemetry`/`with_component`, and safe to call at any point after `new`
-    /// returns for the same reason `with_component` is: nothing a script's top-level code can
-    /// capture refers to this table -- it is reached only from a live `EventProxy`, minted per
-    /// `process()` call. The table is built **once**, here, and shared by `Rc` with every proxy
-    /// this worker goes on to mint.
+    /// returns for the same reason `with_component` is: the table is reached only through the
+    /// `targets` cell -- by a live `EventProxy` minted per `process()` call, and by the `Event.new`
+    /// constructor (`crate::construct`), which reads the cell each time it's called rather than
+    /// capturing the table it was installed alongside. The one thing a script's top-level code
+    /// *can* do is call `Event.new` during `ScriptWorker::new`'s `.exec()`, before this can have
+    /// run; that event resolves `to(..)` against the empty table, exactly as a top-level
+    /// `resource` write sees the pre-first-batch state -- documented, not prevented. The table is
+    /// built **once**, here, and shared by `Rc` with every proxy this worker goes on to mint.
     ///
     /// Calling this with an empty slice is the same as never calling it: `event:to(..)` is then a
     /// script error whatever id it names, never a silent forward.
-    pub fn with_targets(mut self, targets: &[String]) -> Self {
-        self.targets = match targets.is_empty() {
+    pub fn with_targets(self, targets: &[String]) -> Self {
+        *self.targets.borrow_mut() = match targets.is_empty() {
             true => proxy::TargetTable::empty(),
             false => Rc::new(proxy::TargetTable::new(targets)),
         };
@@ -313,7 +332,7 @@ impl ScriptWorker {
     pub fn process(&self, event: Event) -> Result<ProcessOutcome, ScriptError> {
         let process: mlua::Function = self.lua.registry_value(&self.process)?;
         let result: LuaValue = process
-            .call(EventProxy::with_targets(event, self.targets.clone()))
+            .call(EventProxy::with_targets(event, self.targets.borrow().clone()))
             .map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => ProcessOutcome::Drop,
@@ -339,13 +358,22 @@ impl ScriptWorker {
     /// Each flushed event carries its own routing mark, exactly as a `process()`-emitted one does:
     /// "a `flush()`-built event honours its mark like any other" (`docs/adr/target-components.md`).
     /// A flush-built event is typically a `event:clone()` stashed from `process()`, and `clone`
-    /// copies both the mark and the target table, so `e:to("x")` works inside `flush()` too.
-    pub fn flush(&self) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
+    /// copies both the mark and the target table, so `e:to("x")` works inside `flush()` too --
+    /// as does `Event.new(..):to("x")`, which reads the same table at call time.
+    ///
+    /// `now` is the runtime's tick time (`crates/logit-pipeline/src/runtime.rs`'s `flush_now`,
+    /// the same `now_unix_nanos()` the native `aggregate` gets), handed to the script as
+    /// `flush(now)`: a decimal-nanos *string*, the same encoding `event.timestamp` uses, so a
+    /// flush-driven `Event.new{timestamp = now, ..}` has a timestamp without a general clock
+    /// (ADR `lua-event-constructor`). A script declaring `function flush()` ignores it -- plain
+    /// Lua semantics, no shim.
+    pub fn flush(&self, now: i64) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
         let Some(flush_key) = self.flush.as_ref() else {
             return Ok(Vec::new());
         };
         let flush: mlua::Function = self.lua.registry_value(flush_key)?;
-        let result: LuaValue = flush.call(()).map_err(proxy::clarify_destructed_handle_use)?;
+        let result: LuaValue =
+            flush.call(now.to_string()).map_err(proxy::clarify_destructed_handle_use)?;
         Ok(match result {
             LuaValue::Nil => Vec::new(),
             LuaValue::Table(table) => events_from_table(&self.lua, table, "flush")?,
@@ -1367,7 +1395,7 @@ mod tests {
             "#,
         );
         w.process(counter_event("hits", 1.0)).unwrap();
-        let err = match w.flush() {
+        let err = match w.flush(0) {
             Ok(_) => panic!("expected flush() to reject the malformed table"),
             Err(e) => e.to_string(),
         };
@@ -1399,7 +1427,7 @@ mod tests {
             "#,
         );
         emitted(w.process(counter_event("hits", 1.0)).unwrap());
-        let err = match w.flush() {
+        let err = match w.flush(0) {
             Ok(_) => panic!("expected flush() to fail: pending should already be destructed"),
             Err(e) => e.to_string(),
         };
@@ -1433,7 +1461,7 @@ mod tests {
             "#,
         );
         emitted(w.process(counter_event("hits", 1.0)).unwrap());
-        let err = match w.flush() {
+        let err = match w.flush(0) {
             Ok(_) => panic!("expected flush() to fail: pending_attrs should already be destructed"),
             Err(e) => e.to_string(),
         };
@@ -1473,7 +1501,7 @@ mod tests {
             "#,
         );
         emitted(w.process(counter_event("hits", 1.0)).unwrap());
-        assert_eq!(w.flush().unwrap().len(), 1);
+        assert_eq!(w.flush(0).unwrap().len(), 1);
     }
 
     #[test]
@@ -1633,6 +1661,25 @@ mod tests {
         assert_global_is_nil("setfenv");
     }
 
+    /// The one global this crate *adds* to the base set beside `telemetry`/`trace`/`resource`/
+    /// `scope`/`provenance`: `Event`, a table with the `new` constructor (`crate::construct`),
+    /// observed from inside `process()` the same way the sandbox checks above observe absence.
+    #[test]
+    fn event_global_is_installed() {
+        let w = worker(
+            r#"
+            function process(event)
+                event.attributes.present = (Event ~= nil)
+                event.attributes.callable = (type(Event.new) == "function")
+                return event
+            end
+            "#,
+        );
+        let out = emitted(w.process(counter_event("hits", 1.0)).unwrap());
+        assert!(matches!(out.attributes.get("present"), Some(logit_core::Value::Bool(true))));
+        assert!(matches!(out.attributes.get("callable"), Some(logit_core::Value::Bool(true))));
+    }
+
     #[test]
     fn flush_returns_events_a_script_stashed_from_process() {
         let w = worker(
@@ -1655,17 +1702,17 @@ mod tests {
         let outcome = w.process(counter_event("hits", 1.0)).unwrap();
         assert!(matches!(outcome, ProcessOutcome::Drop));
 
-        let flushed = w.flush().unwrap();
+        let flushed = w.flush(0).unwrap();
         assert_eq!(flushed.len(), 1);
 
         // Second flush with nothing pending returns nothing.
-        assert_eq!(w.flush().unwrap().len(), 0);
+        assert_eq!(w.flush(0).unwrap().len(), 0);
     }
 
     #[test]
     fn flush_is_a_noop_when_the_script_defines_none() {
         let w = worker("function process(event) return event end");
-        assert_eq!(w.flush().unwrap().len(), 0);
+        assert_eq!(w.flush(0).unwrap().len(), 0);
     }
 
     #[test]
@@ -1996,7 +2043,7 @@ mod tests {
         );
         assert!(matches!(w.process(counter_event("hits", 1.0)).unwrap(), ProcessOutcome::Drop));
 
-        let flushed = w.flush().unwrap();
+        let flushed = w.flush(0).unwrap();
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].1, Some(0), "a flushed event carries the mark it was given");
     }

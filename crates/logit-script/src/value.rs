@@ -265,15 +265,28 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
             }
             Ok(Value::Array(items))
         }
-        None => {
-            let mut map = AttrMap::new();
-            for pair in table.pairs::<String, LuaValue>() {
-                let (key, value) = pair?;
-                map.insert(&key, lua_to_value(value)?);
-            }
-            Ok(Value::Map(Box::new(map)))
-        }
+        None => Ok(Value::Map(Box::new(lua_table_to_attrmap(table)?))),
     }
+}
+
+/// Converts a map-shaped Lua table into an [`AttrMap`], every value through [`lua_to_value`].
+/// The `Map` arm of [`lua_table_to_value`] (a nested map inside an attribute write) and
+/// `Event.new`'s `attributes` field (`crate::construct`) share this one conversion.
+///
+/// Keys go through mlua's `String` conversion, which *coerces* a numeric key to its decimal
+/// string (`{[1] = "a", x = "b"}` gives keys `"1"` and `"x"`) and rejects any other non-string
+/// key with mlua's own conversion error -- the behaviour the attribute-write path has always had,
+/// kept as is (an `mlua::String` borrowed from the VM rather than an owned Rust `String`, which
+/// is the same coercion and the same UTF-8 requirement minus one allocation per key).
+/// `Event.new` wants a stricter rule (`to_table()` never emits a numeric attribute key, so one is
+/// a mistake to name) and checks the keys itself before calling this.
+pub(crate) fn lua_table_to_attrmap(table: Table) -> mlua::Result<AttrMap> {
+    let mut map = AttrMap::new();
+    for pair in table.pairs::<mlua::String, LuaValue>() {
+        let (key, value) = pair?;
+        map.insert(key.to_str()?, lua_to_value(value)?);
+    }
+    Ok(map)
 }
 
 /// W9: a repeated DogStatsD tag key decodes to a `team: Value::Array` attribute

@@ -48,9 +48,10 @@ fields a script can legitimately mutate in place without breaking a kind's own i
 `sum`/`gauge`'s `value`, a `sum`'s `temporality`/`monotonic`), read-only everywhere else — see
 "Reading and writing `event.metrics`" below. `event.span` is entirely read-only, the same posture
 `provenance` takes, since there is still no script-visible way to construct or mutate a span — see
-"Reading `event.span`" below. Same for any `Event.new(...)`-style constructor: still not built,
-still the same "design pass once a consumer needs it" posture this section originally took for
-metrics and span themselves.
+"Reading `event.span`" below. **`Event.new(t)` builds an event from scratch** -- from a table in
+exactly the shape `event:to_table()` returns, so the two are inverses -- see "Constructing
+events" below; today it constructs `timestamp`/`attributes`/`log`, with metrics and spans landing
+in the remaining workstreams of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md).
 
 No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
 LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
@@ -120,7 +121,7 @@ function process(event)
 end
 
 -- optional, for stateful processors (e.g. the built-in `aggregate`)
-function flush()
+function flush(now)
   ...
   return {event1, event2, ...}  -- events to emit at this flush tick
 end
@@ -130,6 +131,13 @@ end
 is how the aggregator ([docs/design/data-model.md](data-model.md)'s mergeable metric kinds) turns
 accumulated state into emitted events — this is why the flush/timer contract needs to exist in the
 pipeline design now rather than being bolted on when aggregation is implemented.
+
+**`flush` receives one argument, `now`: the runtime's tick time as a decimal-nanos string**, the
+same encoding `event.timestamp` uses (and the same 2^53 reasoning for why it isn't a Lua number,
+below), and the same `now_unix_nanos()` value the runtime hands the native `aggregate`'s own
+flush. It exists so a flush-driven `Event.new{timestamp = now, ...}` ("Constructing events"
+below) has a timestamp without a general clock; a script declaring `function flush()` with no
+parameter simply ignores it -- ordinary Lua semantics, nothing to migrate.
 
 **An event handle — and its `event.attributes` handle — is consumed once the event is returned
 from `process()` or included in a `flush()` table** — don't keep using a Lua variable referencing
@@ -248,7 +256,10 @@ end
 `telemetry.count(name, n, tags?)` / `telemetry.gauge(name, v, tags?)` -- `tags`, if given, is a
 plain table of string keys to string values. No `timing()`: scripts have no clock exposed in the
 sandboxed stdlib (`table`/`string`/`math` only, "Sandboxing" below), so there's no way for a
-script to produce a duration.
+script to produce a duration. The one named exception is `flush(now)`'s tick time ("Script
+contract" above): a value the runtime already computed, handed to the one path that has no
+incoming event to take a timestamp from -- not a clock `process()` can read, and not something
+two reads of could be subtracted into a duration.
 
 This is the same self-observability mechanism `logit` uses on itself
 (`docs/design/internal-telemetry.md`), extended one level further: a component's Rust code can
@@ -698,6 +709,89 @@ field from a known-but-read-only one -- any assignment at all, to any key, raise
 `event.span is read-only`, since there's no field-specific case worth naming when nothing on a
 span is writable.
 
+## Constructing events
+
+**`Event.new(t)` is the inverse of `event:to_table()`** ([ADR
+`lua-event-constructor`](../adr/lua-event-constructor.md), `crates/logit-script/src/construct.rs`).
+An `Event` global -- a table with one function, `new` -- is installed on every worker's VM beside
+`telemetry`/`trace`/`resource`/`scope`/`provenance`, before the script's top-level code runs.
+`Event.new` takes one table in exactly the shape `to_table()` returns (same keys, same encodings,
+same nesting) and returns an ordinary event handle: mutate it, `clone()` it, mark it with `to()`,
+return it from `process()` or include it in a `flush()` table, like any event a script was handed.
+`Event.new(event:to_table())` round-trips every lossless shape, so "rebuild this event with one
+field changed" is `local t = event:to_table(); t.log.severity = "error"; return Event.new(t)`.
+
+```lua
+-- a stateful script minting a log line at each tick, with no incoming event to copy from
+local seen = 0
+
+function process(event)
+  seen = seen + 1
+  return event
+end
+
+function flush(now)
+  local summary = Event.new{
+    timestamp = now,
+    attributes = {component = provenance.component},
+    log = {message = "processed " .. seen .. " events", severity = "info"},
+  }
+  seen = 0
+  return {summary:to("audit")}
+end
+```
+
+The top-level table:
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `timestamp` | decimal-nanos string, the same rule as `event.timestamp` (a Lua number is the same error `event.timestamp = 1` is) | **required** |
+| `attributes` | table of string keys; every value converts the way an `event.attributes.k = v` write does | optional, default empty |
+| `log` | table, below | optional |
+| `metrics` | array of metric tables -- **not constructible yet**: an empty array is accepted (it's what `to_table()` emits for an event with no metrics), a non-empty one is `Event.new: metrics[1] is not constructible yet` until W3-W4 of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md) | optional |
+| `span` | table -- **not constructible yet**: `Event.new: span is not constructible yet` until W5 of the same plan | optional |
+| `has_log`, `has_metrics`, `has_span` | boolean | optional; accepted because `to_table()` emits them, **values ignored** -- the payload keys are the truth |
+
+The `log` table, `to_table().log`'s shape:
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `message` | any value (a string, most commonly), converted like an attribute value | **required** |
+| `severity` | `"trace"`/`"debug"`/`"info"`/`"warn"`/`"error"`/`"fatal"` or `nil` | optional, default absent |
+| `body_format` | `"raw"`/`"json"`/`"structured"` | optional, default `"raw"` |
+| `trace_id` | 32-char hex string, not all-zero | optional, default no trace context |
+| `span_id` | 16-char hex string, not all-zero; only with `trace_id` | optional |
+| `trace_flags` | integer 0-255; only with `trace_id` | optional, default `0` |
+| `event_name` | string (interned -- the same cardinality caution as the `event.log.event_name` write) | optional, default absent |
+| `observed_timestamp` | decimal-nanos string | optional, default `0` |
+| `dropped_attributes_count` | non-negative integer | optional, default `0` |
+
+**Every mistake is a runtime error at the call, prefixed with the dotted path:** `Event.new:
+log.severty is not a field` (unknown keys are rejected everywhere, top level and sub-tables --
+the same strictness the proxies apply to an unknown field on read or write), `Event.new: timestamp
+is required`, `Event.new: log.severity must be one of trace, debug, info, warn, error, fatal (or
+nil), got "warning"`, `Event.new: log.span_id can't be set without a trace_id`, `Event.new:
+attributes has a non-string key (integer)`. Table access is raw, so a metatable on the input can't
+make the key check and the field reads disagree. Defaults exist only where core already documents
+one (`BodyFormat::Raw`, the two zeros above); nothing else is invented.
+
+**Targets resolve at call time, not at script load.** A constructed event's `to(id)` checks the
+worker's `targets:` list as it stands when `Event.new` runs -- inside `process()` or `flush()`,
+the list the component declared. An `Event.new` executed at the script's top level runs before
+that list is installed and sees the empty one, so `e:to("x")` on such an event is the same
+"declares no targets" error a plain `lua` component gives -- the same caveat a top-level
+`resource` write has ("Reading and writing `resource`" above). Documented, not prevented: mint
+inside `process()`/`flush()`.
+
+**Values flatten the way any fresh Lua value does.** A constructed value has no existing `Value`
+to compare against, so the no-op-assignment identity rule
+([ADR `lua-value-identity-preservation`](../adr/lua-value-identity-preservation.md)) can't apply:
+a Lua string becomes `Str` (or `Bytes` only if it isn't valid UTF-8), a Lua integer `I64`, an
+empty table an empty `Map`. `U64`/`Timestamp`/UTF-8 `Bytes` attribute values therefore do not
+round-trip through `Event.new(e:to_table())` -- `Value::U64(5)` comes back `Value::I64(5)` -- and
+a `Value::Null` `message`, which `to_table()` emits as an absent key, is rejected as missing on
+the way back. Both are that ADR's recorded residuals, not oversights.
+
 ## Config shape
 
 A Lua transform is one component in the pipeline's component graph
@@ -807,6 +901,11 @@ Verified with real scripts, not just configured and assumed: `os`, `io`, `ffi`, 
 (`crates/logit-script/src/lib.rs`'s tests) — ten checks, each its own test, not one combined
 assertion, so a regression in any single one fails on its own.
 
+What `logit` *adds* on top of that base is exactly the globals this document describes:
+`telemetry`, `trace`, `provenance`, `resource`, `scope`, and `Event` (the `Event.new`
+constructor, "Constructing events" above) -- each a proxy or a table of Rust closures, none of
+them a route to the host.
+
 ## Costs
 
 | Surface | Where to look |
@@ -814,6 +913,7 @@ assertion, so a regression in any single one fails on its own.
 | `event.attributes`, `event:to_table()` (proxy vs. table conversion) | [`memory.md`](memory.md) §2, §8 |
 | `resource`, `scope` (copy-on-write, read vs. write path) | [`memory.md`](memory.md) §2 |
 | `event.metrics`, `event.span` (per-access `MetricProxy`, `to_table()` growth) | [`memory.md`](memory.md) §2 |
+| `Event.new` (a constructed log event from a literal table; a script that never calls it pays nothing) | [`memory.md`](memory.md) §2 |
 
 Every number for the surfaces above is measured in `crates/logit-bench/tests/allocations.rs`, not
 estimated here -- this table intentionally carries none, so it can't drift out of date the moment
