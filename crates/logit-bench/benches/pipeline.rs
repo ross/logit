@@ -93,6 +93,21 @@ fn json_parse(bencher: Bencher) {
         .bench_local_values(|event| json.process(&resource, event));
 }
 
+/// [`json_parse`] on the 28-key pino-shaped line (`fixtures::WIDE_JSON_SYSLOG_LINE`) -- the
+/// per-key cost, which is what the parser's key cache is for, at a width where it dominates.
+#[divan::bench]
+fn json_parse_wide(bencher: Bencher) {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::wide_json_syslog_datagram(1);
+    bencher
+        .with_inputs(|| {
+            decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("an event")
+        })
+        .bench_local_values(|event| json.process(&resource, event));
+}
+
 #[divan::bench]
 fn kv_metrics(bencher: Bencher) {
     let resource = fixtures::resource();
@@ -130,6 +145,87 @@ fn aggregate_absorb(bencher: Bencher) {
     bencher
         .with_inputs(|| keep.process(&resource, fixtures::nginx_event()).expect("keep forwards"))
         .bench_local_values(|event| agg.process(&resource, event));
+}
+
+/// The interner's probes in isolation, on the six nginx keys cycled in order -- what one key of
+/// one event costs a parser that goes to the process-wide table (`intern_hit`, `lookup_hit`), an
+/// encoder that goes back (`resolve`), and a parser that fronts the table with a
+/// `logit_core::interner::KeyCache` instead (`key_cache_hit` for the in-order steady state,
+/// `key_cache_resync` for a producer that reverses its key order every line, so every key is a
+/// wrapping scan rather than a cursor hit). Single-threaded, so the shard lock is uncontended here:
+/// the pipeline pays more than this whenever two nodes probe at once.
+mod interner {
+    use super::*;
+    use logit_core::interner::{self, intern, lookup, KeyCache, Symbol};
+
+    const KEYS: [&str; 6] = [
+        "host",
+        "request_method",
+        "status",
+        "body_bytes_sent",
+        "request_time",
+        "upstream_response_time",
+    ];
+
+    #[divan::bench]
+    fn intern_hit(bencher: Bencher) {
+        for key in KEYS {
+            intern(key);
+        }
+        let mut i = 0;
+        bencher.bench_local(move || {
+            i = (i + 1) % KEYS.len();
+            intern(divan::black_box(KEYS[i]))
+        });
+    }
+
+    #[divan::bench]
+    fn lookup_hit(bencher: Bencher) {
+        for key in KEYS {
+            intern(key);
+        }
+        let mut i = 0;
+        bencher.bench_local(move || {
+            i = (i + 1) % KEYS.len();
+            lookup(divan::black_box(KEYS[i]))
+        });
+    }
+
+    #[divan::bench]
+    fn resolve(bencher: Bencher) {
+        let symbols: Vec<Symbol> = KEYS.iter().map(|key| intern(key)).collect();
+        let mut i = 0;
+        bencher.bench_local(move || {
+            i = (i + 1) % symbols.len();
+            interner::resolve(divan::black_box(symbols[i]))
+        });
+    }
+
+    #[divan::bench]
+    fn key_cache_hit(bencher: Bencher) {
+        let mut cache = KeyCache::new();
+        for key in KEYS {
+            cache.get_or_intern(key);
+        }
+        let mut i = 0;
+        bencher.bench_local(move || {
+            i = (i + 1) % KEYS.len();
+            cache.get_or_intern(divan::black_box(KEYS[i]))
+        });
+    }
+
+    #[divan::bench]
+    fn key_cache_resync(bencher: Bencher) {
+        let mut cache = KeyCache::new();
+        for key in KEYS {
+            cache.get_or_intern(key);
+        }
+        let mut i = KEYS.len();
+        bencher.bench_local(move || {
+            i = (i + KEYS.len() - 1) % KEYS.len();
+            cache.get_or_intern(divan::black_box(KEYS[i]))
+        });
+    }
 }
 
 /// What each extra fan-out consumer costs per event (`logit_pipeline::Fanout::send` deep-clones
