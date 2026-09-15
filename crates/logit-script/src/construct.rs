@@ -724,6 +724,12 @@ fn trace_ref_from_fields(
 /// `lua-event-constructor` records. The one thing checked up front is the Lua *type*, so the
 /// error names this field rather than `lua_to_value`'s generic "attribute value" wording.
 fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
+    value_at(value, || dotted(path, key))
+}
+
+/// [`value_field`] with a lazily built field name, the split [`finite`] makes for the same
+/// reason: an attribute entry costs no `format!` on the success path.
+fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Value> {
     match value {
         LuaValue::Nil
         | LuaValue::Boolean(_)
@@ -733,7 +739,7 @@ fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
         | LuaValue::Table(_) => lua_to_value(value),
         other => Err(runtime_error(format!(
             "Event.new: {} can't be a Lua {}",
-            dotted(path, key),
+            field(),
             other.type_name()
         ))),
     }
@@ -807,24 +813,29 @@ fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Attr
 /// `String` conversion does and surfaces a non-UTF-8 key as mlua's own conversion error: a
 /// constructor's input is `to_table()`'s output, where every attribute key is a UTF-8 string,
 /// so either is a mistake worth naming with the table's path. One raw pass: each key is checked,
-/// then its value goes through [`value_field`] so a bad value is `Event.new: <path>.<key>.<k>
-/// ...` too. A nested table still converts through the shared `lua_to_value`, so a malformed
+/// then its value goes through [`value_at`] so a bad value is `Event.new: <path>.<key>.<k>
+/// ...` too -- every path here is built only on an error path, so the walk allocates nothing
+/// beyond the map itself (the `lua:` pin in `crates/logit-bench/tests/allocations.rs` holds it
+/// to that). A nested table still converts through the shared `lua_to_value`, so a malformed
 /// value *inside* one reports that helper's unprefixed attribute-conversion error.
 fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
-    let table_path = dotted(path, key);
     let mut map = AttrMap::new();
     for pair in t.pairs::<LuaValue, LuaValue>() {
         let (k, value) = pair?;
         let LuaValue::String(k) = k else {
             return Err(runtime_error(format!(
-                "Event.new: {table_path} has a non-string key ({})",
+                "Event.new: {} has a non-string key ({})",
+                dotted(path, key),
                 k.type_name()
             )));
         };
         let Ok(k) = k.to_str() else {
-            return Err(runtime_error(format!("Event.new: {table_path} has a non-UTF-8 key")));
+            return Err(runtime_error(format!(
+                "Event.new: {} has a non-UTF-8 key",
+                dotted(path, key)
+            )));
         };
-        map.insert(k, value_field(value, &table_path, k)?);
+        map.insert(k, value_at(value, || dotted(&dotted(path, key), k))?);
     }
     Ok(map)
 }
