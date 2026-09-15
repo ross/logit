@@ -1,0 +1,30 @@
+# The logfmt counterpart of json-parse: generate_in renders a logfmt line, `logfmt` merges its
+# nine key/values into attributes, null_out discards. No `kv_metrics` -- this isolates the parse.
+#
+#   script/perf run --scenario logfmt-parse
+#
+# `gen`'s `log:` template is `LOGFMT_LINE` from crates/logit-bench/src/fixtures.rs verbatim (the
+# Loki/Grafana-style line logit-bench's own logfmt allocation tests and benches measure), so this
+# scenario parses the exact shape already pinned at the component level. No `{seq}` substitution,
+# for the reason json-parse gives: one representative line, parsed as fast as the runtime allows.
+#
+# Why it exists alongside json-parse: `logfmt` interns every key of every line straight into the
+# process-wide interner (`crates/logit-transforms/src/logfmt.rs`), which is what `json` did before
+# its per-parser key cache (`logit_core::interner::KeyCache`). Until `logfmt` adopts the same
+# cache this is the scenario in the suite with the most interner probes per event -- nine -- and
+# so the one that shows a change to the interner's own cost (its hasher, its locks) most directly;
+# once it does adopt the cache, this is the number that records what that bought.
+components:
+  gen:
+    type: generate_in
+    count: 7000000
+    event:
+      log: 'level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 component=frontend org_id=fake latency=fast duration=12.3ms status=200 msg="query stats"'
+
+  parsed:
+    type: logfmt
+    sources: [gen]
+
+  out:
+    type: null_out
+    sources: [parsed]

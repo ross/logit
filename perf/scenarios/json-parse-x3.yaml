@@ -1,0 +1,47 @@
+# json-parse's generator fanned out to three `json` nodes in parallel, each draining into its own
+# null_out, with no `kv_metrics` -- three parsers on three cores parsing the same line at once.
+#
+#   script/perf run --scenario json-parse-x3
+#
+# What it measures that `json-parse` cannot: the cost of several parsers sharing process-wide
+# state at the same time. `json-parse` has exactly one node that interns keys, so a change to the
+# interner's lock or hash traffic shows up there only as that node's own probe cost; here the same
+# probes contend on the same DashMap shards from three tasks, which is what a real graph with
+# several parsing inputs looks like. Added 2026-09-14 while measuring the per-parser key cache
+# (`logit_core::interner::KeyCache`): the single-parser scenario moved ~12% with the cache, this
+# one ~25%, because the cache removes the shared-cache-line traffic entirely rather than just a
+# hash.
+#
+# Reading the number: `count` is generated events, and every one is parsed three times, so CPU
+# us/event here is roughly three parses plus `Fanout`'s deep clone of the batch for two of the
+# three consumers (the third gets the original). That clone cost is the same for every
+# configuration being compared and is not what this scenario is for; read it against `fanout`
+# (three sinks, no parsers) if the clone itself is the question. Same template as `json-parse`
+# (`{{`/`}}` are the template engine's brace-escape), no `{seq}` substitution, for the same reasons
+# given there.
+components:
+  gen:
+    type: generate_in
+    count: 7000000
+    event:
+      log: '{{"host":"static.local","request_method":"GET","status":200,"body_bytes_sent":612,"request_time":0.001,"upstream_response_time":"0.004"}}'
+
+  parsed1:
+    type: json
+    sources: [gen]
+  parsed2:
+    type: json
+    sources: [gen]
+  parsed3:
+    type: json
+    sources: [gen]
+
+  out1:
+    type: null_out
+    sources: [parsed1]
+  out2:
+    type: null_out
+    sources: [parsed2]
+  out3:
+    type: null_out
+    sources: [parsed3]
