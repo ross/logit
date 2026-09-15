@@ -105,6 +105,7 @@ VAR_NAME` -- any field on any component can pull its value from the environment 
 graph <config>` prints the resolved graph as graphviz DOT (`crates/logit-cli/src/dot.rs`).
 `logit run` rejects a config referencing any other unimplemented kind with a clear error; see
 [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md) for `aggregate`'s windowing semantics,
+[ADR `lua-flush-root-context`](docs/adr/lua-flush-root-context.md) for the root context a Lua `flush()` runs in,
 [ADR `json-parsing-into-attributes`](docs/adr/json-parsing-into-attributes.md) for `json`'s parsing semantics,
 [ADR `kv-metrics-semantics`](docs/adr/kv-metrics-semantics.md) for `kv_metrics`'/`keep`'s semantics,
 [ADR `scale-transform`](docs/adr/scale-transform.md) for `scale`'s unit-conversion semantics,
