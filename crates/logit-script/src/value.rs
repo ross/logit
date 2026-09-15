@@ -278,8 +278,9 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
 /// key with mlua's own conversion error -- the behaviour the attribute-write path has always had,
 /// kept as is (an `mlua::String` borrowed from the VM rather than an owned Rust `String`, which
 /// is the same coercion and the same UTF-8 requirement minus one allocation per key).
-/// `Event.new` wants a stricter rule (`to_table()` never emits a numeric attribute key, so one is
-/// a mistake to name) and checks the keys itself before calling this.
+/// `Event.new` wants a stricter rule (`to_table()` never emits a numeric or non-UTF-8 attribute
+/// key, so either is a mistake to name) and walks its table itself
+/// (`construct::attributes_from_table`), sharing only `lua_to_value`.
 pub(crate) fn lua_table_to_attrmap(table: Table) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
     for pair in table.pairs::<mlua::String, LuaValue>() {
