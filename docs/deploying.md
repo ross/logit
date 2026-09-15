@@ -89,7 +89,7 @@ readiness/liveness probe live — see [ADR `admin-readiness-endpoint`](adr/admin
 |---|---|
 | `0` | Clean shutdown — a signal arrived, every listener drained, every sink flushed. |
 | `1` | A startup failure — a bad config, a port already in use, a bad `lua_file`, a bad `--log-level`. Nothing was ever running. |
-| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying. |
+| `2` | A runtime failure after the process reported ready — a sustained, purely-configuration-error sink failure (see [Sink delivery buffering](#sink-delivery-buffering) below), a listener's accept loop dying, a `lua`/`lua_file` component's thread panicking (a script's own `process()`/`flush()` errors are not this: they're logged and counted, never fatal). |
 | `130` | A second SIGTERM/SIGINT arrived before a graceful drain finished. |
 
 Enable the probe endpoint with a top-level `admin:` block:
