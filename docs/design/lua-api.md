@@ -649,10 +649,11 @@ mint a sketch or a cardinality estimate by hand. This mirrors `AGENTS.md`'s "met
 stay mergeable" rule for the Rust side of this model: `distribution` (`DdSketch`) and `set`
 (`HyperLogLog`) carry real merge invariants a naive field write could violate, and `samples`/
 `set_members` are raw pre-aggregation collections `aggregate` still needs to fold correctly --
-none of these have a script-safe partial-write surface today, so none get one. The raw kinds
-*can* be built whole, though: `Event.new` constructs a `sum`, `gauge`, `samples` or `set_members`
-record (exemplars included) from the table shape this proxy's `to_table()` emits, and refuses the
-two sketches by name -- see "Constructing events" below.
+none of these have a script-safe partial-write surface today, so none get one. Every kind but
+the sketches *can* be built whole, though: `Event.new` constructs a `sum`, `gauge`, `samples`,
+`set_members`, `histogram`, `exponential_histogram` or `summary` record (exemplars included) from
+the table shape this proxy's `to_table()` emits, and refuses the two sketches by name -- see
+"Constructing events" below.
 
 `exemplars` is a read-only snapshot table, one entry per `logit_core::Exemplar`: `{timestamp=
 <nanos-string>, value=<number>, trace_id=<hex-or-nil>, span_id=<hex-or-nil>,
@@ -782,7 +783,7 @@ kind, never as its payload keys being unknown.
 | Key | Type / encoding | Required? |
 |---|---|---|
 | `name` | string (interned -- the same cardinality caution as the `event.metrics[i].name` write) | **required** |
-| `kind` | `"sum"`, `"gauge"`, `"samples"` or `"set_members"` (the others below) | **required** |
+| `kind` | `"sum"`, `"gauge"`, `"samples"`, `"set_members"`, `"histogram"`, `"exponential_histogram"` or `"summary"` (the others below) | **required** |
 | `unit`, `description` | string (interned) or `nil` | optional, default absent |
 | `start_timestamp` | decimal-nanos string | optional, default `0` (unknown, OTLP's own convention) |
 | `flags` | non-negative integer, the OTLP `DataPointFlags` mask | optional, default `0` |
@@ -800,10 +801,25 @@ Per kind -- and only that kind's keys are accepted:
 | `samples` | `values` | array of finite numbers | optional, default empty |
 | | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
 | `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
+| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer>}` rows, each bucket's own count (not cumulative); may be empty. `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`: a histogram's last bucket is conventionally `+Inf` and `to_table()` emits that bound as `math.huge`. NaN and `-math.huge` are rejected | **required** |
+| | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
+| | `sum`, `min`, `max` | finite number or `nil` (`to_table()` emits `nil` for an absent one) | optional, default absent |
+| `exponential_histogram` | `scale` | integer fitting an `i32` | **required** |
+| | `zero_count`, `count` | non-negative integer | **required** |
+| | `zero_threshold` | finite number | **required** |
+| | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers>}`; `counts` may be empty but must be present | **required** |
+| | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
+| | `sum`, `min`, `max` | finite number or `nil` | optional, default absent |
+| `summary` | `quantiles` | array of `{quantile = <finite number>, value = <finite number>}` rows; may be empty. A `quantile` outside `[0, 1]` is accepted as-is (the model doesn't constrain it) | **required** |
+| | `count` | non-negative integer | **required** |
+| | `sum` | finite number | **required** |
 
 A `sum` given only its `value` is `MetricKind::counter` -- delta, monotonic -- so `{name = "hits",
 kind = "sum", value = 1}` is exactly the counter `statsd_in`'s `c` or a `kv_metrics` `counters:`
-entry emits. Every other default above is one core documents; nothing is invented.
+entry emits. Every other default above is one core documents; nothing is invented -- which is why
+a `histogram`'s or `exponential_histogram`'s `temporality` is required rather than defaulted: a
+`sum` has `MetricKind::counter`'s delta to fall back on, these have nothing (`Event.new:
+metrics[1].temporality is required`).
 
 An exemplar table, `to_table()`'s exemplar snapshot shape (the `event.metrics` section above):
 
@@ -819,17 +835,20 @@ An exemplar table, `to_table()`'s exemplar snapshot shape (the `event.metrics` s
 Errors carry the full path: `Event.new: metrics[2].value must be a finite number, got NaN`,
 `Event.new: metrics[1].values[3] must be a number, got string`, `Event.new: metrics[1].members[1]
 must be a string, got integer`, `Event.new: metrics[1].exemplars[1].span_id can't be set without a
-trace_id`, `Event.new: metrics[1].exemplars[1].flags is not a field`. A non-table entry is
-`Event.new: metrics[1] must be a table, got integer`; `metrics`, `exemplars`, `values` and
-`members` must each be a contiguous array (`{[2] = 1}` is `Event.new: metrics[1].values must be a
-contiguous array-like table`).
+trace_id`, `Event.new: metrics[1].exemplars[1].flags is not a field`, `Event.new:
+metrics[1].buckets[2].bound must be a finite number or math.huge, got NaN`, `Event.new:
+metrics[1].positive.counts[1] must be a non-negative integer, got -2`, `Event.new:
+metrics[1].quantiles[1].value is required`, `Event.new: metrics[1].scale must be an integer
+between -2147483648 and 2147483647, got 1099511627776`. A non-table entry is `Event.new:
+metrics[1] must be a table, got integer` (a bucket or quantile row likewise: `Event.new:
+metrics[1].buckets[1] must be a table, got integer`); `metrics`, `exemplars`, `values`,
+`members`, `buckets`, `quantiles` and a side's `counts` must each be a contiguous array
+(`{[2] = 1}` is `Event.new: metrics[1].values must be a contiguous array-like table`).
 
 **Kinds a script can't build.** An unknown `kind` lists the constructible ones: `Event.new:
 metrics[1].kind must be one of sum, gauge, samples, set_members, histogram, exponential_histogram,
-summary, got "counter"`. Of that list, `histogram`, `exponential_histogram` and `summary` are
-`Event.new: metrics[1].kind "histogram" is not constructible yet` until W4 of
-[`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md). Three kinds are
-deliberately absent from the list and never will be constructible, each saying why:
+summary, got "counter"`. Three kinds are deliberately absent from the list and never will be
+constructible, each saying why:
 `distribution` and `set` are `is not constructible from Lua -- a merged sketch; build a "samples"
 metric and let aggregate summarize it` (`"set_members"` for `set`) -- `to_table()` emits only a
 `count` or an `estimate` for them, never the DDSketch or HyperLogLog state, so there is no shape

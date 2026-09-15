@@ -26,9 +26,10 @@
 //! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...`; the shared
 //! helpers at the bottom take the path as an argument so the metric and span parsers of
 //! `docs/plans/lua-event-constructor.md` reuse them unchanged. `metrics` builds the four raw
-//! kinds (`sum`, `gauge`, `samples`, `set_members`) with their exemplars; the three
-//! pre-aggregated kinds are recognized but not yet constructible (W4), the two sketches and
-//! `gauge_delta` never will be, and `span` is not yet constructible (W5) -- each says so.
+//! kinds (`sum`, `gauge`, `samples`, `set_members`) and the three pre-aggregated ones
+//! (`histogram`, `exponential_histogram`, `summary`), exemplars included; the two sketches and
+//! `gauge_delta` are never constructible, and `span` is not yet constructible (W5) -- each says
+//! so.
 
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_table_to_attrmap, lua_to_value, validated_sequence_len};
@@ -36,8 +37,8 @@ use bytes::Bytes;
 use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
 use logit_core::{
-    AttrMap, BodyFormat, Event, Exemplar, LogRecord, MetricKind, MetricList, MetricRecord, Samples,
-    Severity, Sum, Temporality, Value,
+    AttrMap, BodyFormat, Event, Exemplar, ExpHistogram, Histogram, LogRecord, MetricKind,
+    MetricList, MetricRecord, Samples, Severity, Sum, Summary, Temporality, Value,
 };
 use mlua::{Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
@@ -62,7 +63,7 @@ const LOG_KEYS: &[&str] = &[
 ];
 
 /// The keys `metric_to_table` emits for every kind. A kind's own payload keys
-/// ([`RawKind::keys`]) are added to these for the key check, once the kind is known.
+/// ([`Kind::keys`]) are added to these for the key check, once the kind is known.
 const METRIC_KEYS: &[&str] = &[
     "name",
     "kind",
@@ -78,9 +79,17 @@ const METRIC_KEYS: &[&str] = &[
 const EXEMPLAR_KEYS: &[&str] =
     &["timestamp", "value", "trace_id", "span_id", "trace_flags", "attributes"];
 
-/// The kinds the unknown-`kind` error names: the ones `Event.new` builds, plus the three W4 of
-/// `docs/plans/lua-event-constructor.md` adds -- deliberately *not* the sketches or
-/// `gauge_delta`, which are never constructible and get their own message each.
+/// The keys of one row of a `histogram`'s `buckets`, as `metric_to_table` emits them.
+const BUCKET_KEYS: &[&str] = &["bound", "count"];
+
+/// The keys of an `exponential_histogram`'s `positive`/`negative` table (`exp_buckets_table`).
+const EXP_BUCKETS_KEYS: &[&str] = &["offset", "counts"];
+
+/// The keys of one row of a `summary`'s `quantiles`.
+const QUANTILE_KEYS: &[&str] = &["quantile", "value"];
+
+/// The kinds the unknown-`kind` error names: every kind `Event.new` builds -- deliberately *not*
+/// the sketches or `gauge_delta`, which are never constructible and get their own message each.
 const CONSTRUCTIBLE_KINDS: &str =
     "sum, gauge, samples, set_members, histogram, exponential_histogram, summary";
 
@@ -251,7 +260,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             )))
         }
     };
-    let kind = RawKind::parse(&kind_name.to_string_lossy(), path)?;
+    let kind = Kind::parse(&kind_name.to_string_lossy(), path)?;
     expect_keys_of(&t, &[METRIC_KEYS, kind.keys()], path)?;
     let name = match t.raw_get::<_, LuaValue>("name")? {
         LuaValue::Nil => return Err(required(path, "name")),
@@ -312,7 +321,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
         _ => return Err(not_a_sequence(path, "exemplars")),
     };
     let kind = match kind {
-        RawKind::Sum => {
+        Kind::Sum => {
             // The defaults are `MetricKind::counter`'s -- delta, monotonic -- so
             // `{kind = "sum", value = 1}` is exactly the counter `kv_metrics`/`statsd_in` emit.
             let value = finite_field(t.raw_get("value")?, path, "value")?;
@@ -337,8 +346,8 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             };
             MetricKind::Sum(Sum { value, temporality, monotonic })
         }
-        RawKind::Gauge => MetricKind::Gauge(finite_field(t.raw_get("value")?, path, "value")?),
-        RawKind::Samples => {
+        Kind::Gauge => MetricKind::Gauge(finite_field(t.raw_get("value")?, path, "value")?),
+        Kind::Samples => {
             // `Samples::new`'s `sample_rate` of `1.0` is the default core documents; `values`
             // are pushed straight onto the record's own `SmallVec`, so up to `SAMPLES_INLINE`
             // of them allocate nothing beyond the record.
@@ -364,7 +373,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             }
             MetricKind::Samples(samples)
         }
-        RawKind::SetMembers => {
+        Kind::SetMembers => {
             let members = match t.raw_get::<_, LuaValue>("members")? {
                 LuaValue::Nil => Vec::new(),
                 LuaValue::Table(list) => match validated_sequence_len(&list)? {
@@ -394,35 +403,69 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             };
             MetricKind::SetMembers(members)
         }
+        Kind::Histogram => {
+            // `buckets` is required even when empty: `to_table()` always emits it, and an empty
+            // histogram round-trips as one. Each row is `{bound, count}`, checked strictly.
+            let buckets = sequence_field(t.raw_get("buckets")?, path, "buckets", bucket_from_row)?;
+            MetricKind::Histogram(Histogram {
+                buckets,
+                temporality: temporality_field(&t, path)?,
+                sum: optional_finite_field(t.raw_get("sum")?, path, "sum")?,
+                min: optional_finite_field(t.raw_get("min")?, path, "min")?,
+                max: optional_finite_field(t.raw_get("max")?, path, "max")?,
+            })
+        }
+        Kind::ExponentialHistogram => MetricKind::ExponentialHistogram(ExpHistogram {
+            scale: i32_field(t.raw_get("scale")?, path, "scale")?,
+            zero_count: count_field(t.raw_get("zero_count")?, path, "zero_count")?,
+            zero_threshold: finite_field(t.raw_get("zero_threshold")?, path, "zero_threshold")?,
+            positive: exp_buckets_from_table(t.raw_get("positive")?, path, "positive")?,
+            negative: exp_buckets_from_table(t.raw_get("negative")?, path, "negative")?,
+            temporality: temporality_field(&t, path)?,
+            count: count_field(t.raw_get("count")?, path, "count")?,
+            sum: optional_finite_field(t.raw_get("sum")?, path, "sum")?,
+            min: optional_finite_field(t.raw_get("min")?, path, "min")?,
+            max: optional_finite_field(t.raw_get("max")?, path, "max")?,
+        }),
+        Kind::Summary => MetricKind::Summary(Summary {
+            quantiles: sequence_field(
+                t.raw_get("quantiles")?,
+                path,
+                "quantiles",
+                quantile_from_row,
+            )?,
+            count: count_field(t.raw_get("count")?, path, "count")?,
+            sum: finite_field(t.raw_get("sum")?, path, "sum")?,
+        }),
     };
     Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind })
 }
 
-/// The metric kinds `Event.new` builds today -- the raw, pre-aggregation ones -- and the payload
-/// keys each adds to [`METRIC_KEYS`]. [`RawKind::parse`] is where every kind that *isn't* one
-/// of these gets its own message.
+/// The metric kinds `Event.new` builds -- the four raw, pre-aggregation ones and the three
+/// pre-aggregated ones a scrape or OTLP input carries whole -- and the payload keys each adds to
+/// [`METRIC_KEYS`]. [`Kind::parse`] is where every kind that *isn't* one of these gets its own
+/// message.
 #[derive(Clone, Copy)]
-enum RawKind {
+enum Kind {
     Sum,
     Gauge,
     Samples,
     SetMembers,
+    Histogram,
+    ExponentialHistogram,
+    Summary,
 }
 
-impl RawKind {
+impl Kind {
     fn parse(name: &str, path: &str) -> mlua::Result<Self> {
         Ok(match name {
-            "sum" => RawKind::Sum,
-            "gauge" => RawKind::Gauge,
-            "samples" => RawKind::Samples,
-            "set_members" => RawKind::SetMembers,
-            // W4 of `docs/plans/lua-event-constructor.md` replaces this arm.
-            "histogram" | "exponential_histogram" | "summary" => {
-                return Err(runtime_error(format!(
-                    "Event.new: {} \"{name}\" is not constructible yet",
-                    dotted(path, "kind")
-                )))
-            }
+            "sum" => Kind::Sum,
+            "gauge" => Kind::Gauge,
+            "samples" => Kind::Samples,
+            "set_members" => Kind::SetMembers,
+            "histogram" => Kind::Histogram,
+            "exponential_histogram" => Kind::ExponentialHistogram,
+            "summary" => Kind::Summary,
             // `to_table()` is deliberately lossy for the two sketches (a `count`, an `estimate`
             // -- never the DDSketch or HyperLogLog state), so there is no shape to invert; the
             // raw kind `aggregate` folds into each is the way to get one.
@@ -459,10 +502,24 @@ impl RawKind {
 
     fn keys(self) -> &'static [&'static str] {
         match self {
-            RawKind::Sum => &["value", "temporality", "monotonic"],
-            RawKind::Gauge => &["value"],
-            RawKind::Samples => &["values", "sample_rate"],
-            RawKind::SetMembers => &["members"],
+            Kind::Sum => &["value", "temporality", "monotonic"],
+            Kind::Gauge => &["value"],
+            Kind::Samples => &["values", "sample_rate"],
+            Kind::SetMembers => &["members"],
+            Kind::Histogram => &["buckets", "temporality", "sum", "min", "max"],
+            Kind::ExponentialHistogram => &[
+                "scale",
+                "zero_count",
+                "zero_threshold",
+                "positive",
+                "negative",
+                "temporality",
+                "count",
+                "sum",
+                "min",
+                "max",
+            ],
+            Kind::Summary => &["quantiles", "count", "sum"],
         }
     }
 }
@@ -472,6 +529,81 @@ fn not_constructible(path: &str, name: &str, why: &str) -> mlua::Error {
         "Event.new: {} \"{name}\" is not constructible from Lua -- {why}",
         dotted(path, "kind")
     ))
+}
+
+/// A `histogram`'s or `exponential_histogram`'s `temporality`: the one enum field that is
+/// *required*, because core documents no default for it (ADR `lua-event-constructor` -- a `sum`
+/// has `MetricKind::counter`'s delta, these have nothing to fall back on).
+fn temporality_field(t: &Table, path: &str) -> mlua::Result<Temporality> {
+    enum_field(
+        t.raw_get("temporality")?,
+        path,
+        "temporality",
+        &Temporality::NAMES,
+        Temporality::from_name,
+    )?
+    .ok_or_else(|| required(path, "temporality"))
+}
+
+/// One `{bound=, count=}` row of a `histogram`'s `buckets` (`metric_to_table`'s `Histogram`
+/// arm). `path` yields the row's own path (`metrics[i].buckets[k]`); it is built once here since
+/// `expect_keys` needs it up front -- the same one-`String`-per-row cost the exemplar loop pays.
+fn bucket_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(f64, u64)> {
+    let row = row_table(value, path)?;
+    let path = path();
+    expect_keys(&row, BUCKET_KEYS, &path)?;
+    let bound = bound_field(row.raw_get("bound")?, &path, "bound")?;
+    let count = count_field(row.raw_get("count")?, &path, "count")?;
+    Ok((bound, count))
+}
+
+/// One `{quantile=, value=}` row of a `summary`'s `quantiles`. A `quantile` outside `[0, 1]` is
+/// accepted as-is: `Summary` doesn't constrain it, and neither does any producer, so the
+/// constructor doesn't invent a rule the model lacks.
+fn quantile_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(f64, f64)> {
+    let row = row_table(value, path)?;
+    let path = path();
+    expect_keys(&row, QUANTILE_KEYS, &path)?;
+    let quantile = finite_field(row.raw_get("quantile")?, &path, "quantile")?;
+    let value = finite_field(row.raw_get("value")?, &path, "value")?;
+    Ok((quantile, value))
+}
+
+/// An entry of a sequence that must itself be a table (a bucket or quantile row).
+fn row_table<'lua>(value: LuaValue<'lua>, path: &dyn Fn() -> String) -> mlua::Result<Table<'lua>> {
+    match value {
+        LuaValue::Table(row) => Ok(row),
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be a table, got {}",
+            path(),
+            other.type_name()
+        ))),
+    }
+}
+
+/// An `exponential_histogram`'s `positive`/`negative` table, `exp_buckets_table`'s
+/// `{offset=, counts=[...]}`: required, strict about its keys, and `counts` is required even
+/// when empty (an empty side is what `to_table()` emits for one).
+fn exp_buckets_from_table(value: LuaValue, path: &str, key: &str) -> mlua::Result<(i32, Vec<u64>)> {
+    let table = match value {
+        LuaValue::Nil => return Err(required(path, key)),
+        LuaValue::Table(table) => table,
+        other => {
+            return Err(runtime_error(format!(
+                "Event.new: {} must be a table, got {}",
+                dotted(path, key),
+                other.type_name()
+            )))
+        }
+    };
+    let path = dotted(path, key);
+    expect_keys(&table, EXP_BUCKETS_KEYS, &path)?;
+    let offset = i32_field(table.raw_get("offset")?, &path, "offset")?;
+    // A closure rather than `count` itself: `count` is generic over its path closure, which
+    // can't coerce to the higher-ranked `fn` pointer `sequence_field` takes.
+    let counts =
+        sequence_field(table.raw_get("counts")?, &path, "counts", |v, field| count(v, field))?;
+    Ok((offset, counts))
 }
 
 /// Builds an [`Exemplar`] from a table in `exemplar_to_table`'s shape. `path` is the table's
@@ -511,7 +643,7 @@ fn required(path: &str, key: &str) -> mlua::Error {
 
 /// A field that must be a sequence (`validated_sequence_len`'s contiguous-from-one rule) but is
 /// either a non-table or a table with other keys: `metrics`, a metric's `exemplars`/`values`/
-/// `members`.
+/// `members`/`buckets`/`quantiles`, an exponential histogram side's `counts`.
 fn not_a_sequence(path: &str, key: &str) -> mlua::Error {
     runtime_error(format!("Event.new: {} must be a contiguous array-like table", dotted(path, key)))
 }
@@ -522,6 +654,40 @@ fn dotted(path: &str, key: &str) -> String {
         true => key.to_string(),
         false => format!("{path}.{key}"),
     }
+}
+
+/// [`dotted`] with a one-based index appended: `<path>.<key>[k]`.
+fn indexed(path: &str, key: &str, k: usize) -> String {
+    match path.is_empty() {
+        true => format!("{key}[{k}]"),
+        false => format!("{path}.{key}[{k}]"),
+    }
+}
+
+/// A *required* sequence field (a histogram's `buckets`, a summary's `quantiles`, an exponential
+/// histogram side's `counts` -- each of which `to_table()` always emits, empty or not), every
+/// entry parsed by `entry` from its value and a closure yielding its path (`<path>.<key>[k]`).
+/// The closure keeps a scalar entry's path off the success path (`count` only calls it to build
+/// an error); a row parser calls it once up front because `expect_keys` needs the path eagerly.
+fn sequence_field<T>(
+    value: LuaValue,
+    path: &str,
+    key: &str,
+    entry: fn(LuaValue, &dyn Fn() -> String) -> mlua::Result<T>,
+) -> mlua::Result<Vec<T>> {
+    let list = match value {
+        LuaValue::Nil => return Err(required(path, key)),
+        LuaValue::Table(list) => list,
+        _ => return Err(not_a_sequence(path, key)),
+    };
+    let Some(len) = validated_sequence_len(&list)? else {
+        return Err(not_a_sequence(path, key));
+    };
+    let mut out = Vec::with_capacity(len);
+    for k in 1..=len {
+        out.push(entry(list.raw_get(k)?, &|| indexed(path, key, k))?);
+    }
+    Ok(out)
 }
 
 /// How a table is named in a message about the table itself (as opposed to one of its fields):
@@ -607,6 +773,61 @@ fn u32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u32> {
         LuaValue::Integer(n) => u32::try_from(n).map_err(|_| reject(n.to_string())),
         LuaValue::Number(n) if n.fract() == 0.0 && n >= 0.0 && n <= f64::from(u32::MAX) => {
             Ok(n as u32)
+        }
+        LuaValue::Number(n) => Err(reject(n.to_string())),
+        other => Err(reject(other.type_name().to_string())),
+    }
+}
+
+/// A *required* non-negative integer that fits a `u64` (a histogram bucket's or a summary's
+/// `count`, an exponential histogram's `zero_count`/`count`): `nil` is "is required", and
+/// anything else goes through [`count`]. Unlike [`u32_field`], no default: core documents none
+/// for any of these.
+fn count_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u64> {
+    match value {
+        LuaValue::Nil => Err(required(path, key)),
+        value => count(value, || dotted(path, key)),
+    }
+}
+
+/// [`u32_field`]'s rule widened to `u64` and with a lazily built field name (an exponential
+/// histogram's `counts[k]` element costs no `format!` on the success path): a Lua integer that
+/// is `>= 0`, or an integral float in `[0, 2^64)`. `to_table()` emits every count `as i64`, so
+/// a round-trip arrives as a Lua integer; the float arm is for a script that computed one.
+fn count(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<u64> {
+    let reject = |got: String| {
+        runtime_error(format!("Event.new: {} must be a non-negative integer, got {got}", field()))
+    };
+    match value {
+        LuaValue::Integer(n) => u64::try_from(n).map_err(|_| reject(n.to_string())),
+        LuaValue::Number(n)
+            if n.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&n) =>
+        {
+            Ok(n as u64)
+        }
+        LuaValue::Number(n) => Err(reject(n.to_string())),
+        other => Err(reject(other.type_name().to_string())),
+    }
+}
+
+/// A *required* integer that fits an `i32` (an exponential histogram's `scale`, a side's
+/// `offset`): a Lua integer or an integral float within `i32`'s range, negatives included.
+fn i32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<i32> {
+    let reject = |got: String| {
+        runtime_error(format!(
+            "Event.new: {} must be an integer between {} and {}, got {got}",
+            dotted(path, key),
+            i32::MIN,
+            i32::MAX
+        ))
+    };
+    match value {
+        LuaValue::Nil => Err(required(path, key)),
+        LuaValue::Integer(n) => i32::try_from(n).map_err(|_| reject(n.to_string())),
+        LuaValue::Number(n)
+            if n.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&n) =>
+        {
+            Ok(n as i32)
         }
         LuaValue::Number(n) => Err(reject(n.to_string())),
         other => Err(reject(other.type_name().to_string())),
@@ -751,11 +972,39 @@ fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<S
     }
 }
 
-/// A required finite number (a `sum`/`gauge`/exemplar `value`): `nil` is "is required", and
-/// anything else goes through [`finite`].
+/// A required finite number (a `sum`/`gauge`/exemplar `value`, a summary's `sum`, an
+/// exponential histogram's `zero_threshold`): `nil` is "is required", and anything else goes
+/// through [`finite`].
 fn finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     match value {
         LuaValue::Nil => Err(required(path, key)),
+        value => finite(value, || dotted(path, key)),
+    }
+}
+
+/// An optional finite number (a histogram's or exponential histogram's `sum`/`min`/`max`, which
+/// `to_table()` emits as `nil` when the record has `None`): `nil` is `None`, anything else goes
+/// through [`finite`].
+fn optional_finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<f64>> {
+    match value {
+        LuaValue::Nil => Ok(None),
+        value => finite(value, || dotted(path, key)).map(Some),
+    }
+}
+
+/// A histogram bucket's `bound`: required, and the one field anywhere in `Event.new` that may
+/// be non-finite -- but only as `+inf`. `Histogram`'s last bucket is conventionally
+/// `(f64::INFINITY, n)` (Prometheus's `+Inf` bucket, OTLP's implicit overflow bucket), and
+/// `to_table()` emits that bound as the Lua number `math.huge`, so it has to come back in for
+/// the round-trip to hold. NaN and `-math.huge` are rejected as everywhere else.
+fn bound_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
+    match value {
+        LuaValue::Nil => Err(required(path, key)),
+        LuaValue::Number(n) if n == f64::INFINITY => Ok(n),
+        LuaValue::Number(n) if !n.is_finite() => Err(runtime_error(format!(
+            "Event.new: {} must be a finite number or math.huge, got {n}",
+            dotted(path, key)
+        ))),
         value => finite(value, || dotted(path, key)),
     }
 }
@@ -942,6 +1191,42 @@ mod tests {
 
     fn set_members_kind() -> MetricKind {
         MetricKind::SetMembers(vec![Bytes::from_static(b"alice"), Bytes::from_static(b"bob")])
+    }
+
+    /// `proxy.rs`'s `histogram_kind` plus the trailing `+Inf` bucket a Prometheus/OTLP
+    /// histogram carries: `to_table()` emits that bound as `math.huge`, and the round-trip
+    /// below is what proves `bound_field` lets it back in.
+    fn histogram_kind() -> MetricKind {
+        MetricKind::Histogram(Histogram {
+            buckets: vec![(1.0, 3), (5.0, 7), (f64::INFINITY, 2)],
+            temporality: Temporality::Cumulative,
+            sum: Some(15.0),
+            min: Some(0.5),
+            max: Some(9.0),
+        })
+    }
+
+    fn exp_histogram_kind() -> MetricKind {
+        MetricKind::ExponentialHistogram(ExpHistogram {
+            scale: 3,
+            zero_count: 2,
+            zero_threshold: 0.001,
+            positive: (1, vec![1, 2, 3]),
+            negative: (0, vec![4, 5]),
+            temporality: Temporality::Delta,
+            count: 11,
+            sum: Some(20.0),
+            min: Some(-1.0),
+            max: Some(9.5),
+        })
+    }
+
+    fn summary_kind() -> MetricKind {
+        MetricKind::Summary(Summary {
+            quantiles: vec![(0.5, 10.0), (0.99, 99.0)],
+            count: 42,
+            sum: 500.0,
+        })
     }
 
     /// A one-record metric event with `name = "m"` and the given literal fields, minted from
@@ -1462,19 +1747,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_aggregated_kinds_are_not_constructible_yet() {
-        for kind in ["histogram", "exponential_histogram", "summary"] {
-            let err = metric_err(&format!(r#"name = "m", kind = "{kind}""#));
-            assert!(
-                err.contains(&format!(
-                    "Event.new: metrics[1].kind \"{kind}\" is not constructible yet"
-                )),
-                "got: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn a_non_numeric_value_is_rejected() {
         let err = metric_err(r#"name = "m", kind = "gauge", value = "x""#);
         assert!(
@@ -1622,5 +1894,263 @@ mod tests {
             ),
             "got: {err}"
         );
+    }
+
+    // -- histogram / exponential_histogram / summary ------------------------------------------
+
+    #[test]
+    fn new_of_to_table_round_trips_a_histogram_metric_event_whole() {
+        // The fixture's last bucket is `(f64::INFINITY, _)`, so this also proves `math.huge`
+        // makes it back in as a bound.
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(histogram_kind())).unwrap());
+        assert_eq!(out, metric_event(histogram_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_an_exponential_histogram_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(exp_histogram_kind())).unwrap());
+        assert_eq!(out, metric_event(exp_histogram_kind()));
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_summary_metric_event_whole() {
+        let w = worker(REBUILD);
+        let out = emitted(w.process(metric_event(summary_kind())).unwrap());
+        assert_eq!(out, metric_event(summary_kind()));
+    }
+
+    #[test]
+    fn a_histogram_with_no_sum_min_max_and_no_buckets_rebuilds_as_none_and_empty() {
+        // `sum`/`min`/`max` absent are `None`; an empty `buckets` sequence is the empty
+        // histogram `to_table()` emits for one.
+        let out = mint_metric(r#"kind = "histogram", buckets = {}, temporality = "delta""#);
+        assert_eq!(
+            out.metrics[0].kind,
+            MetricKind::Histogram(Histogram {
+                buckets: Vec::new(),
+                temporality: Temporality::Delta,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_histogram_takes_explicit_sum_min_max_and_a_math_huge_bound() {
+        let out = mint_metric(
+            r#"kind = "histogram", buckets = {{bound = 2.5, count = 4}, {bound = math.huge, count = 1}}, temporality = "cumulative", sum = 6, min = 0.5, max = 3"#,
+        );
+        assert_eq!(
+            out.metrics[0].kind,
+            MetricKind::Histogram(Histogram {
+                buckets: vec![(2.5, 4), (f64::INFINITY, 1)],
+                temporality: Temporality::Cumulative,
+                sum: Some(6.0),
+                min: Some(0.5),
+                max: Some(3.0),
+            })
+        );
+    }
+
+    #[test]
+    fn an_exponential_histogram_with_no_sum_min_max_rebuilds_as_none() {
+        let out = mint_metric(
+            r#"kind = "exponential_histogram", scale = -2, zero_count = 0, zero_threshold = 0, positive = {offset = -1, counts = {}}, negative = {offset = 0, counts = {7}}, temporality = "delta", count = 7"#,
+        );
+        assert_eq!(
+            out.metrics[0].kind,
+            MetricKind::ExponentialHistogram(ExpHistogram {
+                scale: -2,
+                zero_count: 0,
+                zero_threshold: 0.0,
+                positive: (-1, Vec::new()),
+                negative: (0, vec![7]),
+                temporality: Temporality::Delta,
+                count: 7,
+                sum: None,
+                min: None,
+                max: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_exponential_histogram_takes_explicit_sum_min_max() {
+        let out = mint_metric(
+            r#"kind = "exponential_histogram", scale = 0, zero_count = 0, zero_threshold = 0, positive = {offset = 0, counts = {}}, negative = {offset = 0, counts = {}}, temporality = "cumulative", count = 0, sum = 1.5, min = -2, max = 2"#,
+        );
+        let MetricKind::ExponentialHistogram(e) = &out.metrics[0].kind else {
+            panic!("expected an exponential histogram")
+        };
+        assert_eq!((e.sum, e.min, e.max), (Some(1.5), Some(-2.0), Some(2.0)));
+    }
+
+    #[test]
+    fn a_summary_quantile_outside_the_unit_interval_is_accepted_as_is() {
+        // The model doesn't constrain `quantile`, so neither does the constructor.
+        let out = mint_metric(
+            r#"kind = "summary", quantiles = {{quantile = 1.5, value = 3}}, count = 1, sum = 3"#,
+        );
+        assert_eq!(
+            out.metrics[0].kind,
+            MetricKind::Summary(Summary { quantiles: vec![(1.5, 3.0)], count: 1, sum: 3.0 })
+        );
+    }
+
+    #[test]
+    fn the_pre_aggregated_kinds_are_constructible_and_name_their_first_missing_field() {
+        // The W3 "is not constructible yet" arm is gone: a bare kind now gets as far as its
+        // own required payload.
+        for (kind, field) in
+            [("histogram", "buckets"), ("exponential_histogram", "scale"), ("summary", "quantiles")]
+        {
+            let err = metric_err(&format!(r#"name = "m", kind = "{kind}""#));
+            assert!(!err.contains("not constructible"), "got: {err}");
+            assert!(
+                err.contains(&format!("Event.new: metrics[1].{field} is required")),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bucket_row_with_an_extra_key_is_not_a_field_with_its_indexed_path() {
+        let err = metric_err(
+            r#"name = "m", kind = "histogram", buckets = {{bound = 1, count = 1, foo = 2}}, temporality = "delta""#,
+        );
+        assert!(err.contains("Event.new: metrics[1].buckets[1].foo is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_table_bucket_row_is_rejected() {
+        let err =
+            metric_err(r#"name = "m", kind = "histogram", buckets = {1}, temporality = "delta""#);
+        assert!(
+            err.contains("Event.new: metrics[1].buckets[1] must be a table, got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_negative_bucket_count_is_rejected() {
+        let err = metric_err(
+            r#"name = "m", kind = "histogram", buckets = {{bound = 1, count = -1}}, temporality = "delta""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[1].count must be a non-negative integer, got -1"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_nan_bound_is_rejected_while_math_huge_is_not() {
+        let err = metric_err(
+            r#"name = "m", kind = "histogram", buckets = {{bound = 0/0, count = 1}}, temporality = "delta""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].buckets[1].bound must be a finite number or math.huge, \
+                 got NaN"
+            ),
+            "got: {err}"
+        );
+        let err = metric_err(
+            r#"name = "m", kind = "histogram", buckets = {{bound = -math.huge, count = 1}}, temporality = "delta""#,
+        );
+        assert!(err.contains("must be a finite number or math.huge, got -inf"), "got: {err}");
+        let out = mint_metric(
+            r#"kind = "histogram", buckets = {{bound = math.huge, count = 1}}, temporality = "delta""#,
+        );
+        let MetricKind::Histogram(h) = &out.metrics[0].kind else { panic!("expected a histogram") };
+        assert_eq!(h.buckets, vec![(f64::INFINITY, 1)]);
+    }
+
+    #[test]
+    fn a_histogram_sum_must_still_be_finite() {
+        // `math.huge` is a bound's privilege only.
+        let err = metric_err(
+            r#"name = "m", kind = "histogram", buckets = {}, temporality = "delta", sum = math.huge"#,
+        );
+        assert!(
+            err.contains("Event.new: metrics[1].sum must be a finite number, got inf"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_histogram_without_a_temporality_is_required() {
+        let err = metric_err(r#"name = "m", kind = "histogram", buckets = {}"#);
+        assert!(err.contains("Event.new: metrics[1].temporality is required"), "got: {err}");
+    }
+
+    #[test]
+    fn an_exponential_histogram_without_a_temporality_is_required() {
+        let err = metric_err(
+            r#"name = "m", kind = "exponential_histogram", scale = 0, zero_count = 0, zero_threshold = 0, positive = {offset = 0, counts = {}}, negative = {offset = 0, counts = {}}, count = 0"#,
+        );
+        assert!(err.contains("Event.new: metrics[1].temporality is required"), "got: {err}");
+    }
+
+    #[test]
+    fn an_exponential_histogram_side_without_counts_is_required_with_its_path() {
+        let err = metric_err(
+            r#"name = "m", kind = "exponential_histogram", scale = 0, zero_count = 0, zero_threshold = 0, positive = {offset = 0}"#,
+        );
+        assert!(err.contains("Event.new: metrics[1].positive.counts is required"), "got: {err}");
+    }
+
+    #[test]
+    fn an_exponential_histogram_count_element_is_checked_by_index() {
+        let err = metric_err(
+            r#"name = "m", kind = "exponential_histogram", scale = 0, zero_count = 0, zero_threshold = 0, positive = {offset = 0, counts = {1, -2}}"#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].positive.counts[2] must be a non-negative integer, got -2"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_exponential_histogram_side_key_is_not_a_field() {
+        let err = metric_err(
+            r#"name = "m", kind = "exponential_histogram", scale = 0, zero_count = 0, zero_threshold = 0, positive = {offset = 0, counts = {}, bogus = 1}"#,
+        );
+        assert!(err.contains("Event.new: metrics[1].positive.bogus is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scale_that_does_not_fit_an_i32_is_rejected() {
+        let err = metric_err(r#"name = "m", kind = "exponential_histogram", scale = 2^40"#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].scale must be an integer between -2147483648 and \
+                 2147483647, got 1099511627776"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_quantile_row_without_a_value_is_required_with_its_indexed_path() {
+        let err = metric_err(
+            r#"name = "m", kind = "summary", quantiles = {{quantile = 0.5}}, count = 1, sum = 1"#,
+        );
+        assert!(err.contains("Event.new: metrics[1].quantiles[1].value is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_payload_key_of_a_pre_aggregated_kind_is_not_a_field_on_another() {
+        // `buckets` belongs to `histogram`; on a `summary` it's unknown.
+        let err = metric_err(
+            r#"name = "m", kind = "summary", quantiles = {}, count = 0, sum = 0, buckets = {}"#,
+        );
+        assert!(err.contains("Event.new: metrics[1].buckets is not a field"), "got: {err}");
     }
 }
