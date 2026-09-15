@@ -801,16 +801,16 @@ Per kind -- and only that kind's keys are accepted:
 | `samples` | `values` | array of finite numbers | optional, default empty |
 | | `sample_rate` | finite number | optional, default `1.0` (`Samples::new`'s) |
 | `set_members` | `members` | array of strings (each stored as opaque bytes, UTF-8 or not) | optional, default empty |
-| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer>}` rows, each bucket's own count (not cumulative); may be empty. `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`: a histogram's last bucket is conventionally `+Inf` and `to_table()` emits that bound as `math.huge`. NaN and `-math.huge` are rejected | **required** |
+| `histogram` | `buckets` | array of `{bound = <number>, count = <non-negative integer>}` rows; may be empty. `count` is each bucket's *own* observation count, not a running total -- a Prometheus `le="1"`=3, `le="+Inf"`=5 series is `{bound = 1, count = 3}, {bound = math.huge, count = 2}`. Bounds must be strictly increasing (a duplicate or out-of-order bound is an error). `bound` is the one field anywhere in `Event.new` that may be non-finite, and only as `math.huge`, and only on the *last* row: that is the overflow bucket (Prometheus's `+Inf`, OTLP's implicit last `bucket_counts` entry), which `to_table()` emits with the bound `math.huge`. A non-empty `buckets` whose last bound is finite gets `{bound = math.huge, count = 0}` appended -- the constructor's one normalisation; it adds no information and keeps the OTLP shape valid. NaN and `-math.huge` are rejected | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` (`to_table()` emits `nil` for an absent one) | optional, default absent |
-| `exponential_histogram` | `scale` | integer fitting an `i32` | **required** |
+| `exponential_histogram` | `scale` | integer in `[-10, 20]` (OTLP's `ExponentialHistogramDataPoint.scale` range) | **required** |
 | | `zero_count`, `count` | non-negative integer | **required** |
 | | `zero_threshold` | finite number | **required** |
 | | `positive`, `negative` | table of exactly `{offset = <integer fitting an i32>, counts = <array of non-negative integers>}`; `counts` may be empty but must be present | **required** |
 | | `temporality` | `"delta"` or `"cumulative"` | **required** -- core documents no default for it |
 | | `sum`, `min`, `max` | finite number or `nil` | optional, default absent |
-| `summary` | `quantiles` | array of `{quantile = <finite number>, value = <finite number>}` rows; may be empty. A `quantile` outside `[0, 1]` is accepted as-is (the model doesn't constrain it) | **required** |
+| `summary` | `quantiles` | array of `{quantile = <number in [0, 1]>, value = <finite number>}` rows; may be empty and need not be sorted | **required** |
 | | `count` | non-negative integer | **required** |
 | | `sum` | finite number | **required** |
 

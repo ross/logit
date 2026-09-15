@@ -69,7 +69,11 @@ Concretely:
   default to 0, `exemplars`/`unit`/`description` to empty/absent; a `sum` without `temporality`/
   `monotonic` is `MetricKind::counter` (delta, monotonic); `samples` without `sample_rate` is
   `Samples::new`'s 1.0. A histogram's or exponential histogram's `temporality` has no core default
-  and is required. A span needs `trace_id`, `span_id` and `name`; `kind` defaults to `internal`,
+  and is required. A histogram's `buckets` must be strictly increasing with `math.huge` only
+  last, and a non-empty `buckets` whose last bound is finite gets the overflow bucket
+  `{bound = math.huge, count = 0}` appended -- the constructor's one normalisation: it adds no
+  information (nothing was observed above the last bound) and keeps the shape OTLP's
+  `bucket_counts`/`explicit_bounds` split needs valid. A span needs `trace_id`, `span_id` and `name`; `kind` defaults to `internal`,
   `status` to `unset`, `end_timestamp` to the event's `timestamp`, every `dropped_*` count to 0,
   `events`/`links` to empty. An `end_timestamp` before `timestamp` is an error, the same rule
   `trace_context`'s `span:` block applies to a lifted span.
