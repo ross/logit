@@ -44,9 +44,9 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ProvenanceState>>> {
 }
 
 /// Called once per incoming batch, before any of its events reach `process` -- overwrites
-/// `origin`/`previous` in place with the batch's own [`logit_core::Provenance`]. Not called around
-/// a `flush()` call, which keeps whatever was last set, exactly like `trace`/`resource`'s own
-/// documented flush-time staleness (`docs/known-gaps.md`).
+/// `origin`/`previous` in place with the batch's own [`logit_core::Provenance`] -- and once
+/// before every `flush()` call, with the flushing component as both (the root context a flush
+/// runs in, `docs/adr/lua-flush-root-context.md`).
 pub(crate) fn set(state: &Rc<RefCell<ProvenanceState>>, provenance: logit_core::Provenance) {
     let mut state = state.borrow_mut();
     state.origin = provenance.origin_str().map(str::to_string);
