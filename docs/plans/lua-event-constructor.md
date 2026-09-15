@@ -127,6 +127,13 @@ rather than last because W2's flush-path test (`Event.new{timestamp = now, ...}:
 from `flush(now)`) proves the targets cell and the argument at once, and the script-contract section
 is edited once.
 
+### Status (2026-09-15)
+
+All seven workstreams are built and reviewed as a linear stack of PRs, each targeting its parent:
+W0 #219 (`mint/w0` → `main`), W1 #220, W2 #221, W3 #222, W4 #223, W5 #224, and W6 (this closeout)
+on `mint/w6` → `mint/w5`. Nothing is merged. Allocation pins landed at **17** (log),
+**16** (gauge) and **14** (span) for a constructed event, every pre-existing `lua:` pin unchanged.
+
 ### Per-workstream detail
 
 **W0** — Done when: both docs follow `TEMPLATE.md`'s headings, every relative link resolves, both
@@ -184,7 +191,10 @@ this plan's Status paragraph lists PR numbers.
 - Round-trip tests are whole-event `assert_eq!` against the input fixture, not field spot-checks.
 - Manual smoke at W6: a `lua` component with `interval:` whose `flush(now)` returns
   `{Event.new{timestamp = now, metrics = {{name = "tick", kind = "gauge", value = 1}}}}` into
-  `stdio_out`.
+  `stdio_out`. **Done 2026-09-15** (`generate_in` → `lua` with `interval: 1s` → `stdio_out`, in
+  the dev container): each tick rendered one event carrying the `now` timestamp, the flush-built
+  log line, an attribute and the gauge, with the tick timestamp advancing per flush and a final
+  flush on shutdown.
 
 ## Open risks
 
