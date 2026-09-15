@@ -1894,7 +1894,11 @@ fn run_lua_loop(
         worker.set_scope(&None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
-        let result = worker.flush();
+        // The tick time reaches the script as `flush(now)` -- the same `now_unix_nanos()` value
+        // `run_flush` hands the native `aggregate`'s `Transform::flush`, so a flush-driven
+        // `Event.new{timestamp = now, ..}` is stamped the way an aggregate's window would be
+        // (`docs/adr/lua-event-constructor.md`).
+        let result = worker.flush(now_unix_nanos());
         drop(timer);
         // A `flush()` that wrote `resource` (`crates/logit-script/src/resource.rs`) commits that
         // write here -- the one way a flush-driven emission carries a real identity instead of

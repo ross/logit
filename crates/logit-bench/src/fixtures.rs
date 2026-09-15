@@ -924,6 +924,37 @@ function process(event)
 end
 "#;
 
+/// Drops the incoming event and returns one minted from a literal table through `Event.new`
+/// (`crates/logit-script/src/construct.rs`, `docs/adr/lua-event-constructor.md`): one attribute
+/// and a minimal log, the smallest useful constructed event
+/// (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event_constructing_a_log_event`).
+pub const LUA_EVENT_NEW_LOG_SCRIPT: &str = r#"
+function process(event)
+  return Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}
+end
+"#;
+
+/// As [`LUA_EVENT_NEW_LOG_SCRIPT`], minting the smallest useful metric event instead: one
+/// `gauge` record with nothing but its required fields, the shape the plan's `flush(now)` smoke
+/// test emits (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_constructing_a_gauge_event`).
+pub const LUA_EVENT_NEW_GAUGE_SCRIPT: &str = r#"
+function process(event)
+  return Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}
+end
+"#;
+
+/// As [`LUA_EVENT_NEW_LOG_SCRIPT`], minting the smallest useful *span* event instead: the three
+/// required span fields and nothing else, so every core default applies (`kind` internal,
+/// `status` unset, `end_timestamp` the event's own, no `SpanExt`, empty `events`/`links`) --
+/// the last payload kind `Event.new` builds (`crates/logit-bench/tests/allocations.rs`'s
+/// `lua_process_one_event_constructing_a_span_event`).
+pub const LUA_EVENT_NEW_SPAN_SCRIPT: &str = r#"
+function process(event)
+  return Event.new{timestamp = "1", span = {trace_id = "4bf92f3577b34da6a3ce929d0e0e4736", span_id = "00f067aa0ba902b7", name = "GET /"}}
+end
+"#;
+
 /// A metric-only event carrying one `MetricKind::Sum` record -- a counter, the shape
 /// `kv_metrics`'s `nginx.requests` spec (`fn kv_metrics` above) produces on the wire, and the
 /// fixture the Lua `event.metrics[i].value`/`#event.metrics` surface

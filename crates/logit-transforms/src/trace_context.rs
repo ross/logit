@@ -163,26 +163,6 @@ fn numeric_flags(value: &Value) -> Option<u8> {
     }
 }
 
-fn span_kind(name: &str) -> Option<SpanKind> {
-    Some(match name {
-        "server" => SpanKind::Server,
-        "client" => SpanKind::Client,
-        "producer" => SpanKind::Producer,
-        "consumer" => SpanKind::Consumer,
-        "internal" => SpanKind::Internal,
-        _ => return None,
-    })
-}
-
-fn span_status(name: &str) -> Option<SpanStatus> {
-    Some(match name {
-        "ok" => SpanStatus::Ok,
-        "error" => SpanStatus::Error,
-        "unset" => SpanStatus::Unset,
-        _ => return None,
-    })
-}
-
 /// One timing value to exact nanoseconds, by the unit its attribute name declared. `instant`
 /// distinguishes a start/end (which may also arrive as a `Value::Timestamp` or, under the
 /// `_rfc3339` form, a date string) from a duration (which may not). A float in an integer-
@@ -345,11 +325,11 @@ impl TraceContext {
             None => defaults.name.clone(),
         };
         let kind = match present(attrs, SPAN_KIND) {
-            Some(value) => value.as_str().and_then(span_kind).ok_or(Skip::Invalid)?,
+            Some(value) => value.as_str().and_then(SpanKind::from_name).ok_or(Skip::Invalid)?,
             None => defaults.kind,
         };
         let status = match present(attrs, SPAN_STATUS) {
-            Some(value) => value.as_str().and_then(span_status).ok_or(Skip::Invalid)?,
+            Some(value) => value.as_str().and_then(SpanStatus::from_name).ok_or(Skip::Invalid)?,
             None => SpanStatus::Unset,
         };
 

@@ -13,6 +13,30 @@ pub enum Temporality {
     Cumulative,
 }
 
+impl Temporality {
+    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
+    /// render and accept.
+    pub const NAMES: [&'static str; 2] = ["delta", "cumulative"];
+
+    /// The lowercase name the Lua API and `stdio_out` render this temporality as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Temporality::Delta => "delta",
+            Temporality::Cumulative => "cumulative",
+        }
+    }
+
+    /// The inverse of [`Temporality::as_str`]: an exact lowercase match, no case folding or
+    /// aliases.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "delta" => Temporality::Delta,
+            "cumulative" => Temporality::Cumulative,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricRecord {
     pub name: Symbol,
@@ -124,6 +148,23 @@ impl MetricKind {
     /// A monotonic delta sum -- what the old `MetricKind::Counter(v)` meant.
     pub fn counter(v: f64) -> Self {
         MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: true })
+    }
+
+    /// The lowercase snake_case name of this variant -- the `kind` the Lua API and `stdio_out`
+    /// render. There is no `from_name`: a name alone cannot construct a kind's payload.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MetricKind::Sum(_) => "sum",
+            MetricKind::Gauge(_) => "gauge",
+            MetricKind::GaugeDelta(_) => "gauge_delta",
+            MetricKind::Samples(_) => "samples",
+            MetricKind::Distribution(_) => "distribution",
+            MetricKind::SetMembers(_) => "set_members",
+            MetricKind::Set(_) => "set",
+            MetricKind::Histogram(_) => "histogram",
+            MetricKind::ExponentialHistogram(_) => "exponential_histogram",
+            MetricKind::Summary(_) => "summary",
+        }
     }
 }
 
@@ -1123,6 +1164,58 @@ impl<'de> serde::de::Deserializer<'de> for &mut HllBytesReader<'de> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporality_names_round_trip_in_variant_order() {
+        let variants = [Temporality::Delta, Temporality::Cumulative];
+        for (name, v) in Temporality::NAMES.iter().zip(variants) {
+            assert_eq!(v.as_str(), *name);
+            assert_eq!(Temporality::from_name(v.as_str()), Some(v));
+        }
+        assert_eq!(Temporality::from_name("Delta"), None);
+    }
+
+    #[test]
+    fn metric_kind_name_covers_every_variant() {
+        let cases = [
+            (MetricKind::counter(1.0), "sum"),
+            (MetricKind::Gauge(1.0), "gauge"),
+            (MetricKind::GaugeDelta(1.0), "gauge_delta"),
+            (MetricKind::Samples(Samples::new([1.0])), "samples"),
+            (MetricKind::Distribution(DdSketch::new()), "distribution"),
+            (MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]), "set_members"),
+            (MetricKind::Set(HyperLogLog::new()), "set"),
+            (
+                MetricKind::Histogram(Histogram {
+                    buckets: vec![(1.0, 1)],
+                    temporality: Temporality::Delta,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                "histogram",
+            ),
+            (
+                MetricKind::ExponentialHistogram(ExpHistogram {
+                    scale: 0,
+                    zero_count: 0,
+                    zero_threshold: 0.0,
+                    positive: (0, vec![]),
+                    negative: (0, vec![]),
+                    temporality: Temporality::Delta,
+                    count: 0,
+                    sum: None,
+                    min: None,
+                    max: None,
+                }),
+                "exponential_histogram",
+            ),
+            (MetricKind::Summary(Summary { quantiles: vec![], count: 0, sum: 0.0 }), "summary"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.name(), expected);
+        }
+    }
 
     /// `add_weighted(v, 1)` is the `count == 1` case a sample-rate-1 statsd line always takes --
     /// it must be indistinguishable from the plain `add(v)` path it replaces there.

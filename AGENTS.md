@@ -174,7 +174,10 @@ goal — a lossless relay for each like-protocol pair (`statsd_in`/`statsd_out`,
 data as `syslog.sd`, timestamp precedence, bytes MSG, opt-in structured-data emission), statsd (raw
 timers/sets, `|c:`/`|T`, events/service checks), `aggregate`'s raw-retention modes (which keep exact
 values, with a real HyperLogLog backing `sets: estimate` and the overflow fallback), and the Lua
-surface (`event.metrics`, `event.span`, `scope`, the new log/resource fields) have all landed. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
+surface (`event.metrics`, `event.span`, `scope`, the new log/resource fields) have all landed;
+`Event.new(t)` ([ADR `lua-event-constructor`](docs/adr/lua-event-constructor.md)) then made every
+payload constructible from Lua as the inverse of `event:to_table()`, with `flush(now)` supplying a
+flush-driven emission's timestamp. [`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md) has the
 closing assessment; residual debt (post-sketch metric kinds at `statsd_out`, `statsd_out` carrying no
 `unit` and no native rename/prefix and stamping an egress
 timestamp only on a `|T`-marked line, and syslog's `event.timestamp` staying receipt time while the
@@ -351,7 +354,10 @@ not a style preference:
   `PhantomData<*const ()>` marker — don't remove it to make something compile.
 - **Events reach Lua through a proxy (`EventProxy`, userdata + metamethods), not a converted
   table.** The whole point is avoiding a full table conversion on every stage for every event —
-  don't "simplify" this back into `event:to_table()`-by-default.
+  don't "simplify" this back into `event:to_table()`-by-default. `Event.new(t)` is the one
+  opt-in full-table path, in the other direction: a script pays for it only where it calls it
+  (`docs/design/memory.md` §2's `Event.new` rows), and every other `lua:` allocation pin is
+  unchanged by its existence.
 - **Metric kinds must stay mergeable.** `Distribution` needs a sketch with a real error bound
   (`DDSketch`, not a naive percentile), `Set` needs a real union (`HyperLogLog`) — this is what
   makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate.

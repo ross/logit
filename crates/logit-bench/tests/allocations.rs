@@ -3196,6 +3196,116 @@ fn lua_process_one_event_identity_write_to_scope_name_is_free() {
     expect_allocs("lua: set_scope + process (scope.name = scope.name) + take_scope", stats, 5);
 }
 
+/// `Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}` returned
+/// from `process()` in place of the incoming event (`crates/logit-script/src/construct.rs`,
+/// `docs/adr/lua-event-constructor.md`) -- the smallest useful constructed event, measured the
+/// same way as every row above. Additive: a script that never calls `Event.new` pays nothing
+/// new, which is what every other `lua:` pin in this section staying put guarantees.
+///
+/// **17**, broken down by measuring narrower scripts against this one (the same method
+/// [`lua_process_one_event`] used), not derived:
+///
+/// - **4** for any call at all (`lua_process_one_event`'s baseline, confirmed again here with a
+///   `return nil` script).
+/// - **+6** for `Event.new{timestamp = "1"}` itself, whether or not the result is returned
+///   (constructing one and returning `nil` lands at 10): the `Rc<RefCell<Event>>` and the
+///   `EventProxy` userdata a fresh handle costs -- the same pair the incoming event's proxy
+///   accounts for in the baseline -- plus what mlua spends calling into a Rust closure and
+///   handing its userdata result back to Lua; not attributable line by line, the same caveat
+///   the baseline's own bookkeeping carries. `raw_get`/`pairs` over the argument table and the
+///   `timestamp` parse allocate nothing, and every error-path `format!` is lazy.
+/// - **+1** for the `Box` on `ProcessOutcome::Emit` (returning it: 11).
+/// - **+3** for `attributes = {env = "prod"}`: 1 for the sub-table (an empty `attributes = {}`
+///   lands at 12) and 2 for its one entry, one of which is `lua_to_value`'s `Bytes` for `"prod"`
+///   -- a second attribute adds exactly 1 more, so the other 1 is the map's first insert, not
+///   per-entry.
+/// - **+3** for `log = {message = "hi"}`, symmetrically: 1 for the sub-table and 2 for
+///   `message`, `lua_to_value`'s `Bytes` for `"hi"` among them. `LogRecord` is inline in
+///   `Event`, so there is no box for the record itself.
+#[test]
+fn lua_process_one_event_constructing_a_log_event() {
+    let worker = ScriptWorker::new(fixtures::LUA_EVENT_NEW_LOG_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new log event from a literal table", stats, 17);
+}
+
+/// `Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}` returned
+/// from `process()` in place of the incoming event -- the smallest useful constructed *metric*
+/// event, the shape a `flush(now)` tick emits. Same method and baseline as
+/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way.
+///
+/// **16**, broken down by measuring narrower scripts against this one, not derived:
+///
+/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
+///   `ProcessOutcome::Emit`: 11, exactly the log row's first three terms.
+/// - **+1** for the `metrics` array table (`metrics = {}` lands at 12; an empty list costs no
+///   `MetricList`/`Vec` growth -- `with_capacity(0)` and the one-record case both stay inline).
+/// - **+4** for the one metric: 1 for its own sub-table; 1 for `validated_sequence_len`'s key
+///   `Vec` over the array (paid once per event, not per metric -- a second metric adds 3 plus
+///   the `MetricList` spill past its one inline slot, 20 in all); 1 for the `format!`'d
+///   `metrics[i]` path each record's field errors are prefixed with (the same script with a
+///   static path lands at 15 -- the one deliberate per-metric cost, cheaper than threading the
+///   index through every helper); and 1 that every non-empty *record* sub-table carries beyond
+///   its own table and fields, the same bucket the log row folds into `message` -- `log =
+///   {message = 1}` lands at 13 against 12 for an empty sub-table, and a second field adds
+///   nothing. `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk and
+///   every nil-defaulted field allocate nothing; `unit = "ms"` and an empty `exemplars = {}`
+///   add 0 and 1 (the table) respectively.
+#[test]
+fn lua_process_one_event_constructing_a_gauge_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_EVENT_NEW_GAUGE_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new gauge event from a literal table", stats, 16);
+}
+
+/// `Event.new{timestamp = "1", span = {trace_id = <hex>, span_id = <hex>, name = "GET /"}}`
+/// returned from `process()` in place of the incoming event -- the smallest useful constructed
+/// *span* event, every core default applied (`kind` internal, `status` unset, `end_timestamp`
+/// the event's own, no `SpanExt`, empty `events`/`links`). Same method and baseline as
+/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way, and the last
+/// payload kind `Event.new` builds.
+///
+/// **14**, broken down by measuring narrower scripts against this one, not derived:
+///
+/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
+///   `ProcessOutcome::Emit`: 11, exactly the log and gauge rows' first three terms.
+/// - **+3** for the `span` sub-table with its three required fields: 1 for the table itself,
+///   1 for `lua_to_value`'s `Bytes` for the `name` (`name = 1` lands at 13), and the same 1 that
+///   every non-empty record sub-table carries beyond its own table and fields (the log row's
+///   `message` bucket, the gauge row's fourth per-record allocation). The two hex ids parse
+///   straight into their `[u8; N]` arrays, `SpanRecord` is inline in `Event` (no box), and
+///   `Vec::new()` for `events`/`links` is free.
+/// - **+0** for every defaulted or scalar field: `kind = "server", status = "ok", end_timestamp
+///   = "2", parent_span_id = <hex>` together land at 14 too (enum names are looked up through
+///   borrowed `to_string_lossy`, the nanos string parses in place), as does an explicit
+///   `dropped_events_count = 0, flags = 0` -- a default value never earns the `SpanExt` box.
+/// - Beyond the pin, for scale: `status_message = "boom"` adds 2 (the `Box<SpanExt>` and the
+///   `Bytes`); an empty `events = {}` or `links = {}` adds 1 each (the Lua table --
+///   `with_capacity(0)` allocates nothing); one span event `{timestamp = "1", name = "e"}` adds
+///   7 (the `events` table, the row's table, `validated_sequence_len`'s key `Vec`, the
+///   `format!`'d `span.events[1]` path, the name's `Bytes`, the `Vec<SpanEvent>` itself, and the
+///   per-record bucket), and one link with just its ids adds 6 (the same minus the `Bytes`).
+#[test]
+fn lua_process_one_event_constructing_a_span_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_EVENT_NEW_SPAN_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new span event from a literal table", stats, 14);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

@@ -366,17 +366,18 @@ already built that have a known, accepted rough edge.
   not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
   strictly opt-in (never a default, same posture as everything else on this page), and no concrete
   consumer has needed it yet. Revisit once one does.
-- ~~**Lua has no span API at all**~~ — **narrowed to span writes/minting from Lua.** `event.span`
-  (`docs/design/lua-api.md`'s "Reading `event.span`") is now a real, read-only proxy — a script can
-  read every field a `SpanRecord` carries, including its `events`/`links` tables, once one exists.
-  What's left: there is still no way for a script to *create* or *mutate* a span.
-  `trace_context`'s `span:` block ([ADR
-  `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is still the *only* way to
-  turn a log line into a span today. A script ahead of it can still prepare the convention
-  attributes (compute `span.start` from whatever the line actually carries, say) for
-  `trace_context` to consume — genuinely useful, just not a substitute for write access. Span
-  *write* access is its own design pass, the same posture typed record access on `event.log`
-  already took before its own read/write half landed.
+- ~~**Lua has no span API at all**~~ — ~~**narrowed to span writes/minting from Lua.**~~ —
+  **narrowed again (2026-09-15) to in-place span mutation from Lua.** `event.span`
+  (`docs/design/lua-api.md`'s "Reading `event.span`") is a real, read-only proxy — a script can
+  read every field a `SpanRecord` carries, including its `events`/`links` tables, once one exists
+  — and `Event.new` ([ADR `lua-event-constructor`](adr/lua-event-constructor.md), the `span` table
+  in `lua-api.md`'s "Constructing events") now builds a whole span, `events` and `links` included,
+  so `trace_context`'s `span:` block ([ADR
+  `trace-context-span-lifting`](adr/trace-context-span-lifting.md)) is no longer the only way to
+  turn a log line into a span. What's left: a script cannot *mutate* an existing `event.span`
+  field by field; the documented way is `Event.new(event:to_table())` with the table edited. An
+  in-place write path shares this constructor's parsers and is a small follow-up, not designed
+  yet — the same posture in-place `event.log.message`/`severity`/`body_format` writes take.
 - **A haproxy/nginx access line derives only its own server span, not the CLIENT-side child span
   for the hop to its upstream** — `trace_context`'s `span:` block mints one `SpanRecord` per
   event, and `Transform::process` is one-in-one-out, so there's nowhere to put a second span for

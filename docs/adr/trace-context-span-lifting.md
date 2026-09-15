@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-09-11
+updated: 2026-09-15
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -224,6 +224,11 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
 - Lua gains no new capability here — `event.has_span` remains the entire span surface. Recorded as
   its own `docs/known-gaps.md` entry rather than folded into the existing trace-context one, since
   the constraint (no accumulator, no proxy type) is different from that entry's.
+  **Amendment (2026-09-15):** superseded by [ADR `lua-event-constructor`](lua-event-constructor.md)
+  — `event.span` became a read-only proxy in the meantime, and `Event.new(t)` now lets a script
+  mint a span (and a log, and every reconstructible metric kind) from the table shape
+  `event:to_table()` emits. The `span:` block here remains the no-Lua path for lifting a span out
+  of an access line; in-place mutation of an existing `event.span` is still not offered.
 - `docs/plans/demo-tracing-stack.md`'s workstream A description of `logit` having no `traceparent`
   parser, and its per-tier decimal-flags-JSON-fields workaround, are now historical rather than
   current — a follow-up note there points here rather than rewriting that plan's own account of

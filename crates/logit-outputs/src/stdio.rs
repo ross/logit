@@ -47,7 +47,7 @@ use logit_core::time::format_rfc3339_utc;
 use logit_core::trace::push_hex;
 use logit_core::{
     AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Severity,
-    SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus, Telemetry, Value,
+    SpanEvent, SpanLink, SpanRecord, Telemetry, Value,
 };
 use logit_proto::frame::Compression as NativeCompression;
 use logit_proto::native::NativeEncoder;
@@ -179,7 +179,7 @@ impl Encoder for StreamEncoder {
 fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
     out.push_str(&format_rfc3339_utc(event.timestamp));
     if let Some(log) = &event.log {
-        let severity = log.severity.map(severity_label).unwrap_or("-");
+        let severity = log.severity.map(Severity::as_str).unwrap_or("-");
         out.push_str(" log[");
         out.push_str(severity);
         out.push_str("] ");
@@ -228,17 +228,6 @@ fn render_event_block(out: &mut String, resource: &Resource, event: &Event) {
             render_span_link(out, link);
             out.push('\n');
         }
-    }
-}
-
-fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Trace => "trace",
-        Severity::Debug => "debug",
-        Severity::Info => "info",
-        Severity::Warn => "warn",
-        Severity::Error => "error",
-        Severity::Fatal => "fatal",
     }
 }
 
@@ -298,13 +287,6 @@ fn render_merged_attrs(out: &mut String, resource: &AttrMap, event: &AttrMap) {
     }
 }
 
-fn temporality_str(t: logit_core::Temporality) -> &'static str {
-    match t {
-        logit_core::Temporality::Delta => "delta",
-        logit_core::Temporality::Cumulative => "cumulative",
-    }
-}
-
 /// Shared by `Histogram`/`ExponentialHistogram`'s render arms: a trailing ` sum=/min=/max=`
 /// appended only for whichever of the three is actually `Some` -- a debug sink must never print a
 /// bare `sum=` for a metric that carried no sum, so absence renders as absence, not `sum=None`.
@@ -351,7 +333,7 @@ fn render_metric(out: &mut String, metric: &MetricRecord) {
                 out,
                 "sum={} temporality={} monotonic={}",
                 s.value,
-                temporality_str(s.temporality),
+                s.temporality.as_str(),
                 s.monotonic
             );
         }
@@ -462,9 +444,9 @@ fn render_span(out: &mut String, event_timestamp: i64, span: &SpanRecord) {
         push_hex(out, parent);
     }
     out.push_str(" kind=");
-    out.push_str(span_kind_label(span.kind));
+    out.push_str(span.kind.as_str());
     out.push_str(" status=");
-    out.push_str(span_status_label(span.status));
+    out.push_str(span.status.as_str());
     out.push_str(" duration=");
     // `saturating_sub`: a span with a corrupt/out-of-order `end_timestamp` before its own start
     // must still render *something* rather than panicking or wrapping to a nonsense huge value.
@@ -496,24 +478,6 @@ fn render_span_link(out: &mut String, link: &SpanLink) {
     if !link.attributes.is_empty() {
         out.push_str(" attrs ");
         render_attrs(out, &link.attributes);
-    }
-}
-
-fn span_kind_label(kind: SpanKind) -> &'static str {
-    match kind {
-        SpanKind::Internal => "internal",
-        SpanKind::Server => "server",
-        SpanKind::Client => "client",
-        SpanKind::Producer => "producer",
-        SpanKind::Consumer => "consumer",
-    }
-}
-
-fn span_status_label(status: SpanStatus) -> &'static str {
-    match status {
-        SpanStatus::Unset => "unset",
-        SpanStatus::Ok => "ok",
-        SpanStatus::Error => "error",
     }
 }
 
@@ -825,7 +789,9 @@ impl<E: Encoder + Send> Output for StreamOutput<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{BodyFormat, DdSketch, HyperLogLog, LogRecord, Resource};
+    use logit_core::{
+        BodyFormat, DdSketch, HyperLogLog, LogRecord, Resource, SpanKind, SpanStatus,
+    };
     use std::sync::Arc;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
