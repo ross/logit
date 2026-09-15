@@ -32,6 +32,17 @@
 //! longer trustworthy either way, so it's dropped and the next `send` reconnects).
 //! `duplicate_safe()` is `false` -- there is no receiver-side dedupe identity
 //! (`docs/plans/native-transport.md`'s own "Explicitly out of scope" list).
+//!
+//! **Pooled-connection probe.** The `Ambiguous`-after-a-peer-FIN case above is the one this sink
+//! can actually do something about, and does: before the first write of a `send` on a connection
+//! it *inherited* from an earlier batch, the pooled stream gets one non-consuming
+//! `poll_read` (`crate::tls::poll_pending_close` -- see its doc comment for why exactly one poll
+//! and never a cancellable `timeout(read)`). An immediate EOF, or unsolicited bytes -- which on
+//! this protocol means a `Reject{GOING_AWAY}` from a shutdown or a `logit_in` `idle_timeout:`
+//! (`docs/adr/idle-connection-timeout.md`) -- drops that connection and opens a fresh one before
+//! anything leaves the host, so the batch takes the ordinary `Clean` reconnect path instead of
+//! being written into a socket whose peer is gone. The residual case is the FIN that arrives
+//! *between* the probe and the write, which is today's `Ambiguous`, unchanged.
 
 use crate::Output;
 use anyhow::Context;
@@ -60,7 +71,7 @@ pub use crate::tls::TlsClientSettings;
 // The TLS-adjacent pieces every raw-TCP sink shares, defined once in `crate::tls`: `AsyncStream`
 // erases "plain or TLS-wrapped stream" behind one object-safe trait, and `host_only` derives the
 // SNI name from a bare `host:port` endpoint.
-use crate::tls::{host_only, AsyncStream};
+use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 
 /// A live, handshaken connection -- everything about it that only exists once the handshake has
 /// actually happened.
@@ -351,7 +362,28 @@ impl Output for LogitOutput {
         }
 
         let mut conn = match self.stream.take() {
-            Some(conn) => conn,
+            // A *reused* connection is polled once before this batch's first write, so a peer
+            // that closed while this sink had nothing to send costs a reconnect rather than an
+            // `Ambiguous` batch (this module's own "Pooled-connection probe" doc section).
+            // Nothing has been written yet, so replacing the connection here is the ordinary
+            // `Clean` path -- and `connect_and_handshake` counts the `logit.output.reconnects`
+            // this is.
+            Some(mut conn) => {
+                let mut probe = [0u8; 1];
+                let pending = poll_pending_close(&mut *conn.stream, &mut probe).await;
+                match pending {
+                    PendingClose::Open => conn,
+                    // `Bytes` is treated exactly like `Eof`: the only message a `logit_in` ever
+                    // writes unprompted is `Reject{GOING_AWAY}` (a shutdown or an idle close,
+                    // `docs/adr/idle-connection-timeout.md`), which means the same thing here --
+                    // and the probe has already consumed a byte of it, so this connection could
+                    // not be read from coherently again even if it were worth keeping.
+                    _closed => {
+                        drop(conn);
+                        self.connect_and_handshake().await?
+                    }
+                }
+            }
             None => self.connect_and_handshake().await?,
         };
         // Only re-encoded on a v2 connection -- reuses `v1_payload` otherwise, so a v1 connection
@@ -640,15 +672,62 @@ mod tests {
     /// receiver for every batch it forwards -- the round-trip tests drive a real listener rather
     /// than a hand-rolled one, so nothing here can drift from what `logit_in` actually does.
     async fn spawn_real_listener() -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
+        spawn_real_listener_with_idle_timeout(None).await
+    }
+
+    /// [`spawn_real_listener`] with `logit_in`'s own `idle_timeout:` set, for the probe test: a
+    /// real listener closing a real quiet connection is the condition the probe exists for, and
+    /// nothing hand-rolled here can drift from what `logit_in` actually writes on the way out
+    /// (`docs/adr/idle-connection-timeout.md`).
+    async fn spawn_real_listener_with_idle_timeout(
+        idle_timeout: Option<Duration>,
+    ) -> (String, mpsc::Receiver<logit_pipeline::Delivered>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         drop(listener);
-        let mut input = LogitInput::new(addr.clone());
+        let mut input = LogitInput::new(addr.clone()).with_idle_timeout(idle_timeout);
         let (tx, rx) = mpsc::channel(16);
         let sink = Fanout::new(vec![tx]);
         tokio::spawn(async move { input.run(sink).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         (addr, rx)
+    }
+
+    /// `logit.output.reconnects`' value out of a drained `Registry`, or `None` if the counter was
+    /// never touched -- which is itself the assertion for a sink that only ever connected once.
+    /// `syslog_out`'s own `reconnects_in`, one crate module over.
+    fn reconnects_in(events: &[logit_core::Event]) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name) == "logit.output.reconnects" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+        })
+    }
+
+    /// What `logit.output.requests` totals under one `class` tag, or `None` if that class was
+    /// never counted at all -- which is how a test asserts on what *didn't* happen
+    /// (`class=ambiguous`) as precisely as on what did. A sum rather than an occurrence count
+    /// because `Telemetry` coalesces repeats of one metric/tag pair into a single point per
+    /// drain.
+    fn requests_in(events: &[logit_core::Event], class: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if e.attributes.get("class").and_then(|v| v.as_str()) != Some(class) {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum)
+                    if logit_core::interner::resolve(m.name) == "logit.output.requests" =>
+                {
+                    Some(sum.value)
+                }
+                _ => None,
+            })
+        })
     }
 
     async fn recv_batch(rx: &mut mpsc::Receiver<logit_pipeline::Delivered>) -> EventBatch {
@@ -679,6 +758,138 @@ mod tests {
             .flat_map(|e| e.metrics.into_iter())
             .find(|m| logit_core::interner::resolve(m.name) == "logit.output.reconnects");
         assert!(reconnects.is_none(), "expected no reconnects after two sends on one connection");
+    }
+
+    // ---- the pooled-connection probe ---------------------------------------------------------
+    //
+    // This module's "Pooled-connection probe" doc section, end to end against a real `logit_in`
+    // and then isolated against a deterministic fake peer. Real durations, never
+    // `tokio::time::pause()`: the condition under test is a listener's own timer closing a
+    // socket, which paused time cannot produce.
+
+    /// The headline claim of `docs/adr/idle-connection-timeout.md`'s client-probe decision: a
+    /// real `logit_in` with an `idle_timeout:` closes a connection this sink is holding between
+    /// batches, and the next batch still lands -- one counted reconnect, no `Ambiguous`, nothing
+    /// dropped.
+    ///
+    /// Without the probe this is exactly the loss the ADR describes: the write goes into a socket
+    /// whose peer is gone, the ack read then fails, and the batch is classified `Ambiguous` --
+    /// which, with `duplicate_safe()` false, the default at-most-once posture *drops*. So
+    /// `request_classes` asserting `["ok", "ok"]` is the real assertion here, not just that
+    /// `send` returned `Ok`.
+    #[tokio::test]
+    async fn a_pooled_connection_the_peer_closed_is_replaced_before_the_next_write_with_no_batch_lost(
+    ) {
+        let (addr, mut rx) =
+            spawn_real_listener_with_idle_timeout(Some(Duration::from_millis(100))).await;
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+        let mut output = LogitOutput::new(addr).with_telemetry(telemetry);
+
+        output.send(&sample_batch()).await.expect("first send should succeed");
+        assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
+
+        // Three times the listener's idle timeout: by now it has written its
+        // `Reject{GOING_AWAY}` and closed, and those bytes are sitting in this host's receive
+        // queue -- which is precisely what the probe is looking for.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        output
+            .send(&sample_batch())
+            .await
+            .expect("the probe should replace the closed connection before writing anything");
+        assert_eq!(
+            recv_batch(&mut rx).await.events.len(),
+            1,
+            "the second batch must actually reach the listener, not be lost into a dead socket"
+        );
+
+        let drained = registry.drain(0);
+        assert_eq!(
+            reconnects_in(&drained),
+            Some(1.0),
+            "exactly one reconnect -- the probe's, not a retry of a failed write"
+        );
+        assert_eq!(requests_in(&drained, "ok"), Some(2.0), "both batches delivered cleanly");
+        assert_eq!(
+            requests_in(&drained, "ambiguous"),
+            None,
+            "and neither may be classified ambiguous -- an ambiguous batch is a dropped one here"
+        );
+    }
+
+    /// The same replacement, isolated from any timer: a peer that acks the first batch and then
+    /// writes an unsolicited `Reject{GOING_AWAY}` -- the only thing a `logit_in` ever sends
+    /// unprompted, from a shutdown or an idle close. This is the `PendingClose::Bytes` arm
+    /// specifically, and it must be treated exactly like an EOF: nothing of the next batch has
+    /// been written, so the pooled connection is dropped and a fresh one dialled.
+    #[tokio::test]
+    async fn a_pooled_connection_with_an_unsolicited_reject_is_replaced() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let nth = server_accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let control::ControlMessage::Hello(_hello) =
+                    read_control(&mut stream).await.unwrap()
+                else {
+                    panic!("expected Hello");
+                };
+                let ack = control::HelloAck {
+                    version: control::PROTOCOL_VERSION,
+                    codec: native::CODEC_NATIVE_V1,
+                    compression: 0,
+                    max_frame_bytes: frame::MAX_SANE_UNCOMPRESSED_LEN,
+                    window: 1,
+                };
+                write_control(&mut stream, &ack).await.unwrap();
+
+                // One data frame, acked like a healthy peer.
+                let mut header = [0u8; frame::HEADER_LEN];
+                stream.read_exact(&mut header).await.unwrap();
+                let mut header_bytes = Bytes::copy_from_slice(&header);
+                let h = frame::FrameHeader::read(&mut header_bytes).unwrap();
+                let mut body = vec![0u8; h.compressed_len as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                write_control(&mut stream, &control::Ack { seq: 1 }).await.unwrap();
+
+                if nth == 1 {
+                    // ...and then, unprompted, the going-away signal an idle close sends,
+                    // followed by the close itself when `stream` drops.
+                    let reject = control::Reject {
+                        code: control::REJECT_GOING_AWAY,
+                        message: "idle for 100ms".to_string(),
+                    };
+                    write_control(&mut stream, &reject).await.unwrap();
+                }
+            }
+        });
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("out", "logit_out", "sink");
+        let mut output = LogitOutput::new(addr).with_telemetry(telemetry);
+
+        output.send(&sample_batch()).await.expect("first send should succeed");
+        // Long enough for the `Reject` to be sitting in this host's receive queue.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        output
+            .send(&sample_batch())
+            .await
+            .expect("an unsolicited Reject must cost a reconnect, not the batch");
+
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the probe must have dialled a second connection"
+        );
+        let drained = registry.drain(0);
+        assert_eq!(reconnects_in(&drained), Some(1.0));
+        assert_eq!(requests_in(&drained, "ok"), Some(2.0));
+        assert_eq!(requests_in(&drained, "ambiguous"), None);
     }
 
     // ---- provenance / codec negotiation ------------------------------------------------------

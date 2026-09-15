@@ -417,9 +417,11 @@ keeps emitting, because RFC 6587 §3.4.2 says a final syslog message needs no te
 **What `graphite_in` gains.** `tls:` and `handshake_timeout:`, both the driver's and both TCP-only
 (graph rules 43 and 45 now cover this listener). The second closes the known gap this listener
 carried: a peer that connected and sent nothing held one of its 1024 permits indefinitely. Neither
-is an idle timeout; the post-first-byte silence gap is still the accepted one every TCP listener
-has. There is no `graphite_out` TLS half — carbon's own senders speak none, so the listener side is
-for a `logit`-to-`logit` or stunnel-shaped relay hop.
+is an idle timeout; the post-first-byte silence gap was, at the time, still the accepted one every
+TCP listener had — closed 2026-09-14 by the same driver's opt-in `idle_timeout:` field
+([ADR `idle-connection-timeout`](idle-connection-timeout.md)). There is no `graphite_out` TLS half
+— carbon's own senders speak none, so the listener side is for a `logit`-to-`logit` or
+stunnel-shaped relay hop.
 
 **What it costs.** The bespoke loop handed the decoder everything through the read buffer's last
 `\n` in one `decode_into` call; the driver frames first, so plaintext is now **one call per line**,

@@ -342,25 +342,111 @@ bytes itself to tell HTTP/1.1 from an HTTP/2 preface — a read this listener ne
 *can* do on a plaintext listener is wait for the first byte to become available without consuming
 it (a `MSG_PEEK`), which is the bound this knob applies there; the version sniff then proceeds over
 an untouched socket. So a connection that sends nothing at all is closed inside the budget on
-either arm, but a connection that sends **one byte** and then goes silent is past everything this
-knob reaches, and holds its permit until the cap is the only thing bounding it. That residual is a
-real gap and not a tuning choice: see `docs/known-gaps.md`'s "an `otlp_in` connection that sends
-its *first* byte and then goes silent" row. `hyper`'s own HTTP/1 header-read timeout is
-deliberately not used to close it — it re-arms on every idle keep-alive gap, so it would behave as
-an idle timeout and kill a long-interval exporter's pooled connection.
+either arm, and a connection that sends **one byte** and then goes silent is past everything this
+knob reaches — what bounds *that* gap is the separate, opt-in `idle_timeout` below. `hyper`'s own
+HTTP/1 header-read timeout is deliberately not used to close it — it re-arms on every idle
+keep-alive gap, so it would behave as an idle timeout and kill a long-interval exporter's pooled
+connection; `idle_timeout` is that bound made explicit and opt-in instead.
 
 **It is not an idle timeout, on any of them.** Once a connection has got past its pre-message
-phases, the gap before its next frame/request is deliberately unbounded — a long-lived,
-mostly-quiet sender is ordinary traffic, not a fault. A connection that goes silent *after* that
-point holds its permit indefinitely, which is a known, separately-tracked gap (see
-`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row for why closing it is its
-own piece of work). Lowering `handshake_timeout` does not help with that case; it only tightens how
-fast a connection that never said anything at all is given up on.
+phases, the gap before its next frame/request is unbounded by `handshake_timeout` — a long-lived,
+mostly-quiet sender is ordinary traffic, not a fault, so this field never closes a connection for
+going quiet after its handshake. What *does* bound that gap, opt-in and separate from this field,
+is `idle_timeout` — see the next section. Lowering `handshake_timeout` does not help with that
+case either; it only tightens how fast a connection that never said anything at all is given up on.
 
 `handshake_timeout` must be greater than `0s` (rule 45 — `0` would close every connection before
 its handshake could start), and on a `syslog_in`, `graphite_in` or `statsd_in` with
 `transport: udp` it must be left at its default: a datagram listener has no connection to hand
 shake, so a value set there is rejected at validation time rather than silently ignored.
+
+### `idle_timeout` on a TCP listener
+
+`handshake_timeout` above bounds only the *pre*-message phases. What it deliberately leaves open is
+everything after: a connection that gets past its handshake (or, on a plaintext listener, delivers
+at least one byte) and then goes quiet holds its connection-cap permit indefinitely — right up to
+the 1024-connection cap itself — with nothing closing it. `idle_timeout:` is the opt-in field that
+bounds exactly that gap, on the same five kinds `handshake_timeout` covers: `syslog_in`,
+`graphite_in`, `statsd_in` (each `transport: tcp`), `logit_in`, and `otlp_in`. See
+[ADR `idle-connection-timeout`](adr/idle-connection-timeout.md) for the full design; this section
+is the operator-facing summary.
+
+```yaml
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:6514
+    transport: tcp
+    handshake_timeout: 5s        # the default; per pre-message phase, not a total
+    idle_timeout: 5m             # off by default; see the recommendation below
+```
+
+**Off unless set.** With no value, a connection that finished its handshake and then went silent is
+never closed for silence alone — today's behaviour, unchanged. `logit validate` rejects `0s` by
+name (rule 53 — "omit the field to disable the idle timeout") and, on `syslog_in`/`graphite_in`/
+`statsd_in`, rejects any value at all under `transport: udp`, where a datagram listener has no
+connection to time out.
+
+**What it bounds, and the reset rule.** The clock runs only while the listener is waiting on the
+peer's socket, and only two things reset it: bytes actually read from the peer, and the listener
+finishing its own work on the connection — a batch handed downstream, a response completed, an
+`Ack` written. Time spent blocked handing a batch to a full downstream never counts, because the
+clock has not yet been re-armed while that block is in progress; it only starts running again once
+that work returns. A connection stalled on backpressure therefore never looks idle no matter how
+long the stall lasts, and a periodic flush tick that finds nothing to send touches neither event, so
+it never quietly re-arms the clock on its own.
+
+**Per-kind notes:**
+
+| Kind | What resets the clock | How the close happens |
+|---|---|---|
+| `syslog_in`, `graphite_in`, `statsd_in` (`transport: tcp`, the shared driver) | bytes read from the peer; an interval flush that actually emits a batch | the connection is closed directly; any complete buffered batch is flushed first |
+| `logit_in` | the handshake completing, and every `Ack` this listener writes; a peer waiting on a delayed ack is by definition not idle. A frame header whose first byte has already arrived is progress too: the absolute idle deadline bounds only the wait for that first byte, and the rest of the header — like the body — is read under the per-`read` stall bound instead, so a frame that starts arriving right at the deadline is read and acked rather than rejected after the peer already wrote it | `Reject{GOING_AWAY, "idle for <dur>"}` is written first, the same signal an ordinary shutdown sends, then the connection closes |
+| `otlp_in` | a request *completing* — hyper owns the bytes, so this is the finest grain visible here; a request head that dribbles in slower than `idle_timeout` on an otherwise-quiet keep-alive connection is closed by this rule, a documented narrowing; a stalled request *body* gets its own bound, `idle_timeout` itself, per read frame | `graceful_shutdown()` is called and the connection is polled for up to `handshake_timeout` (reused as the grace period — no new knob); if that grace elapses with nothing in flight the connection is dropped regardless of what the poll returned, and if a request arrives inside the grace instead, see the note below the table; a stalled body instead answers `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and closes the connection once the handler returns — that close is counted the same `reason="idle"` as any other, one policy close reached one path earlier |
+
+A request that arrives inside the bounded grace is served to completion, not dropped underneath
+it: the connection is kept open while a request is in flight, and the grace runs again once that
+request completes so its response actually reaches the wire — dropping it mid-flight would discard
+a batch already handed to `Fanout::send`. The cost is at most a reconnect for the *next* request on
+that connection, not a lost response or a lost batch. A silent peer cannot exploit this to hold the
+connection open indefinitely: with nothing in flight the drop still happens at the end of the
+grace, and a request body that stalls mid-upload is bounded by the same per-frame stall timeout
+regardless.
+
+**An idle close is policy, not a fault.** All five listeners return `Ok(())` from the connection
+task the same success path a graceful shutdown takes, so an idle close never reaches the
+`connection_error` diagnostic. It is counted instead: **`logit.input.connections.closed
+{reason="idle"}`** — a rising count here with no corresponding movement in `connection_error` is
+the feature doing its job, not something to investigate. Whatever the connection had already
+buffered is not silently dropped: a complete accumulated batch is flushed before the close, and a
+partial frame still sitting in the framer is counted `truncated` — the same accounting a `Failed` or
+`Shutdown` close already gets.
+
+**The client side: a pooled connection is probed before it is reused.** A server-side idle close is
+not free for a sink holding a pooled connection to it: writing into a socket the peer already
+closed either lands as `Fault::Ambiguous` (`logit_out`, whose native protocol has ack framing to
+notice the failed write) or is silently lost with no ambiguity at all (`syslog_out`, `statsd_out`,
+`graphite_out`, whose plaintext wire protocols have no way to tell the sender anything went wrong).
+Every one of those four pooled TCP sinks now polls a *reused* pooled connection once before its
+first write of a send attempt — a single non-cancellable `poll_read`, never a `timeout(read)`, since
+a timeout on a real read could cancel mid-TLS-record and discard bytes that had already arrived. An
+immediate EOF or unsolicited bytes (the only thing a peer ever sends unprompted on the native
+protocol is `logit_in`'s own `Reject{GOING_AWAY}`) drops the pooled connection and dials a fresh one
+before anything is written — the ordinary `Clean`/reconnect path, not a lost or ambiguous batch.
+This closes the common case for free: a peer that idle-timed-out and closed some time ago is caught
+before the write that would otherwise race its FIN. The residual case is the FIN racing the probe
+itself — the peer closing *while* the sink is writing — which is today's unchanged
+`Fault::Ambiguous` on `logit_out` and a genuinely silent loss on the three plaintext sinks; the probe
+narrows the window, it does not close it.
+
+**Recommendation: enable it wherever consistent traffic is expected.** On a listener receiving
+steady traffic, a connection quiet for longer than the timeout is by definition an anomaly — a dead
+peer, a half-open socket, or a slow-loris attempt — so closing it costs nothing real and returns the
+permit. Size the value comfortably above the sender's longest normal gap (several flush intervals,
+for instance), so the timeout never fires against legitimate traffic. Leave it unset only for
+genuinely sparse or bursty senders, where a long quiet period is expected and normal, and think
+twice about enabling it at all on plaintext `syslog_in`/`graphite_in`/`statsd_in`, where the sender
+has no way to learn its connection was closed.
 
 ### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
@@ -477,16 +563,17 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   `syslog_in` do, so everything in the receive-queue section above applies to it unchanged. The TCP
   driver is the same one a TCP `syslog_in` runs on, so `tls:` and `handshake_timeout:` mean exactly
   what they mean there (next bullet).
-- **`tls:` and `handshake_timeout:` are TCP-only, and behave as `syslog_in`'s do.** A `tls:` block's
-  mere presence turns TLS on and makes it required — there is no plaintext fallback on a TLS
-  listener — and `logit validate` rejects one under `transport: udp` (carbon has no DTLS receiver).
-  Plain carbon senders have no TLS of their own, so this is for a `logit`-to-`logit` or
-  stunnel-shaped relay hop. `handshake_timeout:` (default `5s`) bounds each pre-message phase
-  independently: the TLS accept when `tls:` is set, then the wait for the connection's very first
-  byte, so a TLS connection that says nothing at all costs up to two of them before its permit
-  comes back. It is **not** an idle timeout — once a connection has sent a byte, a long gap before
-  the next datapoint is ordinary carbon traffic and is not bounded at all
-  (`docs/known-gaps.md`'s "No idle-connection timeout on a TCP listener" row).
+- **`tls:`, `handshake_timeout:`, and `idle_timeout:` are TCP-only, and behave as `syslog_in`'s do.**
+  A `tls:` block's mere presence turns TLS on and makes it required — there is no plaintext
+  fallback on a TLS listener — and `logit validate` rejects one under `transport: udp` (carbon has
+  no DTLS receiver). Plain carbon senders have no TLS of their own, so this is for a `logit`-to-
+  `logit` or stunnel-shaped relay hop. `handshake_timeout:` (default `5s`) bounds each pre-message
+  phase independently: the TLS accept when `tls:` is set, then the wait for the connection's very
+  first byte, so a TLS connection that says nothing at all costs up to two of them before its
+  permit comes back. It is **not** an idle timeout — once a connection has sent a byte, the gap
+  before the next datapoint is bounded by the separate, opt-in `idle_timeout:` if one is set, and
+  unbounded if it is not; see ["`idle_timeout` on a TCP
+  listener"](#idle_timeout-on-a-tcp-listener) above.
 - **`receive:` means different halves on the two transports.** A UDP `graphite_in` takes the whole
   block. A TCP one has **no receive queue at all** — TCP's own flow control is the backpressure,
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
@@ -538,7 +625,7 @@ Two smaller behaviours worth knowing before deploying one:
 what [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml) and
 [`examples/statsd-relay.yaml`](../examples/statsd-relay.yaml) use. `transport: tcp` runs the same
 shared stream driver a TCP `syslog_in`/`graphite_in` runs on, so everything the two bullets above
-say about connections, `handshake_timeout:` and `receive:` applies here unchanged:
+say about connections, `handshake_timeout:`, `idle_timeout:` and `receive:` applies here unchanged:
 
 ```yaml
 components:
@@ -551,6 +638,7 @@ components:
       key_file: /etc/logit/tls/server.key
       client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
     handshake_timeout: 5s          # the default; per pre-message phase, tcp only
+    idle_timeout: 5m               # off by default; see "idle_timeout on a TCP listener" above
 ```
 
 - **A TCP message is one LF-delimited line, always.** There is no `framing:` field and no
@@ -990,10 +1078,14 @@ TLS); omit it to accept any client once the handshake itself completes.
 
 `otlp_in.handshake_timeout` (default 5s) bounds that handshake: a client that completes the TCP
 connect and then never sends a ClientHello is closed and its concurrency-cap permit released. It
-bounds the TLS accept and nothing after it, and it therefore only applies to a listener that has a
-`tls:` block at all (rule 45 rejects a non-default value on a plaintext one) — see
+also applies to a plaintext `otlp_in` — there is no TLS context clause rejecting it under rule 45
+the way there is on `syslog_in`/`graphite_in`/`statsd_in`'s `transport: udp` — where it bounds the
+wait for the connection's very first byte instead, via a non-consuming `TcpStream::peek` rather
+than a read, so the byte is still there for `hyper`'s own version sniff afterwards. See
 ["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above for why, and
-for what that leaves open.
+for what that leaves open — which `otlp_in.idle_timeout` (off by default) closes: see
+["`idle_timeout` on a TCP listener"](#idle_timeout-on-a-tcp-listener) above, including the note on
+a request that starts right at the idle deadline.
 
 **`tls.insecure_skip_verify`** (`otlp_out` only) disables server-certificate verification — the
 connection is still encrypted, but any certificate is accepted. `logit` logs a startup warning
@@ -1059,6 +1151,8 @@ connection's first byte, so a TLS peer that connects and then goes quiet is drop
 10s. It applies on the plaintext TCP arm too (where only the first-byte phase exists), and not at
 all under `transport: udp`. See
 ["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above.
+`syslog_in.idle_timeout` (off by default) bounds the gap after that — see ["`idle_timeout` on a TCP
+listener"](#idle_timeout-on-a-tcp-listener) above.
 
 **What to watch.** `syslog_out`: `logit.output.requests{class="ok"|"error"}` (one per attempt) and
 `logit.output.reconnects` (should stay near zero in steady state — a climbing count on a TLS
@@ -1071,9 +1165,8 @@ malformed frame all surface through
 `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
 `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}` — there is no separate
 TLS-specific counter, the same call this section's `otlp_in`/`otlp_out` paragraphs already make.
-`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, no
-`server_name` override, and no idle-connection timeout once a connection has handshaken (or, on
-plaintext, sent its first byte).
+`docs/known-gaps.md` tracks what's still open: DTLS, certificates read once at startup, and no
+`server_name` override; the post-handshake idle case is closed by `idle_timeout` above.
 
 A **TCP `graphite_in`** takes the identical `tls:` block, because it runs on the same listener
 driver ([ADR `graphite-carbon-relay`](adr/graphite-carbon-relay.md)'s 2026-09-14 amendment):
@@ -1173,7 +1266,11 @@ means *this* side gives up first, not that the connection is unsafe. That far-en
 to the TLS accept and to the `Hello` read that follows it -- so a TLS peer that connects and then
 goes silent is dropped after at most 10s, not 5s. See
 ["`handshake_timeout` on a TCP listener"](#handshake_timeout-on-a-tcp-listener) above; it is a
-pre-`Hello` bound only, never an idle timeout on an established connection.
+pre-`Hello` bound only. What bounds an already-handshaken connection that goes quiet is the
+separate, opt-in `logit_in.idle_timeout` (off by default) -- see ["`idle_timeout` on a TCP
+listener"](#idle_timeout-on-a-tcp-listener) above; a `logit_out` peer sees `Reject{GOING_AWAY,
+"idle for <dur>"}` before that close and probes for exactly that signal before reusing a pooled
+connection, so an idle-timed-out `logit_in` costs `logit_out` a reconnect, not a lost batch.
 A peer that gets `Reject{code: REJECT_INTERNAL}` from a `logit_in` at its connection cap never
 classifies it `permanent`: at the handshake (nothing of the batch written yet) it's `clean` and
 the batch is retried within `retry_budget`; once a frame has already left on that connection it's

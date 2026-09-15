@@ -200,3 +200,8 @@ all four listeners are held out for their own effort and ADR (`docs/known-gaps.m
 what that row exists to prevent. So the residual gap is now: one byte of a request head, or one
 byte of an HTTP/2 preface under `protocol: grpc` (where `http2::Builder` has no such knob at all),
 followed by silence.
+
+That effort landed as of 2026-09-14: [ADR `idle-connection-timeout`](idle-connection-timeout.md)
+gives `otlp_in` its own opt-in `idle_timeout:`, tracked at the service level (an in-flight counter,
+not an IO-level timer wrapped around this listener's `hyper` connection) rather than as the
+`header_read_timeout` shape rejected just above, closing the residual this section names.
