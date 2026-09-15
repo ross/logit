@@ -108,6 +108,37 @@ fn json_parse_wide(bencher: Bencher) {
         .bench_local_values(|event| json.process(&resource, event));
 }
 
+/// `logfmt` on `fixtures::LOGFMT_LINE` (nine fields, all zero-copy) -- the transform-level
+/// counterpart of the `logfmt-parse` load-test scenario, and `json_parse`'s sibling.
+#[divan::bench]
+fn logfmt_parse(bencher: Bencher) {
+    let resource = fixtures::resource();
+    let mut logfmt = fixtures::logfmt_parser();
+    bencher
+        .with_inputs(fixtures::logfmt_event)
+        .bench_local_values(|event| logfmt.process(&resource, event));
+}
+
+/// `kv` on `fixtures::KV_LINE` (three `a=1&b=2` pairs).
+#[divan::bench]
+fn kv_parse(bencher: Bencher) {
+    let resource = fixtures::resource();
+    let mut kv = fixtures::kv_parser();
+    bencher
+        .with_inputs(fixtures::kv_event)
+        .bench_local_values(|event| kv.process(&resource, event));
+}
+
+/// `graphite_in`'s plaintext decode of one line carrying two carbon tags
+/// (`fixtures::graphite_tagged_datagram`): the path interned per line, the two tag keys through
+/// the decoder's key cache.
+#[divan::bench]
+fn graphite_decode_tagged(bencher: Bencher) {
+    let datagram = fixtures::graphite_tagged_datagram();
+    let mut decoder = fixtures::graphite_decoder();
+    bencher.bench_local(|| decoder.decode(divan::black_box(datagram.clone())));
+}
+
 #[divan::bench]
 fn kv_metrics(bencher: Bencher) {
     let resource = fixtures::resource();

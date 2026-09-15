@@ -27,7 +27,7 @@ use super::pickle::PickleReader;
 use super::Protocol;
 use crate::{CodecError, Decoder};
 use bytes::Bytes;
-use logit_core::interner::intern;
+use logit_core::interner::{intern, KeyCache};
 use logit_core::{
     AttrMap, Diagnostics, Event, MetricKind, MetricRecord, Resource, Scope, Telemetry, Value,
 };
@@ -57,6 +57,13 @@ pub struct GraphiteDecoder {
     /// Reusable pickle machine -- stack, arenas and memo cleared per frame, never reallocated, so a
     /// warm pickle decode allocates only the caller's `Vec<Event>`.
     pickle: PickleReader,
+    /// Tag *keys* seen so far, memoised `&str -> Symbol` (`logit_core::interner::KeyCache`): a
+    /// tagged carbon stream repeats the same handful of tag names on every line, so after the
+    /// first each is one `memcmp` instead of a probe of the process-wide interner. Tag keys only
+    /// -- the metric *path* is still a plain `intern`, deliberately: paths are series names, a
+    /// stream carries thousands of distinct ones, and they would exhaust the cache's cap on the
+    /// first batch and then pay its scan on every line for nothing.
+    keys: KeyCache,
 }
 
 /// Hand-written, not derived: [`PickleReader`] is a reusable *scratch* machine, and a clone must
@@ -87,6 +94,8 @@ impl Clone for GraphiteDecoder {
             diag: self.diag.clone(),
             telemetry: self.telemetry.clone(),
             pickle: PickleReader::new(),
+            // Fresh, like `pickle`: per-stream state, warmed by the connection's own first lines.
+            keys: KeyCache::new(),
         }
     }
 }
@@ -100,6 +109,7 @@ impl GraphiteDecoder {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             pickle: PickleReader::new(),
+            keys: KeyCache::new(),
         }
     }
 
@@ -144,8 +154,8 @@ impl Decoder for GraphiteDecoder {
         // Destructured rather than reached through `self`: the pickle path hands a closure to
         // `PickleReader`, which already holds `&mut self.pickle`, so the closure cannot also
         // borrow `self`. Splitting the fields once keeps both paths reading the same way.
-        let Self { protocol, diag, telemetry, pickle, .. } = self;
-        let mut ctx = Ctx { telemetry, diag };
+        let Self { protocol, diag, telemetry, pickle, keys, .. } = self;
+        let mut ctx = Ctx { telemetry, diag, keys };
 
         match protocol {
             Protocol::Plaintext => decode_plaintext(&bytes, received_at, out, &mut ctx),
@@ -320,7 +330,7 @@ fn parse_tags<'a>(
             );
             return None;
         }
-        let key = intern(name);
+        let key = ctx.keys.get_or_intern(name);
         if attributes.get_sym(key).is_some() {
             ctx.tag_normalized_duplicate(name);
         }
@@ -387,6 +397,9 @@ fn slice_of(bytes: &Bytes, sub: &str) -> Bytes {
 struct Ctx<'a> {
     telemetry: &'a Telemetry,
     diag: &'a mut Diagnostics,
+    /// The decoder's tag-key cache (`GraphiteDecoder::keys`), carried here so [`parse_tags`]
+    /// reaches it the same way it reaches the skip counters.
+    keys: &'a mut KeyCache,
 }
 
 impl Ctx<'_> {
@@ -500,6 +513,44 @@ mod tests {
         assert_eq!(name(&events[0]), "sys.cpu", "the path stops at the first ';'");
         assert_eq!(attr(&events[0], "env").as_deref(), Some("prod"));
         assert_eq!(attr(&events[0], "host").as_deref(), Some("web-1"));
+    }
+
+    /// Tag keys go through the decoder's `KeyCache`: a second line with the same tag names in
+    /// another order is all hits (the interner doesn't grow, the cache doesn't either), while the
+    /// path is a plain `intern` every time and never enters the cache. `nextest` runs each test
+    /// in its own process, so `interner::len()` reflects only this test.
+    #[test]
+    fn repeat_tag_keys_are_cache_hits_and_paths_are_not_cached() {
+        let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default()));
+        let mut events = Vec::new();
+        let line = |s: &str| Bytes::from(s.to_string());
+        decoder
+            .decode_into(
+                line("gr.cache.a;gtag_env=prod;gtag_host=web-1 1 1700000000\n"),
+                RECEIVED_AT,
+                &mut events,
+            )
+            .expect("plaintext never fails as a whole");
+        assert_eq!(decoder.keys.len(), 2, "two tag keys, no path");
+
+        let before = logit_core::interner::len();
+        decoder
+            .decode_into(
+                line("gr.cache.a;gtag_host=web-2;gtag_env=dev 2 1700000000\n"),
+                RECEIVED_AT,
+                &mut events,
+            )
+            .expect("plaintext never fails as a whole");
+        assert_eq!(logit_core::interner::len(), before, "same path, same tag keys: nothing new");
+        assert_eq!(decoder.keys.len(), 2);
+        assert_eq!(attr(&events[1], "gtag_env").as_deref(), Some("dev"));
+        assert_eq!(attr(&events[1], "gtag_host").as_deref(), Some("web-2"));
+
+        decoder
+            .decode_into(line("gr.cache.b;gtag_env=prod 3 1700000000\n"), RECEIVED_AT, &mut events)
+            .expect("plaintext never fails as a whole");
+        assert_eq!(logit_core::interner::len(), before + 1, "a new path is interned ...");
+        assert_eq!(decoder.keys.len(), 2, "... but never cached");
     }
 
     /// Carbon's own `TaggedSeries.parse` builds a `dict`, so the last occurrence wins -- and the
