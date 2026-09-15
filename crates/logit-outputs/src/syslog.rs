@@ -197,7 +197,7 @@ use crate::stdio::render_value;
 // dials the same shape of connection: a bare `host:port` over raw TCP that may or may not be
 // TLS-wrapped. `AsyncStream` is what lets `Conn::Tcp` hold either without `SyslogOutput` becoming
 // generic; `host_only` derives the SNI name from an endpoint with no scheme to read.
-use crate::tls::{host_only, AsyncStream};
+use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 use crate::Output;
 use anyhow::Context;
 use logit_core::time::format_rfc3339_utc;
@@ -1553,6 +1553,19 @@ impl SyslogOutput {
     ///   `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
     ///   [`TcpDial::connect`], which genuinely precede every byte of the frame.
     ///
+    /// **A reused connection is probed before the first write.** A pooled connection inherited
+    /// from an earlier `send` may have been closed by the receiver in the meantime -- a graceful
+    /// shutdown, a `logit`-side `idle_timeout:` on the far end, an stunnel hop cycling -- and
+    /// plaintext syslog has no ack and no error to tell the sender so: the write lands in the
+    /// local socket buffer, this function reports the batch delivered, and the message is gone.
+    /// So a connection that came out of `*stream` (never a freshly-dialled one) gets exactly one
+    /// non-consuming `poll_read` first ([`crate::tls::poll_pending_close`], whose doc comment has
+    /// why one poll and not a cancellable `timeout(read)`); anything but "still open" drops it
+    /// and dials a fresh one with nothing written yet. That is a plain reconnect -- counted
+    /// `logit.output.reconnects` by [`TcpDial::connect`] like any other -- and it deliberately
+    /// does not consume the one post-write-failure retry below, which is about a connection that
+    /// *was* written to. `docs/adr/idle-connection-timeout.md`.
+    ///
     /// **The success path always `flush`es**, on both transports, before the connection goes back
     /// into `*stream` and this returns `Ok`. Without it a TLS batch could be reported delivered
     /// (and committed off the sink queue, `docs/adr/buffered-sink-delivery.md`) with its records
@@ -1576,7 +1589,22 @@ impl SyslogOutput {
             // Always taken out of `*stream`, never written through it directly -- see this
             // function's doc comment's cancellation-safety point.
             let mut conn: Box<dyn AsyncStream> = match stream.take() {
-                Some(conn) => conn,
+                // A *reused* connection is polled once first -- see this function's doc
+                // comment's probe paragraph. `Eof`/`Bytes` fall through to a fresh connect with
+                // nothing written, so `retried_after_a_zero_byte_failure` is deliberately *not*
+                // consumed: this is not the one retry that follows a failed write, it is a
+                // connection that was never written to at all.
+                Some(mut conn) => {
+                    let mut probe = [0u8; 1];
+                    let pending = poll_pending_close(&mut *conn, &mut probe).await;
+                    match pending {
+                        PendingClose::Open => conn,
+                        _closed => {
+                            drop(conn);
+                            dial.connect().await?
+                        }
+                    }
+                }
                 None => dial.connect().await?,
             };
 
@@ -2365,6 +2393,89 @@ mod tests {
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
     }
 
+    /// [`tcp_collector`], except every connection is closed the moment it has read anything at
+    /// all -- the shape a receiver with an idle timeout of its own, or one restarting, presents
+    /// to a sink holding a pooled connection between batches. A clean FIN, not an RST: the
+    /// collector has read everything before it closes, which is exactly the case a plaintext
+    /// sender cannot detect from a write.
+    async fn tcp_collector_that_closes_after_one_read(
+    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        {
+            let received = Arc::clone(&received);
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 8192];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        buf.truncate(n);
+                        received.lock().unwrap().push(buf);
+                    }
+                    // `stream` drops here: one message read, then a clean close.
+                }
+            });
+        }
+        (addr, received, accepts)
+    }
+
+    /// The pooled-connection probe (`SyslogOutput::send_tcp`'s doc comment;
+    /// `docs/adr/idle-connection-timeout.md`): the receiver closed the connection this sink was
+    /// holding between batches, and the second message must still arrive.
+    ///
+    /// This is the loss the probe exists to prevent, and nothing else in this file can catch it:
+    /// a write into a FIN'd socket *succeeds* locally, so without the probe `send` returns `Ok`,
+    /// the batch is committed off the sink queue, and the message is simply gone -- plaintext
+    /// syslog has no ack to lose it against. Hence the assertion on the collector's second
+    /// accept and on the message's contents, not merely on `send`'s return value.
+    #[tokio::test]
+    async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
+    ) {
+        let (addr, received, accepts) = tcp_collector_that_closes_after_one_read().await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_out", "syslog", "output");
+        let mut output =
+            SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2)).with_telemetry(telemetry);
+
+        output
+            .send(&batch_with(vec![log_event(0, "first", None)]))
+            .await
+            .expect("first send should succeed against a fresh connection");
+
+        // Let the collector's close land in this host's receive queue, so the probe has a FIN to
+        // find rather than a race to lose.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        output
+            .send(&batch_with(vec![log_event(0, "second", None)]))
+            .await
+            .expect("the probe should reconnect rather than write into a closed socket");
+
+        drop(output);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "the probe must have dialled a second connection for the second message"
+        );
+        assert_eq!(
+            reconnects_in(registry.drain(0)),
+            Some(1.0),
+            "the replacement is an ordinary reconnect, counted like any other"
+        );
+        let got = received.lock().unwrap();
+        assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
+        assert!(
+            got.iter().any(|b| String::from_utf8_lossy(b).contains("second")),
+            "the second message must actually have reached the receiver: {got:?}"
+        );
+    }
+
     /// `logit.output.reconnects`' value out of a drained [`Registry`], or `None` if the counter
     /// was never touched at all -- which is itself the assertion for a sink that has only ever
     /// connected once.
@@ -2800,13 +2911,20 @@ mod tests {
     }
 
     impl tokio::io::AsyncRead for FakeTlsStream {
-        /// `syslog_out` never reads -- immediate EOF, so this can't accidentally be depended on.
+        /// `Pending`, which is what a live, quiet stream really does: `syslog_out` reads exactly once,
+        /// non-blockingly, on a pooled connection before its first write
+        /// (`crate::tls::poll_pending_close`), and this fake stands in for a connection that is
+        /// still there -- an immediate `Ok(())` with nothing filled would be an EOF, i.e. "the
+        /// peer closed", and the probe would (rightly) replace it before any scripted write ever
+        /// happened. Nothing else here reads at all, and a waker is deliberately not registered:
+        /// anything that actually *awaited* a read on this would hang, which is a loud failure
+        /// rather than a silently wrong one.
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
             _buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
+            std::task::Poll::Pending
         }
     }
 

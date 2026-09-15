@@ -1436,8 +1436,9 @@ fn now_nanos() -> i64 {
 /// Only ever reached by a listener with no flush interval *and* no idle timeout, since otherwise
 /// the flush tick is the smaller deadline.
 ///
-/// `pub(crate)` for `crate::otlp`'s own idle deadline, which needs the identical overflow
-/// fallback -- one horizon across the crate rather than a second copy of tokio's number.
+/// `pub(crate)` because `crate::logit`'s and `crate::otlp`'s own idle deadlines want the
+/// identical fallback and tokio's copy is out of reach there too -- one definition rather than
+/// multiple 30-year constants drifting apart.
 pub(crate) fn far_future() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }

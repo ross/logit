@@ -56,6 +56,42 @@
 //! `Hello` read was bounded -- an unbounded TLS accept let a client that opened a connection and
 //! sent nothing pin a connection-limit permit forever, which at 1024 connections could turn every
 //! subsequent legitimate peer into an immediate `Reject`.
+//!
+//! **Idle timeout.** [`LogitInput::with_idle_timeout`] -- `logit_in`'s operator-facing
+//! `idle_timeout:` config field -- is off unless set, and when set bounds how long an
+//! already-handshaken connection may stay quiet before this listener closes it and hands its
+//! permit back (`docs/adr/idle-connection-timeout.md`). Unlike the pre-`Hello` budget above it is
+//! not a per-phase deadline but a rolling one, re-armed from the last thing this connection
+//! actually did.
+//!
+//! *Measured from the last `Ack` written* (or from the handshake, on a connection that has never
+//! sent a frame), never from the last frame *read* -- this protocol's own answer to what "idle"
+//! means. A peer that has sent a frame and is waiting for its `Ack` is by definition **not** idle:
+//! that ack is deliberately delayed by a slow downstream ("Ack point" above), so the party doing
+//! the work in that gap is this listener, not the peer. Stamping the clock when the `Ack` is
+//! written -- i.e. after `Fanout::send` has already returned -- is what makes "the peer went
+//! quiet" and "we are still busy with what it last sent" two structurally different states rather
+//! than two readings of the same missing byte, and it is why time blocked in `Fanout::send` can
+//! never count against a peer.
+//!
+//! *A header that has started arriving is progress too.* The clock's absolute deadline bounds
+//! only the wait for a frame's **first** byte; once one byte of the header has landed, the
+//! remaining header bytes are read under the same per-`read` bound a body gets, so a frame whose
+//! first byte arrives a moment before the deadline is read rather than rejected mid-header
+//! ([`read_header`]'s [`IdleBounds`]).
+//!
+//! *A frame body gets its own bound*, per `read` rather than in total ([`read_frame_body`]'s
+//! `stall` argument): a large frame arriving slowly but steadily is not idle either, while a peer
+//! that sends a header, half a body, and then nothing is. Both cases end the same way.
+//!
+//! *And both say so on the wire.* An idle close writes `Reject{GOING_AWAY, "idle for <dur>"}`
+//! before closing -- the same control message an ordinary shutdown sends ([`going_away`] writes
+//! them both), so a `logit_out` peer needs no new case to handle it, and `logit_out`'s own
+//! pooled-connection probe (`logit_outputs`' `poll_pending_close`) looks for exactly this before
+//! reusing a connection rather than writing a batch into a socket the peer has already closed.
+//! An idle close is policy, not a fault: [`serve_connection`] returns `Ok(())`, so the accept
+//! loop's `connection_error` diagnostic never sees it, and it is counted
+//! `logit.input.connections.closed{reason="idle"}` instead -- counted, not diagnosed.
 
 use crate::Input;
 use bytes::{Bytes, BytesMut};
@@ -109,6 +145,10 @@ pub struct LogitInput {
     listener: Option<TcpListener>,
     /// See this module's own doc comment's "Pre-`Hello` timeout" section.
     handshake_timeout: Duration,
+    /// `None` -- the default -- means no idle timeout at all, the behaviour this listener had
+    /// before the field existed. See [`Self::with_idle_timeout`] and this module's own doc
+    /// comment's "Idle timeout" section.
+    idle_timeout: Option<Duration>,
 }
 
 impl LogitInput {
@@ -122,6 +162,7 @@ impl LogitInput {
             max_connections: MAX_CONCURRENT_CONNECTIONS,
             listener: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
         }
     }
 
@@ -180,6 +221,22 @@ impl LogitInput {
         self.handshake_timeout = handshake_timeout;
         self
     }
+
+    /// Bounds how long an already-handshaken connection may stay quiet -- `logit_in`'s
+    /// `idle_timeout:` config field, and off (`None`) when never called. See this module's own
+    /// doc comment's "Idle timeout" section for why the clock is measured from the last `Ack`
+    /// rather than the last frame read, why a peer waiting on a delayed ack is never idle, and
+    /// why an idle close is counted rather than diagnosed. Graph rule 53 rejects `Some(0s)`
+    /// before it can reach here.
+    ///
+    /// Takes the `Option` rather than a bare `Duration`, so the "no idle timeout" case is one
+    /// call from a config that omitted the field rather than a caller-side `if let` --
+    /// `crate::tcp::TcpListener::with_idle_timeout`'s shape, so `logit-cli`'s `build_spec` passes
+    /// what it has straight through on every listener arm alike.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -213,6 +270,7 @@ impl Input for LogitInput {
         let live_connections = Arc::new(AtomicI64::new(0));
         let max_frame_bytes = self.max_frame_bytes;
         let handshake_timeout = self.handshake_timeout;
+        let idle_timeout = self.idle_timeout;
 
         loop {
             let (stream, _peer) = tokio::select! {
@@ -253,6 +311,7 @@ impl Input for LogitInput {
                                     telemetry.clone(),
                                     max_frame_bytes,
                                     handshake_timeout,
+                                    idle_timeout,
                                     conn_shutdown,
                                     live_connections,
                                 )
@@ -272,6 +331,7 @@ impl Input for LogitInput {
                             telemetry.clone(),
                             max_frame_bytes,
                             handshake_timeout,
+                            idle_timeout,
                             conn_shutdown,
                             live_connections,
                         )
@@ -299,7 +359,7 @@ impl Input for LogitInput {
 /// module's own "Connection limit" doc section); the `logit.input.connections` gauge only ever
 /// counts a connection that actually holds one, incremented/decremented around the `Some` arm
 /// here rather than in the accept loop.
-#[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 8 mostly-unrelated threaded-through values
+#[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 9 mostly-unrelated threaded-through values
 async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -307,6 +367,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     telemetry: Telemetry,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
     shutdown: watch::Receiver<bool>,
     live_connections: Arc<AtomicI64>,
 ) -> anyhow::Result<()> {
@@ -331,6 +392,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
         telemetry.clone(),
         max_frame_bytes,
         handshake_timeout,
+        idle_timeout,
         shutdown,
     )
     .await;
@@ -379,6 +441,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     telemetry: Telemetry,
     max_frame_bytes: u32,
     handshake_timeout: Duration,
+    idle_timeout: Option<Duration>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let negotiated = match handshake(&mut stream, max_frame_bytes, handshake_timeout).await {
@@ -389,6 +452,11 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     };
     let compression = compression_tag(negotiated.compression);
+
+    // The idle clock's origin: the handshake completing is this connection's first piece of
+    // progress, and from here on only an `Ack` write advances it -- this module's own "Idle
+    // timeout" doc section for why an `Ack` and not a frame read.
+    let mut last_progress = tokio::time::Instant::now();
 
     let mut seq: u64 = 0;
     loop {
@@ -402,11 +470,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // wouldn't catch "already true when this loop iteration started." The `Ref` temporary
         // from `borrow()` is dropped at the end of this statement, well before any `.await`.
         if *shutdown.borrow() {
-            let reject = control::Reject {
-                code: control::REJECT_GOING_AWAY,
-                message: "listener shutting down".to_string(),
-            };
-            let _ = write_control(&mut stream, &reject).await;
+            going_away(&mut stream, "listener shutting down").await;
             return Ok(());
         }
         // `shutdown.changed()` here, not `wait_for` -- `wait_for`'s `Ref` guard makes the
@@ -415,14 +479,23 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         // has no such guard and, given the explicit check just above, is equivalent here:
         // `shutdown` only ever flips false -> true once, and this receiver hasn't observed that
         // flip yet (the check above would have caught it if it had already happened).
+        //
+        // The header read is also where the idle clock is consulted -- an idle connection is one
+        // parked in exactly this read, and nothing else in the loop below waits on the peer for
+        // an unbounded time. [`IdleBounds`] is the deadline pair, if this connection has one: an
+        // absolute one for the header's first byte, a per-`read` one for the rest of it.
         let header_buf = tokio::select! {
-            result = read_header(&mut stream) => result?,
+            result = read_header(&mut stream, IdleBounds::new(last_progress, idle_timeout)) => {
+                match result {
+                    Ok(header_buf) => header_buf,
+                    Err(HeaderReadError::Idle(idle)) => {
+                        return close_idle(&mut stream, &telemetry, idle).await
+                    }
+                    Err(err) => return Err(err.into_inner()),
+                }
+            }
             _ = shutdown.changed() => {
-                let reject = control::Reject {
-                    code: control::REJECT_GOING_AWAY,
-                    message: "listener shutting down".to_string(),
-                };
-                let _ = write_control(&mut stream, &reject).await;
+                going_away(&mut stream, "listener shutting down").await;
                 return Ok(());
             }
         };
@@ -432,8 +505,14 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
         };
 
         let (header, mut payload) =
-            match read_frame_body(&mut stream, header_buf, max_frame_bytes).await {
+            match read_frame_body(&mut stream, header_buf, max_frame_bytes, idle_timeout).await {
                 Ok(v) => v,
+                // A body that stopped arriving part-way through is the same condition as a gap
+                // between frames, and ends the same way -- policy, not a fault, so no
+                // `logit.proto.errors` here (this module's "Idle timeout" doc section).
+                Err(FrameReadError::Stalled(idle)) => {
+                    return close_idle(&mut stream, &telemetry, idle).await
+                }
                 Err(FrameReadError::TooLarge(err)) => {
                     telemetry.count("logit.proto.errors", 1.0, &[("reason", "too_large")]);
                     return Err(err);
@@ -504,7 +583,44 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         seq += 1;
         write_control(&mut stream, &control::Ack { seq }).await?;
+        // The idle clock restarts here and nowhere else: stamped *after* the `Fanout::send`
+        // above and after the ack has been written, so the whole time this connection spent
+        // waiting on a full downstream is charged to this listener rather than to the peer that
+        // was waiting for the ack (this module's "Idle timeout" doc section).
+        last_progress = tokio::time::Instant::now();
     }
+}
+
+/// Writes the `Reject{GOING_AWAY, why}` this listener sends before closing a connection it has
+/// decided to end: an ordinary shutdown ("listener shutting down") and an idle close ("idle for
+/// <dur>") are the same signal to a peer, which is the point -- `logit_out` already treats
+/// `REJECT_GOING_AWAY` as transient and reconnects, so neither case needs a new code or a new
+/// case on the client side.
+///
+/// The write's own result is deliberately discarded: this connection is going away regardless,
+/// and a peer that has already vanished is not a fault worth reporting. Every caller returns
+/// `Ok(())` immediately afterward.
+async fn going_away<S: AsyncWrite + Unpin>(stream: &mut S, why: &str) {
+    let reject = control::Reject { code: control::REJECT_GOING_AWAY, message: why.to_string() };
+    let _ = write_control(stream, &reject).await;
+}
+
+/// Ends a connection that has been quiet for longer than its `idle_timeout`, or whose frame body
+/// stopped arriving for that long: tell the peer, count it, and return `Ok(())`.
+///
+/// `Ok(())`, never `Err`, because an idle close is policy rather than a fault -- an `Err` here
+/// would reach the accept loop's `connection_error` diagnostic and report a connection this
+/// listener closed *on purpose* as a problem. The counter is the signal instead
+/// (`logit.input.connections.closed{reason="idle"}`), and the connection-cap permit comes back
+/// the ordinary way, when the task ends. See this module's own "Idle timeout" doc section.
+async fn close_idle<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    telemetry: &Telemetry,
+    idle: Duration,
+) -> anyhow::Result<()> {
+    going_away(stream, &format!("idle for {idle:?}")).await;
+    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
+    Ok(())
 }
 
 /// Reads and negotiates the connection handshake: expects `Hello` within `handshake_timeout`
@@ -519,10 +635,15 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_timeout: Duration,
 ) -> anyhow::Result<Negotiated> {
     let read = tokio::time::timeout(handshake_timeout, async {
-        let Some(header_buf) = read_header(stream).await? else {
+        let Some(header_buf) =
+            read_header(stream, None).await.map_err(HeaderReadError::into_inner)?
+        else {
             anyhow::bail!("connection closed before sending Hello");
         };
-        read_frame_body(stream, header_buf, max_frame_bytes)
+        // `None`: the whole `Hello` read, header and body alike, is already inside
+        // `handshake_timeout`'s own `timeout` below, so a per-`read` stall bound here would be a
+        // second, redundant clock on the same phase.
+        read_frame_body(stream, header_buf, max_frame_bytes, None)
             .await
             .map_err(FrameReadError::into_inner)
     });
@@ -591,24 +712,112 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(Negotiated { compression, codec })
 }
 
+/// The two idle bounds a header read gets on a connection that has an `idle_timeout` -- `None`
+/// everywhere it doesn't, which is unbounded, the behaviour [`read_header`] had before either
+/// bound existed.
+///
+/// Two, and not one, because "the peer has sent nothing" and "the peer is part-way through
+/// sending a header" are different states: see [`read_header`]'s own doc comment.
+struct IdleBounds {
+    /// Absolute -- `last_progress + idle_timeout` -- and so measured from the last `Ack` rather
+    /// than restarted by each read. The deadline for the header's *first* byte only.
+    first_byte: tokio::time::Instant,
+    /// The per-`read` budget for every byte *after* the first: the configured `idle_timeout`
+    /// itself, exactly as [`read_frame_body`]'s `stall` bounds each read of a body.
+    stall: Duration,
+}
+
+impl IdleBounds {
+    /// `None` when this connection has no `idle_timeout` at all. `checked_add` because
+    /// `last_progress + idle` can overflow for an absurd (but legal) value, and rule 53 caps
+    /// nothing above `0s`.
+    fn new(last_progress: tokio::time::Instant, idle_timeout: Option<Duration>) -> Option<Self> {
+        let idle = idle_timeout?;
+        Some(Self {
+            first_byte: last_progress.checked_add(idle).unwrap_or_else(crate::tcp::far_future),
+            stall: idle,
+        })
+    }
+}
+
+/// Why [`read_header`] produced no header -- [`FrameReadError`]'s shape one step earlier in the
+/// frame, and for the same reason: an idle bound elapsing is not an error at all, it is the idle
+/// close, so a caller has to be able to tell it apart without re-parsing a message.
+enum HeaderReadError {
+    Io(anyhow::Error),
+    /// A bound elapsed -- either the wait for the header's first byte reached the connection's
+    /// absolute idle deadline, or one `read` after that byte made no progress for the whole
+    /// per-`read` budget. Carries the configured `idle_timeout` so `close_idle` can name it.
+    /// Only reachable when [`IdleBounds`] were passed.
+    Idle(Duration),
+}
+
+impl HeaderReadError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            HeaderReadError::Io(err) => err,
+            // Only for the callers that flatten both variants into one error (the handshake and
+            // the test helpers), none of which pass any bounds in the first place.
+            HeaderReadError::Idle(idle) => {
+                anyhow::anyhow!("a frame header stopped arriving for {idle:?}")
+            }
+        }
+    }
+}
+
 /// Reads exactly [`frame::HEADER_LEN`] bytes off `stream`, distinguishing "the peer closed
 /// cleanly with nothing pending" (`Ok(None)`) from "the peer closed mid-header" (a real error) --
 /// the distinction `read_exact` alone can't make, since it only reports success or failure, never
 /// how many bytes it managed before EOF. This is also exactly the step `serve_connection`'s
 /// per-frame `select!` races against `shutdown`: an idle connection is one blocked here, in the
 /// very first read of a frame boundary.
+///
+/// **Why `bounds` is two deadlines and not one.** [`IdleBounds::first_byte`] is absolute, so the
+/// wait for a frame that never starts is measured from the last `Ack` (this module's "Idle
+/// timeout" doc section) rather than restarted by each read. But once the first byte has arrived
+/// the header *is* arriving, which is progress, so every remaining read is bounded by
+/// [`IdleBounds::stall`] instead -- one `idle_timeout` budget per `read`, the same rule
+/// [`read_frame_body`] applies to a body one step later.
+///
+/// A single absolute deadline around the whole header would instead reject a frame whose first
+/// byte landed a moment before it -- discarding those bytes and answering
+/// `Reject{GOING_AWAY}` to a peer that had already started writing, which costs a `logit_out`
+/// exactly the `Fault::Ambiguous` batch the idle timeout's client-side probe exists to avoid.
+/// Nothing is lost when the first-byte deadline itself fires, since by definition no byte of this
+/// header has been read.
 async fn read_header<S: AsyncRead + Unpin>(
     stream: &mut S,
-) -> anyhow::Result<Option<[u8; frame::HEADER_LEN]>> {
+    bounds: Option<IdleBounds>,
+) -> Result<Option<[u8; frame::HEADER_LEN]>, HeaderReadError> {
     let mut buf = [0u8; frame::HEADER_LEN];
     let mut filled = 0usize;
     loop {
-        let n = stream.read(&mut buf[filled..]).await?;
+        let read = match &bounds {
+            None => stream.read(&mut buf[filled..]).await,
+            Some(bounds) if filled == 0 => {
+                match tokio::time::timeout_at(bounds.first_byte, stream.read(&mut buf[filled..]))
+                    .await
+                {
+                    Ok(read) => read,
+                    Err(_elapsed) => return Err(HeaderReadError::Idle(bounds.stall)),
+                }
+            }
+            Some(bounds) => {
+                match tokio::time::timeout(bounds.stall, stream.read(&mut buf[filled..])).await {
+                    Ok(read) => read,
+                    Err(_elapsed) => return Err(HeaderReadError::Idle(bounds.stall)),
+                }
+            }
+        };
+        let n = read.map_err(|err| HeaderReadError::Io(anyhow::Error::new(err)))?;
         if n == 0 {
             if filled == 0 {
                 return Ok(None);
             }
-            anyhow::bail!("connection closed mid-header ({filled}/{} bytes)", frame::HEADER_LEN);
+            return Err(HeaderReadError::Io(anyhow::anyhow!(
+                "connection closed mid-header ({filled}/{} bytes)",
+                frame::HEADER_LEN
+            )));
         }
         filled += n;
         if filled == frame::HEADER_LEN {
@@ -624,6 +833,12 @@ enum FrameReadError {
     Truncated(anyhow::Error),
     Crc(anyhow::Error),
     Malformed(anyhow::Error),
+    /// A single `read` of the body made no progress for the whole `stall` bound -- carrying that
+    /// duration rather than a rendered error, because this one is not an error at all: the caller
+    /// turns it into an idle close (`close_idle`), which names the duration in its `Reject` and
+    /// counts rather than diagnoses. Only reachable when a `stall` bound was passed, i.e. never
+    /// during the handshake.
+    Stalled(Duration),
 }
 
 impl FrameReadError {
@@ -633,6 +848,11 @@ impl FrameReadError {
             | FrameReadError::Truncated(e)
             | FrameReadError::Crc(e)
             | FrameReadError::Malformed(e) => e,
+            // Only for the callers that flatten every variant into one error (the handshake and
+            // the test helpers), none of which pass a `stall` bound in the first place.
+            FrameReadError::Stalled(idle) => {
+                anyhow::anyhow!("a frame body stopped arriving for {idle:?}")
+            }
         }
     }
 }
@@ -644,10 +864,19 @@ impl FrameReadError {
 /// wholesale rather than reimplementing them). Shared by the handshake (no `shutdown` to race --
 /// it's already time-bounded by [`handshake`]'s own `handshake_timeout`) and `serve_connection`'s
 /// main loop (which only races `shutdown` against the header read that precedes this).
+///
+/// `stall` bounds each individual `read` of the body, **not** the body as a whole: a large frame
+/// arriving slowly but steadily keeps making progress and is never idle, while a peer that sends
+/// a header and then half a body and stops is (this module's own "Idle timeout" doc section). It
+/// is the connection's `idle_timeout`, and `None` -- the handshake, and the test helpers -- means
+/// the untimed `read_exact` this always did. A stalled read returns [`FrameReadError::Stalled`],
+/// which `serve_connection` turns into an idle close rather than an error; `Ok(0)` still means a
+/// peer that closed mid-body, which is [`FrameReadError::Truncated`] as before.
 async fn read_frame_body<S: AsyncRead + Unpin>(
     stream: &mut S,
     header_buf: [u8; frame::HEADER_LEN],
     max_frame_bytes: u32,
+    stall: Option<Duration>,
 ) -> Result<(FrameHeader, Bytes), FrameReadError> {
     let mut header_bytes = Bytes::copy_from_slice(&header_buf);
     let header = FrameHeader::read(&mut header_bytes).map_err(|e| {
@@ -663,10 +892,33 @@ async fn read_frame_body<S: AsyncRead + Unpin>(
         )));
     }
 
+    // A fill loop rather than `read_exact`, so each individual `read` can carry the `stall`
+    // bound. The two outcomes `read_exact` folds into one `io::Error` stay distinguishable here:
+    // `Ok(0)` is a peer that closed mid-body (`Truncated`, as before) and an elapsed `stall` is a
+    // peer that simply stopped (`Stalled`, an idle close).
     let mut body = vec![0u8; header.compressed_len as usize];
-    stream.read_exact(&mut body).await.map_err(|e| {
-        FrameReadError::Truncated(anyhow::Error::new(e).context("reading a frame body"))
-    })?;
+    let mut filled = 0usize;
+    while filled < body.len() {
+        let read = match stall {
+            Some(stall) => {
+                match tokio::time::timeout(stall, stream.read(&mut body[filled..])).await {
+                    Ok(read) => read,
+                    Err(_elapsed) => return Err(FrameReadError::Stalled(stall)),
+                }
+            }
+            None => stream.read(&mut body[filled..]).await,
+        };
+        let n = read.map_err(|e| {
+            FrameReadError::Truncated(anyhow::Error::new(e).context("reading a frame body"))
+        })?;
+        if n == 0 {
+            return Err(FrameReadError::Truncated(anyhow::anyhow!(
+                "connection closed mid-body ({filled}/{} bytes)",
+                body.len()
+            )));
+        }
+        filled += n;
+    }
 
     let mut full = BytesMut::with_capacity(frame::HEADER_LEN + body.len());
     full.extend_from_slice(&header_buf);
@@ -816,9 +1068,12 @@ mod tests {
     /// Reads one whole frame off `stream` with no bound (test client trusts the server) --
     /// returns the header (so a test can check `flags`) and the decoded payload bytes.
     async fn read_frame_raw(stream: &mut TcpStream) -> (FrameHeader, Bytes) {
-        let header_buf =
-            read_header(stream).await.unwrap().expect("expected a frame, got a clean close");
-        read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN)
+        let header_buf = read_header(stream, None)
+            .await
+            .map_err(HeaderReadError::into_inner)
+            .unwrap()
+            .expect("expected a frame, got a clean close");
+        read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
             .await
             .map_err(FrameReadError::into_inner)
             .unwrap()
@@ -1332,10 +1587,13 @@ mod tests {
     async fn read_control_response_over<S: AsyncRead + Unpin>(
         stream: &mut S,
     ) -> control::ControlMessage {
-        let header_buf =
-            read_header(stream).await.unwrap().expect("expected a frame, got a clean close");
+        let header_buf = read_header(stream, None)
+            .await
+            .map_err(HeaderReadError::into_inner)
+            .unwrap()
+            .expect("expected a frame, got a clean close");
         let (header, mut payload) =
-            read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN)
+            read_frame_body(stream, header_buf, frame::MAX_SANE_UNCOMPRESSED_LEN, None)
                 .await
                 .map_err(FrameReadError::into_inner)
                 .unwrap();
@@ -1433,5 +1691,342 @@ mod tests {
             }
             other => panic!("expected Reject, got {other:?}"),
         }
+    }
+
+    // ---- idle timeout -------------------------------------------------------------------------
+    //
+    // Real durations (50-200ms), never `tokio::time::pause()`: these tests are about a timer
+    // racing a socket read, and paused time would advance straight past the read the listener is
+    // actually sitting in. The "closed" assertions read a real `Reject` frame under a 1-2s
+    // timeout against deadlines of at most 200ms; the "still open" ones assert
+    // `timeout(50ms, read) == Err(Elapsed)`, which scheduler lag can only make *more* true.
+
+    /// Reads the control frame an idle close sends and asserts it is the documented
+    /// `Reject{GOING_AWAY, "idle for <dur>"}` -- the signal a `logit_out` peer already knows how
+    /// to treat as transient, and what `logit_out`'s pooled-connection probe looks for. Bounded
+    /// generously against deadlines of at most 200ms.
+    async fn expect_reject_going_away_for_idleness(stream: &mut TcpStream, what: &str) {
+        let response = tokio::time::timeout(Duration::from_secs(2), read_control_response(stream))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: expected an idle close within 2s"));
+        match response {
+            control::ControlMessage::Reject(reject) => {
+                assert_eq!(reject.code, control::REJECT_GOING_AWAY, "{what}");
+                assert!(
+                    reject.message.contains("idle for"),
+                    "{what}: the peer should be told why: {}",
+                    reject.message
+                );
+            }
+            other => panic!("{what}: expected Reject{{GOING_AWAY}}, got {other:?}"),
+        }
+    }
+
+    /// Asserts nothing is readable on `stream` for 50ms -- this listener writes only in response
+    /// to something (a `HelloAck`, an `Ack`, a `Reject`), so on a connection that has been given
+    /// nothing to respond to, silence means "still open" and any byte at all would be the
+    /// `Reject` of a close. Lag-proof in the direction that matters: a slow scheduler makes the
+    /// read *more* likely to time out, never less.
+    async fn expect_still_open(stream: &mut TcpStream, what: &str) {
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(50), stream.read(&mut buf)).await {
+            Err(_elapsed) => {}
+            Ok(Ok(0)) => panic!("{what}: expected the connection to still be open, got a close"),
+            Ok(Ok(_)) => panic!("{what}: expected no bytes, got a frame"),
+            Ok(Err(err)) => panic!("{what}: expected the connection to still be open, got {err}"),
+        }
+    }
+
+    /// The whole point of `idle_timeout:` on this listener: a handshaken connection that then
+    /// goes quiet gives up its connection-cap permit instead of holding it forever. Proven under
+    /// `with_max_connections(1)`, so the second connection can only handshake at all if the first
+    /// one's permit genuinely came back -- and the quiet client is held (not dropped) throughout,
+    /// so nothing but the idle clock could have freed it.
+    ///
+    /// Also the pin for the two things that make this "policy, not a fault": the peer is told
+    /// with a `Reject{GOING_AWAY}` before the socket goes away, and the close is counted
+    /// `logit.input.connections.closed{reason="idle"}` while the listener's `connection_error`
+    /// diagnostic never fires (`serve_connection` returning `Ok(())`).
+    #[tokio::test]
+    async fn an_idle_handshaken_connection_gets_reject_going_away_and_releases_its_permit() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let diag = Diagnostics::new("logit_in");
+        let listener_diag = diag.clone();
+        let mut input = input
+            .with_telemetry(telemetry)
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        // Handshake, so the pre-`Hello` budget is behind us and only the idle clock can close
+        // this -- then nothing at all, with the socket held open.
+        let mut quiet = connect(&addr).await;
+        client_hello(&mut quiet, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut quiet).await;
+
+        expect_reject_going_away_for_idleness(&mut quiet, "a handshaken connection gone quiet")
+            .await;
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), quiet.read(&mut buf))
+            .await
+            .expect("the socket should close right behind the Reject")
+            .unwrap();
+        assert_eq!(n, 0, "the Reject is the last thing on this connection");
+
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            Some(1.0),
+            "an idle close is counted"
+        );
+        assert_eq!(
+            listener_diag.occurrences("connection_error"),
+            0,
+            "and never diagnosed -- an idle close returns Ok(()), so the accept loop's \
+             connection_error path must not see it"
+        );
+
+        // The permit must be back: this listener's cap is 1, and `quiet` is still alive.
+        let mut second = connect(&addr).await;
+        client_hello(&mut second, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        match read_control_response(&mut second).await {
+            control::ControlMessage::HelloAck(ack) => {
+                assert_eq!(ack.codec, native::CODEC_NATIVE_V1, "the permit came back");
+            }
+            other => panic!("expected HelloAck on the second connection, got {other:?}"),
+        }
+        drop(quiet);
+    }
+
+    /// **The test the from-the-last-`Ack` rule exists for.** A peer waiting for an `Ack` that a
+    /// full downstream is delaying is not idle -- this listener is the one working (this module's
+    /// "Ack point" and "Idle timeout" doc sections) -- so the clock must not be running while
+    /// this connection's task is parked in `Fanout::send`.
+    ///
+    /// A capacity-1 channel with nothing draining it puts it exactly there: the first batch is
+    /// buffered and acked, the second blocks. Three idle timeouts' worth of sleep must not close
+    /// the connection, and once the test drains, *both* acks arrive, in order, with no idle close
+    /// counted. A clock measured from the last frame *read*, or armed before the send, would fire
+    /// here and cost a batch that was already accepted.
+    #[tokio::test]
+    async fn a_connection_waiting_on_a_delayed_ack_is_not_closed_as_idle() {
+        let idle = Duration::from_millis(200);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_telemetry(telemetry).with_idle_timeout(Some(idle));
+        // Capacity 1: the first send is buffered, the second blocks until something receives.
+        let (sink, mut rx) = fanout_into_channel(1);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        // Two frames, neither ack read yet -- the second leaves the listener parked in
+        // `Fanout::send` with the channel full.
+        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+
+        // Long enough that a clock running across the blocked send would have fired three times.
+        tokio::time::sleep(idle * 3).await;
+
+        recv_batch(&mut rx).await; // drains the first batch, unblocking the second's send
+        assert_eq!(read_ack(&mut client).await.seq, 1, "the first ack, written long before");
+        assert_eq!(read_ack(&mut client).await.seq, 2, "and the second, after the drain");
+        recv_batch(&mut rx).await;
+
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            None,
+            "nothing was closed as idle, so the counter was never touched"
+        );
+    }
+
+    /// The other half of the reset rule: every `Ack` re-arms the clock, so a connection sending
+    /// steadily is never closed no matter how much total wall clock passes. Four frames 100ms
+    /// apart against a 200ms idle timeout -- over twice the timeout in total -- all acked in
+    /// order, and only *then*, once the sending stops, does the idle close arrive. Without the
+    /// per-ack reset the third frame would land on a closed socket.
+    #[tokio::test]
+    async fn the_idle_clock_restarts_from_each_ack() {
+        let (addr, input) = bound_input().await;
+        let mut input = input.with_idle_timeout(Some(Duration::from_millis(200)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        for expected_seq in 1..=4u64 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+            assert_eq!(read_ack(&mut client).await.seq, expected_seq);
+            recv_batch(&mut rx).await;
+        }
+
+        // Now stop. The clock has only ever been armed from the last ack, so this is the first
+        // gap that can reach 200ms.
+        expect_reject_going_away_for_idleness(&mut client, "a connection that stopped sending")
+            .await;
+    }
+
+    /// **The other side of the stall test below.** A header whose *first* byte lands just inside
+    /// the idle deadline and whose remaining bytes land just outside it must be read, not
+    /// rejected: the header arriving at all is progress, so from that byte on the bound is
+    /// per-`read` rather than the absolute deadline ([`read_header`]'s [`IdleBounds`]).
+    ///
+    /// A single absolute deadline around the whole header fails this twice over -- it discards
+    /// the bytes already read *and* answers `Reject{GOING_AWAY}` to a peer that had already
+    /// started writing a frame, which a `logit_out` reads as `Fault::Ambiguous` for a batch it
+    /// then drops under the default at-most-once posture. Exactly the loss the client-side probe
+    /// exists to avoid, reintroduced from the listener side.
+    ///
+    /// 80ms then 60ms against a 100ms idle timeout: the first byte lands comfortably inside the
+    /// deadline and the rest comfortably outside it, with each gap well under the 100ms
+    /// per-`read` budget that now applies.
+    #[tokio::test]
+    async fn a_frame_header_that_starts_arriving_at_the_idle_deadline_is_read_not_rejected() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let mut encoder = NativeEncoder::new(Compression::None);
+        let framed = encoder.encode(&sample_batch()).unwrap();
+
+        // 80ms of the 100ms deadline spent, then one byte of the header -- progress.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client.write_all(&framed[..1]).await.unwrap();
+        // 60ms more, so 140ms since the handshake: past the absolute deadline, but only 60ms
+        // since the byte that reset the per-`read` budget.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.write_all(&framed[1..]).await.unwrap();
+
+        assert_eq!(
+            read_ack(&mut client).await.seq,
+            1,
+            "a frame whose header started arriving before the deadline must be acked"
+        );
+        assert_eq!(recv_batch(&mut rx).await.events.len(), 1);
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            None,
+            "and nothing closed as idle"
+        );
+    }
+
+    /// And the failure side of that same per-`read` bound: a header that starts arriving and then
+    /// stops is still closed. Switching to the per-`read` budget after the first byte must not
+    /// turn a half-written header into an unbounded wait -- that would hand back the very permit
+    /// leak the feature exists to close, one byte inside a frame.
+    #[tokio::test]
+    async fn a_frame_header_that_starts_and_then_stalls_is_closed_as_idle() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        let mut encoder = NativeEncoder::new(Compression::None);
+        let framed = encoder.encode(&sample_batch()).unwrap();
+        // One byte of the header, then nothing at all -- progress once, and never again.
+        client.write_all(&framed[..1]).await.unwrap();
+
+        expect_reject_going_away_for_idleness(&mut client, "a header that stopped arriving").await;
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            Some(1.0)
+        );
+        assert!(rx.try_recv().is_err(), "a one-byte header must never produce a batch");
+    }
+
+    /// A frame body that stops arriving part-way through is the same condition as a gap between
+    /// frames, and ends the same way -- a `Reject{GOING_AWAY}` and a counted idle close, never an
+    /// `Ack` for the half-arrived frame and never a batch downstream. Without the per-`read`
+    /// stall bound the listener's `read_exact` would wait here forever, holding its permit: the
+    /// gap the whole feature exists to close, one frame deeper.
+    #[tokio::test]
+    async fn a_frame_body_that_stalls_is_closed_as_idle_with_no_ack() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        let mut input =
+            input.with_telemetry(telemetry).with_idle_timeout(Some(Duration::from_millis(100)));
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        // A real, well-formed frame -- header, declared lengths, CRC and all -- of which only the
+        // header and one body byte are ever written. The listener parses the header, sizes the
+        // body, and then reads a body that never finishes arriving.
+        let mut encoder = NativeEncoder::new(Compression::None);
+        let framed = encoder.encode(&sample_batch()).unwrap();
+        assert!(framed.len() > frame::HEADER_LEN + 1, "the fixture needs a multi-byte body");
+        client.write_all(&framed[..frame::HEADER_LEN + 1]).await.unwrap();
+
+        expect_reject_going_away_for_idleness(&mut client, "a frame body that stopped arriving")
+            .await;
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            Some(1.0),
+            "a stalled body is counted exactly like an idle gap between frames"
+        );
+        assert!(rx.try_recv().is_err(), "a half-arrived frame must never be decoded or forwarded");
+    }
+
+    /// The default, and what every config without an `idle_timeout:` keeps getting: no bound at
+    /// all on the gap between frames, so a handshaken `logit_out` peer with nothing to send stays
+    /// connected indefinitely. The `None` arm has to produce a deadline that never fires --
+    /// `read_header_before_idle`'s unwrapped read -- and the connection has to still *work*
+    /// afterward, not merely be unclosed.
+    #[tokio::test]
+    async fn no_idle_timeout_leaves_a_handshaken_connection_open() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
+        let (addr, input) = bound_input().await;
+        // No `with_idle_timeout` call at all -- the shape every caller that never sets the field
+        // produces.
+        let mut input = input.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut client = connect(&addr).await;
+        client_hello(&mut client, vec![native::CODEC_NATIVE_V1], vec![0]).await;
+        let _ = read_control_response(&mut client).await;
+
+        // Longer than any idle timeout in this section, with nothing sent at all.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        expect_still_open(&mut client, "a quiet connection with no idle_timeout").await;
+
+        send_data_frame(&mut client, &sample_batch(), Compression::None).await;
+        assert_eq!(read_ack(&mut client).await.seq, 1, "and still serving frames");
+        recv_batch(&mut rx).await;
+
+        assert_eq!(
+            drained_counter(&registry, "logit.input.connections.closed", ("reason", "idle")),
+            None,
+            "nothing was closed as idle, so the counter was never touched"
+        );
     }
 }

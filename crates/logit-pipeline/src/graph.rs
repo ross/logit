@@ -2142,8 +2142,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // One loop over every kind that carries the field, rule 43's one-rule-for-every-listener
     // shape: the check, the message and the reasoning are identical on all of them and only the
     // `transport` spelling differs -- and on a kind with no datagram transport at all there is
-    // nothing to spell, which is why `otlp_in`'s arm reports `false` rather than reading a field.
-    // `logit_in` joins by adding an arm with the PR that makes it honour the field.
+    // nothing to spell, which is why `logit_in`'s and `otlp_in`'s arms report `false` rather than
+    // reading a field: `logit_in` has no `transport:` at all (it is TCP by construction), and
+    // `otlp_in`'s `protocol` picks HTTP or gRPC over TCP, not a datagram alternative. Only the
+    // zero check can ever fire on either.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -2155,8 +2157,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             ComponentKind::StatsdIn { idle_timeout, transport, .. } => {
                 ("statsd_in", *idle_timeout, *transport == StatsdTransport::Udp)
             }
-            // No transport clause: `otlp_in` is TCP either way -- `protocol` picks HTTP or gRPC
-            // over it, not a datagram alternative -- so only the zero check can reject here.
+            ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
             ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
             _ => continue,
         };
@@ -5461,6 +5462,7 @@ mod tests {
             tls: None,
             max_frame_bytes,
             handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
         }
     }
 
@@ -5471,6 +5473,20 @@ mod tests {
             tls: None,
             max_frame_bytes: None,
             handshake_timeout,
+            idle_timeout: None,
+        }
+    }
+
+    /// Rule 53's `logit_in` shape -- the `Option` that rule reads. No `transport:` to vary,
+    /// unlike its three siblings: a `logit_in` is TCP by construction, so the rule's context
+    /// check can never fire here and only the zero one can.
+    fn logit_in_with_idle_timeout(idle_timeout: Option<Duration>) -> ComponentKind {
+        ComponentKind::LogitIn {
+            bind: "0.0.0.0:5140".to_string(),
+            tls: None,
+            max_frame_bytes: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout,
         }
     }
 
@@ -5808,9 +5824,20 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
-    /// `otlp_in` has no datagram transport to reject a value under, so the zero check is the only
-    /// half of this rule that can fire on it -- and it fires with the identical message, off the
-    /// same loop body.
+    /// The same check on the one kind with no `transport:` to pair it with -- a `logit_in` is TCP
+    /// by construction, so `0s` is the only way rule 53 can reject one of these.
+    #[test]
+    fn a_zero_idle_timeout_is_rejected_on_a_logit_in() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], logit_in_with_idle_timeout(Some(Duration::ZERO))),
+            ("out", vec!["in"], sink()),
+        ]));
+        assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
+    }
+
+    /// `otlp_in` has no datagram transport to reject a value under either, so the zero check is
+    /// the only half of this rule that can fire on it -- and it fires with the identical message,
+    /// off the same loop body.
     #[test]
     fn a_zero_idle_timeout_is_rejected_on_an_otlp_in() {
         let err = expect_err(cfg(vec![
@@ -5888,6 +5915,7 @@ mod tests {
             syslog_in_with_idle_timeout(SyslogTransport::Tcp, Some(Duration::from_secs(300))),
             graphite_in_with_idle_timeout(GraphiteTransport::Tcp, Some(Duration::from_secs(300))),
             statsd_in_with_idle_timeout(StatsdTransport::Tcp, Some(Duration::from_secs(300))),
+            logit_in_with_idle_timeout(Some(Duration::from_secs(300))),
             otlp_in_with_idle_timeout(Some(Duration::from_secs(300))),
         ] {
             resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
@@ -7501,6 +7529,7 @@ mod tests {
             tls: None,
             max_frame_bytes: None,
             handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
         };
         let graph = resolve(cfg(vec![
             ("gen", vec![], generate_in_with_counts(Some(2_000_000), 100, None)),
