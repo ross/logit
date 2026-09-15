@@ -1670,14 +1670,16 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// on the runtime's own worker threads and never nests inside another `.await`. `fanout.send`
 /// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
 ///
-/// Unlike `Transform::flush`, a Lua `flush()` has no resource (or scope) of its own to stamp its
-/// emitted events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource`/
-/// `last_scope` default to whichever resource/scope this component most recently saw on a real
-/// batch (a fresh resource, and no scope, if none has arrived yet), but a script that writes
-/// `resource` and/or `scope` inside `process()` or `flush()` (`crates/logit-script/src/resource.rs`,
-/// `crates/logit-script/src/scope.rs`, `docs/adr/operator-declared-resource-attributes.md`)
-/// overrides that default explicitly -- see `flush_now`'s `take_resource`/`take_scope` calls
-/// below.
+/// **A Lua `flush()` runs in a root context** (`docs/adr/lua-flush-root-context.md`): it is the
+/// result of no one event or batch, so before every `flush()` call this node resets the script's
+/// four batch-scoped globals to what a stand-alone emission genuinely is -- `trace` to the fresh
+/// root the emission is sent under, `provenance` to this component as both `origin` and
+/// `previous` (exactly what `Fanout::stamp` writes on the outgoing batch), `resource` to empty,
+/// and `scope` to none. A script that writes `resource` and/or `scope` inside `flush()`
+/// (`crates/logit-script/src/resource.rs`, `crates/logit-script/src/scope.rs`) gives the emission
+/// a real identity; one that doesn't emits under the empty root -- see `flush_now`'s
+/// `take_resource`/`take_scope` calls below. Nothing from the most recently processed batch
+/// carries over, by design.
 ///
 /// **A Lua node is also a router** (`docs/adr/target-components.md`): `targets` is the component's
 /// `targets:` list in `graph::targets_of` slot order -- handed to the VM as `event:to("..")`'s
@@ -1723,13 +1725,16 @@ fn run_lua(
     let mut diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
 
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
-    let mut last_resource = Arc::new(Resource::default());
-    // `flush_now`'s default identity for a scope-less flush-driven emission -- the same
-    // "whichever batch was last seen" approximation `last_resource` uses, but (W7) a script that
-    // writes `scope` inside `process()`/`flush()` (`crates/logit-script/src/scope.rs`) overrides
-    // this default explicitly, exactly the way `resource` already does -- see `flush_now`'s
-    // `take_scope` call below.
-    let mut last_scope: Option<Arc<Scope>> = None;
+    // The root a `flush()` runs in (this function's own doc comment): one empty resource shared
+    // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
+    // own id as both halves of the provenance -- the identical value `Fanout::stamp` would fill
+    // an empty provenance in with, pre-filled here so what the script reads as
+    // `provenance.origin`/`.previous` *is* what the emitted batch carries, by construction rather
+    // than by two code paths agreeing (`stamp` is idempotent over it: `get_or_insert` on an
+    // already-set `origin`, and `previous` overwritten with the same id).
+    let root_resource = Arc::new(Resource::default());
+    let me = logit_core::interner::intern(&id);
+    let flush_provenance = logit_core::Provenance { origin: Some(me), previous: Some(me) };
 
     // The same node-owned, reused per-destination buffers a native `Router` uses
     // (`RouterScratch`'s own doc comment has the allocation accounting) -- shared by the batch
@@ -1742,10 +1747,11 @@ fn run_lua(
     // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
     // `fanout.rs`'s own doc comment), same reasoning as `run_flush`'s: a Lua `flush()`'s emission
     // has no single incoming batch to call its parent -- worse than `Transform::flush`, even,
-    // since there's no accumulator here at all to eventually attribute it to (`docs/known-gaps.md`'s
-    // internal-spans entry, and the existing resource-stamping gap this same imprecision already
-    // has: `last_resource` above is the identical shape of approximation, just for `Resource`
-    // instead of `TraceContext`).
+    // since there's no accumulator here at all to eventually attribute it to
+    // (`docs/adr/lua-flush-root-context.md`). The script sees that same root: every batch-scoped
+    // global is reset to it before `flush()` runs, so a script reading `trace`/`provenance`/
+    // `resource`/`scope` inside `flush()` reads what its emission will actually go out as, not
+    // whatever the last `process()` batch happened to leave behind.
     //
     // Takes `diag` as a parameter rather than capturing it: the loop body below also needs its
     // own `&mut diag` (for `script_error`), and a closure capturing it by unique reference would
@@ -1753,15 +1759,10 @@ fn run_lua(
     // same goes for `scratch`, whose per-destination buffers the batch path below also fills.
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
-                     resource: &mut Arc<Resource>,
-                     scope: &mut Option<Arc<Scope>>,
                      fanout: &Fanout,
                      target_fanouts: &[Fanout],
                      scratch: &mut RouterScratch| {
-        // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
-        // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
-        // so `Fanout::stamp` fills in both as this component's own id.
-        let ctx: BatchContext = TraceContext::new_root().into();
+        let ctx = BatchContext { trace: TraceContext::new_root(), provenance: flush_provenance };
         let mut span = telemetry.span(
             "flush",
             SpanKind::Internal,
@@ -1769,24 +1770,30 @@ fn run_lua(
             ctx.trace.span_id,
             None,
         );
+        // The root the script sees -- same four setters, same order, same failure handling as
+        // the per-batch path below, just fed the root instead of an incoming batch.
+        if let Err(err) = worker.set_trace_context(ctx.trace.trace_id, ctx.trace.span_id) {
+            diag.warn_throttled(
+                "trace_context_error",
+                format_args!("setting trace context failed: {err}"),
+            );
+        }
+        worker.set_provenance(ctx.provenance);
+        worker.set_resource(&root_resource);
+        worker.set_scope(&None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
         let result = worker.flush();
         drop(timer);
         // A `flush()` that wrote `resource` (`crates/logit-script/src/resource.rs`) commits that
-        // write here -- the one way a flush-driven emission can carry a real identity instead of
-        // `last_resource`'s "whichever batch was last seen" approximation (`docs/known-gaps.md`'s
-        // Lua-flush-staleness entry).
-        if let Some(new_resource) = worker.take_resource() {
-            *resource = new_resource;
-        }
-        // A `flush()` that wrote `scope` (`crates/logit-script/src/scope.rs`) commits that write
-        // here too, the same way as `resource` just above -- `take_scope` always returns `Some`
-        // once written, never `None`-meaning-"clear", so this only ever narrows toward a real
-        // scope, never back to `None`.
-        if let Some(new_scope) = worker.take_scope() {
-            *scope = Some(new_scope);
-        }
+        // write here -- the one way a flush-driven emission carries a real identity instead of
+        // the empty root it otherwise goes out under. `None` means the script never wrote it, so
+        // the root moves through as an `Arc` clone, no allocation -- the same `unwrap_or` shape
+        // the batch path below uses for the incoming batch's own resource.
+        let resource = worker.take_resource().unwrap_or_else(|| root_resource.clone());
+        // Same for `scope` (`crates/logit-script/src/scope.rs`): `take_scope` returns `Some` only
+        // once written, so an untouched `scope` stays the root's `None`.
+        let scope = worker.take_scope();
         // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
         // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
         // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
@@ -1811,8 +1818,8 @@ fn run_lua(
                     &mut scratch.dests,
                     fanout,
                     target_fanouts,
-                    resource,
-                    scope,
+                    &resource,
+                    &scope,
                     ctx,
                     &telemetry,
                 );
@@ -1831,15 +1838,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(
-                    &mut diag,
-                    &worker,
-                    &mut last_resource,
-                    &mut last_scope,
-                    &fanout,
-                    &target_fanouts,
-                    &mut scratch,
-                );
+                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1863,15 +1862,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(
-                    &mut diag,
-                    &worker,
-                    &mut last_resource,
-                    &mut last_scope,
-                    &fanout,
-                    &target_fanouts,
-                    &mut scratch,
-                );
+                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
             }
             return;
         };
@@ -1909,10 +1900,9 @@ fn run_lua(
         // involved and so nothing that can fail.
         worker.set_provenance(parent.provenance);
         let batch = unwrap_batch(batch);
-        // Lets the script's own `process()`/`flush()` read (and write) `resource`
+        // Lets the script's own `process()` read (and write) `resource`
         // (`crates/logit-script/src/resource.rs`) -- called on every batch, including one whose
-        // every event errors, so a later `flush()` never reads a stale identity because this
-        // batch happened to produce nothing.
+        // every event errors, so a write left over from the previous batch is always cleared.
         worker.set_resource(&batch.resource);
         // Same reasoning, for `scope` (`crates/logit-script/src/scope.rs`) -- `batch.scope` is
         // `Option`al (not every batch carries one), which `set_scope` itself handles.
@@ -1992,8 +1982,6 @@ fn run_lua(
         // need an owned default `Scope` to unwrap into, and there isn't a sensible one -- `None`
         // is the correct fallback, not `Scope::default()`).
         let scope = worker.take_scope().or_else(|| batch.scope.clone());
-        last_resource = resource.clone();
-        last_scope = scope.clone();
         // One send per non-empty destination, all under the one `ctx` minted above -- one
         // incoming batch is one hop however many ways it forks, the same rule `run_router`
         // applies.
@@ -7646,6 +7634,269 @@ mod tests {
         assert!(
             rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(),
             "the flush marked its event for a, so the component's own consumer sees nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A Lua `flush()` runs in a root context (`docs/adr/lua-flush-root-context.md`)
+    // -----------------------------------------------------------------------------------------
+
+    /// A pass-through `Transform` that reports every batch's [`TraceContext`] and [`Provenance`]
+    /// to the test -- `RecordProvenance`'s shape, widened to the trace half, since the flush
+    /// tests below need to compare what a script *read* inside `flush()` against what its
+    /// emission actually went out under, and `Output::send` never sees the context.
+    struct RecordDelivered {
+        ctx_tx: std::sync::mpsc::Sender<TraceContext>,
+        prov_tx: std::sync::mpsc::Sender<Provenance>,
+    }
+
+    impl Transform for RecordDelivered {
+        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+            Some(event)
+        }
+
+        fn observe_batch_context(&mut self, ctx: TraceContext) {
+            let _ = self.ctx_tx.send(ctx);
+        }
+
+        fn observe_provenance(&mut self, provenance: Provenance) {
+            let _ = self.prov_tx.send(provenance);
+        }
+    }
+
+    fn hex_id(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn attr_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// Runs `in -> windowed (this `script`, with an interval) -> watcher -> out` with `input` as
+    /// the one and only batch, until the input finishes and the close-time flush has fired.
+    /// Returns, in delivery order, every `(context, provenance)` the watcher observed and every
+    /// batch the sink received -- index-aligned, since one watcher sits on the one path between
+    /// the Lua node and the sink.
+    async fn run_lua_flush_probe(
+        script: &str,
+        input: EventBatch,
+    ) -> (Vec<(TraceContext, Provenance)>, Vec<EventBatch>) {
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                },
+            ),
+            (
+                "windowed",
+                vec!["in"],
+                vec![],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+            (
+                "watcher",
+                vec!["windowed"],
+                vec![],
+                ComponentKind::Lua { script: String::new(), interval: None },
+            ),
+            ("out", vec!["watcher"], vec![], influxdb_out()),
+        ]);
+
+        let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
+        let (prov_tx, prov_rx) = std::sync::mpsc::channel();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(input) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+        );
+        specs.insert(
+            "watcher".to_string(),
+            NodeSpec::Transform(Box::new(RecordDelivered { ctx_tx, prov_tx })),
+        );
+        specs.insert("out".to_string(), recording_sink(out_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let contexts: Vec<TraceContext> = ctx_rx.try_iter().collect();
+        let provenances: Vec<Provenance> = prov_rx.try_iter().collect();
+        assert_eq!(contexts.len(), provenances.len(), "one context and one provenance per batch");
+        let batches: Vec<EventBatch> = out_rx.try_iter().collect();
+        assert_eq!(batches.len(), contexts.len(), "the watcher and the sink see the same batches");
+        (contexts.into_iter().zip(provenances).collect(), batches)
+    }
+
+    /// Stashes a clone in `process()` (which also passes the original through, so the process
+    /// path's batch reaches the sink too) and re-emits it from `flush()`, tagging each with what
+    /// the script could see of `trace`/`provenance` at that moment.
+    const FLUSH_PROBE_SCRIPT: &str = r#"
+        local pending = nil
+        local function stamp(e, phase)
+            e.attributes["phase"] = phase
+            e.attributes["seen_trace_id"] = trace.trace_id
+            e.attributes["seen_span_id"] = trace.span_id
+            e.attributes["seen_origin"] = provenance.origin
+            e.attributes["seen_previous"] = provenance.previous
+            e.attributes["seen_component"] = provenance.component
+            return e
+        end
+        function process(event)
+            pending = event:clone()
+            return stamp(event, "process")
+        end
+        function flush()
+            if pending then
+                local e = pending
+                pending = nil
+                return {stamp(e, "flush")}
+            end
+            return {}
+        end
+    "#;
+
+    fn upstream_batch() -> EventBatch {
+        let mut resource = Resource::default();
+        resource.attributes.insert("service.name", "upstream");
+        EventBatch {
+            resource: Arc::new(resource),
+            scope: Some(Arc::new(Scope {
+                name: "upstream-lib".into(),
+                version: "1".into(),
+                attributes: AttrMap::new(),
+                dropped_attributes_count: 0,
+                schema_url: None,
+            })),
+            events: vec![tagged_event("stashed", None)],
+        }
+    }
+
+    /// The flushed batch goes out under an empty resource and no scope -- not the last processed
+    /// batch's, which the process path's own batch (first to arrive) still carries untouched.
+    #[tokio::test]
+    async fn lua_flush_resource_and_scope_start_empty_not_last_seen() {
+        let (_, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+        assert_eq!(attr_str(&processed.events[0], "phase"), Some("process"));
+        assert_eq!(
+            processed.resource.attributes.get("service.name").and_then(|v| v.as_str()),
+            Some("upstream"),
+            "the process path keeps the incoming batch's resource"
+        );
+        assert!(processed.scope.is_some(), "the process path keeps the incoming batch's scope");
+
+        assert_eq!(attr_str(&flushed.events[0], "phase"), Some("flush"));
+        assert!(
+            flushed.resource.attributes.is_empty(),
+            "a flush runs in a root context: empty resource, got {:?}",
+            flushed.resource
+        );
+        assert!(flushed.scope.is_none(), "a flush runs in a root context: no scope");
+    }
+
+    /// A `resource`/`scope` write inside `flush()` is the one way a flush-driven emission carries
+    /// either -- committed onto the flushed batch exactly as a `process()`-time write would be.
+    #[tokio::test]
+    async fn lua_flush_resource_and_scope_written_inside_flush_are_honoured() {
+        let script = r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    resource["service.name"] = "from-flush"
+                    scope.name = "from-flush-lib"
+                    return {e}
+                end
+                return {}
+            end
+        "#;
+        let (_, batches) = run_lua_flush_probe(script, upstream_batch()).await;
+        let [flushed] = batches.as_slice() else {
+            panic!("process() drops, so only the flushed batch should arrive, got {batches:?}");
+        };
+        assert_eq!(
+            flushed.resource.attributes.get("service.name").and_then(|v| v.as_str()),
+            Some("from-flush")
+        );
+        let scope = flushed.scope.as_ref().expect("the scope written in flush() should be carried");
+        assert_eq!(&scope.name[..], b"from-flush-lib");
+    }
+
+    /// Inside `flush()`, `provenance.origin`/`.previous` are both this component -- what the
+    /// flushed batch is stamped with on the way out -- while `process()` still sees the incoming
+    /// batch's own provenance.
+    #[tokio::test]
+    async fn lua_flush_sees_its_own_component_as_origin_and_previous() {
+        let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+
+        let seen = &processed.events[0];
+        assert_eq!(attr_str(seen, "seen_origin"), Some("in"), "process() sees the listener");
+        assert_eq!(attr_str(seen, "seen_previous"), Some("in"));
+        assert_eq!(attr_str(seen, "seen_component"), Some("windowed"));
+
+        let seen = &flushed.events[0];
+        assert_eq!(attr_str(seen, "seen_origin"), Some("windowed"), "a flush is its own origin");
+        assert_eq!(attr_str(seen, "seen_previous"), Some("windowed"));
+        assert_eq!(attr_str(seen, "seen_component"), Some("windowed"));
+        let (_, stamped) = &observed[1];
+        assert_eq!(symbol_name(stamped.origin).as_deref(), Some("windowed"));
+        assert_eq!(symbol_name(stamped.previous).as_deref(), Some("windowed"));
+    }
+
+    /// Inside `flush()`, `trace` is the fresh root the flushed batch is actually sent under --
+    /// the very ids the watcher observes on it -- and not the last processed batch's context.
+    #[tokio::test]
+    async fn lua_flush_sees_the_fresh_root_trace_context_it_is_sent_under() {
+        let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [(process_ctx, _), (flush_ctx, _)] = observed.as_slice() else {
+            panic!("expected two observed contexts, got {}", observed.len());
+        };
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+
+        // The process path: the script reads the *incoming* batch's context, and the outgoing
+        // batch is its child -- same trace, different span.
+        let seen = &processed.events[0];
+        assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&process_ctx.trace_id).as_str()));
+        assert_ne!(attr_str(seen, "seen_span_id"), Some(hex_id(&process_ctx.span_id).as_str()));
+
+        // The flush: what the script read *is* the root the batch went out under, both halves.
+        let seen = &flushed.events[0];
+        assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&flush_ctx.trace_id).as_str()));
+        assert_eq!(attr_str(seen, "seen_span_id"), Some(hex_id(&flush_ctx.span_id).as_str()));
+        assert_ne!(
+            flush_ctx.trace_id, process_ctx.trace_id,
+            "a flush is a new root, unrelated to the batch that fed it"
         );
     }
 }

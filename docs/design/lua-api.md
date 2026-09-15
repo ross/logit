@@ -129,7 +129,12 @@ end
 `process` runs once per event. `flush` runs on the interval configured for that pipeline stage and
 is how the aggregator ([docs/design/data-model.md](data-model.md)'s mergeable metric kinds) turns
 accumulated state into emitted events — this is why the flush/timer contract needs to exist in the
-pipeline design now rather than being bolted on when aggregation is implemented.
+pipeline design now rather than being bolted on when aggregation is implemented. **`flush()` runs
+in a root context** ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)): it is the
+result of no one event or batch, so `trace`, `provenance`, `resource` and `scope` are reset before
+every call — a fresh trace root, this component as its own provenance, an empty resource, no scope
+— rather than left at whatever the last `process()` batch set. Each global's section below says
+what that means for it.
 
 **An event handle — and its `event.attributes` handle — is consumed once the event is returned
 from `process()` or included in a `flush()` table** — don't keep using a Lua variable referencing
@@ -301,16 +306,16 @@ the other (`event.log.trace_id = trace.trace_id`, stamping a log with "which `lo
 this line") is a deliberate choice a script can make; `logit` never does it on its own -- see
 [ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
 
-**Stale during `flush()`.** `trace` is *not* updated around a `flush()` call -- it keeps whatever
-the most recently processed batch set (see this crate's own known-gaps entry). A `flush()`-driven
-emission has no single incoming batch to attribute itself to -- however many batches contributed to
-whatever a stateful script is about to flush, `logit` has no way to know, and doesn't try to guess.
-A script that wants better than "whichever batch was last seen" needs to track contributing
-contexts itself, inside its own `process()` -- the values are genuinely there to read, `logit` just
-doesn't aggregate them on the script's behalf the way
-`docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking does for the native
-`aggregate` transform. `resource`, below, has the same default staleness at a flush tick, but --
-unlike `trace` -- a script can override it explicitly.
+**Inside `flush()`, `trace` is the fresh root the flushed batch is sent under** -- not the last
+processed batch's context ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)). A
+`flush()`-driven emission has no single incoming batch to attribute itself to -- however many
+batches contributed to whatever a stateful script is about to flush, `logit` has no way to know,
+and doesn't try to guess -- so what the script reads is exactly what its emission goes out as: a
+new `trace_id`, and the `span_id` of this node's own `flush` span. A script that wants to relate a
+flush to the batches that fed it tracks contributing contexts itself, inside its own `process()`
+-- the values are genuinely there to read, `logit` just doesn't aggregate them on the script's
+behalf the way `docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking does for
+the native `aggregate` transform.
 
 ## Reading provenance
 
@@ -343,10 +348,11 @@ no field" split `event.has_log`/`event.log`'s fields already use, so a write to 
 
 `provenance.origin`/`.previous` are set once per incoming batch, before any of its events reach
 `process()` -- the same timing `trace` uses. `provenance.component` is fixed for this worker's
-whole lifetime, set once when the pipeline starts. **Stale during `flush()`**, the same way `trace`
-is: `provenance.origin`/`.previous` keep whatever the most recently processed batch set, since a
-flush-driven emission has no single incoming batch to attribute itself to (see "Reading trace
-context" above for the full reasoning, and `docs/known-gaps.md`).
+whole lifetime, set once when the pipeline starts. **Inside `flush()`, `origin` and `previous` are
+both this component** -- `provenance.origin == provenance.previous == provenance.component` -- the
+root a flush-driven emission runs in, and exactly what the flushed batch is stamped with on the
+way out ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)); see "Reading trace
+context" above for the same rule on `trace`.
 
 `provenance` carries no application meaning on its own -- a script that wants it in the outgoing
 data copies it into an attribute explicitly (`event.attributes["source.origin"] =
@@ -376,7 +382,8 @@ including any events already processed earlier in the same batch -- `resource` i
 state, not per-event. A script that wants a per-event identity uses `event.attributes` instead.
 Writes made at a script's top level, before any batch has arrived, are silently discarded once the
 first batch's `set_resource` call resets `resource` -- write inside `process()`/`flush()`, not at
-load time. `resource` starts empty, the same all-clear starting point `trace` has.
+load time. `resource` starts empty, the same all-clear starting point `trace` has, and is reset to
+empty again before every `flush()` call (next paragraph but one).
 
 **Copy-on-write, so a script that never touches `resource` costs nothing.** Reading or writing
 `event.attributes` on an event a script doesn't otherwise touch is already the common case this
@@ -384,12 +391,15 @@ proxy design exists to keep cheap; `resource` follows the identical shape
 (`crates/logit-script/src/resource.rs`) -- see [memory.md](memory.md) for the measured cost of both
 the no-write and write paths.
 
-**A write inside `flush()` gives a stateful script's flush-driven emission a real identity**,
-where `trace` (above) has none to offer -- the one asymmetry between the two globals. It doesn't
-resolve the underlying *n*-to-1 problem (`logit` still can't attribute a flush automatically to one
-of several upstream resources), it just gives the script a way to state the answer itself when it
-knows one. See `docs/known-gaps.md`'s entry and
-[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md).
+**Inside `flush()`, `resource` starts empty, and a write there is the only way a flush-driven
+emission carries a resource at all** ([ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md)).
+A flush is the result of no one batch, so nothing from the last processed batch carries over --
+`logit` can't attribute a flush to one of several upstream resources, and doesn't pretend to by
+reusing whichever it saw last. A script that knows the answer states it: `resource["service.name"]
+= "..."` inside `flush()` lands on the flushed batch exactly as a `process()`-time write lands on
+its batch; one that doesn't emits under the empty resource. See
+[ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md) for
+the `set` component as the no-Lua way to stamp one downstream.
 
 The `set` native transform (`logit_config::ComponentKind::Set`) offers the same capability without
 writing Lua at all, for the common case of stamping a handful of constant values -- see that ADR
@@ -460,13 +470,13 @@ is always a real, if empty, `Arc<Resource>`, never absent) -- before any batch h
 reset once per incoming batch before any of its events reach `process()`, the same timing
 `resource` uses.
 
-**Copy-on-write, and stale during `flush()`, the same way and for the same reason as `resource`.**
+**Copy-on-write, and reset before `flush()`, the same way and for the same reason as `resource`.**
 A script that never touches `scope` costs nothing (`crates/logit-script/src/scope.rs`); a `flush()`
-tick sees whatever the most recently processed batch's scope was, unless the script writes `scope`
-inside `flush()` itself, which gives that flush-driven emission a real identity the same way a
-`resource` write does (`crates/logit-pipeline/src/runtime.rs`'s `run_lua` commits a `scope` write
-the same way it commits a `resource` write, for both the per-batch and the `flush()` path). See
-`docs/known-gaps.md`'s Lua-`flush()`-staleness entry, which now covers both globals.
+call starts with no scope at all (the all-clear defaults above), not the last processed batch's,
+and a `scope` write inside `flush()` is the only way a flush-driven emission carries one
+(`crates/logit-pipeline/src/runtime.rs`'s `run_lua` commits a `scope` write the same way it
+commits a `resource` write, for both the per-batch and the `flush()` path). See
+[ADR `lua-flush-root-context`](../adr/lua-flush-root-context.md).
 
 `scope:to_table()` is the enumeration escape hatch, as `resource:to_table()` is (no `__pairs`
 under LuaJIT), but its shape differs: `resource:to_table()` is the flat attribute map, while

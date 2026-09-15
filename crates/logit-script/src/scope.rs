@@ -57,9 +57,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ScopeState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` -- resets `scope` to
-/// read the batch's own scope (or the all-clear defaults, if the batch has none) and clears any
-/// write left over from a previous batch.
+/// Called once per incoming batch, before any of its events reach `process` (and once before
+/// every `flush()` call, with `None` -- `docs/adr/lua-flush-root-context.md`) -- resets `scope`
+/// to read the batch's own scope (or the all-clear defaults, if there is none) and clears any
+/// write left over from a previous call.
 pub(crate) fn set(state: &Rc<RefCell<ScopeState>>, scope: &Option<Arc<Scope>>) {
     let mut state = state.borrow_mut();
     state.base = scope.clone();

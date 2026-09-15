@@ -51,8 +51,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ResourceState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` -- resets `resource`
-/// to read `resource`'s attributes and clears any write left over from a previous batch.
+/// Called once per incoming batch, before any of its events reach `process` (and once before
+/// every `flush()` call, with an empty resource -- `docs/adr/lua-flush-root-context.md`) --
+/// resets `resource` to read `resource`'s attributes and clears any write left over from a
+/// previous call.
 pub(crate) fn set(state: &Rc<RefCell<ResourceState>>, resource: &Arc<Resource>) {
     let mut state = state.borrow_mut();
     state.base = resource.clone();
