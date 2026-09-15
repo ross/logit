@@ -1005,8 +1005,13 @@ fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>
         let id_bytes = parse_sd_name(s, &mut pos)?;
         let id = std::str::from_utf8(id_bytes)
             .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
-        let id_key = keys.get_or_intern(id);
-        if sd.get_sym(id_key).is_some() {
+        // `AttrMap::get`, not an interned probe: `id` is unvalidated here -- the SD-ELEMENT it
+        // opens may still be rejected below, and `parse_line`'s any-digit RFC 5424 sniff routes
+        // plain RFC 3164 lines whose MSG happens to contain a `[token` through this function
+        // before falling back. Interning at this point would retain producer-controlled text in
+        // the process-wide table for the life of the process, outside `docs/design/memory.md`
+        // §4's accepted exposure. The intern happens once, at the successful insert below.
+        if sd.get(id).is_some() {
             return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
         }
 
@@ -1048,7 +1053,7 @@ fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>
                 }
             }
         }
-        sd.insert_sym(id_key, Value::Map(Box::new(inner)));
+        sd.insert_sym(keys.get_or_intern(id), Value::Map(Box::new(inner)));
     }
 
     if s.get(pos) == Some(&b' ') {
@@ -1867,6 +1872,49 @@ mod tests {
     fn structured_data_duplicate_sd_id_is_rejected() {
         let line = r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#;
         assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    }
+
+    /// A line that reaches `parse_structured_data` and is then rejected must intern nothing: the
+    /// SD-ID duplicate check above is a non-interning `AttrMap::get` probe precisely so an SD-ID
+    /// that never validates stays out of the process-wide table. Both ways in matter --
+    /// `parse_line`'s any-digit RFC 5424 sniff hands a plain RFC 3164 line whose MSG contains a
+    /// `[token` to the SD parser before falling back (that token is message text, not an SD-ID),
+    /// and a genuine version-`1` line with a malformed SD-ELEMENT is rejected outright. Either
+    /// one interning its token would retain producer-controlled text for the life of the process,
+    /// outside `docs/design/memory.md` §4's accepted exposure. `nextest` runs each test in its own
+    /// process, so `interner::len()` here reflects only this test.
+    #[test]
+    fn a_line_rejected_inside_structured_data_interns_nothing() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        // Warm-up: one well-formed line, so `KEYS`'s `LazyLock` (all eight carrier keys, interned
+        // together on first touch) is initialized before the window below opens.
+        drop(
+            decoder
+                .decode(Bytes::from_static(b"<134>1 - - - - - - warm"))
+                .expect("decode should succeed"),
+        );
+
+        let before = logit_core::interner::len();
+
+        // The sniff fallback: version `4` is really RFC 3164 MSG text, and so is `[session-8f3a1c`.
+        let fallback = Bytes::from_static(b"<13>4 requests failed in pool A [session-8f3a1c retry");
+        let events = decoder.decode(fallback).expect("decode should succeed").events;
+        assert_eq!(
+            message_str(&only_event(events)),
+            "4 requests failed in pool A [session-8f3a1c retry",
+            "the line falls back to RFC 3164 and keeps its whole MSG"
+        );
+
+        // A genuine version-`1` line whose SD-ELEMENT is malformed: rejected, no event at all.
+        let rejected = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
+        let events = decoder.decode(rejected).expect("decode should succeed").events;
+        assert!(events.is_empty(), "a malformed SD-ELEMENT rejects the whole line");
+
+        assert_eq!(
+            logit_core::interner::len(),
+            before,
+            "an SD-ID from a line that never validated must not reach the interner"
+        );
     }
 
     #[test]
