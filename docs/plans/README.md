@@ -9,6 +9,7 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: `Event.new(t)` — constructing events from Lua](lua-event-constructor.md) | 2026-09-15 | 2026-09-15 |
 | [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-14 |
 | [Enabling plan: `target` components and routers](target-components.md) | 2026-09-13 | 2026-09-13 |
 | [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-13 |
