@@ -63,7 +63,7 @@ pub enum NodeState {
     /// It returned `Ok(())` on its own -- a finite listener, or any node whose inbox closed
     /// during a graceful drain.
     Finished,
-    /// It returned `Err`, or its task panicked.
+    /// It returned `Err`, or its task (or, for a Lua node, its thread) panicked.
     Failed,
     /// A `target` ([`crate::graph::Role::Target`], `docs/adr/target-components.md`): there is no
     /// task and no inbox to report on, because a target is a *name* for its routers' outbound
