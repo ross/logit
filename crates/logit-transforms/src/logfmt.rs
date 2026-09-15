@@ -17,7 +17,7 @@
 //! parses it).
 
 use bytes::Bytes;
-use logit_core::interner::intern;
+use logit_core::interner::KeyCache;
 use logit_core::{AttrMap, Diagnostics, Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::fmt;
@@ -131,15 +131,19 @@ fn scan_quoted(s: &[u8], i: usize) -> Result<(usize, usize, bool, usize), ParseE
 /// Parses `text` (the whole message, already verified valid UTF-8 by the caller) as logfmt into
 /// `out`. `raw` shares `text`'s underlying bytes -- every unquoted or escape-free-quoted value is
 /// sliced straight out of it (`raw.slice`, a `Bytes` refcount bump), never copied. A key is
-/// interned straight off `text`'s own bytes (`&text[key_start..key_end]`), never through an owned
-/// `String` -- safe because every delimiter this scanner splits on (whitespace, `=`, `"`) is a
-/// single-byte ASCII character, so a byte range this function ever slices always lands on a `text`
-/// char boundary. See the EBNF and algorithm in `docs/adr/logfmt-and-kv-parsing.md`.
+/// resolved to its `Symbol` straight off `text`'s own bytes (`&text[key_start..key_end]`), never
+/// through an owned `String` -- safe because every delimiter this scanner splits on (whitespace,
+/// `=`, `"`) is a single-byte ASCII character, so a byte range this function ever slices always
+/// lands on a `text` char boundary -- and through the transform's [`KeyCache`], so a key this
+/// parser has seen before (every key of every line after the first, on a schema-shaped stream)
+/// is one `memcmp` rather than a probe of the process-wide interner. See the EBNF and algorithm
+/// in `docs/adr/logfmt-and-kv-parsing.md`.
 fn parse_logfmt(
     raw: &Bytes,
     text: &str,
     bare_keys: bool,
     out: &mut Vec<(Symbol, Value)>,
+    keys: &mut KeyCache,
     telemetry: &Telemetry,
 ) -> Result<(), ParseError> {
     let s = text.as_bytes();
@@ -200,7 +204,7 @@ fn parse_logfmt(
             continue;
         };
 
-        out.push((intern(&text[key_start..key_end]), value));
+        out.push((keys.get_or_intern(&text[key_start..key_end]), value));
         telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
     }
 
@@ -244,6 +248,7 @@ fn parse_kv_segment(
     kv_sep_bytes: &[u8],
     bare_keys: bool,
     out: &mut Vec<(Symbol, Value)>,
+    keys: &mut KeyCache,
     saw_pair: &mut bool,
     telemetry: &Telemetry,
 ) {
@@ -262,7 +267,7 @@ fn parse_kv_segment(
             let key = &text[(seg_start + key_range.start)..(seg_start + key_range.end)];
             let value_abs = (seg_start + value_range.start)..(seg_start + value_range.end);
             *saw_pair = true;
-            out.push((intern(key), Value::Str(raw.slice(value_abs))));
+            out.push((keys.get_or_intern(key), Value::Str(raw.slice(value_abs))));
             telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
         }
         None => {
@@ -278,7 +283,7 @@ fn parse_kv_segment(
                 return;
             }
             let key = &text[(seg_start + key_range.start)..(seg_start + key_range.end)];
-            out.push((intern(key), Value::Bool(true)));
+            out.push((keys.get_or_intern(key), Value::Bool(true)));
             telemetry.count("logit.transform.pairs.parsed", 1.0, &[]);
         }
     }
@@ -288,6 +293,7 @@ fn parse_kv_segment(
 /// occurrence within it. No quoting, no escapes -- a value containing `pair_sep` is not
 /// representable (`logfmt` is the component for that shape). See
 /// `docs/adr/logfmt-and-kv-parsing.md`.
+#[allow(clippy::too_many_arguments)]
 fn parse_kv(
     raw: &Bytes,
     text: &str,
@@ -295,6 +301,7 @@ fn parse_kv(
     kv_sep: &str,
     bare_keys: bool,
     out: &mut Vec<(Symbol, Value)>,
+    keys: &mut KeyCache,
     telemetry: &Telemetry,
 ) -> Result<(), ParseError> {
     let bytes = text.as_bytes();
@@ -314,6 +321,7 @@ fn parse_kv(
             kv_sep_bytes,
             bare_keys,
             out,
+            keys,
             &mut saw_pair,
             telemetry,
         );
@@ -364,11 +372,16 @@ pub struct Logfmt {
     /// exactly `JsonParser::scratch`, and for the same reason: a line that fails partway must
     /// leave `event.attributes` untouched, not half-populated.
     scratch: Vec<(Symbol, Value)>,
+    /// Keys seen so far, memoised `&str -> Symbol` -- exactly `JsonParser::keys`, for the same
+    /// reason: a logfmt stream's key set is small and repeats in the same order every line, so
+    /// after the first line every key is one `memcmp` instead of a hash and a shard lock on the
+    /// process-wide interner. See `KeyCache`'s docs for the shape and the bound.
+    keys: KeyCache,
 }
 
 impl Logfmt {
     pub fn new(bare_keys: bool) -> Self {
-        Self { bare_keys, ..Self::default() }
+        Self { bare_keys, keys: KeyCache::new(), ..Self::default() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -389,7 +402,15 @@ impl Transform for Logfmt {
         let text = std::str::from_utf8(&raw).expect("message_bytes verified valid UTF-8");
 
         self.scratch.clear();
-        match parse_logfmt(&raw, text, self.bare_keys, &mut self.scratch, &self.telemetry) {
+        let parsed = parse_logfmt(
+            &raw,
+            text,
+            self.bare_keys,
+            &mut self.scratch,
+            &mut self.keys,
+            &self.telemetry,
+        );
+        match parsed {
             Ok(()) => merge_into(&mut self.scratch, &mut event.attributes),
             Err(err) => {
                 self.scratch.clear();
@@ -418,6 +439,8 @@ pub struct Kv {
     diag: Diagnostics,
     telemetry: Telemetry,
     scratch: Vec<(Symbol, Value)>,
+    /// See `Logfmt::keys`.
+    keys: KeyCache,
 }
 
 impl Kv {
@@ -429,6 +452,7 @@ impl Kv {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             scratch: Vec::new(),
+            keys: KeyCache::new(),
         }
     }
 
@@ -456,6 +480,7 @@ impl Transform for Kv {
             &self.kv_sep,
             self.bare_keys,
             &mut self.scratch,
+            &mut self.keys,
             &self.telemetry,
         );
         match result {
@@ -478,7 +503,7 @@ impl Transform for Kv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::interner::intern as intern_for_test;
+    use logit_core::interner::{intern as intern_for_test, resolve};
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanKind};
     use logit_core::{Registry, SpanRecord, SpanStatus};
 
@@ -545,6 +570,57 @@ mod tests {
         assert_eq!(attr(&event, "level"), Some(&Value::str("info")));
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")), "never coerce to a number");
         assert_ne!(attr(&event, "status"), Some(&Value::U64(200)));
+    }
+
+    /// The per-parser key cache, from `logfmt`'s side: a later line with the same keys in a
+    /// different order, one missing and one new, resolves every repeat to the same `Symbol`
+    /// without touching the interner and grows the cache only by the new key. `nextest` runs
+    /// each test in its own process (`docs/design/memory.md` §7), so `interner::len()` here
+    /// reflects only this test.
+    #[test]
+    fn repeat_keys_in_any_order_are_cache_hits_and_never_touch_the_interner() {
+        let mut logfmt = Logfmt::new(false);
+        let resource = default_resource();
+        let first = log_event("lf_cache_a=1 lf_cache_b=2 lf_cache_c=3");
+        let first = logfmt.process(&resource, first).expect("log events pass through");
+        assert_eq!(logfmt.keys.len(), 3);
+
+        let before = logit_core::interner::len();
+        let second = log_event("lf_cache_c=30 lf_cache_a=10");
+        let second = logfmt.process(&resource, second).expect("log events pass through");
+        assert_eq!(attr(&second, "lf_cache_a"), Some(&Value::str("10")));
+        assert_eq!(attr(&second, "lf_cache_c"), Some(&Value::str("30")));
+        assert_eq!(attr(&second, "lf_cache_b"), None);
+        assert_eq!(logit_core::interner::len(), before, "every key was a cache hit");
+        for key in ["lf_cache_a", "lf_cache_c"] {
+            let sym =
+                |e: &Event| e.attributes.iter().find(|(k, _)| resolve(*k) == key).map(|(k, _)| k);
+            assert_eq!(sym(&first), sym(&second), "{key}");
+        }
+
+        let third = log_event("lf_cache_d=4 lf_cache_a=100");
+        let third = logfmt.process(&resource, third).expect("log events pass through");
+        assert_eq!(attr(&third, "lf_cache_d"), Some(&Value::str("4")));
+        assert_eq!(logfmt.keys.len(), 4, "only the genuinely new key was added");
+    }
+
+    /// `kv`'s side of the same cache, through `parse_kv_segment`'s two push sites (a pair and
+    /// an opted-in bareword).
+    #[test]
+    fn kv_repeat_keys_are_cache_hits() {
+        let mut kv = Kv::new("&".into(), "=".into(), true);
+        let resource = default_resource();
+        drop(kv.process(&resource, log_event("kv_cache_a=1&kv_cache_flag&kv_cache_b=2")));
+        assert_eq!(kv.keys.len(), 3);
+
+        let before = logit_core::interner::len();
+        let event = log_event("kv_cache_b=20&kv_cache_a=10&kv_cache_flag");
+        let event = kv.process(&resource, event).expect("log events pass through");
+        assert_eq!(attr(&event, "kv_cache_a"), Some(&Value::str("10")));
+        assert_eq!(attr(&event, "kv_cache_b"), Some(&Value::str("20")));
+        assert_eq!(attr(&event, "kv_cache_flag"), Some(&Value::Bool(true)));
+        assert_eq!(logit_core::interner::len(), before, "every key was a cache hit");
+        assert_eq!(kv.keys.len(), 3);
     }
 
     #[test]
