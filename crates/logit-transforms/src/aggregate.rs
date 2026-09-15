@@ -182,8 +182,7 @@ pub struct Aggregator {
     diag: Diagnostics,
     telemetry: Telemetry,
     /// The most recent batch's `TraceContext`, per `observe_batch_context` -- rolling state, not
-    /// reset by `flush` (it isn't part of any one window). Mirrors `run_lua`'s `last_resource`
-    /// precedent (`crates/logit-pipeline/src/runtime.rs`): default until the first batch arrives.
+    /// reset by `flush` (it isn't part of any one window). Default until the first batch arrives.
     current_batch_context: TraceContext,
     /// How many consecutive *idle* windows (no update at all) a retainable series is kept past its
     /// last update, so a gauge delta in window N+1 can still resolve against window N's final

@@ -190,10 +190,10 @@ impl ScriptWorker {
     }
 
     /// Overwrites the `trace` global's `trace_id`/`span_id` (hex-encoded) so this worker's next
-    /// `process()` call reads the given batch's context. Called once per incoming batch, before
-    /// its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) -- not
-    /// called at all around a `flush()` call, which keeps whatever was last set, exactly like
-    /// `run_lua`'s own `last_resource` staleness (see `docs/known-gaps.md`'s entry for both).
+    /// `process()`/`flush()` call reads the given context. Called once per incoming batch, before
+    /// its events reach `process`, and once before every `flush()` call with the fresh root that
+    /// flush's emission is sent under (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`,
+    /// `docs/adr/lua-flush-root-context.md`).
     pub fn set_trace_context(
         &self,
         trace_id: [u8; 16],
@@ -203,10 +203,12 @@ impl ScriptWorker {
     }
 
     /// Resets `resource` (`crate::resource`) so this worker's next `process()`/`flush()` call
-    /// reads the given batch's resource, and clears any write left over from a previous batch.
-    /// Called once per incoming batch, before its events reach `process`
-    /// (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) -- unlike `set_trace_context`, no
-    /// `&Lua` is needed, since `resource`'s state is a plain `Rc`, not a `RegistryKey`.
+    /// reads the given resource, and clears any write left over from a previous call. Called once
+    /// per incoming batch, before its events reach `process`, and once before every `flush()`
+    /// call with an empty resource -- a flush runs in a root context, not the last batch's
+    /// (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`, `docs/adr/lua-flush-root-context.md`).
+    /// Unlike `set_trace_context`, no `&Lua` is needed, since `resource`'s state is a plain `Rc`,
+    /// not a `RegistryKey`.
     pub fn set_resource(&self, resource: &Arc<Resource>) {
         resource::set(&self.resource_state, resource);
     }
@@ -219,10 +221,10 @@ impl ScriptWorker {
     }
 
     /// Resets `scope` (`crate::scope`) so this worker's next `process()`/`flush()` call reads the
-    /// given batch's scope (or, for a batch with none, the all-clear defaults `crate::scope`
-    /// documents), and clears any write left over from a previous batch. Called once per incoming
-    /// batch, before its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s
-    /// `run_lua`) -- same reasoning and same plain-`Rc` shape as `set_resource`.
+    /// given scope (or, for none, the all-clear defaults `crate::scope` documents), and clears any
+    /// write left over from a previous call. Called once per incoming batch, before its events
+    /// reach `process`, and once before every `flush()` call with `None` -- same root-context
+    /// rule, same reasoning and same plain-`Rc` shape as `set_resource`.
     pub fn set_scope(&self, scope: &Option<Arc<Scope>>) {
         scope::set(&self.scope_state, scope);
     }
@@ -236,12 +238,13 @@ impl ScriptWorker {
     }
 
     /// Overwrites the read-only `provenance` global's `origin`/`previous` fields so this worker's
-    /// next `process()` call reads the given batch's provenance. Called once per incoming batch,
-    /// before its events reach `process` (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`) --
-    /// not called at all around a `flush()` call, which keeps whatever was last set, the same
-    /// staleness `set_trace_context`/`set_resource` already have (`docs/known-gaps.md`). A plain
-    /// `Rc<RefCell<..>>` mutation, like `set_resource`, so unlike `set_trace_context` there's no
-    /// `&Lua` call involved and nothing that can fail.
+    /// next `process()`/`flush()` call reads the given provenance. Called once per incoming
+    /// batch, before its events reach `process`, and once before every `flush()` call with this
+    /// worker's own component as both `origin` and `previous` -- what the flushed batch is
+    /// stamped with (`crates/logit-pipeline/src/runtime.rs`'s `run_lua`,
+    /// `docs/adr/lua-flush-root-context.md`). A plain `Rc<RefCell<..>>` mutation, like
+    /// `set_resource`, so unlike `set_trace_context` there's no `&Lua` call involved and nothing
+    /// that can fail.
     pub fn set_provenance(&self, provenance: logit_core::Provenance) {
         provenance::set(&self.provenance_state, provenance)
     }

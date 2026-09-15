@@ -348,38 +348,17 @@ already built that have a known, accepted rough edge.
   script's own decision, has a cheap, non-cloning answer now. The backpressure caveat two
   paragraphs up is unchanged either way: a stalled consumer of one target still backs up through
   its router into every other target's flow, the same as any other shared upstream.
-- **A Lua component's `flush()` has no resource or scope of its own at a timer tick** — unlike an
-  `aggregate` component, which tracks its own per-resource windows, a Lua component's flushed
-  events default to whichever resource (and, since W7, scope) it most recently saw on a real batch
-  (`crates/logit-pipeline/src/runtime.rs`'s `last_resource`/`last_scope`, see [ADR
-  `aggregation-window-semantics`](adr/aggregation-window-semantics.md)). A script can now override
-  either default explicitly by writing `resource`/`scope` inside `flush()` itself
-  (`crates/logit-script/src/resource.rs`/`scope.rs`, [ADR
-  `operator-declared-resource-attributes`](adr/operator-declared-resource-attributes.md)) — a
-  workaround available to the script author, not a fix to the underlying gap: `logit` still has no
-  way to attribute a flush-driven emission to a *specific* one of several upstream resources (or
-  scopes) on its own. Fine for every config today (one listener, one resource/scope); would need a
-  real answer once a component has more than one upstream resource/scope and no script-side
-  override.
-- **A Lua component's `flush()` sees a stale trace context, for the same reason.** `trace.trace_id`/
-  `trace.span_id` (`docs/design/lua-api.md`'s "Reading trace context") reflect whichever batch
-  `process()` most recently saw, not any single batch a flush-driven emission could correctly
-  attribute itself to — the same *n*-to-1 problem `Transform::flush`'s linking solves for native
-  transforms (below), deliberately not solved the same way here: a Lua component has no
-  accumulator `logit` can inspect, so there's no state to track contributing contexts *into*. A
-  script that wants better than "stale" can read `trace.trace_id`/`trace.span_id` inside its own
-  `process()` and do its own bookkeeping — the values are genuinely there to use, just not
-  aggregated by `logit` on the script's behalf.
-- **A Lua component's `flush()` sees stale provenance, for the same reason.**
-  `provenance.origin`/`.previous` (`docs/design/lua-api.md`'s "Reading provenance") reflect
-  whichever batch `process()` most recently saw, not the flushing component itself — the same
-  *n*-to-1 gap as the trace-context entry just above, with one difference: outside a Lua `flush()`,
-  `Fanout` (`crates/logit-pipeline/src/fanout.rs`) resolves this correctly for the batch it actually
-  sends (a flush-driven emission is stamped with the flushing component as both `origin` and
-  `previous`, [ADR `batch-provenance-on-delivered`](adr/batch-provenance-on-delivered.md)) — only
-  the Lua globals a script reads *during* `flush()`, before that stamp is applied, are stale. A
-  script reading `provenance.origin` inside `flush()` to decide what to do sees the last processed
-  batch's value, not what the emitted batch will actually be stamped with.
+- ~~**A Lua component's `flush()` has no resource or scope of its own at a timer tick**, and sees
+  a stale trace context and stale provenance, all for the same reason: its globals kept whatever
+  the most recently processed batch set.~~ **Closed** ([ADR
+  `lua-flush-root-context`](adr/lua-flush-root-context.md)): a Lua `flush()` runs in a root
+  context. Before every call, `trace` is the fresh root the emission is sent under, `provenance`
+  is this component as both `origin` and `previous` (what the batch is stamped with), `resource`
+  is empty and `scope` is none; a `resource`/`scope` write inside `flush()` is the one way a
+  flush-driven emission carries either. What remains is not a gap but the ADR's stated boundary:
+  `logit` never attributes a flush to any of the batches that fed it (no accumulator to inspect,
+  unlike `Transform::flush`'s linking below), so a script that wants that relationship tracks
+  contributing contexts itself inside `process()`.
 - **No native way to stamp `logit`'s own pipeline trace context onto a log's `LogRecord.trace`** —
   a script can already do this by hand (`event.log.trace_id = trace.trace_id`,
   [ADR `log-record-trace-context`](adr/log-record-trace-context.md)), but the `trace_context`
@@ -881,9 +860,10 @@ already built that have a known, accepted rough edge.
     `ContributingContexts` set per series (`MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`, 8 — dropped and
     counted past the cap, `logit.transform.links.dropped{reason="cardinality"}`) and paired each
     flushed `Event` with the `SpanLink`s that set produced. Lua's `flush()` got no equivalent — no
-    accumulator `logit` can inspect — left as an accepted stale-context limitation (next to the
-    identical `Resource`-staleness gap), with `trace.trace_id`/`trace.span_id`
-    (`docs/design/lua-api.md`) exposed to a script's own `process()` instead. Picking an arbitrary
+    accumulator `logit` can inspect — and runs in a link-less root context instead
+    ([ADR `lua-flush-root-context`](adr/lua-flush-root-context.md)), with `trace.trace_id`/
+    `trace.span_id` (`docs/design/lua-api.md`) exposed to a script's own `process()` for its own
+    bookkeeping. Picking an arbitrary
     contributing batch as "the" parent, for either case, was considered and rejected (silently
     wrong is worse than visibly incomplete).
 
@@ -935,8 +915,8 @@ already built that have a known, accepted rough edge.
        (`Input::run` is a free-form loop) — the still-open listener-side half of "delivery I/O is
        not decoupled from event processing" (below).
     2. **Lua `flush()` still gets a link-less root.** It gets a real span now (ADR `internal-span-emission-and-deterministic-sampling`), but no
-       links — there is still no accumulator on the Lua side to inspect, same limitation as the
-       `Resource`-staleness gap above.
+       links — there is still no accumulator on the Lua side to inspect. The script-visible side
+       of that root is settled ([ADR `lua-flush-root-context`](adr/lua-flush-root-context.md)).
     3. **A `SinkQueue` entry is 24 bytes larger.** `TraceContext` now rides inline in every queue
        entry (`push`/`peek`) so `write_loop` can parent its own sink span on the context a batch
        actually arrived under — the same size-for-a-span trade `Delivered` itself already made and

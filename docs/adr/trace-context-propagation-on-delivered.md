@@ -1,6 +1,6 @@
 ---
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-09-15
 ---
 
 # Propagate real trace context on `Delivered`, for the node kinds with one unambiguous parent
@@ -54,10 +54,11 @@ documented, deliberate gap.**
   for exactly this shape (OTel's answer to "influenced by several spans, not descended from one"),
   so the honest design is a bounded set of contributing contexts recorded as links — new state on
   `Accumulator`, new bookkeeping on every `process()` call, a cardinality question of its own. Real
-  work, not done in this change. Lua's `flush()` is worse: no accumulator to inspect at all, the
-  same shape `docs/known-gaps.md` already accepts for `Resource` stamping
-  (`last_resource` tracks whichever resource a Lua component most recently saw, not the correct
-  one for a flush-driven emission either).
+  work, not done in this change. Lua's `flush()` is worse: no accumulator to inspect at all.
+  (Amended 2026-09-15: [ADR `lua-flush-root-context`](lua-flush-root-context.md) makes the fresh
+  root the script-visible context too — `trace`/`provenance`/`resource`/`scope` are all reset to
+  the root before `flush()` runs, and the `last_resource` approximation this paragraph originally
+  cited is gone.)
 
 `Fanout::send`/`send_blocking` keep their existing signatures and behavior (mint a root) — every
 listener (`Input::run` never receives a `Delivered`, so has no parent to inherit) and every

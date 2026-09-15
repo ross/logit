@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-09-12
+updated: 2026-09-15
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -78,10 +78,11 @@ two-stage window), not a special case.
 `lua_file` transform config variants (`crates/logit-config/src/lib.rs`). Omitted, the stage never
 ticks — the same as a script defining no `flush()` at all, which was already legal and is now
 finally reachable in practice. A Lua stage's `flush()` has no batch of its own to take a resource
-from (unlike `Aggregate`, which tracks its own per-resource windows); it's stamped with whichever
-resource the worker most recently saw on a real batch, or a fresh default if none has arrived yet.
-This is a real, narrow gap — documented here rather than left silent — that matters only once a
-pipeline has more than one resource feeding it, which nothing in v0.1 does.
+from (unlike `Aggregate`, which tracks its own per-resource windows). ~~It's stamped with whichever
+resource the worker most recently saw on a real batch, or a fresh default if none has arrived
+yet.~~ Superseded 2026-09-15 by [ADR `lua-flush-root-context`](lua-flush-root-context.md): a Lua
+`flush()` runs in a root context — an empty resource and no scope unless the script writes them
+inside `flush()` — rather than inheriting the last batch's.
 
 ## Alternatives considered
 - **Sliding windows.** Rejected for v0.1: no consumer needs overlap between windows, and a sliding
