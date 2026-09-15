@@ -301,8 +301,9 @@ pub async fn run_with_telemetry(
     // Maps each spawned task back to the component id it runs -- `AbortHandle::id()` at spawn
     // time, read back via `join_next_with_id`/`JoinError::id()` in the loop below, so a failing
     // (or panicking) task can be named in `readiness` without threading the id through every
-    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node has no entry
-    // here -- it's a raw `std::thread`, not a `JoinSet` task (`docs/known-gaps.md`).
+    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node's entry is its
+    // `watch_lua_thread` task -- the raw `std::thread` itself can't be a `JoinSet` member, so a
+    // task that awaits the thread's exit report stands in for it (see `run_lua`'s doc comment).
     let mut node_ids: HashMap<tokio::task::Id, String> = HashMap::with_capacity(ids.len());
     // Needed only for Lua nodes -- see `run_lua`'s doc comment. `Handle::current()` requires an
     // async context, true here since `run` is itself running as a task on this runtime.
@@ -395,6 +396,7 @@ pub async fn run_with_telemetry(
                 let target_routes =
                     resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+                let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
                 let handle = runtime_handle.clone();
                 let thread_id = id.clone();
                 std::thread::Builder::new()
@@ -406,6 +408,7 @@ pub async fn run_with_telemetry(
                             interval,
                             targets,
                             ready_tx,
+                            done_tx,
                             inbox,
                             fanout,
                             target_routes,
@@ -415,12 +418,17 @@ pub async fn run_with_telemetry(
                     })
                     .with_context(|| format!("spawning thread for component '{id}'"))
                     .map_err(RunError::Startup)?;
-                // Not moved into `node_ids` -- there is no `JoinSet` entry for a Lua node to look
-                // up (see `node_ids`'s own doc comment); its `NodeState` stays `Running` for the
-                // rest of this run even if it later fails, a known gap
-                // (`docs/known-gaps.md`), not something this workstream fixes.
                 match ready_rx.await {
-                    Ok(Ok(())) => readiness.set_node(&id, NodeState::Running),
+                    Ok(Ok(())) => {
+                        // The thread's stand-in `JoinSet` entry (see `node_ids`'s doc comment):
+                        // spawned only once the handshake has succeeded, so a load failure --
+                        // which returns `Startup` just below -- never leaves a watcher behind.
+                        // `done_tx` buffers its one message, so a thread that dies between
+                        // reporting ready and this spawn is still observed.
+                        let watcher = tasks.spawn(watch_lua_thread(id.clone(), done_rx));
+                        node_ids.insert(watcher.id(), id.clone());
+                        readiness.set_node(&id, NodeState::Running);
+                    }
                     Ok(Err(message)) => {
                         return Err(RunError::Startup(anyhow::anyhow!(
                             "component '{id}': {message}"
@@ -1670,14 +1678,18 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// on the runtime's own worker threads and never nests inside another `.await`. `fanout.send`
 /// becomes `fanout.send_blocking` for the same reason: no `.await` available outside `block_on`.
 ///
-/// Unlike `Transform::flush`, a Lua `flush()` has no resource (or scope) of its own to stamp its
-/// emitted events with (`docs/adr/aggregation-window-semantics.md`) -- `last_resource`/
-/// `last_scope` default to whichever resource/scope this component most recently saw on a real
-/// batch (a fresh resource, and no scope, if none has arrived yet), but a script that writes
-/// `resource` and/or `scope` inside `process()` or `flush()` (`crates/logit-script/src/resource.rs`,
-/// `crates/logit-script/src/scope.rs`, `docs/adr/operator-declared-resource-attributes.md`)
-/// overrides that default explicitly -- see `flush_now`'s `take_resource`/`take_scope` calls
-/// below.
+/// **A Lua `flush()` runs in a root context** (`docs/adr/lua-flush-root-context.md`): it is the
+/// result of no one event or batch, so before every `flush()` call this node resets the script's
+/// four batch-scoped globals to what a stand-alone emission genuinely is -- `trace` to the fresh
+/// root the emission is sent under, `provenance` to this component as both `origin` and
+/// `previous` (what this node's own outbound edge stamps; an event marked for a `target` takes a
+/// further hop, and that target's `Fanout` rewrites `previous` to the target's id exactly as it
+/// does on the `process()` path, leaving `origin` this node), `resource` to empty, and `scope` to
+/// none. A script that writes `resource` and/or `scope` inside `flush()`
+/// (`crates/logit-script/src/resource.rs`, `crates/logit-script/src/scope.rs`) gives the emission
+/// a real identity; one that doesn't emits under the empty root -- see `flush_now`'s
+/// `take_resource`/`take_scope` calls below. Nothing from the most recently processed batch
+/// carries over, by design.
 ///
 /// **A Lua node is also a router** (`docs/adr/target-components.md`): `targets` is the component's
 /// `targets:` list in `graph::targets_of` slot order -- handed to the VM as `event:to("..")`'s
@@ -1688,6 +1700,22 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// mints for that batch -- one incoming batch is one hop however many ways it forks, exactly the
 /// rule `run_router` and `Fanout` already apply. A component with no `targets:` has a single
 /// destination and behaves exactly as it did before any of this existed.
+///
+/// **How the thread's exit reaches `run_with_telemetry`.** Two handshakes, not one: `ready_tx`
+/// carries the script-load outcome (a failure there is `RunError::Startup`; the run never
+/// reports ready), and `done_tx` carries the post-ready outcome -- `Ok(())` once the inbox closed
+/// and the loop returned on its own, `Err(message)` if the loop panicked. [`watch_lua_thread`]
+/// awaits `done_rx` as this node's `JoinSet` entry, so the join loop treats a Lua node's exit
+/// exactly as any task's: `NodeState::Finished` on `Ok`; `NodeState::Failed`, `Phase::Failed`
+/// (`/readyz`'s `degraded`), the graceful drain and `RunError::Runtime` on `Err`. The loop body
+/// runs under `catch_unwind` (`AssertUnwindSafe`: `ScriptWorker` holds `Lua` and `Rc<RefCell>`s,
+/// none of which are `UnwindSafe`, and nothing is used after the unwind anyway) so a panic becomes
+/// a message rather than a silently dropped sender; the default panic hook still prints its own
+/// line to stderr first, naming this `logit-{id}` thread. A script's *own* errors are not this
+/// path: `process()`/`flush()` raising is logged and counted inside [`run_lua_loop`] and never
+/// ends the node. The report is sent only after the closure has dropped `inbox` and the
+/// `Fanout`s, so by the time the watcher resolves the downstream cascade (consumers' inboxes
+/// closing, their close-time flushes running) is already underway.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1695,7 +1723,8 @@ fn run_lua(
     configured_interval: Option<Duration>,
     targets: Vec<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-    mut inbox: mpsc::Receiver<Delivered>,
+    done_tx: oneshot::Sender<Result<(), String>>,
+    inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
     target_fanouts: Vec<Fanout>,
     telemetry: Telemetry,
@@ -1719,17 +1748,104 @@ fn run_lua(
     // No `logit-cli::pipeline::build_spec` attaches one the way every other kind's own
     // `with_diagnostics` builder does -- `ScriptWorker` can't be constructed outside this thread
     // (see `NodeSpec::Lua`'s own doc comment), so there's no earlier point to attach one at.
-    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent.
-    let mut diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent. Cloned so
+    // the panic report below still has one after the loop's own copy has moved into the closure.
+    let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    let reporter = diag.clone();
 
+    // Interned here, where `id` still lives: the loop has no `String` to intern (everything it
+    // touches is moved in by value, `run_lua_loop`'s own doc comment) and only ever needs the
+    // `Symbol` -- the same one `Fanout::with_component` interned for this node's own edge.
+    let me = logit_core::interner::intern(&id);
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        run_lua_loop(
+            worker,
+            me,
+            configured_interval,
+            inbox,
+            fanout,
+            target_fanouts,
+            telemetry,
+            runtime,
+            diag,
+        )
+    }));
+    let report = thread_outcome(outcome);
+    if let Err(message) = &report {
+        reporter.error("thread_panicked", format_args!("{message}"));
+    }
+    // The receiver is gone only if `run` already returned for an unrelated reason; nothing to do.
+    let _ = done_tx.send(report);
+}
+
+/// A Lua thread's post-ready outcome as a message [`watch_lua_thread`] can name the component
+/// in: a panic payload is a `&str` for a literal `panic!("..")`, a `String` for a formatted one,
+/// and anything at all for `panic_any` -- the fallback text keeps the report honest rather than
+/// silent for that last case.
+fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(payload) => {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            Err(format!("thread panicked: {message}"))
+        }
+    }
+}
+
+/// A Lua node's `JoinSet` entry: nothing but a wait on the thread's `done` report (`run_lua`'s
+/// doc comment). Deliberately does *not* watch `shutdown`: a shutdown reaches the thread the
+/// same way it reaches every other node, by the cascade closing its inbox, after which the loop
+/// returns and reports on its own -- racing against `shutdown` here would only ever resolve
+/// *before* the thread has actually finished its close-time flush. The `Err(_)` arm (sender
+/// dropped without a message) is defensive: `run_lua` sends unconditionally after
+/// `catch_unwind`, so it's reachable only if the wrapper itself dies past that point.
+async fn watch_lua_thread(
+    id: String,
+    done_rx: oneshot::Receiver<Result<(), String>>,
+) -> anyhow::Result<()> {
+    match done_rx.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(anyhow::anyhow!("component '{id}': {message}")),
+        Err(_) => Err(anyhow::anyhow!("component '{id}': thread exited without reporting")),
+    }
+}
+
+/// The loop half of [`run_lua`], on the same thread, everything it touches moved in by value so
+/// `catch_unwind` has nothing borrowed to reason about. Returns once `inbox` closes (after a last
+/// `flush()` if the component has an interval); a panic anywhere in here is `run_lua`'s to report.
+#[allow(clippy::too_many_arguments)]
+fn run_lua_loop(
+    worker: ScriptWorker,
+    me: logit_core::Symbol,
+    configured_interval: Option<Duration>,
+    mut inbox: mpsc::Receiver<Delivered>,
+    fanout: Fanout,
+    target_fanouts: Vec<Fanout>,
+    telemetry: Telemetry,
+    runtime: tokio::runtime::Handle,
+    mut diag: Diagnostics,
+) {
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
-    let mut last_resource = Arc::new(Resource::default());
-    // `flush_now`'s default identity for a scope-less flush-driven emission -- the same
-    // "whichever batch was last seen" approximation `last_resource` uses, but (W7) a script that
-    // writes `scope` inside `process()`/`flush()` (`crates/logit-script/src/scope.rs`) overrides
-    // this default explicitly, exactly the way `resource` already does -- see `flush_now`'s
-    // `take_scope` call below.
-    let mut last_scope: Option<Arc<Scope>> = None;
+    // The root a `flush()` runs in (`run_lua`'s own doc comment): one empty resource shared
+    // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
+    // own id as both halves of the provenance -- the identical value `Fanout::stamp` fills an
+    // empty provenance in with on this node's *own* outbound edge, pre-filled here so what the
+    // script reads as `provenance.origin`/`.previous` is what a batch leaving that edge carries,
+    // by construction rather than by two code paths agreeing (`stamp` is idempotent over it:
+    // `get_or_insert` on an already-set `origin`, and `previous` overwritten with the same id).
+    // An event the script marked for a `target` takes one more hop first: that target's `Fanout`
+    // is built `with_component(<target id>)`, so `stamp` rewrites `previous` to the target's id
+    // there, exactly as it does for a marked event on the `process()` path
+    // (`docs/adr/target-components.md`). `origin`, filled in here, survives that hop untouched.
+    let root_resource = Arc::new(Resource::default());
+    let flush_provenance = logit_core::Provenance { origin: Some(me), previous: Some(me) };
 
     // The same node-owned, reused per-destination buffers a native `Router` uses
     // (`RouterScratch`'s own doc comment has the allocation accounting) -- shared by the batch
@@ -1742,10 +1858,11 @@ fn run_lua(
     // through `fanout.send_blocking`, which now only ever mints a root for a genuine listener --
     // `fanout.rs`'s own doc comment), same reasoning as `run_flush`'s: a Lua `flush()`'s emission
     // has no single incoming batch to call its parent -- worse than `Transform::flush`, even,
-    // since there's no accumulator here at all to eventually attribute it to (`docs/known-gaps.md`'s
-    // internal-spans entry, and the existing resource-stamping gap this same imprecision already
-    // has: `last_resource` above is the identical shape of approximation, just for `Resource`
-    // instead of `TraceContext`).
+    // since there's no accumulator here at all to eventually attribute it to
+    // (`docs/adr/lua-flush-root-context.md`). The script sees that same root: every batch-scoped
+    // global is reset to it before `flush()` runs, so a script reading `trace`/`provenance`/
+    // `resource`/`scope` inside `flush()` reads what its emission will actually go out as, not
+    // whatever the last `process()` batch happened to leave behind.
     //
     // Takes `diag` as a parameter rather than capturing it: the loop body below also needs its
     // own `&mut diag` (for `script_error`), and a closure capturing it by unique reference would
@@ -1753,15 +1870,10 @@ fn run_lua(
     // same goes for `scratch`, whose per-destination buffers the batch path below also fills.
     let flush_now = |diag: &mut Diagnostics,
                      worker: &ScriptWorker,
-                     resource: &mut Arc<Resource>,
-                     scope: &mut Option<Arc<Scope>>,
                      fanout: &Fanout,
                      target_fanouts: &[Fanout],
                      scratch: &mut RouterScratch| {
-        // Empty provenance in, same reasoning as `run_flush`'s own doc comment: a Lua `flush()`
-        // is a fresh emission with no single incoming batch to inherit `origin`/`previous` from,
-        // so `Fanout::stamp` fills in both as this component's own id.
-        let ctx: BatchContext = TraceContext::new_root().into();
+        let ctx = BatchContext { trace: TraceContext::new_root(), provenance: flush_provenance };
         let mut span = telemetry.span(
             "flush",
             SpanKind::Internal,
@@ -1769,6 +1881,17 @@ fn run_lua(
             ctx.trace.span_id,
             None,
         );
+        // The root the script sees -- same four setters, same order, same failure handling as
+        // the per-batch path below, just fed the root instead of an incoming batch.
+        if let Err(err) = worker.set_trace_context(ctx.trace.trace_id, ctx.trace.span_id) {
+            diag.warn_throttled(
+                "trace_context_error",
+                format_args!("setting trace context failed: {err}"),
+            );
+        }
+        worker.set_provenance(ctx.provenance);
+        worker.set_resource(&root_resource);
+        worker.set_scope(&None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
         // The tick time reaches the script as `flush(now)` -- the same `now_unix_nanos()` value
@@ -1778,19 +1901,14 @@ fn run_lua(
         let result = worker.flush(now_unix_nanos());
         drop(timer);
         // A `flush()` that wrote `resource` (`crates/logit-script/src/resource.rs`) commits that
-        // write here -- the one way a flush-driven emission can carry a real identity instead of
-        // `last_resource`'s "whichever batch was last seen" approximation (`docs/known-gaps.md`'s
-        // Lua-flush-staleness entry).
-        if let Some(new_resource) = worker.take_resource() {
-            *resource = new_resource;
-        }
-        // A `flush()` that wrote `scope` (`crates/logit-script/src/scope.rs`) commits that write
-        // here too, the same way as `resource` just above -- `take_scope` always returns `Some`
-        // once written, never `None`-meaning-"clear", so this only ever narrows toward a real
-        // scope, never back to `None`.
-        if let Some(new_scope) = worker.take_scope() {
-            *scope = Some(new_scope);
-        }
+        // write here -- the one way a flush-driven emission carries a real identity instead of
+        // the empty root it otherwise goes out under. `None` means the script never wrote it, so
+        // the root moves through as an `Arc` clone, no allocation -- the same `unwrap_or` shape
+        // the batch path below uses for the incoming batch's own resource.
+        let resource = worker.take_resource().unwrap_or_else(|| root_resource.clone());
+        // Same for `scope` (`crates/logit-script/src/scope.rs`): `take_scope` returns `Some` only
+        // once written, so an untouched `scope` stays the root's `None`.
+        let scope = worker.take_scope();
         // Sampled here too, not only after a batch (below) -- `ScriptWorker::used_memory`'s own
         // doc comment names accumulation *across `flush()` calls* as exactly the leak shape this
         // metric exists to catch. A script whose only growth happens in `flush()` (nothing new
@@ -1815,8 +1933,8 @@ fn run_lua(
                     &mut scratch.dests,
                     fanout,
                     target_fanouts,
-                    resource,
-                    scope,
+                    &resource,
+                    &scope,
                     ctx,
                     &telemetry,
                 );
@@ -1835,15 +1953,7 @@ fn run_lua(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                flush_now(
-                    &mut diag,
-                    &worker,
-                    &mut last_resource,
-                    &mut last_scope,
-                    &fanout,
-                    &target_fanouts,
-                    &mut scratch,
-                );
+                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
                 let interval = configured_interval
                     .expect("next_flush is only ever Some for a component with an interval");
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
@@ -1867,15 +1977,7 @@ fn run_lua(
         };
         let Some(batch) = batch else {
             if next_flush.is_some() {
-                flush_now(
-                    &mut diag,
-                    &worker,
-                    &mut last_resource,
-                    &mut last_scope,
-                    &fanout,
-                    &target_fanouts,
-                    &mut scratch,
-                );
+                flush_now(&mut diag, &worker, &fanout, &target_fanouts, &mut scratch);
             }
             return;
         };
@@ -1913,10 +2015,9 @@ fn run_lua(
         // involved and so nothing that can fail.
         worker.set_provenance(parent.provenance);
         let batch = unwrap_batch(batch);
-        // Lets the script's own `process()`/`flush()` read (and write) `resource`
+        // Lets the script's own `process()` read (and write) `resource`
         // (`crates/logit-script/src/resource.rs`) -- called on every batch, including one whose
-        // every event errors, so a later `flush()` never reads a stale identity because this
-        // batch happened to produce nothing.
+        // every event errors, so a write left over from the previous batch is always cleared.
         worker.set_resource(&batch.resource);
         // Same reasoning, for `scope` (`crates/logit-script/src/scope.rs`) -- `batch.scope` is
         // `Option`al (not every batch carries one), which `set_scope` itself handles.
@@ -1996,8 +2097,6 @@ fn run_lua(
         // need an owned default `Scope` to unwrap into, and there isn't a sensible one -- `None`
         // is the correct fallback, not `Scope::default()`).
         let scope = worker.take_scope().or_else(|| batch.scope.clone());
-        last_resource = resource.clone();
-        last_scope = scope.clone();
         // One send per non-empty destination, all under the one `ctx` minted above -- one
         // incoming batch is one hop however many ways it forks, the same rule `run_router`
         // applies.
@@ -6030,6 +6129,221 @@ mod tests {
         assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
     }
 
+    /// A Lua node's thread panicking once the pipeline is already `Ready` is observed exactly
+    /// like a task failing (`watch_lua_thread`): `Phase::Failed`, that node `Failed`, the rest
+    /// drained (`Finished`, not aborted), and `RunError::Runtime` naming the component. Before
+    /// the watcher existed this run would have hung forever with `/readyz` still `ok` -- hence
+    /// the timeout around it.
+    ///
+    /// **The panic vector.** A script's own errors are non-fatal by design, so the only way to
+    /// kill the thread is a Rust panic. `NodeSpec::Lua { interval: Some(Duration::ZERO) }` gets
+    /// one deterministically on the first loop iteration: `advance_flush_deadline` rejects a
+    /// zero interval (`debug_assert!` in debug, `% 0` in release -- both after the ready
+    /// handshake and before the first `inbox.recv()`). Graph rule 9 (`graph.rs`) rejects a zero
+    /// interval from *config*, which is why the graph component here has `interval: None` and
+    /// only the spec carries the zero -- the two are independent at this layer. If a runtime
+    /// guard on the interval ever lands, this test needs a new vector, not a relaxed assertion.
+    #[tokio::test]
+    async fn a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: None,
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (readiness, rx) = Readiness::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: Some(Duration::ZERO),
+            },
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
+        )
+        .await
+        .expect("a dead Lua thread must end the run, not leave it hanging")
+        .expect_err("the panicking Lua thread should fail the run");
+        assert!(matches!(err, RunError::Runtime(_)), "a post-ready failure is a runtime failure");
+        let message = err.to_string();
+        assert!(message.contains("enrich"), "the error should name enrich: {message}");
+        assert!(
+            message.contains("panicked"),
+            "the error should say the thread panicked: {message}"
+        );
+
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Failed);
+        assert_eq!(snapshot.components.get("enrich"), Some(&NodeState::Failed));
+        assert_eq!(
+            snapshot.components.get("in"),
+            Some(&NodeState::Finished),
+            "the listener should have been drained by the failure-triggered shutdown, not aborted"
+        );
+        assert_eq!(
+            snapshot.components.get("out"),
+            Some(&NodeState::Finished),
+            "the sink should have drained once the dead node's fanout closed its inbox"
+        );
+    }
+
+    /// The other half of `watch_lua_thread`: a Lua node whose inbox closes normally (its only
+    /// listener finished) reports `Finished`, the same as any task -- previously it stayed
+    /// `Running` for the rest of the run, since nothing ever observed the thread returning.
+    #[tokio::test]
+    async fn a_lua_node_finishing_on_its_own_reaches_finished() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: None,
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (readiness, rx) = Readiness::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![counter_event("hits", 1.0)],
+        };
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: None,
+            },
+        );
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
+        )
+        .await
+        .expect("a finite input should let the whole graph drain and the run end")
+        .expect("a clean run should end with Ok");
+
+        let received =
+            out_rx.try_recv().expect("the batch should have flowed through the Lua node");
+        assert_eq!(received.events.len(), 1);
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Ready, "nothing failed and nothing signalled a drain");
+        assert_eq!(snapshot.components.get("in"), Some(&NodeState::Finished));
+        assert_eq!(
+            snapshot.components.get("enrich"),
+            Some(&NodeState::Finished),
+            "the Lua node's own exit is now observed via its watcher task"
+        );
+        assert_eq!(snapshot.components.get("out"), Some(&NodeState::Finished));
+    }
+
+    /// `thread_outcome` turns each payload shape `std::panic` can hand back into a message that
+    /// still says *panicked* -- a `&str` from `panic!("literal")`, a `String` from a formatted
+    /// `panic!`, and the honest fallback for `panic_any` with anything else.
+    #[test]
+    fn thread_outcome_reports_a_panic_payload_as_a_message() {
+        assert_eq!(thread_outcome(Ok(())), Ok(()));
+
+        let literal = std::panic::catch_unwind(|| panic!("boom"));
+        assert_eq!(thread_outcome(literal), Err("thread panicked: boom".to_string()));
+
+        let formatted = std::panic::catch_unwind(|| {
+            let n = 7;
+            panic!("slot {n} out of range")
+        });
+        assert_eq!(
+            thread_outcome(formatted),
+            Err("thread panicked: slot 7 out of range".to_string())
+        );
+
+        let opaque = std::panic::catch_unwind(|| std::panic::panic_any(42u8));
+        assert_eq!(
+            thread_outcome(opaque),
+            Err("thread panicked: non-string panic payload".to_string())
+        );
+    }
+
+    /// `watch_lua_thread` maps the three ways `done_rx` can resolve: a clean report is `Ok`, a
+    /// panic report is an error naming the component and carrying the message, and a sender
+    /// dropped without reporting is still an error (the defensive arm) rather than a hang or a
+    /// silent `Ok`.
+    #[tokio::test]
+    async fn watch_lua_thread_maps_each_outcome() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(())).expect("receiver alive");
+        watch_lua_thread("enrich".to_string(), rx).await.expect("a clean report is Ok");
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err("thread panicked: boom".to_string())).expect("receiver alive");
+        let err = watch_lua_thread("enrich".to_string(), rx)
+            .await
+            .expect_err("a panic report is an error");
+        assert_eq!(err.to_string(), "component 'enrich': thread panicked: boom");
+
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        drop(tx);
+        let err = watch_lua_thread("enrich".to_string(), rx)
+            .await
+            .expect_err("a dropped sender is an error, not a silent Ok");
+        assert!(
+            err.to_string().contains("without reporting"),
+            "the defensive arm should say what happened: {err}"
+        );
+    }
+
     /// The exit-2 path: a sustained permanent sink failure (`PERMANENT_FAILURE_WINDOW`) ends
     /// `run_with_telemetry` with `RunError::Runtime`, not `Startup` -- no shortened window or
     /// test-only knob needed, `write_loop` runs entirely on the paused virtual clock.
@@ -7650,6 +7964,357 @@ mod tests {
         assert!(
             rx_fwd.recv_timeout(Duration::from_millis(50)).is_err(),
             "the flush marked its event for a, so the component's own consumer sees nothing"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A Lua `flush()` runs in a root context (`docs/adr/lua-flush-root-context.md`)
+    // -----------------------------------------------------------------------------------------
+
+    /// A pass-through `Transform` that reports every batch's [`TraceContext`] and [`Provenance`]
+    /// to the test -- `RecordProvenance`'s shape, widened to the trace half, since the flush
+    /// tests below need to compare what a script *read* inside `flush()` against what its
+    /// emission actually went out under, and `Output::send` never sees the context.
+    struct RecordDelivered {
+        ctx_tx: std::sync::mpsc::Sender<TraceContext>,
+        prov_tx: std::sync::mpsc::Sender<Provenance>,
+    }
+
+    impl Transform for RecordDelivered {
+        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+            Some(event)
+        }
+
+        fn observe_batch_context(&mut self, ctx: TraceContext) {
+            let _ = self.ctx_tx.send(ctx);
+        }
+
+        fn observe_provenance(&mut self, provenance: Provenance) {
+            let _ = self.prov_tx.send(provenance);
+        }
+    }
+
+    fn hex_id(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn attr_str<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+        event.attributes.get(key).and_then(|v| v.as_str())
+    }
+
+    /// Runs `in -> windowed (this `script`, with an interval) -> watcher -> out` with `input` as
+    /// the one and only batch, until the input finishes and the close-time flush has fired.
+    /// Returns, in delivery order, every `(context, provenance)` the watcher observed and every
+    /// batch the sink received -- index-aligned, since one watcher sits on the one path between
+    /// the Lua node and the sink.
+    async fn run_lua_flush_probe(
+        script: &str,
+        input: EventBatch,
+    ) -> (Vec<(TraceContext, Provenance)>, Vec<EventBatch>) {
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                },
+            ),
+            (
+                "windowed",
+                vec!["in"],
+                vec![],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+            (
+                "watcher",
+                vec!["windowed"],
+                vec![],
+                ComponentKind::Lua { script: String::new(), interval: None },
+            ),
+            ("out", vec!["watcher"], vec![], influxdb_out()),
+        ]);
+
+        let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
+        let (prov_tx, prov_rx) = std::sync::mpsc::channel();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(input) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+        );
+        specs.insert(
+            "watcher".to_string(),
+            NodeSpec::Transform(Box::new(RecordDelivered { ctx_tx, prov_tx })),
+        );
+        specs.insert("out".to_string(), recording_sink(out_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let contexts: Vec<TraceContext> = ctx_rx.try_iter().collect();
+        let provenances: Vec<Provenance> = prov_rx.try_iter().collect();
+        assert_eq!(contexts.len(), provenances.len(), "one context and one provenance per batch");
+        let batches: Vec<EventBatch> = out_rx.try_iter().collect();
+        assert_eq!(batches.len(), contexts.len(), "the watcher and the sink see the same batches");
+        (contexts.into_iter().zip(provenances).collect(), batches)
+    }
+
+    /// Stashes a clone in `process()` (which also passes the original through, so the process
+    /// path's batch reaches the sink too) and re-emits it from `flush()`, tagging each with what
+    /// the script could see of `trace`/`provenance` at that moment.
+    const FLUSH_PROBE_SCRIPT: &str = r#"
+        local pending = nil
+        local function stamp(e, phase)
+            e.attributes["phase"] = phase
+            e.attributes["seen_trace_id"] = trace.trace_id
+            e.attributes["seen_span_id"] = trace.span_id
+            e.attributes["seen_origin"] = provenance.origin
+            e.attributes["seen_previous"] = provenance.previous
+            e.attributes["seen_component"] = provenance.component
+            return e
+        end
+        function process(event)
+            pending = event:clone()
+            return stamp(event, "process")
+        end
+        function flush()
+            if pending then
+                local e = pending
+                pending = nil
+                return {stamp(e, "flush")}
+            end
+            return {}
+        end
+    "#;
+
+    fn upstream_batch() -> EventBatch {
+        let mut resource = Resource::default();
+        resource.attributes.insert("service.name", "upstream");
+        EventBatch {
+            resource: Arc::new(resource),
+            scope: Some(Arc::new(Scope {
+                name: "upstream-lib".into(),
+                version: "1".into(),
+                attributes: AttrMap::new(),
+                dropped_attributes_count: 0,
+                schema_url: None,
+            })),
+            events: vec![tagged_event("stashed", None)],
+        }
+    }
+
+    /// The flushed batch goes out under an empty resource and no scope -- not the last processed
+    /// batch's, which the process path's own batch (first to arrive) still carries untouched.
+    #[tokio::test]
+    async fn lua_flush_resource_and_scope_start_empty_not_last_seen() {
+        let (_, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+        assert_eq!(attr_str(&processed.events[0], "phase"), Some("process"));
+        assert_eq!(
+            processed.resource.attributes.get("service.name").and_then(|v| v.as_str()),
+            Some("upstream"),
+            "the process path keeps the incoming batch's resource"
+        );
+        assert!(processed.scope.is_some(), "the process path keeps the incoming batch's scope");
+
+        assert_eq!(attr_str(&flushed.events[0], "phase"), Some("flush"));
+        assert!(
+            flushed.resource.attributes.is_empty(),
+            "a flush runs in a root context: empty resource, got {:?}",
+            flushed.resource
+        );
+        assert!(flushed.scope.is_none(), "a flush runs in a root context: no scope");
+    }
+
+    /// A `resource`/`scope` write inside `flush()` is the one way a flush-driven emission carries
+    /// either -- committed onto the flushed batch exactly as a `process()`-time write would be.
+    #[tokio::test]
+    async fn lua_flush_resource_and_scope_written_inside_flush_are_honoured() {
+        let script = r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    resource["service.name"] = "from-flush"
+                    scope.name = "from-flush-lib"
+                    return {e}
+                end
+                return {}
+            end
+        "#;
+        let (_, batches) = run_lua_flush_probe(script, upstream_batch()).await;
+        let [flushed] = batches.as_slice() else {
+            panic!("process() drops, so only the flushed batch should arrive, got {batches:?}");
+        };
+        assert_eq!(
+            flushed.resource.attributes.get("service.name").and_then(|v| v.as_str()),
+            Some("from-flush")
+        );
+        let scope = flushed.scope.as_ref().expect("the scope written in flush() should be carried");
+        assert_eq!(&scope.name[..], b"from-flush-lib");
+    }
+
+    /// Inside `flush()`, `provenance.origin`/`.previous` are both this component -- what the
+    /// flushed batch is stamped with on the way out -- while `process()` still sees the incoming
+    /// batch's own provenance.
+    #[tokio::test]
+    async fn lua_flush_sees_its_own_component_as_origin_and_previous() {
+        let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+
+        let seen = &processed.events[0];
+        assert_eq!(attr_str(seen, "seen_origin"), Some("in"), "process() sees the listener");
+        assert_eq!(attr_str(seen, "seen_previous"), Some("in"));
+        assert_eq!(attr_str(seen, "seen_component"), Some("windowed"));
+
+        let seen = &flushed.events[0];
+        assert_eq!(attr_str(seen, "seen_origin"), Some("windowed"), "a flush is its own origin");
+        assert_eq!(attr_str(seen, "seen_previous"), Some("windowed"));
+        assert_eq!(attr_str(seen, "seen_component"), Some("windowed"));
+        let (_, stamped) = &observed[1];
+        assert_eq!(symbol_name(stamped.origin).as_deref(), Some("windowed"));
+        assert_eq!(symbol_name(stamped.previous).as_deref(), Some("windowed"));
+    }
+
+    /// Inside `flush()`, `trace` is the fresh root the flushed batch is actually sent under --
+    /// the very ids the watcher observes on it -- and not the last processed batch's context.
+    #[tokio::test]
+    async fn lua_flush_sees_the_fresh_root_trace_context_it_is_sent_under() {
+        let (observed, batches) = run_lua_flush_probe(FLUSH_PROBE_SCRIPT, upstream_batch()).await;
+        let [(process_ctx, _), (flush_ctx, _)] = observed.as_slice() else {
+            panic!("expected two observed contexts, got {}", observed.len());
+        };
+        let [processed, flushed] = batches.as_slice() else {
+            panic!("expected the process-path batch then the flushed batch, got {batches:?}");
+        };
+
+        // The process path: the script reads the *incoming* batch's context, and the outgoing
+        // batch is its child -- same trace, different span.
+        let seen = &processed.events[0];
+        assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&process_ctx.trace_id).as_str()));
+        assert_ne!(attr_str(seen, "seen_span_id"), Some(hex_id(&process_ctx.span_id).as_str()));
+
+        // The flush: what the script read *is* the root the batch went out under, both halves.
+        let seen = &flushed.events[0];
+        assert_eq!(attr_str(seen, "seen_trace_id"), Some(hex_id(&flush_ctx.trace_id).as_str()));
+        assert_eq!(attr_str(seen, "seen_span_id"), Some(hex_id(&flush_ctx.span_id).as_str()));
+        assert_ne!(
+            flush_ctx.trace_id, process_ctx.trace_id,
+            "a flush is a new root, unrelated to the batch that fed it"
+        );
+    }
+
+    /// A flushed event marked for a `target` keeps this node as `origin` and takes the target as
+    /// `previous`: the flush pre-fills both halves of the provenance
+    /// (`docs/adr/lua-flush-root-context.md`), and the target's own `Fanout` then applies the one
+    /// unchanged stamping rule (`docs/adr/batch-provenance-on-delivered.md`) it applies on the
+    /// `process()` path -- `previous` becomes the target, `origin` is untouched
+    /// (`docs/adr/target-components.md`). Before the root context an empty `origin` reached the
+    /// target unset, so the *target* named itself as the origin of a flushed batch.
+    #[tokio::test]
+    async fn lua_flush_through_a_target_keeps_this_node_as_origin_and_the_target_as_previous() {
+        let script = r#"
+            local pending = nil
+            function process(event)
+                pending = event:clone()
+                return nil
+            end
+            function flush()
+                if pending then
+                    local e = pending
+                    pending = nil
+                    return {e:to("a")}
+                end
+                return {}
+            end
+        "#;
+        let g = routed_graph(vec![
+            (
+                "in",
+                vec![],
+                vec![],
+                ComponentKind::StatsdIn {
+                    bind: "127.0.0.1:0".to_string(),
+                    transport: logit_config::StatsdTransport::default(),
+                    tls: None,
+                    handshake_timeout: logit_config::default_handshake_timeout(),
+                    idle_timeout: None,
+                },
+            ),
+            (
+                "windowed",
+                vec!["in"],
+                vec!["a"],
+                ComponentKind::Lua {
+                    script: script.to_string(),
+                    interval: Some(Duration::from_secs(3600)),
+                },
+            ),
+            ("a", vec![], vec![], ComponentKind::Target {}),
+            ("watcher", vec!["a"], vec![], ComponentKind::Json { skip_to_brace: false }),
+        ]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput {
+                    batch: Some(one_batch(vec![tagged_event("stashed", None)])),
+                }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "windowed".to_string(),
+            NodeSpec::Lua { script: script.to_string(), interval: Some(Duration::from_secs(3600)) },
+        );
+        specs.insert("a".to_string(), NodeSpec::Target);
+        specs.insert("watcher".to_string(), NodeSpec::Transform(Box::new(RecordProvenance { tx })));
+
+        tokio::time::timeout(Duration::from_secs(5), run(g, specs))
+            .await
+            .expect("run should return once the only input finishes, not hang forever")
+            .expect("run should complete without error");
+
+        let provenance = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the flushed batch should reach the target's consumer");
+        assert_eq!(
+            symbol_name(provenance.origin).as_deref(),
+            Some("windowed"),
+            "the flushing node stays the origin -- the target never overwrites an already-set one"
+        );
+        assert_eq!(
+            symbol_name(provenance.previous).as_deref(),
+            Some("a"),
+            "the target's Fanout rewrote previous, exactly as it does on the process() path"
         );
     }
 }
