@@ -63,9 +63,10 @@ same misunderstanding.
   shape. `crates/logit-proto/src/otlp/mod.rs`'s existing hand-built `OTLP_TRACE_REQUEST` literal
   already covers the protobuf decode path, so this wasn't judged worth the added harness
   complexity for a first PR — see `testdata/interop/otlp/README.md`'s own "not covered" section.
-- **TCP-framed syslog fixtures.** `syslog_in` is UDP-only today
-  (`crates/logit-inputs/src/syslog.rs`'s module doc), so there's nothing to exercise yet — but
-  `raw_capture.py` already implements a `--proto tcp` capture mode for when that changes.
+- **TCP-framed syslog fixtures.** Closed since: `syslog_in` runs `transport: tcp` on the shared
+  stream driver ([`syslog-tls.md`](syslog-tls.md)), and `record_rsyslog_tcp` in
+  `script/record-fixtures` records `testdata/interop/syslog/rsyslog-tcp-000.raw` over
+  `raw_capture.py`'s `--proto tcp` mode.
 
 ## Amendment (2026-09-12): collectd, recorded
 
