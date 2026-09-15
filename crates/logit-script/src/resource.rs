@@ -51,8 +51,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ResourceState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` -- resets `resource`
-/// to read `resource`'s attributes and clears any write left over from a previous batch.
+/// Called once per incoming batch, before any of its events reach `process` (and once before
+/// every `flush()` call, with an empty resource -- `docs/adr/lua-flush-root-context.md`) --
+/// resets `resource` to read `resource`'s attributes and clears any write left over from a
+/// previous call.
 pub(crate) fn set(state: &Rc<RefCell<ResourceState>>, resource: &Arc<Resource>) {
     let mut state = state.borrow_mut();
     state.base = resource.clone();
@@ -60,8 +62,10 @@ pub(crate) fn set(state: &Rc<RefCell<ResourceState>>, resource: &Arc<Resource>) 
 }
 
 /// `Some` if a script wrote `resource` since the last [`set`], committing that write as the new
-/// `base` so a later read (inside the same batch's remaining `process()` calls, or a `flush()`
-/// that runs before the next `set`) sees it too. `None` -- the common case -- costs nothing.
+/// `base` so a read before the next [`set`] sees it too, and a second [`take`] returns `None`.
+/// `run_lua` calls [`set`] before every batch and before every `flush()`
+/// (`docs/adr/lua-flush-root-context.md`), so no write carries into the next call. `None` -- the
+/// common case -- costs nothing.
 pub(crate) fn take(state: &Rc<RefCell<ResourceState>>) -> Option<Arc<Resource>> {
     let mut state = state.borrow_mut();
     let modified = state.modified.take()?;
