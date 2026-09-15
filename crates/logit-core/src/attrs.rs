@@ -63,6 +63,14 @@ impl AttrMap {
     pub fn remove(&mut self, key: &str) -> Option<Value> {
         // Same reasoning as `get`: a key never interned was never inserted, so it can't be present.
         let key = lookup(key)?;
+        self.remove_sym(key)
+    }
+
+    /// Same as [`AttrMap::remove`], but for a caller that already holds the [`Symbol`] -- the
+    /// [`AttrMap::get_sym`] reasoning applied to removal. The first callers are the `remove` ->
+    /// `insert` merge steps for a repeated key (`statsd_in`'s tags, `syslog_in`'s SD params),
+    /// which resolve the key once through a `KeyCache` and then do both halves by `Symbol`.
+    pub fn remove_sym(&mut self, key: Symbol) -> Option<Value> {
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| self.0.remove(i).1)
     }
 

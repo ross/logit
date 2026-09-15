@@ -245,13 +245,14 @@ use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
 use logit_core::{
-    interner::intern, AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord,
-    Resource, Samples, Scope, Severity, Telemetry, Value,
+    interner::{intern, KeyCache},
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, MetricKind, MetricRecord, Resource,
+    Samples, Scope, Severity, Symbol, Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
 /// Which driver a [`StatsdInput`] is wrapping. Chosen once, by `transport:`
@@ -507,11 +508,18 @@ impl Input for StatsdInput {
 pub struct StatsdDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
+    /// DogStatsD tag keys seen so far, memoised `&str -> Symbol`
+    /// (`logit_core::interner::KeyCache`): a client's tag names repeat on every line, so after
+    /// the first each is one `memcmp` instead of a probe of the process-wide interner -- and one
+    /// probe rather than the two (`remove` then `insert`) the repeated-key merge in
+    /// [`insert_tags`] used to pay. The fixed `statsd.*` carrier keys don't go through this;
+    /// they are process constants, interned once in `KEYS`.
+    keys: KeyCache,
 }
 
 impl StatsdDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default() }
+        Self { resource, diag: Diagnostics::default(), keys: KeyCache::new() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -555,7 +563,7 @@ impl Decoder for StatsdDecoder {
             // datagram -- StatsD clients routinely pack several independent metrics into one
             // packet, so treating the datagram as atomic would let a single bad line take down
             // everything alongside it. Isolate per line: keep what parsed, report what didn't.
-            match parse_line(&bytes, text, line, received_at) {
+            match parse_line(&bytes, text, line, received_at, &mut self.keys) {
                 Ok(mut line_events) => out.append(&mut line_events),
                 Err(err) => {
                     self.diag.warn_throttled("bad_line", err);
@@ -583,6 +591,39 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
     bytes.slice(start..start + sub.len())
 }
 
+/// The `statsd.*` carrier keys, interned exactly once per process -- the same reasoning as
+/// `crate::syslog`'s `KEYS`: each used to cost a hash and a shard lock on the process-wide
+/// interner per line for a string that never changes, where `insert_sym` by a `Symbol` held here
+/// is a plain sorted insert. A `LazyLock` rather than a decoder field because the parsers are
+/// free functions and these are process constants; `KEYS.x` is one acquire load after first use.
+static KEYS: LazyLock<StatsdKeys> = LazyLock::new(|| StatsdKeys {
+    container_id: intern("statsd.container_id"),
+    timestamp: intern("statsd.timestamp"),
+    type_: intern("statsd.type"),
+    event_title: intern("statsd.event.title"),
+    event_host: intern("statsd.event.host"),
+    event_priority: intern("statsd.event.priority"),
+    event_aggregation_key: intern("statsd.event.aggregation_key"),
+    event_source_type: intern("statsd.event.source_type"),
+    service_check_name: intern("statsd.service_check.name"),
+    service_check_status: intern("statsd.service_check.status"),
+    service_check_host: intern("statsd.service_check.host"),
+});
+
+struct StatsdKeys {
+    container_id: Symbol,
+    timestamp: Symbol,
+    type_: Symbol,
+    event_title: Symbol,
+    event_host: Symbol,
+    event_priority: Symbol,
+    event_aggregation_key: Symbol,
+    event_source_type: Symbol,
+    service_check_name: Symbol,
+    service_check_status: Symbol,
+    service_check_host: Symbol,
+}
+
 /// Parses a comma-separated `#<tag>[:<value>],...` segment (the text after the `#`, for a metric
 /// line, an event, or a service check alike) and folds each tag into `attributes`. A `key:value`
 /// tag's value is a zero-copy [`slice_of`] `text`/`bytes`; a valueless tag (`#urgent`) marks
@@ -606,7 +647,13 @@ fn slice_of(bytes: &Bytes, text: &str, sub: &str) -> Bytes {
 /// it), where a plain `insert` was one. See the module doc's "DogStatsD tags" section for the
 /// semantics this implements and for what it deliberately leaves alone (a repeated `|` *segment*,
 /// and the `statsd.*` carrier keys).
-fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) {
+fn insert_tags(
+    attributes: &mut AttrMap,
+    bytes: &Bytes,
+    text: &str,
+    tags: &str,
+    keys: &mut KeyCache,
+) {
     for tag in tags.split(',').filter(|t| !t.is_empty()) {
         let (key, value) = match tag.split_once(':') {
             // `v` is a genuine `&str` slice of `text`, so `slice_of` shares the datagram's
@@ -614,7 +661,9 @@ fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) 
             Some((k, v)) => (k, Value::Str(slice_of(bytes, text, v))),
             None => (tag, Value::Bool(true)),
         };
-        let merged = match attributes.remove(key) {
+        // One cache probe for the key, then both halves of the merge by `Symbol`.
+        let key = keys.get_or_intern(key);
+        let merged = match attributes.remove_sym(key) {
             None => value,
             Some(Value::Array(mut arr)) => {
                 if !arr.iter().any(|e| tag_element_eq(e, &value)) {
@@ -625,7 +674,7 @@ fn insert_tags(attributes: &mut AttrMap, bytes: &Bytes, text: &str, tags: &str) 
             Some(existing) if tag_element_eq(&existing, &value) => existing,
             Some(existing) => Value::Array(vec![existing, value]),
         };
-        attributes.insert(key, merged);
+        attributes.insert_sym(key, merged);
     }
 }
 
@@ -649,7 +698,7 @@ fn tag_element_eq(a: &Value, b: &Value) -> bool {
 /// carrier for a concept this model has no normalized field for) as a zero-copy datagram slice.
 /// Shared by metric lines' `|c:`, events' `c:`, and service checks' `c:` alike.
 fn insert_container_id(attributes: &mut AttrMap, bytes: &Bytes, text: &str, container_id: &str) {
-    attributes.insert("statsd.container_id", Value::Str(slice_of(bytes, text, container_id)));
+    attributes.insert_sym(KEYS.container_id, Value::Str(slice_of(bytes, text, container_id)));
 }
 
 /// Parses a `|T<unix-seconds>`/`d:<unix-seconds>` value shared by metric lines, events, and
@@ -679,6 +728,7 @@ fn parse_line(
     text: &str,
     line: &str,
     timestamp: i64,
+    keys: &mut KeyCache,
 ) -> Result<Vec<Event>, CodecError> {
     // DogStatsD events and service checks are picked out by their leading sigil, before any of
     // the `<name>:<value>|<type>` grammar below applies at all -- see the module doc's "DogStatsD
@@ -686,10 +736,10 @@ fn parse_line(
     // -- including one that merely starts with `_` without matching either, like a legal
     // `_`-prefixed metric name -- falls through unchanged into the generic grammar below.
     if line.starts_with("_e{") {
-        return parse_event(bytes, text, line, timestamp).map(|event| vec![event]);
+        return parse_event(bytes, text, line, timestamp, keys).map(|event| vec![event]);
     }
     if line.starts_with("_sc|") {
-        return parse_service_check(bytes, text, line, timestamp).map(|event| vec![event]);
+        return parse_service_check(bytes, text, line, timestamp, keys).map(|event| vec![event]);
     }
 
     let malformed = || CodecError::Malformed(format!("malformed statsd line: {line:?}"));
@@ -720,7 +770,7 @@ fn parse_line(
             }
             sample_rate = parsed;
         } else if let Some(tags) = extra.strip_prefix('#') {
-            insert_tags(&mut attributes, bytes, text, tags);
+            insert_tags(&mut attributes, bytes, text, tags, keys);
         } else if let Some(container_id) = extra.strip_prefix("c:") {
             // DogStatsD container id (`|c:<id>`, v1.2+; v1.4+'s `ci-`/`in-`-prefixed variants
             // land in the same slot verbatim -- this decoder carries whatever follows `c:`
@@ -740,7 +790,7 @@ fn parse_line(
             // stage downstream that rebuilds `Event::timestamp` (`aggregate`'s flush, notably)
             // can't fabricate a `|T` value the wire never sent: `statsd_out` reads this attribute
             // directly rather than trusting `event.timestamp`.
-            attributes.insert("statsd.timestamp", Value::U64(secs));
+            attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
         }
         // Anything else is accepted and ignored -- forward-compatible with segment kinds this
         // decoder doesn't know about yet, rather than a hard error on something benign.
@@ -782,7 +832,7 @@ fn parse_line(
             // The wire type letter survives as `statsd.type` (rule (b)) since `ms`/`h`/`d` all
             // land on the same `Samples` shape -- a zero-copy slice of the datagram, like every
             // other string-valued attribute this decoder stamps.
-            attrs.insert("statsd.type", Value::Str(slice_of(bytes, text, type_part)));
+            attrs.insert_sym(KEYS.type_, Value::Str(slice_of(bytes, text, type_part)));
             let kind = MetricKind::Samples(samples);
             Ok(vec![Event::metric(line_timestamp, attrs, MetricRecord::new(intern(name), kind))])
         }
@@ -805,7 +855,13 @@ fn parse_line(
 /// Parses a DogStatsD event line (`_e{<TITLE_LEN>,<TEXT_LEN>}:<TITLE>|<TEXT>|...`) -- see the
 /// module doc's "DogStatsD events and service checks" section for the full grammar and decoded
 /// shape. `line` is already known to start with `"_e{"` (checked by `parse_line`'s dispatch).
-fn parse_event(bytes: &Bytes, text: &str, line: &str, timestamp: i64) -> Result<Event, CodecError> {
+fn parse_event(
+    bytes: &Bytes,
+    text: &str,
+    line: &str,
+    timestamp: i64,
+    keys: &mut KeyCache,
+) -> Result<Event, CodecError> {
     let malformed = || CodecError::Malformed(format!("malformed dogstatsd event: {line:?}"));
 
     let header_rest = line.strip_prefix("_e{").ok_or_else(malformed)?;
@@ -825,7 +881,7 @@ fn parse_event(bytes: &Bytes, text: &str, line: &str, timestamp: i64) -> Result<
     let after_text = &after_title[text_len..];
 
     let mut attributes = AttrMap::new();
-    attributes.insert("statsd.event.title", Value::Str(slice_of(bytes, text, title)));
+    attributes.insert_sym(KEYS.event_title, Value::Str(slice_of(bytes, text, title)));
 
     let mut line_timestamp = timestamp;
     let mut severity = None;
@@ -834,21 +890,21 @@ fn parse_event(bytes: &Bytes, text: &str, line: &str, timestamp: i64) -> Result<
         let fields = after_text.strip_prefix('|').ok_or_else(malformed)?;
         for field in fields.split('|') {
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, text, tags);
+                insert_tags(&mut attributes, bytes, text, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, text, container_id);
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
-                attributes.insert("statsd.timestamp", Value::U64(secs));
+                attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
             } else if let Some(host) = field.strip_prefix("h:") {
-                attributes.insert("statsd.event.host", Value::Str(slice_of(bytes, text, host)));
+                attributes.insert_sym(KEYS.event_host, Value::Str(slice_of(bytes, text, host)));
             } else if let Some(priority) = field.strip_prefix("p:") {
                 if priority != "normal" && priority != "low" {
                     return Err(malformed());
                 }
                 attributes
-                    .insert("statsd.event.priority", Value::Str(slice_of(bytes, text, priority)));
+                    .insert_sym(KEYS.event_priority, Value::Str(slice_of(bytes, text, priority)));
             } else if let Some(alert_type) = field.strip_prefix("t:") {
                 severity = Some(match alert_type {
                     "error" => Severity::Error,
@@ -862,10 +918,10 @@ fn parse_event(bytes: &Bytes, text: &str, line: &str, timestamp: i64) -> Result<
                 );
             } else if let Some(key) = field.strip_prefix("k:") {
                 attributes
-                    .insert("statsd.event.aggregation_key", Value::Str(slice_of(bytes, text, key)));
+                    .insert_sym(KEYS.event_aggregation_key, Value::Str(slice_of(bytes, text, key)));
             } else if let Some(source) = field.strip_prefix("s:") {
                 attributes
-                    .insert("statsd.event.source_type", Value::Str(slice_of(bytes, text, source)));
+                    .insert_sym(KEYS.event_source_type, Value::Str(slice_of(bytes, text, source)));
             }
             // Anything else (including `|T`, which is not part of this grammar) is accepted and
             // ignored -- same forward-compatible stance as an unrecognized segment on a metric
@@ -925,6 +981,7 @@ fn parse_service_check(
     text: &str,
     line: &str,
     timestamp: i64,
+    keys: &mut KeyCache,
 ) -> Result<Event, CodecError> {
     let malformed =
         || CodecError::Malformed(format!("malformed dogstatsd service check: {line:?}"));
@@ -947,8 +1004,8 @@ fn parse_service_check(
     // Rule (b) (`docs/adr/lossless-transit.md`): the raw carrier -- `MetricRecord` has nowhere
     // else for a service check's name to land, so it's stamped unconditionally, not just on
     // mismatch.
-    attributes.insert("statsd.service_check.name", Value::Str(slice_of(bytes, text, name)));
-    attributes.insert("statsd.service_check.status", Value::U64(status as u64));
+    attributes.insert_sym(KEYS.service_check_name, Value::Str(slice_of(bytes, text, name)));
+    attributes.insert_sym(KEYS.service_check_status, Value::U64(status as u64));
 
     let mut line_timestamp = timestamp;
 
@@ -966,16 +1023,16 @@ fn parse_service_check(
                 None => (cursor, None),
             };
             if let Some(tags) = field.strip_prefix('#') {
-                insert_tags(&mut attributes, bytes, text, tags);
+                insert_tags(&mut attributes, bytes, text, tags, keys);
             } else if let Some(container_id) = field.strip_prefix("c:") {
                 insert_container_id(&mut attributes, bytes, text, container_id);
             } else if let Some(secs) = field.strip_prefix("d:") {
                 let (nanos, secs) = parse_wire_seconds(secs, line)?;
                 line_timestamp = nanos;
-                attributes.insert("statsd.timestamp", Value::U64(secs));
+                attributes.insert_sym(KEYS.timestamp, Value::U64(secs));
             } else if let Some(host) = field.strip_prefix("h:") {
                 attributes
-                    .insert("statsd.service_check.host", Value::Str(slice_of(bytes, text, host)));
+                    .insert_sym(KEYS.service_check_host, Value::Str(slice_of(bytes, text, host)));
             }
             // Anything else (including `|T`) is accepted and ignored, same forward-compatible
             // stance as everywhere else in this decoder.
@@ -1164,7 +1221,8 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let text = std::str::from_utf8(&bytes).unwrap();
-        parse_line(&bytes, text, text, 0).expect_err("expected this line to be rejected")
+        parse_line(&bytes, text, text, 0, &mut KeyCache::new())
+            .expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -1423,6 +1481,44 @@ mod tests {
         assert_eq!(event.attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
         assert_eq!(event.attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
         assert!(matches!(event.attributes.get("urgent"), Some(logit_core::Value::Bool(true))));
+    }
+
+    /// Tag keys go through the decoder's `KeyCache` and the fixed `statsd.*` carrier keys are
+    /// process constants: a second line with the same tag names in another order (one repeated,
+    /// so the `remove_sym` -> `insert_sym` merge runs too) interns nothing new, and the cache
+    /// holds exactly the three tag names. `nextest` runs each test in its own process, so
+    /// `interner::len()` here reflects only this test.
+    #[test]
+    fn repeat_tag_keys_are_cache_hits() {
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
+        let line = |s: &str| Bytes::from(s.to_string());
+        // `|c:` on the warm-up line too: the first touch of any `statsd.*` carrier key interns
+        // all of `KEYS` at once (a one-time process cost, not a per-line one), and the point
+        // below is that a *repeat* line interns nothing.
+        drop(
+            decoder.decode(line("tc.views:1|c|#tc_env:prod,tc_host:web1,tc_urgent|c:abc")).unwrap(),
+        );
+        assert_eq!(decoder.keys.len(), 3);
+
+        let before = logit_core::interner::len();
+        let events = decoder
+            .decode(line("tc.views:2|c|#tc_host:web2,tc_urgent,tc_env:dev,tc_env:qa|c:abc"))
+            .expect("decode should succeed")
+            .events;
+        assert_eq!(logit_core::interner::len(), before, "same tag keys, same carrier keys");
+        assert_eq!(decoder.keys.len(), 3);
+
+        let event = &events[0];
+        assert_eq!(event.attributes.get("tc_host").and_then(|v| v.as_str()), Some("web2"));
+        assert_eq!(
+            event.attributes.get("tc_env"),
+            Some(&Value::Array(vec![Value::str("dev"), Value::str("qa")]))
+        );
+        assert!(matches!(event.attributes.get("tc_urgent"), Some(Value::Bool(true))));
+        assert_eq!(
+            event.attributes.get("statsd.container_id").and_then(|v| v.as_str()),
+            Some("abc")
+        );
     }
 
     #[test]

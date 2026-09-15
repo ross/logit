@@ -79,8 +79,11 @@ pub fn len() -> usize {
 ///
 /// **Contract.** `cache.get_or_intern(s) == intern(s)` for every `s`, always; the cache holds no
 /// `Symbol` the global table doesn't. Single-owner by design (`&mut self`): a `Transform` is
-/// owned by exactly one task, so there is nothing to synchronise.
-#[derive(Debug, Default)]
+/// owned by exactly one task, so there is nothing to synchronise. `Clone` because the decoders
+/// that own one are cloned per accepted connection (`crates/logit-inputs/src/tcp.rs`); a clone
+/// carries the warm entries with it, which is harmless (every entry is a valid `Symbol` for the
+/// life of the process) and lets a new connection start warm on a listener-wide schema.
+#[derive(Debug, Default, Clone)]
 pub struct KeyCache {
     entries: Vec<(Box<str>, Symbol)>,
     cursor: usize,
