@@ -125,14 +125,16 @@ use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
 use bytes::Bytes;
+use logit_core::interner::{intern, KeyCache};
 use logit_core::time::{parse_rfc3339_to_nanos, TimestampError};
 use logit_core::{
-    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Telemetry, Value,
+    AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Scope, Severity, Symbol,
+    Telemetry, Value,
 };
 use logit_pipeline::Fanout;
 use logit_proto::{CodecError, Decoder};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
 /// Which driver a [`SyslogInput`] is wrapping. Chosen once, by `transport:`
@@ -376,11 +378,17 @@ pub struct SyslogDecoder {
     diag: Diagnostics,
     /// See [`Self::with_line_splitting`].
     line_splitting: bool,
+    /// RFC 5424 SD-IDs and PARAM-NAMEs seen so far, memoised `&str -> Symbol`
+    /// (`logit_core::interner::KeyCache`): structured data repeats the same few element ids and
+    /// parameter names on every line that carries it, so after the first each is one `memcmp`
+    /// instead of a probe of the process-wide interner. The fixed `syslog.*` carrier keys don't
+    /// go through this -- they are process constants, interned once in `KEYS`.
+    keys: KeyCache,
 }
 
 impl SyslogDecoder {
     pub fn new(resource: Arc<Resource>) -> Self {
-        Self { resource, diag: Diagnostics::default(), line_splitting: true }
+        Self { resource, diag: Diagnostics::default(), line_splitting: true, keys: KeyCache::new() }
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -411,7 +419,7 @@ impl SyslogDecoder {
         if line.is_empty() {
             return;
         }
-        match parse_line(&line, received_at, &mut self.diag) {
+        match parse_line(&line, received_at, &mut self.diag, &mut self.keys) {
             Ok(event) => out.push(event),
             Err(err) => {
                 self.diag.warn_throttled("bad_line", err);
@@ -535,12 +543,46 @@ fn is_printusascii(b: &[u8]) -> bool {
     b.iter().all(|&c| is_printusascii_byte(c))
 }
 
+/// The eight `syslog.*` carrier keys, interned exactly once per process. Every decoded line used
+/// to `AttrMap::insert(&str)` each of them -- a hash and a shard lock on the process-wide interner
+/// per key per line for a set of strings that never changes -- where `insert_sym` by a `Symbol`
+/// held here is a plain sorted insert. `crates/logit-proto/src/collectd/decode.rs`'s `AttrKeys`
+/// is the same pattern as a decoder field; a `LazyLock` here because `parse_3164`/`parse_5424`
+/// are free functions and the keys are process constants, not per-decoder state. `KEYS.x` is one
+/// acquire load after the first use.
+static KEYS: LazyLock<SyslogKeys> = LazyLock::new(|| SyslogKeys {
+    facility: intern("syslog.facility"),
+    severity: intern("syslog.severity"),
+    timestamp: intern("syslog.timestamp"),
+    hostname: intern("syslog.hostname"),
+    tag: intern("syslog.tag"),
+    pid: intern("syslog.pid"),
+    msgid: intern("syslog.msgid"),
+    sd: intern("syslog.sd"),
+});
+
+struct SyslogKeys {
+    facility: Symbol,
+    severity: Symbol,
+    timestamp: Symbol,
+    hostname: Symbol,
+    tag: Symbol,
+    pid: Symbol,
+    msgid: Symbol,
+    sd: Symbol,
+}
+
 /// Parses one non-empty line, already isolated as a `Bytes` slice of the original datagram by
 /// [`SyslogDecoder::decode_into`] -- not yet validated as UTF-8 anywhere; that validation now
 /// happens field-by-field below (PRINTUSASCII for every header field, UTF-8-or-`Bytes` for MSG
 /// alone). `diag` is threaded down to [`parse_5424`], which uses it to report a
 /// well-formed-but-unrepresentable TIMESTAMP without failing the whole line over it.
-fn parse_line(line: &Bytes, recv_ts: i64, diag: &mut Diagnostics) -> Result<Event, CodecError> {
+fn parse_line(
+    line: &Bytes,
+    recv_ts: i64,
+    diag: &mut Diagnostics,
+    keys: &mut KeyCache,
+) -> Result<Event, CodecError> {
     let malformed = || {
         CodecError::Malformed(format!("malformed syslog line: {:?}", String::from_utf8_lossy(line)))
     };
@@ -585,7 +627,16 @@ fn parse_line(line: &Bytes, recv_ts: i64, diag: &mut Diagnostics) -> Result<Even
 
     match is_5424_after {
         Some((version, after_version)) => {
-            match parse_5424(line, after_version, facility, severity_num, severity, recv_ts, diag) {
+            match parse_5424(
+                line,
+                after_version,
+                facility,
+                severity_num,
+                severity,
+                recv_ts,
+                diag,
+                keys,
+            ) {
                 Ok(event) => Ok(event),
                 // The sniff above only checks "digit, then space" -- RFC 5424's VERSION is
                 // `NONZERO-DIGIT 0*2DIGIT`, so a tag-less RFC 3164 line whose MSG happens to start
@@ -718,12 +769,12 @@ fn parse_3164(
     };
 
     let mut attrs = AttrMap::new();
-    attrs.insert("syslog.facility", Value::U64(facility as u64));
-    attrs.insert("syslog.severity", Value::U64(severity_num as u64));
+    attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
+    attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
     if let Some(ts) = ts_token {
         // ASCII by construction -- `parse_3164_timestamp` only accepts alphabetic/digit/space/
         // colon bytes.
-        attrs.insert("syslog.timestamp", Value::Str(slice_of(line, ts)));
+        attrs.insert_sym(KEYS.timestamp, Value::Str(slice_of(line, ts)));
     }
     if let Some(host) = hostname {
         if !host.is_empty() {
@@ -736,7 +787,7 @@ fn parse_3164(
             // and was rejected with its own diagnostic; this keeps that observability for what is
             // now a partial, per-field loss instead of a whole-line rejection).
             if std::str::from_utf8(host).is_ok() {
-                attrs.insert("syslog.hostname", Value::Str(slice_of(line, host)));
+                attrs.insert_sym(KEYS.hostname, Value::Str(slice_of(line, host)));
             } else {
                 diag.warn_throttled(
                     "hostname_not_utf8",
@@ -755,15 +806,15 @@ fn parse_3164(
             // `is_tag_shaped` already validated the bracketed-PID shape.
             let name = &tag_body[..open];
             let pid_bytes = &tag_body[open + 1..tag_body.len() - 1];
-            attrs.insert("syslog.tag", Value::Str(slice_of(line, name)));
+            attrs.insert_sym(KEYS.tag, Value::Str(slice_of(line, name)));
             match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
-                Some(n) => attrs.insert("syslog.pid", Value::U64(n)),
+                Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
                 // `is_tag_shaped` guarantees `pid_bytes` is PRINTUSASCII (hence valid UTF-8) when
                 // it isn't a `u64`, so this `Value::Str` construction can't violate its invariant.
-                None => attrs.insert("syslog.pid", Value::Str(slice_of(line, pid_bytes))),
+                None => attrs.insert_sym(KEYS.pid, Value::Str(slice_of(line, pid_bytes))),
             }
         } else {
-            attrs.insert("syslog.tag", Value::Str(slice_of(line, tag_body)));
+            attrs.insert_sym(KEYS.tag, Value::Str(slice_of(line, tag_body)));
         }
     }
 
@@ -919,9 +970,9 @@ fn parse_param_value(s: &[u8], pos: &mut usize) -> Result<Vec<u8>, SdError> {
 /// SD-ELEMENT becomes a `Value::Array` of `Value::Str`, in the order encountered -- RFC 5424
 /// doesn't forbid repetition, and this project's `syslog.sd` convention keeps every occurrence
 /// rather than the last-write-wins an ordinary `AttrMap::insert` would give.
-fn insert_param(inner: &mut AttrMap, name: &str, value: Bytes) {
+fn insert_param(inner: &mut AttrMap, name: Symbol, value: Bytes) {
     let value = Value::Str(value);
-    let merged = match inner.remove(name) {
+    let merged = match inner.remove_sym(name) {
         None => value,
         Some(Value::Array(mut arr)) => {
             arr.push(value);
@@ -929,7 +980,7 @@ fn insert_param(inner: &mut AttrMap, name: &str, value: Bytes) {
         }
         Some(existing) => Value::Array(vec![existing, value]),
     };
-    inner.insert(name, merged);
+    inner.insert_sym(name, merged);
 }
 
 /// Parses RFC 5424 STRUCTURED-DATA (section 6.3): the nil marker `-`, or one or more concatenated
@@ -938,7 +989,7 @@ fn insert_param(inner: &mut AttrMap, name: &str, value: Bytes) {
 /// following space when present -- the same "consumed one following space" contract
 /// [`skip_structured_data`](self) (this function's predecessor) used. An `Err` names what grammar
 /// rule was violated and where, relative to the start of `s`.
-fn parse_structured_data(s: &[u8]) -> Result<(Option<Value>, usize), SdError> {
+fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>, usize), SdError> {
     if let Some(rest) = s.strip_prefix(b"-") {
         return Ok((None, 1 + usize::from(rest.first() == Some(&b' '))));
     }
@@ -954,6 +1005,12 @@ fn parse_structured_data(s: &[u8]) -> Result<(Option<Value>, usize), SdError> {
         let id_bytes = parse_sd_name(s, &mut pos)?;
         let id = std::str::from_utf8(id_bytes)
             .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
+        // `AttrMap::get`, not an interned probe: `id` is unvalidated here -- the SD-ELEMENT it
+        // opens may still be rejected below, and `parse_line`'s any-digit RFC 5424 sniff routes
+        // plain RFC 3164 lines whose MSG happens to contain a `[token` through this function
+        // before falling back. Interning at this point would retain producer-controlled text in
+        // the process-wide table for the life of the process, outside `docs/design/memory.md`
+        // §4's accepted exposure. The intern happens once, at the successful insert below.
         if sd.get(id).is_some() {
             return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
         }
@@ -986,7 +1043,7 @@ fn parse_structured_data(s: &[u8]) -> Result<(Option<Value>, usize), SdError> {
                     let value = String::from_utf8(value_bytes).map_err(|_| {
                         SdError::new(value_start, "PARAM-VALUE is not valid UTF-8 once unescaped")
                     })?;
-                    insert_param(&mut inner, name, Bytes::from(value));
+                    insert_param(&mut inner, keys.get_or_intern(name), Bytes::from(value));
                 }
                 Some(_) => {
                     return Err(SdError::new(pos, "expected SP or ']' inside SD-ELEMENT"));
@@ -996,7 +1053,7 @@ fn parse_structured_data(s: &[u8]) -> Result<(Option<Value>, usize), SdError> {
                 }
             }
         }
-        sd.insert(id, Value::Map(Box::new(inner)));
+        sd.insert_sym(keys.get_or_intern(id), Value::Map(Box::new(inner)));
     }
 
     if s.get(pos) == Some(&b' ') {
@@ -1014,6 +1071,7 @@ fn parse_5424(
     severity: Severity,
     recv_ts: i64,
     diag: &mut Diagnostics,
+    keys: &mut KeyCache,
 ) -> Result<Event, CodecError> {
     let malformed =
         |detail: String| CodecError::Malformed(format!("malformed RFC 5424 syslog line: {detail}"));
@@ -1028,14 +1086,14 @@ fn parse_5424(
     // always a genuine subslice of `line` (built entirely through `split_first_token`), so this
     // pointer subtraction is sound the same way `slice_of`'s is.
     let sd_base = rest.as_ptr() as usize - line.as_ptr() as usize;
-    let (sd_value, sd_offset) = parse_structured_data(rest).map_err(|e| {
+    let (sd_value, sd_offset) = parse_structured_data(rest, keys).map_err(|e| {
         malformed(format!("STRUCTURED-DATA at byte {}: {}", sd_base + e.offset, e.message))
     })?;
     let msg = &rest[sd_offset..];
 
     let mut attrs = AttrMap::new();
-    attrs.insert("syslog.facility", Value::U64(facility as u64));
-    attrs.insert("syslog.severity", Value::U64(severity_num as u64));
+    attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
+    attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
     // A nil TIMESTAMP (`-`) now stamps an explicit `Value::Null` -- distinct from "this decoder
     // never looked" -- but a non-nil TIMESTAMP that fails to parse is not "absent", it's
     // malformed input, and must take the same skip-and-continue path a bad PRI does rather than
@@ -1047,14 +1105,14 @@ fn parse_5424(
     // field.
     match nil_or(ts_field) {
         None => {
-            attrs.insert("syslog.timestamp", Value::Null);
+            attrs.insert_sym(KEYS.timestamp, Value::Null);
         }
         Some(ts) => {
             let ts_str = std::str::from_utf8(ts)
                 .map_err(|_| malformed("TIMESTAMP is not valid UTF-8".to_string()))?;
             match parse_rfc3339_to_nanos(ts_str) {
                 Ok(nanos) => {
-                    attrs.insert("syslog.timestamp", Value::Timestamp(nanos));
+                    attrs.insert_sym(KEYS.timestamp, Value::Timestamp(nanos));
                 }
                 Err(TimestampError::OutOfRange) => {
                     diag.warn_throttled(
@@ -1073,10 +1131,10 @@ fn parse_5424(
         }
     }
     if let Some(v) = field_value(line, host_field, "HOSTNAME")? {
-        attrs.insert("syslog.hostname", v);
+        attrs.insert_sym(KEYS.hostname, v);
     }
     if let Some(v) = field_value(line, app_field, "APP-NAME")? {
-        attrs.insert("syslog.tag", v);
+        attrs.insert_sym(KEYS.tag, v);
     }
     if let Some(pid) = nil_or(procid_field) {
         // PROCID is a free-form PRINTUSASCII string per RFC 5424 (it need not be numeric).
@@ -1090,18 +1148,18 @@ fn parse_5424(
         }
         match std::str::from_utf8(pid).expect("validated PRINTUSASCII above").parse::<u64>() {
             Ok(n) => {
-                attrs.insert("syslog.pid", Value::U64(n));
+                attrs.insert_sym(KEYS.pid, Value::U64(n));
             }
             Err(_) => {
-                attrs.insert("syslog.pid", Value::Str(slice_of(line, pid)));
+                attrs.insert_sym(KEYS.pid, Value::Str(slice_of(line, pid)));
             }
         }
     }
     if let Some(v) = field_value(line, msgid_field, "MSGID")? {
-        attrs.insert("syslog.msgid", v);
+        attrs.insert_sym(KEYS.msgid, v);
     }
     if let Some(sd) = sd_value {
-        attrs.insert("syslog.sd", sd);
+        attrs.insert_sym(KEYS.sd, sd);
     }
 
     let message = message_value(line, msg, true);
@@ -1222,7 +1280,8 @@ mod tests {
     fn parse_err(line: &str) -> CodecError {
         let bytes = Bytes::from(line.to_string());
         let mut diag = Diagnostics::default();
-        parse_line(&bytes, 0, &mut diag).expect_err("expected this line to be rejected")
+        parse_line(&bytes, 0, &mut diag, &mut KeyCache::new())
+            .expect_err("expected this line to be rejected")
     }
 
     #[test]
@@ -1700,6 +1759,37 @@ mod tests {
         assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
     }
 
+    /// SD-IDs and PARAM-NAMEs go through the decoder's `KeyCache`, and the fixed `syslog.*`
+    /// carrier keys are process constants: a second line with the same structured data (params
+    /// in another order) interns nothing new and the cache holds exactly the id plus the three
+    /// param names. `nextest` runs each test in its own process, so `interner::len()` here
+    /// reflects only this test.
+    #[test]
+    fn repeat_sd_ids_and_param_names_are_cache_hits() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        let first = "<165>1 2003-10-11T22:14:15.003Z host app - ID47 \
+                     [sdcache@1 sdc_iut=\"3\" sdc_src=\"App\" sdc_id=\"1011\"] one\n";
+        let second = "<165>1 2003-10-11T22:14:16.003Z host app - ID48 \
+                      [sdcache@1 sdc_id=\"1012\" sdc_iut=\"4\" sdc_src=\"App\"] two\n";
+        drop(decoder.decode(Bytes::from(first)).expect("decode should succeed"));
+        assert_eq!(decoder.keys.len(), 4, "one SD-ID plus three PARAM-NAMEs");
+
+        let before = logit_core::interner::len();
+        let events = decoder.decode(Bytes::from(second)).expect("decode should succeed").events;
+        assert_eq!(logit_core::interner::len(), before, "nothing new to intern on a repeat");
+        assert_eq!(decoder.keys.len(), 4);
+
+        let event = only_event(events);
+        let mut params = AttrMap::new();
+        params.insert("sdc_iut", Value::str("4"));
+        params.insert("sdc_src", Value::str("App"));
+        params.insert("sdc_id", Value::str("1012"));
+        let mut sd = AttrMap::new();
+        sd.insert("sdcache@1", Value::Map(Box::new(params)));
+        assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
+        assert_eq!(event.attributes.get("syslog.msgid").and_then(Value::as_str), Some("ID48"));
+    }
+
     #[test]
     fn rfc5424_section_6_5_example_4_two_sd_elements() {
         let line = "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 \
@@ -1782,6 +1872,49 @@ mod tests {
     fn structured_data_duplicate_sd_id_is_rejected() {
         let line = r#"<134>1 - - - - - [ex@32473 k="v"][ex@32473 j="w"] msg"#;
         assert!(matches!(parse_err(line), CodecError::Malformed(_)));
+    }
+
+    /// A line that reaches `parse_structured_data` and is then rejected must intern nothing: the
+    /// SD-ID duplicate check above is a non-interning `AttrMap::get` probe precisely so an SD-ID
+    /// that never validates stays out of the process-wide table. Both ways in matter --
+    /// `parse_line`'s any-digit RFC 5424 sniff hands a plain RFC 3164 line whose MSG contains a
+    /// `[token` to the SD parser before falling back (that token is message text, not an SD-ID),
+    /// and a genuine version-`1` line with a malformed SD-ELEMENT is rejected outright. Either
+    /// one interning its token would retain producer-controlled text for the life of the process,
+    /// outside `docs/design/memory.md` §4's accepted exposure. `nextest` runs each test in its own
+    /// process, so `interner::len()` here reflects only this test.
+    #[test]
+    fn a_line_rejected_inside_structured_data_interns_nothing() {
+        let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
+        // Warm-up: one well-formed line, so `KEYS`'s `LazyLock` (all eight carrier keys, interned
+        // together on first touch) is initialized before the window below opens.
+        drop(
+            decoder
+                .decode(Bytes::from_static(b"<134>1 - - - - - - warm"))
+                .expect("decode should succeed"),
+        );
+
+        let before = logit_core::interner::len();
+
+        // The sniff fallback: version `4` is really RFC 3164 MSG text, and so is `[session-8f3a1c`.
+        let fallback = Bytes::from_static(b"<13>4 requests failed in pool A [session-8f3a1c retry");
+        let events = decoder.decode(fallback).expect("decode should succeed").events;
+        assert_eq!(
+            message_str(&only_event(events)),
+            "4 requests failed in pool A [session-8f3a1c retry",
+            "the line falls back to RFC 3164 and keeps its whole MSG"
+        );
+
+        // A genuine version-`1` line whose SD-ELEMENT is malformed: rejected, no event at all.
+        let rejected = Bytes::from_static(b"<134>1 - - - - - [badelem@1 msg");
+        let events = decoder.decode(rejected).expect("decode should succeed").events;
+        assert!(events.is_empty(), "a malformed SD-ELEMENT rejects the whole line");
+
+        assert_eq!(
+            logit_core::interner::len(),
+            before,
+            "an SD-ID from a line that never validated must not reach the interner"
+        );
     }
 
     #[test]
