@@ -129,6 +129,21 @@ pub fn nginx_syslog_datagram(count: usize) -> Bytes {
     join_lines(NGINX_SYSLOG_LINE, count)
 }
 
+/// [`NGINX_SYSLOG_LINE`] with the same six JSON keys in the reverse order -- a producer that
+/// serialises its fields differently from the one `json` warmed up on. Exists for
+/// `json_parse_reordered_keys_event` (`tests/allocations.rs`): the parser's key cache must
+/// resynchronise on a reordered line without allocating.
+pub const NGINX_SYSLOG_LINE_REVERSED_KEYS: &str = concat!(
+    "<190>Aug 31 06:52:01 nginx_access: ",
+    r#"{"upstream_response_time":"0.004","request_time":0.001,"body_bytes_sent":612,"#,
+    r#""status":200,"request_method":"GET","host":"static.local"}"#
+);
+
+/// One [`NGINX_SYSLOG_LINE_REVERSED_KEYS`] datagram.
+pub fn nginx_syslog_datagram_reversed_keys() -> Bytes {
+    join_lines(NGINX_SYSLOG_LINE_REVERSED_KEYS, 1)
+}
+
 /// `count` copies of [`STATSD_LINE`], newline-separated.
 pub fn statsd_datagram(count: usize) -> Bytes {
     join_lines(STATSD_LINE, count)
