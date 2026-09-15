@@ -1419,14 +1419,19 @@ already built that have a known, accepted rough edge.
   a node that has actually exited with an error, not one that's merely behind. A richer per-sink
   probe is additive to `PipelineState.components` (already keyed by component id) should a real
   need for it show up — not built now because nothing has asked for it yet.
-- **A Lua node's post-startup failure is invisible to `/readyz`.** A Lua component runs on a raw
-  `std::thread`, not inside the `JoinSet` `run_with_telemetry` otherwise watches every task
-  through — its `NodeState` reaches `Running` once it reports ready and stays there for the rest
-  of the run, even if the thread later panics or its script errors out unrecoverably. True before
-  workstream B (`docs/plans/operator-surface.md`) and unchanged by it; the readiness side simply
-  can't see what the join loop never sees either. A bad `lua_file`/`Lua` script that fails to
-  *load* is still caught (the startup handshake `run_with_telemetry`'s spawn loop already does) —
-  this gap is specifically about a failure *after* that handshake succeeds.
+- ~~**A Lua node's post-startup failure is invisible to `/readyz`.**~~ **Closed**
+  (`crates/logit-pipeline/src/runtime.rs`'s `watch_lua_thread`): the Lua thread now reports its
+  exit over a second oneshot (`done_tx`, beside the existing ready handshake), and a `JoinSet`
+  task awaiting that report is the node's entry in the join loop — so a thread that panics after
+  reporting ready is treated exactly like any task failing: `NodeState::Failed`, `/readyz`
+  `503 degraded`, the same graceful drain SIGTERM drives, exit code `2` with the component named
+  in the `exiting` line, plus a `thread_panicked` diagnostic in the self-log stream. A thread
+  that returns on its own (inbox closed) reports `Finished` instead of staying `Running`. No
+  in-process restart, deliberately — the same fail-fast-for-the-supervisor posture ADR
+  `service-lifecycle-and-output-retry` takes for every other node. Unchanged and worth restating:
+  a script's *own* `process()`/`flush()` errors are logged and counted, never fatal, so the only
+  thing that can kill the thread is a Rust panic; a bad `lua_file`/`Lua` script that fails to
+  *load* is still a startup failure (exit `1`), caught by the ready handshake as before.
 - **No config hot reload on SIGHUP.** A config change means a restart; SIGHUP gets no special
   handling today. Explicitly out of scope for `docs/plans/operator-surface.md` — it needs its own
   design (diffing the old and new resolved `Graph`, deciding which components can be reused versus

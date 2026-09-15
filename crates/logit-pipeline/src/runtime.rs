@@ -301,8 +301,9 @@ pub async fn run_with_telemetry(
     // Maps each spawned task back to the component id it runs -- `AbortHandle::id()` at spawn
     // time, read back via `join_next_with_id`/`JoinError::id()` in the loop below, so a failing
     // (or panicking) task can be named in `readiness` without threading the id through every
-    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node has no entry
-    // here -- it's a raw `std::thread`, not a `JoinSet` task (`docs/known-gaps.md`).
+    // `run_input`/`run_output`/`run_transform` call's own error path. A Lua node's entry is its
+    // `watch_lua_thread` task -- the raw `std::thread` itself can't be a `JoinSet` member, so a
+    // task that awaits the thread's exit report stands in for it (see `run_lua`'s doc comment).
     let mut node_ids: HashMap<tokio::task::Id, String> = HashMap::with_capacity(ids.len());
     // Needed only for Lua nodes -- see `run_lua`'s doc comment. `Handle::current()` requires an
     // async context, true here since `run` is itself running as a task on this runtime.
@@ -395,6 +396,7 @@ pub async fn run_with_telemetry(
                 let target_routes =
                     resolve_target_fanouts(&id, &component.targets, &target_fanouts);
                 let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+                let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
                 let handle = runtime_handle.clone();
                 let thread_id = id.clone();
                 std::thread::Builder::new()
@@ -406,6 +408,7 @@ pub async fn run_with_telemetry(
                             interval,
                             targets,
                             ready_tx,
+                            done_tx,
                             inbox,
                             fanout,
                             target_routes,
@@ -415,12 +418,17 @@ pub async fn run_with_telemetry(
                     })
                     .with_context(|| format!("spawning thread for component '{id}'"))
                     .map_err(RunError::Startup)?;
-                // Not moved into `node_ids` -- there is no `JoinSet` entry for a Lua node to look
-                // up (see `node_ids`'s own doc comment); its `NodeState` stays `Running` for the
-                // rest of this run even if it later fails, a known gap
-                // (`docs/known-gaps.md`), not something this workstream fixes.
                 match ready_rx.await {
-                    Ok(Ok(())) => readiness.set_node(&id, NodeState::Running),
+                    Ok(Ok(())) => {
+                        // The thread's stand-in `JoinSet` entry (see `node_ids`'s doc comment):
+                        // spawned only once the handshake has succeeded, so a load failure --
+                        // which returns `Startup` just below -- never leaves a watcher behind.
+                        // `done_tx` buffers its one message, so a thread that dies between
+                        // reporting ready and this spawn is still observed.
+                        let watcher = tasks.spawn(watch_lua_thread(id.clone(), done_rx));
+                        node_ids.insert(watcher.id(), id.clone());
+                        readiness.set_node(&id, NodeState::Running);
+                    }
                     Ok(Err(message)) => {
                         return Err(RunError::Startup(anyhow::anyhow!(
                             "component '{id}': {message}"
@@ -1692,6 +1700,22 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// mints for that batch -- one incoming batch is one hop however many ways it forks, exactly the
 /// rule `run_router` and `Fanout` already apply. A component with no `targets:` has a single
 /// destination and behaves exactly as it did before any of this existed.
+///
+/// **How the thread's exit reaches `run_with_telemetry`.** Two handshakes, not one: `ready_tx`
+/// carries the script-load outcome (a failure there is `RunError::Startup`; the run never
+/// reports ready), and `done_tx` carries the post-ready outcome -- `Ok(())` once the inbox closed
+/// and the loop returned on its own, `Err(message)` if the loop panicked. [`watch_lua_thread`]
+/// awaits `done_rx` as this node's `JoinSet` entry, so the join loop treats a Lua node's exit
+/// exactly as any task's: `NodeState::Finished` on `Ok`; `NodeState::Failed`, `Phase::Failed`
+/// (`/readyz`'s `degraded`), the graceful drain and `RunError::Runtime` on `Err`. The loop body
+/// runs under `catch_unwind` (`AssertUnwindSafe`: `ScriptWorker` holds `Lua` and `Rc<RefCell>`s,
+/// none of which are `UnwindSafe`, and nothing is used after the unwind anyway) so a panic becomes
+/// a message rather than a silently dropped sender; the default panic hook still prints its own
+/// line to stderr first, naming this `logit-{id}` thread. A script's *own* errors are not this
+/// path: `process()`/`flush()` raising is logged and counted inside [`run_lua_loop`] and never
+/// ends the node. The report is sent only after the closure has dropped `inbox` and the
+/// `Fanout`s, so by the time the watcher resolves the downstream cascade (consumers' inboxes
+/// closing, their close-time flushes running) is already underway.
 #[allow(clippy::too_many_arguments)]
 fn run_lua(
     id: String,
@@ -1699,7 +1723,8 @@ fn run_lua(
     configured_interval: Option<Duration>,
     targets: Vec<String>,
     ready_tx: oneshot::Sender<Result<(), String>>,
-    mut inbox: mpsc::Receiver<Delivered>,
+    done_tx: oneshot::Sender<Result<(), String>>,
+    inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
     target_fanouts: Vec<Fanout>,
     telemetry: Telemetry,
@@ -1723,9 +1748,83 @@ fn run_lua(
     // No `logit-cli::pipeline::build_spec` attaches one the way every other kind's own
     // `with_diagnostics` builder does -- `ScriptWorker` can't be constructed outside this thread
     // (see `NodeSpec::Lua`'s own doc comment), so there's no earlier point to attach one at.
-    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent.
-    let mut diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    // Built from `telemetry` directly, the same `write_loop`/`run_output` precedent. Cloned so
+    // the panic report below still has one after the loop's own copy has moved into the closure.
+    let diag = Diagnostics::new(id.clone()).with_telemetry(telemetry.clone());
+    let reporter = diag.clone();
 
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        run_lua_loop(
+            worker,
+            configured_interval,
+            inbox,
+            fanout,
+            target_fanouts,
+            telemetry,
+            runtime,
+            diag,
+        )
+    }));
+    let report = thread_outcome(outcome);
+    if let Err(message) = &report {
+        reporter.error("thread_panicked", format_args!("{message}"));
+    }
+    // The receiver is gone only if `run` already returned for an unrelated reason; nothing to do.
+    let _ = done_tx.send(report);
+}
+
+/// A Lua thread's post-ready outcome as a message [`watch_lua_thread`] can name the component
+/// in: a panic payload is a `&str` for a literal `panic!("..")`, a `String` for a formatted one,
+/// and anything at all for `panic_any` -- the fallback text keeps the report honest rather than
+/// silent for that last case.
+fn thread_outcome(result: std::thread::Result<()>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(payload) => {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            Err(format!("thread panicked: {message}"))
+        }
+    }
+}
+
+/// A Lua node's `JoinSet` entry: nothing but a wait on the thread's `done` report (`run_lua`'s
+/// doc comment). Deliberately does *not* watch `shutdown`: a shutdown reaches the thread the
+/// same way it reaches every other node, by the cascade closing its inbox, after which the loop
+/// returns and reports on its own -- racing against `shutdown` here would only ever resolve
+/// *before* the thread has actually finished its close-time flush. The `Err(_)` arm (sender
+/// dropped without a message) is defensive: `run_lua` sends unconditionally after
+/// `catch_unwind`, so it's reachable only if the wrapper itself dies past that point.
+async fn watch_lua_thread(
+    id: String,
+    done_rx: oneshot::Receiver<Result<(), String>>,
+) -> anyhow::Result<()> {
+    match done_rx.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(anyhow::anyhow!("component '{id}': {message}")),
+        Err(_) => Err(anyhow::anyhow!("component '{id}': thread exited without reporting")),
+    }
+}
+
+/// The loop half of [`run_lua`], on the same thread, everything it touches moved in by value so
+/// `catch_unwind` has nothing borrowed to reason about. Returns once `inbox` closes (after a last
+/// `flush()` if the component has an interval); a panic anywhere in here is `run_lua`'s to report.
+#[allow(clippy::too_many_arguments)]
+fn run_lua_loop(
+    worker: ScriptWorker,
+    configured_interval: Option<Duration>,
+    mut inbox: mpsc::Receiver<Delivered>,
+    fanout: Fanout,
+    target_fanouts: Vec<Fanout>,
+    telemetry: Telemetry,
+    runtime: tokio::runtime::Handle,
+    mut diag: Diagnostics,
+) {
     let mut next_flush = configured_interval.map(|interval| tokio::time::Instant::now() + interval);
     // The root a `flush()` runs in (this function's own doc comment): one empty resource shared
     // by every flush tick (an `Arc` clone per tick, never a fresh allocation), and this node's
@@ -6018,6 +6117,221 @@ mod tests {
         let snapshot = rx.borrow().clone();
         assert_eq!(snapshot.phase, Phase::Failed);
         assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
+    }
+
+    /// A Lua node's thread panicking once the pipeline is already `Ready` is observed exactly
+    /// like a task failing (`watch_lua_thread`): `Phase::Failed`, that node `Failed`, the rest
+    /// drained (`Finished`, not aborted), and `RunError::Runtime` naming the component. Before
+    /// the watcher existed this run would have hung forever with `/readyz` still `ok` -- hence
+    /// the timeout around it.
+    ///
+    /// **The panic vector.** A script's own errors are non-fatal by design, so the only way to
+    /// kill the thread is a Rust panic. `NodeSpec::Lua { interval: Some(Duration::ZERO) }` gets
+    /// one deterministically on the first loop iteration: `advance_flush_deadline` rejects a
+    /// zero interval (`debug_assert!` in debug, `% 0` in release -- both after the ready
+    /// handshake and before the first `inbox.recv()`). Graph rule 9 (`graph.rs`) rejects a zero
+    /// interval from *config*, which is why the graph component here has `interval: None` and
+    /// only the spec carries the zero -- the two are independent at this layer. If a runtime
+    /// guard on the interval ever lands, this test needs a new vector, not a relaxed assertion.
+    #[tokio::test]
+    async fn a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: None,
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (readiness, rx) = Readiness::channel();
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(Box::new(ForeverInput), InputRuntimeConfig::default()),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: Some(Duration::ZERO),
+            },
+        );
+        let (tx, _out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
+        )
+        .await
+        .expect("a dead Lua thread must end the run, not leave it hanging")
+        .expect_err("the panicking Lua thread should fail the run");
+        assert!(matches!(err, RunError::Runtime(_)), "a post-ready failure is a runtime failure");
+        let message = err.to_string();
+        assert!(message.contains("enrich"), "the error should name enrich: {message}");
+        assert!(
+            message.contains("panicked"),
+            "the error should say the thread panicked: {message}"
+        );
+
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Failed);
+        assert_eq!(snapshot.components.get("enrich"), Some(&NodeState::Failed));
+        assert_eq!(
+            snapshot.components.get("in"),
+            Some(&NodeState::Finished),
+            "the listener should have been drained by the failure-triggered shutdown, not aborted"
+        );
+        assert_eq!(
+            snapshot.components.get("out"),
+            Some(&NodeState::Finished),
+            "the sink should have drained once the dead node's fanout closed its inbox"
+        );
+    }
+
+    /// The other half of `watch_lua_thread`: a Lua node whose inbox closes normally (its only
+    /// listener finished) reports `Finished`, the same as any task -- previously it stayed
+    /// `Running` for the rest of the run, since nothing ever observed the thread returning.
+    #[tokio::test]
+    async fn a_lua_node_finishing_on_its_own_reaches_finished() {
+        let mut components = Map::new();
+        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
+        components.insert(
+            "enrich".to_string(),
+            plain_component(
+                vec!["in".to_string()],
+                ComponentKind::Lua {
+                    script: "function process(event) return event end".to_string(),
+                    interval: None,
+                },
+            ),
+        );
+        components
+            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
+        let g =
+            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
+
+        let (readiness, rx) = Readiness::channel();
+        let batch = EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: vec![counter_event("hits", 1.0)],
+        };
+        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
+        specs.insert(
+            "in".to_string(),
+            NodeSpec::Input(
+                Box::new(FiniteInput { batch: Some(batch) }),
+                InputRuntimeConfig::default(),
+            ),
+        );
+        specs.insert(
+            "enrich".to_string(),
+            NodeSpec::Lua {
+                script: "function process(event) return event end".to_string(),
+                interval: None,
+            },
+        );
+        let (tx, out_rx) = std::sync::mpsc::channel();
+        specs.insert(
+            "out".to_string(),
+            NodeSpec::Output(
+                Box::new(RecordingOutput { tx }),
+                SinkStoreConfig::Memory(SinkQueueConfig::default()),
+                WriteLoopConfig::default(),
+            ),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
+        )
+        .await
+        .expect("a finite input should let the whole graph drain and the run end")
+        .expect("a clean run should end with Ok");
+
+        let received =
+            out_rx.try_recv().expect("the batch should have flowed through the Lua node");
+        assert_eq!(received.events.len(), 1);
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.phase, Phase::Ready, "nothing failed and nothing signalled a drain");
+        assert_eq!(snapshot.components.get("in"), Some(&NodeState::Finished));
+        assert_eq!(
+            snapshot.components.get("enrich"),
+            Some(&NodeState::Finished),
+            "the Lua node's own exit is now observed via its watcher task"
+        );
+        assert_eq!(snapshot.components.get("out"), Some(&NodeState::Finished));
+    }
+
+    /// `thread_outcome` turns each payload shape `std::panic` can hand back into a message that
+    /// still says *panicked* -- a `&str` from `panic!("literal")`, a `String` from a formatted
+    /// `panic!`, and the honest fallback for `panic_any` with anything else.
+    #[test]
+    fn thread_outcome_reports_a_panic_payload_as_a_message() {
+        assert_eq!(thread_outcome(Ok(())), Ok(()));
+
+        let literal = std::panic::catch_unwind(|| panic!("boom"));
+        assert_eq!(thread_outcome(literal), Err("thread panicked: boom".to_string()));
+
+        let formatted = std::panic::catch_unwind(|| {
+            let n = 7;
+            panic!("slot {n} out of range")
+        });
+        assert_eq!(
+            thread_outcome(formatted),
+            Err("thread panicked: slot 7 out of range".to_string())
+        );
+
+        let opaque = std::panic::catch_unwind(|| std::panic::panic_any(42u8));
+        assert_eq!(
+            thread_outcome(opaque),
+            Err("thread panicked: non-string panic payload".to_string())
+        );
+    }
+
+    /// `watch_lua_thread` maps the three ways `done_rx` can resolve: a clean report is `Ok`, a
+    /// panic report is an error naming the component and carrying the message, and a sender
+    /// dropped without reporting is still an error (the defensive arm) rather than a hang or a
+    /// silent `Ok`.
+    #[tokio::test]
+    async fn watch_lua_thread_maps_each_outcome() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(())).expect("receiver alive");
+        watch_lua_thread("enrich".to_string(), rx).await.expect("a clean report is Ok");
+
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err("thread panicked: boom".to_string())).expect("receiver alive");
+        let err = watch_lua_thread("enrich".to_string(), rx)
+            .await
+            .expect_err("a panic report is an error");
+        assert_eq!(err.to_string(), "component 'enrich': thread panicked: boom");
+
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        drop(tx);
+        let err = watch_lua_thread("enrich".to_string(), rx)
+            .await
+            .expect_err("a dropped sender is an error, not a silent Ok");
+        assert!(
+            err.to_string().contains("without reporting"),
+            "the defensive arm should say what happened: {err}"
+        );
     }
 
     /// The exit-2 path: a sustained permanent sink failure (`PERMANENT_FAILURE_WINDOW`) ends
