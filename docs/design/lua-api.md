@@ -914,7 +914,16 @@ span.attributes is not a field`. `SpanRecord.ext` (`status_message`, `trace_stat
 logit-proto`'s `ext_from_wire` already applies to a decoded span -- so a minimal constructed span
 costs what a minimal decoded one does, and `dropped_events_count = 0` written out explicitly
 earns no box. A `Value::Null` span or span-event `name` is the same residual as a `Value::Null`
-`message`: `to_table()` emits it as an absent key, and `Event.new` rejects it as missing.
+`message`: `to_table()` emits it as an absent key, and `Event.new` rejects it as missing. Two
+more span shapes a wire decoder can produce are recorded residuals of the same kind, deliberately
+rejected rather than rebuilt: an `end_timestamp` before the event's `timestamp` (`otlp_in` and
+the native codec carry the wire value through unchecked, a missing end decodes as `0`, and
+`stdio_out` renders such a span with a saturating duration) is `Event.new: span.end_timestamp
+precedes timestamp`; an all-zero `trace_id`/`span_id`/`parent_span_id` or link id (both decoders
+check length only, so an exporter that pads a root span's parent with eight zero bytes yields
+`parent_span_id = "0000000000000000"`) is the `not all-zero` error above. A script rebuilding
+such an event through `Event.new(event:to_table())` must fix or drop the offending field first --
+`t.span.parent_span_id = nil`, say, or `t.span.end_timestamp = t.timestamp`.
 
 ```lua
 -- a script minting a span from a line trace_context can't lift (say, a two-timestamp line
@@ -943,16 +952,18 @@ integer`. A non-table row is `Event.new: span.events[1] must be a table, got int
 and `links` must each be a contiguous array (`Event.new: span.links must be a contiguous
 array-like table`).
 
-**Every mistake is a runtime error at the call, prefixed with the dotted path:** `Event.new:
-log.severty is not a field` (unknown keys are rejected everywhere, top level and sub-tables --
-the same strictness the proxies apply to an unknown field on read or write), `Event.new: timestamp
-is required`, `Event.new: log.severity must be one of trace, debug, info, warn, error, fatal (or
-nil), got "warning"`, `Event.new: log.span_id can't be set without a trace_id`, `Event.new:
-attributes has a non-string key (integer)`. Table access is raw, so a metatable on the input can't
-make the key check and the field reads disagree. Defaults exist only where core already documents
-one (`BodyFormat::Raw`, the zeros above, `MetricKind::counter`'s temporality and monotonicity,
-`Samples::new`'s `sample_rate`, a span's `internal`/`unset` and its own start as its end);
-nothing else is invented.
+**Every mistake is a runtime error at the call, prefixed with the dotted path down to the
+field** (a malformed value inside a nested attribute table reports the shared
+attribute-conversion error instead)**:** `Event.new: log.severty is not a field` (unknown keys
+are rejected everywhere, top level and sub-tables -- the same strictness the proxies apply to an
+unknown field on read or write), `Event.new: timestamp is required`, `Event.new: log.severity
+must be one of trace, debug, info, warn, error, fatal (or nil), got "warning"`, `Event.new:
+log.span_id can't be set without a trace_id`, `Event.new: attributes has a non-string key
+(integer)`, `Event.new: attributes.cb can't be a Lua function`. Table access is raw, so a
+metatable on the input can't make the key check and the field reads disagree. Defaults exist only
+where core already documents one (`BodyFormat::Raw`, the zeros above, `MetricKind::counter`'s
+temporality and monotonicity, `Samples::new`'s `sample_rate`, a span's `internal`/`unset` and its
+own start as its end); nothing else is invented.
 
 **Targets resolve at call time, not at script load.** A constructed event's `to(id)` checks the
 worker's `targets:` list as it stands when `Event.new` runs -- inside `process()` or `flush()`,
@@ -968,8 +979,17 @@ to compare against, so the no-op-assignment identity rule
 a Lua string becomes `Str` (or `Bytes` only if it isn't valid UTF-8), a Lua integer `I64`, an
 empty table an empty `Map`. `U64`/`Timestamp`/UTF-8 `Bytes` attribute values therefore do not
 round-trip through `Event.new(e:to_table())` -- `Value::U64(5)` comes back `Value::I64(5)` -- and
-a `Value::Null` `message`, which `to_table()` emits as an absent key, is rejected as missing on
-the way back. Both are that ADR's recorded residuals, not oversights.
+neither does an `I64` past ±2^53, which `to_table()` emits as a decimal string (the same string
+branch `Timestamp` takes) and which comes back `Value::Str` (`Value::I64(9007199254740993)`
+returns as `Value::Str("9007199254740993")`), nor an *integral* `F64` such as `3.0`, which
+LuaJIT's dual-number mode canonicalizes to a Lua integer so it comes back `Value::I64(3)` (a
+fractional `F64` is unaffected). A `Value::Null` `message`, which `to_table()` emits as an absent
+key, is rejected as missing on the way back. A `sum`/`gauge`/`samples`/exemplar `value` (or a
+`sample_rate`) that is NaN or an infinity is rejected by the finiteness rule above rather than
+rebuilt: `to_table()` emits the raw float, and the pipeline does admit such a point --
+`prometheus_in` carries OpenMetrics `NaN`/`+Inf` through verbatim and `otlp_in` passes an
+`AsDouble` through unfiltered -- so a script rebuilding a scraped event must fix or drop the
+offending value. Every case in this list is that ADR's recorded residual, not an oversight.
 
 ## Config shape
 
