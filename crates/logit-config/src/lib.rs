@@ -403,14 +403,42 @@ pub enum ComponentKind {
         /// budget of this length, so a TLS connection that says nothing at all costs up to two
         /// of them -- 10s at the default.
         ///
-        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
-        /// on the gap before the next line -- a long-lived, mostly-quiet statsd client is
-        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
-        /// holds its permit indefinitely; that is a known, deliberately separate gap
-        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
+        /// once a connection has sent its first byte, the gap before the next line is bounded by
+        /// `idle_timeout` if one is set, and unbounded if it is not.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
+        /// datagram listener has no connection to time out). How long one connection may stay
+        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
+        /// unless set:** with no value, a connection that sent one line and then went silent
+        /// holds its permit indefinitely, which is what every `logit` release so far has done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
+        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
+        /// where the sender cannot detect the close. A statsd client flushing on a fixed
+        /// interval is the easy case; one that only emits when its process sees traffic is not.
+        ///
+        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
+        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
+        /// finishing its own work on the connection (an accumulated batch handed downstream).
+        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
+        /// never make a busy connection look idle; a flush tick with nothing to send resets
+        /// nothing.
+        ///
+        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
+        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
+        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
+        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
+        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
+        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// collectd's binary "`network` plugin" protocol over UDP
     /// (`docs/adr/collectd-binary-relay.md`; `crates/logit-inputs/src/collectd.rs` is the
@@ -482,14 +510,43 @@ pub enum ComponentKind {
         /// budget of this length, so a TLS connection that says nothing at all costs up to two
         /// of them -- 10s at the default.
         ///
-        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
-        /// on the gap before the next datapoint -- a carbon relay that flushes once a minute is
-        /// ordinary traffic, not a fault. A connection that goes silent *after* that first byte
-        /// holds its permit indefinitely; that is a known, deliberately separate gap
-        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
+        /// once a connection has sent its first byte, the gap before the next datapoint is
+        /// bounded by `idle_timeout` if one is set, and unbounded if it is not.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
+        /// datagram listener has no connection to time out). How long one connection may stay
+        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
+        /// unless set:** with no value, a connection that sent one datapoint and then went
+        /// silent holds its permit indefinitely, which is what every `logit` release so far has
+        /// done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
+        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
+        /// where the sender cannot detect the close. A carbon relay that flushes once a minute
+        /// wants a value well above that minute, not a tight one.
+        ///
+        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
+        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
+        /// finishing its own work on the connection (an accumulated batch handed downstream).
+        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
+        /// never make a busy connection look idle; a flush tick with nothing to send resets
+        /// nothing.
+        ///
+        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
+        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
+        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
+        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
+        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
+        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
         /// The longest plaintext line this listener will assemble before giving up on it and
         /// draining to the next newline (counted once as `logit.input.frames.dropped
         /// {reason="oversize"}`; the line *after* it still decodes). Defaults to `"8192"` --
@@ -555,14 +612,42 @@ pub enum ComponentKind {
         /// of them -- 10s at the default -- exactly the way `syslog_out`'s `connect_timeout`
         /// bounds its own TCP connect and TLS handshake separately.
         ///
-        /// **Not an idle timeout.** Once a connection has sent its first byte there is no bound
-        /// on the gap before the next frame -- a long-lived, mostly-quiet sender is ordinary
-        /// syslog traffic, not a fault. A connection that goes silent *after* that first byte
-        /// holds its permit indefinitely; that is a known, deliberately separate gap
-        /// (`docs/known-gaps.md`'s "no idle-connection timeout on a TCP listener" row).
+        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
+        /// once a connection has sent its first byte, the gap before the next frame is bounded by
+        /// `idle_timeout` if one is set, and unbounded if it is not.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
+        /// datagram listener has no connection to time out). How long one connection may stay
+        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
+        /// unless set:** with no value, a connection that sent one frame and then went silent
+        /// holds its permit indefinitely, which is what every `logit` release so far has done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
+        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
+        /// where the sender cannot detect the close -- a plaintext syslog sender has no ack to
+        /// lose a message against and may not notice the close until after it has written one.
+        ///
+        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
+        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
+        /// finishing its own work on the connection (an accumulated batch handed downstream).
+        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
+        /// never make a busy connection look idle; a flush tick with nothing to send resets
+        /// nothing.
+        ///
+        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
+        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
+        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
+        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
+        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
+        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// OpenTelemetry Protocol (logs, metrics, and/or traces).
     OtlpIn {
@@ -578,18 +663,51 @@ pub enum ComponentKind {
         /// on a plaintext listener, which has no TLS accept -- the wait for its very **first
         /// byte**. Applies with or without `tls:`.
         ///
-        /// **What it does not bound.** Once a connection has produced one byte it is inside
-        /// `hyper`'s own read loop, which this listener does not drive, so a client that sends a
-        /// single byte and then goes silent still holds its permit -- and under `protocol: grpc`
-        /// the same is true of a client that sends one byte of the HTTP/2 preface. `hyper`'s own
-        /// `http1().header_read_timeout(..)` is deliberately not installed to close that: it
-        /// re-arms across every idle keep-alive gap, which would make it an idle timeout and
-        /// close a long-interval exporter's pooled connection between exports. See
-        /// `docs/known-gaps.md`'s plaintext-`otlp_in` row and its "no idle-connection timeout on
-        /// a TCP listener" row.
+        /// **Not an idle timeout.** It bounds the pre-request phases and nothing after them:
+        /// once a connection has produced one byte it is inside `hyper`'s own read loop, and what
+        /// bounds the quiet gaps there is `idle_timeout` if one is set, and nothing if it is not.
+        /// `hyper`'s own `http1().header_read_timeout(..)` is deliberately not installed either
+        /// way: it re-arms across every idle keep-alive gap, which makes it an idle timeout
+        /// wearing a first-head name, and it covers `protocol: http`'s HTTP/1.1 case only.
+        ///
+        /// Doubles as the grace period an idle close gives `hyper` to shut the connection down in
+        /// before it is dropped -- see `idle_timeout` below, and
+        /// `docs/adr/idle-connection-timeout.md`.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// How long one connection may sit with **no request in flight** before this listener
+        /// closes it and hands back its connection-cap permit. **Off unless set:** with no value,
+        /// a connection that sent one byte and then went silent holds its permit indefinitely,
+        /// which is what every `logit` release so far has done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap; leave it unset for genuinely sparse or bursty
+        /// senders. An OTLP exporter pools its connection between exports, so the value belongs
+        /// well above that export interval -- a conformant exporter also reconnects on its own,
+        /// so a close between exports costs it a reconnect, not a batch.
+        ///
+        /// **What the clock measures.** It runs only while no request is in flight, and it is
+        /// reset by a request *completing* -- time a handler spends blocked on a full downstream
+        /// therefore never counts, so a stalled pipeline can never make a busy connection look
+        /// idle. Unlike the other listeners this one resets on request completion rather than on
+        /// bytes read, because `hyper` owns this connection's reads: a request *head* that takes
+        /// longer than this to arrive on an otherwise idle keep-alive connection is closed. A
+        /// request *body* that stalls mid-upload is bounded per-frame by this same value instead,
+        /// answering `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and then
+        /// closing the connection.
+        ///
+        /// **An idle close is policy, not a fault.** `hyper` is asked to shut the connection
+        /// down gracefully, given `handshake_timeout` to do it, and only then dropped, so a
+        /// response already in flight still goes out; the close is counted
+        /// `logit.input.connections.closed{reason="idle"}` -- counted, never diagnosed as a
+        /// `connection_error`. Rule 53 rejects `0s`: omit the field to disable the idle timeout.
+        /// See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// Tails one or more files as a log source, one line per event -- rotation-, truncation-,
     /// and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the
@@ -654,14 +772,42 @@ pub enum ComponentKind {
         /// 10s at the default -- exactly the way `logit_out` races every step of its own connect
         /// against its single `request_timeout`.
         ///
-        /// **Not an idle timeout.** Once a connection is handshaken, the gap before its next
-        /// data frame is unbounded on purpose -- an idle `logit_out` peer with nothing to send
-        /// is ordinary. Such a connection holds its permit indefinitely; that is a known,
-        /// deliberately separate gap (`docs/known-gaps.md`'s "no idle-connection timeout on a
-        /// TCP listener" row).
+        /// **Not an idle timeout.** It bounds the pre-`Hello` phases and nothing after them:
+        /// once a connection is handshaken, the gap before its next data frame is bounded by
+        /// `idle_timeout` if one is set, and unbounded if it is not.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
+        /// How long one handshaken connection may stay quiet before this listener closes it and
+        /// hands back its connection-cap permit. **Off unless set:** with no value, a connection
+        /// that sent one frame and then went silent holds its permit indefinitely, which is what
+        /// every `logit` release so far has done.
+        ///
+        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
+        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
+        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
+        /// above the sender's longest normal gap (several of the peer's flush intervals, say);
+        /// leave it unset for genuinely sparse or bursty senders.
+        ///
+        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
+        /// socket, and it is reset by two things: the handshake completing, and every `Ack` this
+        /// listener writes. A peer patiently waiting for an ack that a slow downstream is
+        /// delaying is by definition not idle -- this listener is the one working -- so time
+        /// blocked on a full downstream never counts against it. A frame body that stops arriving
+        /// part-way through is bounded by this value too, per `read` rather than in total, so a
+        /// large frame that keeps making progress is never cut off.
+        ///
+        /// **An idle close is policy, not a fault.** It is counted
+        /// `logit.input.connections.closed{reason="idle"}` -- counted, never diagnosed as a
+        /// `connection_error`. Rule 53 rejects `0s`: omit the field to disable the idle timeout.
+        /// Unlike the plaintext listeners, the peer is *told*: this listener writes
+        /// `Reject{GOING_AWAY, "idle for <dur>"}` before closing, and `logit_out` probes a pooled
+        /// connection for exactly that before reusing it, so a `logit_out -> logit_in` pair
+        /// reconnects rather than losing a batch into a closed socket. See
+        /// `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// `logit` talking about itself: drains every component's buffered self-telemetry points on
     /// `interval` and emits them as ordinary events into the graph, same as any other listener.
@@ -3373,6 +3519,7 @@ mod tests {
                 protocol,
                 tls,
                 handshake_timeout,
+                idle_timeout,
                 max_line_bytes,
                 max_frame_bytes,
             } => {
@@ -3381,6 +3528,7 @@ mod tests {
                 assert_eq!(protocol, GraphiteProtocol::Plaintext);
                 assert_eq!(tls, None, "plaintext unless a tls: block says otherwise");
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
                 assert_eq!(max_line_bytes, 8192);
                 assert_eq!(max_frame_bytes, 1 << 20);
             }
@@ -3563,11 +3711,12 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "syslog_in", "bind": "0.0.0.0:5514"}"#).unwrap();
         match component.kind {
-            ComponentKind::SyslogIn { bind, transport, tls, handshake_timeout } => {
+            ComponentKind::SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
                 assert_eq!(bind, "0.0.0.0:5514");
                 assert_eq!(transport, SyslogTransport::Udp);
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
             }
             other => panic!("expected SyslogIn, got {other:?}"),
         }
@@ -3614,11 +3763,12 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout } => {
+            ComponentKind::OtlpIn { bind, protocol, tls, handshake_timeout, idle_timeout } => {
                 assert_eq!(bind, "0.0.0.0:4317");
                 assert_eq!(protocol, OtlpProtocol::Grpc);
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -3665,11 +3815,18 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "logit_in", "bind": "0.0.0.0:5140"}"#).unwrap();
         match component.kind {
-            ComponentKind::LogitIn { bind, tls, max_frame_bytes, handshake_timeout } => {
+            ComponentKind::LogitIn {
+                bind,
+                tls,
+                max_frame_bytes,
+                handshake_timeout,
+                idle_timeout,
+            } => {
                 assert_eq!(bind, "0.0.0.0:5140");
                 assert_eq!(tls, None);
                 assert_eq!(max_frame_bytes, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
             }
             other => panic!("expected LogitIn, got {other:?}"),
         }
@@ -3729,6 +3886,118 @@ mod tests {
         match otlp.kind {
             ComponentKind::OtlpIn { handshake_timeout, .. } => {
                 assert_eq!(handshake_timeout, Duration::from_secs(60));
+            }
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
+    }
+
+    /// `idle_timeout` is opt-in on every listener that has one: absent means the pre-`idle_timeout`
+    /// behaviour, where a connection that sent one frame and then went quiet keeps its
+    /// connection-cap permit forever (`docs/adr/idle-connection-timeout.md`). A `#[serde(default)]`
+    /// typo on any one kind would silently turn that default into whatever a `Duration`'s own
+    /// default is, so all of them are checked here rather than only the one that happened to be
+    /// edited last.
+    #[test]
+    fn idle_timeout_defaults_to_none_on_every_tcp_listener() {
+        let syslog: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match syslog.kind {
+            ComponentKind::SyslogIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+
+        let graphite: Component =
+            serde_json::from_str(r#"{"type": "graphite_in", "bind": "0.0.0.0:2003"}"#).unwrap();
+        match graphite.kind {
+            ComponentKind::GraphiteIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let statsd: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp"}"#,
+        )
+        .unwrap();
+        match statsd.kind {
+            ComponentKind::StatsdIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+
+        let logit: Component =
+            serde_json::from_str(r#"{"type": "logit_in", "bind": "0.0.0.0:5140"}"#).unwrap();
+        match logit.kind {
+            ComponentKind::LogitIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected LogitIn, got {other:?}"),
+        }
+
+        let otlp: Component =
+            serde_json::from_str(r#"{"type": "otlp_in", "bind": "0.0.0.0:4318"}"#).unwrap();
+        match otlp.kind {
+            ComponentKind::OtlpIn { idle_timeout, .. } => assert_eq!(idle_timeout, None),
+            other => panic!("expected OtlpIn, got {other:?}"),
+        }
+    }
+
+    /// The twin of [`handshake_timeout_parses_on_all_three_tcp_listeners`] for the `Option`
+    /// codec: one humantime string per kind, since `humantime_serde_duration::option` is a
+    /// separate module from the non-`Option` one and each kind carries its own copy of the
+    /// attribute pair.
+    #[test]
+    fn idle_timeout_parses_on_every_tcp_listener() {
+        let syslog: Component = serde_json::from_str(
+            r#"{"type": "syslog_in", "bind": "0.0.0.0:6514", "transport": "tcp",
+                "idle_timeout": "5m"}"#,
+        )
+        .unwrap();
+        match syslog.kind {
+            ComponentKind::SyslogIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_secs(300)));
+            }
+            other => panic!("expected SyslogIn, got {other:?}"),
+        }
+
+        let graphite: Component = serde_json::from_str(
+            r#"{"type": "graphite_in", "bind": "0.0.0.0:2003", "idle_timeout": "90s"}"#,
+        )
+        .unwrap();
+        match graphite.kind {
+            ComponentKind::GraphiteIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_secs(90)));
+            }
+            other => panic!("expected GraphiteIn, got {other:?}"),
+        }
+
+        let statsd: Component = serde_json::from_str(
+            r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp",
+                "idle_timeout": "500ms"}"#,
+        )
+        .unwrap();
+        match statsd.kind {
+            ComponentKind::StatsdIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_millis(500)));
+            }
+            other => panic!("expected StatsdIn, got {other:?}"),
+        }
+
+        let logit: Component = serde_json::from_str(
+            r#"{"type": "logit_in", "bind": "0.0.0.0:5140", "idle_timeout": "10m"}"#,
+        )
+        .unwrap();
+        match logit.kind {
+            ComponentKind::LogitIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_secs(600)));
+            }
+            other => panic!("expected LogitIn, got {other:?}"),
+        }
+
+        let otlp: Component = serde_json::from_str(
+            r#"{"type": "otlp_in", "bind": "0.0.0.0:4318", "idle_timeout": "10m"}"#,
+        )
+        .unwrap();
+        match otlp.kind {
+            ComponentKind::OtlpIn { idle_timeout, .. } => {
+                assert_eq!(idle_timeout, Some(Duration::from_secs(600)));
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
@@ -4756,11 +5025,12 @@ mod tests {
         let bare: Component =
             serde_json::from_str(r#"{"type": "statsd_in", "bind": "0.0.0.0:8125"}"#).unwrap();
         match bare.kind {
-            ComponentKind::StatsdIn { bind, transport, tls, handshake_timeout } => {
+            ComponentKind::StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
                 assert_eq!(bind, "0.0.0.0:8125");
                 assert_eq!(transport, StatsdTransport::Udp, "classic statsd stays the default");
                 assert_eq!(tls, None);
                 assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None, "opt-in -- no idle timeout unless asked for");
             }
             other => panic!("expected StatsdIn, got {other:?}"),
         }

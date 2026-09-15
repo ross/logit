@@ -103,6 +103,7 @@
 //! and this sink would have no way to tell. State this plainly rather than silently assuming every
 //! receiver is whisper.
 
+use crate::tls::{poll_pending_close, PendingClose};
 use anyhow::Context;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{Fault, Output};
@@ -423,6 +424,18 @@ impl GraphiteOutput {
     /// see this module's doc comment, "Packing", for why one write of the concatenation is
     /// equivalent to one `write_all` per frame here. Returns `(messages sent, datapoints sent, 0)`
     /// -- there's no datagram count on TCP.
+    ///
+    /// **A reused connection is probed before the first write.** A pooled connection inherited
+    /// from an earlier `send` may have been closed by the carbon receiver in the meantime -- a
+    /// restart, a `logit`-side `idle_timeout:` on the far end, a relay hop cycling -- and carbon's
+    /// wire has no ack and no error to tell the sender so: the write lands in the local socket
+    /// buffer, this function reports the batch delivered, and those datapoints are gone. So a
+    /// connection that came out of `*stream` (never a freshly-dialled one) gets exactly one
+    /// non-consuming `poll_read` first ([`crate::tls::poll_pending_close`], whose doc comment has
+    /// why one poll and not a cancellable `timeout(read)`); anything but "still open" drops it and
+    /// dials a fresh one with nothing written yet. It deliberately does not consume the one
+    /// post-write-failure retry below, which is about a connection that *was* written to.
+    /// `docs/adr/idle-connection-timeout.md`.
     async fn send_tcp(
         stream: &mut Option<TcpStream>,
         endpoint: &str,
@@ -444,12 +457,23 @@ impl GraphiteOutput {
         let mut retried_after_a_zero_byte_failure = false;
         loop {
             let mut conn = match stream.take() {
-                Some(conn) => conn,
-                None => tokio::time::timeout(connect_timeout, TcpStream::connect(endpoint))
-                    .await
-                    .context("connecting to graphite_out endpoint timed out")
-                    .and_then(|r| r.context("connecting to graphite_out endpoint"))
-                    .context(Fault::Clean)?,
+                // A *reused* connection is polled once first -- see this function's doc
+                // comment's probe paragraph. `Eof`/`Bytes` fall through to a fresh connect with
+                // nothing written, so `retried_after_a_zero_byte_failure` is deliberately *not*
+                // consumed: this is not the one retry that follows a failed write, it is a
+                // connection that was never written to at all.
+                Some(mut conn) => {
+                    let mut probe = [0u8; 1];
+                    let pending = poll_pending_close(&mut conn, &mut probe).await;
+                    match pending {
+                        PendingClose::Open => conn,
+                        _closed => {
+                            drop(conn);
+                            connect(endpoint, connect_timeout).await?
+                        }
+                    }
+                }
+                None => connect(endpoint, connect_timeout).await?,
             };
 
             let first_write = match conn.write(frame_buf).await {
@@ -486,6 +510,21 @@ impl GraphiteOutput {
             }
         }
     }
+}
+
+/// One fresh TCP connection to `endpoint`, raced against `connect_timeout`. `Fault::Clean`
+/// throughout: nothing of a batch can have left this host while a connection is still being
+/// established. Its own function rather than inline in [`GraphiteOutput::send_tcp`] now that
+/// there are two callers -- the first dial of a lazily-connected sink, and replacing a pooled
+/// connection the probe found closed. Unlike `syslog_out`/`statsd_out`'s `TcpDial::connect` there
+/// is no TLS phase and no `logit.output.reconnects` counter here: this sink has never had either
+/// (this module's doc comment; `docs/adr/graphite-carbon-relay.md`).
+async fn connect(endpoint: &str, connect_timeout: Duration) -> anyhow::Result<TcpStream> {
+    tokio::time::timeout(connect_timeout, TcpStream::connect(endpoint))
+        .await
+        .context("connecting to graphite_out endpoint timed out")
+        .and_then(|r| r.context("connecting to graphite_out endpoint"))
+        .context(Fault::Clean)
 }
 
 /// `90` is `EMSGSIZE` on Linux specifically -- see `statsd::is_message_too_large`'s doc comment
@@ -790,6 +829,84 @@ mod tests {
         let got = received.lock().await;
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
+    }
+
+    /// [`tcp_collector`], except every connection is closed the moment it has read anything at
+    /// all -- the shape a carbon receiver restarting, or one with an idle timeout of its own,
+    /// presents to a sink holding a pooled connection between batches. A clean FIN, not an RST:
+    /// the collector has read everything before it closes, which is exactly the case carbon's
+    /// wire gives a sender no way to detect from a write.
+    async fn tcp_collector_that_closes_after_one_read(
+    ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        {
+            let received = Arc::clone(&received);
+            let accepts = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 8192];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        buf.truncate(n);
+                        received.lock().await.push(buf);
+                    }
+                    // `stream` drops here: one batch read, then a clean close.
+                }
+            });
+        }
+        (addr, received, accepts)
+    }
+
+    /// The pooled-connection probe (`GraphiteOutput::send_tcp`'s doc comment;
+    /// `docs/adr/idle-connection-timeout.md`): the carbon receiver closed the connection this
+    /// sink was holding between batches, and the second batch's datapoints must still arrive.
+    ///
+    /// This is the loss the probe exists to prevent, and nothing else in this file can catch it:
+    /// a write into a FIN'd socket *succeeds* locally, so without the probe `send` returns `Ok`,
+    /// the batch is committed off the sink queue, and those datapoints are simply gone -- carbon
+    /// sends nothing back to lose them against. Hence the assertion on the collector's second
+    /// accept and on the line itself, not merely on `send`'s return value. No reconnect counter
+    /// to check here: `graphite_out` has never had one (this module's doc comment).
+    #[tokio::test]
+    async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
+    ) {
+        let (addr, received, accepts) = tcp_collector_that_closes_after_one_read().await;
+        let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_secs(2));
+
+        output
+            .send(&batch_with(vec![gauge_event("first", 1.0)]))
+            .await
+            .expect("first send should succeed against a fresh connection");
+
+        // Let the collector's close land in this host's receive queue, so the probe has a FIN to
+        // find rather than a race to lose.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        output
+            .send(&batch_with(vec![gauge_event("second", 1.0)]))
+            .await
+            .expect("the probe should reconnect rather than write into a closed socket");
+
+        drop(output);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the probe must have dialled a second connection for the second batch"
+        );
+        let got = received.lock().await;
+        assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("first")));
+        assert!(
+            got.iter().any(|b| String::from_utf8_lossy(b).contains("second")),
+            "the second batch must actually have reached the receiver: {got:?}"
+        );
     }
 
     /// A write that fails only *after* at least one byte of the batch already left this host must

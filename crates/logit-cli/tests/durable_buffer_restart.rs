@@ -134,6 +134,7 @@ fn graph_and_topology(disk_dir: std::path::PathBuf) -> (graph::Graph, DiskQueueC
                 transport: logit_config::StatsdTransport::default(),
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
+                idle_timeout: None,
             },
         },
     );

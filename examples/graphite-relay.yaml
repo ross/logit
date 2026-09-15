@@ -77,9 +77,13 @@ components:
     # max_frame_bytes: "1MiB"
     # transport: tcp only. How long one connection has, per pre-message phase, before it is closed
     # and its connection-cap permit handed back: the TLS accept when tls: is set, then the wait for
-    # its very first byte. Not an idle timeout -- once a connection has sent a byte, a long gap
-    # before the next datapoint is ordinary carbon traffic and is not bounded (docs/known-gaps.md).
+    # its very first byte. Not an idle timeout -- see idle_timeout below.
     # handshake_timeout: 5s
+    # transport: tcp only, off by default. Bounds the gap after the first byte -- closes a
+    # connection quiet for longer than this and releases its permit. Recommended wherever
+    # consistent traffic is expected, sized above the sender's longest normal gap; think twice
+    # here since a plain carbon sender cannot detect the close (docs/adr/idle-connection-timeout.md).
+    # idle_timeout: 5m
     # transport: tcp only, and off unless present: a tls: block turns TLS on and makes it required
     # (there is no plaintext fallback on a TLS listener). Plain carbon senders speak no TLS, so
     # this is for a logit-to-logit or stunnel-shaped relay hop; there is no graphite_out half.

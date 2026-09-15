@@ -601,6 +601,25 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     (24/34/44/52), unlike rule 43's one-rule-for-every-listener, because each sink also checks its
     own `tls:` internals. `logit_outputs::statsd::StatsdOutput::with_tls` re-checks the
     `transport: udp` one itself, since `graph::resolve` isn't the only possible caller.
+53. An `idle_timeout`, where set, must be greater than `0s` on every kind that has one —
+    `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` — and must not be set at all
+    where it could never take effect: a `syslog_in`, a `graphite_in` or a `statsd_in` with
+    `transport: udp`, which has no connection to time out
+    ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)). `0s` is rule 45's
+    impossible bound for a different reason than rule 45's own: every connection is momentarily
+    idle whenever this listener is waiting on its next byte, so a zero budget would close each one
+    the instant it stopped sending — rules 9/15/18/28/45's "0 is impossible, not just small" call
+    either way. The context check is rule 43's reasoning and rule 45's shape, one field over.
+
+    **One rule, five kinds — and no default to exempt.** Like rule 43 (and unlike the per-sink
+    rules 24/34/44/52) the check, the message and the reasoning are identical on every kind it
+    covers, so a listener joins by adding an arm to its match. Each kind's arm landed in the same
+    PR that made that listener *honour* the field, so no released state ever accepted a
+    set-but-ignored `idle_timeout`. Where rule 45 has to tell a defaulted `handshake_timeout` from a set one,
+    this field is an `Option`: absent *is* "no idle timeout", so every `Some` is a set value and
+    the UDP check rejects any of them rather than only a non-default one. That is also why the
+    zero message names the fix — "omit the field to disable the idle timeout" — instead of a legal
+    value to use instead.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
