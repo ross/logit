@@ -212,6 +212,7 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         "severity",
         &Severity::NAMES,
         Severity::from_name,
+        true,
     )?;
     let body_format = enum_field(
         t.raw_get("body_format")?,
@@ -219,6 +220,7 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
         "body_format",
         &BodyFormat::NAMES,
         BodyFormat::from_name,
+        true,
     )?
     .unwrap_or(BodyFormat::Raw);
     let trace = trace_ref_from_fields(
@@ -334,6 +336,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
                 "temporality",
                 &Temporality::NAMES,
                 Temporality::from_name,
+                true,
             )?
             .unwrap_or(Temporality::Delta);
             let monotonic = match t.raw_get::<_, LuaValue>("monotonic")? {
@@ -544,6 +547,7 @@ fn temporality_field(t: &Table, path: &str) -> mlua::Result<Temporality> {
         "temporality",
         &Temporality::NAMES,
         Temporality::from_name,
+        false,
     )?
     .ok_or_else(|| required(path, "temporality"))
 }
@@ -837,15 +841,19 @@ fn i32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<i32> {
     }
 }
 
-/// An optional enum-valued field named by its lowercase name: `nil` is `None`, a string is looked
-/// up through `parse` (one of the `from_name`s `logit-core` provides), anything else is an error
-/// listing `names` (the matching `NAMES` table) so the message can't drift from the enum.
+/// An enum-valued field named by its lowercase name: `nil` is `None` (the caller decides whether
+/// that is a default or `required`), a string is looked up through `parse` (one of the
+/// `from_name`s `logit-core` provides), anything else is an error listing `names` (the matching
+/// `NAMES` table) so the message can't drift from the enum. `optional` says whether the messages
+/// offer `nil`: a *required* field ([`temporality_field`]) must not tell the author nil is
+/// allowed and then reject it as missing.
 fn enum_field<T>(
     value: LuaValue,
     path: &str,
     key: &str,
     names: &[&str],
     parse: fn(&str) -> Option<T>,
+    optional: bool,
 ) -> mlua::Result<Option<T>> {
     match value {
         LuaValue::Nil => Ok(None),
@@ -853,15 +861,17 @@ fn enum_field<T>(
             let s = s.to_string_lossy();
             parse(&s).map(Some).ok_or_else(|| {
                 runtime_error(format!(
-                    "Event.new: {} must be one of {} (or nil), got \"{s}\"",
+                    "Event.new: {} must be one of {}{}, got \"{s}\"",
                     dotted(path, key),
-                    names.join(", ")
+                    names.join(", "),
+                    if optional { " (or nil)" } else { "" }
                 ))
             })
         }
         other => Err(runtime_error(format!(
-            "Event.new: {} must be a string or nil, got {}",
+            "Event.new: {} must be a string{}, got {}",
             dotted(path, key),
+            if optional { " or nil" } else { "" },
             other.type_name()
         ))),
     }
@@ -2140,6 +2150,26 @@ mod tests {
     fn a_histogram_without_a_temporality_is_required() {
         let err = metric_err(r#"name = "m", kind = "histogram", buckets = {}"#);
         assert!(err.contains("Event.new: metrics[1].temporality is required"), "got: {err}");
+    }
+
+    /// A required field's errors must not offer `nil` and then reject it as missing.
+    #[test]
+    fn a_histograms_bad_temporality_does_not_offer_nil() {
+        let err =
+            metric_err(r#"name = "m", kind = "histogram", buckets = {}, temporality = "total""#);
+        assert!(
+            err.contains(
+                "Event.new: metrics[1].temporality must be one of delta, cumulative, got \"total\""
+            ),
+            "got: {err}"
+        );
+        assert!(!err.contains("or nil"), "got: {err}");
+        let err = metric_err(r#"name = "m", kind = "histogram", buckets = {}, temporality = 5"#);
+        assert!(
+            err.contains("Event.new: metrics[1].temporality must be a string, got integer"),
+            "got: {err}"
+        );
+        assert!(!err.contains("or nil"), "got: {err}");
     }
 
     #[test]
