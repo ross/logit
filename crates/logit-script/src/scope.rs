@@ -57,9 +57,10 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ScopeState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` -- resets `scope` to
-/// read the batch's own scope (or the all-clear defaults, if the batch has none) and clears any
-/// write left over from a previous batch.
+/// Called once per incoming batch, before any of its events reach `process` (and once before
+/// every `flush()` call, with `None` -- `docs/adr/lua-flush-root-context.md`) -- resets `scope`
+/// to read the batch's own scope (or the all-clear defaults, if there is none) and clears any
+/// write left over from a previous call.
 pub(crate) fn set(state: &Rc<RefCell<ScopeState>>, scope: &Option<Arc<Scope>>) {
     let mut state = state.borrow_mut();
     state.base = scope.clone();
@@ -67,8 +68,10 @@ pub(crate) fn set(state: &Rc<RefCell<ScopeState>>, scope: &Option<Arc<Scope>>) {
 }
 
 /// `Some` if a script wrote `scope` since the last [`set`], committing that write as the new
-/// `base` so a later read (inside the same batch's remaining `process()` calls, or a `flush()`
-/// that runs before the next `set`) sees it too. `None` -- the common case -- costs nothing.
+/// `base` so a read before the next [`set`] sees it too, and a second [`take`] returns `None`.
+/// `run_lua` calls [`set`] before every batch and before every `flush()`
+/// (`docs/adr/lua-flush-root-context.md`), so no write carries into the next call. `None` -- the
+/// common case -- costs nothing.
 pub(crate) fn take(state: &Rc<RefCell<ScopeState>>) -> Option<Arc<Scope>> {
     let mut state = state.borrow_mut();
     let modified = state.modified.take()?;

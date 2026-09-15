@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-15
 ---
 
 # Operator-declared resource attributes: a `set` transform, not a per-input config field
@@ -104,8 +104,10 @@ never touches it costs nothing. `docs/design/lua-api.md` has the full contract.
   free default), and `run_lua`'s per-batch loop threads a resource through `ScriptWorker::
   set_resource`/`take_resource` the same way it already threads trace context.
 - A Lua `flush()` can now stamp a real resource on its own emission instead of relying purely on
-  `last_resource`'s "whichever batch was last seen" approximation — see
-  `docs/known-gaps.md`'s Lua-flush-staleness entry, amended, not resolved, by this.
+  `last_resource`'s "whichever batch was last seen" approximation. (Amended 2026-09-15: that
+  approximation is gone — [ADR `lua-flush-root-context`](lua-flush-root-context.md) resets
+  `resource` to empty before every `flush()`, so a write inside `flush()` is now the *only* way a
+  flush-driven emission carries a resource.)
 - Demo-stack workstream B (`docs/plans/otlp-logs-and-resource-identity.md`) landed on this: the
   demo's log leg now sets `service.name`/`service.namespace` via `set`, giving Loki real index
   labels with no `demo/loki/loki.yaml` change (both are already in Loki's default index-label set).

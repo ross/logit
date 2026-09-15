@@ -693,6 +693,10 @@ entire pipeline's transform chain serially, because chain adjacency was guarante
 `PipelineConfig.transforms`. In the graph model, adjacency isn't guaranteed — a Lua component's
 sources and consumers can be arbitrary other components — so **each Lua component gets its own
 thread**, communicating with its neighbors over the same `mpsc` channels every other node uses.
+The thread's exit (a normal return once its inbox closes, or a panic caught at the top of the
+thread) is reported over a oneshot that a small `JoinSet` task awaits on the node's behalf
+(`runtime.rs`'s `watch_lua_thread`), so readiness, the failure-triggered drain and the exit code
+treat a Lua node exactly as they treat any task.
 
 Everything else — listeners, sinks, native `Send` transforms (`aggregate` today via
 `logit-transforms::Aggregator`; `json`/`filter`/etc. as they land in the same crate), and **native
