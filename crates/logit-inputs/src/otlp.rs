@@ -2896,6 +2896,14 @@ mod tests {
     /// The pre-filled capacity-1 channel is what parks the handler, and the batch it holds is a
     /// metric while the request carries a span, so "the request's batch arrived" is a distinct
     /// assertion from "the pre-filled one drained".
+    ///
+    /// **The timings, and why they are what they are.** A 200ms idle timeout and a 100ms grace,
+    /// so the grace window runs from roughly 200ms to 300ms after this connection's first byte,
+    /// and the rest of the request lands at 260ms -- 60ms *past* the idle deadline, so the
+    /// request cannot have been in flight when it fired (which would make the test vacuous), and
+    /// 40ms *inside* the grace, so it is genuinely picked up in the window under test. The
+    /// downstream is then left blocked until 600ms, 300ms past the grace's expiry, which is what
+    /// the old drop-on-expiry close would have lost the batch in.
     #[tokio::test]
     async fn a_request_that_starts_inside_the_grace_window_is_served_not_dropped() {
         let registry = logit_core::Registry::new();
@@ -2903,10 +2911,10 @@ mod tests {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let mut input = input
             .with_telemetry(telemetry)
-            .with_idle_timeout(Some(Duration::from_millis(100)))
-            // Doubles as the grace, kept short so every deadline here is visible inside a
-            // fraction of a second.
-            .with_handshake_timeout(Duration::from_millis(50));
+            .with_idle_timeout(Some(Duration::from_millis(200)))
+            // Doubles as the grace. Both halves of this test's margin are tens of milliseconds
+            // wide (see the timings above), which is why neither number is any tighter.
+            .with_handshake_timeout(Duration::from_millis(100));
         let (sink, mut rx) = fanout_into_channel_with_capacity(1);
         // Pre-filled, so the handler's own `Fanout::send` parks until this test drains it.
         sink.send(metric_batch()).await;
@@ -2924,15 +2932,17 @@ mod tests {
         let mut late = tokio::net::TcpStream::connect(&addr).await.unwrap();
         late.write_all(&head[..2]).await.unwrap();
 
-        // Past the 100ms idle deadline: `graceful_shutdown` has been called and the 50ms grace
-        // is running or already spent. The rest of the request lands anyway.
-        tokio::time::sleep(Duration::from_millis(110)).await;
+        // t+260ms: 60ms past the 200ms idle deadline, so `graceful_shutdown` has certainly been
+        // called and nothing was in flight when it fired -- and 40ms inside the 100ms grace, so
+        // the rest of the request is picked up by a connection that is already shutting down.
+        tokio::time::sleep(Duration::from_millis(260)).await;
         late.write_all(&head[2..]).await.unwrap();
         late.write_all(&body).await.unwrap();
 
-        // Six graces' worth of parked handler. Under a close that dropped on grace expiry, this
-        // connection and this batch would both be long gone.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // t+600ms: three further graces' worth of parked handler, 300ms past the window's
+        // expiry. Under a close that dropped on grace expiry, this connection and this batch
+        // would both be long gone by now.
+        tokio::time::sleep(Duration::from_millis(340)).await;
 
         let prefilled = recv_batch(&mut rx).await;
         assert!(prefilled.events[0].span.is_none(), "the pre-filled batch drains first");
