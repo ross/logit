@@ -46,12 +46,13 @@ concrete consumer needed them (W7 of
 read/write, array-like proxy over the event's metric list — read/write only on the handful of
 fields a script can legitimately mutate in place without breaking a kind's own invariants (a
 `sum`/`gauge`'s `value`, a `sum`'s `temporality`/`monotonic`), read-only everywhere else — see
-"Reading and writing `event.metrics`" below. `event.span` is entirely read-only, the same posture
-`provenance` takes, since there is still no script-visible way to construct or mutate a span — see
-"Reading `event.span`" below. **`Event.new(t)` builds an event from scratch** -- from a table in
-exactly the shape `event:to_table()` returns, so the two are inverses -- see "Constructing
-events" below; today it constructs `timestamp`/`attributes`/`log`, with metrics and spans landing
-in the remaining workstreams of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md).
+"Reading and writing `event.metrics`" below. `event.span` is entirely read-only in place, the
+same posture `provenance` takes: a script that wants a span builds a whole one with `Event.new`
+rather than editing an existing one field by field — see "Reading `event.span`" below.
+**`Event.new(t)` builds an event from scratch** -- from a table in exactly the shape
+`event:to_table()` returns, so the two are inverses -- see "Constructing events" below; it
+constructs `timestamp`/`attributes`/`log`, every constructible metric kind, and a `span` with its
+`events` and `links`.
 
 No `__pairs`: it isn't available under LuaJIT. `mlua::MetaMethod::Pairs` requires Lua 5.2+, and
 LuaJIT is Lua 5.1 semantics — this was in the original version of this section and is wrong.
@@ -543,14 +544,15 @@ The `trace_context` native transform (`logit_config::ComponentKind::TraceContext
 common case -- lifting a trace id already sitting in an attribute (a JSON log body's own
 `trace.id` field, or a W3C `traceparent`) onto the log record -- without writing Lua, the same
 relationship `set` has to `resource`/`event.attributes`. See `docs/adr/log-record-trace-context.md`.
-Its `span:` block goes one step further than any script can today: it mints a `SpanRecord` from an
-access line's ids and timing (`docs/adr/trace-context-span-lifting.md`,
-`docs/design/data-model.md`'s "Well-known attribute names"). A script can *read* a span once one
-exists -- `event.span`, read-only, see "Reading `event.span`" below -- and can *prepare* the
-attributes a `trace_context` placed after it needs (compute `span.start` from whatever the line
-carries, say), but still has no way to *create* or *mutate* a span itself. Narrowed in
-`docs/known-gaps.md` (W7): the remaining gap is span writes/minting specifically, not span access
-as a whole.
+Its `span:` block mints a `SpanRecord` from an access line's ids and timing without writing Lua
+(`docs/adr/trace-context-span-lifting.md`, `docs/design/data-model.md`'s "Well-known attribute
+names"). A script can *read* a span once one exists -- `event.span`, read-only in place, see
+"Reading `event.span`" below -- and can *create* one with `Event.new` (the `span` table in
+"Constructing events" below, which takes everything `trace_context` lifts and more: `events`,
+`links`, a `parent_span_id`, an `ext`). What it cannot do is mutate an existing `event.span` field
+by field; the documented way to change one is `Event.new(event:to_table())` with the table
+edited. Narrowed in `docs/known-gaps.md` twice: first (W7 of `lossless-transit`) to span
+writes/minting, then (`lua-event-constructor`) to in-place span mutation alone.
 
 ## Reading and writing `event.metrics`
 
@@ -664,11 +666,13 @@ stands, or to rebuild the record with `Event.new`.
 
 ## Reading `event.span`
 
-`event.span` is `nil` on an event with no span (`event.has_span == false`); otherwise it's a
-proxy onto the span record, entirely read-only -- there is no script-visible way to construct or
-mutate a span, only to read one `trace_context`'s `span:` block already minted
-([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) or a wire codec already
-decoded (`crates/logit-script/src/proxy.rs`):
+Constructible with `Event.new`, read-only in place. `event.span` is `nil` on an event with no
+span (`event.has_span == false`); otherwise it's a proxy onto the span record, entirely read-only
+-- a script reads one that already exists, whether `Event.new` built it (the `span` table in
+"Constructing events" below), `trace_context`'s `span:` block minted it
+([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) or a wire codec decoded
+it (`crates/logit-script/src/proxy.rs`); in-place mutation of an existing span is the one thing
+not offered:
 
 ```lua
 function process(event)
@@ -713,7 +717,10 @@ no attribute map separate from the event's -- a span-carrying event's attributes
 Unlike every other proxy in this module, `event.span`'s write path doesn't distinguish an unknown
 field from a known-but-read-only one -- any assignment at all, to any key, raises the flat
 `event.span is read-only`, since there's no field-specific case worth naming when nothing on a
-span is writable.
+span is writable in place. A script that wants a different span builds one: `local t =
+event:to_table(); t.span.status = "error"; return Event.new(t)` rebuilds the whole event with
+that one field changed, and `Event.new{timestamp = ..., span = {...}}` mints one from nothing --
+see the `span` table below.
 
 ## Constructing events
 
@@ -755,7 +762,7 @@ The top-level table:
 | `attributes` | table of string keys; every value converts the way an `event.attributes.k = v` write does | optional, default empty |
 | `log` | table, below | optional |
 | `metrics` | array of metric tables, below, in order | optional, default empty (which is what `to_table()` emits for an event with no metrics) |
-| `span` | table -- **not constructible yet**: `Event.new: span is not constructible yet` until W5 of [`docs/plans/lua-event-constructor.md`](../plans/lua-event-constructor.md) | optional |
+| `span` | table, below; the event's `timestamp` is the span's start | optional |
 | `has_log`, `has_metrics`, `has_span` | boolean | optional; accepted because `to_table()` emits them, **values ignored** -- the payload keys are the truth |
 
 The `log` table, `to_table().log`'s shape:
@@ -856,6 +863,86 @@ to invert, and a sketch rebuilt from a count alone would lie about its contents.
 `is not constructible from Lua -- aggregate's private intermediate, never valid at a sink`
 ([`docs/known-gaps.md`](../known-gaps.md)'s relative-gauge-adjustments entry).
 
+### `span`
+
+The `span` table is `to_table().span`'s shape: the fields `event.span` reads ("Reading
+`event.span`" above), with the event's `timestamp` serving as the span's start (a `SpanRecord`
+has no start of its own -- `crates/logit-core/src/span.rs`). A span needs its two ids and a
+`name`; everything else defaults to what core documents.
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `trace_id` | 32-char hex string, not all-zero | **required** |
+| `span_id` | 16-char hex string, not all-zero | **required** |
+| `parent_span_id` | 16-char hex string, not all-zero, or `nil` | optional, default absent |
+| `name` | any value (a string, most commonly), converted like an attribute value | **required** |
+| `kind` | `"internal"`/`"server"`/`"client"`/`"producer"`/`"consumer"` | optional, default `"internal"` |
+| `status` | `"unset"`/`"ok"`/`"error"` | optional, default `"unset"` |
+| `end_timestamp` | decimal-nanos string; must not precede the event's `timestamp` -- the same rule `trace_context`'s `span:` block applies to a lifted span, and a zero-duration span (`end_timestamp == timestamp`) is fine | optional, default the event's `timestamp` |
+| `flags` | non-negative integer, OTLP's `Span.flags` (the low 8 bits are the W3C trace flags) | optional, default `0` |
+| `status_message` | string or `nil` | optional, default absent |
+| `trace_state` | string or `nil`, the W3C `tracestate` | optional, default absent |
+| `dropped_attributes_count`, `dropped_events_count`, `dropped_links_count` | non-negative integer | optional, default `0` |
+| `events` | array of span-event tables, below, in order | optional, default empty (which is what `to_table()` emits for a span with none) |
+| `links` | array of span-link tables, below, in order | optional, default empty |
+
+A span-event table, `to_table().span.events[i]`'s shape:
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `timestamp` | decimal-nanos string | **required** |
+| `name` | any value, converted like an attribute value | **required** |
+| `attributes` | table of string keys, converted like `attributes` above | optional, default empty |
+| `dropped_attributes_count` | non-negative integer | optional, default `0` |
+
+A span-link table, `to_table().span.links[i]`'s shape -- both ids are required, since a link *is*
+a reference to another span:
+
+| Key | Type / encoding | Required? |
+|---|---|---|
+| `trace_id` | 32-char hex string, not all-zero | **required** |
+| `span_id` | 16-char hex string, not all-zero | **required** |
+| `trace_state` | string or `nil` | optional, default absent |
+| `flags` | non-negative integer | optional, default `0` |
+| `dropped_attributes_count` | non-negative integer | optional, default `0` |
+| `attributes` | table of string keys | optional, default empty |
+
+There is no `span.attributes`, for the reason "Reading `event.span`" gives: a span-carrying
+event's attributes are the top-level `attributes`, so `span = {attributes = {}}` is `Event.new:
+span.attributes is not a field`. `SpanRecord.ext` (`status_message`, `trace_state`, the three
+`dropped_*` counts) is boxed only when one of the five is non-default -- the rule `crates/
+logit-proto`'s `ext_from_wire` already applies to a decoded span -- so a minimal constructed span
+costs what a minimal decoded one does, and `dropped_events_count = 0` written out explicitly
+earns no box. A `Value::Null` span or span-event `name` is the same residual as a `Value::Null`
+`message`: `to_table()` emits it as an absent key, and `Event.new` rejects it as missing.
+
+```lua
+-- a script minting a span from a line trace_context can't lift (say, a two-timestamp line
+-- whose end is in a different field on each variant)
+function process(event)
+  local a = event.attributes
+  local t = event:to_table()
+  t.span = {
+    trace_id = a["trace.id"], span_id = a["span.id"], name = a["http.route"] or "request",
+    kind = "server", status = a["http.status"] >= 500 and "error" or "unset",
+    end_timestamp = a["request.end"],
+    events = {{timestamp = a["request.end"], name = "response.sent"}},
+  }
+  return Event.new(t)
+end
+```
+
+Errors carry the full path: `Event.new: span.trace_id is required`, `Event.new: span.trace_id
+must be a 32-character hex string, and not all-zero`, `Event.new: span.parent_span_id must be a
+16-character hex string (or nil), and not all-zero`, `Event.new: span.end_timestamp precedes
+timestamp`, `Event.new: span.kind must be one of internal, server, client, producer, consumer (or
+nil), got "SERVER"` (names are exact and lowercase, as everywhere), `Event.new:
+span.events[1].name is required`, `Event.new: span.links[1].span_id is required`, `Event.new:
+span.links[1].bogus is not a field`, `Event.new: span.status_message must be a string or nil, got
+integer`. A non-table row is `Event.new: span.events[1] must be a table, got integer`; `events`
+and `links` must each be a contiguous array (`Event.new: span.links must be a contiguous
+array-like table`).
+
 **Every mistake is a runtime error at the call, prefixed with the dotted path:** `Event.new:
 log.severty is not a field` (unknown keys are rejected everywhere, top level and sub-tables --
 the same strictness the proxies apply to an unknown field on read or write), `Event.new: timestamp
@@ -864,7 +951,8 @@ nil), got "warning"`, `Event.new: log.span_id can't be set without a trace_id`, 
 attributes has a non-string key (integer)`. Table access is raw, so a metatable on the input can't
 make the key check and the field reads disagree. Defaults exist only where core already documents
 one (`BodyFormat::Raw`, the zeros above, `MetricKind::counter`'s temporality and monotonicity,
-`Samples::new`'s `sample_rate`); nothing else is invented.
+`Samples::new`'s `sample_rate`, a span's `internal`/`unset` and its own start as its end);
+nothing else is invented.
 
 **Targets resolve at call time, not at script load.** A constructed event's `to(id)` checks the
 worker's `targets:` list as it stands when `Event.new` runs -- inside `process()` or `flush()`,
@@ -1004,7 +1092,7 @@ them a route to the host.
 | `event.attributes`, `event:to_table()` (proxy vs. table conversion) | [`memory.md`](memory.md) §2, §8 |
 | `resource`, `scope` (copy-on-write, read vs. write path) | [`memory.md`](memory.md) §2 |
 | `event.metrics`, `event.span` (per-access `MetricProxy`, `to_table()` growth) | [`memory.md`](memory.md) §2 |
-| `Event.new` (a constructed log event and a constructed gauge event, each from a literal table; a script that never calls it pays nothing) | [`memory.md`](memory.md) §2 |
+| `Event.new` (a constructed log event, a constructed gauge event and a constructed span event, each from a literal table; a script that never calls it pays nothing) | [`memory.md`](memory.md) §2 |
 
 Every number for the surfaces above is measured in `crates/logit-bench/tests/allocations.rs`, not
 estimated here -- this table intentionally carries none, so it can't drift out of date the moment

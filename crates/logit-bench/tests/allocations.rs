@@ -3267,6 +3267,45 @@ fn lua_process_one_event_constructing_a_gauge_event() {
     expect_allocs("lua: Event.new gauge event from a literal table", stats, 16);
 }
 
+/// `Event.new{timestamp = "1", span = {trace_id = <hex>, span_id = <hex>, name = "GET /"}}`
+/// returned from `process()` in place of the incoming event -- the smallest useful constructed
+/// *span* event, every core default applied (`kind` internal, `status` unset, `end_timestamp`
+/// the event's own, no `SpanExt`, empty `events`/`links`). Same method and baseline as
+/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way, and the last
+/// payload kind `Event.new` builds.
+///
+/// **14**, broken down by measuring narrower scripts against this one, not derived:
+///
+/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
+///   `ProcessOutcome::Emit`: 11, exactly the log and gauge rows' first three terms.
+/// - **+3** for the `span` sub-table with its three required fields: 1 for the table itself,
+///   1 for `lua_to_value`'s `Bytes` for the `name` (`name = 1` lands at 13), and the same 1 that
+///   every non-empty record sub-table carries beyond its own table and fields (the log row's
+///   `message` bucket, the gauge row's fourth per-record allocation). The two hex ids parse
+///   straight into their `[u8; N]` arrays, `SpanRecord` is inline in `Event` (no box), and
+///   `Vec::new()` for `events`/`links` is free.
+/// - **+0** for every defaulted or scalar field: `kind = "server", status = "ok", end_timestamp
+///   = "2", parent_span_id = <hex>` together land at 14 too (enum names are looked up through
+///   borrowed `to_string_lossy`, the nanos string parses in place), as does an explicit
+///   `dropped_events_count = 0, flags = 0` -- a default value never earns the `SpanExt` box.
+/// - Beyond the pin, for scale: `status_message = "boom"` adds 2 (the `Box<SpanExt>` and the
+///   `Bytes`); an empty `events = {}` or `links = {}` adds 1 each (the Lua table --
+///   `with_capacity(0)` allocates nothing); one span event `{timestamp = "1", name = "e"}` adds
+///   7 (the `events` table, the row's table, `validated_sequence_len`'s key `Vec`, the
+///   `format!`'d `span.events[1]` path, the name's `Bytes`, the `Vec<SpanEvent>` itself, and the
+///   per-record bucket), and one link with just its ids adds 6 (the same minus the `Bytes`).
+#[test]
+fn lua_process_one_event_constructing_a_span_event() {
+    let worker =
+        ScriptWorker::new(fixtures::LUA_EVENT_NEW_SPAN_SCRIPT).expect("script should load");
+    drop(worker.process(fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (outcome, stats) = measure(|| worker.process(event).expect("script should run"));
+    assert!(matches!(outcome, ProcessOutcome::Emit(..)));
+    expect_allocs("lua: Event.new span event from a literal table", stats, 14);
+}
+
 // ---------------------------------------------------------------------------------------------
 // End to end
 // ---------------------------------------------------------------------------------------------

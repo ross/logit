@@ -20,16 +20,19 @@
 //! - **Defaults only where core already documents one** (`BodyFormat::Raw`, `observed_timestamp`
 //!   and `dropped_attributes_count` of `0`, empty `attributes`; a metric's `start_timestamp`/
 //!   `flags` of `0`, `MetricKind::counter`'s temporality and monotonicity for a bare `sum`,
-//!   `Samples::new`'s `sample_rate` of `1.0`); `timestamp`, `log.message`, a metric's `name`/
-//!   `kind` and its kind's own payload are required, exactly as the ADR lists.
+//!   `Samples::new`'s `sample_rate` of `1.0`; a span's `SpanKind::Internal`/`SpanStatus::Unset`,
+//!   an `end_timestamp` equal to its start, `SpanExt`'s zeros, empty `events`/`links`);
+//!   `timestamp`, `log.message`, a metric's `name`/`kind` and its kind's own payload, and a
+//!   span's `trace_id`/`span_id`/`name` are required, exactly as the ADR lists.
 //!
 //! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...`; the shared
-//! helpers at the bottom take the path as an argument so the metric and span parsers of
-//! `docs/plans/lua-event-constructor.md` reuse them unchanged. `metrics` builds the four raw
-//! kinds (`sum`, `gauge`, `samples`, `set_members`) and the three pre-aggregated ones
-//! (`histogram`, `exponential_histogram`, `summary`), exemplars included; the two sketches and
-//! `gauge_delta` are never constructible, and `span` is not yet constructible (W5) -- each says
-//! so.
+//! helpers at the bottom take the path as an argument so the log, metric and span parsers reuse
+//! them unchanged. `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`,
+//! `set_members`) and the three pre-aggregated ones (`histogram`, `exponential_histogram`,
+//! `summary`), exemplars included; the two sketches and `gauge_delta` are never constructible,
+//! and each says so. `span` builds a whole [`SpanRecord`], its `events` and `links` included --
+//! the one way a script mints a span, since `event.span` itself stays read-only in place
+//! (`crate::proxy`'s `SpanProxy`).
 
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_table_to_attrmap, lua_to_value, validated_sequence_len};
@@ -38,7 +41,8 @@ use logit_core::interner::{intern, Symbol};
 use logit_core::trace::{parse_span_id, parse_trace_id, TraceRef};
 use logit_core::{
     AttrMap, BodyFormat, Event, Exemplar, ExpHistogram, Histogram, LogRecord, MetricKind,
-    MetricList, MetricRecord, Samples, Severity, Sum, Summary, Temporality, Value,
+    MetricList, MetricRecord, Samples, Severity, SpanEvent, SpanExt, SpanKind, SpanLink,
+    SpanRecord, SpanStatus, Sum, Summary, Temporality, Value,
 };
 use mlua::{Lua, Table, Value as LuaValue};
 use std::cell::RefCell;
@@ -87,6 +91,32 @@ const EXP_BUCKETS_KEYS: &[&str] = &["offset", "counts"];
 
 /// The keys of one row of a `summary`'s `quantiles`.
 const QUANTILE_KEYS: &[&str] = &["quantile", "value"];
+
+/// The keys `span_to_table` emits.
+const SPAN_KEYS: &[&str] = &[
+    "trace_id",
+    "span_id",
+    "parent_span_id",
+    "name",
+    "kind",
+    "status",
+    "status_message",
+    "trace_state",
+    "end_timestamp",
+    "flags",
+    "dropped_attributes_count",
+    "dropped_events_count",
+    "dropped_links_count",
+    "events",
+    "links",
+];
+
+/// The keys `span_event_to_table` emits.
+const SPAN_EVENT_KEYS: &[&str] = &["timestamp", "name", "attributes", "dropped_attributes_count"];
+
+/// The keys `span_link_to_table` emits.
+const SPAN_LINK_KEYS: &[&str] =
+    &["trace_id", "span_id", "trace_state", "flags", "dropped_attributes_count", "attributes"];
 
 /// The kinds the unknown-`kind` error names: every kind `Event.new` builds -- deliberately *not*
 /// the sketches or `gauge_delta`, which are never constructible and get their own message each.
@@ -164,19 +194,19 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
         },
         _ => return Err(not_a_sequence("", "metrics")),
     };
-    match t.raw_get::<_, LuaValue>("span")? {
-        LuaValue::Nil => {}
-        // W5 of `docs/plans/lua-event-constructor.md` replaces this arm with `span_from_table`.
-        LuaValue::Table(_) => {
-            return Err(runtime_error("Event.new: span is not constructible yet".to_string()))
-        }
+    let span = match t.raw_get::<_, LuaValue>("span")? {
+        LuaValue::Nil => None,
+        // The event's `timestamp` is the span's start (`SpanRecord::end_timestamp`'s doc), so the
+        // span parser gets it: it is the `end_timestamp` default and the floor `end_timestamp`
+        // is checked against.
+        LuaValue::Table(span) => Some(span_from_table(span, "span", timestamp)?),
         other => {
             return Err(runtime_error(format!(
                 "Event.new: span must be a table (or nil), got {}",
                 other.type_name()
             )))
         }
-    }
+    };
     let log = match t.raw_get::<_, LuaValue>("log")? {
         LuaValue::Nil => None,
         LuaValue::Table(log) => Some(log_from_table(log, "log")?),
@@ -190,6 +220,7 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
     let mut event = Event::empty(timestamp, attributes);
     event.log = log;
     event.metrics = metrics;
+    event.span = span;
     Ok(event)
 }
 
@@ -625,13 +656,132 @@ fn exemplar_from_table(t: Table, path: &str) -> mlua::Result<Exemplar> {
     Ok(Exemplar { timestamp, value, trace, filtered_attributes })
 }
 
+/// Builds a [`SpanRecord`] from a table in `span_to_table`'s shape. `path` is the table's own
+/// path (`span`); `start` is the event's already-parsed `timestamp`, which is the span's start
+/// (`SpanRecord::end_timestamp`'s doc) -- the default for `end_timestamp` and the floor it is
+/// checked against, the same `end < start` rule `trace_context`'s `span:` block applies to a
+/// lifted span (`crates/logit-transforms/src/trace_context.rs`).
+fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord> {
+    expect_keys(&t, SPAN_KEYS, path)?;
+    let trace_id = required_hex_id(t.raw_get("trace_id")?, path, "trace_id", parse_trace_id)?;
+    let span_id = required_hex_id(t.raw_get("span_id")?, path, "span_id", parse_span_id)?;
+    let parent_span_id =
+        hex_id_field(t.raw_get("parent_span_id")?, path, "parent_span_id", parse_span_id, true)?;
+    let name = match t.raw_get::<_, LuaValue>("name")? {
+        // As `log.message`: a `Value::Null` name is an absent key in `to_table()`'s output and
+        // comes back as missing -- the ADR's recorded residual.
+        LuaValue::Nil => return Err(required(path, "name")),
+        value => value_field(value, path, "name")?,
+    };
+    let kind = enum_field(t.raw_get("kind")?, path, "kind", &SpanKind::NAMES, SpanKind::from_name)?
+        .unwrap_or(SpanKind::Internal);
+    let status = enum_field(
+        t.raw_get("status")?,
+        path,
+        "status",
+        &SpanStatus::NAMES,
+        SpanStatus::from_name,
+    )?
+    .unwrap_or(SpanStatus::Unset);
+    let end_timestamp = match t.raw_get::<_, LuaValue>("end_timestamp")? {
+        LuaValue::Nil => start,
+        value => nanos_string(value, path, "end_timestamp")?,
+    };
+    if end_timestamp < start {
+        return Err(runtime_error(format!(
+            "Event.new: {} precedes timestamp",
+            dotted(path, "end_timestamp")
+        )));
+    }
+    let flags = u32_field(t.raw_get("flags")?, path, "flags")?;
+    // `SpanExt` is boxed only when something in it is non-default -- `crates/logit-proto`'s
+    // `ext_from_wire` rule -- so a minimal constructed span costs what a minimal decoded one
+    // does, and `to_table()`'s `nil`/`0` for an `ext`-less span rebuilds as `ext: None`.
+    let ext = SpanExt {
+        status_message: bytes_field(t.raw_get("status_message")?, path, "status_message")?,
+        trace_state: bytes_field(t.raw_get("trace_state")?, path, "trace_state")?,
+        dropped_attributes_count: u32_field(
+            t.raw_get("dropped_attributes_count")?,
+            path,
+            "dropped_attributes_count",
+        )?,
+        dropped_events_count: u32_field(
+            t.raw_get("dropped_events_count")?,
+            path,
+            "dropped_events_count",
+        )?,
+        dropped_links_count: u32_field(
+            t.raw_get("dropped_links_count")?,
+            path,
+            "dropped_links_count",
+        )?,
+    };
+    let ext = (ext != SpanExt::default()).then(|| Box::new(ext));
+    // Each row's parser needs its `span.events[i]`/`span.links[i]` path up front for
+    // `expect_keys`, so it is built once per row -- the same one-`String`-per-row cost the
+    // exemplar and bucket loops pay -- while every scalar beneath stays lazy.
+    let events = optional_sequence_field(t.raw_get("events")?, path, "events", |value, path| {
+        span_event_from_table(row_table(value, path)?, &path())
+    })?;
+    let links = optional_sequence_field(t.raw_get("links")?, path, "links", |value, path| {
+        span_link_from_table(row_table(value, path)?, &path())
+    })?;
+    Ok(SpanRecord {
+        trace_id,
+        span_id,
+        parent_span_id,
+        name,
+        kind,
+        status,
+        events,
+        links,
+        end_timestamp,
+        flags,
+        ext,
+    })
+}
+
+/// Builds a [`SpanEvent`] from a table in `span_event_to_table`'s shape. `path` is the row's
+/// own path (`span.events[i]`).
+fn span_event_from_table(t: Table, path: &str) -> mlua::Result<SpanEvent> {
+    expect_keys(&t, SPAN_EVENT_KEYS, path)?;
+    let timestamp = match t.raw_get::<_, LuaValue>("timestamp")? {
+        LuaValue::Nil => return Err(required(path, "timestamp")),
+        value => nanos_string(value, path, "timestamp")?,
+    };
+    let name = match t.raw_get::<_, LuaValue>("name")? {
+        LuaValue::Nil => return Err(required(path, "name")),
+        value => value_field(value, path, "name")?,
+    };
+    let attributes = attributes_field(t.raw_get("attributes")?, path, "attributes")?;
+    let dropped_attributes_count =
+        u32_field(t.raw_get("dropped_attributes_count")?, path, "dropped_attributes_count")?;
+    Ok(SpanEvent { timestamp, name, attributes, dropped_attributes_count })
+}
+
+/// Builds a [`SpanLink`] from a table in `span_link_to_table`'s shape. `path` is the row's own
+/// path (`span.links[i]`). Unlike a log's or exemplar's trace context, a link's `trace_id` and
+/// `span_id` are both required: a link *is* a reference to another span, so there is no
+/// "trace only" shape for it.
+fn span_link_from_table(t: Table, path: &str) -> mlua::Result<SpanLink> {
+    expect_keys(&t, SPAN_LINK_KEYS, path)?;
+    let trace_id = required_hex_id(t.raw_get("trace_id")?, path, "trace_id", parse_trace_id)?;
+    let span_id = required_hex_id(t.raw_get("span_id")?, path, "span_id", parse_span_id)?;
+    let trace_state = bytes_field(t.raw_get("trace_state")?, path, "trace_state")?;
+    let flags = u32_field(t.raw_get("flags")?, path, "flags")?;
+    let dropped_attributes_count =
+        u32_field(t.raw_get("dropped_attributes_count")?, path, "dropped_attributes_count")?;
+    let attributes = attributes_field(t.raw_get("attributes")?, path, "attributes")?;
+    Ok(SpanLink { trace_id, span_id, attributes, flags, trace_state, dropped_attributes_count })
+}
+
 // -- shared helpers -----------------------------------------------------------------------------
 //
 // Each takes the `path` of the table it's reading (`""` at the top level) and the `key` within
 // it separately, and only joins them (`dotted`) on the error path: a constructed event's
-// success path allocates nothing for messages it never raises (the `lua: Event.new ..` pin in
-// `crates/logit-bench/tests/allocations.rs`), and W3-W5's metric/exemplar/span parsers can pass
-// `metrics[i]`, `metrics[i].exemplars[j]`, `span`, ... as `path` unchanged.
+// success path allocates nothing for messages it never raises (the `lua: Event.new ..` pins in
+// `crates/logit-bench/tests/allocations.rs`), and the metric/exemplar/span parsers pass
+// `metrics[i]`, `metrics[i].exemplars[j]`, `span`, `span.events[i]`, ... as `path` unchanged.
 
 fn runtime_error(message: String) -> mlua::Error {
     mlua::Error::RuntimeError(message)
@@ -688,6 +838,21 @@ fn sequence_field<T>(
         out.push(entry(list.raw_get(k)?, &|| indexed(path, key, k))?);
     }
     Ok(out)
+}
+
+/// [`sequence_field`] for a sequence that may be absent (a span's `events`/`links`, which
+/// `to_table()` always emits but a script minting a span needn't): `nil` is empty -- and free,
+/// `Vec::new()` allocates nothing -- anything else goes through [`sequence_field`].
+fn optional_sequence_field<T>(
+    value: LuaValue,
+    path: &str,
+    key: &str,
+    entry: fn(LuaValue, &dyn Fn() -> String) -> mlua::Result<T>,
+) -> mlua::Result<Vec<T>> {
+    match value {
+        LuaValue::Nil => Ok(Vec::new()),
+        value => sequence_field(value, path, key, entry),
+    }
 }
 
 /// How a table is named in a message about the table itself (as opposed to one of its fields):
@@ -866,57 +1031,27 @@ fn enum_field<T>(
 
 /// The log proxy's trace-context rule, applied to three fields read at once: `trace_id` is the
 /// gate (absent means no [`TraceRef`] at all), `span_id`/`trace_flags` without it are the same
-/// error `event.log.span_id = ..` raises before a `trace_id` is set, and each id goes through the
-/// parser `logit_core::trace` already has (exact length, hex, not all-zero). `path` is the
-/// record's path (`log`, or W3's `metrics[i].exemplars[j]`), not a field's.
+/// error `event.log.span_id = ..` raises before a `trace_id` is set, and each id goes through
+/// [`hex_id_field`]. `path` is the record's path (`log`, `metrics[i].exemplars[j]`), not a
+/// field's.
 fn trace_ref_from_fields(
     trace_id: LuaValue,
     span_id: LuaValue,
     trace_flags: LuaValue,
     path: &str,
 ) -> mlua::Result<Option<TraceRef>> {
-    let trace_id = match trace_id {
-        LuaValue::Nil => {
-            for (key, value) in [("span_id", &span_id), ("trace_flags", &trace_flags)] {
-                if !matches!(value, LuaValue::Nil) {
-                    return Err(runtime_error(format!(
-                        "Event.new: {} can't be set without a trace_id",
-                        dotted(path, key)
-                    )));
-                }
+    let Some(trace_id) = hex_id_field(trace_id, path, "trace_id", parse_trace_id, true)? else {
+        for (key, value) in [("span_id", &span_id), ("trace_flags", &trace_flags)] {
+            if !matches!(value, LuaValue::Nil) {
+                return Err(runtime_error(format!(
+                    "Event.new: {} can't be set without a trace_id",
+                    dotted(path, key)
+                )));
             }
-            return Ok(None);
         }
-        LuaValue::String(s) => s.to_str().ok().and_then(parse_trace_id).ok_or_else(|| {
-            runtime_error(format!(
-                "Event.new: {} must be a 32-character hex string (or nil), and not all-zero",
-                dotted(path, "trace_id")
-            ))
-        })?,
-        other => {
-            return Err(runtime_error(format!(
-                "Event.new: {} must be a hex string or nil, got {}",
-                dotted(path, "trace_id"),
-                other.type_name()
-            )))
-        }
+        return Ok(None);
     };
-    let span_id = match span_id {
-        LuaValue::Nil => None,
-        LuaValue::String(s) => Some(s.to_str().ok().and_then(parse_span_id).ok_or_else(|| {
-            runtime_error(format!(
-                "Event.new: {} must be a 16-character hex string (or nil), and not all-zero",
-                dotted(path, "span_id")
-            ))
-        })?),
-        other => {
-            return Err(runtime_error(format!(
-                "Event.new: {} must be a hex string or nil, got {}",
-                dotted(path, "span_id"),
-                other.type_name()
-            )))
-        }
-    };
+    let span_id = hex_id_field(span_id, path, "span_id", parse_span_id, true)?;
     let flags = match trace_flags {
         LuaValue::Nil => 0,
         LuaValue::Integer(n) => u8::try_from(n).map_err(|_| {
@@ -936,7 +1071,63 @@ fn trace_ref_from_fields(
     Ok(Some(TraceRef { trace_id, span_id, flags }))
 }
 
-/// A field holding an arbitrary [`Value`] (`log.message`; W5's span and span-event `name`s),
+/// A hex id field -- a trace id or a span id, `parse` being `logit_core::trace`'s
+/// `parse_trace_id`/`parse_span_id` (exact length, hex, not all-zero): `nil` is `None`, and the
+/// caller decides whether that is a default (a log's trace context, a span's `parent_span_id`)
+/// or "is required" ([`required_hex_id`]). `optional` only shapes the wording, so a required
+/// id's error doesn't offer `nil` as a choice.
+fn hex_id_field<const N: usize>(
+    value: LuaValue,
+    path: &str,
+    key: &str,
+    parse: fn(&str) -> Option<[u8; N]>,
+    optional: bool,
+) -> mlua::Result<Option<[u8; N]>> {
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(s) => s.to_str().ok().and_then(parse).map(Some).ok_or_else(|| {
+            runtime_error(format!(
+                "Event.new: {} must be a {}-character hex string{}, and not all-zero",
+                dotted(path, key),
+                N * 2,
+                if optional { " (or nil)" } else { "" }
+            ))
+        }),
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be a hex string{}, got {}",
+            dotted(path, key),
+            if optional { " or nil" } else { "" },
+            other.type_name()
+        ))),
+    }
+}
+
+/// [`hex_id_field`] for a *required* id (a span's or a link's `trace_id`/`span_id`).
+fn required_hex_id<const N: usize>(
+    value: LuaValue,
+    path: &str,
+    key: &str,
+    parse: fn(&str) -> Option<[u8; N]>,
+) -> mlua::Result<[u8; N]> {
+    hex_id_field(value, path, key, parse, false)?.ok_or_else(|| required(path, key))
+}
+
+/// An optional opaque-bytes field (a span's `status_message`/`trace_state`, a link's
+/// `trace_state`): `nil` is `None`, a Lua string is copied as-is, UTF-8 or not -- `to_table()`
+/// emits these straight from the record's `Bytes`, so this is the exact inverse.
+fn bytes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<Bytes>> {
+    match value {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(s) => Ok(Some(Bytes::copy_from_slice(s.as_bytes()))),
+        other => Err(runtime_error(format!(
+            "Event.new: {} must be a string or nil, got {}",
+            dotted(path, key),
+            other.type_name()
+        ))),
+    }
+}
+
+/// A field holding an arbitrary [`Value`] (`log.message`, a span's and a span event's `name`),
 /// converted the way a fresh attribute write is (`lua_to_value`) -- so a Lua string becomes
 /// `Str`, an integer `I64`, an empty table an empty `Map`: the flattening ADR
 /// `lua-event-constructor` records. The one thing checked up front is the Lua *type*, so the
@@ -1227,6 +1418,93 @@ mod tests {
             count: 42,
             sum: 500.0,
         })
+    }
+
+    /// `proxy.rs`'s `span_record_with_everything`: every `SpanRecord` field non-default, `ext`
+    /// fully populated, one event and one link each carrying attributes. Every value in it is
+    /// one `to_table()` emits losslessly (`Value::str` names; `Str`/`Bool` attributes), so the
+    /// whole-event round-trip below can `assert_eq!` against it.
+    fn span_record_with_everything() -> SpanRecord {
+        SpanRecord {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            parent_span_id: Some([3; 8]),
+            name: Value::str("GET /"),
+            kind: SpanKind::Server,
+            status: SpanStatus::Error,
+            events: vec![SpanEvent {
+                timestamp: 1_700_000_000_100_000_000,
+                name: Value::str("exception"),
+                attributes: {
+                    let mut m = AttrMap::new();
+                    m.insert("type", "Timeout");
+                    m
+                },
+                dropped_attributes_count: 2,
+            }],
+            links: vec![SpanLink {
+                trace_id: [4; 16],
+                span_id: [5; 8],
+                attributes: {
+                    let mut m = AttrMap::new();
+                    m.insert("linked", true);
+                    m
+                },
+                flags: 1,
+                trace_state: Some(Bytes::from_static(b"vendor=value")),
+                dropped_attributes_count: 1,
+            }],
+            end_timestamp: 1_700_000_000_900_000_000,
+            flags: 1,
+            ext: Some(Box::new(SpanExt {
+                status_message: Some(Bytes::from_static(b"boom")),
+                trace_state: Some(Bytes::from_static(b"vendor=xyz")),
+                dropped_attributes_count: 3,
+                dropped_events_count: 4,
+                dropped_links_count: 5,
+            })),
+        }
+    }
+
+    fn span_event() -> Event {
+        Event::span(
+            1_700_000_000_000_000_000,
+            round_trippable_attributes(),
+            span_record_with_everything(),
+        )
+    }
+
+    /// `proxy.rs`'s `minimal_span_record`, started at `5` (the `timestamp` [`mint_span`] uses):
+    /// what a `{trace_id, span_id, name}` literal must rebuild as once every default applies.
+    fn minimal_span_record() -> SpanRecord {
+        SpanRecord {
+            trace_id: [9; 16],
+            span_id: [8; 8],
+            parent_span_id: None,
+            name: Value::str("minimal"),
+            kind: SpanKind::Internal,
+            status: SpanStatus::Unset,
+            events: vec![],
+            links: vec![],
+            end_timestamp: 5,
+            flags: 0,
+            ext: None,
+        }
+    }
+
+    /// `process()`'s result for `Event.new{timestamp = "5", span = {<the minimal ids and name>,
+    /// <fields>}}` -- the span-side twin of [`mint_metric`].
+    fn mint_span(fields: &str) -> Event {
+        let w = worker(&format!(
+            r#"function process(event) return Event.new{{timestamp = "5", span = {{trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "minimal", {fields}}}}} end"#
+        ));
+        emitted(w.process(Event::empty(0, AttrMap::new())).unwrap())
+    }
+
+    /// The error for `Event.new{timestamp = "5", span = {<fields>}}` -- no ids or name filled
+    /// in, so a test names exactly the fields it means to.
+    fn span_err(fields: &str) -> String {
+        new_err(&format!(r#"{{timestamp = "5", span = {{{fields}}}}}"#))
     }
 
     /// A one-record metric event with `name = "m"` and the given literal fields, minted from
@@ -1567,12 +1845,6 @@ mod tests {
     fn a_non_boolean_has_flag_is_rejected() {
         let err = new_err(r#"{timestamp = "1", has_log = "yes"}"#);
         assert!(err.contains("Event.new: has_log must be a boolean, got string"), "got: {err}");
-    }
-
-    #[test]
-    fn a_span_is_not_constructible_yet() {
-        let err = new_err(r#"{timestamp = "1", span = {}}"#);
-        assert!(err.contains("Event.new: span is not constructible yet"), "got: {err}");
     }
 
     #[test]
@@ -2152,5 +2424,278 @@ mod tests {
             r#"name = "m", kind = "summary", quantiles = {}, count = 0, sum = 0, buckets = {}"#,
         );
         assert!(err.contains("Event.new: metrics[1].buckets is not a field"), "got: {err}");
+    }
+
+    // -- span ---------------------------------------------------------------------------------
+
+    #[test]
+    fn new_of_to_table_round_trips_a_span_event_whole() {
+        // Every `ext` field, `parent_span_id`, a non-default kind/status, an event and a link
+        // with attributes and a `trace_state` -- all of it back, field for field.
+        let w = worker(REBUILD);
+        let out = emitted(w.process(span_event()).unwrap());
+        assert_eq!(out, span_event());
+    }
+
+    #[test]
+    fn a_minimal_span_gets_cores_documented_defaults() {
+        // `kind` internal, `status` unset, `end_timestamp` the event's own `timestamp`,
+        // `flags` 0, no `ext` at all, empty `events`/`links`.
+        let out = mint_span("");
+        assert_eq!(out, Event::span(5, AttrMap::new(), minimal_span_record()));
+    }
+
+    #[test]
+    fn a_status_message_alone_boxes_ext_with_only_that_set() {
+        let out = mint_span(r#"status_message = "boom""#);
+        let mut expected = minimal_span_record();
+        expected.ext = Some(Box::new(SpanExt {
+            status_message: Some(Bytes::from_static(b"boom")),
+            ..SpanExt::default()
+        }));
+        assert_eq!(out, Event::span(5, AttrMap::new(), expected));
+    }
+
+    #[test]
+    fn an_explicit_default_dropped_count_leaves_ext_none() {
+        // `ext_from_wire`'s rule: a field that is present but default doesn't earn a box.
+        let out = mint_span("dropped_events_count = 0");
+        assert_eq!(out.span.as_ref().unwrap().ext, None);
+        assert_eq!(out, Event::span(5, AttrMap::new(), minimal_span_record()));
+    }
+
+    #[test]
+    fn a_span_takes_its_parent_kind_status_end_and_flags() {
+        let out = mint_span(
+            r#"parent_span_id = string.rep("07", 8), kind = "client", status = "ok", end_timestamp = "9", flags = 257"#,
+        );
+        let span = out.span.as_ref().unwrap();
+        assert_eq!(span.parent_span_id, Some([7; 8]));
+        assert_eq!(span.kind, SpanKind::Client);
+        assert_eq!(span.status, SpanStatus::Ok);
+        assert_eq!(span.end_timestamp, 9);
+        assert_eq!(span.flags, 257);
+        assert_eq!(span.ext, None);
+    }
+
+    #[test]
+    fn an_end_timestamp_equal_to_the_start_is_accepted() {
+        // A zero-duration span is legal (`trace_context` accepts `end == start` too); only an
+        // end *before* the start is rejected.
+        let out = mint_span(r#"end_timestamp = "5""#);
+        assert_eq!(out.span.as_ref().unwrap().end_timestamp, 5);
+    }
+
+    #[test]
+    fn a_span_event_and_link_from_literals_rebuild_whole() {
+        let out = mint_span(
+            r#"events = {{timestamp = "6", name = "exception", attributes = {type = "Timeout"}, dropped_attributes_count = 2}}, links = {{trace_id = string.rep("04", 16), span_id = string.rep("05", 8), trace_state = "vendor=value", flags = 1, dropped_attributes_count = 1, attributes = {linked = true}}}"#,
+        );
+        let span = out.span.as_ref().unwrap();
+        let everything = span_record_with_everything();
+        assert_eq!(span.events.len(), 1);
+        assert_eq!(span.events[0].timestamp, 6);
+        assert_eq!(span.events[0].name, everything.events[0].name);
+        assert_eq!(span.events[0].attributes, everything.events[0].attributes);
+        assert_eq!(span.events[0].dropped_attributes_count, 2);
+        assert_eq!(span.links, everything.links);
+    }
+
+    #[test]
+    fn a_bare_span_event_gets_empty_attributes_and_a_zero_count() {
+        let out = mint_span(r#"events = {{timestamp = "6", name = "tick"}}"#);
+        assert_eq!(
+            out.span.as_ref().unwrap().events,
+            vec![SpanEvent {
+                timestamp: 6,
+                name: Value::str("tick"),
+                attributes: AttrMap::new(),
+                dropped_attributes_count: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_bare_span_link_gets_no_trace_state_and_zeros() {
+        let out = mint_span(
+            r#"links = {{trace_id = string.rep("04", 16), span_id = string.rep("05", 8)}}"#,
+        );
+        assert_eq!(
+            out.span.as_ref().unwrap().links,
+            vec![SpanLink {
+                trace_id: [4; 16],
+                span_id: [5; 8],
+                attributes: AttrMap::new(),
+                flags: 0,
+                trace_state: None,
+                dropped_attributes_count: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn new_of_to_table_round_trips_a_mixed_event_whole() {
+        // A log, a gauge and a span on one event (`docs/adr/multi-payload-events.md`): the
+        // three parsers compose, and the event's `timestamp` serves as the span's start.
+        let mut event = log_event();
+        event.metrics.push(metric_record(gauge_kind()));
+        event.span = Some(span_record_with_everything());
+        let w = worker(REBUILD);
+        let out = emitted(w.process(event.clone()).unwrap());
+        assert_eq!(out, event);
+    }
+
+    #[test]
+    fn an_end_timestamp_before_the_timestamp_is_rejected() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", end_timestamp = "4""#,
+        );
+        assert!(err.contains("Event.new: span.end_timestamp precedes timestamp"), "got: {err}");
+    }
+
+    #[test]
+    fn an_all_zero_span_trace_id_is_rejected_without_offering_nil() {
+        let err = span_err(
+            r#"trace_id = string.rep("00", 16), span_id = string.rep("08", 8), name = "x""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: span.trace_id must be a 32-character hex string, and not all-zero"
+            ),
+            "got: {err}"
+        );
+        assert!(!err.contains("or nil"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bad_parent_span_id_is_rejected() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", parent_span_id = "zz""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: span.parent_span_id must be a 16-character hex string (or nil), and \
+                 not all-zero"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_span_event_without_a_name_is_required_with_its_indexed_path() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", events = {{timestamp = "1"}}"#,
+        );
+        assert!(err.contains("Event.new: span.events[1].name is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_span_link_without_a_span_id_is_required_with_its_indexed_path() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", links = {{trace_id = string.rep("04", 16)}}"#,
+        );
+        assert!(err.contains("Event.new: span.links[1].span_id is required"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_span_link_key_is_not_a_field() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", links = {{trace_id = string.rep("04", 16), span_id = string.rep("05", 8), bogus = 1}}"#,
+        );
+        assert!(err.contains("Event.new: span.links[1].bogus is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_span_key_is_not_a_field() {
+        // `attributes` in particular: a span has none of its own (`event.attributes` is the
+        // span's), so it isn't a field here any more than on `event.span`.
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", attributes = {}"#,
+        );
+        assert!(err.contains("Event.new: span.attributes is not a field"), "got: {err}");
+    }
+
+    #[test]
+    fn a_span_kind_is_matched_exactly_and_lists_the_names() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", kind = "SERVER""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: span.kind must be one of internal, server, client, producer, \
+                 consumer (or nil), got \"SERVER\""
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_span_status_lists_the_names() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", status = "failed""#,
+        );
+        assert!(
+            err.contains(
+                "Event.new: span.status must be one of unset, ok, error (or nil), got \"failed\""
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_span_table_is_missing_its_trace_id() {
+        // The W2 "is not constructible yet" arm is gone: a bare `span = {}` now gets as far as
+        // its own first required field.
+        let err = span_err("");
+        assert!(!err.contains("not constructible"), "got: {err}");
+        assert!(err.contains("Event.new: span.trace_id is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_span_without_a_name_is_required() {
+        let err = span_err(r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8)"#);
+        assert!(err.contains("Event.new: span.name is required"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_table_span_is_rejected() {
+        let err = new_err(r#"{timestamp = "1", span = 5}"#);
+        assert!(
+            err.contains("Event.new: span must be a table (or nil), got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_table_span_event_row_is_rejected_by_index() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", events = {1}"#,
+        );
+        assert!(
+            err.contains("Event.new: span.events[1] must be a table, got integer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_sequence_links_table_is_rejected() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", links = {[2] = {}}"#,
+        );
+        assert!(
+            err.contains("Event.new: span.links must be a contiguous array-like table"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_string_status_message_is_rejected() {
+        let err = span_err(
+            r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", status_message = 1"#,
+        );
+        assert!(
+            err.contains("Event.new: span.status_message must be a string or nil, got integer"),
+            "got: {err}"
+        );
     }
 }

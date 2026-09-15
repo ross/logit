@@ -3,9 +3,10 @@
 //! mostly read-write), `MetricsProxy`/`MetricProxy` (`event.metrics`, an indexable array of
 //! per-kind records, read-write only on the handful of fields a script can legitimately mutate
 //! in place -- a metric's `value` on `sum`/`gauge`, plus `sum`'s own `temporality`/`monotonic`),
-//! and `SpanProxy` (`event.span`, entirely read-only -- there is no script-visible way to build or
-//! mutate a span, only to construct one via `logit_config::ComponentKind::TraceContext`'s `span:`
-//! block or read one that already exists). All of these share the same `Rc<RefCell<Event>>` as
+//! and `SpanProxy` (`event.span`, entirely read-only -- in-place mutation of an existing span is
+//! not offered; a script that wants a span builds a whole one with `Event.new`, `crate::construct`,
+//! or reads one `logit_config::ComponentKind::TraceContext`'s `span:` block or a wire codec
+//! already minted). All of these share the same `Rc<RefCell<Event>>` as
 //! their parent [`EventProxy`] -- mutating through any of them is visible through every other,
 //! matching Lua's own reference semantics (`local e2 = event` aliases the same event, exactly as
 //! it would for a table).
@@ -1446,12 +1447,14 @@ fn metric_to_table<'lua>(lua: &'lua Lua, record: &MetricRecord) -> mlua::Result<
 // -- `event.span` ---------------------------------------------------------------------------
 
 /// The `event.span` sub-object -- entirely read-only, unlike every other proxy in this module:
-/// there is no script-visible way to construct or mutate a span (`docs/design/lua-api.md`'s
-/// "Reading and writing `event.log`" section notes the same gap for span *construction*; this
-/// proxy is the read side once one already exists, minted by `ComponentKind::TraceContext`'s
-/// `span:` block or a codec that decoded one off the wire). Shares the same `Rc<RefCell<Event>>`
-/// as its parent [`EventProxy`], cached and gated on `event.span.is_some()` the same way
-/// [`LogProxy`] is -- see [`EventProxy::span_userdata`].
+/// in-place mutation of an existing span is the one thing not offered. *Construction* is
+/// `Event.new`'s job (`crate::construct`'s `span_from_table`, the inverse of [`span_to_table`]
+/// below; `docs/design/lua-api.md`'s "Constructing events"), and "rebuild it with one field
+/// changed" is `Event.new(event:to_table())` with the table edited. This proxy is the read side
+/// once a span already exists -- minted by `Event.new`, by `ComponentKind::TraceContext`'s
+/// `span:` block, or by a codec that decoded one off the wire. Shares the same
+/// `Rc<RefCell<Event>>` as its parent [`EventProxy`], cached and gated on `event.span.is_some()`
+/// the same way [`LogProxy`] is -- see [`EventProxy::span_userdata`].
 ///
 /// Note what's *not* here: a `SpanRecord` has no `attributes` field of its own (checked against
 /// `crates/logit-core/src/span.rs` directly) -- a span-carrying event's attributes are
@@ -1521,7 +1524,8 @@ impl UserData for SpanProxy {
         });
 
         // Unconditional, unlike every other proxy's `__newindex` -- there's no per-field split to
-        // make: nothing on a span is writable from Lua.
+        // make: nothing on a span is writable *in place* from Lua. A script that wants a
+        // different span builds one with `Event.new` (`crate::construct`).
         methods.add_meta_method(
             MetaMethod::NewIndex,
             |_, _this, (_key, _value): (mlua::String, LuaValue)| {
