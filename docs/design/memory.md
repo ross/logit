@@ -247,6 +247,8 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `csv` parse + merge (16-column wide row) | **1** | `AttrMap` inline-capacity spill only -- every field itself is still a zero-copy slice |
 | `kv_metrics` derive 4 metrics | **1** | the `MetricList` spill, grown once via `reserve`; was 3 while each distribution sketched per event -- they are raw inline `MetricKind::Samples` now ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)) |
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
+| `keep_values` clamp `host`, already allowed and lowercase | **0** | `Clamp::normalize` returns `None` (nothing changed) and the allowed path never calls `insert_sym` -- the steady-state case pays nothing, same property `keep`'s row above pins |
+| `keep_values` clamp `host`, `normalize: [lower]` needs to lower it | **1** | the one path that isn't free: an uppercase byte forces a fresh `Bytes` for the write-back. The cardinality win `normalize:` exists for costs exactly one allocation per event that actually needed it, never per event that didn't |
 | `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` -- the `AttrMap` clone/insert itself stays inline on an empty resource |

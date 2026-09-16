@@ -142,10 +142,12 @@ PR because `build_spec`'s match is exhaustive — a variant added without its ar
 `is_implemented` returning `true` without one is the exact "schema advertises what the binary won't
 run" failure `routing-by-condition-is-lua` closed.
 
-### Status (2026-09-15)
+### Status (2026-09-16)
 
-All three workstreams built as a linear stack of PRs, each targeting its parent. Nothing merged;
-Ross directs merging.
+All three workstreams built as a linear stack of PRs, each targeting its parent: W0 #227
+(`kvals/w0` → `main`), W1 #228, W2 #229 (`kvals/w2` → `kvals/w1`). Nothing merged; Ross directs
+merging. Allocation pins landed exactly as designed: **0** for an already-allowed, already-lowercase
+`host`, **1** for one that needs lowering before it's allowed.
 
 ### Per-workstream detail
 
@@ -182,9 +184,14 @@ allowed value pinning 0, and an uppercase value that must be lowered pinning 1, 
 - `logit graph` on the edited example — `bounded` renders as an ordinary transform node between
   `trimmed` and `windowed`.
 - Manual smoke: `script/server` against `examples/nginx-to-influxdb.yaml` plus the real nginx,
-  `curl -H 'Host: static.local'`, `-H 'Host: STATIC.Local'`, `-H 'Host: junk.example'`, and no
-  `Host` at all. Expect InfluxDB to show `host=static.local` (both casings folded) and a single
-  `host=other` series, no per-junk-value series.
+  `curl -H 'Host: static.local'`, `-H 'Host: STATIC.Local'`, `-H 'Host: junk.example'`, `-H
+  'Host: proxy.local'`, and no `Host` at all. Expect InfluxDB to show `host=static.local` (both
+  casings folded) and a single `host=other` series, no per-junk-value series. **Done 2026-09-16**:
+  queried `metrics.nginx.requests` after the requests above and a 10s aggregate flush -- exactly
+  three distinct `host` values came back (`static.local`, `proxy.local`, `other`), with per-value
+  counts `static.local=3` (the two casings plus nginx's own default-server resolution of the
+  empty-Host request), `proxy.local=1`, `other=1` (the one junk value). No stray series for
+  `STATIC.Local` or `junk.example` at all.
 
 ## Open risks
 

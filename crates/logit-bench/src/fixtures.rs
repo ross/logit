@@ -31,8 +31,8 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
-    AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, Kv, KvMetrics,
-    Logfmt, MetricSpec, RegexParser, Set,
+    AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, KeepValues, Kv,
+    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -550,6 +550,30 @@ pub fn kv_metrics() -> KvMetrics {
 /// docs).
 pub fn keep() -> Keep {
     Keep::new(vec!["host".to_string(), "request_method".to_string(), "status".to_string()])
+}
+
+/// The `bounded` component from the reference example: clamps `host` to the two real vhosts,
+/// lowercasing first (`crates/logit-bench/tests/allocations.rs`'s `keep_values_one_event`/
+/// `keep_values_one_event_needs_lowering`).
+pub fn keep_values() -> KeepValues {
+    KeepValues::new(
+        vec![],
+        vec![(
+            "host".to_string(),
+            vec![Normalize::Lower],
+            vec![Value::str("static.local"), Value::str("proxy.local")],
+            Some(Value::str("other")),
+        )],
+    )
+}
+
+/// [`nginx_event`] with its `host` attribute uppercased -- [`nginx_event`]'s own `host` is already
+/// `static.local` (`NGINX_SYSLOG_LINE`), so this is what forces `keep_values`' `normalize: [lower]`
+/// step to actually allocate, for `keep_values_one_event_needs_lowering`.
+pub fn nginx_event_with_uppercase_host() -> Event {
+    let mut event = nginx_event();
+    event.attributes.insert("host", Value::str("STATIC.LOCAL"));
+    event
 }
 
 /// A `set` configured with one attribute pair and no resource pairs -- the per-event-only path

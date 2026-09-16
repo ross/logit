@@ -772,6 +772,13 @@ Worked examples, one per shipped component:
   convention). No `.payloads.stripped`-style counter — neither kind mutates a forwarded event. No
   `Diagnostics`, same reasoning as `has_attributes`/`has_signal`. See
   [ADR `provenance-filtering-components`](../adr/provenance-filtering-components.md).
+- `keep_values` (`crates/logit-transforms/src/keep_values.rs`): `logit.transform.values.allowed`/
+  `.clamped`, tagged `field` — the value-side counterpart to `keep`'s `.attributes.kept`/`.dropped`,
+  read per configured field rather than in aggregate, since two fields on the same component can
+  clamp at very different rates. `.values.normalized`, also tagged `field`, fires only when a
+  `normalize:` step actually changed the value — counting the common already-conforming case would
+  make the rate unreadable. No `Diagnostics` — clamping to a fixed allow-list can't fail. See
+  [ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure
