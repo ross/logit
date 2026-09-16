@@ -145,9 +145,9 @@ run" failure `routing-by-condition-is-lua` closed.
 ### Status (2026-09-16)
 
 All three workstreams built as a linear stack of PRs, each targeting its parent: W0 #227
-(`kvals/w0` → `main`), W1 #228, W2 (this closeout) on `kvals/w2` → `kvals/w1`. Nothing merged;
-Ross directs merging. Allocation pins landed exactly as designed: **0** for an already-allowed,
-already-lowercase `host`, **1** for one that needs lowering before it's allowed.
+(`kvals/w0` → `main`), W1 #228, W2 #229 (`kvals/w2` → `kvals/w1`). Nothing merged; Ross directs
+merging. Allocation pins landed exactly as designed: **0** for an already-allowed, already-lowercase
+`host`, **1** for one that needs lowering before it's allowed.
 
 ### Per-workstream detail
 
