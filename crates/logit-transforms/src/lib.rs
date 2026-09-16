@@ -250,21 +250,24 @@ mod chained_pipeline_test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// The workstream's headline test: a `json -> scale -> kv_metrics -> keep -> aggregate` chain
-    /// fed one synthetic nginx-shaped log event produces correctly-tagged counter/gauge/
-    /// distribution metrics and nothing else -- specifically, that the tags surviving into
-    /// `aggregate`'s `SeriesKey` are exactly what `keep` named, and that `scale`'s unit
-    /// conversion (seconds -> milliseconds, matching `demo/logit.yaml`'s `nginx_scale`) has
-    /// already happened by the time `kv_metrics` reads `request_time`. This is what proves
-    /// `keep`'s documented placement ahead of `aggregate` (`crate::keep`'s module doc comment,
-    /// `docs/adr/kv-metrics-semantics.md`) actually bounds series cardinality end to end,
-    /// not just in isolation.
+    /// The workstream's headline test: a `json -> scale -> kv_metrics -> keep -> keep_values ->
+    /// aggregate` chain fed one synthetic nginx-shaped log event produces correctly-tagged
+    /// counter/gauge/distribution metrics and nothing else -- specifically, that the tags
+    /// surviving into `aggregate`'s `SeriesKey` are exactly what `keep` named, that `scale`'s
+    /// unit conversion (seconds -> milliseconds, matching `demo/logit.yaml`'s `nginx_scale`) has
+    /// already happened by the time `kv_metrics` reads `request_time`, and that a junk `host` --
+    /// exactly the reference example's motivating case
+    /// (`docs/adr/value-allowlist-cardinality-clamp.md`) -- collapses into one `other`-tagged
+    /// series rather than a series of its own. This is what proves `keep`'s documented placement
+    /// ahead of `aggregate` (`crate::keep`'s module doc comment,
+    /// `docs/adr/kv-metrics-semantics.md`) and `keep_values`' placement alongside it actually
+    /// bound series cardinality end to end, not just in isolation.
     #[test]
-    fn json_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
+    fn json_scale_kv_metrics_keep_keep_values_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
 
         let raw = r#"{"status":200,"body_bytes_sent":512,"request_time":0.012,
-                       "client_ip":"10.0.0.1","user_agent":"curl/8.0"}"#;
+                       "host":"junk.example","client_ip":"10.0.0.1","user_agent":"curl/8.0"}"#;
         let event = Event::log(
             0,
             AttrMap::new(),
@@ -282,7 +285,7 @@ mod chained_pipeline_test {
         // json: the raw body becomes attributes.
         let mut json = JsonParser::new(false);
         let event = json.process(&resource, event).expect("json always forwards");
-        assert_eq!(event.attributes.len(), 5, "every top-level JSON key should have landed");
+        assert_eq!(event.attributes.len(), 6, "every top-level JSON key should have landed");
 
         // scale: request_time converts from seconds to milliseconds before kv_metrics ever
         // reads it.
@@ -310,12 +313,37 @@ mod chained_pipeline_test {
         let event = kv.process(&resource, event).expect("kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
 
-        // keep: only `status` is allowed to survive as a tag -- client_ip/user_agent (and the
-        // now-redundant body_bytes_sent/request_time) must not reach aggregate.
-        let mut keep = Keep::new(vec!["status".to_string()]);
+        // keep: only `status`/`host` are allowed to survive as tags -- client_ip/user_agent (and
+        // the now-redundant body_bytes_sent/request_time) must not reach aggregate.
+        let mut keep = Keep::new(vec!["status".to_string(), "host".to_string()]);
         let event = keep.process(&resource, event).expect("keep always forwards");
+        let mut expected_kept = AttrMap::new();
+        expected_kept.insert("status", Value::Null);
+        expected_kept.insert("host", Value::Null);
+        let expected_kept_order: Vec<&str> =
+            expected_kept.iter().map(|(k, _)| resolve(k)).collect();
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
-        assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
+        assert_eq!(kept, expected_kept_order, "exactly the two kept attributes should survive");
+
+        // keep_values: `host` is nginx's `$host`, unbounded and attacker-controlled -- clamps
+        // anything outside the two real vhosts to `other` rather than letting it become its own
+        // series (docs/adr/value-allowlist-cardinality-clamp.md). This event's `host` is junk, so
+        // it must clamp, not pass through.
+        let mut keep_values = KeepValues::new(
+            vec![],
+            vec![(
+                "host".to_string(),
+                vec![],
+                vec![Value::str("static.local"), Value::str("proxy.local")],
+                Some(Value::str("other")),
+            )],
+        );
+        let event = keep_values.process(&resource, event).expect("keep_values always forwards");
+        assert_eq!(
+            event.attributes.get("host"),
+            Some(&Value::str("other")),
+            "a host outside the allow-list must clamp to 'other'"
+        );
 
         // aggregate: every metric here is mergeable, so it's fully absorbed -- the log half
         // (still present) is forwarded on its own as the remainder.
@@ -332,9 +360,13 @@ mod chained_pipeline_test {
         for (series_event, _links) in events {
             let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();
             assert_eq!(
-                tags,
-                vec!["status"],
+                tags, expected_kept_order,
                 "every series' tags must be exactly what keep named, no more and no less"
+            );
+            assert_eq!(
+                series_event.attributes.get("host"),
+                Some(&Value::str("other")),
+                "the clamped host must survive into the series, not the original junk value"
             );
             assert_eq!(series_event.metrics.len(), 1);
 
@@ -364,11 +396,13 @@ mod chained_pipeline_test {
         }
     }
 
-    /// The `logfmt` mirror of [`json_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics`]:
-    /// same chain, fed a logfmt-shaped line instead of JSON, proving `logfmt`'s always-`Value::Str`
-    /// output (`request_time="0.012"`, never a number) still flows correctly through `scale` ->
-    /// `Value::F64(12.0)` -> `kv_metrics`'s `numeric` coercion, exactly as `crate::numeric`'s own
-    /// doc comment promises.
+    /// The `logfmt` mirror of
+    /// [`json_scale_kv_metrics_keep_keep_values_aggregate_chain_produces_correctly_tagged_metrics`]
+    /// -- same `json`/`scale`/`kv_metrics`/`keep`/`aggregate` chain (no `keep_values` here; that
+    /// gap is covered by the JSON version above), fed a logfmt-shaped line instead of JSON,
+    /// proving `logfmt`'s always-`Value::Str` output (`request_time="0.012"`, never a number)
+    /// still flows correctly through `scale` -> `Value::F64(12.0)` -> `kv_metrics`'s `numeric`
+    /// coercion, exactly as `crate::numeric`'s own doc comment promises.
     #[test]
     fn logfmt_scale_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());

@@ -835,6 +835,13 @@ already built that have a known, accepted rough edge.
   nginx-side mitigation (e.g. capping `$host`'s logged length) is added here: the pipeline already
   degrades gracefully on a truncated line by whatever means it happens, and capping a field nginx
   itself allows up to 8KB would be solving a problem the design doesn't actually have.
+
+  **Narrowed on 2026-09-16:** the *cardinality* half of the same `$host` exposure -- distinct from
+  the truncation risk above -- is now closed by example. `nginx.conf` serves exactly two vhosts,
+  but `$host` itself stays attacker-controlled, so a junk `Host` header used to become its own
+  unbounded series in `aggregate` and in InfluxDB. `examples/nginx-to-influxdb.yaml`'s `bounded`
+  component (`keep_values`, `docs/adr/value-allowlist-cardinality-clamp.md`) now clamps `host` to
+  the two real vhosts ahead of `aggregate`, folding anything else into one `other`-tagged series.
 - **Internal telemetry ([internal-telemetry.md](design/internal-telemetry.md),
   [ADR `internal-telemetry-as-pipeline-events`](adr/internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,

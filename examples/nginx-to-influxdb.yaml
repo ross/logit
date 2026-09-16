@@ -1,6 +1,7 @@
 # The nginx reference example (docs/plans/nginx-integration.md, workstream F): proves
-# syslog_in -> json -> kv_metrics -> keep -> aggregate -> influxdb_out (plus stdio_out for
-# visibility) against a real nginx (examples/nginx/), end to end in this repo's own dev stack.
+# syslog_in -> json -> kv_metrics -> keep -> keep_values -> aggregate -> influxdb_out (plus
+# stdio_out for visibility) against a real nginx (examples/nginx/), end to end in this repo's own
+# dev stack.
 #
 # This is a contributor-facing fixture, not the recommended starting point for trying `logit` --
 # it exists because root compose.yaml's `nginx` service and crates/logit-bench/src/fixtures.rs's
@@ -28,7 +29,10 @@
 #             stdio_out              trimmed (keep)   <- drops   nginx_spans (keep_signals: [traces])
 #                                          |             high-cardinality        |
 #                                          v             attrs                   v
-#                                    windowed (aggregate)              span_tap (stdio_out)
+#                                  bounded (keep_values) <- clamps $host    span_tap (stdio_out)
+#                                          |                to the two
+#                                          v                real vhosts
+#                                    windowed (aggregate)
 #                                          |
 #                                          v
 #                                     influx_out
@@ -36,7 +40,10 @@
 # `nginx.conf`'s lean `access_json_syslog` log_format is sized to carry exactly the fields
 # `nginx_metrics` reads below plus the trace/span convention `nginx_trace` reads -- see that
 # file's comments and docs/known-gaps.md for what happens to the one field it can't bound ($host)
-# on a pathologically oversized Host header.
+# on a pathologically oversized Host header. `bounded` (below) closes the *cardinality* half of
+# that same gap: nginx serves exactly two vhosts, but `$host` itself is attacker-controlled, so
+# without a clamp a stuffed Host header would explode both `aggregate`'s series count and the
+# InfluxDB tag it becomes (docs/adr/value-allowlist-cardinality-clamp.md).
 components:
   nginx_in:
     type: syslog_in
@@ -114,9 +121,25 @@ components:
     sources: [nginx_metrics]
     fields: [host, request_method, status]
 
+  # `keep` bounds which keys reach `aggregate`'s SeriesKey; this bounds which *values* do.
+  # `request_method`/`status` are closed sets, but `host` is nginx's `$host` -- the client's Host
+  # header, unbounded and attacker-controlled. `nginx.conf` serves exactly two vhosts, so anything
+  # else is junk and belongs in one bucket rather than its own series. `normalize: [lower]` is
+  # belt-and-braces here (nginx already lowercases `$host` itself) and would be load-bearing for
+  # any other syslog client feeding this listener, which is why the allow-list doesn't just rely
+  # on nginx's own behavior.
+  bounded:
+    type: keep_values
+    sources: [trimmed]
+    attributes:
+      host:
+        normalize: [lower]
+        allow: [static.local, proxy.local]
+        other: other
+
   windowed:
     type: aggregate
-    sources: [trimmed]
+    sources: [bounded]
     interval: 10s
 
   influx_out:

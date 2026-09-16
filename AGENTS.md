@@ -239,7 +239,15 @@ or any schedule yet. `target`/`route` are real, implemented `ComponentKind`s too
 named, zero-cost destination a router directs events into, and `route` is the native equality-only
 router that fills it, closing the two structural costs (a filter chain paid by every branch, and
 the deep clone an all-mutating fan-out can't avoid) the central-collector split-apart topology had
-no better answer for ([ADR `target-components`](docs/adr/target-components.md)).
+no better answer for ([ADR `target-components`](docs/adr/target-components.md)). `keep_values` is
+also a real, implemented `ComponentKind`: `keep`'s value-side sibling, clamping attribute (and/or
+resource-attribute) values to a per-field allow-list -- a tag whose valid set the operator knows
+but the producer doesn't enforce (nginx's `$host` against a handful of real vhosts, say) becomes
+that field's `other` (or is removed) rather than an unbounded new series, with an optional ordered
+`normalize:` step (today just ASCII-lowercasing) applied and written back before the allow test
+([ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md)).
+[examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) now runs one, clamping `$host`
+ahead of `aggregate`.
 
 ## Environment
 
@@ -415,7 +423,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, logfmt, kv, regex, route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

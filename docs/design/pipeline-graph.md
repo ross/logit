@@ -105,6 +105,11 @@ pub enum ComponentKind {
     // Drops an event whose batch's origin/previous match every configured field -- has_provenance's
     // exact complement on the identical config, taken at the top level.
     DropProvenance { origin: Vec<String>, previous: Vec<String> },
+    // Clamps attribute/resource-attribute values to a per-field allow-list -- `keep`'s value-side
+    // sibling. A disallowed value becomes that field's `other` (or is removed if absent); an
+    // optional, ordered `normalize` step (today just lowercasing) runs before the allow test and
+    // is written back (docs/adr/value-allowlist-cardinality-clamp.md).
+    KeepValues { resource: BTreeMap<String, ValueAllowList>, attributes: BTreeMap<String, ValueAllowList> },
     // Matches a pattern against a log message (or a named attribute), turning named capture
     // groups into attributes (docs/adr/regex-transform.md).
     Regex { pattern: String, field: Option<String> },
@@ -186,7 +191,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -620,6 +625,17 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     the UDP check rejects any of them rather than only a non-default one. That is also why the
     zero message names the fix — "omit the field to disable the idle timeout" — instead of a legal
     value to use instead.
+54. A `keep_values` with neither `resource` nor `attributes` configured is rejected — rule 12's
+    "can only ever be a no-op" reasoning. An empty field name in either map is rejected — rules
+    19/20's reasoning. A field's `allow` list being empty is rejected too, naming the alternative:
+    `set` (with `other:`) or `remove` (without it) already say "clamp everything on this field."
+    A non-finite `F64` literal in `allow`/`other` is rejected — rule 36's finiteness reasoning,
+    since it could never compare equal to anything under the coercing matcher. Under a field's own
+    `normalize: [lower]`, a `Str` literal in `allow`/`other` that isn't already ASCII-lowercase is
+    rejected by name, since a `lower` step could never produce it; a duplicate step within one
+    field's `normalize:` list is rejected too, the same no-op reasoning once more. An *empty*
+    `normalize:` list is legal — it's the default, meaning no normalization at all
+    ([ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md)).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

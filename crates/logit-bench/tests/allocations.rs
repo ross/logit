@@ -999,6 +999,38 @@ fn keep_one_event() {
     expect_allocs("keep: filter to 3 attributes", stats, 0);
 }
 
+/// Free: `nginx_event`'s `host` is already `static.local` -- on the allow-list and already
+/// lowercase, so `Clamp::normalize` returns `None` (nothing to write back) and the allowed path
+/// never calls `insert_sym` at all. The reference example's `bounded` component pays nothing in
+/// steady state, the same "the common case costs nothing" property `keep`'s own test above pins.
+#[test]
+fn keep_values_one_event() {
+    let mut kv = fixtures::keep_values();
+    let resource = fixtures::resource();
+    drop(kv.process(&resource, fixtures::nginx_event()));
+
+    let event = fixtures::nginx_event();
+    let (event, stats) = measure(|| kv.process(&resource, event).expect("keep_values forwards"));
+    assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
+    expect_allocs("keep_values: host already lowercase and allowed", stats, 0);
+}
+
+/// One allocation: `STATIC.LOCAL` has an uppercase byte, so `normalize: [lower]` builds a new
+/// `Bytes` to write back -- the one path in `keep_values` that isn't free, and the reason
+/// `normalize:`'s cardinality win (folding casing variants of a legitimate value into one series)
+/// isn't also a free one. Compare [`keep_values_one_event`], the already-conforming case.
+#[test]
+fn keep_values_one_event_needs_lowering() {
+    let mut kv = fixtures::keep_values();
+    let resource = fixtures::resource();
+    drop(kv.process(&resource, fixtures::nginx_event_with_uppercase_host()));
+
+    let event = fixtures::nginx_event_with_uppercase_host();
+    let (event, stats) = measure(|| kv.process(&resource, event).expect("keep_values forwards"));
+    assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
+    expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
+}
+
 /// Also free in steady state, and that is *because* `keep` ran first. `aggregate` clones the whole
 /// attribute map into a `SeriesKey` per metric per event, but three attributes fit inline, so the
 /// clone is a 400-byte memcpy rather than a heap allocation, and the `HashMap` entry hits.
@@ -3314,11 +3346,14 @@ fn lua_process_one_event_constructing_a_span_event() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 3 = 1 (decode) + 1 (json) + 1 (kv_metrics) + 0 (keep) + 0 (aggregate). Was 5 while
-/// `kv_metrics` sketched each distribution per event ([`kv_metrics_one_event`]); `aggregate`
+/// 3 = 1 (decode) + 1 (json) + 1 (kv_metrics) + 0 (keep) + 0 (keep_values) + 0 (aggregate). Was 5
+/// while `kv_metrics` sketched each distribution per event ([`kv_metrics_one_event`]); `aggregate`
 /// absorbs the raw `Samples` it emits now into its per-series sketch without allocating
-/// ([`aggregate_absorb_one_samples_event_sketch_mode`]), so the two allocations are gone from the chain,
-/// not moved along it.
+/// ([`aggregate_absorb_one_samples_event_sketch_mode`]), so the two allocations are gone from the
+/// chain, not moved along it. `keep_values` costs nothing here specifically because the fixture's
+/// `host` is already `static.local` -- on the allow-list and already lowercase
+/// ([`keep_values_one_event`]); a line whose `Host` header actually needed clamping would cost the
+/// same one allocation [`keep_values_one_event_needs_lowering`] pins, not reflected in this count.
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -3326,6 +3361,7 @@ fn full_chain_one_line() {
     let mut json = fixtures::json_parser();
     let mut kv = fixtures::kv_metrics();
     let mut keep = fixtures::keep();
+    let mut keep_values = fixtures::keep_values();
     let mut agg = fixtures::aggregator();
     let datagram = fixtures::nginx_syslog_datagram(1);
 
@@ -3336,6 +3372,7 @@ fn full_chain_one_line() {
                 let event = json.process(&resource, event).expect("json forwards");
                 let event = kv.process(&resource, event).expect("kv forwards");
                 let event = keep.process(&resource, event).expect("keep forwards");
+                let event = keep_values.process(&resource, event).expect("keep_values forwards");
                 drop(agg.process(&resource, event));
             }
         }};
