@@ -121,6 +121,36 @@ pub enum SetValue {
     Str(String),
 }
 
+/// A rewrite `keep_values` (`ComponentKind::KeepValues`) applies to a field's value before
+/// testing it against `allow` -- see `docs/adr/value-allowlist-cardinality-clamp.md`. A list
+/// (not a single value) deliberately, so a later step (`trim`, `strip_port`) can land beside
+/// `lower` with no config break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizeStep {
+    /// ASCII-lowercase a `Str`/`Bytes` value, bytewise -- not Unicode case folding. See the ADR
+    /// for why: hostnames and similar tag values are ASCII at the wire, folding is
+    /// locale-dependent, and a bytewise lowercase can't change a string's length, which is what
+    /// keeps an already-lowercase value's clamp allocation-free.
+    Lower,
+}
+
+/// One field's clamp, under `ComponentKind::KeepValues`'s `resource`/`attributes` maps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ValueAllowList {
+    /// Rewrites applied in order, before the `allow` test, and written back to the event when the
+    /// result is allowed. Empty (the default) means no normalization.
+    #[serde(default)]
+    pub normalize: Vec<NormalizeStep>,
+    /// The permitted values, compared with `logit-transforms`' coercing `value_matches` -- a
+    /// configured `200` matches `Value::I64(200)`, `U64(200)`, `F64(200.0)`, and `Str("200")`
+    /// alike. May not be empty -- see `crates/logit-pipeline/src/graph.rs` rule 54.
+    pub allow: Vec<SetValue>,
+    /// What a value outside `allow` becomes. Absent (the default) removes the attribute instead.
+    #[serde(default)]
+    pub other: Option<SetValue>,
+}
+
 /// Which metric kind a [`GenerateMetric`] produces. Named after the three
 /// `logit_core::MetricKind`s a load-test scenario actually wants to exercise, not the full set:
 /// `Sum` for a counter, `Gauge` for a level, and `Distribution` for the sketch-merging path (as
@@ -1109,6 +1139,21 @@ pub enum ComponentKind {
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
+    },
+    /// Clamps attribute (and/or resource-attribute) values to an operator-configured allow-list,
+    /// per field -- `keep`'s value-side sibling, for a tag whose valid set the operator knows but
+    /// the producer doesn't enforce (a `Host` header against a handful of real vhosts, say). A
+    /// value not in a field's `allow` becomes that field's `other`, or is removed if `other` is
+    /// absent. Never drops an event. An attribute the event doesn't carry is a silent no-op for
+    /// that field, never a stamp. See `docs/adr/value-allowlist-cardinality-clamp.md`.
+    KeepValues {
+        /// Applied once per batch, to the batch's `Resource` -- `set`'s `resource`/`attributes`
+        /// split, field for field.
+        #[serde(default)]
+        resource: std::collections::BTreeMap<String, ValueAllowList>,
+        /// Applied per event, to `event.attributes`.
+        #[serde(default)]
+        attributes: std::collections::BTreeMap<String, ValueAllowList>,
     },
     /// Forwards an event whose batch's `origin`/`previous` match a configured allowlist --
     /// `origin`/`previous` are which component created the batch and which one most recently
@@ -3450,6 +3495,74 @@ mod tests {
             }
             other => panic!("expected DropAttributes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn keep_values_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep_values", "sources": ["in"],
+                "attributes": {"host": {"normalize": ["lower"],
+                                         "allow": ["static.local", "proxy.local"],
+                                         "other": "other"}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KeepValues { resource, attributes } => {
+                assert!(resource.is_empty(), "resource must default to empty");
+                let host = attributes.get("host").expect("host field configured");
+                assert_eq!(host.normalize, vec![NormalizeStep::Lower]);
+                assert_eq!(
+                    host.allow,
+                    vec![
+                        SetValue::Str("static.local".to_string()),
+                        SetValue::Str("proxy.local".to_string())
+                    ]
+                );
+                assert_eq!(host.other, Some(SetValue::Str("other".to_string())));
+            }
+            other => panic!("expected KeepValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_values_normalize_and_other_default_to_empty_and_none() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep_values", "sources": ["in"],
+                "attributes": {"status": {"allow": [200]}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KeepValues { attributes, .. } => {
+                let status = attributes.get("status").expect("status field configured");
+                assert!(status.normalize.is_empty(), "normalize must default to empty");
+                assert_eq!(status.allow, vec![SetValue::I64(200)], "a whole number must stay I64");
+                assert!(status.other.is_none(), "other must default to None");
+            }
+            other => panic!("expected KeepValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_values_resource_field_deserializes() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "keep_values", "sources": ["in"],
+                "resource": {"env": {"allow": ["prod", "staging"]}}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::KeepValues { resource, attributes } => {
+                assert!(attributes.is_empty(), "attributes must default to empty");
+                assert!(resource.contains_key("env"));
+            }
+            other => panic!("expected KeepValues, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_step_uses_snake_case() {
+        let step: NormalizeStep = serde_json::from_str(r#""lower""#).unwrap();
+        assert_eq!(step, NormalizeStep::Lower);
+        assert_eq!(serde_json::to_string(&NormalizeStep::Lower).unwrap(), r#""lower""#);
     }
 
     #[test]

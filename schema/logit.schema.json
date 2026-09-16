@@ -1102,6 +1102,37 @@
           }
         },
         {
+          "description": "Clamps attribute (and/or resource-attribute) values to an operator-configured allow-list, per field -- `keep`'s value-side sibling, for a tag whose valid set the operator knows but the producer doesn't enforce (a `Host` header against a handful of real vhosts, say). A value not in a field's `allow` becomes that field's `other`, or is removed if `other` is absent. Never drops an event. An attribute the event doesn't carry is a silent no-op for that field, never a stamp. See `docs/adr/value-allowlist-cardinality-clamp.md`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "attributes": {
+              "description": "Applied per event, to `event.attributes`.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ValueAllowList"
+              }
+            },
+            "resource": {
+              "description": "Applied once per batch, to the batch's `Resource` -- `set`'s `resource`/`attributes` split, field for field.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/definitions/ValueAllowList"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "keep_values"
+              ]
+            }
+          }
+        },
+        {
           "description": "Forwards an event whose batch's `origin`/`previous` match a configured allowlist -- `origin`/`previous` are which component created the batch and which one most recently handled it (`docs/adr/batch-provenance-on-delivered.md`), not event data. Never mutates a forwarded event, the same posture `has_attributes`/`has_signal` have.\n\n**Each field is a list of alternatives, OR'd within the field; the two fields AND together when both are configured.** An empty list means \"not checked\" for that field -- a configured field the batch doesn't carry a matching value for never matches (\"absent is `false`\"). At least one of `origin`/`previous` must be non-empty (an empty config matches every batch, a no-op -- rejected at graph-validation time), and no entry may be an empty string. See `docs/adr/provenance-filtering-components.md`.",
           "type": "object",
           "required": [
@@ -2254,6 +2285,18 @@
         }
       }
     },
+    "NormalizeStep": {
+      "description": "A rewrite `keep_values` (`ComponentKind::KeepValues`) applies to a field's value before testing it against `allow` -- see `docs/adr/value-allowlist-cardinality-clamp.md`. A list (not a single value) deliberately, so a later step (`trim`, `strip_port`) can land beside `lower` with no config break.",
+      "oneOf": [
+        {
+          "description": "ASCII-lowercase a `Str`/`Bytes` value, bytewise -- not Unicode case folding. See the ADR for why: hostnames and similar tag values are ASCII at the wire, folding is locale-dependent, and a bytewise lowercase can't change a string's length, which is what keeps an already-lowercase value's clamp allocation-free.",
+          "type": "string",
+          "enum": [
+            "lower"
+          ]
+        }
+      ]
+    },
     "OtlpCompression": {
       "description": "Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`, gRPC's per-message compressed-frame flag plus `grpc-encoding: gzip`). Default `none`, deliberately: flipping it would change an existing pipeline's wire behavior in a patch, and would break `otlp_out -> otlp_in` across two `logit` versions where only one side has learned gzip. `otlp_out` never advertises accepting a compressed *response* regardless of this setting (`docs/adr/otlp-compression-and-decompression-bounds.md`) -- this only ever compresses what it sends.",
       "type": "string",
@@ -2715,6 +2758,42 @@
         "key_file": {
           "description": "Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.",
           "type": "string"
+        }
+      }
+    },
+    "ValueAllowList": {
+      "description": "One field's clamp, under `ComponentKind::KeepValues`'s `resource`/`attributes` maps.",
+      "type": "object",
+      "required": [
+        "allow"
+      ],
+      "properties": {
+        "allow": {
+          "description": "The permitted values, compared with `logit-transforms`' coercing `value_matches` -- a configured `200` matches `Value::I64(200)`, `U64(200)`, `F64(200.0)`, and `Str(\"200\")` alike. May not be empty -- see `crates/logit-pipeline/src/graph.rs` rule 54.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SetValue"
+          }
+        },
+        "normalize": {
+          "description": "Rewrites applied in order, before the `allow` test, and written back to the event when the result is allowed. Empty (the default) means no normalization.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/NormalizeStep"
+          }
+        },
+        "other": {
+          "description": "What a value outside `allow` becomes. Absent (the default) removes the attribute instead.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SetValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
