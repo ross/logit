@@ -55,11 +55,11 @@ use logit_transforms::{
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, Kv as KvTransform, KvMetrics as KvMetricsTransform,
-    Logfmt as LogfmtTransform, MatchMode as TransformMatchMode, RegexParser,
-    Remove as RemoveTransform, Route as RouteTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
+    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
+    Route as RouteTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
+    SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -644,6 +644,10 @@ fn build_spec(
         )),
         DropAttributes { resource, attributes } => NodeSpec::Transform(Box::new(
             DropAttributesTransform::new(to_set_pairs(resource), to_set_pairs(attributes))
+                .with_telemetry(telemetry.clone()),
+        )),
+        KeepValues { resource, attributes } => NodeSpec::Transform(Box::new(
+            KeepValuesTransform::new(to_allow_lists(resource), to_allow_lists(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
         // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
@@ -1394,16 +1398,40 @@ fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::
 fn to_set_pairs(
     values: &std::collections::BTreeMap<String, logit_config::SetValue>,
 ) -> Vec<(String, logit_core::Value)> {
+    values.iter().map(|(k, v)| (k.clone(), to_set_value(v))).collect()
+}
+
+/// Converts one `SetValue` -- shared by [`to_set_pairs`] and [`to_allow_lists`] so the two
+/// config surfaces cannot map the same literal to two different `logit_core::Value`s.
+fn to_set_value(v: &logit_config::SetValue) -> logit_core::Value {
+    match v {
+        logit_config::SetValue::Bool(b) => logit_core::Value::Bool(*b),
+        logit_config::SetValue::I64(i) => logit_core::Value::I64(*i),
+        logit_config::SetValue::F64(f) => logit_core::Value::F64(*f),
+        logit_config::SetValue::Str(s) => logit_core::Value::str(s.clone()),
+    }
+}
+
+/// Converts `logit-config`'s `ValueAllowList` map (`ComponentKind::KeepValues`'s `resource`/
+/// `attributes` fields) into the `logit_transforms::ClampConfig` tuples `KeepValues::new` takes --
+/// `logit-transforms` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), same reasoning as [`to_set_pairs`].
+fn to_allow_lists(
+    values: &std::collections::BTreeMap<String, logit_config::ValueAllowList>,
+) -> Vec<logit_transforms::ClampConfig> {
     values
         .iter()
-        .map(|(k, v)| {
-            let value = match v {
-                logit_config::SetValue::Bool(b) => logit_core::Value::Bool(*b),
-                logit_config::SetValue::I64(i) => logit_core::Value::I64(*i),
-                logit_config::SetValue::F64(f) => logit_core::Value::F64(*f),
-                logit_config::SetValue::Str(s) => logit_core::Value::str(s.clone()),
-            };
-            (k.clone(), value)
+        .map(|(field, allow_list)| {
+            let normalize = allow_list
+                .normalize
+                .iter()
+                .map(|step| match step {
+                    logit_config::NormalizeStep::Lower => TransformNormalize::Lower,
+                })
+                .collect();
+            let allow = allow_list.allow.iter().map(to_set_value).collect();
+            let other = allow_list.other.as_ref().map(to_set_value);
+            (field.clone(), normalize, allow, other)
         })
         .collect()
 }
@@ -3584,6 +3612,32 @@ mod tests {
         };
         assert!(matches!(
             build_spec("drop_attributes", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_keep_values_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::KeepValues {
+                resource: std::collections::BTreeMap::new(),
+                attributes: std::collections::BTreeMap::from([(
+                    "host".to_string(),
+                    logit_config::ValueAllowList {
+                        normalize: vec![logit_config::NormalizeStep::Lower],
+                        allow: vec![logit_config::SetValue::Str("static.local".to_string())],
+                        other: Some(logit_config::SetValue::Str("other".to_string())),
+                    },
+                )]),
+            },
+        };
+        assert!(matches!(
+            build_spec("keep_values", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
     }

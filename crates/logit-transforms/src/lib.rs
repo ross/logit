@@ -5,14 +5,16 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `logfmt`, `kv`, `regex`, and `route` are implemented (`rename`/`filter`/`sample`/`throttle`/
-//! `dedup` were retired rather than landing -- `docs/adr/routing-by-condition-is-lua.md`).
+//! `keep_values`, `logfmt`, `kv`, `regex`, and `route` are implemented (`rename`/`filter`/
+//! `sample`/`throttle`/`dedup` were retired rather than landing --
+//! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
 mod csv;
 mod json;
 mod keep;
+mod keep_values;
 mod kv_metrics;
 mod logfmt;
 mod provenance;
@@ -30,6 +32,7 @@ pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
+pub use keep_values::{ClampConfig, KeepValues, Normalize};
 pub use kv_metrics::{KvMetrics, MetricSpec};
 pub use logfmt::{Kv, Logfmt};
 pub use provenance::{DropProvenance, HasProvenance};

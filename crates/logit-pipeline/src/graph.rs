@@ -248,6 +248,16 @@
 //!     reading from it. Unlike rule 45's field this one is an `Option` with no default to tell
 //!     apart from a set value, so there is nothing to compare against and the message says what to
 //!     do instead -- omit the field to disable the idle timeout.
+//! 54. `keep_values`-specific validation (`docs/adr/value-allowlist-cardinality-clamp.md`): both
+//!     `resource`/`attributes` maps empty is rejected, the same "can only ever be a no-op"
+//!     instinct as rule 12; an empty field name in either map is rejected, rule 19/20's reasoning;
+//!     an empty `allow` list on a field is rejected, naming `set`/`remove` as what "clamp
+//!     everything on this field" already means; a non-finite `F64` in `allow`/`other` is rejected,
+//!     rule 36's finiteness reasoning; a `Str` literal in `allow`/`other` that isn't already
+//!     ASCII-lowercase under that field's `normalize: [lower]` is rejected, naming the field and
+//!     the literal, since it could never match anything that step could produce; and a duplicate
+//!     step within one field's `normalize:` list is rejected, the same no-op reasoning again. An
+//!     empty `normalize:` list is not rejected -- it's the default, meaning no normalization.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -336,6 +346,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DropAttributes { .. }
         | HasProvenance { .. }
         | DropProvenance { .. }
+        | KeepValues { .. }
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. }
@@ -394,6 +405,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DropAttributes { .. } => "drop_attributes",
         HasProvenance { .. } => "has_provenance",
         DropProvenance { .. } => "drop_provenance",
+        KeepValues { .. } => "keep_values",
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
@@ -490,6 +502,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DropAttributes { .. }
             | ComponentKind::HasProvenance { .. }
             | ComponentKind::DropProvenance { .. }
+            | ComponentKind::KeepValues { .. }
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
@@ -2260,6 +2273,82 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Rule 54: `keep_values`-specific validation
+    // (`docs/adr/value-allowlist-cardinality-clamp.md`). Neither map configured can only ever be
+    // a no-op, exactly rule 12's `set` reasoning -- `keep_values`'s config is shaped like `set`'s
+    // on purpose. An empty key in either map could never name a real attribute, rule 12/19/20's
+    // reasoning again. A field's own `allow` list being empty is a stronger no-op than rule 12's:
+    // there is no value that field could ever keep, so the whole field clamps to `other` (or
+    // removal) unconditionally -- which is exactly what `set`/`remove` already express, so the
+    // message names them rather than leaving an operator to guess. A non-finite `F64` in `allow`
+    // or `other` can never compare equal to anything under `value_matches`'s coercion, the same
+    // "would only ever produce a value the matcher then rejects" reasoning rule 36 applies to
+    // `has_attributes`. A `normalize: [lower]` field additionally constrains what a `Str` literal
+    // in `allow`/`other` may spell: anything but already-lowercase ASCII could never be produced
+    // by that step, so `allow` could never match it and `other` would violate the field's own
+    // declared invariant the moment it's substituted in -- rejected by name rather than silently
+    // lowercased, so what validates is what the operator actually wrote. A duplicate step within
+    // one field's `normalize:` list is the same no-op instinct once more; an *empty* list is not
+    // rejected -- it is the default, meaning no normalization at all.
+    for (id, component) in &components {
+        if let ComponentKind::KeepValues { resource, attributes } = &component.kind {
+            if resource.is_empty() && attributes.is_empty() {
+                anyhow::bail!(
+                    "component '{id}': a keep_values with neither 'resource' nor 'attributes' \
+                     configured can only ever be a no-op"
+                );
+            }
+            for (map_name, map) in [("resource", resource), ("attributes", attributes)] {
+                for (field, allow_list) in map {
+                    if field.is_empty() {
+                        anyhow::bail!(
+                            "component '{id}': a keep_values '{map_name}' key must not be empty \
+                             -- it could never name a real attribute"
+                        );
+                    }
+                    if allow_list.allow.is_empty() {
+                        anyhow::bail!(
+                            "component '{id}': keep_values '{map_name}.{field}' has an empty \
+                             'allow' list -- that clamps every value unconditionally, which is \
+                             what 'set' (with 'other:') or 'remove' (without it) already do"
+                        );
+                    }
+                    let lower = allow_list.normalize.contains(&logit_config::NormalizeStep::Lower);
+                    let mut seen_steps = std::collections::HashSet::new();
+                    for step in &allow_list.normalize {
+                        if !seen_steps.insert(step) {
+                            anyhow::bail!(
+                                "component '{id}': keep_values '{map_name}.{field}' repeats a \
+                                 'normalize' step -- a duplicate can only ever be a no-op"
+                            );
+                        }
+                    }
+                    for literal in allow_list.allow.iter().chain(allow_list.other.iter()) {
+                        match literal {
+                            logit_config::SetValue::F64(f) if !f.is_finite() => {
+                                anyhow::bail!(
+                                    "component '{id}': every keep_values '{map_name}.{field}' \
+                                     value must be a finite number -- a non-finite value never \
+                                     compares equal to anything, so that entry could never match"
+                                );
+                            }
+                            logit_config::SetValue::Str(s)
+                                if lower && s.chars().any(|c| c.is_ascii_uppercase()) =>
+                            {
+                                anyhow::bail!(
+                                    "component '{id}': keep_values '{map_name}.{field}' has \
+                                     'normalize: [lower]' but the literal '{s}' isn't already \
+                                     ASCII-lowercase -- a 'lower' step could never produce it"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4064,6 +4153,248 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["scale"].role(), Role::Transform);
+    }
+
+    /// Builds a [`logit_config::ValueAllowList`] for rule 54's tests -- `normalize`/`other`
+    /// default the way the real config's `#[serde(default)]` fields do.
+    fn allow_list(
+        normalize: Vec<logit_config::NormalizeStep>,
+        allow: Vec<logit_config::SetValue>,
+        other: Option<logit_config::SetValue>,
+    ) -> logit_config::ValueAllowList {
+        logit_config::ValueAllowList { normalize, allow, other }
+    }
+
+    #[test]
+    fn a_keep_values_with_neither_map_configured_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_an_empty_field_name_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        String::new(),
+                        allow_list(
+                            vec![],
+                            vec![logit_config::SetValue::Str("x".to_string())],
+                            None,
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_an_empty_allow_list_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(vec![], vec![], None),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("'allow'"), "got: {err}");
+        assert!(err.contains("set"), "message should name the alternative -- got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_a_non_finite_allow_value_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "ratio".to_string(),
+                        allow_list(vec![], vec![logit_config::SetValue::F64(f64::NAN)], None),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("finite"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_a_non_finite_other_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "ratio".to_string(),
+                        allow_list(
+                            vec![],
+                            vec![logit_config::SetValue::F64(1.0)],
+                            Some(logit_config::SetValue::F64(f64::INFINITY)),
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("finite"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_a_non_lowercase_allow_literal_under_lower_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(
+                            vec![logit_config::NormalizeStep::Lower],
+                            vec![logit_config::SetValue::Str("Static.Local".to_string())],
+                            None,
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("Static.Local"), "got: {err}");
+        assert!(err.contains("lower"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_a_non_lowercase_other_under_lower_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(
+                            vec![logit_config::NormalizeStep::Lower],
+                            vec![logit_config::SetValue::Str("static.local".to_string())],
+                            Some(logit_config::SetValue::Str("Other".to_string())),
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("Other"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_a_duplicate_normalize_step_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(
+                            vec![
+                                logit_config::NormalizeStep::Lower,
+                                logit_config::NormalizeStep::Lower,
+                            ],
+                            vec![logit_config::SetValue::Str("static.local".to_string())],
+                            None,
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]));
+        assert!(err.contains("normalize"), "got: {err}");
+    }
+
+    #[test]
+    fn a_keep_values_with_an_empty_normalize_list_is_legal() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(
+                            vec![],
+                            vec![logit_config::SetValue::Str("static.local".to_string())],
+                            None,
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]))
+        .expect("an empty normalize list means no normalization, not a config error");
+        assert_eq!(graph.components["kv"].role(), Role::Transform);
+    }
+
+    #[test]
+    fn a_keep_values_with_a_field_configured_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "kv",
+                vec!["in"],
+                ComponentKind::KeepValues {
+                    resource: std::collections::BTreeMap::new(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "host".to_string(),
+                        allow_list(
+                            vec![logit_config::NormalizeStep::Lower],
+                            vec![logit_config::SetValue::Str("static.local".to_string())],
+                            Some(logit_config::SetValue::Str("other".to_string())),
+                        ),
+                    )]),
+                },
+            ),
+            ("out", vec!["kv"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["kv"].role(), Role::Transform);
     }
 
     #[test]
