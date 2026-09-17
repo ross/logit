@@ -980,10 +980,15 @@ fn exemplar_fits(exemplar: &Exemplar) -> bool {
     total <= 128
 }
 
-/// `{trace_id="...",span_id="...",<other>}`, sorted by label name -- a [`logit_core::TraceRef`]
-/// becomes the two id labels it arrived as, and every other exemplar attribute renders like any
-/// label (an unrepresentable one is dropped, the way the encode side's own labels are).
-fn push_exemplar_labels(out: &mut Vec<u8>, exemplar: &Exemplar) {
+/// An [`Exemplar`]'s labels, sorted by name: a [`logit_core::TraceRef`] becomes the two id labels
+/// it arrived as, and every other exemplar attribute renders like any label (an unrepresentable one
+/// is dropped, the way the encode side's own labels are). The inverse of
+/// [`super::assemble::exemplar_from_labels`].
+///
+/// Shared with [`super::remote_write`], which puts the same pairs in a protobuf field rather than
+/// between braces -- the *spelling* of an exemplar's trace reference is a Prometheus convention,
+/// not an exposition one.
+pub(super) fn exemplar_labels(exemplar: &Exemplar) -> Vec<(String, String)> {
     let mut labels: Vec<(String, String)> = Vec::new();
     if let Some(trace) = &exemplar.trace {
         labels.push(("trace_id".to_string(), to_hex(&trace.trace_id)));
@@ -997,8 +1002,13 @@ fn push_exemplar_labels(out: &mut Vec<u8>, exemplar: &Exemplar) {
         }
     }
     labels.sort_by(|a, b| a.0.cmp(&b.0));
+    labels
+}
+
+/// `{trace_id="...",span_id="...",<other>}` -- [`exemplar_labels`] between braces.
+fn push_exemplar_labels(out: &mut Vec<u8>, exemplar: &Exemplar) {
     out.push(b'{');
-    for (i, (key, value)) in labels.iter().enumerate() {
+    for (i, (key, value)) in exemplar_labels(exemplar).iter().enumerate() {
         if i > 0 {
             out.push(b',');
         }
@@ -1048,9 +1058,13 @@ fn push_count(out: &mut Vec<u8>, count: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
-/// A float in exposition spelling: `NaN`/`+Inf`/`-Inf` (Rust's own `NaN`/`inf`/`-inf` is not valid
-/// exposition), otherwise shortest-round-trip decimal.
-fn push_float_str(buf: &mut String, v: f64) {
+/// A float in Prometheus' own spelling: `NaN`/`+Inf`/`-Inf` (Rust's own `NaN`/`inf`/`-inf` is not
+/// valid exposition), otherwise shortest-round-trip decimal.
+///
+/// Shared with [`super::remote_write`]: protobuf carries a sample *value* as a double and needs no
+/// formatting at all, but `le`/`quantile` are label values, and a label value is a string in every
+/// format Prometheus has.
+pub(super) fn push_float_str(buf: &mut String, v: f64) {
     if v.is_nan() {
         buf.push_str("NaN");
     } else if v == f64::INFINITY {

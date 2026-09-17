@@ -4,13 +4,18 @@
 //!
 //! **This module doc is the mapping table** (house convention, see `crate::otlp`'s module doc).
 //!
-//! **Why the split.** [`MetricFamily`] is the seam: `text.rs` maps bytes ↔ families, this module
-//! maps families ↔ [`Event`]s. A future `remote_write.rs` (prompb ↔ families, see
-//! [ADR `prometheus-scrape-and-exposition`](../../../../docs/adr/prometheus-scrape-and-exposition.md)'s
-//! forward-compatibility section) plugs into the same seam and reuses every rule below unchanged --
+//! **Why the split.** [`MetricFamily`] is the seam: [`text`] maps exposition bytes ↔ families,
+//! [`remote_write`] maps prompb 1.0/2.0 ↔ families, [`assemble`] holds the flat-sample reassembly
+//! both of those need, and *this* module maps families ↔ [`Event`]s. The second syntax module
+//! ([ADR `prometheus-remote-write`](../../../../docs/adr/prometheus-remote-write.md)) plugged into
+//! the seam [ADR `prometheus-scrape-and-exposition`](../../../../docs/adr/prometheus-scrape-and-exposition.md)'s
+//! forward-compatibility section reserved for it and **changed none of the mapping tables below** --
 //! remote-write is a transport for exactly the semantics the exposition format already describes
 //! (`docs/design/telemetry-landscape.md`'s remote-write section), so the model mapping must not
-//! depend on text syntax, and doesn't.
+//! depend on wire syntax, and doesn't. What it did add is three switches
+//! ([`PrometheusDecoder::with_timestamp_marker`], [`PrometheusEncoder::with_timestamps_always`],
+//! [`PrometheusEncoder::with_stale_markers`]) and one [`Point`] variant ([`Point::Stale`]), each of
+//! which defaults to the exposition path's existing behaviour.
 //!
 //! **No [`crate::Encoder`]/[`crate::Decoder`]/[`crate::SignalEncoder`]/[`crate::SignalDecoder`]
 //! implementation here**, deliberately, for the reason `statsd_out`/`syslog_out` don't have one
@@ -145,6 +150,8 @@
 pub mod generated;
 
 mod assemble;
+
+pub mod remote_write;
 
 pub mod text;
 

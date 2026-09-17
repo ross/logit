@@ -915,6 +915,7 @@ dependencies = [
  "logit-script",
  "logit-transforms",
  "postcard",
+ "prost",
  "rkyv",
  "serde",
  "tokio",

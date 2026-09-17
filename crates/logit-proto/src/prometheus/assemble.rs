@@ -24,8 +24,9 @@
 //! | a label set naming one label twice | `skipped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
 //! | a series whose samples don't add up to its type's value (a counter with only a `_created`, a histogram with no buckets) | `skipped{reason="incomplete_series"}` at [`Assembler::finish`] |
 //!
-//! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`])
-//! may arrive in any order and either side of the samples they describe -- a `# TYPE` for an already-implicit family retypes it
+//! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`],
+//! and [`Assembler::declare`] for a transport that carries all three together) may arrive in any
+//! order and either side of the samples they describe -- a `# TYPE` for an already-implicit family retypes it
 //! in place, which is the leniency [`super::text`]'s module doc promises. Samples already *routed*
 //! into another family are not re-homed by a late declaration; they stay where they landed.
 //! A second, conflicting `# TYPE` is `skipped{reason="duplicate_type"}` and a second `# HELP`/
@@ -40,7 +41,14 @@
 //! (19 significant digits against an `f64`'s 15-16), so [`Sample::value_text`] carries the source
 //! token and [`parse_created_seconds`] reads it digit by digit. A transport whose created
 //! timestamps arrive in their own integer field -- remote-write 2.0's `Sample.start_timestamp` --
-//! has no such token, passes `None`, and hands the instant over in its own integer field instead.
+//! has no such token, passes `None`, and hands the instant over through
+//! [`Assembler::push_created`] instead.
+//!
+//! Three further entry points exist for facts a transport carries in a field of its own rather than
+//! as a suffixed sample: [`Assembler::push_created`], [`Assembler::push_stale`] (remote-write's
+//! stale-marker NaN, which is a property of the *series* rather than a value) and
+//! [`Assembler::push_exemplar`]. All three route by sample name exactly as [`Assembler::push`]
+//! does, so they reach the same series the samples did.
 //!
 //! [`Point`]: super::Point
 
@@ -139,6 +147,10 @@ struct FamilyAccum {
 #[derive(Default)]
 struct SeriesAccum {
     labels: Vec<(String, String)>,
+    /// This series carries no reading at all -- a remote-write stale marker. It wins over every
+    /// accumulated value below, which is the point: a producer that marks a series stale is saying
+    /// the samples stop here, not that they take some particular value.
+    stale: bool,
     value: Option<f64>,
     buckets: Vec<(f64, u64)>,
     sum: Option<f64>,
@@ -171,6 +183,27 @@ pub(super) struct Assembler {
 impl Assembler {
     pub(super) fn new(implicit: FamilyType) -> Self {
         Assembler { implicit, families: Vec::new(), index: HashMap::new() }
+    }
+
+    /// Declares `base`'s type, help and unit in one call -- what a transport that carries all three
+    /// together (remote-write's `MetricMetadata`/`Metadata`) has in hand, on top of the three
+    /// separate entry points a line-oriented syntax needs. A `None` help or unit says nothing
+    /// rather than saying "empty", so it can't displace one an earlier declaration supplied.
+    pub(super) fn declare(
+        &mut self,
+        base: &str,
+        kind: FamilyType,
+        help: Option<String>,
+        unit: Option<String>,
+        decoder: &mut PrometheusDecoder,
+    ) {
+        self.declare_type(base, kind, decoder);
+        if help.is_some() {
+            self.declare_help(base, help, decoder);
+        }
+        if unit.is_some() {
+            self.declare_unit(base, unit, decoder);
+        }
     }
 
     /// `# TYPE base <kind>`: the first type wins, a second *conflicting* one is counted, and a
@@ -296,6 +329,73 @@ impl Assembler {
                 series.exemplars.push(exemplar);
             }
         }
+        true
+    }
+
+    /// The creation instant of the series `sample_name` names, from a transport that carries it in
+    /// a field of its own (remote-write 2.0's `Sample.start_timestamp`) rather than as a
+    /// `<base>_created` sample. Routes by sample name like every other entry point, then sets
+    /// `created` whatever role that name plays -- `foo_total` and `foo_created` name the same
+    /// series, and only one of them is a *sample* of it.
+    ///
+    /// Repeating the same instant is not a duplicate: a 2.0 series repeats `start_timestamp` on
+    /// every one of its samples, and each of those reaches this once. A *different* instant for one
+    /// series is `skipped{reason="duplicate_series"}`, first wins, as everywhere else.
+    pub(super) fn push_created(
+        &mut self,
+        sample_name: &str,
+        labels: Vec<(String, String)>,
+        created_nanos: i64,
+        decoder: &mut PrometheusDecoder,
+    ) -> bool {
+        let Some(slot) = self.slot(sample_name, labels, decoder) else { return false };
+        let series = &mut self.families[slot.family].series[slot.series];
+        match series.created {
+            Some(existing) if existing == created_nanos => true,
+            Some(_) => {
+                decoder.skipped("duplicate_series");
+                false
+            }
+            None => {
+                series.created = Some(created_nanos);
+                true
+            }
+        }
+    }
+
+    /// A stale marker for the series `sample_name` names: it has gone away, and there is no reading
+    /// to record. See [`super::Point::Stale`].
+    pub(super) fn push_stale(
+        &mut self,
+        sample_name: &str,
+        labels: Vec<(String, String)>,
+        timestamp_nanos: Option<i64>,
+        decoder: &mut PrometheusDecoder,
+    ) -> bool {
+        let Some(slot) = self.slot(sample_name, labels, decoder) else { return false };
+        let series = &mut self.families[slot.family].series[slot.series];
+        series.stale = true;
+        if let Some(ts) = timestamp_nanos {
+            series.timestamp = Some(ts);
+        }
+        true
+    }
+
+    /// An exemplar the transport already attached to a series of its own accord, rather than one
+    /// riding a sample line. Unlike [`Assembler::push`] there is no role filter here: OpenMetrics
+    /// only *has* somewhere to write an exemplar on a `_total` or `_bucket` line, whereas
+    /// remote-write carries them in a per-series field, so the producer has already said which
+    /// series it meant and dropping one for sitting on the "wrong" sample would lose data the wire
+    /// really carried.
+    pub(super) fn push_exemplar(
+        &mut self,
+        sample_name: &str,
+        labels: Vec<(String, String)>,
+        exemplar: Exemplar,
+        decoder: &mut PrometheusDecoder,
+    ) -> bool {
+        let Some(slot) = self.slot(sample_name, labels, decoder) else { return false };
+        self.families[slot.family].series[slot.series].exemplars.push(exemplar);
         true
     }
 
@@ -432,6 +532,27 @@ impl Assembler {
     }
 }
 
+/// The *family* name a sample name belongs to, given its family's type -- the inverse of the
+/// routing table above, for a transport that declares a type against a series without naming the
+/// family (remote-write 2.0's per-series `Metadata`, which has a type but no family-name field).
+///
+/// Only a suffix that the type actually gives meaning to is stripped, so a `gauge` genuinely called
+/// `foo_sum` keeps its name and a `histogram`'s `foo_sum` resolves to `foo`. A name that *is* only
+/// its suffix (`_total`) keeps it: stripping there would leave a family with no name at all.
+pub(super) fn family_base(sample_name: &str, kind: FamilyType) -> &str {
+    for (suffix, role) in SUFFIXES {
+        if !suffix_applies(kind, suffix, role) {
+            continue;
+        }
+        if let Some(base) = sample_name.strip_suffix(suffix) {
+            if !base.is_empty() {
+                return base;
+            }
+        }
+    }
+    sample_name
+}
+
 /// Sets `slot` unless it already holds a value; returns whether this was a duplicate (the first
 /// value always wins, which is what a strict parser rejecting the body would effectively have
 /// kept).
@@ -452,6 +573,7 @@ fn finish_series(
 ) -> Option<Series> {
     let SeriesAccum {
         labels,
+        stale,
         value,
         mut buckets,
         sum,
@@ -461,6 +583,13 @@ fn finish_series(
         created,
         exemplars,
     } = accum;
+    // A stale marker is the whole point: it says this series has no reading, so whatever else
+    // arrived for it does not get to supply one. Checked before the per-type completeness rules
+    // below, which would otherwise report an `incomplete_series` for a series that is complete in
+    // the only way a stale one can be.
+    if stale {
+        return Some(Series { labels, point: Point::Stale, timestamp, created, exemplars });
+    }
     let point = match kind {
         FamilyType::Counter => Point::Counter(value_or_skip(value, decoder)?),
         FamilyType::Gauge => Point::Gauge(value_or_skip(value, decoder)?),
