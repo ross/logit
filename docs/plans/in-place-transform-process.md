@@ -160,7 +160,7 @@ brought up to date with `git merge origin/main` (never rebase). One implementati
 
 W1 is implemented and measured (the ADR's "Measured" section carries the numbers, taken against
 `main` at `b5c820a`). Both workstreams are open as a linear stack of PRs, each targeting its parent:
-W0 PR #TBD (`inplace/w0` → `main`), W1 PR #TBD (`inplace/w1` → `inplace/w0`). Nothing merged; Ross
+W0 PR #232 (`inplace/w0` → `main`), W1 PR #233 (`inplace/w1` → `inplace/w0`). Nothing merged; Ross
 directs merging.
 
 ### Per-workstream detail
