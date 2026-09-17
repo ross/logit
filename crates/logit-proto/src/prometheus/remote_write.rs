@@ -123,6 +123,7 @@
 //! | a label with an empty value, or named `__name__`/`le`/`quantile` where the codec generates that name itself | the label is dropped, `logit.output.labels.dropped{reason="empty_value"\|"reserved"}` -- both specs forbid an empty value, and a repeated name is an invalid label set rather than a confusing one |
 //! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` -- the same rule and the same counter the OpenMetrics writer uses |
 //! | a family with an empty name | **skipped**, `logit.output.metrics.skipped{reason="invalid_labels"}`; `__name__` may not be empty |
+//! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins and the earlier is dropped, `logit.output.metrics.degraded{reason="sub_ms_collapsed"}` per dropped reading. One label set may not carry two samples at one timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp` and the sender treats that as permanent, so emitting both would cost the whole request rather than the one reading |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
 //!
 //! ## Permitted normalizations
@@ -133,7 +134,10 @@
 //! - everything on [`super`]'s own list, which this module inherits whole;
 //! - series and label reordering: series by label set, labels by byte order, groups by timestamp;
 //! - timestamps and created timestamps are **milliseconds** on the wire, so sub-millisecond
-//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates);
+//!   precision is truncated (toward zero, as the text 0.0.4 writer truncates) -- and where that
+//!   truncation puts two readings of one series on one millisecond, the later one wins and the
+//!   earlier is dropped and counted (see the drop table above). This is the one entry on this list
+//!   that loses a *reading* rather than a rendering of one;
 //! - `Untyped` is spelled `Unknown` on both versions: the metadata enums have one value for "no
 //!   type", so a text 0.0.4 relay's `untyped` comes back as `unknown`. Both decode to the same
 //!   `Gauge` + `prometheus.type` marker and both write as `untyped` in text 0.0.4;
@@ -826,9 +830,30 @@ pub fn encode(
         }
     }
     for out in built.values_mut() {
-        // Both versions require a series' samples to be in timestamp order. Stable, so two samples
-        // that truncate to the same millisecond keep the order the groups gave them.
+        // Both versions require a series' samples to be in timestamp order. The sort is stable, so
+        // two samples that truncate to the same millisecond keep the order their groups gave them
+        // -- which is what makes "keep the last" below mean "the latest reading wins".
         out.samples.sort_by_key(|sample| sample.timestamp_ms);
+        // One label set may not carry two samples at one timestamp: Prometheus and Mimir answer
+        // `400 duplicate sample for timestamp`, which the sender classifies as permanent and the
+        // whole batch is dropped -- so a pair of readings a microsecond apart would cost every
+        // other series in the request too. The wire has millisecond resolution and the model has
+        // nanosecond, so any sub-millisecond source (`statsd_in` gauges, `internal`) reaches this.
+        //
+        // The last reading wins, the same rule `prometheus_out`'s own registry upsert applies to
+        // two scrapes of one series, and each dropped reading is counted -- it is real data loss,
+        // not a reordering.
+        let before = out.samples.len();
+        out.samples.dedup_by(|later, earlier| {
+            if later.timestamp_ms != earlier.timestamp_ms {
+                return false;
+            }
+            *earlier = *later;
+            true
+        });
+        for _ in out.samples.len()..before {
+            encoder.degraded_reason("sub_ms_collapsed");
+        }
     }
     match version {
         Version::V1 => encode_v1(built),
@@ -847,6 +872,7 @@ struct SeriesOut {
     exemplars: Vec<ExemplarOut>,
 }
 
+#[derive(Clone, Copy)]
 struct SampleOut {
     value: f64,
     timestamp_ms: i64,

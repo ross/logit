@@ -560,6 +560,97 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     );
 }
 
+/// Encodes with telemetry attached and returns every `logit.output.metrics.{skipped,degraded}`
+/// and `logit.output.labels.dropped` reason it recorded, alongside the body.
+fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<String>) {
+    let registry = Registry::new();
+    let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus",
+        "prometheus_out",
+        "sink",
+    ));
+    let body = encode(groups, version, &mut encoder);
+    let reasons = registry
+        .drain(0)
+        .iter()
+        .flat_map(|event| {
+            let counted = event.metrics.iter().any(|metric| {
+                let name = resolve(metric.name);
+                name.starts_with("logit.output.")
+            });
+            counted
+                .then(|| event.attributes.get("reason").and_then(|v| v.as_str()).map(String::from))
+                .flatten()
+        })
+        .collect();
+    (body, reasons)
+}
+
+/// The wire has millisecond resolution and the model has nanosecond, so two readings of one series
+/// a nanosecond apart truncate onto one timestamp. A `TimeSeries` may not carry two samples at one
+/// timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp`, which a sender
+/// classifies as permanent and drops the *whole batch* over -- so the later reading wins and the
+/// earlier is dropped and counted. Any sub-millisecond source (`statsd_in` gauges, `internal`)
+/// reaches this through `prometheus_out endpoint:`.
+#[test]
+fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
+    let reading = |timestamp: i64, value: f64| {
+        vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(timestamp),
+                ..Series::new(vec![("shard".to_string(), "1".to_string())], Point::Gauge(value))
+            }],
+            ..MetricFamily::new("m", FamilyType::Gauge)
+        }]
+    };
+    // Two `Event::timestamp`s one nanosecond apart, so two groups that truncate onto one
+    // millisecond -- exactly what a batch of statsd gauges looks like.
+    let groups = vec![reading(TIMESTAMP, 1.0), reading(TIMESTAMP + 1, 2.0)];
+
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&groups, version);
+        assert_eq!(reasons, ["sub_ms_collapsed"], "{version:?}");
+
+        // One `TimeSeries`, and crucially one `Sample` in it: two would be the 400.
+        let samples: Vec<(f64, i64)> = match version {
+            Version::V1 => {
+                let request = pb1::WriteRequest::decode(body.as_slice()).expect("must decode");
+                assert_eq!(request.timeseries.len(), 1);
+                request.timeseries[0]
+                    .samples
+                    .iter()
+                    .map(|sample| (sample.value, sample.timestamp))
+                    .collect()
+            }
+            Version::V2 => {
+                let request = pb2::Request::decode(body.as_slice()).expect("must decode");
+                assert_eq!(request.timeseries.len(), 1);
+                request.timeseries[0]
+                    .samples
+                    .iter()
+                    .map(|sample| (sample.value, sample.timestamp))
+                    .collect()
+            }
+        };
+        assert_eq!(samples, [(2.0, TIMESTAMP / 1_000_000)], "{version:?}: the later reading wins");
+
+        // And it reads back as one group holding that reading.
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups, vec![reading(TIMESTAMP, 2.0)], "{version:?}");
+        assert_eq!(decoded.samples, 1);
+    }
+
+    // A millisecond apart is not a collision: both readings survive, nothing is counted.
+    let apart = vec![reading(TIMESTAMP, 1.0), reading(TIMESTAMP + 1_000_000, 2.0)];
+    for version in [Version::V1, Version::V2] {
+        let (body, reasons) = encode_reasons(&apart, version);
+        assert!(reasons.is_empty(), "{version:?} counted {reasons:?}");
+        let decoded = decode(&body, version, &mut PrometheusDecoder::new()).expect("must decode");
+        assert_eq!(decoded.groups.len(), 2, "{version:?}");
+        assert_eq!(decoded.samples, 2, "{version:?}");
+    }
+}
+
 /// Protobuf skips fields it does not recognise, and the two versions' field numbers are disjoint
 /// (2.0 reserves 1-3, which is where 1.0 keeps its `timeseries` and `metadata`), so each version's
 /// body decodes as an *empty* request of the other rather than as an error. Left alone, a sender
