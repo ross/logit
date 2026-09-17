@@ -113,7 +113,8 @@ Consequences below say so explicitly.
 ### Measured
 
 2026-09-17, on the dev box, pinned per the repo's bench convention. Before is `main` at `b5c820a`,
-after is `699564a`.
+after is the W1 branch as measured (its tree is what PR #233 carries; the branch was later
+rewritten to fold two commits, byte-identical tree).
 
 **Microbenchmarks** (divan, `taskset -c 2`, fastest of three runs):
 
