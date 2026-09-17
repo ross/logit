@@ -73,6 +73,9 @@ sketches-ddsketch = "0.4"
 # `Serializer`/`Deserializer` pair in `metric.rs` rather than pulling in a second new crate (a
 # data-format crate like `postcard`/`serde_json`) just to get bytes out.
 cardinality-estimator = { version = "1.0.3", features = ["with_serde"] }
+# Prometheus remote-write mandates Snappy **block** compression (not framed) for the request body
+# (docs/plans/prometheus-remote-write.md). BSD-3-Clause, allowed in `deny.toml`.
+snap = "1"
 # rustls, not the default native-tls/OpenSSL backend -- keeps "no host toolchain needed"
 # (ADR `containerized-development`) intact, since rustls has no system OpenSSL to link against.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

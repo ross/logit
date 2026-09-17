@@ -136,6 +136,12 @@
 //!
 //! Everything else is an error or a counted skip, never a silent reinterpretation.
 
+/// The committed, pre-generated prompb protobuf types (`docs/adr/committed-pregenerated-otlp-protobuf.md`'s
+/// scheme, extended to this second proto family -- see `crates/logit-proto/proto/README.md`'s
+/// "Vendored Prometheus prompb" section for the pinned tag/commit). Remote-write's own codec plugs
+/// into this the way `text.rs` plugs into `otlp::generated`.
+pub mod generated;
+
 pub mod text;
 
 pub use text::Dialect;
