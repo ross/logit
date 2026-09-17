@@ -884,7 +884,15 @@ fn build_spec(
             )
         }
 
-        PrometheusOut { bind, path, expire_after, max_series } => {
+        PrometheusOut { bind, path, expire_after, max_series, .. } => {
+            // Graph rule 56 guarantees exactly one mode field is set; the sender half of this
+            // arm lands with `RemoteWriteOutput` itself, in this workstream's next commit.
+            let Some(bind) = bind else {
+                anyhow::bail!(
+                    "component '{id}': prometheus_out's remote-write 'endpoint' mode isn't built \
+                     yet"
+                );
+            };
             // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
             // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
             // address already in use into a startup failure that names this component.
@@ -1764,10 +1772,15 @@ mod tests {
             targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::PrometheusOut {
-                bind: "127.0.0.1:0".to_string(),
+                bind: Some("127.0.0.1:0".to_string()),
                 path: "/metrics".to_string(),
                 expire_after: Duration::from_secs(300),
                 max_series: 100_000,
+                endpoint: None,
+                version: logit_config::RemoteWriteVersion::default(),
+                timeout: logit_config::default_prometheus_endpoint_timeout(),
+                headers: HashMap::new(),
+                endpoint_tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(

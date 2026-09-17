@@ -258,6 +258,24 @@
 //!     the literal, since it could never match anything that step could produce; and a duplicate
 //!     step within one field's `normalize:` list is rejected, the same no-op reasoning again. An
 //!     empty `normalize:` list is not rejected -- it's the default, meaning no normalization.
+//! 56. `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`): exactly one of
+//!     `bind:` (serve an exposition) and `endpoint:` (write to a remote-write receiver), never
+//!     both and never neither. A **non-default** field belonging to the mode that isn't set is an
+//!     error rather than a silent no-op -- `path`/`expire_after`/`max_series` under `endpoint:`,
+//!     `version`/`timeout`/`headers`/`endpoint_tls` under `bind:` -- rules 45/53's shape, for
+//!     their reason: a setting that quietly does nothing is worse than a startup failure naming
+//!     it. Compared against `logit_config`'s own `default_prometheus_*` functions, imported the
+//!     way rule 45 imports `default_handshake_timeout`, so a default that moves can't leave this
+//!     rule disagreeing with it. Rule 41's `path`/`max_series` checks become registry-mode-only
+//!     for the same reason -- two rules, one gate each. In sender mode the rest is rule 40's own
+//!     shape restated against this kind's fields: `endpoint` must be an absolute `http://`/
+//!     `https://` URL (path included -- the receiver's write path lives there, not in `path:`),
+//!     `timeout: 0s` is rejected, `headers` may not be empty-named, `:`-prefixed, case-colliding,
+//!     or name one of [`RESERVED_REMOTE_WRITE_HEADERS`], the `endpoint_tls:` block must be
+//!     internally consistent (rules 24/34/44/52's two checks, since this is a *sink*'s own TLS
+//!     block), and a non-default `endpoint_tls:` under a plain `http://` endpoint is rejected --
+//!     a *scheme* check, exactly rule 40's third TLS check, since TLS is selected by the
+//!     endpoint's own scheme and a block under `http://` could only ever be ignored.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -618,6 +636,24 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "te",
     "transfer-encoding",
     "connection",
+];
+
+/// Header names `prometheus_out`'s remote-write sender sets itself (rule 56) --
+/// `crates/logit-outputs/src/prometheus.rs`'s `RemoteWriteOutput::send` inserts all four protocol
+/// headers over the operator's own map, plus `content-length`, which `reqwest` sets from the body.
+/// Five names -- exactly what the sink writes, and nothing else
+/// (`docs/adr/prometheus-remote-write.md`'s "Sender behaviour"). Narrower than
+/// [`RESERVED_PROMETHEUS_HEADERS`] and [`RESERVED_OTLP_HEADERS`], which additionally carry HTTP's
+/// connection-management names: those two lists are shared with components that hand-frame a
+/// request (`otlp_out`'s gRPC transport) or negotiate a dialect through one (`prometheus_in`'s
+/// `accept`), and this sender does neither. Checked case-insensitively, matching HTTP's own
+/// header-name semantics.
+const RESERVED_REMOTE_WRITE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "content-length",
+    "x-prometheus-remote-write-version",
+    "user-agent",
 ];
 
 /// Rule 40's URL check: `scrape_targets` must be absolute `http://`/`https://` URLs with a non-empty
@@ -1894,8 +1930,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // path (always absolute), so every scrape would 404 against an endpoint that looks configured;
     // `max_series: 0` is rule 38's impossible bound in another shape -- every series would be
     // evicted the instant it arrived, exposing nothing.
+    //
+    // **Registry mode only.** Both fields are statements about an exposition this sink serves, and
+    // a `prometheus_out` in sender mode serves none; rule 56 is what rejects a non-default value
+    // of either one there, with a message that says so. Without this gate the two rules would
+    // race for the same config and an operator would get whichever fired first.
     for (id, component) in &components {
-        let ComponentKind::PrometheusOut { path, max_series, .. } = &component.kind else {
+        let ComponentKind::PrometheusOut { bind: Some(_), path, max_series, .. } = &component.kind
+        else {
             continue;
         };
         if !path.starts_with('/') {
@@ -2347,6 +2389,169 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                             _ => {}
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Rule 56: `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`). Exactly one
+    // of `bind:`/`endpoint:`, and a non-default field belonging to the other mode is an error
+    // rather than a setting that silently does nothing -- rules 45/53's shape, for their reason.
+    // Everything else here is the sender's own shape: rule 40's URL, timeout, header and TLS
+    // *scheme* checks, restated against this kind's fields. Rule 41 owns the registry mode's
+    // `path`/`max_series` and runs only when `bind:` is set.
+    for (id, component) in &components {
+        let ComponentKind::PrometheusOut {
+            bind,
+            path,
+            expire_after,
+            max_series,
+            endpoint,
+            version,
+            timeout,
+            headers,
+            endpoint_tls,
+        } = &component.kind
+        else {
+            continue;
+        };
+        match (bind, endpoint) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "component '{id}': 'bind' and 'endpoint' are the two modes of prometheus_out and \
+                 can't both be set -- 'bind' serves an exposition a Prometheus scrapes, \
+                 'endpoint' writes to a remote-write receiver; use two components for both"
+            ),
+            (None, None) => anyhow::bail!(
+                "component '{id}': prometheus_out needs exactly one of 'bind' (serve an \
+                 exposition) or 'endpoint' (write to a remote-write receiver) -- with neither it \
+                 has nowhere to put anything it's sent"
+            ),
+            (Some(_), None) => {
+                // Registry mode: every sender-only field must still be at its default. Compared
+                // against the config crate's own defaults rather than literals here, so the
+                // field's default stays legal in both modes and can move without this rule
+                // silently disagreeing with it.
+                if *version != logit_config::RemoteWriteVersion::default() {
+                    anyhow::bail!(
+                        "component '{id}': 'version' selects the remote-write protocol version \
+                         and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
+                         serves an exposition, which has no wire version to pick"
+                    );
+                }
+                if *timeout != logit_config::default_prometheus_endpoint_timeout() {
+                    anyhow::bail!(
+                        "component '{id}': 'timeout' bounds one remote-write request and only \
+                         means anything with 'endpoint' -- a prometheus_out with 'bind' issues no \
+                         requests of its own"
+                    );
+                }
+                if !headers.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'headers' are sent on a remote-write request and only \
+                         mean anything with 'endpoint' -- a prometheus_out with 'bind' answers \
+                         requests rather than making them"
+                    );
+                }
+                if !endpoint_tls.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'endpoint_tls' tunes the TLS of a remote-write request \
+                         and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
+                         serves plaintext HTTP and has no client TLS at all (see the ADR's \
+                         'Security posture')"
+                    );
+                }
+            }
+            (None, Some(endpoint)) => {
+                // Sender mode: the registry-only fields must be at their defaults, then the
+                // sender's own fields are checked.
+                if path != &logit_config::default_prometheus_path() {
+                    anyhow::bail!(
+                        "component '{id}': 'path' is the path this sink *serves* an exposition on \
+                         and only means anything with 'bind' -- a remote-write 'endpoint' carries \
+                         its own path, so put it there"
+                    );
+                }
+                if *expire_after != logit_config::default_prometheus_expire_after() {
+                    anyhow::bail!(
+                        "component '{id}': 'expire_after' expires series out of the exposition \
+                         registry and only means anything with 'bind' -- a remote-write sender \
+                         holds no series between batches"
+                    );
+                }
+                if *max_series != logit_config::default_prometheus_max_series() {
+                    anyhow::bail!(
+                        "component '{id}': 'max_series' caps the exposition registry and only \
+                         means anything with 'bind' -- a remote-write sender holds no series \
+                         between batches"
+                    );
+                }
+                if !is_absolute_http_url(endpoint) {
+                    anyhow::bail!(
+                        "component '{id}': 'endpoint' {endpoint:?} isn't an absolute 'http://' or \
+                         'https://' URL -- give the receiver's full write URL, path included \
+                         (typically '/api/v1/write')"
+                    );
+                }
+                if timeout.is_zero() {
+                    anyhow::bail!(
+                        "component '{id}': 'timeout: 0s' would fail every remote-write request \
+                         immediately -- use a positive duration"
+                    );
+                }
+                // Rule 40's header block, verbatim except for the list and the word "output" --
+                // an operator who wrote one of these meant it to be sent, and a name the sink
+                // sets itself can't be.
+                let mut seen_lowercase = BTreeSet::new();
+                for name in headers.keys() {
+                    if name.is_empty() {
+                        anyhow::bail!("component '{id}': 'headers' has an empty header name");
+                    }
+                    if name.starts_with(':') {
+                        anyhow::bail!(
+                            "component '{id}': 'headers' names {name:?} -- an HTTP/2 \
+                             pseudo-header (starting with ':') can't be set as a custom header"
+                        );
+                    }
+                    let lowercase = name.to_ascii_lowercase();
+                    if RESERVED_REMOTE_WRITE_HEADERS.contains(&lowercase.as_str()) {
+                        anyhow::bail!(
+                            "component '{id}': 'headers' names {name:?}, which this output sets \
+                             itself -- it can't be overridden"
+                        );
+                    }
+                    if !seen_lowercase.insert(lowercase) {
+                        anyhow::bail!(
+                            "component '{id}': 'headers' names {name:?}, which differs only in \
+                             case from another entry -- HTTP header names are case-insensitive, \
+                             so which value would actually be sent is undefined"
+                        );
+                    }
+                }
+                // Rule 24/34/44/52's per-sink `tls:` internals, on this sink's own block.
+                if endpoint_tls.cert_file.is_some() != endpoint_tls.key_file.is_some() {
+                    anyhow::bail!(
+                        "component '{id}': 'endpoint_tls.cert_file' and 'endpoint_tls.key_file' \
+                         must both be set for mutual TLS, or both omitted -- one alone can't be \
+                         used"
+                    );
+                }
+                if endpoint_tls.insecure_skip_verify && endpoint_tls.ca_file.is_some() {
+                    anyhow::bail!(
+                        "component '{id}': 'endpoint_tls.insecure_skip_verify' and \
+                         'endpoint_tls.ca_file' can't both be set -- 'insecure_skip_verify' \
+                         trusts any certificate, which makes a specific trusted CA meaningless"
+                    );
+                }
+                // A *scheme* check, exactly rule 40's third TLS check: TLS is selected by the
+                // endpoint's own scheme, so a block under `http://` could only ever be ignored.
+                if !endpoint_tls.is_empty()
+                    && !endpoint.to_ascii_lowercase().starts_with("https://")
+                {
+                    anyhow::bail!(
+                        "component '{id}': 'endpoint_tls' is set, but 'endpoint' isn't 'https://' \
+                         -- TLS is selected by the endpoint's own scheme, so an 'endpoint_tls:' \
+                         block here would have no effect"
+                    );
                 }
             }
         }
@@ -7471,12 +7676,34 @@ mod tests {
 
     // ---- rule 41: prometheus_out --------------------------------------------------------------
 
+    /// A registry-mode `prometheus_out` -- `bind:` set, every sender-only field defaulted, which
+    /// is what rule 56 requires of one.
     fn prometheus_out(path: &str, max_series: usize) -> ComponentKind {
         ComponentKind::PrometheusOut {
-            bind: "127.0.0.1:9464".to_string(),
+            bind: Some("127.0.0.1:9464".to_string()),
             path: path.to_string(),
             expire_after: Duration::from_secs(300),
             max_series,
+            endpoint: None,
+            version: logit_config::RemoteWriteVersion::default(),
+            timeout: logit_config::default_prometheus_endpoint_timeout(),
+            headers: HashMap::new(),
+            endpoint_tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    /// A sender-mode `prometheus_out` -- `endpoint:` set, every registry-only field defaulted.
+    fn prometheus_remote_write(endpoint: &str) -> ComponentKind {
+        ComponentKind::PrometheusOut {
+            bind: None,
+            path: logit_config::default_prometheus_path(),
+            expire_after: logit_config::default_prometheus_expire_after(),
+            max_series: logit_config::default_prometheus_max_series(),
+            endpoint: Some(endpoint.to_string()),
+            version: logit_config::RemoteWriteVersion::default(),
+            timeout: logit_config::default_prometheus_endpoint_timeout(),
+            headers: HashMap::new(),
+            endpoint_tls: logit_config::TlsClientConfig::default(),
         }
     }
 
@@ -7519,6 +7746,235 @@ mod tests {
             ("out", vec!["in"], prometheus_out("/metrics", 0)),
         ]));
         assert!(err.contains("'out'") && err.contains("max_series: 0"), "got: {err}");
+    }
+
+    // ---- rule 56: prometheus_out's two modes ---------------------------------------------------
+
+    /// The shape every wrong-mode test below uses: one sender-mode `prometheus_out` with one field
+    /// mutated, resolved behind a listener.
+    fn remote_write_cfg(mutate: impl FnOnce(&mut ComponentKind)) -> Config {
+        let mut kind = prometheus_remote_write("http://mimir:8080/api/v1/push");
+        mutate(&mut kind);
+        cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)])
+    }
+
+    /// The registry-mode twin of [`remote_write_cfg`].
+    fn expose_cfg(mutate: impl FnOnce(&mut ComponentKind)) -> Config {
+        let mut kind = prometheus_out("/metrics", 100_000);
+        mutate(&mut kind);
+        cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)])
+    }
+
+    #[test]
+    fn a_prometheus_out_in_sender_mode_resolves() {
+        resolve(remote_write_cfg(|_| {}))
+            .expect("an endpoint-mode prometheus_out should resolve fine");
+    }
+
+    #[test]
+    fn a_prometheus_out_with_both_bind_and_endpoint_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { bind, .. } = kind else { unreachable!() };
+            *bind = Some("127.0.0.1:9464".to_string());
+        }));
+        assert!(err.contains("'out'") && err.contains("can't both be set"), "got: {err}");
+    }
+
+    #[test]
+    fn a_prometheus_out_with_neither_bind_nor_endpoint_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint, .. } = kind else { unreachable!() };
+            *endpoint = None;
+        }));
+        assert!(err.contains("'out'") && err.contains("exactly one of"), "got: {err}");
+    }
+
+    /// Rule 56's wrong-mode half, sender side: a registry-only field set alongside `endpoint:`
+    /// would silently do nothing, so it fails startup naming itself instead (rules 45/53's shape).
+    #[test]
+    fn registry_only_fields_are_rejected_alongside_an_endpoint() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { path, .. } = kind else { unreachable!() };
+            *path = "/exposed".to_string();
+        }));
+        assert!(err.contains("'out'") && err.contains("'path'"), "got: {err}");
+
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { expire_after, .. } = kind else { unreachable!() };
+            *expire_after = Duration::from_secs(30);
+        }));
+        assert!(err.contains("'out'") && err.contains("'expire_after'"), "got: {err}");
+
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { max_series, .. } = kind else { unreachable!() };
+            *max_series = 25;
+        }));
+        assert!(err.contains("'out'") && err.contains("'max_series'"), "got: {err}");
+    }
+
+    /// The other direction: a sender-only field set alongside `bind:`.
+    #[test]
+    fn sender_only_fields_are_rejected_alongside_a_bind() {
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { version, .. } = kind else { unreachable!() };
+            *version = logit_config::RemoteWriteVersion::V2;
+        }));
+        assert!(err.contains("'out'") && err.contains("'version'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { timeout, .. } = kind else { unreachable!() };
+            *timeout = Duration::from_secs(30);
+        }));
+        assert!(err.contains("'out'") && err.contains("'timeout'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { headers, .. } = kind else { unreachable!() };
+            headers.insert("X-Scope-OrgID".to_string(), "tenant-a".to_string());
+        }));
+        assert!(err.contains("'out'") && err.contains("'headers'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint_tls, .. } = kind else { unreachable!() };
+            endpoint_tls.insecure_skip_verify = true;
+        }));
+        assert!(err.contains("'out'") && err.contains("'endpoint_tls'"), "got: {err}");
+    }
+
+    /// A *default* sender-only value stays legal under `bind:` -- rule 45's reason for comparing
+    /// against the config crate's own default rather than rejecting the field's presence.
+    #[test]
+    fn a_defaulted_sender_field_is_fine_under_bind() {
+        resolve(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { timeout, version, .. } = kind else {
+                unreachable!()
+            };
+            *timeout = logit_config::default_prometheus_endpoint_timeout();
+            *version = logit_config::RemoteWriteVersion::default();
+        }))
+        .expect("defaults are legal in either mode");
+    }
+
+    /// Rule 41's checks are registry-mode-only now: a sender-mode component never reaches them,
+    /// and rule 56 is what rejects a non-default `max_series` there.
+    #[test]
+    fn rule_41_does_not_fire_on_a_sender_mode_prometheus_out() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { max_series, .. } = kind else { unreachable!() };
+            *max_series = 0;
+        }));
+        assert!(
+            err.contains("'max_series'") && !err.contains("max_series: 0"),
+            "rule 56 should name the field as wrong-mode, not rule 41's bound: {err}"
+        );
+    }
+
+    #[test]
+    fn a_prometheus_out_endpoint_that_is_not_an_absolute_http_url_is_rejected() {
+        for bad in ["mimir:8080/api/v1/write", "/api/v1/write", "ftp://mimir/api/v1/write", ""] {
+            let err = expect_err(remote_write_cfg(|kind| {
+                let ComponentKind::PrometheusOut { endpoint, .. } = kind else { unreachable!() };
+                *endpoint = Some(bad.to_string());
+            }));
+            assert!(
+                err.contains("'out'") && err.contains("absolute 'http://'"),
+                "{bad:?}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_prometheus_out_endpoint_timeout_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { timeout, .. } = kind else { unreachable!() };
+            *timeout = Duration::ZERO;
+        }));
+        assert!(err.contains("'out'") && err.contains("'timeout: 0s'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_reserved_remote_write_header_is_rejected_whatever_its_case() {
+        for name in [
+            "content-type",
+            "Content-Encoding",
+            "content-length",
+            "X-Prometheus-Remote-Write-Version",
+            "USER-AGENT",
+        ] {
+            let err = expect_err(remote_write_cfg(|kind| {
+                let ComponentKind::PrometheusOut { headers, .. } = kind else { unreachable!() };
+                headers.insert(name.to_string(), "x".to_string());
+            }));
+            assert!(
+                err.contains("'out'") && err.contains("which this output sets itself"),
+                "{name}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_pseudo_remote_write_header_name_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { headers, .. } = kind else { unreachable!() };
+            headers.insert(String::new(), "x".to_string());
+        }));
+        assert!(err.contains("empty header name"), "got: {err}");
+
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { headers, .. } = kind else { unreachable!() };
+            headers.insert(":authority".to_string(), "x".to_string());
+        }));
+        assert!(err.contains("pseudo-header"), "got: {err}");
+    }
+
+    #[test]
+    fn two_remote_write_headers_differing_only_in_case_are_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { headers, .. } = kind else { unreachable!() };
+            headers.insert("X-Scope-OrgID".to_string(), "a".to_string());
+            headers.insert("x-scope-orgid".to_string(), "b".to_string());
+        }));
+        assert!(err.contains("differs only in") && err.contains("case"), "got: {err}");
+    }
+
+    #[test]
+    fn an_inconsistent_endpoint_tls_block_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint, endpoint_tls, .. } = kind else {
+                unreachable!()
+            };
+            *endpoint = Some("https://mimir:8080/api/v1/push".to_string());
+            endpoint_tls.cert_file = Some("client.pem".to_string());
+        }));
+        assert!(err.contains("must both be set for mutual TLS"), "got: {err}");
+
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint, endpoint_tls, .. } = kind else {
+                unreachable!()
+            };
+            *endpoint = Some("https://mimir:8080/api/v1/push".to_string());
+            endpoint_tls.insecure_skip_verify = true;
+            endpoint_tls.ca_file = Some("ca.pem".to_string());
+        }));
+        assert!(err.contains("can't both be set"), "got: {err}");
+    }
+
+    /// Rule 40's third TLS check in this kind's spelling: a *scheme* check, not a mode check.
+    #[test]
+    fn an_endpoint_tls_block_under_a_plaintext_endpoint_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint_tls, .. } = kind else { unreachable!() };
+            endpoint_tls.ca_file = Some("ca.pem".to_string());
+        }));
+        assert!(err.contains("'out'") && err.contains("would have no effect"), "got: {err}");
+
+        resolve(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { endpoint, endpoint_tls, .. } = kind else {
+                unreachable!()
+            };
+            *endpoint = Some("https://mimir:8080/api/v1/push".to_string());
+            endpoint_tls.ca_file = Some("ca.pem".to_string());
+        }))
+        .expect("an endpoint_tls block under an https endpoint is exactly what it is for");
     }
 
     // ---- rule 42: generate_in / null_out ------------------------------------------------------
