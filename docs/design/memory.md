@@ -249,7 +249,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `keep_values` clamp `host`, already allowed and lowercase | **0** | `Clamp::normalize` returns `None` (nothing changed) and the allowed path never calls `insert_sym` -- the steady-state case pays nothing, same property `keep`'s row above pins |
 | `keep_values` clamp `host`, `normalize: [lower]` needs to lower it | **1** | the one path that isn't free: an uppercase byte forces a fresh `Bytes` for the write-back. The cardinality win `normalize:` exists for costs exactly one allocation per event that actually needed it, never per event that didn't |
-| `set` through `process_batch`, attributes only | **0** | nothing at all: `process_batch` is a `Vec::retain_mut` over the batch's own `events` (ADR `in-place-transform-process`), and `map_resource` returns `None` immediately, same as `keep` |
+| `set` through `process_batch`, attributes only | **0** | nothing at all: `process_batch` is a `Vec::retain_mut` over the batch's own `events` ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md)), and `map_resource` returns `None` immediately, same as `keep` |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` -- the `AttrMap` clone/insert itself stays inline on an empty resource |
 | `has_attributes`/`drop_attributes`, match 1 attribute | **0** | `AttrMap::get_sym` (a `binary_search_by_key`) + `value_matches`' numeric coercion, both stack-only |
@@ -511,7 +511,7 @@ draft actually established:
 
 | Path | allocs | Notes |
 |---|---:|---|
-| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place (ADR `in-place-transform-process`, §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into |
+| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into |
 | `process_batch` through `set` (attributes only) | **0** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
@@ -598,11 +598,18 @@ channel hop and the trait-object call, because both drive a **current-thread** r
 
 | Path | fastest | allocs |
 |---|---:|---:|
-| `process_batch` through `keep` | 360 ns | 0 |
+| `process_batch` through `keep` | 431 ns | 0 |
 | `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
 | `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
 | `send_batch` through a no-op `Output` | 189 ns | 1 (the `async_trait` box) |
 | `send_batch` through a **failing** `Output` | 238 ns | 4 (matches the disabled-telemetry failure row above exactly) |
+
+`process_batch`'s row is a same-day pair, not a comparison across builds: the same session measured
+the pre-change, `out`-`Vec` shape at **469 ns / 1 alloc** and this one at **431 ns / 0** on the same
+pinned core (`taskset -c 2`, fastest of three, 2026-09-17), which is the ~8% the removed `Vec` and
+the removed per-event `Event` move are actually worth here. The 360 ns this row carried before was
+measured on an earlier build and box state and is not comparable to either number; every other row
+in the table is still that older measurement and was deliberately left alone.
 
 ### Costing internal spans: the `Delivered` trade, measured
 
@@ -929,8 +936,8 @@ A second, separable change, since landed: `Transform::process(&mut self, &Arc<Re
 Event) -> bool` plus `Vec::retain_mut` in `process_batch` removes one full 864-byte `Event` memcpy
 per node hop and one `Vec` allocation per batch per node. Nothing was lost — the trait already
 couldn't emit more than one event per input, so a bool says everything the `Option<Event>` return
-did. See ADR `in-place-transform-process` and §8 item 14; the `process_batch` rows in §2's
-"Runtime" table are the measured result.
+did. See [ADR `in-place-transform-process`](../adr/in-place-transform-process.md) and §8 item 14;
+the `process_batch` rows in §2's "Runtime" table are the measured result.
 
 ### Routing: a partition pass instead of N clones (ADR `target-components`)
 
@@ -1425,7 +1432,8 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 ### Later — needs a reason first
 
 14. ~~**`Transform::process(&mut Event) -> bool`.**~~ **Done** — see §2's "Runtime" table and the
-    `Transform::process`/`process_batch` doc comments (ADR `in-place-transform-process`). Removes
+    `Transform::process`/`process_batch` doc comments
+    ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md)). Removes
     an 864-byte memcpy per node hop *and* the per-batch `out` `Vec` that `process_batch` used to
     collect survivors into: `process_batch` is a `Vec::retain_mut` over the batch's own `events`
     now, so every `process_batch` row in the table above dropped by exactly 1, to **0** for the
