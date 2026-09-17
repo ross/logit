@@ -18,6 +18,9 @@
 //! second listener builds its own service and its own connection future and hands the result to
 //! [`drive_with_idle`], which is the actual seam.
 
+use bytes::{Bytes, BytesMut};
+use http_body_util::{BodyExt, Limited};
+use hyper::body::Incoming;
 use logit_core::Telemetry;
 use std::future::Future;
 use std::pin::Pin;
@@ -205,4 +208,81 @@ where
     }
     telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "idle")]);
     Ok(())
+}
+
+/// Why reading a request body stopped short, distinguished so the caller can answer `408`/gRPC
+/// `DEADLINE_EXCEEDED` for "this body stopped arriving" rather than reusing the `413` path for
+/// everything, the way a bare `Limited::collect` failure forced.
+pub(crate) enum BodyReadError {
+    /// No frame of the body arrived within the per-frame bound.
+    Stalled(std::time::Duration),
+    /// Anything [`Limited`] itself reports: over `MAX_REQUEST_BYTES`, a client vanishing
+    /// mid-upload, a reset h2 stream. Still goes through [`body_read_error_message`].
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// `Limited::collect` with a per-frame stall bound -- the body half of `crate::otlp`'s "Idle
+/// timeout" doc section. The bound is per *frame*, never a total: a large body that keeps
+/// arriving in pieces is making progress and is not stalled, however long it takes in aggregate
+/// (the same distinction `logit_in`'s per-`read` body bound draws).
+///
+/// With `stall: None` this is the old `limited.collect().await` in every observable respect,
+/// including which errors reach [`body_read_error_message`].
+pub(crate) async fn collect_with_stall_bound(
+    mut body: Limited<Incoming>,
+    stall: Option<std::time::Duration>,
+) -> Result<Bytes, BodyReadError> {
+    // Frames are accumulated rather than concatenated as they arrive so the overwhelmingly
+    // common single-frame body is handed on without a copy, exactly as `Collected::to_bytes`
+    // would do it.
+    let mut frames: Vec<Bytes> = Vec::new();
+    loop {
+        let next = match stall {
+            Some(stall) => match tokio::time::timeout(stall, body.frame()).await {
+                Ok(next) => next,
+                Err(_elapsed) => return Err(BodyReadError::Stalled(stall)),
+            },
+            None => body.frame().await,
+        };
+        let Some(frame) = next else { break };
+        let frame = frame.map_err(BodyReadError::Failed)?;
+        // Trailers on a request body are legal and carry nothing this input reads; dropping them
+        // is what `Collected::to_bytes` does too.
+        if let Ok(data) = frame.into_data() {
+            frames.push(data);
+        }
+    }
+    Ok(match frames.len() {
+        0 => Bytes::new(),
+        1 => frames.pop().expect("length checked just above"),
+        _ => {
+            let mut joined = BytesMut::with_capacity(frames.iter().map(Bytes::len).sum());
+            for frame in frames {
+                joined.extend_from_slice(&frame);
+            }
+            joined.freeze()
+        }
+    })
+}
+
+/// Turns a [`Limited`] read failure into a response message that doesn't overclaim. `Limited`'s
+/// `Error` covers *any* failure reading the body, not just exceeding `MAX_REQUEST_BYTES` -- a
+/// client disconnecting mid-upload, malformed chunked encoding, or an HTTP/2 stream reset all
+/// surface the same way. Distinguished via `LengthLimitError`'s presence in the error chain
+/// (`Limited` wraps the real cause when the limit trips, and otherwise forwards the underlying
+/// body's own error untouched) rather than assumed from the mere fact that `collect` failed --
+/// callers still respond `413`/`RESOURCE_EXHAUSTED` either way (there's no better status for "the
+/// request body never finished," and this is not the place to teach every HTTP/gRPC client the
+/// difference), but the message itself says which actually happened.
+pub(crate) fn body_read_error_message(
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+) -> String {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            return "request exceeds the maximum allowed size".to_string();
+        }
+        cause = e.source();
+    }
+    format!("failed reading the request body (not necessarily oversized): {err}")
 }
