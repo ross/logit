@@ -24,13 +24,29 @@
 //! | a label set naming one label twice | `skipped{reason="duplicate_label"}` -- an invalid label set, so the whole sample goes |
 //! | a series whose samples don't add up to its type's value (a counter with only a `_created`, a histogram with no buckets) | `skipped{reason="incomplete_series"}` at [`Assembler::finish`] |
 //!
-//! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`],
-//! and [`Assembler::declare`] for a transport that carries all three together) may arrive in any
-//! order and either side of the samples they describe -- a `# TYPE` for an already-implicit family retypes it
-//! in place, which is the leniency [`super::text`]'s module doc promises. Samples already *routed*
-//! into another family are not re-homed by a late declaration; they stay where they landed.
-//! A second, conflicting `# TYPE` is `skipped{reason="duplicate_type"}` and a second `# HELP`/
-//! `# UNIT` is `skipped{reason="duplicate_metadata"}`, first wins in both cases.
+//! Declarations ([`Assembler::declare_type`]/[`Assembler::declare_help`]/[`Assembler::declare_unit`])
+//! may arrive in any order and either side of the samples they describe -- a `# TYPE` for an
+//! already-implicit family retypes it in place, which is the leniency [`super::text`]'s module doc
+//! promises. Samples already *routed* into another family are not re-homed by a late declaration;
+//! they stay where they landed. A second declaration that *conflicts* with the first is
+//! `skipped{reason="duplicate_type"|"duplicate_metadata"}` and the first wins; a second that says
+//! the same thing is neither counted nor an error, since every format lets a producer repeat
+//! itself and a counter an operator reads as "input was dropped" should not fire when nothing was.
+//!
+//! ## Declaring lazily
+//!
+//! A transport that carries a request's metadata separately from its samples (remote-write) can
+//! hand over a whole [`Declarations`] table up front with [`Assembler::with_declarations`], and
+//! several assemblers can share one by reference. A declared family is then materialized **only
+//! when a sample name actually routes to it** -- one hash lookup per suffix on the miss path in
+//! [`Assembler::route`], and nothing at all for a family nobody sampled.
+//!
+//! That laziness is a bound, not a micro-optimization. Remote-write decodes into one assembler per
+//! distinct sample timestamp, and both the timestamp count and the declaration count come off the
+//! wire; replaying every declaration into every group would let a small compressed body ask for
+//! `groups x declarations` accumulators, each with an owned name, a `Vec` and a `HashMap` that live
+//! until [`Assembler::finish`]. Declaring on demand makes the cost proportional to the samples the
+//! request actually carries.
 //!
 //! ## What an assembler does *not* decide
 //!
@@ -44,11 +60,13 @@
 //! has no such token, passes `None`, and hands the instant over through
 //! [`Assembler::push_created`] instead.
 //!
-//! Three further entry points exist for facts a transport carries in a field of its own rather than
+//! Four further entry points exist for facts a transport carries in a field of its own rather than
 //! as a suffixed sample: [`Assembler::push_created`], [`Assembler::push_stale`] (remote-write's
-//! stale-marker NaN, which is a property of the *series* rather than a value) and
-//! [`Assembler::push_exemplar`]. All three route by sample name exactly as [`Assembler::push`]
-//! does, so they reach the same series the samples did.
+//! stale-marker NaN, which is a property of the *series* rather than a value),
+//! [`Assembler::push_exemplar`] and [`Assembler::describe`]. The first two route by sample
+//! name exactly as [`Assembler::push`] does, so they reach the same series the samples did; the
+//! last two route over what *already exists* and create nothing, because an exemplar or a help
+//! string is a fact about a series, not a reason for one to exist.
 //!
 //! [`Point`]: super::Point
 
@@ -116,6 +134,19 @@ fn bare_name_role(kind: FamilyType) -> Option<Role> {
     }
 }
 
+/// A family's declared type and metadata, keyed by the family's own (base) name. A transport that
+/// carries a request's metadata separately from its samples builds one of these and shares it
+/// across every assembler the request needs -- see the module doc's "Declaring lazily" section.
+pub(super) type Declarations = HashMap<String, Declaration>;
+
+/// One entry of a [`Declarations`] table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Declaration {
+    pub kind: FamilyType,
+    pub help: Option<String>,
+    pub unit: Option<String>,
+}
+
 /// One flat sample on its way into a family -- what every Prometheus syntax hands the assembler,
 /// with `le`/`quantile` still in `labels` (the assembler strips whichever the role calls for).
 pub(super) struct Sample<'a> {
@@ -171,39 +202,28 @@ struct Slot {
 }
 
 /// Flat samples in, [`MetricFamily`]s out. See the module doc for every decision it makes.
-pub(super) struct Assembler {
+pub(super) struct Assembler<'a> {
     /// The type a family gets when nothing declared one: `Untyped` in text 0.0.4, `Unknown` in
     /// OpenMetrics and remote-write. The two are the same semantics under two spellings, kept apart
     /// so a relay re-emits the one it received ([`FamilyType`]'s own doc).
     implicit: FamilyType,
+    /// Declarations this assembler may materialize on demand, shared by reference with every other
+    /// assembler decoding the same request -- see the module doc's "Declaring lazily" section.
+    declarations: Option<&'a Declarations>,
     families: Vec<FamilyAccum>,
     index: HashMap<String, usize>,
 }
 
-impl Assembler {
+impl<'a> Assembler<'a> {
     pub(super) fn new(implicit: FamilyType) -> Self {
-        Assembler { implicit, families: Vec::new(), index: HashMap::new() }
+        Assembler { implicit, declarations: None, families: Vec::new(), index: HashMap::new() }
     }
 
-    /// Declares `base`'s type, help and unit in one call -- what a transport that carries all three
-    /// together (remote-write's `MetricMetadata`/`Metadata`) has in hand, on top of the three
-    /// separate entry points a line-oriented syntax needs. A `None` help or unit says nothing
-    /// rather than saying "empty", so it can't displace one an earlier declaration supplied.
-    pub(super) fn declare(
-        &mut self,
-        base: &str,
-        kind: FamilyType,
-        help: Option<String>,
-        unit: Option<String>,
-        decoder: &mut PrometheusDecoder,
-    ) {
-        self.declare_type(base, kind, decoder);
-        if help.is_some() {
-            self.declare_help(base, help, decoder);
-        }
-        if unit.is_some() {
-            self.declare_unit(base, unit, decoder);
-        }
+    /// Declarations to materialize lazily, as sample names route to them. Sharing one table across
+    /// the assemblers of one request is the point: see the module doc.
+    pub(super) fn with_declarations(mut self, declarations: &'a Declarations) -> Self {
+        self.declarations = Some(declarations);
+        self
     }
 
     /// `# TYPE base <kind>`: the first type wins, a second *conflicting* one is counted, and a
@@ -227,8 +247,9 @@ impl Assembler {
     }
 
     /// `# HELP base <text>`, already unescaped; `None` for an empty one, which is *absent* rather
-    /// than `Some("")` ([`MetricFamily::help`]'s own doc). A second `# HELP` is counted whatever it
-    /// says, including an empty one, so "help was already set" is the only question asked.
+    /// than `Some("")` ([`MetricFamily::help`]'s own doc). Only a *conflicting* second `# HELP` is
+    /// counted, as with [`Assembler::declare_type`]: a producer repeating itself is not a dropped
+    /// input, and remote-write 2.0 repeats a family's metadata on every one of its wire series.
     pub(super) fn declare_help(
         &mut self,
         base: &str,
@@ -236,11 +257,7 @@ impl Assembler {
         decoder: &mut PrometheusDecoder,
     ) {
         let idx = self.family_index(base);
-        if self.families[idx].help.is_some() {
-            decoder.skipped("duplicate_metadata");
-            return;
-        }
-        self.families[idx].help = help;
+        self.set_help(idx, help, decoder);
     }
 
     /// `# UNIT base <unit>` -- the same rules as [`Assembler::declare_help`].
@@ -251,11 +268,58 @@ impl Assembler {
         decoder: &mut PrometheusDecoder,
     ) {
         let idx = self.family_index(base);
-        if self.families[idx].unit.is_some() {
-            decoder.skipped("duplicate_metadata");
-            return;
+        self.set_unit(idx, unit, decoder);
+    }
+
+    fn set_help(&mut self, idx: usize, help: Option<String>, decoder: &mut PrometheusDecoder) {
+        match &self.families[idx].help {
+            Some(existing) if Some(existing) == help.as_ref() => {}
+            Some(_) => decoder.skipped("duplicate_metadata"),
+            None => self.families[idx].help = help,
         }
-        self.families[idx].unit = unit;
+    }
+
+    fn set_unit(&mut self, idx: usize, unit: Option<String>, decoder: &mut PrometheusDecoder) {
+        match &self.families[idx].unit {
+            Some(existing) if Some(existing) == unit.as_ref() => {}
+            Some(_) => decoder.skipped("duplicate_metadata"),
+            None => self.families[idx].unit = unit,
+        }
+    }
+
+    /// The help and unit a transport attached to a *series* rather than to a family, applied to
+    /// whichever family that series' samples already landed in. Creates nothing, changes no type,
+    /// and never displaces a description the family already has.
+    ///
+    /// Remote-write 2.0's `Metadata` is per series and carries no family name, so a series whose
+    /// type is `UNSPECIFIED` says nothing about which family it belongs to: `foo_bucket` might be a
+    /// histogram's bucket line or a gauge that happens to be called that. Declaring a family from
+    /// it would create a `foo_bucket` family that then *beats* a sibling series' `HISTOGRAM`
+    /// declaration of `foo`, since [`Assembler::route`] prefers an exact name match over the suffix
+    /// scan -- leaving that histogram bucket-less. Waiting until the sample has routed asks the
+    /// question the other way round, which is the only way it has an answer.
+    ///
+    /// Silent rather than counted when the family is already described: the series never claimed to
+    /// be describing *that* family -- it was describing itself, and which family that turned out to
+    /// mean is this assembler's conclusion, not the sender's. Reporting a `duplicate_metadata` the
+    /// producer did not commit would be reporting our own inference.
+    pub(super) fn describe(
+        &mut self,
+        sample_name: &str,
+        help: Option<String>,
+        unit: Option<String>,
+    ) {
+        let Some((family, _)) = self.route_existing(sample_name) else { return };
+        if self.families[family].help.is_none() {
+            if let Some(help) = help {
+                self.families[family].help = Some(help);
+            }
+        }
+        if self.families[family].unit.is_none() {
+            if let Some(unit) = unit {
+                self.families[family].unit = Some(unit);
+            }
+        }
     }
 
     /// One flat sample. Returns whether it landed -- a caller that reports how much of a request it
@@ -382,20 +446,33 @@ impl Assembler {
     }
 
     /// An exemplar the transport already attached to a series of its own accord, rather than one
-    /// riding a sample line. Unlike [`Assembler::push`] there is no role filter here: OpenMetrics
-    /// only *has* somewhere to write an exemplar on a `_total` or `_bucket` line, whereas
-    /// remote-write carries them in a per-series field, so the producer has already said which
-    /// series it meant and dropping one for sitting on the "wrong" sample would lose data the wire
-    /// really carried.
+    /// riding a sample line. Returns whether it was stored.
+    ///
+    /// Two differences from [`Assembler::push`], both deliberate. There is no role filter:
+    /// OpenMetrics only *has* somewhere to write an exemplar on a `_total` or `_bucket` line,
+    /// whereas remote-write carries them in a per-series field, so the producer has already said
+    /// which series it meant and dropping one for sitting on the "wrong" sample would lose data the
+    /// wire really carried. And this **creates nothing** -- no family, no series: an exemplar is an
+    /// example of a reading, so a series with no reading here is one this assembler should not be
+    /// made to invent (it would come back out as an `incomplete_series` skip, having swallowed the
+    /// exemplar on the way).
     pub(super) fn push_exemplar(
         &mut self,
         sample_name: &str,
-        labels: Vec<(String, String)>,
+        mut labels: Vec<(String, String)>,
         exemplar: Exemplar,
-        decoder: &mut PrometheusDecoder,
     ) -> bool {
-        let Some(slot) = self.slot(sample_name, labels, decoder) else { return false };
-        self.families[slot.family].series[slot.series].exemplars.push(exemplar);
+        let Some((family, role)) = self.route_existing(sample_name) else { return false };
+        match role {
+            Role::Bucket => drop(take_label(&mut labels, "le")),
+            Role::Quantile => drop(take_label(&mut labels, "quantile")),
+            _ => {}
+        }
+        labels.sort_by(|a, b| a.0.cmp(&b.0));
+        let Some(series) = self.families[family].series_index.get(&labels).copied() else {
+            return false;
+        };
+        self.families[family].series[series].exemplars.push(exemplar);
         true
     }
 
@@ -458,6 +535,7 @@ impl Assembler {
         name: &str,
         decoder: &mut PrometheusDecoder,
     ) -> Option<(usize, Role, bool)> {
+        self.materialize(name, decoder);
         if let Some(idx) = self.index.get(name).copied() {
             return match bare_name_role(self.families[idx].kind) {
                 Some(role) => Some((idx, role, false)),
@@ -479,6 +557,64 @@ impl Assembler {
         }
         let idx = self.family_index(name);
         Some((idx, Role::Primary, false))
+    }
+
+    /// Creates any *declared* family `name` could route to, if a sample has not already brought it
+    /// into existence. One hash lookup for the name itself plus one per suffix, and only on the
+    /// miss path -- see the module doc's "Declaring lazily" section for why this is on demand
+    /// rather than replayed into every assembler up front.
+    fn materialize(&mut self, name: &str, decoder: &mut PrometheusDecoder) {
+        let Some(declarations) = self.declarations else { return };
+        if declarations.is_empty() {
+            return;
+        }
+        if !self.index.contains_key(name) {
+            if let Some(declaration) = declarations.get(name) {
+                self.declare_from(name, declaration.clone(), decoder);
+            }
+        }
+        for (suffix, _) in SUFFIXES {
+            let Some(base) = name.strip_suffix(suffix) else { continue };
+            if self.index.contains_key(base) {
+                continue;
+            }
+            if let Some(declaration) = declarations.get(base) {
+                self.declare_from(base, declaration.clone(), decoder);
+            }
+        }
+    }
+
+    fn declare_from(
+        &mut self,
+        base: &str,
+        declaration: Declaration,
+        decoder: &mut PrometheusDecoder,
+    ) {
+        let Declaration { kind, help, unit } = declaration;
+        self.declare_type(base, kind, decoder);
+        let idx = self.family_index(base);
+        if help.is_some() {
+            self.set_help(idx, help, decoder);
+        }
+        if unit.is_some() {
+            self.set_unit(idx, unit, decoder);
+        }
+    }
+
+    /// The family and role a sample name routes to **among the families that already exist** --
+    /// the read-only half of [`Assembler::route`], with no implicit family created, no declaration
+    /// materialized and nothing counted. What [`Assembler::push_exemplar`] and
+    /// [`Assembler::describe_untyped`] route over.
+    fn route_existing(&self, name: &str) -> Option<(usize, Role)> {
+        if let Some(idx) = self.index.get(name).copied() {
+            return bare_name_role(self.families[idx].kind).map(|role| (idx, role));
+        }
+        for (suffix, role) in SUFFIXES {
+            let Some(base) = name.strip_suffix(suffix) else { continue };
+            let Some(idx) = self.index.get(base).copied() else { continue };
+            return suffix_applies(self.families[idx].kind, suffix, role).then_some((idx, role));
+        }
+        None
     }
 
     fn family_index(&mut self, name: &str) -> usize {

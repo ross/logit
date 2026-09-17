@@ -33,7 +33,8 @@
 //!
 //! [ADR `lossless-transit`]: ../../../docs/adr/lossless-transit.md
 
-use logit_core::{AttrMap, Exemplar, TraceRef, Value};
+use logit_core::interner::resolve;
+use logit_core::{AttrMap, Exemplar, Registry, TraceRef, Value};
 use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
 use logit_proto::prometheus::generated::prometheus as pb1;
 use logit_proto::prometheus::remote_write::{decode, encode, Decoded, Version};
@@ -51,6 +52,34 @@ const TIMESTAMP: i64 = 1_605_281_325_000_000_000;
 fn round_trip(groups: &[Vec<MetricFamily>], version: Version) -> Decoded {
     let body = encode(groups, version, &mut PrometheusEncoder::new());
     decode(&body, version, &mut PrometheusDecoder::new()).expect("our own encoding must decode")
+}
+
+/// Decodes with telemetry attached and returns every `logit.input.metrics.{skipped,degraded}`
+/// reason it recorded. `round_trip` compares families only, which cannot see a decoder that reaches
+/// the right answer while counting input it did not drop -- a counter an operator reads as data
+/// loss.
+fn decode_reasons(body: &[u8], version: Version) -> (Decoded, Vec<String>) {
+    let registry = Registry::new();
+    let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus",
+        "prometheus_in",
+        "source",
+    ));
+    let decoded = decode(body, version, &mut decoder).expect("must decode");
+    let reasons = registry
+        .drain(0)
+        .iter()
+        .flat_map(|event| {
+            let counted = event.metrics.iter().any(|metric| {
+                let name = resolve(metric.name);
+                name == "logit.input.metrics.skipped" || name == "logit.input.metrics.degraded"
+            });
+            counted
+                .then(|| event.attributes.get("reason").and_then(|v| v.as_str()).map(String::from))
+                .flatten()
+        })
+        .collect();
+    (decoded, reasons)
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -531,13 +560,81 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     );
 }
 
+/// Protobuf skips fields it does not recognise, and the two versions' field numbers are disjoint
+/// (2.0 reserves 1-3, which is where 1.0 keeps its `timeseries` and `metadata`), so each version's
+/// body decodes as an *empty* request of the other rather than as an error. Left alone, a sender
+/// that posts 1.0 bytes under the 2.0 `Content-Type` gets a `204` reporting nothing written, which
+/// reads as "accepted"; a receiver has to answer `400`.
+#[test]
+fn a_body_of_the_other_version_is_malformed_rather_than_an_empty_request() {
+    let families = vec![vec![MetricFamily {
+        series: vec![Series {
+            timestamp: Some(TIMESTAMP),
+            ..Series::new(vec![("shard".to_string(), "1".to_string())], Point::Gauge(1.0))
+        }],
+        ..MetricFamily::new("m", FamilyType::Gauge)
+    }]];
+
+    for (sent, claimed) in [(Version::V1, Version::V2), (Version::V2, Version::V1)] {
+        let body = encode(&families, sent, &mut PrometheusEncoder::new());
+        assert!(!body.is_empty());
+        // It really does decode "successfully" as the wrong version -- that is the trap.
+        match claimed {
+            Version::V1 => {
+                let wrong = pb1::WriteRequest::decode(body.as_slice()).expect("prost accepts it");
+                assert!(wrong.timeseries.is_empty() && wrong.metadata.is_empty());
+            }
+            Version::V2 => {
+                let wrong = pb2::Request::decode(body.as_slice()).expect("prost accepts it");
+                assert!(wrong.symbols.is_empty() && wrong.timeseries.is_empty());
+            }
+        }
+        let error = decode(&body, claimed, &mut PrometheusDecoder::new())
+            .expect_err("a body of the other version must not decode as an empty request");
+        assert!(
+            error.to_string().contains("body is not"),
+            "{sent:?} body read as {claimed:?} gave {error}"
+        );
+        // And the right version still reads it.
+        assert_eq!(round_trip(&families, sent).groups, families, "{sent:?}");
+    }
+}
+
+/// A zero-byte body is a genuinely empty request, not a wrong-version one -- an empty 1.0
+/// `WriteRequest` encodes to exactly that.
+#[test]
+fn an_empty_body_is_an_empty_request_in_both_versions() {
+    for version in [Version::V1, Version::V2] {
+        let decoded =
+            decode(&[], version, &mut PrometheusDecoder::new()).expect("must decode: {version:?}");
+        assert_eq!(decoded, Decoded::default(), "{version:?}");
+    }
+    // 1.0 with nothing in it *is* a zero-byte body; 2.0's is the one mandatory empty symbol, which
+    // is not zero bytes and is recognised on its own.
+    let empty_v1 = encode(&[], Version::V1, &mut PrometheusEncoder::new());
+    assert!(empty_v1.is_empty());
+    let empty_v2 = encode(&[], Version::V2, &mut PrometheusEncoder::new());
+    assert!(!empty_v2.is_empty());
+    assert_eq!(
+        decode(&empty_v2, Version::V2, &mut PrometheusDecoder::new()).expect("must decode"),
+        Decoded::default()
+    );
+}
+
 /// The `Content-Type` table, including the tolerances a real sender needs.
 #[test]
 fn from_content_type_recognizes_both_versions_and_rejects_the_rest() {
     let v1 = Some(Version::V1);
     let v2 = Some(Version::V2);
-    let cases: [(&str, Option<Version>); 12] = [
+    let cases: [(&str, Option<Version>); 16] = [
         ("application/x-protobuf", v1),
+        // A parameter with no `=` is one more parameter this codec has no use for, not a reason to
+        // answer 415: a trailing `;` (which `split` yields as an empty part), a bare word, and a
+        // `proto=` that still has to win from behind one.
+        ("application/x-protobuf;", v1),
+        ("application/x-protobuf; ", v1),
+        ("application/x-protobuf; charset", v1),
+        ("application/x-protobuf; charset; proto=io.prometheus.write.v2.Request;", v2),
         ("application/x-protobuf;proto=prometheus.WriteRequest", v1),
         ("APPLICATION/X-PROTOBUF; PROTO=prometheus.WriteRequest", v1),
         ("application/x-protobuf ; proto = prometheus.WriteRequest", v1),
@@ -574,6 +671,327 @@ fn native_histograms_are_counted_and_skipped() {
     assert_eq!(decoded.histograms_skipped, 2);
     assert_eq!(decoded.samples, 0);
     assert!(decoded.groups.is_empty(), "nothing to put in a group");
+}
+
+/// A stale marker has to survive on *every* family type, not only the ones `events_to_families`
+/// can build one for: a stale NaN on `foo_bucket{le=…}` flags the whole series stale, so a relay
+/// hands this encoder stale histograms and summaries too. The bare family name is not a sample name
+/// for those types, so the marker rides `_count`/`_sum` (`_gcount`/`_gsum`) instead.
+#[test]
+fn a_stale_marker_survives_on_every_family_type() {
+    for kind in [
+        FamilyType::Counter,
+        FamilyType::Gauge,
+        FamilyType::Unknown,
+        FamilyType::Info,
+        FamilyType::StateSet,
+        FamilyType::Histogram,
+        FamilyType::GaugeHistogram,
+        FamilyType::Summary,
+    ] {
+        let name = match kind {
+            FamilyType::Counter => "m_total",
+            _ => "m",
+        };
+        let families = vec![vec![MetricFamily {
+            series: vec![Series {
+                timestamp: Some(TIMESTAMP),
+                ..Series::new(vec![("shard".to_string(), "1".to_string())], Point::Stale)
+            }],
+            ..MetricFamily::new(name, kind)
+        }]];
+        for version in [Version::V1, Version::V2] {
+            let body = encode(&families, version, &mut PrometheusEncoder::new());
+            let (decoded, reasons) = decode_reasons(&body, version);
+            assert_eq!(decoded.groups, families, "{kind:?} {version:?}");
+            assert!(reasons.is_empty(), "{kind:?} {version:?} counted {reasons:?}");
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Declarations are materialized on demand, and only what a sample asks for
+// -------------------------------------------------------------------------------------------------
+
+/// A request's declaration count and its distinct-timestamp count are both attacker-controlled, so
+/// a decoder that replayed every declaration into every timestamp group would let a small body ask
+/// for `declarations x groups` accumulators. Declaring on demand makes the cost proportional to the
+/// samples the request actually carries: 200 declarations and 50 timestamps over one series is 50
+/// groups of **one** family, not 50 of 201.
+#[test]
+fn declarations_materialize_only_where_a_sample_routes_to_them() {
+    const DECLARATIONS: usize = 200;
+    const TIMESTAMPS: i64 = 50;
+
+    let metadata = (0..DECLARATIONS)
+        .map(|i| pb1::MetricMetadata {
+            r#type: pb1::metric_metadata::MetricType::Counter as i32,
+            metric_family_name: format!("declared_{i}_total"),
+            help: "Never sampled.".to_string(),
+            unit: String::new(),
+        })
+        .collect();
+    let samples =
+        (0..TIMESTAMPS).map(|i| pb1::Sample { value: i as f64, timestamp: 1_000 + i }).collect();
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![pb1::TimeSeries {
+            labels: vec![label("__name__", "sampled_total")],
+            samples,
+            ..Default::default()
+        }],
+        metadata,
+    });
+
+    assert_eq!(decoded.groups.len(), TIMESTAMPS as usize);
+    for group in &decoded.groups {
+        assert_eq!(group.len(), 1, "a group must hold only the families its own samples touched");
+        assert_eq!(group[0].name, "sampled_total");
+    }
+    // And the 200 declared-but-unsampled families appear nowhere at all -- not as empty families,
+    // not as a family with a `help` and no series.
+    assert!(!decoded.groups.iter().flatten().any(|family| family.name.starts_with("declared_")));
+}
+
+/// The narrow statement of the same property, with the numbers small enough to read.
+#[test]
+fn a_declared_but_unsampled_family_never_appears_in_any_group() {
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![v1_series(&[("__name__", "present")], 1.0)],
+        metadata: vec![
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Histogram as i32,
+                metric_family_name: "absent".to_string(),
+                help: "Declared, never sampled.".to_string(),
+                unit: "seconds".to_string(),
+            },
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Gauge as i32,
+                metric_family_name: "present".to_string(),
+                help: "Sampled.".to_string(),
+                unit: String::new(),
+            },
+        ],
+    });
+    assert_eq!(decoded.groups.len(), 1);
+    assert_eq!(decoded.groups[0].len(), 1);
+    assert_eq!(decoded.groups[0][0].name, "present");
+    assert_eq!(decoded.groups[0][0].kind, FamilyType::Gauge);
+    assert_eq!(decoded.groups[0][0].help.as_deref(), Some("Sampled."));
+}
+
+/// 2.0 repeats a family's `Metadata` on every one of its wire series, so a decoder that treated
+/// each repeat as a second declaration would count `duplicate_metadata` once per series -- a
+/// counter operators read as "input was dropped" firing on a request nothing was dropped from.
+/// Asserted over both fixture corpora and the 100-series bench shape, in both versions.
+#[test]
+fn a_faithful_round_trip_counts_nothing_as_skipped_or_degraded() {
+    for (label, body) in
+        [("text 0.0.4 corpus", TEXT_FIXTURE), ("openmetrics corpus", OPENMETRICS_FIXTURE)]
+    {
+        let dialect =
+            if body == TEXT_FIXTURE { Dialect::Text0_0_4 } else { Dialect::OpenMetrics1_0 };
+        for version in [Version::V1, Version::V2] {
+            let families = stamped(parse(body.as_bytes(), dialect).expect("must parse"), version);
+            let encoded = encode(&[families], version, &mut PrometheusEncoder::new());
+            let (_, reasons) = decode_reasons(&encoded, version);
+            assert!(reasons.is_empty(), "{label} {version:?} counted {reasons:?}");
+        }
+    }
+
+    // And the wide shape: one family, 100 series, which in 2.0 is 100 repeats of one `Metadata`.
+    // Series are sorted by label set because that is the canonical order a decode comes back in
+    // ("shard=10" before "shard=2"); an unsorted fixture would be testing its own construction.
+    let mut series: Vec<Series> = (0..100)
+        .map(|i| Series {
+            timestamp: Some(TIMESTAMP),
+            ..Series::new(vec![("shard".to_string(), i.to_string())], Point::Gauge(i as f64))
+        })
+        .collect();
+    series.sort_by(|a, b| a.labels.cmp(&b.labels));
+    let wide = vec![MetricFamily {
+        help: Some("Bench gauge.".to_string()),
+        unit: Some("seconds".to_string()),
+        series,
+        ..MetricFamily::new("prom_bench_gauge_seconds", FamilyType::Gauge)
+    }];
+    for version in [Version::V1, Version::V2] {
+        let encoded = encode(std::slice::from_ref(&wide), version, &mut PrometheusEncoder::new());
+        let (decoded, reasons) = decode_reasons(&encoded, version);
+        assert_eq!(decoded.groups, vec![wide.clone()], "{version:?}");
+        assert!(reasons.is_empty(), "100-series {version:?} counted {reasons:?}");
+    }
+}
+
+/// A metadata entry that *disagrees* with an earlier one for the same family is the real duplicate:
+/// first wins, and it is counted.
+#[test]
+fn a_conflicting_metadata_entry_is_counted_and_loses() {
+    let request = pb1::WriteRequest {
+        timeseries: vec![v1_series(&[("__name__", "foo")], 1.0)],
+        metadata: vec![
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Gauge as i32,
+                metric_family_name: "foo".to_string(),
+                help: "First.".to_string(),
+                unit: String::new(),
+            },
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Counter as i32,
+                metric_family_name: "foo".to_string(),
+                help: "Second.".to_string(),
+                unit: String::new(),
+            },
+        ],
+    };
+    let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
+    assert_eq!(decoded.groups[0][0].kind, FamilyType::Gauge, "the first entry wins");
+    assert_eq!(decoded.groups[0][0].help.as_deref(), Some("First."));
+    assert!(reasons.contains(&"duplicate_type".to_string()), "{reasons:?}");
+    assert!(reasons.contains(&"duplicate_metadata".to_string()), "{reasons:?}");
+}
+
+// -------------------------------------------------------------------------------------------------
+// Exemplars are placed against their own series' samples, not against whatever group exists
+// -------------------------------------------------------------------------------------------------
+
+/// An exemplar goes to a group where *its own* series has a sample. The failure this pins is
+/// order-dependence: with one series sampled at 2000 and another at 1000 carrying an exemplar
+/// timestamped 2000, a decoder that matched the exemplar against groups-so-far would put it in the
+/// 2000 group (inventing a reading-less series there) or not, depending purely on `TimeSeries`
+/// order, which neither spec constrains.
+#[test]
+fn an_exemplar_lands_on_its_own_series_whichever_order_the_series_arrive_in() {
+    let at = |name: &str, ms: i64| pb1::TimeSeries {
+        labels: vec![label("__name__", name)],
+        samples: vec![pb1::Sample { value: 1.0, timestamp: ms }],
+        ..Default::default()
+    };
+    let b_with_exemplar = pb1::TimeSeries {
+        exemplars: vec![pb1::Exemplar {
+            labels: vec![label("detail", "kept")],
+            value: 0.5,
+            timestamp: 2_000,
+        }],
+        ..at("b", 1_000)
+    };
+
+    let forwards = decode_v1(pb1::WriteRequest {
+        timeseries: vec![at("a", 2_000), b_with_exemplar.clone()],
+        metadata: Vec::new(),
+    });
+    let backwards = decode_v1(pb1::WriteRequest {
+        timeseries: vec![b_with_exemplar, at("a", 2_000)],
+        metadata: Vec::new(),
+    });
+    assert_eq!(forwards, backwards, "the result must not depend on TimeSeries order");
+
+    assert_eq!(forwards.exemplars, 1);
+    assert_eq!(forwards.groups.len(), 2, "two timestamps, two groups");
+    // Group 0 is 1000, where `b` lives; group 1 is 2000, where `a` does. The exemplar is on `b`,
+    // and `a`'s group holds only `a` -- no phantom `b` series, and so no `incomplete_series` skip.
+    assert_eq!(forwards.groups[0].len(), 1);
+    assert_eq!(forwards.groups[0][0].name, "b");
+    assert_eq!(forwards.groups[0][0].series[0].exemplars.len(), 1);
+    assert_eq!(forwards.groups[1].len(), 1);
+    assert_eq!(forwards.groups[1][0].name, "a");
+    assert!(forwards.groups[1][0].series[0].exemplars.is_empty());
+}
+
+/// An exemplar whose series carried no sample at all has no reading to be an example of. It is
+/// dropped and counted, never stored, and `Decoded::exemplars` -- which becomes
+/// `X-Prometheus-Remote-Write-Exemplars-Written` -- does not claim it.
+#[test]
+fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
+    let request = pb1::WriteRequest {
+        timeseries: vec![pb1::TimeSeries {
+            labels: vec![label("__name__", "orphan")],
+            exemplars: vec![pb1::Exemplar {
+                labels: vec![label("detail", "lost")],
+                value: 0.5,
+                timestamp: 2_000,
+            }],
+            ..Default::default()
+        }],
+        metadata: Vec::new(),
+    };
+    let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
+    assert_eq!(decoded.exemplars, 0, "nothing was stored, so nothing is reported as written");
+    assert!(decoded.groups.is_empty(), "no samples means no groups and no phantom series");
+    assert_eq!(reasons, ["exemplar_dropped"]);
+}
+
+// -------------------------------------------------------------------------------------------------
+// 2.0's per-series metadata names no family, so an unspecified type must not invent one
+// -------------------------------------------------------------------------------------------------
+
+/// A 2.0 series with help but no *type* says nothing about which family it belongs to: `foo_bucket`
+/// might be a histogram's bucket line or a gauge that happens to be called that. Declaring a family
+/// from it would create a `foo_bucket` family that beats the sibling's `HISTOGRAM` declaration of
+/// `foo` -- `route` prefers an exact name over the suffix scan -- and leave the histogram
+/// bucket-less. The help still lands, on the family the sample actually routed to.
+#[test]
+fn an_unspecified_type_describes_the_family_its_samples_land_in_rather_than_declaring_one() {
+    let request = pb2::Request {
+        symbols: vec![
+            String::new(),
+            "__name__".to_string(),
+            "foo_bucket".to_string(),
+            "le".to_string(),
+            "1".to_string(),
+            "foo_sum".to_string(),
+            "Latency.".to_string(),
+            "foo_count".to_string(),
+        ],
+        timeseries: vec![
+            pb2::TimeSeries {
+                labels_refs: vec![1, 2, 3, 4],
+                samples: vec![pb2::Sample { value: 3.0, timestamp: 1, start_timestamp: 0 }],
+                // Help, no type -- the case the guard used not to cover.
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Unspecified as i32,
+                    help_ref: 6,
+                    unit_ref: 0,
+                }),
+                ..Default::default()
+            },
+            pb2::TimeSeries {
+                labels_refs: vec![1, 5],
+                samples: vec![pb2::Sample { value: 2.5, timestamp: 1, start_timestamp: 0 }],
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Histogram as i32,
+                    help_ref: 0,
+                    unit_ref: 0,
+                }),
+                ..Default::default()
+            },
+            pb2::TimeSeries {
+                labels_refs: vec![1, 7],
+                samples: vec![pb2::Sample { value: 3.0, timestamp: 1, start_timestamp: 0 }],
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Histogram as i32,
+                    help_ref: 0,
+                    unit_ref: 0,
+                }),
+                ..Default::default()
+            },
+        ],
+    };
+    let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V2);
+    assert_eq!(decoded.groups.len(), 1);
+    let families = &decoded.groups[0];
+    assert_eq!(
+        families.len(),
+        1,
+        "one histogram, not a histogram plus a stray gauge: {families:#?}"
+    );
+    assert_eq!(families[0].name, "foo");
+    assert_eq!(families[0].kind, FamilyType::Histogram);
+    assert_eq!(families[0].help.as_deref(), Some("Latency."), "the help still lands");
+    assert_eq!(
+        families[0].series[0].point,
+        Point::Histogram { buckets: vec![(1.0, 3), (f64::INFINITY, 3)], sum: Some(2.5), count: 3 }
+    );
+    assert!(reasons.is_empty(), "{reasons:?}");
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -664,15 +1082,11 @@ fn point_for(kind: FamilyType) -> BoxedStrategy<Point> {
         FamilyType::Info => Just(Point::Info).boxed(),
         FamilyType::StateSet => any::<bool>().prop_map(Point::StateSet).boxed(),
     };
-    match kind {
-        // A `Stale` histogram or summary encodes as one sample on the family's *primary* name,
-        // which those types have none of -- `foo` under `# TYPE foo histogram` is not a sample of
-        // it. Those kinds are skipped on the way out of the model long before they reach this
-        // codec (`with_stale_markers` converts only the single-series kinds), so generating one
-        // here would be testing a state the pipeline cannot produce.
-        FamilyType::Histogram | FamilyType::GaugeHistogram | FamilyType::Summary => valued,
-        _ => prop_oneof![9 => valued, 1 => Just(Point::Stale)].boxed(),
-    }
+    // Every family type, `Stale` included. `events_to_families` only ever builds a `Stale` for the
+    // single-series kinds, but *this decoder* builds one for any of them -- a stale NaN on
+    // `foo_bucket{le=…}` flags the whole series stale -- so a relay (1.0 to 2.0, or W3 to W4) can
+    // and does hand the encoder a stale histogram.
+    prop_oneof![9 => valued, 1 => Just(Point::Stale)].boxed()
 }
 
 /// Whole milliseconds: both versions' only resolution.

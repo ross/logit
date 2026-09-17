@@ -58,7 +58,7 @@
 //! | `Sample.value`, `Sample.timestamp` (ms) | the point's value, and the group it lands in |
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
-//! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes` |
+//! | `Exemplar` | the shared exemplar mapping ([`assemble::exemplar_from_labels`]): `trace_id`/`span_id` → [`logit_core::TraceRef`], the rest → `filtered_attributes`. Attached in a pass of its own, once every series' samples are grouped, to the group where *that series* has a sample at the exemplar's own timestamp -- else the latest group where it has one at all. Never to a group where it has none: see [`Decoded::exemplars`] |
 //! | `histograms[]` (native histograms) | **skipped**, counted `logit.input.metrics.skipped{reason="native_histogram"}` and reported in [`Decoded::histograms_skipped`] -- `docs/known-gaps.md`'s native-histogram row |
 //!
 //! Everything else is the assembler's, unchanged: suffix routing, `le`/`quantile` stripping, the
@@ -69,7 +69,15 @@
 //! [`CodecError::Malformed`] is reserved for a request that is *structurally* broken, where no part
 //! of it can be trusted -- the receiver answers `400` and keeps nothing:
 //!
-//! - the body is not the protobuf message the `Content-Type` promised;
+//! - the body is not the protobuf message the `Content-Type` promised. Protobuf cannot say so
+//!   directly -- it skips fields it does not recognise -- so this is caught by the *shape* of what
+//!   came back: a non-empty body that decodes to a request with nothing in it was some other
+//!   message. The two versions are mutually unrecognisable in exactly this way, since 2.0 reserves
+//!   fields 1-3 and 1.0 uses 1 and 3, so a 1.0 body posted with a 2.0 `Content-Type` yields an
+//!   empty `Request` rather than an error. Without the check the receiver would answer `204` and
+//!   report nothing written, which reads to a sender as "accepted". A genuinely empty body -- zero
+//!   bytes, which is what an empty 1.0 `WriteRequest` encodes to -- is a valid empty request and
+//!   decodes to no groups;
 //! - 2.0: `symbols[0]` is not the empty string, a `labels_refs` list has an odd length, or any
 //!   symbol reference is out of range. A bad index means the whole table is being read wrongly.
 //!
@@ -80,6 +88,11 @@
 //! |---|---|
 //! | `invalid_labels` | a series with no `__name__`, an empty label name or value, or a label set that is not strictly ascending by byte order -- all of which both specs forbid a sender from producing |
 //! | `native_histogram` | one entry of a `histograms[]` list (above) |
+//! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
+//!
+//! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
+//! whose series has no sample anywhere in the request, so there is no reading for it to be an
+//! example of.
 //!
 //! ## Encode: families → protobuf
 //!
@@ -95,7 +108,7 @@
 //! | `histogram` | `<name>_bucket{le}` per cumulative bucket including `+Inf`, then `<name>_sum` when the model has one, then `<name>_count` |
 //! | `gaugehistogram` | the same with `_gsum`/`_gcount`, and no `_gcount` when there is no `_gsum` (OpenMetrics' own rule, which the assembler reads back) |
 //! | `summary` | `<name>{quantile}` per quantile, then `<name>_sum`/`<name>_count` when the model has them |
-//! | [`Point::Stale`] | one sample of the family's primary series name, valued [`super::STALE_NAN_BITS`] |
+//! | [`Point::Stale`] | [`super::STALE_NAN_BITS`] on the family's primary series name -- or, for the types that have no sample called that, on `<name>_count` and `<name>_sum` (`_gcount`/`_gsum` for a gaugehistogram), which are names the decoder routes back to the same family |
 //!
 //! The label set is the series' labels plus `__name__` plus the generated `le`/`quantile`, **sorted
 //! by byte order after** those are added. Exemplars ride the `_total` and `_bucket` series only, as
@@ -129,15 +142,15 @@
 //! - 1.0 drops `Series::created` (above);
 //! - an exemplar belongs to a `TimeSeries`, not to a sample, in *both* versions -- so a request
 //!   carrying several timestamps for one series cannot say which sample an exemplar came from.
-//!   Decode assigns each one to the group whose timestamp it matches, and to the latest group when
-//!   it matches none;
+//!   Decode assigns each one to the group where that series has a sample at the exemplar's own
+//!   timestamp, and to the latest group where it has one at all otherwise;
 //! - a histogram's exemplars come back in *bucket-label* order (`le` sorted as a string, so `+Inf`
 //!   first), not in the order the model held them.
 //!
 //! [`Assembler`]: assemble::Assembler
 //! [`CodecError::Malformed`]: crate::CodecError::Malformed
 
-use super::assemble::{self, Assembler, Sample};
+use super::assemble::{self, Assembler, Declaration, Declarations, Sample};
 use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
@@ -213,7 +226,11 @@ impl Version {
         }
         let mut version = Version::V1;
         for part in parts {
-            let (key, parameter) = part.split_once('=')?;
+            // A parameter with no `=` at all -- a trailing `;`, which `split` yields as an empty
+            // part, or a bare word -- is one more parameter this codec has no use for, not a
+            // reason to reject the request. The `proto=` parameter is the only one that decides
+            // anything here.
+            let Some((key, parameter)) = part.split_once('=') else { continue };
             if !key.trim().eq_ignore_ascii_case("proto") {
                 continue;
             }
@@ -243,7 +260,10 @@ pub struct Decoded {
     /// Samples actually stored -- a sample the assembler stepped over (a duplicate, a bad `le`) is
     /// not counted, because the header is a report of what the receiver kept.
     pub samples: u64,
-    /// Exemplars actually stored.
+    /// Exemplars actually stored. An exemplar whose series carried no sample this codec kept has
+    /// nowhere to go and is not counted here -- it is counted
+    /// `logit.input.metrics.degraded{reason="exemplar_dropped"}` instead, because
+    /// `X-Prometheus-Remote-Write-Exemplars-Written` is a report of what the receiver *stored*.
     pub exemplars: u64,
     /// Native-histogram entries skipped, each also counted
     /// `logit.input.metrics.skipped{reason="native_histogram"}`.
@@ -268,67 +288,134 @@ pub fn decode(
 }
 
 /// One series' `__name__` and label set once its references have been resolved and validated, or
-/// `None` for a series already counted `invalid_labels`. 2.0 decodes in passes -- validate, then
-/// declare, then push -- so this is what the first pass hands the other two.
+/// `None` for a series already counted `invalid_labels`. 2.0 decodes in passes, and this is what
+/// the first hands the rest.
 type ResolvedSeries<'a> = Option<(&'a str, Vec<(String, String)>)>;
 
-/// A family declaration lifted out of a request's metadata, before any group exists to put it in.
-struct Declaration {
-    name: String,
-    kind: FamilyType,
-    help: Option<String>,
-    unit: Option<String>,
+/// A help/unit pair a 2.0 series carried without a type, which therefore describes no family until
+/// its samples have routed -- `None` for a series that carried no such pair. See `decode_v2`.
+type UntypedDescription = Option<(Option<String>, Option<String>)>;
+
+/// One series, once its labels have been resolved and validated and its samples have been routed:
+/// the sample name, the series labels, and the groups a sample of it actually landed in (ascending,
+/// deduplicated). That last part is what the exemplar pass needs and the only reason this outlives
+/// the sample loop.
+struct Routed<'a> {
+    name: &'a str,
+    labels: Vec<(String, String)>,
+    /// Empty unless the series carries something that has to be placed relative to its samples --
+    /// an exemplar, or 2.0 help/unit from an untyped series. Tracking it unconditionally would cost
+    /// one `Vec<i64>` per series for a request that mostly has neither.
+    groups: Vec<i64>,
 }
 
-/// One [`Assembler`] per distinct sample timestamp, each pre-loaded with every declaration the
-/// request carried. Declarations are per *request*, not per timestamp, so applying all of them to
-/// each group is both correct and cheap -- a real request has one or two groups.
+impl Routed<'_> {
+    /// The group an exemplar at `timestamp_nanos` belongs to: the group where *this series* has a
+    /// sample at that instant, else the latest group where it has one at all.
+    ///
+    /// An exemplar hangs off a `TimeSeries` rather than off a sample in both versions, so a request
+    /// carrying several timestamps for one series cannot say which sample an exemplar came from and
+    /// this is a choice the wire forces -- see the permitted-normalization list. What it must not
+    /// do is pick a group in which the series has no sample: an exemplar is an example of a
+    /// reading, and inventing a reading-less series to hang it on turns into an `incomplete_series`
+    /// skip that swallows the exemplar on the way past.
+    fn group_for(&self, timestamp_nanos: i64) -> Option<i64> {
+        if self.groups.binary_search(&timestamp_nanos).is_ok() {
+            return Some(timestamp_nanos);
+        }
+        self.groups.last().copied()
+    }
+}
+
+/// One [`Assembler`] per distinct sample timestamp, all sharing one [`Declarations`] table by
+/// reference. Nothing is replayed into a new group: a declared family materializes in a group only
+/// when one of that group's own samples routes to it, which is what keeps a request's cost
+/// proportional to its samples rather than to `timestamps x declarations` (see [`assemble`]'s
+/// "Declaring lazily" section -- both of those numbers come off the wire).
 struct Groups<'a> {
-    declarations: &'a [Declaration],
-    groups: BTreeMap<i64, Assembler>,
+    declarations: &'a Declarations,
+    groups: BTreeMap<i64, Assembler<'a>>,
 }
 
 impl<'a> Groups<'a> {
-    fn new(declarations: &'a [Declaration]) -> Self {
+    fn new(declarations: &'a Declarations) -> Self {
         Groups { declarations, groups: BTreeMap::new() }
     }
 
     /// The group for `timestamp_nanos`, opening it if this is the first sample at that instant.
-    fn at(&mut self, timestamp_nanos: i64, decoder: &mut PrometheusDecoder) -> &mut Assembler {
+    fn at(&mut self, timestamp_nanos: i64) -> &mut Assembler<'a> {
+        let declarations = self.declarations;
         self.groups.entry(timestamp_nanos).or_insert_with(|| {
             // Remote-write has no "untyped" spelling of its own, so an undeclared family is
             // `Unknown` -- OpenMetrics' spelling, and what both metadata enums' zero value means.
-            let mut assembler = Assembler::new(FamilyType::Unknown);
-            for declaration in self.declarations {
-                assembler.declare(
-                    &declaration.name,
-                    declaration.kind,
-                    declaration.help.clone(),
-                    declaration.unit.clone(),
-                    decoder,
-                );
-            }
-            assembler
+            Assembler::new(FamilyType::Unknown).with_declarations(declarations)
         })
     }
 
-    /// The group an *exemplar* belongs to, without opening one: the exact timestamp match when the
-    /// request carried a sample at that instant, else the latest group. An exemplar hangs off a
-    /// `TimeSeries` rather than a sample in both versions, so this is a choice the wire forces --
-    /// see the permitted-normalization list.
-    fn existing(&mut self, timestamp_nanos: i64) -> Option<&mut Assembler> {
-        let key = if self.groups.contains_key(&timestamp_nanos) {
-            timestamp_nanos
-        } else {
-            *self.groups.keys().next_back()?
-        };
-        self.groups.get_mut(&key)
+    /// An existing group, never opening one.
+    fn group(&mut self, timestamp_nanos: i64) -> Option<&mut Assembler<'a>> {
+        self.groups.get_mut(&timestamp_nanos)
     }
 
     fn finish(self, decoder: &mut PrometheusDecoder) -> Vec<Vec<MetricFamily>> {
         // A `BTreeMap` keyed by timestamp already drains in ascending order.
         self.groups.into_values().map(|assembler| assembler.finish(decoder)).collect()
     }
+}
+
+/// Folds one metadata entry into the request's declaration table, first-wins per field. The dedupe
+/// matters for more than tidiness: 2.0 repeats a family's `Metadata` on every one of its wire
+/// series, so without this a five-series histogram would declare itself five times.
+///
+/// Only a *conflict* is counted -- a second entry naming a different type, help or unit for one
+/// family. A sender repeating what it already said is not a dropped input, and
+/// `skipped{reason="duplicate_metadata"}` is a counter operators read as one.
+fn merge_declaration(
+    declarations: &mut Declarations,
+    name: &str,
+    kind: FamilyType,
+    help: Option<String>,
+    unit: Option<String>,
+    decoder: &mut PrometheusDecoder,
+) {
+    let Some(existing) = declarations.get_mut(name) else {
+        declarations.insert(name.to_string(), Declaration { kind, help, unit });
+        return;
+    };
+    if existing.kind != kind {
+        decoder.skipped("duplicate_type");
+    }
+    for (slot, incoming) in [(&mut existing.help, help), (&mut existing.unit, unit)] {
+        match (&slot, incoming) {
+            // A field the first entry left unset is not a conflict, whatever a later one says.
+            (None, incoming) => *slot = incoming,
+            (Some(_), None) => {}
+            (Some(held), Some(incoming)) if **held == incoming => {}
+            (Some(_), Some(_)) => decoder.skipped("duplicate_metadata"),
+        }
+    }
+}
+
+/// Attaches one exemplar to the group [`Routed::group_for`] chooses, counting
+/// `logit.input.metrics.degraded{reason="exemplar_dropped"}` when there is nowhere to put it --
+/// a series whose every sample this codec stepped over, or one that carried exemplars and no
+/// samples at all. Returns whether it was stored, which is what
+/// `X-Prometheus-Remote-Write-Exemplars-Written` reports.
+fn attach_exemplar(
+    groups: &mut Groups<'_>,
+    routed: &Routed<'_>,
+    timestamp_nanos: i64,
+    exemplar: Exemplar,
+    decoder: &mut PrometheusDecoder,
+) -> bool {
+    let stored =
+        routed.group_for(timestamp_nanos).and_then(|group| groups.group(group)).is_some_and(
+            |assembler| assembler.push_exemplar(routed.name, routed.labels.clone(), exemplar),
+        );
+    if !stored {
+        decoder.degraded("exemplar_dropped");
+    }
+    stored
 }
 
 /// A series' `__name__` and its remaining labels, or `None` -- counted `invalid_labels` by the
@@ -400,41 +487,66 @@ fn family_type_v2(value: i32) -> FamilyType {
 fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, CodecError> {
     let request = pb1::WriteRequest::decode(body)
         .map_err(|e| CodecError::Malformed(format!("prometheus.WriteRequest: {e}")))?;
+    if !body.is_empty() && request.timeseries.is_empty() && request.metadata.is_empty() {
+        return Err(CodecError::Malformed(
+            "body is not a prometheus.WriteRequest: it carries no timeseries and no metadata"
+                .into(),
+        ));
+    }
 
-    let declarations: Vec<Declaration> = request
-        .metadata
-        .iter()
-        .map(|metadata| Declaration {
-            name: metadata.metric_family_name.clone(),
-            kind: family_type_v1(metadata.r#type),
-            help: non_empty(&metadata.help),
-            unit: non_empty(&metadata.unit),
-        })
-        .collect();
+    // Pass one: the declaration table. 1.0 names the family explicitly, so an `UNKNOWN` type is
+    // still a real statement about a family that exists -- unlike 2.0's `UNSPECIFIED`, which names
+    // no family at all (see `decode_v2`).
+    let mut declarations = Declarations::new();
+    for metadata in &request.metadata {
+        merge_declaration(
+            &mut declarations,
+            &metadata.metric_family_name,
+            family_type_v1(metadata.r#type),
+            non_empty(&metadata.help),
+            non_empty(&metadata.unit),
+            decoder,
+        );
+    }
 
     let mut groups = Groups::new(&declarations);
     let mut decoded = Decoded::default();
+
+    // Pass two: labels and samples.
+    let mut routed: Vec<Option<Routed<'_>>> = Vec::with_capacity(request.timeseries.len());
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     for series in &request.timeseries {
         pairs.clear();
         pairs.extend(series.labels.iter().map(|l| (l.name.as_str(), l.value.as_str())));
         let Some((name, labels)) = series_labels(&pairs) else {
             decoder.skipped("invalid_labels");
+            routed.push(None);
             continue;
         };
+        let track = !series.exemplars.is_empty();
+        let mut touched = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
-            if push_sample(
-                groups.at(timestamp, decoder),
-                name,
-                &labels,
-                sample.value,
-                timestamp,
-                decoder,
-            ) {
+            if push_sample(groups.at(timestamp), name, &labels, sample.value, timestamp, decoder) {
                 decoded.samples += 1;
+                if track {
+                    touched.push(timestamp);
+                }
             }
         }
+        for _ in &series.histograms {
+            decoded.histograms_skipped += 1;
+            decoder.skipped("native_histogram");
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        routed.push(Some(Routed { name, labels, groups: touched }));
+    }
+
+    // Pass three: exemplars, once every series' samples are in their groups -- see
+    // `Routed::group_for` for why this cannot be done as the samples go past.
+    for (series, routed) in request.timeseries.iter().zip(&routed) {
+        let Some(routed) = routed else { continue };
         for exemplar in &series.exemplars {
             let timestamp = ms_to_nanos(exemplar.timestamp);
             let converted = assemble::exemplar_from_labels(
@@ -442,18 +554,12 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
                 exemplar.value,
                 timestamp,
             );
-            // An exemplar with no group at all to land in has nothing to attach to -- the series
-            // carried no samples this codec kept.
-            let Some(assembler) = groups.existing(timestamp) else { continue };
-            if assembler.push_exemplar(name, labels.clone(), converted, decoder) {
+            if attach_exemplar(&mut groups, routed, timestamp, converted, decoder) {
                 decoded.exemplars += 1;
             }
         }
-        for _ in &series.histograms {
-            decoded.histograms_skipped += 1;
-            decoder.skipped("native_histogram");
-        }
     }
+
     decoded.groups = groups.finish(decoder);
     Ok(decoded)
 }
@@ -461,7 +567,7 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
 /// The one sample-pushing decision both versions share: the stale NaN is a property of the series,
 /// every other value is a reading.
 fn push_sample(
-    assembler: &mut Assembler,
+    assembler: &mut Assembler<'_>,
     name: &str,
     labels: &[(String, String)],
     value: f64,
@@ -532,6 +638,13 @@ fn resolve_refs<'a>(
 fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, CodecError> {
     let request = pb2::Request::decode(body)
         .map_err(|e| CodecError::Malformed(format!("io.prometheus.write.v2.Request: {e}")))?;
+    if !body.is_empty() && request.symbols.is_empty() && request.timeseries.is_empty() {
+        return Err(CodecError::Malformed(
+            "body is not an io.prometheus.write.v2.Request: it carries no symbols and no \
+             timeseries"
+                .into(),
+        ));
+    }
     if request.symbols.first().is_some_and(|first| !first.is_empty()) {
         return Err(CodecError::Malformed(
             "io.prometheus.write.v2.Request: symbols[0] must be the empty string".into(),
@@ -539,8 +652,8 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     }
 
     // Pass one: resolve and validate every series' labels. Doing this before any declaration is
-    // read means a declaration on a *later* series still reaches the group an earlier one opened,
-    // without having to retrofit declarations into groups that already exist.
+    // read means a declaration on a *later* series is still in the table before the first sample
+    // routes.
     let mut resolved: Vec<ResolvedSeries<'_>> = Vec::with_capacity(request.timeseries.len());
     for series in &request.timeseries {
         let pairs = resolve_refs(&request.symbols, &series.labels_refs)?;
@@ -553,38 +666,67 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
         }
     }
 
-    // Pass two: the declarations. 2.0's `Metadata` has no family-name field, so the family is the
-    // sample name with its type's own suffix taken off. Metadata that says nothing at all -- an
-    // unset (or absent) message, which is what a sender with no type to report emits -- declares
-    // nothing, leaving the family implicitly `Unknown` and free for a sibling series to type.
-    let mut declarations = Vec::new();
+    // Pass two: the declaration table, plus the descriptions that cannot become one.
+    //
+    // 2.0's `Metadata` rides every series and names no family, so the family has to be the sample
+    // name with its type's own suffix taken off -- which only works when there *is* a type.
+    // `UNSPECIFIED` therefore declares nothing: `family_base` would strip no suffix, so a series
+    // called `foo_bucket` would declare a family literally called `foo_bucket`, and `route` prefers
+    // an exact name over the suffix scan -- so it would beat a sibling series' `HISTOGRAM`
+    // declaration of `foo` and leave that histogram bucket-less. Any help or unit such a series
+    // carries is applied after its samples route, to whatever family they landed in
+    // (`Assembler::describe`), which is the only question that has an answer.
+    let mut declarations = Declarations::new();
+    let mut described: Vec<UntypedDescription> = Vec::with_capacity(request.timeseries.len());
     for (series, resolved) in request.timeseries.iter().zip(&resolved) {
-        let Some((name, _)) = resolved else { continue };
-        let Some(metadata) = series.metadata else { continue };
+        let Some((name, _)) = resolved else {
+            described.push(None);
+            continue;
+        };
+        let Some(metadata) = series.metadata else {
+            described.push(None);
+            continue;
+        };
         let kind = family_type_v2(metadata.r#type);
         let help = symbol(&request.symbols, metadata.help_ref)?;
         let unit = symbol(&request.symbols, metadata.unit_ref)?;
-        if kind == FamilyType::Unknown && help.is_none() && unit.is_none() {
+        if kind == FamilyType::Unknown {
+            described.push((help.is_some() || unit.is_some()).then_some((help, unit)));
             continue;
         }
-        declarations.push(Declaration {
-            name: assemble::family_base(name, kind).to_string(),
+        described.push(None);
+        merge_declaration(
+            &mut declarations,
+            assemble::family_base(name, kind),
             kind,
             help,
             unit,
-        });
+            decoder,
+        );
     }
 
-    // Pass three: the data.
     let mut groups = Groups::new(&declarations);
     let mut decoded = Decoded::default();
-    for (series, resolved) in request.timeseries.iter().zip(&resolved) {
-        let Some((name, labels)) = resolved else { continue };
+
+    // Pass three: samples, created timestamps, and the untyped descriptions.
+    let mut routed: Vec<Option<Routed<'_>>> = Vec::with_capacity(request.timeseries.len());
+    for ((series, resolved), described) in request.timeseries.iter().zip(resolved).zip(&described) {
+        // `resolved` is consumed, not borrowed: the labels move into `Routed` for the exemplar pass
+        // rather than being cloned once per series.
+        let Some((name, labels)) = resolved else {
+            routed.push(None);
+            continue;
+        };
+        let track = !series.exemplars.is_empty() || described.is_some();
+        let mut touched = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
-            let assembler = groups.at(timestamp, decoder);
-            if push_sample(assembler, name, labels, sample.value, timestamp, decoder) {
+            let assembler = groups.at(timestamp);
+            if push_sample(assembler, name, &labels, sample.value, timestamp, decoder) {
                 decoded.samples += 1;
+                if track {
+                    touched.push(timestamp);
+                }
             }
             if sample.start_timestamp != 0 {
                 assembler.push_created(
@@ -595,6 +737,25 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
                 );
             }
         }
+        for _ in &series.histograms {
+            decoded.histograms_skipped += 1;
+            decoder.skipped("native_histogram");
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        if let Some((help, unit)) = described {
+            for timestamp in &touched {
+                if let Some(assembler) = groups.group(*timestamp) {
+                    assembler.describe(name, help.clone(), unit.clone());
+                }
+            }
+        }
+        routed.push(Some(Routed { name, labels, groups: touched }));
+    }
+
+    // Pass four: exemplars.
+    for (series, routed) in request.timeseries.iter().zip(&routed) {
+        let Some(routed) = routed else { continue };
         for exemplar in &series.exemplars {
             let pairs = resolve_refs(&request.symbols, &exemplar.labels_refs)?;
             let timestamp = ms_to_nanos(exemplar.timestamp);
@@ -603,16 +764,12 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
                 exemplar.value,
                 timestamp,
             );
-            let Some(assembler) = groups.existing(timestamp) else { continue };
-            if assembler.push_exemplar(name, labels.clone(), converted, decoder) {
+            if attach_exemplar(&mut groups, routed, timestamp, converted, decoder) {
                 decoded.exemplars += 1;
             }
         }
-        for _ in &series.histograms {
-            decoded.histograms_skipped += 1;
-            decoder.skipped("native_histogram");
-        }
     }
+
     decoded.groups = groups.finish(decoder);
     Ok(decoded)
 }
@@ -778,10 +935,32 @@ fn flatten(
             out.push(plain(primary.into_owned(), if *on { 1.0 } else { 0.0 }));
         }
         Point::Stale => {
-            // A stale marker replaces the family's value sample: one sample, no reading, the
-            // reserved NaN payload. There is nothing for an exemplar to be an example of.
+            // A stale marker replaces the family's value samples: no reading, the reserved NaN
+            // payload, and nothing for an exemplar to be an example of.
+            //
+            // It has to go on a name the *decoder* routes back to this family, which for a
+            // histogram or a summary is not the bare family name -- those types have no sample
+            // called that (`bare_name_role`), so a marker there would come back
+            // `unknown_suffix`/`malformed_line` and the series would vanish on a 1.0-to-2.0
+            // transcode or a receiver-to-sender relay. `_count`/`_sum` (`_gcount`/`_gsum` for a
+            // gaugehistogram) are names those types do have, and a stale NaN in any role flags the
+            // whole series stale, so either one alone would do; both are sent because a Prometheus
+            // marking a metric stale marks every series of it, and a receiver that reads only one
+            // of them still gets the message.
             drop_exemplars(encoder);
-            out.push(plain(primary.into_owned(), f64::from_bits(STALE_NAN_BITS)));
+            let stale = f64::from_bits(STALE_NAN_BITS);
+            let suffixes: &[&str] = match family.kind {
+                FamilyType::Histogram | FamilyType::Summary => &["_count", "_sum"],
+                FamilyType::GaugeHistogram => &["_gcount", "_gsum"],
+                _ => &[],
+            };
+            if suffixes.is_empty() {
+                out.push(plain(primary.into_owned(), stale));
+            } else {
+                for suffix in suffixes {
+                    out.push(plain(format!("{}{suffix}", family.name), stale));
+                }
+            }
         }
         Point::Histogram { buckets, sum, count } => {
             let gauge_histogram = family.kind == FamilyType::GaugeHistogram;
