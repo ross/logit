@@ -71,11 +71,15 @@ io/prometheus/write/v2/types.proto
 "types.proto"`s its sibling in the same directory, and both `import "gogoproto/gogo.proto"`; the
 2.0 file (package `io.prometheus.write.v2`, self-contained -- it references no `prometheus`-package
 type) also imports `gogoproto/gogo.proto` only. Neither prompb file imports the other, so
-`tools/protogen`'s Prometheus family passes two include roots: this `prometheus/prompb/` directory
-(so `types.proto` and the nested v2 file resolve) and this `proto/` directory itself (so
-`gogoproto/gogo.proto` resolves). `gogoproto/gogo.proto`'s own `import
-"google/protobuf/descriptor.proto"` resolves against `protoc`'s bundled well-known-types include
-path, which needs no vendoring here.
+`tools/protogen`'s Prometheus family passes **three** include roots (`tools/protogen/src/main.rs`):
+this `prometheus/prompb/` directory (so `types.proto` and the nested v2 file resolve), this
+`proto/` directory itself (so `gogoproto/gogo.proto` resolves), and `/usr/include` (so
+`gogoproto/gogo.proto`'s own `import "google/protobuf/descriptor.proto"` resolves).
+`/usr/include/google/protobuf/*.proto` is *not* something Debian's `protobuf-compiler` package
+ships on its own -- `tools/protogen/Dockerfile` installs `libprotobuf-dev` specifically to put
+those well-known-type sources on disk there; without it `protoc` fails with
+`google/protobuf/descriptor.proto: File not found`. A re-vendor that drops the third include root
+(or the `libprotobuf-dev` install) will hit that failure again.
 
 Also vendored, under `gogoproto/`:
 
@@ -86,9 +90,17 @@ gogo.proto
 from [`gogo/protobuf`](https://github.com/gogo/protobuf) at commit
 `f67b8970b736e53dbd7d0a27146c8f1ac52f74e5` (the tip of `master` at fetch time; gogo/protobuf cuts
 no recent tags). The only gogoproto extension the vendored prompb files use is
-`(gogoproto.nullable) = false`, applied only to `repeated` fields -- a no-op for `prost`, which
-never wraps a `repeated` field in `Option` regardless of this option, so no prost-build
-customization is needed to honor it correctly.
+`(gogoproto.nullable) = false`, almost always applied to `repeated` fields -- a no-op for `prost`,
+which never wraps a `repeated` field in `Option` regardless of this option, so no prost-build
+customization is needed to honor it correctly there. **One exception:**
+`io.prometheus.write.v2.TimeSeries.metadata` (`prompb/io/prometheus/write/v2/types.proto:80`,
+`Metadata metadata = 5 [(gogoproto.nullable) = false];`) is a **singular** message field, not a
+`repeated` one -- gogo renders it as a by-value struct whose marshaller always emits field 5, but
+`prost` has no way to honor `nullable = false` on a singular message field and generates
+`pub metadata: Option<Metadata>` regardless (`generated/io.prometheus.write.v2.rs:58-59`). Remote-write
+2.0 requires per-series metadata, so **the W2 codec must always populate `Some(Metadata { .. })` on
+encode**, and treat `None` on decode as "unspecified" rather than as evidence the field can
+legitimately be absent on the wire.
 
 Regenerating this family works the same way as OTLP's above: `script/protogen` overwrites
 `crates/logit-proto/src/prometheus/generated/{prometheus.rs,io.prometheus.write.v2.rs}`; review the
