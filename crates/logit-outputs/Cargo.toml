@@ -43,6 +43,10 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# `prometheus.rs`'s remote-write sender tests decode the request body they captured as the real
+# vendored prompb message (`logit_proto::prometheus::generated`), rather than asserting against
+# this codec's own view of what it wrote.
+prost.workspace = true
 # Only for the end-to-end regression test that a Lua enrichment stage doesn't silently change an
 # attribute's InfluxDB tag-inclusion behavior -- see
 # bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage below.

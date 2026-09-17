@@ -1277,6 +1277,11 @@ mod tests {
         Summary, Temporality, Value,
     };
     use logit_proto::prometheus::{ATTR_TIMESTAMP, ATTR_TYPE, LABEL_INSTANCE};
+    // The vendored prompb types, so a sender test asserts against the *message* a receiver would
+    // decode rather than against this codec's own view of it (`crates/logit-proto/proto/`).
+    use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
+    use logit_proto::prometheus::generated::prometheus as pb1;
+    use prost::Message as _;
 
     // -- fixtures ---------------------------------------------------------------------------
 
@@ -1991,5 +1996,623 @@ mod tests {
 
     fn counter(registry: &logit_core::Registry, name: &str, tag: &str, value: &str) -> f64 {
         tagged(&registry.drain(0), name, tag, value)
+    }
+
+    // -- sender mode: a canned remote-write receiver ------------------------------------------
+
+    /// One request as a canned receiver saw it -- enough to assert everything the wire contract
+    /// promises without either side sharing code with the other.
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        method: Method,
+        path: String,
+        headers: http::HeaderMap,
+        /// Still Snappy-compressed, exactly as it arrived.
+        body: Vec<u8>,
+    }
+
+    impl CapturedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers.get(name).and_then(|v| v.to_str().ok())
+        }
+
+        /// The decompressed protobuf body -- Snappy *block* format, which is what both specs mean
+        /// by `Content-Encoding: snappy`. A test asserting this decompresses at all is asserting
+        /// the sink didn't reach for the framed encoder.
+        fn decompressed(&self) -> Vec<u8> {
+            snap::raw::Decoder::new()
+                .decompress_vec(&self.body)
+                .expect("the body should be a snappy block")
+        }
+
+        fn as_v1(&self) -> pb1::WriteRequest {
+            pb1::WriteRequest::decode(self.decompressed().as_slice())
+                .expect("the body should decode as prometheus.WriteRequest")
+        }
+
+        fn as_v2(&self) -> pb2::Request {
+            pb2::Request::decode(self.decompressed().as_slice())
+                .expect("the body should decode as io.prometheus.write.v2.Request")
+        }
+    }
+
+    /// A real HTTP/1.1 receiver answering `status` with `body` and recording every request it
+    /// saw. A real server rather than a raw-socket canned response (`otlp.rs`'s pattern) because
+    /// these assertions are about the *request*: the headers, the path, and a body this test then
+    /// decompresses and prost-decodes.
+    async fn canned_receiver(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let seen_conn = Arc::clone(&seen_task);
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            service_fn(move |req| {
+                                let seen = Arc::clone(&seen_conn);
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        record(req, seen, status, body).await,
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}/api/v1/write"), seen)
+    }
+
+    /// The TLS-wrapped twin of [`canned_receiver`], presenting `testdata/tls/server.pem`. ALPN
+    /// offers `http/1.1` only, since this test server speaks `hyper::server::conn::http1`.
+    async fn canned_tls_receiver(
+        require_client_auth: bool,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(http1_server_tls_config(require_client_auth));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let acceptor = acceptor.clone();
+                let seen_conn = Arc::clone(&seen_task);
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else { return };
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(tls_stream),
+                            service_fn(move |req| {
+                                let seen = Arc::clone(&seen_conn);
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        record(req, seen, StatusCode::OK, "").await,
+                                    )
+                                }
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("https://{addr}/api/v1/write"), seen)
+    }
+
+    async fn record(
+        req: http::Request<hyper::body::Incoming>,
+        seen: Arc<Mutex<Vec<CapturedRequest>>>,
+        status: StatusCode,
+        body: &'static str,
+    ) -> http::Response<Full<Bytes>> {
+        use http_body_util::BodyExt as _;
+        let (parts, incoming) = req.into_parts();
+        let collected = incoming.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+        seen.lock().unwrap().push(CapturedRequest {
+            method: parts.method,
+            path: parts.uri.path().to_string(),
+            headers: parts.headers,
+            body: collected.to_vec(),
+        });
+        http::Response::builder()
+            .status(status)
+            .body(Full::new(Bytes::from_static(body.as_bytes())))
+            .expect("a well-formed response always builds")
+    }
+
+    /// `otlp.rs`'s own test-only server config, with ALPN narrowed to HTTP/1.1.
+    fn http1_server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
+        use rustls_pki_types::pem::PemObject as _;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        let dir = testdata_tls_dir();
+        let chain: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(dir.join("server.pem"))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let key = PrivateKeyDer::from_pem_file(dir.join("server.key")).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let mut cfg = if require_client_auth {
+            let mut roots = rustls::RootCertStore::empty();
+            let ca: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_file_iter(dir.join("ca.pem"))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            roots.add_parsable_certificates(ca);
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap();
+            builder.with_client_cert_verifier(verifier).with_single_cert(chain, key).unwrap()
+        } else {
+            builder.with_no_client_auth().with_single_cert(chain, key).unwrap()
+        };
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    }
+
+    /// `logit-outputs` lives at `crates/logit-outputs`; the fixtures live at the repo root's
+    /// `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+    fn testdata_tls_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
+    }
+
+    fn sender(endpoint: &str) -> RemoteWriteOutput {
+        RemoteWriteOutput::new(endpoint)
+    }
+
+    /// One cumulative counter at one timestamp -- the smallest batch that produces a request.
+    fn counter_batch(timestamp: i64, value: f64) -> EventBatch {
+        batch(vec![Event::metric(
+            timestamp,
+            AttrMap::new(),
+            MetricRecord::new(intern("http_requests"), cumulative_counter(value)),
+        )])
+    }
+
+    fn only(seen: &Arc<Mutex<Vec<CapturedRequest>>>) -> CapturedRequest {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "expected exactly one request, got {}", seen.len());
+        seen[0].clone()
+    }
+
+    // -- sender mode: the wire ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_batch_is_posted_to_the_configured_url_with_the_four_protocol_headers() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        sink.send(&counter_batch(1_700_000_000_000_000_000, 5.0)).await.expect("2xx is Ok");
+
+        let request = only(&seen);
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.path, "/api/v1/write", "the endpoint's own path is used verbatim");
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/x-protobuf;proto=prometheus.WriteRequest")
+        );
+        assert_eq!(request.header("content-encoding"), Some("snappy"));
+        assert_eq!(request.header("x-prometheus-remote-write-version"), Some("0.1.0"));
+        assert_eq!(
+            request.header("user-agent"),
+            Some(concat!("logit/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    #[tokio::test]
+    async fn version_2_switches_the_content_type_the_version_header_and_the_message() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url).with_version(remote_write::Version::V2);
+        sink.send(&counter_batch(1_700_000_000_000_000_000, 5.0)).await.expect("2xx is Ok");
+
+        let request = only(&seen);
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/x-protobuf;proto=io.prometheus.write.v2.Request")
+        );
+        assert_eq!(request.header("x-prometheus-remote-write-version"), Some("2.0.0"));
+        let decoded = request.as_v2();
+        assert_eq!(decoded.symbols.first().map(String::as_str), Some(""), "symbols[0] is empty");
+        assert_eq!(decoded.timeseries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_operator_header_rides_along_and_a_protocol_owned_one_is_overridden() {
+        // Rule 56 rejects `content-type` in `headers:` at config time -- this proves the
+        // defense-in-depth guarantee directly, bypassing that rule via `with_headers`.
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url)
+            .with_headers(&HashMap::from([
+                ("X-Scope-OrgID".to_string(), "tenant-a".to_string()),
+                ("content-type".to_string(), "text/plain".to_string()),
+            ]))
+            .expect("both names are lexically legal headers");
+        sink.send(&counter_batch(1_700_000_000_000_000_000, 5.0)).await.expect("2xx is Ok");
+
+        let request = only(&seen);
+        assert_eq!(request.header("x-scope-orgid"), Some("tenant-a"));
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/x-protobuf;proto=prometheus.WriteRequest"),
+            "a protocol-owned name is inserted over the operator's, never appended to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_body_is_a_snappy_block_that_decodes_as_a_write_request() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        sink.send(&counter_batch(1_700_000_000_500_000_000, 5.0)).await.expect("2xx is Ok");
+
+        let decoded = only(&seen).as_v1();
+        assert_eq!(decoded.timeseries.len(), 1);
+        let series = &decoded.timeseries[0];
+        let name = series
+            .labels
+            .iter()
+            .find(|l| l.name == "__name__")
+            .map(|l| l.value.as_str())
+            .expect("every series carries __name__");
+        assert_eq!(name, "http_requests_total", "a counter gains _total on the wire");
+        assert_eq!(series.samples.len(), 1);
+        assert_eq!(series.samples[0].value, 5.0);
+        assert_eq!(
+            series.samples[0].timestamp, 1_700_000_000_500,
+            "nanoseconds truncate to milliseconds on the wire"
+        );
+    }
+
+    /// The timestamp partition, inverted: three events at three instants for one series become
+    /// **one** `TimeSeries` with three samples in ascending timestamp order, not three series.
+    #[tokio::test]
+    async fn a_multi_timestamp_batch_becomes_one_timeseries_with_ordered_samples() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        // Deliberately out of order in the batch: ascending order is the partition's, not the
+        // caller's.
+        sink.send(&batch(vec![
+            Event::metric(
+                3_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("http_requests"), cumulative_counter(3.0)),
+            ),
+            Event::metric(
+                1_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("http_requests"), cumulative_counter(1.0)),
+            ),
+            Event::metric(
+                2_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("http_requests"), cumulative_counter(2.0)),
+            ),
+        ]))
+        .await
+        .expect("2xx is Ok");
+
+        let decoded = only(&seen).as_v1();
+        assert_eq!(decoded.timeseries.len(), 1, "one label set is one TimeSeries");
+        let samples = &decoded.timeseries[0].samples;
+        assert_eq!(
+            samples.iter().map(|s| (s.timestamp, s.value)).collect::<Vec<_>>(),
+            vec![(1_000, 1.0), (2_000, 2.0), (3_000, 3.0)]
+        );
+    }
+
+    /// `with_stale_markers(true)`: a `FLAG_NO_RECORDED_VALUE` gauge is Prometheus's own stale
+    /// marker on the wire, not a skipped series. The exposition path would skip and count it.
+    #[tokio::test]
+    async fn a_flagged_gauge_is_sent_as_a_stale_nan_sample() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        let mut record = MetricRecord::new(intern("temperature"), MetricKind::Gauge(0.0));
+        record.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        sink.send(&batch(vec![Event::metric(1_000_000_000, AttrMap::new(), record)]))
+            .await
+            .expect("2xx is Ok");
+
+        let decoded = only(&seen).as_v1();
+        assert_eq!(decoded.timeseries.len(), 1);
+        let value = decoded.timeseries[0].samples[0].value;
+        assert_eq!(
+            value.to_bits(),
+            logit_proto::prometheus::STALE_NAN_BITS,
+            "the stale marker is a specific NaN payload, not any NaN"
+        );
+    }
+
+    /// Delta temporality has no spelling in remote-write either -- skipped and counted, with the
+    /// same named fix the exposition path gives.
+    #[tokio::test]
+    async fn a_delta_sum_is_skipped_and_counted_with_no_request_left_to_send() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let registry = logit_core::Registry::new();
+        let mut sink =
+            sender(&url).with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        sink.send(&batch(vec![Event::metric(
+            1_000_000_000,
+            AttrMap::new(),
+            MetricRecord::new(
+                intern("requests"),
+                MetricKind::Sum(Sum {
+                    value: 1.0,
+                    temporality: Temporality::Delta,
+                    monotonic: true,
+                }),
+            ),
+        )]))
+        .await
+        .expect("a skipped record is not a failure");
+
+        assert_eq!(
+            counter(&registry, "logit.output.metrics.skipped", "metric_kind", "delta_sum"),
+            1.0
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing survived, so nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_sends_no_request_at_all() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        sink.send(&batch(vec![])).await.expect("an empty batch is a no-op");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    // -- sender mode: telemetry ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_successful_request_counts_its_class_its_duration_and_its_samples() {
+        let (url, _seen) = canned_receiver(StatusCode::OK, "").await;
+        let registry = logit_core::Registry::new();
+        let mut sink =
+            sender(&url).with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        // Two series at two timestamps: four samples, which is neither the family count (2) nor
+        // the event count (4 records over 2 events) by accident.
+        sink.send(&batch(vec![
+            Event::metric(
+                1_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("a"), MetricKind::Gauge(1.0)),
+            ),
+            Event::metric(
+                1_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("b"), MetricKind::Gauge(2.0)),
+            ),
+            Event::metric(
+                2_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("a"), MetricKind::Gauge(3.0)),
+            ),
+            Event::metric(
+                2_000_000_000,
+                AttrMap::new(),
+                MetricRecord::new(intern("b"), MetricKind::Gauge(4.0)),
+            ),
+        ]))
+        .await
+        .expect("2xx is Ok");
+
+        let events = registry.drain(0);
+        assert_eq!(tagged(&events, "logit.output.requests", "class", "2xx"), 1.0);
+        assert_eq!(
+            events
+                .iter()
+                .flat_map(|e| &e.metrics)
+                .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.samples")
+                .map(|m| match m.kind {
+                    MetricKind::Sum(ref s) => s.value,
+                    ref other => panic!("samples should be a counter, got {other:?}"),
+                })
+                .sum::<f64>(),
+            4.0
+        );
+        assert!(
+            events.iter().flat_map(|e| &e.metrics).any(|m| {
+                logit_core::interner::resolve(m.name) == "logit.output.request.duration"
+            }),
+            "one timer per request actually issued"
+        );
+    }
+
+    // -- sender mode: fault classification -----------------------------------------------------
+
+    #[tokio::test]
+    async fn a_5xx_and_a_429_are_ambiguous_and_counted_by_class() {
+        for (status, class) in
+            [(StatusCode::INTERNAL_SERVER_ERROR, "5xx"), (StatusCode::TOO_MANY_REQUESTS, "4xx")]
+        {
+            let (url, _seen) = canned_receiver(status, "").await;
+            let registry = logit_core::Registry::new();
+            let mut sink = sender(&url).with_telemetry(registry.telemetry_for(
+                "out",
+                "prometheus_out",
+                "sink",
+            ));
+            let err = sink
+                .send(&counter_batch(1_000_000_000, 1.0))
+                .await
+                .expect_err("a rejection is an error");
+            assert_eq!(
+                logit_pipeline::classify(&err),
+                Fault::Ambiguous,
+                "{status}: the request reached the server and may have been partly applied"
+            );
+            assert_eq!(counter(&registry, "logit.output.requests", "class", class), 1.0);
+        }
+    }
+
+    /// A `400` is permanent, and its body is the useful half of the exchange -- Prometheus names
+    /// the offending series in it.
+    #[tokio::test]
+    async fn a_400_is_permanent_and_carries_the_response_body_in_its_message() {
+        let (url, _seen) =
+            canned_receiver(StatusCode::BAD_REQUEST, "out of order sample for series {x=\"1\"}")
+                .await;
+        let mut sink = sender(&url);
+        let err =
+            sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("a 400 is an error");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert!(logit_pipeline::is_explicitly_permanent(&err), "never retried under any posture");
+        let message = format!("{err:#}");
+        assert!(message.contains("400"), "got: {message}");
+        assert!(message.contains("out of order sample"), "got: {message}");
+    }
+
+    /// The snippet is bounded: a receiver answering with a page of HTML must not become a log
+    /// line of one.
+    #[test]
+    fn a_long_rejection_body_is_truncated_on_a_character_boundary() {
+        let long = "é".repeat(400);
+        let snippet = body_snippet(&long);
+        assert!(snippet.len() <= ERROR_BODY_SNIPPET_BYTES + 3, "got {} bytes", snippet.len());
+        assert!(snippet.ends_with("..."));
+        assert_eq!(body_snippet("  short  "), "short", "trimmed, and not truncated");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_clean() {
+        // Bound and immediately dropped, so the port is (almost certainly) unused and closed --
+        // `influxdb.rs`'s own "nothing is listening" pattern.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let registry = logit_core::Registry::new();
+        let mut sink = sender(&format!("http://{addr}/api/v1/write"))
+            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        let err =
+            sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("nothing is listening");
+        assert_eq!(
+            logit_pipeline::classify(&err),
+            Fault::Clean,
+            "a connect failure provably never reached a receiver"
+        );
+        assert_eq!(counter(&registry, "logit.output.requests", "class", "network_error"), 1.0);
+    }
+
+    // -- sender mode: TLS, lifecycle, posture --------------------------------------------------
+
+    #[tokio::test]
+    async fn an_https_endpoint_with_a_trusted_ca_file_delivers() {
+        let (url, seen) = canned_tls_receiver(false).await;
+        let mut sink = sender(&url)
+            .with_tls(
+                &TlsClientSettings { ca_file: Some("ca.pem".to_string()), ..Default::default() },
+                &testdata_tls_dir(),
+            )
+            .expect("the fixture CA loads");
+        sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("a trusted CA handshakes");
+        assert_eq!(only(&seen).path, "/api/v1/write");
+    }
+
+    #[tokio::test]
+    async fn an_https_endpoint_with_an_untrusted_ca_fails_cleanly() {
+        let (url, _seen) = canned_tls_receiver(false).await;
+        let mut sink = sender(&url)
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("other-ca.pem".to_string()),
+                    ..Default::default()
+                },
+                &testdata_tls_dir(),
+            )
+            .expect("the other CA loads too -- it just doesn't sign this server");
+        let err = sink
+            .send(&counter_batch(1_000_000_000, 1.0))
+            .await
+            .expect_err("an untrusted CA should fail");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
+    }
+
+    #[tokio::test]
+    async fn an_https_endpoint_requiring_a_client_certificate_gets_one() {
+        let (url, seen) = canned_tls_receiver(true).await;
+        let mut sink = sender(&url)
+            .with_tls(
+                &TlsClientSettings {
+                    ca_file: Some("ca.pem".to_string()),
+                    cert_file: Some("client.pem".to_string()),
+                    key_file: Some("client.key".to_string()),
+                    ..Default::default()
+                },
+                &testdata_tls_dir(),
+            )
+            .expect("the fixture client certificate loads");
+        sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("mutual TLS handshakes");
+        assert_eq!(only(&seen).path, "/api/v1/write");
+    }
+
+    #[tokio::test]
+    async fn the_sender_binds_and_flushes_as_no_ops() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url);
+        sink.bind().await.expect("there is nothing to bind");
+        sink.flush().await.expect("there is nothing to flush");
+        assert!(seen.lock().unwrap().is_empty(), "neither hook touches the network");
+    }
+
+    /// `true` is what selects `AtLeastOnce`, which is the only posture under which the
+    /// `Fault::Ambiguous` a 5xx produces is retried -- see the module doc.
+    #[test]
+    fn the_sender_is_duplicate_safe_and_that_selects_at_least_once() {
+        let sink = RemoteWriteOutput::new("http://mimir:8080/api/v1/push");
+        assert!(sink.duplicate_safe());
+        assert_eq!(
+            logit_pipeline::DeliveryPosture::from_duplicate_safe(sink.duplicate_safe()),
+            logit_pipeline::DeliveryPosture::AtLeastOnce
+        );
+    }
+
+    #[test]
+    fn a_header_name_that_is_not_a_legal_http_header_is_rejected_at_construction() {
+        // `let ... else`, not `expect_err`: the `Ok` side is a whole sink, which has no reason to
+        // be `Debug` just so a test can name it.
+        let Err(err) = RemoteWriteOutput::new("http://mimir:8080/api/v1/push")
+            .with_headers(&HashMap::from([("bad header".to_string(), "x".to_string())]))
+        else {
+            panic!("a space is not legal in a header name");
+        };
+        assert!(format!("{err:#}").contains("not a legal header name"), "got: {err:#}");
+
+        let Err(err) =
+            RemoteWriteOutput::new("http://mimir:8080/api/v1/push").with_headers(&HashMap::from([
+                ("X-A".to_string(), "1".to_string()),
+                ("x-a".to_string(), "2".to_string()),
+            ]))
+        else {
+            panic!("two names collide once case is normalized");
+        };
+        assert!(format!("{err:#}").contains("collides"), "got: {err:#}");
+    }
+
+    /// The mode enum delegates and decides nothing of its own.
+    #[tokio::test]
+    async fn the_mode_enum_delegates_to_the_selected_half() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink: PrometheusOutput = RemoteWriteOutput::new(&url).into();
+        assert!(sink.duplicate_safe());
+        sink.bind().await.expect("a sender has nothing to bind");
+        sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect("2xx is Ok");
+        sink.flush().await.expect("a sender has nothing to flush");
+        assert_eq!(only(&seen).method, Method::POST);
+
+        let mut sink: PrometheusOutput = ExposeOutput::new("127.0.0.1:0").into();
+        assert!(sink.duplicate_safe());
+        sink.bind().await.expect("the exposition half binds");
+        sink.send(&fixture_batch()).await.expect("the exposition half never fails a send");
+        sink.flush().await.expect("the exposition half aborts its accept loop");
     }
 }

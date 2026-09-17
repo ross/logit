@@ -1828,6 +1828,41 @@ mod tests {
         ));
     }
 
+    /// The other half of the same arm: `endpoint:` builds the remote-write sender, with the
+    /// config-facing integer `version:` translated into the codec's own `Version`. Nothing is
+    /// dialed here -- this sink connects per request.
+    #[test]
+    fn build_spec_builds_a_prometheus_remote_write_sink() {
+        for version in [logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteVersion::V2]
+        {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                targets: Vec::new(),
+                consumers: vec![],
+                kind: ComponentKind::PrometheusOut {
+                    bind: None,
+                    path: logit_config::default_prometheus_path(),
+                    expire_after: logit_config::default_prometheus_expire_after(),
+                    max_series: logit_config::default_prometheus_max_series(),
+                    endpoint: Some("http://mimir:8080/api/v1/push".to_string()),
+                    version,
+                    timeout: Duration::from_secs(30),
+                    headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
+                    endpoint_tls: logit_config::TlsClientConfig::default(),
+                },
+            };
+            assert!(
+                matches!(
+                    build_spec("out", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Output(_, _, _)
+                ),
+                "version {version:?}"
+            );
+        }
+    }
+
     #[test]
     fn build_spec_builds_a_null_sink() {
         let component = ResolvedComponent {

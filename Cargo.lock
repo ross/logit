@@ -1025,6 +1025,7 @@ dependencies = [
  "logit-proto",
  "logit-script",
  "proptest",
+ "prost",
  "reqwest",
  "rustls",
  "rustls-pki-types",
