@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-13
+updated: 2026-09-17
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -371,6 +371,11 @@ NodeState::Bound)` bookkeeping extend to `NodeSpec::Output` alongside `NodeSpec:
 this true.
 
 ### Remote-write forward compatibility
+
+**2026-09-17: landed as [ADR `prometheus-remote-write`](prometheus-remote-write.md)**, which takes
+this seam as given and changes none of it — except that the `tls:` field named below is now
+`scrape_tls:`, since `prometheus_in` gained a second, server-side TLS role (`bind_tls:`) and every
+TLS key on the kind is prefixed by the mode it serves.
 
 Nothing here is built yet; this section fixes the seam so that adding it later is additive to
 `prometheus_in`/`prometheus_out`, never a third `_in`/`_out` pair or a breaking change to config
