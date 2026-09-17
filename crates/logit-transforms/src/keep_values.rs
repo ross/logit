@@ -163,11 +163,11 @@ fn clamp_field(clamp: &Clamp, attrs: &mut logit_core::AttrMap, telemetry: &Telem
 }
 
 impl Transform for KeepValues {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         for clamp in &self.attribute_fields {
             clamp_field(clamp, &mut event.attributes, &self.telemetry);
         }
-        Some(event)
+        true
     }
 
     fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
@@ -249,8 +249,8 @@ mod tests {
     fn an_allowed_value_is_untouched() {
         let mut kv = allow_only("host", &["static.local", "proxy.local"]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("static.local"))]);
-        let event = kv.process(&resource, event).expect("never drops");
+        let mut event = event_with_attrs(&[("host", Value::str("static.local"))]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
     }
 
@@ -258,8 +258,8 @@ mod tests {
     fn a_disallowed_value_is_replaced_with_other() {
         let mut kv = allow_with_other("host", &["static.local"], "other");
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("junk.example"))]);
-        let event = kv.process(&resource, event).expect("never drops");
+        let mut event = event_with_attrs(&[("host", Value::str("junk.example"))]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(event.attributes.get("host"), Some(&Value::str("other")));
     }
 
@@ -267,8 +267,8 @@ mod tests {
     fn a_disallowed_value_is_removed_when_other_is_absent() {
         let mut kv = allow_only("host", &["static.local"]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("junk.example"))]);
-        let event = kv.process(&resource, event).expect("never drops");
+        let mut event = event_with_attrs(&[("host", Value::str("junk.example"))]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(event.attributes.get("host"), None);
     }
 
@@ -276,7 +276,8 @@ mod tests {
     fn an_absent_attribute_is_a_no_op_never_a_stamp() {
         let mut kv = allow_with_other("host", &["static.local"], "other");
         let resource = default_resource();
-        let event = kv.process(&resource, event_with_attrs(&[])).expect("never drops");
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(event.attributes.get("host"), None, "must not invent the field");
     }
 
@@ -287,8 +288,8 @@ mod tests {
             vec![("status".to_string(), vec![], vec![Value::I64(200)], None)],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[("status", Value::str("200"))]);
-        let event = kv.process(&resource, event).expect("never drops");
+        let mut event = event_with_attrs(&[("status", Value::str("200"))]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(
             event.attributes.get("status"),
             Some(&Value::str("200")),
@@ -303,8 +304,8 @@ mod tests {
             vec![("sampled".to_string(), vec![], vec![Value::Bool(true)], None)],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[("sampled", Value::str("true"))]);
-        let event = kv.process(&resource, event).expect("never drops");
+        let mut event = event_with_attrs(&[("sampled", Value::str("true"))]);
+        assert!(kv.process(&resource, &mut event), "never drops");
         assert_eq!(event.attributes.get("sampled"), None, "a bool must not match a string");
     }
 
@@ -368,7 +369,7 @@ mod tests {
         let original_message = event.log.as_ref().unwrap().message.clone();
 
         let mut kv = allow_with_other("host", &["static.local"], "other");
-        let event = kv.process(&resource, event).unwrap();
+        assert!(kv.process(&resource, &mut event));
         assert_eq!(event.metrics.len(), 1, "keep_values must not touch metrics");
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
     }
@@ -385,11 +386,11 @@ mod tests {
             )],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("junk.example"))]);
-        let once = kv.process(&resource, event).unwrap();
-        assert_eq!(once.attributes.get("host"), Some(&Value::str("other")));
-        let twice = kv.process(&resource, once).unwrap();
-        assert_eq!(twice.attributes.get("host"), Some(&Value::str("other")));
+        let mut event = event_with_attrs(&[("host", Value::str("junk.example"))]);
+        assert!(kv.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("host"), Some(&Value::str("other")));
+        assert!(kv.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("host"), Some(&Value::str("other")));
     }
 
     // -- normalize --------------------------------------------------------------------------
@@ -410,8 +411,8 @@ mod tests {
     fn an_uppercase_allowed_value_is_written_back_lowercased() {
         let mut kv = lower_allow("host", &["static.local"], None);
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("STATIC.Local"))]);
-        let event = kv.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("host", Value::str("STATIC.Local"))]);
+        assert!(kv.process(&resource, &mut event));
         assert_eq!(
             event.attributes.get("host"),
             Some(&Value::str("static.local")),
@@ -425,8 +426,8 @@ mod tests {
         // through to `other` -- proving the order, not just the write-back.
         let mut kv = lower_allow("host", &["static.local"], Some("other"));
         let resource = default_resource();
-        let event = event_with_attrs(&[("host", Value::str("STATIC.Local"))]);
-        let event = kv.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("host", Value::str("STATIC.Local"))]);
+        assert!(kv.process(&resource, &mut event));
         assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
     }
 
@@ -436,7 +437,8 @@ mod tests {
         let telemetry = registry.telemetry_for("host_clamp", "keep_values", "transform");
         let mut kv = lower_allow("host", &["static.local"], None).with_telemetry(telemetry);
         let resource = default_resource();
-        kv.process(&resource, event_with_attrs(&[("host", Value::str("static.local"))])).unwrap();
+        let mut event = event_with_attrs(&[("host", Value::str("static.local"))]);
+        assert!(kv.process(&resource, &mut event));
 
         let events = registry.drain(0);
         assert_eq!(
@@ -451,8 +453,8 @@ mod tests {
         for value in [Value::I64(1), Value::Bool(true), Value::Null] {
             let mut kv = lower_allow("f", &["x"], None);
             let resource = default_resource();
-            let event = event_with_attrs(&[("f", value.clone())]);
-            let event = kv.process(&resource, event).unwrap();
+            let mut event = event_with_attrs(&[("f", value.clone())]);
+            assert!(kv.process(&resource, &mut event));
             assert_eq!(event.attributes.get("f"), None, "{value:?} never matches 'x' and clamps");
         }
     }
@@ -469,9 +471,9 @@ mod tests {
             )],
         );
         let resource = default_resource();
-        let event =
+        let mut event =
             event_with_attrs(&[("raw", Value::Bytes(bytes::Bytes::from_static(b"A\xffB")))]);
-        let event = kv.process(&resource, event).unwrap();
+        assert!(kv.process(&resource, &mut event));
         assert_eq!(
             event.attributes.get("raw"),
             Some(&Value::Bytes(bytes::Bytes::from_static(b"a\xffb")))
@@ -493,8 +495,10 @@ mod tests {
         let telemetry = registry.telemetry_for("host_clamp", "keep_values", "transform");
         let mut kv = allow_with_other("host", &["static.local"], "other").with_telemetry(telemetry);
         let resource = default_resource();
-        kv.process(&resource, event_with_attrs(&[("host", Value::str("static.local"))])).unwrap();
-        kv.process(&resource, event_with_attrs(&[("host", Value::str("junk.example"))])).unwrap();
+        let mut event1 = event_with_attrs(&[("host", Value::str("static.local"))]);
+        assert!(kv.process(&resource, &mut event1));
+        let mut event2 = event_with_attrs(&[("host", Value::str("junk.example"))]);
+        assert!(kv.process(&resource, &mut event2));
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.values.allowed"), Some(1.0));

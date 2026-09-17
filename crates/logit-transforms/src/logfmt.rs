@@ -396,8 +396,8 @@ impl Logfmt {
 }
 
 impl Transform for Logfmt {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        let Some(raw) = message_bytes(&event, &mut self.diag) else { return Some(event) };
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let Some(raw) = message_bytes(event, &mut self.diag) else { return true };
         // Constructed only from a buffer `message_bytes` already verified is valid UTF-8.
         let text = std::str::from_utf8(&raw).expect("message_bytes verified valid UTF-8");
 
@@ -425,7 +425,7 @@ impl Transform for Logfmt {
             }
         }
 
-        Some(event)
+        true
     }
 }
 
@@ -468,8 +468,8 @@ impl Kv {
 }
 
 impl Transform for Kv {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        let Some(raw) = message_bytes(&event, &mut self.diag) else { return Some(event) };
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let Some(raw) = message_bytes(event, &mut self.diag) else { return true };
         let text = std::str::from_utf8(&raw).expect("message_bytes verified valid UTF-8");
 
         self.scratch.clear();
@@ -496,7 +496,7 @@ impl Transform for Kv {
             }
         }
 
-        Some(event)
+        true
     }
 }
 
@@ -565,8 +565,8 @@ mod tests {
     fn a_flat_line_populates_attributes_as_strings() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("level=info status=200");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("level=info status=200");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "level"), Some(&Value::str("info")));
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")), "never coerce to a number");
         assert_ne!(attr(&event, "status"), Some(&Value::U64(200)));
@@ -581,13 +581,13 @@ mod tests {
     fn repeat_keys_in_any_order_are_cache_hits_and_never_touch_the_interner() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let first = log_event("lf_cache_a=1 lf_cache_b=2 lf_cache_c=3");
-        let first = logfmt.process(&resource, first).expect("log events pass through");
+        let mut first = log_event("lf_cache_a=1 lf_cache_b=2 lf_cache_c=3");
+        assert!(logfmt.process(&resource, &mut first), "log events pass through");
         assert_eq!(logfmt.keys.len(), 3);
 
         let before = logit_core::interner::len();
-        let second = log_event("lf_cache_c=30 lf_cache_a=10");
-        let second = logfmt.process(&resource, second).expect("log events pass through");
+        let mut second = log_event("lf_cache_c=30 lf_cache_a=10");
+        assert!(logfmt.process(&resource, &mut second), "log events pass through");
         assert_eq!(attr(&second, "lf_cache_a"), Some(&Value::str("10")));
         assert_eq!(attr(&second, "lf_cache_c"), Some(&Value::str("30")));
         assert_eq!(attr(&second, "lf_cache_b"), None);
@@ -598,8 +598,8 @@ mod tests {
             assert_eq!(sym(&first), sym(&second), "{key}");
         }
 
-        let third = log_event("lf_cache_d=4 lf_cache_a=100");
-        let third = logfmt.process(&resource, third).expect("log events pass through");
+        let mut third = log_event("lf_cache_d=4 lf_cache_a=100");
+        assert!(logfmt.process(&resource, &mut third), "log events pass through");
         assert_eq!(attr(&third, "lf_cache_d"), Some(&Value::str("4")));
         assert_eq!(logfmt.keys.len(), 4, "only the genuinely new key was added");
     }
@@ -610,12 +610,13 @@ mod tests {
     fn kv_repeat_keys_are_cache_hits() {
         let mut kv = Kv::new("&".into(), "=".into(), true);
         let resource = default_resource();
-        drop(kv.process(&resource, log_event("kv_cache_a=1&kv_cache_flag&kv_cache_b=2")));
+        let mut warm = log_event("kv_cache_a=1&kv_cache_flag&kv_cache_b=2");
+        let _ = kv.process(&resource, &mut warm);
         assert_eq!(kv.keys.len(), 3);
 
         let before = logit_core::interner::len();
-        let event = log_event("kv_cache_b=20&kv_cache_a=10&kv_cache_flag");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("kv_cache_b=20&kv_cache_a=10&kv_cache_flag");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "kv_cache_a"), Some(&Value::str("10")));
         assert_eq!(attr(&event, "kv_cache_b"), Some(&Value::str("20")));
         assert_eq!(attr(&event, "kv_cache_flag"), Some(&Value::Bool(true)));
@@ -627,8 +628,8 @@ mod tests {
     fn a_quoted_value_keeps_its_spaces() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event(r#"msg="hello world""#);
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"msg="hello world""#);
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "msg"), Some(&Value::str("hello world")));
     }
 
@@ -636,8 +637,8 @@ mod tests {
     fn an_escaped_quote_inside_a_quoted_value_decodes() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event(r#"msg="say \"hi\"""#);
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"msg="say \"hi\"""#);
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "msg"), Some(&Value::str(r#"say "hi""#)));
     }
 
@@ -645,8 +646,8 @@ mod tests {
     fn a_known_escape_decodes_and_an_unknown_one_is_preserved_verbatim() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event(r#"a="line1\nline2" b="tab\there" c="what\A""#);
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"a="line1\nline2" b="tab\there" c="what\A""#);
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("line1\nline2")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("tab\there")));
         assert_eq!(attr(&event, "c"), Some(&Value::str(r"what\A")), "unknown escape kept verbatim");
@@ -656,8 +657,8 @@ mod tests {
     fn an_empty_quoted_value_is_an_empty_string() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event(r#"msg="""#);
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"msg="""#);
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "msg"), Some(&Value::str("")));
     }
 
@@ -665,8 +666,8 @@ mod tests {
     fn an_empty_value_is_an_empty_string_not_a_flag() {
         let mut logfmt = Logfmt::new(true);
         let resource = default_resource();
-        let event = log_event("k=");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("k=");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "k"), Some(&Value::str("")));
     }
 
@@ -674,8 +675,8 @@ mod tests {
     fn a_bareword_is_skipped_by_default() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("level=info cached status=200");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("level=info cached status=200");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "level"), Some(&Value::str("info")));
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
         assert_eq!(attr(&event, "cached"), None);
@@ -685,8 +686,8 @@ mod tests {
     fn a_bareword_becomes_true_with_bare_keys_enabled() {
         let mut logfmt = Logfmt::new(true);
         let resource = default_resource();
-        let event = log_event("level=info cached status=200");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("level=info cached status=200");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "cached"), Some(&Value::Bool(true)));
     }
 
@@ -694,13 +695,13 @@ mod tests {
     fn a_bareword_at_end_of_line_follows_the_same_rule() {
         let mut default_off = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("level=info cached");
-        let event = default_off.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("level=info cached");
+        assert!(default_off.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "cached"), None);
 
         let mut bare_on = Logfmt::new(true);
-        let event = log_event("level=info cached");
-        let event = bare_on.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("level=info cached");
+        assert!(bare_on.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "cached"), Some(&Value::Bool(true)));
     }
 
@@ -708,8 +709,8 @@ mod tests {
     fn an_unterminated_quote_passes_the_event_through_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event(r#"a=1 msg="oops"#);
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"a=1 msg="oops"#);
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &Value::str(r#"a=1 msg="oops"#));
     }
@@ -718,8 +719,8 @@ mod tests {
     fn a_keyless_equals_is_skipped_and_the_rest_of_the_line_still_parses() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("=1 a=2");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("=1 a=2");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("2")));
         assert_eq!(event.attributes.len(), 1);
     }
@@ -728,8 +729,8 @@ mod tests {
     fn a_line_with_no_equals_at_all_passes_through_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("just some prose");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("just some prose");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &Value::str("just some prose"));
     }
@@ -739,10 +740,12 @@ mod tests {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
 
-        let event = logfmt.process(&resource, log_event("")).expect("log events pass through");
+        let mut event = log_event("");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
 
-        let event = logfmt.process(&resource, log_event("   ")).expect("log events pass through");
+        let mut event = log_event("   ");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -750,8 +753,8 @@ mod tests {
     fn a_duplicate_key_takes_the_last_value() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("a=1 a=2");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1 a=2");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("2")));
     }
 
@@ -761,7 +764,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("a=1");
         event.attributes.insert("a", Value::str("old"));
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
     }
 
@@ -769,8 +772,8 @@ mod tests {
     fn tabs_and_crlf_separate_pairs_like_spaces() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("a=1\tb=2\r\nc=3");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1\tb=2\r\nc=3");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
         assert_eq!(attr(&event, "c"), Some(&Value::str("3")));
@@ -780,8 +783,8 @@ mod tests {
     fn a_value_containing_an_equals_sign_keeps_it() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("a=b=c");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=b=c");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("b=c")));
     }
 
@@ -790,7 +793,7 @@ mod tests {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
         let message = Bytes::from_static(b"msg=\"hello world\" status=200");
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -803,7 +806,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
 
         let Some(Value::Str(msg)) = attr(&event, "msg") else { panic!("msg should be a Str") };
         assert!(points_into(&message, msg), "escape-free quoted value should slice the message");
@@ -825,8 +828,8 @@ mod tests {
     fn kv_splits_on_configured_separators() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&b=2&c=hello");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&b=2&c=hello");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
         assert_eq!(attr(&event, "c"), Some(&Value::str("hello")));
@@ -836,8 +839,8 @@ mod tests {
     fn kv_trims_whitespace_around_keys_and_values() {
         let mut kv = Kv::new(",".to_string(), "=".to_string(), false);
         let resource = default_resource();
-        let event = log_event("a=1, b=2,  c = 3 ");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1, b=2,  c = 3 ");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
         assert_eq!(attr(&event, "c"), Some(&Value::str("3")));
@@ -847,8 +850,8 @@ mod tests {
     fn kv_splits_at_the_first_kv_sep_only() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=b=c");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=b=c");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("b=c")));
     }
 
@@ -856,8 +859,8 @@ mod tests {
     fn kv_handles_multi_byte_separators() {
         let mut kv = Kv::new(" :: ".to_string(), " -> ".to_string(), false);
         let resource = default_resource();
-        let event = log_event("a -> 1 :: b -> 2");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a -> 1 :: b -> 2");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
     }
@@ -866,8 +869,8 @@ mod tests {
     fn kv_skips_an_empty_segment() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&&b=2");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&&b=2");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
         assert_eq!(event.attributes.len(), 2);
@@ -877,8 +880,8 @@ mod tests {
     fn kv_skips_a_segment_with_an_empty_key() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&=2&b=3");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&=2&b=3");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("3")));
         assert_eq!(event.attributes.len(), 2);
@@ -888,14 +891,14 @@ mod tests {
     fn kv_bareword_follows_the_same_rule_as_logfmt() {
         let mut default_off = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&cached&b=2");
-        let event = default_off.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&cached&b=2");
+        assert!(default_off.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "cached"), None);
         assert_eq!(event.attributes.len(), 2);
 
         let mut bare_on = amp_kv(true);
-        let event = log_event("a=1&cached&b=2");
-        let event = bare_on.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&cached&b=2");
+        assert!(bare_on.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "cached"), Some(&Value::Bool(true)));
     }
 
@@ -903,8 +906,8 @@ mod tests {
     fn kv_with_no_separator_anywhere_passes_the_event_through_untouched() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("just some prose");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("just some prose");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &Value::str("just some prose"));
     }
@@ -913,8 +916,8 @@ mod tests {
     fn kv_duplicate_key_takes_the_last_value() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&a=2");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&a=2");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("2")));
     }
 
@@ -922,8 +925,8 @@ mod tests {
     fn kv_values_are_always_strings_never_coerced() {
         let mut kv = amp_kv(false);
         let resource = default_resource();
-        let event = log_event("a=1&b=true");
-        let event = kv.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("a=1&b=true");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("true")));
     }
@@ -933,7 +936,7 @@ mod tests {
         let mut kv = amp_kv(false);
         let resource = default_resource();
         let message = Bytes::from_static(b"a=1&b=hello");
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -946,7 +949,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = kv.process(&resource, event).expect("log events pass through");
+        assert!(kv.process(&resource, &mut event), "log events pass through");
         let Some(Value::Str(b)) = attr(&event, "b") else { panic!("b should be a Str") };
         assert!(points_into(&message, b), "kv value should slice the message");
     }
@@ -960,12 +963,12 @@ mod tests {
     fn a_metric_event_passes_through_with_attributes_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = Event::metric(
+        let mut event = Event::metric(
             0,
             AttrMap::new(),
             MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)),
         );
-        let event = logfmt.process(&resource, event).expect("metric-only events pass through");
+        assert!(logfmt.process(&resource, &mut event), "metric-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -973,7 +976,7 @@ mod tests {
     fn a_span_event_passes_through_with_attributes_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = Event::span(
+        let mut event = Event::span(
             0,
             AttrMap::new(),
             SpanRecord {
@@ -990,7 +993,7 @@ mod tests {
                 ext: None,
             },
         );
-        let event = logfmt.process(&resource, event).expect("span-only events pass through");
+        assert!(logfmt.process(&resource, &mut event), "span-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -1000,7 +1003,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("a=1");
         event.metrics.push(MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)));
-        let event = logfmt.process(&resource, event).expect("mixed events pass through");
+        assert!(logfmt.process(&resource, &mut event), "mixed events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
         assert!(matches!(
@@ -1015,7 +1018,7 @@ mod tests {
         let resource = default_resource();
         let mut map = AttrMap::new();
         map.insert("a", Value::str("1"));
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -1028,7 +1031,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -1036,13 +1039,13 @@ mod tests {
     fn an_event_with_no_log_passes_through() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = Event::metric(
+        let mut event = Event::metric(
             0,
             AttrMap::new(),
             MetricRecord::new(intern_for_test("m"), MetricKind::counter(1.0)),
         );
         assert!(event.log.is_none());
-        let event = logfmt.process(&resource, event).expect("events with no log pass through");
+        assert!(logfmt.process(&resource, &mut event), "events with no log pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -1050,8 +1053,8 @@ mod tests {
     fn an_invalid_utf8_message_passes_through_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event_bytes(b"a=1 \xff\xfe b=2");
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        let mut event = log_event_bytes(b"a=1 \xff\xfe b=2");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -1059,9 +1062,9 @@ mod tests {
     fn the_message_and_body_format_are_left_untouched() {
         let mut logfmt = Logfmt::new(false);
         let resource = default_resource();
-        let event = log_event("a=1");
+        let mut event = log_event("a=1");
         let original_message = message_of(&event).clone();
-        let event = logfmt.process(&resource, event).expect("log events pass through");
+        assert!(logfmt.process(&resource, &mut event), "log events pass through");
         assert_eq!(message_of(&event), &original_message);
         assert_eq!(
             event.log.as_ref().expect("event should carry a log").body_format,
@@ -1084,8 +1087,8 @@ mod tests {
             )),
         );
         let resource = default_resource();
-        let event = log_event(r#"a=1 msg="oops"#);
-        drop(logfmt.process(&resource, event));
+        let mut event = log_event(r#"a=1 msg="oops"#);
+        let _ = logfmt.process(&resource, &mut event);
 
         let events = registry.drain(0);
         assert_eq!(events.len(), 1);

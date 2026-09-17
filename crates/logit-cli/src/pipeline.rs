@@ -3393,12 +3393,13 @@ mod tests {
             },
         );
         let resource = Arc::new(logit_core::Resource::default());
-        let out = transform.process(&resource, event).expect("should forward the event");
-        let trace = out.log.expect("log should survive").trace.expect("trace should be lifted");
+        let mut event = event;
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        let trace = event.log.expect("log should survive").trace.expect("trace should be lifted");
         assert_eq!(trace.trace_id, [0xab; 16]);
         assert_eq!(trace.span_id, Some([0xcd; 8]));
         assert!(
-            out.attributes.get("tid").is_some(),
+            event.attributes.get("tid").is_some(),
             "keep_source: true should retain the attribute"
         );
     }
@@ -3450,11 +3451,12 @@ mod tests {
             },
         );
         let resource = Arc::new(logit_core::Resource::default());
-        let out = transform.process(&resource, event).expect("should forward the event");
-        let span = out.span.expect("a span should be minted");
+        let mut event = event;
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        let span = event.span.expect("a span should be minted");
         assert_eq!(span.kind, logit_core::SpanKind::Client);
         assert_eq!(span.name.as_str(), Some("http.request"));
-        assert_eq!(out.timestamp, 1_725_000_000_000_000_000);
+        assert_eq!(event.timestamp, 1_725_000_000_000_000_000);
         assert_eq!(span.end_timestamp, 1_725_000_000_005_000_000);
     }
 
@@ -3495,8 +3497,9 @@ mod tests {
             },
         );
         let resource = Arc::new(logit_core::Resource::default());
-        let out = transform.process(&resource, event).expect("should forward the event");
-        match out.attributes.get("request_time") {
+        let mut event = event;
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        match event.attributes.get("request_time") {
             Some(logit_core::Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected a scaled F64, got {other:?}"),
         }

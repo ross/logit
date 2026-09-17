@@ -249,7 +249,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `keep_values` clamp `host`, already allowed and lowercase | **0** | `Clamp::normalize` returns `None` (nothing changed) and the allowed path never calls `insert_sym` -- the steady-state case pays nothing, same property `keep`'s row above pins |
 | `keep_values` clamp `host`, `normalize: [lower]` needs to lower it | **1** | the one path that isn't free: an uppercase byte forces a fresh `Bytes` for the write-back. The cardinality win `normalize:` exists for costs exactly one allocation per event that actually needed it, never per event that didn't |
-| `set` through `process_batch`, attributes only | **1** | `process_batch`'s own `Vec::with_capacity` -- `map_resource` returns `None` immediately, same as `keep` |
+| `set` through `process_batch`, attributes only | **0** | nothing at all: `process_batch` is a `Vec::retain_mut` over the batch's own `events` ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md)), and `map_resource` returns `None` immediately, same as `keep` |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` -- the `AttrMap` clone/insert itself stays inline on an empty resource |
 | `has_attributes`/`drop_attributes`, match 1 attribute | **0** | `AttrMap::get_sym` (a `binary_search_by_key`) + `value_matches`' numeric coercion, both stack-only |
@@ -511,16 +511,16 @@ draft actually established:
 
 | Path | allocs | Notes |
 |---|---:|---|
-| `process_batch` through `keep`, telemetry disabled | **1** | `Vec::with_capacity(batch.events.len())` for `out` — this is the whole cost |
-| `process_batch` through `set` (attributes only) | **1** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
+| `process_batch` through `keep`, telemetry disabled | **0** | nothing at all — `1 → 0` when `Transform::process` went in place ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md), §8 item 14): `process_batch` is a `Vec::retain_mut` over the batch's own `events` now, so there is no `out` `Vec` to collect survivors into |
+| `process_batch` through `set` (attributes only) | **0** | identical to `keep` — `Transform::map_resource`'s default `None` return costs nothing beyond the call itself (`crates/logit-pipeline/src/transform.rs`) |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache (`crates/logit-transforms/src/set.rs`) hits |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` only — cloning/inserting into the fixture's empty, inline `AttrMap` never touches the heap |
-| `process_batch` through `has_attributes`, forwarding | **1** | identical to `keep`/`set` — `process_batch`'s own `Vec` is the whole cost; `crates/logit-transforms/src/attributes.rs`'s `Matcher::matches` contributes nothing |
-| `process_batch` through `drop_attributes`, dropping every event | **1** | the same `Vec`, built before any event is processed and thrown away unused — same shape as the fully-absorbed `aggregate` row below, for a filter rather than an accumulator |
+| `process_batch` through `has_attributes`, forwarding | **0** | identical to `keep`/`set` — `retain_mut` keeps a forwarded event exactly where it already is; `crates/logit-transforms/src/attributes.rs`'s `Matcher::matches` contributes nothing |
+| `process_batch` through `drop_attributes`, dropping every event | **0** | dropping costs no more than forwarding: `retain_mut` drops each rejected event in place — same shape as the fully-absorbed `aggregate` row below, for a filter rather than an accumulator |
 | `has_attributes`/`drop_attributes`, resource match, cache hit (same input `Arc`) | **0** | `Matcher`'s one-entry `Arc::ptr_eq` cache — `Set::map_resource`'s caching idiom, applied to a read instead of a rebuild |
 | `has_attributes`/`drop_attributes`, resource match, cache miss (distinct input `Arc`) | **0**, not **1** | the one place this diverges from `set.map_resource`'s own cache-miss row above: a miss here only re-evaluates `AttrMap::get_sym` against the `Arc` a caller already passed in, never allocates a replacement `Resource` — `native::decode` mints a fresh `Arc<Resource>` per frame, so the fan-out-after-`logit_in` topology this component exists for (`docs/adr/attribute-filtering-components.md`) always misses this cache, and this row is why that's fine |
-| `trace_context`, lifting a valid `trace_id` | **1** | identical to `keep`/`set`'s own rows — `process_batch`'s own `Vec` is the whole cost; `parse_trace_id` (`logit_core::trace`) works on stack arrays and `AttrMap::remove` (`keep_source: false`) is an in-place `SmallVec` shift |
-| `trace_context` with a `span:` block, minting a `SpanRecord` from the convention (`traceparent` + ids + `span.end_s`/`span.duration_s`) | **1** | the same `Vec`; ids parse to stack arrays, timing is integer arithmetic, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount bump), `events`/`links` are `Vec::new()`, `SpanRecord` is inline in `Event` (§1) so `event.span = Some(..)` is a 144-byte move, and the ~7 consumed attributes are in-place removes (`docs/adr/trace-context-span-lifting.md`) |
+| `trace_context`, lifting a valid `trace_id` | **0** | identical to `keep`/`set`'s own rows — nothing on the batch path, and `parse_trace_id` (`logit_core::trace`) works on stack arrays while `AttrMap::remove` (`keep_source: false`) is an in-place `SmallVec` shift |
+| `trace_context` with a `span:` block, minting a `SpanRecord` from the convention (`traceparent` + ids + `span.end_s`/`span.duration_s`) | **0** | the same nothing; ids parse to stack arrays, timing is integer arithmetic, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount bump), `events`/`links` are `Vec::new()`, `SpanRecord` is inline in `Event` (§1) so `event.span = Some(..)` is a 144-byte move, and the ~7 consumed attributes are in-place removes (`docs/adr/trace-context-span-lifting.md`) |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script never writes `resource` | **9** | identical to plain `process` (below) — `set_resource`/`take_resource` are field assignments, no allocation |
 | `run_lua`: `set_resource` + `process` + `take_resource`, script writes `resource` | **7** | see `crates/logit-script/src/resource.rs` — lower than the row above because this script (unlike `LUA_ENRICH_SCRIPT`) never touches `event.attributes`, skipping its `AttrsProxy` cost; the `+1` here is `take_resource`'s `Arc::new(Resource { .. })` commit |
 | `process` reading `event.log.trace_id` (`LogProxy`) | **9** | same total a script touching `event.attributes` instead pays (`crates/logit-bench/tests/allocations.rs`'s `lua_process_one_event`) despite touching no attributes at all — creating and caching the `LogProxy` userdata costs what `AttrsProxy` does there, `to_hex`'s returned `String` costs what an attribute write does; a script that never touches `event.log` pays none of it, unchanged at 9 either way |
@@ -536,9 +536,9 @@ draft actually established:
 | `process` returning `Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}` in place of the incoming event (`crates/logit-script/src/construct.rs`) | **17** | 4 baseline + 6 for the construction itself (a fresh `EventProxy`'s `Rc<RefCell<Event>>` and userdata, plus mlua's own cost for calling a Rust closure and returning its userdata — constructing and discarding lands at 10) + 1 `Box` + 3 for the `attributes` sub-table with one entry (1 for the table, `lua_to_value`'s `Bytes` for `"prod"`, 1 for the map's first insert; each further attribute adds 1) + 3 for the `log` sub-table with its `message` (the same shape; `LogRecord` is inline in `Event`, no box). Additive: every other `lua:` row above is unchanged, so a script that never calls `Event.new` pays nothing (`lua_process_one_event_constructing_a_log_event`) |
 | `process` returning `Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}` in place of the incoming event | **16** | the log row's 4 baseline + 6 construction + 1 `Box` (11) + 1 for the `metrics` array table (an empty list stays inline, 12) + 4 for the one record: 1 for its sub-table, 1 for `validated_sequence_len`'s key `Vec` over the array (once per event; a second metric adds 3 plus the `MetricList` spill, 20 in all), 1 for the `format!`'d `metrics[i]` error-path prefix (the one deliberate per-metric cost; a static path lands at 15), and 1 that every non-empty record sub-table carries beyond its table and fields — the same bucket the log row folds into `message`. `intern("tick")`, the `expect_keys` walk and every nil-defaulted field allocate nothing (`lua_process_one_event_constructing_a_gauge_event`) |
 | `process` returning `Event.new{timestamp = "1", span = {trace_id = <hex>, span_id = <hex>, name = "GET /"}}` in place of the incoming event | **14** | the log row's 4 baseline + 6 construction + 1 `Box` (11) + 3 for the `span` sub-table with its three required fields: 1 for the table, 1 for `lua_to_value`'s `Bytes` for the `name` (`name = 1` lands at 13), and the same 1 every non-empty record sub-table carries beyond its table and fields. The two hex ids parse straight into their arrays, `SpanRecord` is inline in `Event`, and `Vec::new()` for `events`/`links` is free. Every defaulted or scalar field adds 0 — `kind`/`status`/`end_timestamp`/`parent_span_id` set explicitly still land at 14, as does an explicit `dropped_events_count = 0` (a default value never earns the `SpanExt` box); `status_message = "boom"` adds 2 (the box and its `Bytes`), an empty `events = {}`/`links = {}` 1 each, one span event with a name 7, one link with just its ids 6 (`lua_process_one_event_constructing_a_span_event`) |
-| `process_batch`, fully absorbed (`aggregate`) | **1** | the same `Vec`, built before any event is processed, thrown away unused when nothing survives |
-| `process_batch` through `keep`, telemetry live, **steady state** | **1** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
-| `process_batch`, **first call after an `internal` drain** | **3** | the `out` `Vec` (1) + a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below |
+| `process_batch`, fully absorbed (`aggregate`) | **0** | nothing to throw away unused: absorbing every event just empties the batch's own `Vec` in place |
+| `process_batch` through `keep`, telemetry live, **steady state** | **0** | identical to disabled — `count`/`timer` update an existing `ComponentBuffer` entry in place, no allocation of their own |
+| `process_batch`, **first call after an `internal` drain** | **2** | a `HashMap` table rebuild (1) + a fresh `DdSketch` (1) — see below; this used to be 3, the third being the `out` `Vec` the in-place `process` removed |
 | `unwrap_batch` (`Delivered::Owned`) | **0** | no `Arc` was ever involved |
 | `unwrap_batch` (`Delivered::Shared`, sole reference) | **0** | `Arc::try_unwrap` succeeds |
 | `unwrap_batch` (`Delivered::Shared`, contended) | **3** | falls back to `EventBatch::clone` — 1 for the `Vec<Event>` + `Event::clone`'s 2 (nginx shape) |
@@ -562,8 +562,9 @@ draft actually established:
    `mem::take`s the whole `points` map on every `internal` tick, so the next `count`/`timer` call for
    each key is a fresh insert into an empty map, not an update. Concretely: the map's backing table
    (first insert since the reset) plus a fresh `DdSketch` for the timing key (no prior sample to
-   merge into) — 2 allocations, on top of whatever the disabled baseline already costs (`process_batch`'s
-   `out` `Vec`, or `send_batch`'s `async_trait` box). This is not a one-time cost: it happens once per
+   merge into) — 2 allocations, on top of whatever the disabled baseline already costs (nothing at all
+   for `process_batch` since it went in place, `send_batch`'s `async_trait` box). This is not a
+   one-time cost: it happens once per
    `internal` drain interval, for as long as `internal` runs, on every component it's attached to.
 
 **A third, unrelated finding, found the same way: `Output` is `#[async_trait]`
@@ -597,11 +598,18 @@ channel hop and the trait-object call, because both drive a **current-thread** r
 
 | Path | fastest | allocs |
 |---|---:|---:|
-| `process_batch` through `keep` | 360 ns | 1 |
+| `process_batch` through `keep` | 431 ns | 0 |
 | `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
 | `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
 | `send_batch` through a no-op `Output` | 189 ns | 1 (the `async_trait` box) |
 | `send_batch` through a **failing** `Output` | 238 ns | 4 (matches the disabled-telemetry failure row above exactly) |
+
+`process_batch`'s row is a same-day pair, not a comparison across builds: the same session measured
+the pre-change, `out`-`Vec` shape at **469 ns / 1 alloc** and this one at **431 ns / 0** on the same
+pinned core (`taskset -c 2`, fastest of three, 2026-09-17), which is the ~8% the removed `Vec` and
+the removed per-event `Event` move are actually worth here. The 360 ns this row carried before was
+measured on an earlier build and box state and is not comparable to either number; every other row
+in the table is still that older measurement and was deliberately left alone.
 
 ### Costing internal spans: the `Delivered` trade, measured
 
@@ -924,11 +932,12 @@ Two things that didn't change through any of this:
   single-consumer case. Prior art for the batch-level choice: Vector's `LogEvent` is an
   `Arc<Inner>` with copy-on-write for the same reason.
 
-A second, separable change: `Transform::process(&mut self, &Arc<Resource>, &mut Event) -> bool`
-plus `Vec::retain_mut` in `run_transform` would remove one full 864-byte `Event` memcpy per node
-hop and one `Vec` allocation per batch per node. Nothing is lost — the trait already can't emit
-more than one event per input. Deserves its own ADR; gets more expensive to make with every
-transform that lands (§8 item 14).
+A second, separable change, since landed: `Transform::process(&mut self, &Arc<Resource>, &mut
+Event) -> bool` plus `Vec::retain_mut` in `process_batch` removes one full 864-byte `Event` memcpy
+per node hop and one `Vec` allocation per batch per node. Nothing was lost — the trait already
+couldn't emit more than one event per input, so a bool says everything the `Option<Event>` return
+did. See [ADR `in-place-transform-process`](../adr/in-place-transform-process.md) and §8 item 14;
+the `process_batch` rows in §2's "Runtime" table are the measured result.
 
 ### Routing: a partition pass instead of N clones (ADR `target-components`)
 
@@ -956,12 +965,13 @@ logarithm.
 
 Against that, the shape a router replaces — an N-way `Fanout` plus N `has_attributes` filters, each
 scanning the *whole* batch to keep its own slice — costs `fan_out_plus_two_has_attributes_for_the_
-same_split`'s **196** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
+same_split`'s **194** for the identical 64-event, 2-way `stream: host`/`stream: app` split: 1
 `Arc::new` (`Fanout::deliver`'s once-per-send wrap) + 193 for the forced `EventBatch` deep clone
 that a fan-out with no `Output` branch always pays (1 for the clone's own `Vec<Event>`, plus 64 × 3
 for this fixture's own per-event clone cost — see the test's doc comment for why that's 3, not the
-reference nginx shape's 2) + 2 for the two `has_attributes` passes (1 allocation per batch each,
-`process_batch_through_has_attributes`'s own number). The two numbers aren't directly comparable
+reference nginx shape's 2) + 0 for the two `has_attributes` passes (each free per batch now,
+`process_batch_through_has_attributes`'s own number; they cost 1 apiece until `Transform::process`
+went in place). The two numbers aren't directly comparable
 per-event (`route`'s inputs are borrowed, never cloned, and its output partition is exactly sized
 to the split; the fan-out's cost is paid whether or not that branch's filter keeps anything) — the
 comparison that matters is scaling: routing costs `1 + destinations used`, flat in event count and
@@ -1421,10 +1431,14 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
 
 ### Later — needs a reason first
 
-14. **`Transform::process(&mut Event) -> bool`.** Removes an 864-byte memcpy per node hop. Gets more
-    expensive to decide with every transform that lands, so decide it early even if applied late.
-    Touches `runtime.rs`, the same file item 7's three rounds just settled — a fresh reason to
-    check `unwrap_batch`'s current shape before starting, not a blocker any more.
+14. ~~**`Transform::process(&mut Event) -> bool`.**~~ **Done** — see §2's "Runtime" table and the
+    `Transform::process`/`process_batch` doc comments
+    ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md)). Removes
+    an 864-byte memcpy per node hop *and* the per-batch `out` `Vec` that `process_batch` used to
+    collect survivors into: `process_batch` is a `Vec::retain_mut` over the batch's own `events`
+    now, so every `process_batch` row in the table above dropped by exactly 1, to **0** for the
+    ordinary forward/filter/absorb cases. Decided and applied while the implementer list was still
+    ~20 transforms, exactly as this item said to.
 15. **`AttrMap` accessors keyed by `Symbol`,** eliminating the remaining `resolve` → `intern` round
     trips. Narrower than it used to be: `influxdb_out`'s and `stdio_out`'s are both gone now (both
     encoders merge-join instead of clone-and-reinsert). What's left is `json`'s final merge into

@@ -28,10 +28,23 @@ pub type FlushedEvent = (Event, Vec<SpanLink>);
 pub type FlushOutput = Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<FlushedEvent>)>;
 
 pub trait Transform: Send {
-    /// Consumes or transforms one event. `Some` means "forward this downstream" (possibly
-    /// unchanged, possibly mutated); `None` means the transform absorbed it into internal state
-    /// (e.g. an aggregator accumulating a mergeable metric kind).
-    fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event>;
+    /// Transforms one event **in place**. `true` means "forward this downstream" (possibly
+    /// unchanged, possibly mutated through the `&mut`); `false` means the transform absorbed the
+    /// event into internal state (e.g. an aggregator accumulating a mergeable metric kind) or
+    /// dropped it, and the caller discards the event rather than forwarding it.
+    ///
+    /// **Borrows the event on purpose**, exactly as [`crate::Router::route`] does and for exactly
+    /// the same reason: `Event` is 864 bytes (`crates/logit-core/tests/type_sizes.rs` pins the
+    /// exact `size_of`), and an owned `Event -> Option<Event>` shape memcpy'd one of those per
+    /// node hop -- per *event*, on the hot path -- to express something the trait can already say
+    /// with a bool, since `process` has never been able to emit more than one event per input.
+    /// [`crate::runtime::process_batch`] drives this with `Vec::retain_mut`, so a forwarded event
+    /// is never moved at all and an absorbed one costs no `Vec` of survivors to collect into.
+    ///
+    /// An *absorbing* transform still gets everything it needs from a `&mut`: it moves the payload
+    /// it wants out with `std::mem::take` (`crates/logit-transforms/src/aggregate.rs` takes
+    /// `event.metrics` this way) and leaves the drained shell behind for the caller to drop.
+    fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool;
 
     /// Called once per incoming batch, before any of that batch's events reach `process` -- gives
     /// a transform whose emission spans several batches (only `Aggregator` today) a chance to

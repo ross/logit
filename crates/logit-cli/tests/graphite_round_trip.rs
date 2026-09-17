@@ -833,8 +833,11 @@ async fn statsd_in_to_aggregate_to_graphite_out_expands_a_timer_into_the_documen
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
-    let forwarded: Vec<Event> =
-        batch.events.into_iter().filter_map(|event| aggregator.process(&resource, event)).collect();
+    let forwarded: Vec<Event> = batch
+        .events
+        .into_iter()
+        .filter_map(|mut event| aggregator.process(&resource, &mut event).then_some(event))
+        .collect();
     assert!(forwarded.is_empty(), "every timer sample is absorbed by aggregate's default sketch");
 
     let mut flushed = aggregator.flush(1_700_000_000_000_000_000);

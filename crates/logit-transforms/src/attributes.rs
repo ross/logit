@@ -130,9 +130,9 @@ impl HasAttributes {
 }
 
 impl Transform for HasAttributes {
-    fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
-        let matched = self.matcher.matches(resource, &event);
-        forward(matched, event, &self.telemetry)
+    fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let matched = self.matcher.matches(resource, event);
+        forward(matched, &self.telemetry)
     }
 }
 
@@ -162,14 +162,14 @@ impl DropAttributes {
 }
 
 impl Transform for DropAttributes {
-    fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
-        let matched = self.matcher.matches(resource, &event);
+    fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let matched = self.matcher.matches(resource, event);
         // The single `!` here is the entire difference between `HasAttributes` and
         // `DropAttributes` -- which is what makes this the exact boolean complement structurally,
         // rather than by convention. With several pairs configured, this drops an event only when
         // *every* pair matches, not when any one does -- same conjunction `Matcher::matches` always
         // evaluates, just inverted at the very end.
-        forward(!matched, event, &self.telemetry)
+        forward(!matched, &self.telemetry)
     }
 }
 
@@ -177,9 +177,9 @@ impl Transform for DropAttributes {
 /// caller (`HasAttributes` passes its match result through; `DropAttributes` passes its negation).
 /// The `0.0` on the forward path is deliberate, not a no-op: it registers the series so it appears
 /// at zero rather than being absent, mirroring `HasSignal::process`'s own reasoning.
-fn forward(keep: bool, event: Event, telemetry: &Telemetry) -> Option<Event> {
+fn forward(keep: bool, telemetry: &Telemetry) -> bool {
     telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
-    keep.then_some(event)
+    keep
 }
 
 #[cfg(test)]
@@ -240,24 +240,24 @@ mod tests {
     fn has_attributes_forwards_an_event_whose_single_attribute_matches() {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("stream", Value::str("a"))]);
-        assert!(has.process(&resource, event).is_some());
+        let mut event = event_with_attrs(&[("stream", Value::str("a"))]);
+        assert!(has.process(&resource, &mut event));
     }
 
     #[test]
     fn has_attributes_drops_an_event_whose_value_differs() {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("stream", Value::str("b"))]);
-        assert!(has.process(&resource, event).is_none());
+        let mut event = event_with_attrs(&[("stream", Value::str("b"))]);
+        assert!(!has.process(&resource, &mut event));
     }
 
     #[test]
     fn has_attributes_drops_an_event_missing_the_configured_key() {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[]);
-        assert!(has.process(&resource, event).is_none());
+        let mut event = event_with_attrs(&[]);
+        assert!(!has.process(&resource, &mut event));
     }
 
     // -- HasAttributes: AND -------------------------------------------------------------------
@@ -270,11 +270,12 @@ mod tests {
         );
         let resource = default_resource();
 
-        let both = event_with_attrs(&[("stream", Value::str("a")), ("tier", Value::str("gold"))]);
-        assert!(has.process(&resource, both).is_some(), "both pairs match");
+        let mut both =
+            event_with_attrs(&[("stream", Value::str("a")), ("tier", Value::str("gold"))]);
+        assert!(has.process(&resource, &mut both), "both pairs match");
 
-        let one_only = event_with_attrs(&[("stream", Value::str("a"))]);
-        assert!(has.process(&resource, one_only).is_none(), "only one of two pairs matches");
+        let mut one_only = event_with_attrs(&[("stream", Value::str("a"))]);
+        assert!(!has.process(&resource, &mut one_only), "only one of two pairs matches");
     }
 
     #[test]
@@ -286,19 +287,19 @@ mod tests {
         let matching_resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
         let other_resource = resource_with_attrs(&[("service.name", Value::str("haproxy"))]);
 
-        let event = event_with_attrs(&[("stream", Value::str("a"))]);
+        let mut event = event_with_attrs(&[("stream", Value::str("a"))]);
         assert!(
-            has.process(&matching_resource, event.clone()).is_some(),
+            has.process(&matching_resource, &mut event),
             "both resource and attribute pairs match"
         );
         assert!(
-            has.process(&other_resource, event).is_none(),
+            !has.process(&other_resource, &mut event),
             "attribute pair matches but resource pair does not"
         );
 
-        let mismatched_event = event_with_attrs(&[("stream", Value::str("b"))]);
+        let mut mismatched_event = event_with_attrs(&[("stream", Value::str("b"))]);
         assert!(
-            has.process(&matching_resource, mismatched_event).is_none(),
+            !has.process(&matching_resource, &mut mismatched_event),
             "resource pair matches but attribute pair does not"
         );
     }
@@ -308,8 +309,8 @@ mod tests {
         let mut has =
             HasAttributes::new(vec![("service.name".to_string(), Value::str("nginx"))], vec![]);
         let resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
-        let event = event_with_attrs(&[]);
-        assert!(has.process(&resource, event).is_some());
+        let mut event = event_with_attrs(&[]);
+        assert!(has.process(&resource, &mut event));
     }
 
     #[test]
@@ -319,8 +320,8 @@ mod tests {
         let resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
         // An event whose own attributes could never satisfy a stream/tier-shaped config still
         // forwards, because a resource-only config never looks at event.attributes at all.
-        let event = event_with_attrs(&[("stream", Value::str("unrelated"))]);
-        assert!(has.process(&resource, event).is_some());
+        let mut event = event_with_attrs(&[("stream", Value::str("unrelated"))]);
+        assert!(has.process(&resource, &mut event));
     }
 
     // -- value_matches integration --------------------------------------------------------------
@@ -330,8 +331,8 @@ mod tests {
         for actual in [Value::I64(200), Value::U64(200), Value::F64(200.0), Value::str("200")] {
             let mut has = HasAttributes::new(vec![], vec![("status".to_string(), Value::I64(200))]);
             let resource = default_resource();
-            let event = event_with_attrs(&[("status", actual.clone())]);
-            assert!(has.process(&resource, event).is_some(), "{actual:?} should coerce-match 200");
+            let mut event = event_with_attrs(&[("status", actual.clone())]);
+            assert!(has.process(&resource, &mut event), "{actual:?} should coerce-match 200");
         }
     }
 
@@ -339,17 +340,17 @@ mod tests {
     fn has_attributes_compares_bytes_and_str_alike() {
         let mut has = HasAttributes::new(vec![], vec![("host".to_string(), Value::str("web-1"))]);
         let resource = default_resource();
-        let event =
+        let mut event =
             event_with_attrs(&[("host", Value::Bytes(bytes::Bytes::from_static(b"web-1")))]);
-        assert!(has.process(&resource, event).is_some());
+        assert!(has.process(&resource, &mut event));
     }
 
     #[test]
     fn has_attributes_does_not_coerce_a_bool_to_a_string() {
         let mut has = HasAttributes::new(vec![], vec![("sampled".to_string(), Value::Bool(true))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("sampled", Value::str("true"))]);
-        assert!(has.process(&resource, event).is_none(), "Bool must never coerce to a string");
+        let mut event = event_with_attrs(&[("sampled", Value::str("true"))]);
+        assert!(!has.process(&resource, &mut event), "Bool must never coerce to a string");
     }
 
     // -- never mutates --------------------------------------------------------------------------
@@ -358,11 +359,12 @@ mod tests {
     fn has_attributes_never_mutates_a_forwarded_event() {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("stream", Value::str("a")), ("other", Value::str("x"))]);
+        let mut event =
+            event_with_attrs(&[("stream", Value::str("a")), ("other", Value::str("x"))]);
         let original_message = event.log.as_ref().map(|l| l.message.clone());
         let original_metrics = event.metrics.len();
 
-        let event = has.process(&resource, event).expect("matches");
+        assert!(has.process(&resource, &mut event), "matches");
         assert_eq!(event.attributes.get("other"), Some(&Value::str("x")));
         assert_eq!(event.log.as_ref().map(|l| l.message.clone()), original_message);
         assert_eq!(event.metrics.len(), original_metrics);
@@ -384,13 +386,13 @@ mod tests {
             event_with_attrs(&[("stream", Value::str("b")), ("tier", Value::str("gold"))]),
         ];
 
-        for event in cases {
+        for mut event in cases {
             let mut has = HasAttributes::new(vec![], config());
             let mut drop = DropAttributes::new(vec![], config());
             let resource = default_resource();
 
-            let has_forwards = has.process(&resource, event.clone()).is_some();
-            let drop_forwards = drop.process(&resource, event).is_some();
+            let has_forwards = has.process(&resource, &mut event);
+            let drop_forwards = drop.process(&resource, &mut event);
             assert_eq!(
                 has_forwards, !drop_forwards,
                 "has_attributes and drop_attributes must exactly partition every event"
@@ -406,12 +408,13 @@ mod tests {
         );
         let resource = default_resource();
 
-        let both = event_with_attrs(&[("stream", Value::str("a")), ("tier", Value::str("gold"))]);
-        assert!(drop.process(&resource, both).is_none(), "every pair matches -- dropped");
+        let mut both =
+            event_with_attrs(&[("stream", Value::str("a")), ("tier", Value::str("gold"))]);
+        assert!(!drop.process(&resource, &mut both), "every pair matches -- dropped");
 
-        let one_only = event_with_attrs(&[("stream", Value::str("a"))]);
+        let mut one_only = event_with_attrs(&[("stream", Value::str("a"))]);
         assert!(
-            drop.process(&resource, one_only).is_some(),
+            drop.process(&resource, &mut one_only),
             "only one of two pairs matches -- forwarded, not dropped"
         );
     }
@@ -420,9 +423,9 @@ mod tests {
     fn drop_attributes_forwards_an_event_missing_the_configured_key() {
         let mut drop = DropAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        let event = event_with_attrs(&[]);
+        let mut event = event_with_attrs(&[]);
         assert!(
-            drop.process(&resource, event).is_some(),
+            drop.process(&resource, &mut event),
             "an event that never carried the key isn't one of the ones told to drop"
         );
     }
@@ -439,11 +442,11 @@ mod tests {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let mut drop = DropAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
 
-        for event in events {
-            let has_result = has.process(&resource, event.clone());
-            let drop_result = drop.process(&resource, event);
+        for mut event in events {
+            let has_result = has.process(&resource, &mut event);
+            let drop_result = drop.process(&resource, &mut event);
             assert!(
-                has_result.is_some() != drop_result.is_some(),
+                has_result != drop_result,
                 "every event lands in exactly one of the two kinds, never both, never neither"
             );
         }
@@ -458,9 +461,11 @@ mod tests {
         let resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
 
         assert_eq!(has.cached_resource_matched(), None, "nothing cached before the first match");
-        has.process(&resource, event_with_attrs(&[]));
+        let mut event = event_with_attrs(&[]);
+        has.process(&resource, &mut event);
         assert_eq!(has.cached_resource_matched(), Some(true), "the first call populates the cache");
-        has.process(&resource, event_with_attrs(&[]));
+        let mut event = event_with_attrs(&[]);
+        has.process(&resource, &mut event);
         assert_eq!(
             has.cached_resource_matched(),
             Some(true),
@@ -475,7 +480,8 @@ mod tests {
         let resource = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
 
         assert_eq!(drop.cached_resource_matched(), None);
-        drop.process(&resource, event_with_attrs(&[]));
+        let mut event = event_with_attrs(&[]);
+        drop.process(&resource, &mut event);
         assert_eq!(drop.cached_resource_matched(), Some(true));
     }
 
@@ -486,9 +492,11 @@ mod tests {
         let a = resource_with_attrs(&[("service.name", Value::str("nginx"))]);
         let b = resource_with_attrs(&[("service.name", Value::str("nginx"))]); // distinct Arc
 
-        assert!(has.process(&a, event_with_attrs(&[])).is_some());
+        let mut event_a = event_with_attrs(&[]);
+        assert!(has.process(&a, &mut event_a));
+        let mut event_b = event_with_attrs(&[]);
         assert!(
-            has.process(&b, event_with_attrs(&[])).is_some(),
+            has.process(&b, &mut event_b),
             "a distinct but value-equal Arc must still be evaluated correctly"
         );
     }
@@ -503,8 +511,10 @@ mod tests {
             .with_telemetry(has_telemetry);
         let resource = default_resource();
 
-        has.process(&resource, event_with_attrs(&[("stream", Value::str("a"))]));
-        has.process(&resource, event_with_attrs(&[("stream", Value::str("b"))]));
+        let mut event_a = event_with_attrs(&[("stream", Value::str("a"))]);
+        has.process(&resource, &mut event_a);
+        let mut event_b = event_with_attrs(&[("stream", Value::str("b"))]);
+        has.process(&resource, &mut event_b);
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
@@ -514,6 +524,7 @@ mod tests {
     fn a_disabled_telemetry_handle_is_the_default() {
         let mut has = HasAttributes::new(vec![], vec![("stream".to_string(), Value::str("a"))]);
         let resource = default_resource();
-        assert!(has.process(&resource, event_with_attrs(&[("stream", Value::str("a"))])).is_some());
+        let mut event = event_with_attrs(&[("stream", Value::str("a"))]);
+        assert!(has.process(&resource, &mut event));
     }
 }

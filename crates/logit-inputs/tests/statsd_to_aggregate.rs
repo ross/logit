@@ -23,8 +23,8 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
 
     let batch = decoder.decode(Bytes::from_static(b"conns:10|g")).expect("should decode");
     assert_eq!(batch.events.len(), 1);
-    for event in batch.events {
-        assert!(agg.process(&resource, event).is_none(), "a pure gauge event should absorb");
+    for mut event in batch.events {
+        assert!(!agg.process(&resource, &mut event), "a pure gauge event should absorb");
     }
 
     let batch = decoder.decode(Bytes::from_static(b"conns:+5|g")).expect("should decode");
@@ -32,8 +32,8 @@ fn statsd_gauge_then_delta_resolves_through_aggregate() {
     // The event's own kind, straight off the decoder -- confirms the wire produced a real
     // `GaugeDelta`, not a `Gauge`, before it ever reaches `aggregate`.
     assert!(matches!(batch.events[0].metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
-    for event in batch.events {
-        assert!(agg.process(&resource, event).is_none(), "a pure gauge delta event should absorb");
+    for mut event in batch.events {
+        assert!(!agg.process(&resource, &mut event), "a pure gauge delta event should absorb");
     }
 
     let flushed = agg.flush(1_000_000_000);

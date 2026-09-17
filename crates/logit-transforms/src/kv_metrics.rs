@@ -169,7 +169,7 @@ impl KvMetrics {
 impl Transform for KvMetrics {
     /// Appends zero or more metrics to `event.metrics`, in config order (counters, then gauges,
     /// then distributions) -- never replacing what's already there, and never dropping the event:
-    /// this always returns `Some`. `log`/`span`/`attributes`/`timestamp` are untouched.
+    /// this always returns `true`. `log`/`span`/`attributes`/`timestamp` are untouched.
     ///
     /// Tallies `logit.transform.derived{metric_kind}`/`.derived.skipped{metric_kind}` for every
     /// configured metric, whether or not `metric_value`/`numeric` below actually produced a value
@@ -179,7 +179,7 @@ impl Transform for KvMetrics {
     /// not here ([`Tally`]'s doc comment says why). Tagged `metric_kind`, not `kind` -- `kind`
     /// is reserved for a point's own component-kind identity
     /// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::drain`).
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         // One `MetricList` growth for the whole append, not one per doubling: `MetricList` keeps
         // a single record inline (`crates/logit-core/src/event.rs`), so on the reference config
         // (four metrics) the second push would spill to the heap and a later push regrow it.
@@ -243,7 +243,7 @@ impl Transform for KvMetrics {
             };
             self.tally.record(Kind::Distribution, derived);
         }
-        Some(event)
+        true
     }
 
     /// Emits the batch's tallied `derived`/`skipped` counts -- see [`Tally`]. A disabled handle
@@ -330,7 +330,8 @@ mod tests {
     fn a_counter_with_no_field_increments_by_exactly_one_per_event() {
         let mut kv = KvMetrics::new(vec![spec("hits", None)], vec![], vec![]);
         let resource = default_resource();
-        let event = kv.process(&resource, event_with_attrs(&[])).expect("always forwards");
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         let m = metric_named(&event, "hits").expect("counter should be present");
         assert_eq!(counter_value(m), 1.0);
     }
@@ -343,12 +344,12 @@ mod tests {
             vec![spec("request_time", Some("request_time"))],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[
+        let mut event = event_with_attrs(&[
             ("body_bytes_sent", Value::U64(512)),
             ("active", Value::I64(3)),
             ("request_time", Value::F64(0.012)),
         ]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        assert!(kv.process(&resource, &mut event), "always forwards");
 
         assert_eq!(counter_value(metric_named(&event, "bytes").unwrap()), 512.0);
         assert_eq!(gauge_value(metric_named(&event, "conns").unwrap()), 3.0);
@@ -371,8 +372,8 @@ mod tests {
             vec![],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", Value::U64(1))]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("a", Value::U64(1))]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
 
         assert!(metric_named(&event, "present").is_some());
         assert!(metric_named(&event, "missing").is_none());
@@ -383,8 +384,8 @@ mod tests {
     fn a_non_numeric_string_field_skips_only_that_metric() {
         let mut kv = KvMetrics::new(vec![spec("dash", Some("upstream_time"))], vec![], vec![]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("upstream_time", Value::str("-"))]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("upstream_time", Value::str("-"))]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert!(event.metrics.is_empty());
         assert!(
             event.log.is_some(),
@@ -400,9 +401,9 @@ mod tests {
             vec![],
         );
         let resource = default_resource();
-        let event =
+        let mut event =
             event_with_attrs(&[("a", Value::F64(f64::NAN)), ("b", Value::F64(f64::INFINITY))]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert!(event.metrics.is_empty(), "NaN/inf must never become a metric value");
     }
 
@@ -414,8 +415,8 @@ mod tests {
             vec![],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", Value::U64(1))]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("a", Value::U64(1))]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert!(metric_named(&event, "good").is_some());
         assert_eq!(
             event.log.as_ref().unwrap().message,
@@ -428,8 +429,8 @@ mod tests {
     fn a_quoted_numeric_json_string_field_still_coerces() {
         let mut kv = KvMetrics::new(vec![spec("status", Some("status"))], vec![], vec![]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("status", Value::str("200"))]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("status", Value::str("200"))]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert_eq!(counter_value(metric_named(&event, "status").unwrap()), 200.0);
     }
 
@@ -443,8 +444,8 @@ mod tests {
         ] {
             let mut kv = KvMetrics::new(vec![spec("m", Some("f"))], vec![], vec![]);
             let resource = default_resource();
-            let event = event_with_attrs(&[("f", value.clone())]);
-            let event = kv.process(&resource, event).expect("always forwards");
+            let mut event = event_with_attrs(&[("f", value.clone())]);
+            assert!(kv.process(&resource, &mut event), "always forwards");
             assert!(event.metrics.is_empty(), "{value:?} should not coerce to a metric value");
         }
     }
@@ -453,7 +454,8 @@ mod tests {
     fn unit_lands_on_the_emitted_metric_record() {
         let mut kv = KvMetrics::new(vec![spec_with_unit("bytes", None, "By")], vec![], vec![]);
         let resource = default_resource();
-        let event = kv.process(&resource, event_with_attrs(&[])).expect("always forwards");
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         let m = metric_named(&event, "bytes").unwrap();
         assert_eq!(m.unit.map(resolve), Some("By"));
     }
@@ -464,7 +466,7 @@ mod tests {
         let resource = default_resource();
         let mut event = event_with_attrs(&[]);
         event.metrics.push(MetricRecord::new(intern("existing"), MetricKind::counter(9.0)));
-        let event = kv.process(&resource, event).expect("always forwards");
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert_eq!(event.metrics.len(), 2);
         assert_eq!(resolve(event.metrics[0].name), "existing");
         assert_eq!(resolve(event.metrics[1].name), "new_counter");
@@ -492,7 +494,7 @@ mod tests {
         let original_attrs = event.attributes.clone();
         let original_log = event.log.clone();
 
-        let event = kv.process(&resource, event).expect("always forwards");
+        assert!(kv.process(&resource, &mut event), "always forwards");
 
         assert_eq!(event.timestamp, 12345);
         assert!(event.span.is_some());
@@ -511,8 +513,8 @@ mod tests {
             vec![spec("rt", Some("request_time"))],
         );
         let resource = default_resource();
-        let event = event_with_attrs(&[]);
-        let event = kv.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event), "always forwards");
         assert_eq!(event.metrics.len(), 2, "only the two no-field metrics should be emitted");
         assert!(metric_named(&event, "hits").is_some());
         assert!(metric_named(&event, "up").is_some());
@@ -542,7 +544,8 @@ mod tests {
         let mut kv =
             KvMetrics::new(vec![spec("hits", None)], vec![], vec![]).with_telemetry(telemetry);
         let resource = default_resource();
-        kv.process(&resource, event_with_attrs(&[])).unwrap();
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event));
 
         // Nothing is emitted until the batch closes -- the tally is per batch, not per event.
         assert!(registry.drain(0).is_empty(), "no telemetry before end_batch");
@@ -568,7 +571,8 @@ mod tests {
             // `bytes` is present on the even events only; `rt` never.
             let attrs: Vec<(&str, Value)> =
                 if i % 2 == 0 { vec![("body_bytes_sent", Value::U64(1))] } else { vec![] };
-            kv.process(&resource, event_with_attrs(&attrs)).unwrap();
+            let mut event = event_with_attrs(&attrs);
+            assert!(kv.process(&resource, &mut event));
         }
         kv.end_batch();
 
@@ -595,7 +599,8 @@ mod tests {
         let mut kv = KvMetrics::new(vec![spec("missing", Some("nope"))], vec![], vec![])
             .with_telemetry(telemetry);
         let resource = default_resource();
-        kv.process(&resource, event_with_attrs(&[])).unwrap();
+        let mut event = event_with_attrs(&[]);
+        assert!(kv.process(&resource, &mut event));
         kv.end_batch();
 
         let events = registry.drain(0);
@@ -614,8 +619,9 @@ mod tests {
         )
         .with_telemetry(telemetry);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", Value::U64(1)), ("request_time", Value::F64(0.5))]);
-        kv.process(&resource, event).unwrap();
+        let mut event =
+            event_with_attrs(&[("a", Value::U64(1)), ("request_time", Value::F64(0.5))]);
+        assert!(kv.process(&resource, &mut event));
         kv.end_batch();
 
         let events = registry.drain(0);

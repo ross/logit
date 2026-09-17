@@ -419,9 +419,9 @@ impl Transform for TraceContext {
     /// own reasons (see [`Skip`]). A successful lift overwrites `log.trace` (and, with `span:`,
     /// `event.span` and `event.timestamp` -- the span's start) and, unless `keep_source`,
     /// removes every convention attribute it read.
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.log.is_none() {
-            return Some(event);
+            return true;
         }
         match self.lift(&event.attributes, event.timestamp) {
             Ok(lifted) => {
@@ -450,7 +450,7 @@ impl Transform for TraceContext {
                 );
             }
         }
-        Some(event)
+        true
     }
 }
 
@@ -584,8 +584,8 @@ mod tests {
     #[test]
     fn a_valid_trace_id_is_lifted_and_removed_by_default() {
         let mut t = legacy();
-        let event = log_event(&[("trace_id", Value::str(hex_trace()))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("trace_id", Value::str(hex_trace()))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace,
             Some(TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 })
@@ -599,8 +599,8 @@ mod tests {
     #[test]
     fn keep_source_leaves_the_attribute_in_place() {
         let mut t = TraceContext::new("trace_id".to_string(), None, None, true);
-        let event = log_event(&[("trace_id", Value::str(hex_trace()))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("trace_id", Value::str(hex_trace()))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.log.unwrap().trace.is_some());
         assert!(event.attributes.get("trace_id").is_some());
     }
@@ -613,12 +613,12 @@ mod tests {
             Some("flags".to_string()),
             false,
         );
-        let event = log_event(&[
+        let mut event = log_event(&[
             ("trace_id", Value::str(hex_trace())),
             ("span_id", Value::str(hex_span())),
             ("flags", Value::I64(1)),
         ]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace,
             Some(TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 1 })
@@ -631,24 +631,25 @@ mod tests {
     fn flags_accepts_a_decimal_string_but_not_hex() {
         let mut t =
             TraceContext::new("trace_id".to_string(), None, Some("flags".to_string()), false);
-        let event = log_event(&[("trace_id", Value::str(hex_trace())), ("flags", Value::str("1"))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event =
+            log_event(&[("trace_id", Value::str(hex_trace())), ("flags", Value::str("1"))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace.unwrap().flags, 1);
     }
 
     #[test]
     fn a_missing_trace_id_attribute_is_skipped_not_an_error() {
         let mut t = legacy();
-        let event = log_event(&[]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace, None);
     }
 
     #[test]
     fn an_unparseable_trace_id_is_skipped_and_leaves_the_attribute_in_place() {
         let mut t = legacy();
-        let event = log_event(&[("trace_id", Value::str("not-hex"))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("trace_id", Value::str("not-hex"))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace, None);
         assert!(
             event.attributes.get("trace_id").is_some(),
@@ -660,9 +661,9 @@ mod tests {
     fn an_unparseable_span_id_skips_the_whole_lift_even_though_trace_id_was_valid() {
         let mut t =
             TraceContext::new("trace_id".to_string(), Some("span_id".to_string()), None, false);
-        let event =
+        let mut event =
             log_event(&[("trace_id", Value::str(hex_trace())), ("span_id", Value::str("not-hex"))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace, None, "an invalid span_id must not partially apply");
         assert!(event.attributes.get("trace_id").is_some());
         assert!(event.attributes.get("span_id").is_some());
@@ -672,8 +673,8 @@ mod tests {
     fn a_configured_span_id_field_absent_from_the_event_is_not_an_error() {
         let mut t =
             TraceContext::new("trace_id".to_string(), Some("span_id".to_string()), None, false);
-        let event = log_event(&[("trace_id", Value::str(hex_trace()))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("trace_id", Value::str(hex_trace()))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace,
             Some(TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 })
@@ -685,7 +686,7 @@ mod tests {
         let mut t = legacy();
         let mut event = metric_only_event();
         event.attributes.insert("trace_id", Value::str(hex_trace()));
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.log.is_none());
         assert!(event.attributes.get("trace_id").is_some(), "nothing should have been touched");
     }
@@ -696,14 +697,15 @@ mod tests {
         let mut event = log_event(&[("trace_id", Value::str(hex_trace()))]);
         event.log.as_mut().unwrap().trace =
             Some(TraceRef { trace_id: [1; 16], span_id: None, flags: 0 });
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace.unwrap().trace_id, [0xab; 16]);
     }
 
     #[test]
     fn a_missing_lift_records_a_skipped_missing_counter() {
         let (mut t, registry) = instrumented(legacy());
-        t.process(&default_resource(), log_event(&[])).unwrap();
+        let mut event = log_event(&[]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             counter(
                 &registry,
@@ -717,8 +719,8 @@ mod tests {
     #[test]
     fn a_successful_lift_records_a_lifted_counter() {
         let (mut t, registry) = instrumented(legacy());
-        t.process(&default_resource(), log_event(&[("trace_id", Value::str(hex_trace()))]))
-            .unwrap();
+        let mut event = log_event(&[("trace_id", Value::str(hex_trace()))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(counter(&registry, "logit.transform.trace_context.lifted", None), Some(1.0));
     }
 
@@ -727,12 +729,12 @@ mod tests {
     #[test]
     fn the_convention_defaults_lift_dotted_names_with_no_overrides() {
         let mut t = convention();
-        let event = log_event(&[
+        let mut event = log_event(&[
             ("trace.id", Value::str(hex_trace())),
             ("span.id", Value::str(hex_span())),
             ("trace.flags", Value::U64(1)),
         ]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace,
             Some(TraceRef { trace_id: [0xab; 16], span_id: Some([0xcd; 8]), flags: 1 })
@@ -743,8 +745,8 @@ mod tests {
     #[test]
     fn a_traceparent_alone_lifts_trace_id_and_flags_but_never_becomes_the_logs_span_id() {
         let mut t = convention();
-        let event = log_event(&[("traceparent", Value::str(W3C_EXAMPLE))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("traceparent", Value::str(W3C_EXAMPLE))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace,
             Some(TraceRef { trace_id: W3C_TRACE, span_id: None, flags: 1 }),
@@ -757,13 +759,13 @@ mod tests {
     fn traceparent_flags_are_hex_while_the_standalone_field_is_decimal() {
         let header = format!("{}-10", &W3C_EXAMPLE[..52]);
         let mut t = convention();
-        let event = log_event(&[("traceparent", Value::str(header.clone()))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        let mut event = log_event(&[("traceparent", Value::str(header.clone()))]);
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace.unwrap().flags, 0x10, "header octet is hex");
 
-        let event =
+        let mut event =
             log_event(&[("traceparent", Value::str(header)), ("trace.flags", Value::str("10"))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             event.log.unwrap().trace.unwrap().flags,
             10,
@@ -774,22 +776,22 @@ mod tests {
     #[test]
     fn an_explicit_trace_id_beats_the_traceparents() {
         let mut t = convention();
-        let event = log_event(&[
+        let mut event = log_event(&[
             ("traceparent", Value::str(W3C_EXAMPLE)),
             ("trace.id", Value::str(hex_trace())),
         ]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace.unwrap().trace_id, [0xab; 16]);
     }
 
     #[test]
     fn a_malformed_traceparent_is_invalid_even_with_a_valid_explicit_trace_id() {
         let (mut t, registry) = instrumented(convention());
-        let event = log_event(&[
+        let mut event = log_event(&[
             ("traceparent", Value::str("00-nope")),
             ("trace.id", Value::str(hex_trace())),
         ]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(event.log.unwrap().trace, None);
         assert_eq!(
             counter(
@@ -805,21 +807,21 @@ mod tests {
     fn empty_dash_and_null_values_count_as_absent() {
         let mut t = convention();
         for absent in [Value::str(""), Value::str("-"), Value::Null] {
-            let event = log_event(&[
+            let mut event = log_event(&[
                 ("trace.id", Value::str(hex_trace())),
                 ("span.id", absent.clone()),
                 ("traceparent", absent.clone()),
                 ("trace.flags", absent),
             ]);
-            let event = t.process(&default_resource(), event).unwrap();
+            assert!(t.process(&default_resource(), &mut event));
             assert_eq!(
                 event.log.unwrap().trace,
                 Some(TraceRef { trace_id: [0xab; 16], span_id: None, flags: 0 })
             );
         }
-        let event = log_event(&[("trace.id", Value::str(""))]);
+        let mut event = log_event(&[("trace.id", Value::str(""))]);
         let (mut t, registry) = instrumented(convention());
-        t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert_eq!(
             counter(
                 &registry,
@@ -834,9 +836,9 @@ mod tests {
     #[test]
     fn a_null_span_id_field_disables_that_lookup() {
         let mut t = TraceContext::new("trace.id".to_string(), None, None, false);
-        let event =
+        let mut event =
             log_event(&[("trace.id", Value::str(hex_trace())), ("span.id", Value::str("not-hex"))]);
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.log.unwrap().trace.is_some(), "span.id was never read, so can't be invalid");
         assert!(event.attributes.get("span.id").is_some(), "and is not consumed either");
     }
@@ -849,7 +851,8 @@ mod tests {
         let mut attrs = span_attrs();
         attrs.push(("traceparent", Value::str(W3C_EXAMPLE)));
         attrs.push(("host", Value::str("example")));
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
 
         let span = event.span.as_ref().expect("a span");
         assert_eq!(span.trace_id, [0xab; 16], "explicit trace.id beat the traceparent's");
@@ -880,7 +883,8 @@ mod tests {
     fn a_missing_span_id_is_a_span_id_skip_unless_minting_is_on() {
         let (mut t, registry) = instrumented(with_span());
         let attrs: Vec<_> = span_attrs().into_iter().filter(|(k, _)| *k != "span.id").collect();
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.span.is_none());
         assert_eq!(event.log.as_ref().unwrap().trace, None, "all-or-nothing");
         assert_eq!(event.timestamp, RECEIPT, "timestamp untouched");
@@ -896,7 +900,8 @@ mod tests {
 
         let (mut t, registry) =
             instrumented(convention().with_span(SpanLift { mint_id: true, ..span_lift() }));
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
         let span = event.span.expect("minted");
         assert_ne!(span.span_id, [0; 8]);
         assert_eq!(event.log.unwrap().trace.unwrap().span_id, Some(span.span_id));
@@ -917,7 +922,8 @@ mod tests {
             ("span.kind", Value::str("client")),
             ("span.status", Value::str("error")),
         ]);
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
         let span = event.span.unwrap();
         assert_eq!(span.parent_span_id, Some([0xef; 8]), "explicit parent beats the header's");
         assert_eq!(span.name.as_str(), Some("GET /"));
@@ -937,7 +943,8 @@ mod tests {
             let (mut t, registry) = instrumented(with_span());
             let mut attrs = span_attrs();
             attrs.push((key, value));
-            let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+            let mut event = log_event(&attrs);
+            assert!(t.process(&default_resource(), &mut event));
             assert!(event.span.is_none(), "{key}");
             assert_eq!(
                 counter(
@@ -962,7 +969,8 @@ mod tests {
         .with_span(span_lift());
         let mut attrs = span_attrs();
         attrs.push(("traceparent", Value::str(W3C_EXAMPLE)));
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.span.is_some());
         assert_eq!(event.attributes.len(), attrs.len());
     }
@@ -974,7 +982,8 @@ mod tests {
         let mut attrs =
             vec![("trace.id", Value::str(hex_trace())), ("span.id", Value::str(hex_span()))];
         attrs.extend(timing.iter().cloned());
-        let event = t.process(&default_resource(), log_event(&attrs)).unwrap();
+        let mut event = log_event(&attrs);
+        assert!(t.process(&default_resource(), &mut event));
         match event.span {
             Some(span) => Ok((event.timestamp, span.end_timestamp)),
             None => {
@@ -1246,7 +1255,8 @@ mod tests {
         let mut attrs = span_attrs();
         attrs.push(("span.kind", Value::str("bogus")));
         let before = log_event(&attrs);
-        let after = t.process(&default_resource(), before.clone()).unwrap();
+        let mut after = before.clone();
+        assert!(t.process(&default_resource(), &mut after));
         assert_eq!(after.timestamp, before.timestamp);
         assert_eq!(after.log.as_ref().unwrap().trace, None);
         assert!(after.span.is_none());
@@ -1263,7 +1273,7 @@ mod tests {
         for (k, v) in span_attrs() {
             event.attributes.insert(k, v);
         }
-        let event = t.process(&default_resource(), event).unwrap();
+        assert!(t.process(&default_resource(), &mut event));
         assert!(event.span.is_none());
         assert_eq!(event.attributes.len(), 4);
     }
