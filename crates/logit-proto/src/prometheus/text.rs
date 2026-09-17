@@ -20,6 +20,7 @@
 //! | `_created` | not part of the format (accepted on parse, never written) | written for counter/histogram/summary |
 //! | exemplars | none (parsed and discarded, never written) | ` # {labels} value [ts]` on `_total`/`_bucket` lines |
 //! | unannotated samples | `# TYPE x untyped` | `# TYPE x unknown` |
+//! | stale markers ([`super::Point::Stale`]) | no spelling: the series is skipped, counted `logit.output.metrics.skipped{reason="stale"}` | the same |
 //! | `info`/`stateset`/`gaugehistogram` | no such type -- written as their nearest text shape (below) | native |
 //! | metadata order | `# HELP` then `# TYPE` (Prometheus's own output) | `# TYPE`, `# UNIT`, `# HELP` (the spec's own examples) |
 //!
@@ -717,6 +718,14 @@ impl Writer<'_> {
                     self.count_sample(&series.labels, None, *count, series, None);
                 }
                 self.created(series);
+            }
+            Point::Stale => {
+                // Prometheus' stale marker is a specific NaN payload on the wire, and neither
+                // exposition dialect has a spelling for it: writing a bare `NaN` sample would read
+                // as a real reading of NaN at every scraper, and writing nothing at all is the
+                // honest rendering of "this codec cannot say that". Under the default encoder
+                // settings this is unreachable -- only `with_stale_markers(true)` builds one.
+                self.encoder.skipped_reason("stale");
             }
             Point::Summary { quantiles, sum, count } => {
                 // A summary has no line OpenMetrics allows an exemplar on -- only `_total` and
@@ -2319,5 +2328,39 @@ mod tests {
         let (families, reasons) = parse_reasons("# just a comment\n#\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(family_names(&families), vec!["foo"]);
         assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    /// Neither dialect can express a stale marker, so the writer drops the series and counts it --
+    /// a bare `NaN` line would read as a real reading of `NaN` at every scraper. Under the default
+    /// encoder settings `events_to_families` never builds one, so this is the belt to
+    /// `with_stale_markers`' braces.
+    #[test]
+    fn a_stale_series_is_skipped_and_counted_in_both_dialects() {
+        for dialect in [Dialect::Text0_0_4, Dialect::OpenMetrics1_0] {
+            let families = [MetricFamily {
+                series: vec![
+                    Series::new(vec![("shard".to_string(), "1".to_string())], Point::Stale),
+                    Series::new(vec![("shard".to_string(), "2".to_string())], Point::Gauge(3.0)),
+                ],
+                ..MetricFamily::new("m", FamilyType::Gauge)
+            }];
+            let registry = Registry::new();
+            let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
+                "prometheus",
+                "prometheus_out",
+                "sink",
+            ));
+            let mut out = Vec::new();
+            write_with(&families, dialect, &mut out, &mut encoder);
+            let text = String::from_utf8(out).expect("exposition must be utf-8");
+
+            assert!(!text.contains("shard=\"1\""), "{dialect:?} wrote the stale series:\n{text}");
+            assert!(text.contains("m{shard=\"2\"} 3\n"), "{dialect:?} lost the live one:\n{text}");
+            let skipped = registry.drain(0).iter().any(|event| {
+                event.metrics.iter().any(|m| resolve(m.name) == "logit.output.metrics.skipped")
+                    && event.attributes.get("reason").and_then(|v| v.as_str()) == Some("stale")
+            });
+            assert!(skipped, "{dialect:?} did not count the skip");
+        }
     }
 }
