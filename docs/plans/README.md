@@ -9,6 +9,7 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: `docker_in` live container identity and a minimal `inotify` watch set](docker-container-identity.md) | 2026-09-17 | 2026-09-17 |
 | [Enabling plan: `Transform::process` in place — `&mut Event -> bool`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
 | [Enabling plan: `keep_values` — clamping tag-value cardinality against an allow-list](value-allowlist-cardinality-clamp.md) | 2026-09-15 | 2026-09-15 |
 | [Enabling plan: `Event.new(t)` — constructing events from Lua](lua-event-constructor.md) | 2026-09-15 | 2026-09-15 |
