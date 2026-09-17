@@ -206,10 +206,10 @@ matches what `allocations.rs` asserts line for line.
   showed ~−40% ns with an unchanged body). Only `process_batch_through_keep`, `full_chain` and the
   untouched controls compare cleanly; the ADR says so, and anyone quoting the other rows should
   too.
-- **The `json`-versus-`logfmt` asymmetry is unexplained.** A `json` node gained 15–20% end to end
-  and a `logfmt` node gained nothing measurable, from the same removed `Vec` and the same removed
-  memcpy. Worth a `script/perf flamegraph` on both before anyone builds a model of per-hop cost on
-  these numbers.
+- **The gain is visible only where `process_batch` overhead is a large share of the node.** Flamegraphs
+  of `json-parse` and `logfmt-parse` before/after show the same underlying improvement in both
+  (allocator call share −25% each); `logfmt`'s per-attribute cost dominates its node, so its
+  end-to-end delta stays inside noise. Not a risk to the change; a limit on where to expect it.
 - **Part of the end-to-end gain is allocator churn, not memcpy.** The removed survivors `Vec` was
   ~55 KB per batch per node (64 × 864 B), and peak RSS on `json-parse` fell 139 → 80 MiB alongside
   the CPU drop. That makes the win real but its attribution approximate, and it means the result may

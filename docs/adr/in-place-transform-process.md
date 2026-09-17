@@ -156,10 +156,14 @@ within a few MiB.
 864-byte memcpy per hop alone explains, and it coincides with the RSS drop, so part of it is
 allocator churn rather than memcpy: the removed per-batch survivors `Vec` was 64 events × 864 B ≈
 55 KB of fresh allocation per batch per node, and not paying it changes the allocator's working set
-as well as its instruction count. Against that, **`logfmt-parse` shows no end-to-end gain at all**,
-within noise, at both the scenario and the node level — the same transform shape, the same removed
-`Vec`, no measurable benefit. That asymmetry is not explained by this work and this ADR does not
-claim to explain it. Run-to-run drift on this box is 1–2% (`logfmt-parse`'s three interleaved
+as well as its instruction count. Against that, **`logfmt-parse` shows no end-to-end gain**, within noise, at both the scenario and
+the node level. Flamegraphs of both scenarios before and after (same day, same box) show the two
+transforms got the *same* underlying improvement: allocator call share fell ~25% in each and the
+large-allocation class halved in each. The difference is only what share of each node's total
+that fixed saving is — `logfmt`'s per-event cost is dominated by per-attribute work (nine interned
+keys, an `AttrMap` spilled past its eight inline slots, nine string `Value` drops) that this change
+never touched, so the same absolute saving lands inside its noise. Not a caveat on the mechanism,
+just on which workloads it is visible in. Run-to-run drift on this box is 1–2% (`logfmt-parse`'s three interleaved
 before/after pairs gave +1.9%/−0.9%/+2.0%, and one `json-parse` baseline pair drifted to 0.682), so
 every magnitude above is approximate and the small rows (`passthrough`, `aggregate`) are inside
 that drift.
@@ -231,7 +235,8 @@ that drift.
   the per-hop budget and deliberately does not touch the channel/scheduler term. Whether fusing a
   linear run of adjacent nodes onto one thread is worth its complexity is still undecided, and now
   has cleaner inputs.
-- **Follow-on: the json-vs-logfmt asymmetry is unexplained.** A `json` node gained 15–20% and a
-  `logfmt` node gained nothing measurable, from the same removed `Vec` and the same removed memcpy.
-  Anyone revisiting per-hop cost should point `script/perf flamegraph` at both scenarios before
-  building a model of where transform time goes; this ADR's numbers alone do not support one.
+- **Follow-on: the win is per transform node and scales with how much of that node is
+  `process_batch` overhead.** A `json` node gained 15–20%; a `logfmt` node, dominated by
+  per-attribute work, gained nothing measurable from the same removed `Vec` and memcpy. Where the
+  rest of a wide event's time goes (`AttrMap` inline capacity, interning, `Value` drops) is a
+  separate question with its own notes, not part of this decision.
