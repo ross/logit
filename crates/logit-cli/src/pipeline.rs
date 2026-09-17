@@ -20,7 +20,7 @@ use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
-use logit_inputs::prometheus::PrometheusInput;
+use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
@@ -40,7 +40,7 @@ use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{
-    DiskQueueConfig, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
+    DiskQueueConfig, Input, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
@@ -441,9 +441,12 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        // The receiver half of this kind lands in the next commit; until then only scrape mode
-        // builds, and a `bind:` config is a clear error rather than a listener that silently
-        // scrapes nothing.
+        // Two modes, one kind -- graph rule 55 has already established that exactly one of
+        // `scrape_targets`/`bind` is set, so this dispatches on `bind` and trusts it. The two
+        // modes are two types (`PrometheusInput`, `PrometheusReceiver`) rather than one enum: a
+        // scrape client and an HTTP listener share no field and no builder, and `NodeSpec::Input`
+        // already takes a `Box<dyn Input>`, so the kind's config is the only thing that needs to
+        // know about both.
         PrometheusIn {
             scrape_targets,
             interval,
@@ -451,23 +454,32 @@ fn build_spec(
             headers,
             scrape_tls,
             bind,
-            path: _,
-            bind_tls: _,
-            idle_timeout: _,
+            path,
+            bind_tls,
+            idle_timeout,
         } => {
-            if bind.is_some() {
-                anyhow::bail!(
-                    "component '{id}': a 'bind:' prometheus_in (the remote-write receiver) isn't \
-                     built yet"
-                );
-            }
-            let input = PrometheusInput::new(scrape_targets.clone(), *interval)
-                .with_timeout(*timeout)
-                .with_headers(headers)?
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone())
-                .with_tls(&to_input_tls_client_settings(scrape_tls), base_dir)?;
-            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+            let input: Box<dyn Input + Send> = match bind {
+                Some(bind) => {
+                    let mut receiver = PrometheusReceiver::new(bind.clone(), path.clone())
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .with_idle_timeout(*idle_timeout);
+                    if let Some(bind_tls) = bind_tls {
+                        receiver =
+                            receiver.with_bind_tls(&to_tls_server_settings(bind_tls), base_dir)?;
+                    }
+                    Box::new(receiver)
+                }
+                None => Box::new(
+                    PrometheusInput::new(scrape_targets.clone(), *interval)
+                        .with_timeout(*timeout)
+                        .with_headers(headers)?
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .with_tls(&to_input_tls_client_settings(scrape_tls), base_dir)?,
+                ),
+            };
+            NodeSpec::Input(input, input_runtime_config(&component.receive))
         }
         LogitIn { bind, tls, max_frame_bytes, handshake_timeout, idle_timeout } => {
             let mut input = LogitInput::new(bind.clone())
@@ -1938,6 +1950,35 @@ mod tests {
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
                 idle_timeout: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The other half of the same kind: `bind:` set instead of `scrape_targets:` builds the
+    /// remote-write receiver rather than the scrape client, which is the whole of what the arm
+    /// dispatches on.
+    #[test]
+    fn build_spec_builds_a_prometheus_receiver() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::PrometheusIn {
+                scrape_targets: Vec::new(),
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+                bind: Some("127.0.0.1:0".to_string()),
+                path: "/api/v1/write".to_string(),
+                bind_tls: None,
+                idle_timeout: Some(Duration::from_secs(60)),
             },
         };
         assert!(matches!(
