@@ -633,6 +633,22 @@ pub fn encode(
     version: Version,
     encoder: &mut PrometheusEncoder,
 ) -> Vec<u8> {
+    encode_counted(groups, version, encoder).0
+}
+
+/// [`encode`], plus how many samples the body it returns actually carries -- what a sender counts
+/// as `logit.output.samples`, the mirror of [`Decoded::samples`] on the receiving end.
+///
+/// A separate entry point rather than a wider return type on [`encode`], because the count is only
+/// derivable *here*: one [`Series`] becomes one sample for a gauge and several for a histogram
+/// (this module doc's flattening table), and a label set repeated across groups merges into one
+/// `TimeSeries` with several. A caller counting its own families would be counting something else
+/// and calling it samples.
+pub fn encode_counted(
+    groups: &[Vec<MetricFamily>],
+    version: Version,
+    encoder: &mut PrometheusEncoder,
+) -> (Vec<u8>, u64) {
     let mut built: BTreeMap<Vec<(String, String)>, SeriesOut> = BTreeMap::new();
     let mut flat = Vec::new();
     for families in groups {
@@ -668,15 +684,18 @@ pub fn encode(
             }
         }
     }
+    let mut samples = 0u64;
     for out in built.values_mut() {
         // Both versions require a series' samples to be in timestamp order. Stable, so two samples
         // that truncate to the same millisecond keep the order the groups gave them.
         out.samples.sort_by_key(|sample| sample.timestamp_ms);
+        samples += out.samples.len() as u64;
     }
-    match version {
+    let body = match version {
         Version::V1 => encode_v1(built),
         Version::V2 => encode_v2(built),
-    }
+    };
+    (body, samples)
 }
 
 /// One series on its way out: the family facts both versions' metadata needs, plus the samples and

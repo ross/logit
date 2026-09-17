@@ -1,32 +1,50 @@
-//! `prometheus_out`: a Prometheus/OpenMetrics **exposition** endpoint -- a sink that holds a
-//! registry of current series and renders it on demand, rather than writing anything anywhere.
-//! The mirror of `logit_inputs::prometheus` (scrape), and the fourth like-protocol pair under
-//! [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md). The wire syntax and the whole
-//! model↔families mapping live in `logit_proto::prometheus`
-//! ([`text::write`], [`events_to_families`]); nothing here knows what a sample line looks like.
+//! `prometheus_out`: the Prometheus sink, in either of its two shapes -- an **exposition**
+//! endpoint a Prometheus scrapes (`bind:`), or a **remote-write sender** that POSTs each batch to
+//! a receiver (`endpoint:`). Exactly one is set; graph rule 56 rejects both and neither. The
+//! mirror of `logit_inputs::prometheus`, which is the same pair the other way round (scrape a
+//! target, or receive remote-write on a bind), and the fourth like-protocol pair under
+//! [ADR `lossless-transit`](../../../docs/adr/lossless-transit.md). Both wire syntaxes and the
+//! whole model<->families mapping live in `logit_proto::prometheus` ([`text::write`],
+//! [`remote_write::encode`], [`events_to_families`]); nothing here knows what a sample line or a
+//! `TimeSeries` looks like.
 //!
-//! **This module doc is the spec** (house convention, see [`crate::statsd`]'s). The authority is
-//! [ADR `prometheus-scrape-and-exposition`](../../../docs/adr/prometheus-scrape-and-exposition.md)
-//! -- "Exposition state and expiry", "Dialects and negotiation", "`Output::bind`".
+//! **This module doc is the spec** (house convention, see [`crate::statsd`]'s). The authorities
+//! are [ADR `prometheus-scrape-and-exposition`](../../../docs/adr/prometheus-scrape-and-exposition.md)
+//! -- "Exposition state and expiry", "Dialects and negotiation", "`Output::bind`" -- and
+//! [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md) -- "Sender
+//! behaviour: one request per batch, no retry in the sink", "Decode and encode work in timestamp
+//! groups", "Timestamps: received without the marker, sent always".
 //!
 //! ## Config
 //!
+//! Registry mode -- [`ExposeOutput`]:
+//!
 //! ```yaml
 //! kind: prometheus_out
-//! bind: "127.0.0.1:9464"   # required; loopback in every example -- see "Security posture"
+//! bind: "127.0.0.1:9464"   # loopback in every example -- see "Security posture"
 //! path: /metrics           # default
 //! expire_after: 5m         # a series not updated within this window stops being exposed; 0s off
 //! max_series: 100000       # hard cap; least-recently-updated evicted first
 //! ```
 //!
-//! `buffer:` works unchanged -- it is a sibling of `kind:` on every sink, and this one is no
-//! different (though a sink whose `send` never fails will never actually back one up).
+//! Sender mode -- [`RemoteWriteOutput`]:
 //!
-//! A future remote-write **sender** is an optional `endpoint:` on this same variant, mutually
-//! exclusive with `bind:` by a graph rule -- purely additive, see the ADR's forward-compatibility
-//! section. There is no `endpoint:` today.
+//! ```yaml
+//! kind: prometheus_out
+//! endpoint: "http://mimir:8080/api/v1/push"  # absolute http(s) URL, path included
+//! version: 1                                 # default; 1 = prometheus.WriteRequest, 2 = io.prometheus.write.v2.Request
+//! timeout: 10s                               # default; bounds one request
+//! headers:                                   # e.g. a tenant header; !env works on a value
+//!   X-Scope-OrgID: tenant-a
+//! endpoint_tls: {}                           # https:// only -- see `TlsClientConfig`
+//! ```
 //!
-//! ## Dialect negotiation
+//! A field of the mode that isn't set is a config error rather than a setting that silently does
+//! nothing (rule 56). `buffer:` works unchanged on both -- it is a sibling of `kind:` on every
+//! sink. It matters rather more in sender mode, which is the only one of the two whose `send` can
+//! actually fail.
+//!
+//! ## Dialect negotiation (registry mode)
 //!
 //! One endpoint, two dialects, chosen per request from the client's own `Accept`:
 //!
@@ -39,7 +57,7 @@
 //! response's `Content-Type` are never two independent copies of the same string. `Accept-Encoding:
 //! gzip` gets a gzip-compressed body and `Content-Encoding: gzip`; a `gzip;q=0` does not.
 //!
-//! ## Routes
+//! ## Routes (registry mode)
 //!
 //! | Request | Response |
 //! |---|---|
@@ -52,9 +70,9 @@
 //! Path is matched before method, so an unknown path is a `404` regardless of method: "no such
 //! resource" outranks "wrong verb for the resource you didn't ask for".
 //!
-//! ## State: upsert, expiry, cardinality
+//! ## State: upsert, expiry, cardinality (registry mode)
 //!
-//! [`PrometheusOutput::send`] converts the batch with [`events_to_families`] (every lossy path --
+//! [`ExposeOutput::send`] converts the batch with [`events_to_families`] (every lossy path --
 //! delta temporality, `ExponentialHistogram`, an unrepresentable label -- is counted by the codec's
 //! own [`PrometheusEncoder`], not here) and **upserts** each series into the registry: keyed by
 //! family name, then by the series' rendered, sorted label set, latest value wins. That is
@@ -76,7 +94,75 @@
 //! counted. Keeping the old type instead would mean silently dropping live data in favour of data
 //! that may already have expired.
 //!
+//! ## The wire (sender mode)
+//!
+//! One `send` is **one `POST`**, and a batch that produces no series at all sends **no request** --
+//! not an empty `WriteRequest`. Four headers are `insert`ed *over* a clone of the operator's
+//! `headers:` map, so a protocol-owned name always wins whatever config said (rule 56 rejects one
+//! at config time as well; this is the defense in depth behind it, and the same merge order
+//! `otlp_out`'s HTTP transport uses):
+//!
+//! | Header | Value |
+//! |---|---|
+//! | `Content-Type` | [`remote_write::Version::content_type`] -- `application/x-protobuf;proto=prometheus.WriteRequest` for `version: 1`, `…;proto=io.prometheus.write.v2.Request` for `2` |
+//! | `Content-Encoding` | `snappy` -- the Snappy **block** format (`snap::raw`), never the framed one |
+//! | `X-Prometheus-Remote-Write-Version` | [`remote_write::Version::header_version`] -- `0.1.0` for 1.0 (the spec's own historical number), `2.0.0` for 2.0 |
+//! | `User-Agent` | `logit/<version>` |
+//!
+//! There is no negotiation and no fallback between versions: the operator picks the one their
+//! receiver speaks, exactly as they already pick an exposition dialect.
+//!
+//! **Timestamp partition → merged `TimeSeries`.** A remote-write `TimeSeries` is one label set and
+//! N samples; a `Series` is one label set and one point. So [`RemoteWriteOutput::send`] partitions
+//! the batch's events by `Event::timestamp` (ascending, stable within a timestamp), runs
+//! [`events_to_families`] once per partition, and hands the whole list of groups to
+//! [`remote_write::encode`], which merges identical label sets **across** groups into one
+//! `TimeSeries` whose samples are in timestamp order. A batch holding five scrapes of one target
+//! therefore becomes one `TimeSeries` with five samples, which is both what the format is for and
+//! what a receiver's in-order check expects. The partition is also what keeps a classic
+//! histogram's `_bucket`/`_sum`/`_count` samples -- which by construction share one timestamp --
+//! in front of one assembler at the far end.
+//!
+//! The encoder runs with `with_timestamps_always(true)`, because the wire has no way to omit a
+//! timestamp and a series without one would be silently skipped, and with
+//! `with_stale_markers(true)`, so a record flagged `FLAG_NO_RECORDED_VALUE` is written as
+//! Prometheus's own stale marker (a NaN with bit pattern `0x7ff0000000000002`) rather than skipped.
+//! That last one covers `Gauge`, `Sum` and marker-untyped records only: a flagged
+//! `Histogram`/`Summary`/sketch expands to several derived series and one flag says nothing about
+//! which of them existed, so it stays skipped and counted (`docs/known-gaps.md`).
+//!
+//! ## Faults, retries and duplicate safety (sender mode)
+//!
+//! **One `send` is one attempt.** There is no retry loop here; retry is `write_loop`'s job
+//! (`docs/adr/buffered-sink-delivery.md`) and this sink's whole contribution is classifying the
+//! outcome, attached to the error with `.context(fault)` -- the identical table `otlp_out`'s HTTP
+//! transport uses, shared with it as code in [`crate::http`] rather than copied:
+//!
+//! | Outcome | Result |
+//! |---|---|
+//! | 2xx | `Ok` |
+//! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied |
+//! | any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange |
+//! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
+//! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//!
+//! [`RemoteWriteOutput::duplicate_safe`] is **`true`**, and load-bearing rather than incidental. A
+//! sample's identity at a remote-write receiver is `(label set, timestamp)`, so replaying an
+//! identical request is an idempotent overwrite, never a double count -- which is what makes
+//! `true` honest. And `true` is what selects `DeliveryPosture::AtLeastOnce`
+//! (`logit_pipeline::output`), which is the *only* posture under which a `Fault::Ambiguous` is
+//! retried at all: setting it `false` would not make delivery safer, it would silently turn every
+//! 5xx into a dropped batch.
+//!
+//! **Ordering is the topology's, not this sink's.** Samples go out in batch order and nothing here
+//! reorders across batches. Two upstream branches writing the same series can therefore draw
+//! out-of-order `400`s from a receiver with no out-of-order window -- a property of the pipeline
+//! that was built, not a bug in the sink. A single chain into one `prometheus_out` does not have
+//! it.
+//!
 //! ## Telemetry
+//!
+//! Registry mode:
 //!
 //! | Point | Meaning |
 //! |---|---|
@@ -86,53 +172,75 @@
 //! | `logit.output.series.evicted{reason="expired"\|"cardinality"}` | see above |
 //! | `logit.output.metrics.type_conflict` | see above |
 //!
-//! plus everything the codec counts on the [`PrometheusEncoder`] this sink hands it:
-//! `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
+//! Sender mode:
+//!
+//! | Point | Meaning |
+//! |---|---|
+//! | `logit.output.requests{class="1xx"\|"2xx"\|"3xx"\|"4xx"\|"5xx"\|"other"\|"network_error"}` | one per request. `otlp_out`'s vocabulary exactly ([`crate::http::status_class`]), with no `429` class of its own -- a 429 is a `4xx`, and splitting it out would contradict [`crate::http::is_retryable_http_status`], which reads the same status to pick the `Fault`. No `timeout` class either: a timeout is a transport error, so it lands in `network_error`. And no `signal` tag, which `otlp_out` does carry -- this sink has exactly one signal, and hard-coding a tag that never varies is noise |
+//! | `logit.output.request.duration` | one timer per request actually issued -- the spelling `graphite_out`, `collectd_out`, `syslog_out`, `statsd_out` and `influxdb_out` already use |
+//! | `logit.output.samples` | samples in the request body, counted by the codec ([`remote_write::encode_counted`]) rather than guessed from family counts: one `Series` is one sample for a gauge and several for a histogram. The mirror of `prometheus_in`'s own `logit.input.samples`, so the two ends of a remote-write relay are comparable |
+//!
+//! plus, in **both** modes, everything the codec counts on the [`PrometheusEncoder`] the sink hands
+//! it: `logit.output.metrics.{skipped,degraded}`, `logit.output.labels.dropped`, and
 //! `logit.output.labels.normalized{reason="multi_value"}` -- a `Value::Array` attribute (a repeated
 //! DogStatsD tag key relayed in from `statsd_in`) collapsed to its last representable element,
 //! since a Prometheus label set is a map and has no multi-value label. Unlike every other
 //! `*.normalized` reason in `docs/design/internal-telemetry.md`, which report a
 //! lossless-but-different rendering of the same information, that one is **lossy**: the non-last
 //! elements are discarded, not re-spelled. It reads as `normalized` rather than `dropped` because
-//! the label itself survives and the series still exposes. A delta `Sum`
-//! reaching this sink is the common one -- skipped, counted
-//! `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with a throttled
-//! `delta_temporality_unresolved` diagnostic naming the fix (an `aggregate` with
-//! `temporality: cumulative` in front of the sink).
+//! the label itself survives and the series still exposes. A delta `Sum` reaching either mode is
+//! the common one -- skipped, counted `logit.output.metrics.skipped{metric_kind="delta_sum"}`, with
+//! a throttled `delta_temporality_unresolved` diagnostic naming the fix (an `aggregate` with
+//! `temporality: cumulative` in front of the sink). Remote-write does not change that: the format
+//! carries cumulative series, so a delta `Sum` has no more of a spelling there than it has in an
+//! exposition.
 //!
-//! **Both directions count under one encoder.** `send` and a render share a single
+//! **Both directions count under one encoder** in registry mode. `send` and a render share a single
 //! [`PrometheusEncoder`], so the drops each side reaches -- `send`'s unrepresentable labels and
 //! skipped kinds, a render's `degraded{reason="exemplar_dropped"|"unit_not_suffix"}` from
 //! [`text::write_with`] -- add up as this component's totals rather than splitting across two
 //! encoder identities for the same sink. The lock order that implies (encoder before registry) is
-//! on [`PrometheusOutput::encoder`].
+//! on [`ExposeOutput::encoder`]. Sender mode needs none of that: it has one direction and one
+//! `&mut self`, so its encoder is a plain field.
 //!
-//! ## Security posture: no TLS, no auth
+//! ## Security posture: no TLS, no auth on `bind:`
 //!
-//! This server serves the **entire registry** -- every label on every series it currently holds --
-//! to anything that connects to `bind:`, with no credential check and no transport encryption. That
-//! is the same posture [ADR `admin-readiness-endpoint`](../../../docs/adr/admin-readiness-endpoint.md)
-//! accepted for `/readyz`, with one difference that matters: `bind:` here is **required**, not
-//! off-by-default, and the payload is a metric surface rather than a lifecycle word. So: bind
-//! loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and let something that
-//! does have TLS and auth front it. An operator who needs this reachable from off-host is making
-//! that choice deliberately, not inheriting it from an example. Tracked in `docs/known-gaps.md`
-//! next to `admin:`'s own row.
+//! The registry-mode server serves the **entire registry** -- every label on every series it
+//! currently holds -- to anything that connects to `bind:`, with no credential check and no
+//! transport encryption. That is the same posture
+//! [ADR `admin-readiness-endpoint`](../../../docs/adr/admin-readiness-endpoint.md) accepted for
+//! `/readyz`, with one difference that matters: the payload is a metric surface rather than a
+//! lifecycle word. So: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example
+//! does) and let something that does have TLS and auth front it. An operator who needs this
+//! reachable from off-host is making that choice deliberately, not inheriting it from an example.
+//! Tracked in `docs/known-gaps.md` next to `admin:`'s own row.
+//!
+//! Sender mode is the opposite posture and always has been: it dials out, an `https://` endpoint
+//! gets real TLS with the bundled Mozilla roots by default, and `endpoint_tls:` tunes that -- a
+//! private CA, a client certificate for mutual TLS, or (deliberately awkward to ask for)
+//! `insecure_skip_verify`, which logs a startup warning. The receiver getting TLS does not
+//! retroactively give the exposition server any.
 
+use crate::http::{build_client, classify_reqwest_error, is_retryable_http_status, status_class};
+/// The sender's `endpoint_tls:`, re-exported at this path the way `otlp_out`, `logit_out`,
+/// `syslog_out` and `statsd_out` each re-export the one shared type.
+pub use crate::tls::TlsClientSettings;
 use anyhow::Context;
 use bytes::Bytes;
-use http::{Method, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use logit_core::{Diagnostics, EventBatch, Exemplar, Telemetry};
-use logit_pipeline::Output;
+use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
+use logit_pipeline::{Fault, Output};
 use logit_proto::prometheus::{
-    events_to_families, text, Dialect, FamilyType, MetricFamily, Point, PrometheusEncoder, Series,
+    events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
+    PrometheusEncoder, Series,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -187,6 +295,20 @@ fn response_timeout(max_series: usize) -> Duration {
     )
 }
 
+/// The default `timeout:` for one remote-write request -- the same 10s `otlp_out` and
+/// `prometheus_in`'s scrape both use for one HTTP request.
+pub const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `User-Agent` every remote-write request carries. Reserved in config (rule 56) so an
+/// operator can't replace it: a receiver's own logs are frequently the only place a misbehaving
+/// sender is identified from, and this is the identification.
+const USER_AGENT: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
+
+/// How much of a rejection body is worth carrying into an error message and a diagnostic. Enough
+/// for Prometheus's own `400` text -- which names the offending series and why -- and short enough
+/// that a receiver answering with an HTML error page doesn't fill a log line.
+const ERROR_BODY_SNIPPET_BYTES: usize = 256;
+
 const SCRAPES: &str = "logit.output.scrapes";
 /// Response body bytes as *rendered* (post-gzip when the client asked for it), counted when the
 /// body is built rather than when its last byte is acknowledged -- a `Full<Bytes>` response has no
@@ -196,6 +318,14 @@ const SCRAPE_BYTES: &str = "logit.output.scrape.bytes";
 const SERIES: &str = "logit.output.series";
 const SERIES_EVICTED: &str = "logit.output.series.evicted";
 const TYPE_CONFLICT: &str = "logit.output.metrics.type_conflict";
+
+// Sender mode's three. See the module doc's telemetry table for why `requests` carries no
+// `signal` tag and no `429`/`timeout` class of its own.
+const REQUESTS: &str = "logit.output.requests";
+const REQUEST_DURATION: &str = "logit.output.request.duration";
+/// Samples in the request body, as the codec counted them -- not families, and not series: one
+/// `Series` is one sample for a gauge and several for a histogram.
+const SAMPLES: &str = "logit.output.samples";
 
 /// What reads "now" for the expiry sweep. A closure rather than a bare `Instant::now` so the
 /// expiry and cardinality tests can advance time by hand instead of sleeping -- the sweep is the
@@ -387,7 +517,7 @@ struct ServerState {
     registry: Arc<Mutex<Registry>>,
     /// The *same* encoder `send` uses, not a second one built from the same handles: one component,
     /// one encoder identity, so `logit.output.metrics.degraded` reads as this sink's total however
-    /// the drop was reached. See [`PrometheusOutput::encoder`] for the lock ordering it implies.
+    /// the drop was reached. See [`ExposeOutput::encoder`] for the lock ordering it implies.
     encoder: Arc<Mutex<PrometheusEncoder>>,
     path: String,
     expire_after: Duration,
@@ -398,14 +528,77 @@ struct ServerState {
     clock: Clock,
 }
 
-/// `logit_pipeline::Output` for `prometheus_out` -- see the module doc for the whole spec.
-pub struct PrometheusOutput {
+/// `prometheus_out`, in whichever of its two shapes the config selected -- see the module doc for
+/// the whole spec. One enum rather than two unrelated sinks because it is one `kind:` with one
+/// name in `docs/design/pipeline-graph.md`'s table, one `buffer:`, and one set of encoder
+/// counters; graph rule 56 is what guarantees the choice is unambiguous, so `build_spec` picks a
+/// variant and nothing downstream branches again.
+// The two variants differ in size by a few hundred bytes (`RemoteWriteOutput` carries a
+// `reqwest::Client` and a `HeaderMap`), which is what clippy is pointing at -- and it costs
+// nothing here: exactly one of these exists per configured component, built once at startup and
+// immediately boxed as `NodeSpec::Output`'s `Box<dyn Output>`. Boxing a variant to even them out
+// would add an indirection to every `send` to save a one-off allocation of the larger size.
+#[allow(clippy::large_enum_variant)]
+pub enum PrometheusOutput {
+    /// `bind:` -- the exposition endpoint.
+    Expose(ExposeOutput),
+    /// `endpoint:` -- the remote-write sender.
+    Send(RemoteWriteOutput),
+}
+
+impl From<ExposeOutput> for PrometheusOutput {
+    fn from(output: ExposeOutput) -> Self {
+        PrometheusOutput::Expose(output)
+    }
+}
+
+impl From<RemoteWriteOutput> for PrometheusOutput {
+    fn from(output: RemoteWriteOutput) -> Self {
+        PrometheusOutput::Send(output)
+    }
+}
+
+/// Pure delegation -- every method's contract, including [`Output::duplicate_safe`]'s, is the
+/// selected mode's and is documented there. Nothing is decided at this level.
+#[async_trait::async_trait]
+impl Output for PrometheusOutput {
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        match self {
+            PrometheusOutput::Expose(output) => output.bind().await,
+            PrometheusOutput::Send(output) => output.bind().await,
+        }
+    }
+
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        match self {
+            PrometheusOutput::Expose(output) => output.send(batch).await,
+            PrometheusOutput::Send(output) => output.send(batch).await,
+        }
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        match self {
+            PrometheusOutput::Expose(output) => output.flush().await,
+            PrometheusOutput::Send(output) => output.flush().await,
+        }
+    }
+
+    fn duplicate_safe(&self) -> bool {
+        match self {
+            PrometheusOutput::Expose(output) => output.duplicate_safe(),
+            PrometheusOutput::Send(output) => output.duplicate_safe(),
+        }
+    }
+}
+
+/// The `bind:` half: `logit_pipeline::Output` for the exposition endpoint -- see the module doc.
+pub struct ExposeOutput {
     bind: String,
     path: String,
     expire_after: Duration,
     max_series: usize,
     registry: Arc<Mutex<Registry>>,
-    /// The address actually bound, once [`PrometheusOutput::bind`] has run -- and the reason
+    /// The address actually bound, once [`ExposeOutput::bind`] has run -- and the reason
     /// `bind` is where the socket is opened rather than lazily on first request: a test binds
     /// `127.0.0.1:0` and reads the real port back from here.
     local_addr: Option<SocketAddr>,
@@ -425,7 +618,7 @@ pub struct PrometheusOutput {
     clock: Clock,
 }
 
-impl PrometheusOutput {
+impl ExposeOutput {
     /// `bind` is `host:port`, resolved when [`Output::bind`] runs, not at config-load time -- the
     /// same `syslog_out`/`statsd_out` precedent for an address in config.
     pub fn new(bind: impl Into<String>) -> Self {
@@ -505,7 +698,7 @@ impl PrometheusOutput {
 }
 
 #[async_trait::async_trait]
-impl Output for PrometheusOutput {
+impl Output for ExposeOutput {
     /// Opens the exposition socket and starts serving it. Idempotent (a second call sees
     /// `self.server` already `Some` and returns), which is what lets the runtime's pre-spawn pass
     /// and `run_output`'s own lazy call both happen without binding twice -- see
@@ -600,12 +793,312 @@ impl Output for PrometheusOutput {
 ///
 /// `abort` rather than an await: `Drop` cannot be async, and abort is all `flush` does anyway -- the
 /// task owns the `TcpListener`, so dropping its future closes the port.
-impl Drop for PrometheusOutput {
+impl Drop for ExposeOutput {
     fn drop(&mut self) {
         if let Some(server) = self.server.take() {
             server.abort();
         }
     }
+}
+
+/// The `endpoint:` half: a stateless remote-write sender -- see the module doc for the wire, the
+/// `Fault` table, and why [`RemoteWriteOutput::duplicate_safe`] is `true`.
+///
+/// Nothing is retained between batches, which is what makes this the opposite shape from
+/// [`ExposeOutput`]: no registry, no expiry sweep, no cardinality cap, no lock. `send` takes
+/// `&mut self`, so the encoder is a plain field rather than the `Arc<Mutex<..>>` a shared request
+/// handler forces on the other mode.
+pub struct RemoteWriteOutput {
+    /// The absolute write URL, path included. Never parsed here -- `reqwest` does that per
+    /// request, and graph rule 56 has already checked the scheme and authority.
+    endpoint: String,
+    version: remote_write::Version,
+    request_timeout: Duration,
+    client: reqwest::Client,
+    /// The operator's `headers:`, built into a `HeaderMap` once at construction rather than per
+    /// request. The protocol's own four are inserted *over* a clone of this on each request --
+    /// see [`RemoteWriteOutput::request_headers`].
+    headers: HeaderMap,
+    /// `Some` only once [`RemoteWriteOutput::with_tls`] has built one from `endpoint_tls:`;
+    /// `None` leaves `reqwest`'s own default trust (the bundled Mozilla root set) in place, which
+    /// is already correct for an ordinary `https://` receiver.
+    tls: Option<rustls::ClientConfig>,
+    /// Rebuilt from `telemetry`/`diag` by the builders below, exactly as [`ExposeOutput`] does --
+    /// the encoder is derived state, and `PrometheusEncoder`'s own `mut self -> Self` builders
+    /// stay usable as written that way.
+    encoder: PrometheusEncoder,
+    diag: Diagnostics,
+    telemetry: Telemetry,
+}
+
+impl RemoteWriteOutput {
+    /// `endpoint` is the receiver's absolute write URL, path included -- resolved at request time,
+    /// never at config-load time, the same `otlp_out`/`syslog_out` precedent for an address in
+    /// config.
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            version: remote_write::Version::V1,
+            request_timeout: DEFAULT_ENDPOINT_TIMEOUT,
+            client: build_client(DEFAULT_ENDPOINT_TIMEOUT, None),
+            headers: HeaderMap::new(),
+            tls: None,
+            encoder: new_sender_encoder(&Telemetry::default(), &Diagnostics::default()),
+            diag: Diagnostics::default(),
+            telemetry: Telemetry::default(),
+        }
+    }
+
+    /// Which remote-write message this sender writes (`version:` in config). No negotiation and no
+    /// fallback -- see the module doc.
+    pub fn with_version(mut self, version: remote_write::Version) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Per-request timeout (`timeout:` in config). Rebuilds the client, since that is where
+    /// `reqwest`'s own client-wide default lives; the per-request `.timeout(..)` in `send` is what
+    /// actually bounds a request either way, so the two are kept in step rather than left to
+    /// disagree.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self.client = build_client(timeout, self.tls.as_ref());
+        self
+    }
+
+    /// The extra headers sent on every request (`headers:` in config). Fails if a name or value
+    /// isn't a legal HTTP header (graph rule 56 rejects a protocol-owned name before construction
+    /// ever sees it; this catches the lexical shape `graph` can't -- illegal bytes, embedded
+    /// newlines), and if two names collide once `HeaderName` normalizes their case, which
+    /// `HeaderMap::insert` would otherwise resolve by whichever of the two the `HashMap` happened
+    /// to iterate last. Both are the same defense-in-depth relationship `otlp_out::with_headers`
+    /// has with its own rule.
+    pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
+        let mut map = HeaderMap::with_capacity(headers.len());
+        for (name, value) in headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("prometheus_out: {name:?} is not a legal header name"))?;
+            let header_value = HeaderValue::from_str(value)
+                .with_context(|| format!("prometheus_out: header {name:?} has an invalid value"))?;
+            if map.insert(header_name, header_value).is_some() {
+                anyhow::bail!(
+                    "prometheus_out: header {name:?} collides with another entry in 'headers' \
+                     once case is ignored -- HTTP header names are case-insensitive, so which \
+                     value would actually be sent is undefined"
+                );
+            }
+        }
+        self.headers = map;
+        Ok(self)
+    }
+
+    /// Client-side TLS tuning (`endpoint_tls:` in config) -- a private CA, a client certificate
+    /// for mutual TLS, or disabling verification entirely. A no-op if `settings` is empty:
+    /// `reqwest` already defaults to a working TLS configuration (the bundled Mozilla root set)
+    /// for an `https://` endpoint without this ever being called. Graph rule 56 rejects a
+    /// non-empty block on a non-`https://` endpoint and requires `cert_file`/`key_file` together
+    /// before this ever runs -- this method still loads and validates every file itself, since
+    /// `graph::resolve` never touches the filesystem.
+    pub fn with_tls(
+        mut self,
+        settings: &TlsClientSettings,
+        base_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        if settings.is_empty() {
+            return Ok(self);
+        }
+        if settings.insecure_skip_verify {
+            self.diag.warn(
+                "endpoint_tls.insecure_skip_verify is set -- the connection is encrypted, but \
+                 this output will accept any certificate the peer presents, self-signed or \
+                 otherwise",
+            );
+        }
+        let cfg = crate::tls::build_client_config(settings, base_dir)?;
+        self.client = build_client(self.request_timeout, Some(&cfg));
+        self.tls = Some(cfg);
+        Ok(self)
+    }
+
+    /// Reaches the codec's encoder, which is what reports the throttled
+    /// `delta_temporality_unresolved`/`gauge_delta_unresolved` diagnostics -- and this sink's own
+    /// `remote_write_rejected`, an independent throttle key.
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self.encoder = new_sender_encoder(&self.telemetry, &self.diag);
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
+        self.encoder = new_sender_encoder(&self.telemetry, &self.diag);
+        self
+    }
+
+    /// The batch's events grouped by `Event::timestamp`, ascending, stable within a group -- the
+    /// partition [`remote_write::encode`] inverts back into one `TimeSeries` per label set. A
+    /// `BTreeMap` rather than a sort: a real batch carries one or two distinct timestamps, so this
+    /// is a couple of map lookups per event rather than a comparison sort over all of them, and
+    /// ascending order comes out of the map rather than out of a sort key.
+    fn partition(batch: &EventBatch) -> BTreeMap<i64, Vec<&Event>> {
+        let mut groups: BTreeMap<i64, Vec<&Event>> = BTreeMap::new();
+        for event in &batch.events {
+            groups.entry(event.timestamp).or_default().push(event);
+        }
+        groups
+    }
+
+    /// The operator's headers with the protocol's own four `insert`ed over them, so a
+    /// protocol-owned name always wins whatever `headers:` said. `insert` (not `RequestBuilder`'s
+    /// append-semantics `.header(..)`), and one `.headers(..)` call at the call site, for exactly
+    /// the reason `otlp_out::send_http` spells out: mixing the two would undo this guarantee.
+    fn request_headers(&self) -> HeaderMap {
+        let mut headers = self.headers.clone();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static(self.version.content_type()),
+        );
+        headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static(remote_write::CONTENT_ENCODING_SNAPPY),
+        );
+        headers.insert(
+            HeaderName::from_static(remote_write::HEADER_VERSION),
+            HeaderValue::from_static(self.version.header_version()),
+        );
+        headers.insert(http::header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
+        headers
+    }
+}
+
+/// One encoder configured the way this transport needs it, in one place so `new` and both
+/// telemetry builders cannot drift: `with_timestamps_always` because the wire has no way to omit a
+/// timestamp and a series without one would be silently skipped and counted; `with_stale_markers`
+/// because remote-write *does* have a spelling for "this series is gone" and an exposition of the
+/// same data does not. See the module doc's "The wire".
+fn new_sender_encoder(telemetry: &Telemetry, diag: &Diagnostics) -> PrometheusEncoder {
+    PrometheusEncoder::new()
+        .with_stale_markers(true)
+        .with_timestamps_always(true)
+        .with_telemetry(telemetry.clone())
+        .with_diagnostics(diag.clone())
+}
+
+#[async_trait::async_trait]
+impl Output for RemoteWriteOutput {
+    /// Nothing to bind: this sink dials out per request. `Ok(())` rather than the trait's default
+    /// so the whole `Output` surface reads from one place in this file.
+    async fn bind(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// One batch, one request -- see the module doc's "The wire" and "Faults, retries and
+    /// duplicate safety". Exactly one attempt: retry is `write_loop`'s job.
+    async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
+        let resource = batch.resource.as_ref();
+        let groups: Vec<Vec<MetricFamily>> = Self::partition(batch)
+            .into_values()
+            .map(|events| {
+                events_to_families(
+                    events.into_iter().map(|event| (resource, event)),
+                    &mut self.encoder,
+                )
+            })
+            .collect();
+        // No request at all for a batch that produced nothing -- a batch of logs reaching a
+        // metrics sink, or one whose every record was skipped and counted. An empty `WriteRequest`
+        // is a legal message, but sending one would turn a no-op into network traffic and into a
+        // `requests{class="2xx"}` an operator would read as a delivery.
+        if groups.iter().all(Vec::is_empty) {
+            return Ok(());
+        }
+        let (body, samples) =
+            remote_write::encode_counted(&groups, self.version, &mut self.encoder);
+        // Snappy *block* format (`snap::raw`), which is what both specs mean by
+        // `Content-Encoding: snappy` -- never the framed format `snap::write` produces.
+        // Infallible in practice: `compress_vec` only errors on an input past `u32::MAX`, which a
+        // batch cannot reach, but it is reported rather than unwrapped so an absurd one fails the
+        // batch instead of the process.
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&body)
+            .context("snappy-compressing a remote-write request body")?;
+
+        let request_timer = self.telemetry.timer(REQUEST_DURATION);
+        let result = self
+            .client
+            .post(&self.endpoint)
+            .headers(self.request_headers())
+            .timeout(self.request_timeout)
+            .body(compressed)
+            .send()
+            .await;
+        drop(request_timer);
+
+        match result {
+            Ok(response) if response.status().is_success() => {
+                self.telemetry.count(REQUESTS, 1.0, &[("class", status_class(response.status()))]);
+                self.telemetry.count(SAMPLES, samples as f64, &[]);
+                Ok(())
+            }
+            Ok(response) => {
+                let status = response.status();
+                self.telemetry.count(REQUESTS, 1.0, &[("class", status_class(status))]);
+                let fault = if is_retryable_http_status(status) {
+                    Fault::Ambiguous
+                } else {
+                    Fault::Permanent
+                };
+                // The body, not just the status: a Prometheus-style `400` names the offending
+                // series (`out of order sample`, `duplicate sample for timestamp`, a label that
+                // failed validation), and that is the only actionable thing in the exchange.
+                // Truncated, because a receiver under load can answer with a great deal of it.
+                let body = response.text().await.unwrap_or_default();
+                let snippet = body_snippet(&body);
+                self.diag.warn_throttled(
+                    "remote_write_rejected",
+                    format_args!("remote-write to {} failed ({status}): {snippet}", self.endpoint),
+                );
+                Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}")).context(fault)
+            }
+            Err(err) => {
+                self.telemetry.count(REQUESTS, 1.0, &[("class", "network_error")]);
+                let fault = classify_reqwest_error(&err);
+                Err(anyhow::Error::new(err)).context(fault)
+            }
+        }
+    }
+
+    /// Nothing is buffered here: `send` has already issued (or deliberately not issued) its one
+    /// request by the time it returns.
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// `true`, and load-bearing -- see the module doc's "Faults, retries and duplicate safety".
+    /// A sample's identity at a remote-write receiver is `(label set, timestamp)`, and this sink
+    /// re-encodes a retried batch from the same events, so a replayed request is an idempotent
+    /// overwrite rather than a second sample. And `true` is what selects
+    /// `DeliveryPosture::AtLeastOnce` (`logit_pipeline::output`'s `from_duplicate_safe` and
+    /// `is_retryable`), the only posture under which the `Fault::Ambiguous` a 5xx produces is
+    /// retried at all: `false` here would silently turn every 5xx into a dropped batch.
+    fn duplicate_safe(&self) -> bool {
+        true
+    }
+}
+
+/// The first [`ERROR_BODY_SNIPPET_BYTES`] of a rejection body, on a character boundary so the
+/// result is always printable, with an ellipsis when anything was cut. A `String` is UTF-8 by
+/// construction, so `floor_char_boundary`'s work is all this needs.
+fn body_snippet(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.len() <= ERROR_BODY_SNIPPET_BYTES {
+        return trimmed.to_string();
+    }
+    let mut end = ERROR_BODY_SNIPPET_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &trimmed[..end])
 }
 
 /// Poisoning cannot lose data here -- a panic while holding this lock would have to come from
@@ -865,15 +1358,15 @@ mod tests {
 
     /// A bound sink plus the base URL to scrape it at. `expire_after: 0s` unless a test says
     /// otherwise, so nothing expires out from under a byte-exact assertion.
-    async fn bound(sink: PrometheusOutput) -> (PrometheusOutput, String) {
+    async fn bound(sink: ExposeOutput) -> (ExposeOutput, String) {
         let mut sink = sink;
         sink.bind().await.expect("binding an ephemeral port should succeed");
         let addr = sink.local_addr().expect("bind records the address");
         (sink, format!("http://{addr}"))
     }
 
-    async fn fixture_sink() -> (PrometheusOutput, String) {
-        let mut sink = PrometheusOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
+    async fn fixture_sink() -> (ExposeOutput, String) {
+        let mut sink = ExposeOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
         sink.send(&fixture_batch()).await.expect("send never fails");
         bound(sink).await
     }
@@ -1053,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_custom_path_is_served_and_the_default_one_is_not() {
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_path("/exposed")
             .with_expire_after(Duration::ZERO);
         sink.send(&fixture_batch()).await.unwrap();
@@ -1080,7 +1573,7 @@ mod tests {
     /// accumulate and it does not appear twice.
     #[tokio::test]
     async fn a_resent_series_replaces_its_stored_value_rather_than_adding_to_it() {
-        let mut sink = PrometheusOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
+        let mut sink = ExposeOutput::new("127.0.0.1:0").with_expire_after(Duration::ZERO);
         sink.send(&batch(vec![metric_event("hits", cumulative_counter(1.0), &[])])).await.unwrap();
         sink.send(&batch(vec![metric_event("hits", cumulative_counter(9.0), &[])])).await.unwrap();
         let (_sink, url) = bound(sink).await;
@@ -1098,7 +1591,7 @@ mod tests {
         let now = Arc::new(Mutex::new(start));
         let clock_handle = Arc::clone(&now);
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::from_secs(60))
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
             .with_clock(Arc::new(move || *lock(&clock_handle)));
@@ -1125,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn expire_after_zero_disables_expiry_entirely() {
         let start = Instant::now();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_clock(Arc::new(move || start + Duration::from_secs(86_400)));
         sink.send(&batch(vec![metric_event("hits", cumulative_counter(1.0), &[])])).await.unwrap();
@@ -1146,7 +1639,7 @@ mod tests {
         let now = Arc::new(Mutex::new(start));
         let clock_handle = Arc::clone(&now);
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_max_series(2)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
@@ -1205,7 +1698,7 @@ mod tests {
         let now = Arc::new(Mutex::new(start));
         let clock_handle = Arc::clone(&now);
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_max_series(CAP)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"))
@@ -1248,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn a_type_conflict_replaces_the_family_and_evicts_its_old_series() {
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![metric_event(
@@ -1274,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn a_delta_sum_is_skipped_and_counted_through_the_sinks_own_telemetry() {
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![metric_event(
@@ -1310,7 +1803,7 @@ mod tests {
             Exemplar { timestamp: 0, value: 1.0, trace: None, filtered_attributes: AttrMap::new() },
             Exemplar { timestamp: 0, value: 2.0, trace: None, filtered_attributes: AttrMap::new() },
         ];
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![Event::metric(0, AttrMap::new(), record)])).await.unwrap();
@@ -1337,7 +1830,7 @@ mod tests {
     /// accept loop behind.
     #[tokio::test]
     async fn binding_twice_is_a_no_op_that_keeps_the_first_address() {
-        let mut sink = PrometheusOutput::new("127.0.0.1:0");
+        let mut sink = ExposeOutput::new("127.0.0.1:0");
         sink.bind().await.expect("the first bind should succeed");
         let first = sink.local_addr().expect("bind records the address");
         sink.bind().await.expect("a second bind must be a harmless no-op");
@@ -1346,13 +1839,11 @@ mod tests {
 
     #[tokio::test]
     async fn binding_an_address_already_in_use_fails_with_the_address_in_the_message() {
-        let mut first = PrometheusOutput::new("127.0.0.1:0");
+        let mut first = ExposeOutput::new("127.0.0.1:0");
         first.bind().await.unwrap();
         let addr = first.local_addr().unwrap();
-        let err = PrometheusOutput::new(addr.to_string())
-            .bind()
-            .await
-            .expect_err("the port is already held");
+        let err =
+            ExposeOutput::new(addr.to_string()).bind().await.expect_err("the port is already held");
         assert!(err.to_string().contains(&addr.to_string()), "got: {err}");
     }
 
@@ -1372,7 +1863,7 @@ mod tests {
     /// component's `bind` fails -- must not leave its accept loop holding the port.
     #[tokio::test]
     async fn dropping_an_unflushed_bound_sink_closes_the_port() {
-        let (sink, url) = bound(PrometheusOutput::new("127.0.0.1:0")).await;
+        let (sink, url) = bound(ExposeOutput::new("127.0.0.1:0")).await;
         assert_eq!(get(&format!("{url}/metrics"), &[]).await.status(), 200);
 
         drop(sink); // no flush, exactly as a startup failure would
@@ -1396,7 +1887,7 @@ mod tests {
     /// able to tell "up, no data" from "not listening".
     #[tokio::test]
     async fn a_scrape_before_any_batch_arrives_is_an_empty_200() {
-        let (_sink, url) = bound(PrometheusOutput::new("127.0.0.1:0")).await;
+        let (_sink, url) = bound(ExposeOutput::new("127.0.0.1:0")).await;
         let response = get(&format!("{url}/metrics"), &[]).await;
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "");
@@ -1404,7 +1895,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_is_duplicate_safe_because_it_only_replaces_in_memory_state() {
-        assert!(PrometheusOutput::new("127.0.0.1:0").duplicate_safe());
+        assert!(ExposeOutput::new("127.0.0.1:0").duplicate_safe());
     }
 
     // -- telemetry --------------------------------------------------------------------------
@@ -1412,7 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn each_request_is_counted_by_outcome_class_with_the_bytes_it_served() {
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![metric_event("hits", cumulative_counter(1.0), &[])])).await.unwrap();
@@ -1432,7 +1923,7 @@ mod tests {
     #[tokio::test]
     async fn the_series_gauge_reports_what_the_registry_holds_after_each_send() {
         let registry = logit_core::Registry::new();
-        let mut sink = PrometheusOutput::new("127.0.0.1:0")
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
         sink.send(&batch(vec![

@@ -22,6 +22,9 @@ http.workspace = true
 http-body-util.workspace = true
 # otlp_out's optional gzip request compression (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
+# prometheus_out's remote-write sender Snappy-block-compresses every request body -- the one
+# `Content-Encoding` both remote-write specs define (docs/adr/prometheus-remote-write.md).
+snap.workspace = true
 # TLS for otlp_out, both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
 # `rustls-pki-types` build a `rustls::ClientConfig` from config-supplied PEM; `hyper-rustls` wraps
 # `hyper-util`'s pooled client (the gRPC transport's connection manager) in it; `webpki-roots` is

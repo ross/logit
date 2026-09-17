@@ -59,6 +59,10 @@ use logit_proto::{Signal, SignalEncoder};
 use rustls_pki_types::pem::PemObject;
 #[cfg(test)]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+// Shared with `prometheus_out`'s remote-write sender, which reuses this transport's `Fault` table
+// by name (`docs/adr/prometheus-remote-write.md`) -- see `crate::http`.
+use crate::http::{build_client, classify_reqwest_error, is_retryable_http_status, status_class};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -455,18 +459,6 @@ impl Output for OtlpOutput {
     }
 }
 
-/// Builds the HTTP transport's client. `tls` is `None` for the common case (no `tls:` block set)
-/// -- `reqwest`'s own default TLS configuration already trusts the bundled Mozilla root set for
-/// an `https://` endpoint, so there's nothing to override. `Some` only once
-/// [`OtlpOutput::with_tls`] has built a customized `rustls::ClientConfig`.
-fn build_client(timeout: Duration, tls: Option<&rustls::ClientConfig>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
-    if let Some(cfg) = tls {
-        builder = builder.use_preconfigured_tls(cfg.clone());
-    }
-    builder.build().expect("reqwest client should build with the configured TLS settings")
-}
-
 /// The gRPC transport's default trust: the same bundled Mozilla root set `reqwest`'s own default
 /// TLS configuration uses for the HTTP transport, via the `ring` crypto provider (never
 /// `aws-lc-rs` -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`). Built once at [`OtlpOutput::new`]
@@ -520,36 +512,6 @@ fn normalize_grpc_endpoint(endpoint: &str) -> String {
         format!("http://{}", &trimmed[7..])
     } else {
         format!("http://{trimmed}")
-    }
-}
-
-/// A coarse HTTP response-status bucket -- see `crate::influxdb::status_class`'s identical
-/// reasoning; duplicated rather than shared because these are two independently-evolving outputs.
-fn status_class(status: reqwest::StatusCode) -> &'static str {
-    match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "other",
-    }
-}
-
-/// 429 and any 5xx are transient (`Fault::Ambiguous`); every other 4xx is a configuration error
-/// (`Fault::Permanent`) -- see this module's doc comment table.
-fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status.as_u16() == 429
-}
-
-/// See `crate::influxdb::classify_transport_error`'s doc comment -- same underlying
-/// `reqwest::Error::is_connect()` distinction, duplicated (not shared) per this module's own doc
-/// comment on why `Fault` classification isn't shared between the two outputs.
-fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
-    if err.is_connect() {
-        Fault::Clean
-    } else {
-        Fault::Ambiguous
     }
 }
 

@@ -1028,6 +1028,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "snap",
  "tokio",
  "tokio-rustls",
  "tracing-subscriber",
