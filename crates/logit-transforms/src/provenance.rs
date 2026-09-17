@@ -95,8 +95,8 @@ impl Transform for HasProvenance {
         self.matcher.provenance = provenance;
     }
 
-    fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
-        forward(self.matcher.matches(), event, &self.telemetry)
+    fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+        forward(self.matcher.matches(), &self.telemetry)
     }
 }
 
@@ -125,13 +125,13 @@ impl Transform for DropProvenance {
         self.matcher.provenance = provenance;
     }
 
-    fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
         // The single `!` here is the entire difference between `HasProvenance` and
         // `DropProvenance` -- which is what makes this the exact boolean complement structurally,
         // rather than by convention. With both fields configured, this drops an event only when
         // *both* match, not when either one does -- same conjunction `Matcher::matches` always
         // evaluates, just inverted at the very end.
-        forward(!self.matcher.matches(), event, &self.telemetry)
+        forward(!self.matcher.matches(), &self.telemetry)
     }
 }
 
@@ -139,9 +139,9 @@ impl Transform for DropProvenance {
 /// "should this event be forwarded," already resolved by the caller. The `0.0` on the forward
 /// path is deliberate, not a no-op: it registers the series so it appears at zero rather than
 /// being absent, mirroring `HasAttributes::process`'s own reasoning.
-fn forward(keep: bool, event: Event, telemetry: &Telemetry) -> Option<Event> {
+fn forward(keep: bool, telemetry: &Telemetry) -> bool {
     telemetry.count("logit.transform.events.filtered", if keep { 0.0 } else { 1.0 }, &[]);
-    keep.then_some(event)
+    keep
 }
 
 #[cfg(test)]
@@ -192,21 +192,24 @@ mod tests {
     fn has_provenance_forwards_an_event_whose_origin_matches() {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        assert!(has.process(&default_resource(), event()).is_some());
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev));
     }
 
     #[test]
     fn has_provenance_drops_an_event_whose_origin_differs() {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
         has.observe_provenance(provenance(Some("syslog_in"), None));
-        assert!(has.process(&default_resource(), event()).is_none());
+        let mut ev = event();
+        assert!(!has.process(&default_resource(), &mut ev));
     }
 
     #[test]
     fn has_provenance_drops_an_event_with_no_origin_set() {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
         has.observe_provenance(Provenance::default());
-        assert!(has.process(&default_resource(), event()).is_none());
+        let mut ev = event();
+        assert!(!has.process(&default_resource(), &mut ev));
     }
 
     // -- HasProvenance: OR within a field --------------------------------------------------------
@@ -219,10 +222,12 @@ mod tests {
         );
 
         has.observe_provenance(provenance(Some("edge_syslog_in"), None));
-        assert!(has.process(&default_resource(), event()).is_some(), "second alternative matches");
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev), "second alternative matches");
 
         has.observe_provenance(provenance(Some("edge_haproxy_in"), None));
-        assert!(has.process(&default_resource(), event()).is_none(), "unlisted origin drops");
+        let mut ev = event();
+        assert!(!has.process(&default_resource(), &mut ev), "unlisted origin drops");
     }
 
     // -- HasProvenance: AND across fields ---------------------------------------------------------
@@ -233,13 +238,16 @@ mod tests {
             HasProvenance::new(vec!["nginx_in".to_string()], vec!["parse_json".to_string()]);
 
         has.observe_provenance(provenance(Some("nginx_in"), Some("parse_json")));
-        assert!(has.process(&default_resource(), event()).is_some(), "both fields match");
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev), "both fields match");
 
         has.observe_provenance(provenance(Some("nginx_in"), Some("scale")));
-        assert!(has.process(&default_resource(), event()).is_none(), "only origin matches");
+        let mut ev = event();
+        assert!(!has.process(&default_resource(), &mut ev), "only origin matches");
 
         has.observe_provenance(provenance(Some("syslog_in"), Some("parse_json")));
-        assert!(has.process(&default_resource(), event()).is_none(), "only previous matches");
+        let mut ev = event();
+        assert!(!has.process(&default_resource(), &mut ev), "only previous matches");
     }
 
     #[test]
@@ -247,9 +255,11 @@ mod tests {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
         // previous: is unconfigured -- any value, or none at all, should be irrelevant.
         has.observe_provenance(provenance(Some("nginx_in"), Some("anything")));
-        assert!(has.process(&default_resource(), event()).is_some());
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev));
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        assert!(has.process(&default_resource(), event()).is_some());
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev));
     }
 
     // -- never mutates ----------------------------------------------------------------------------
@@ -260,7 +270,7 @@ mod tests {
         has.observe_provenance(provenance(Some("nginx_in"), None));
         let mut attrs = AttrMap::new();
         attrs.insert("other", Value::str("x"));
-        let ev = Event::log(
+        let mut ev = Event::log(
             0,
             attrs,
             LogRecord {
@@ -273,8 +283,8 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let out = has.process(&default_resource(), ev).expect("matches");
-        assert_eq!(out.attributes.get("other"), Some(&Value::str("x")));
+        assert!(has.process(&default_resource(), &mut ev), "matches");
+        assert_eq!(ev.attributes.get("other"), Some(&Value::str("x")));
     }
 
     // -- DropProvenance: the exact complement ------------------------------------------------------
@@ -296,8 +306,10 @@ mod tests {
             has.observe_provenance(p);
             drop.observe_provenance(p);
 
-            let has_forwards = has.process(&default_resource(), event()).is_some();
-            let drop_forwards = drop.process(&default_resource(), event()).is_some();
+            let mut has_ev = event();
+            let has_forwards = has.process(&default_resource(), &mut has_ev);
+            let mut drop_ev = event();
+            let drop_forwards = drop.process(&default_resource(), &mut drop_ev);
             assert_eq!(
                 has_forwards, !drop_forwards,
                 "has_provenance and drop_provenance must exactly partition every batch"
@@ -309,8 +321,9 @@ mod tests {
     fn drop_provenance_forwards_an_event_missing_the_configured_origin() {
         let mut drop = DropProvenance::new(vec!["nginx_in".to_string()], vec![]);
         drop.observe_provenance(Provenance::default());
+        let mut ev = event();
         assert!(
-            drop.process(&default_resource(), event()).is_some(),
+            drop.process(&default_resource(), &mut ev),
             "a batch that never carried the configured origin isn't one told to drop"
         );
     }
@@ -325,9 +338,9 @@ mod tests {
             HasProvenance::new(vec!["nginx_in".to_string()], vec![]).with_telemetry(telemetry);
 
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        has.process(&default_resource(), event());
+        has.process(&default_resource(), &mut event());
         has.observe_provenance(provenance(Some("syslog_in"), None));
-        has.process(&default_resource(), event());
+        has.process(&default_resource(), &mut event());
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
@@ -337,7 +350,8 @@ mod tests {
     fn a_disabled_telemetry_handle_is_the_default() {
         let mut has = HasProvenance::new(vec!["nginx_in".to_string()], vec![]);
         has.observe_provenance(provenance(Some("nginx_in"), None));
-        assert!(has.process(&default_resource(), event()).is_some());
+        let mut ev = event();
+        assert!(has.process(&default_resource(), &mut ev));
     }
 
     // -- end-to-end: a real batch through Fanout/run_transform -----------------------------------

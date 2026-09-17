@@ -460,7 +460,7 @@ impl Aggregator {
     /// Absorbs every mergeable metric off `event` into this aggregator's window state, and
     /// forwards whatever's left -- unmergeable metric kinds (a cumulative `Sum`, `Histogram`,
     /// `ExponentialHistogram`, `Summary`), a kind conflict with an already-accumulating series,
-    /// and/or a log or span, if the event carries any (docs/adr/multi-payload-events.md). `None`
+    /// and/or a log or span, if the event carries any (docs/adr/multi-payload-events.md). `false`
     /// only when nothing at all remains on the event; a pure log/span event (no metrics at all)
     /// never touches window state, matching the zero-cost pass-through this had before an event
     /// could carry more than one payload.
@@ -470,9 +470,9 @@ impl Aggregator {
     /// aggregate together, not be split into separate windows because they happen to be
     /// different allocations. One input's batches do share one `Arc` in practice (see
     /// `crates/logit-inputs/src/statsd.rs`), so the common case is a single linear-scan group.
-    pub fn process(&mut self, resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    pub fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         if event.metrics.is_empty() {
-            return Some(event);
+            return true;
         }
 
         // Read once, not once per metric -- `observe_batch_context`/`observe_scope` each fire
@@ -908,11 +908,9 @@ impl Aggregator {
             }
         }
 
-        if event.metrics.is_empty() && event.log.is_none() && event.span.is_none() {
-            None
-        } else {
-            Some(event)
-        }
+        // Forward unless the event has been drained of every payload: whatever didn't merge was
+        // pushed back onto `event.metrics` above, and a log/span half is never touched here.
+        !(event.metrics.is_empty() && event.log.is_none() && event.span.is_none())
     }
 
     fn group_for(
@@ -1165,7 +1163,7 @@ impl Aggregator {
 /// deliberate match, not a coincidence -- see `crate::Transform`'s doc comment): this impl is
 /// pure delegation, no reshaping needed.
 impl Transform for Aggregator {
-    fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
+    fn process(&mut self, resource: &Arc<Resource>, event: &mut Event) -> bool {
         Aggregator::process(self, resource, event)
     }
 
@@ -1496,6 +1494,16 @@ mod tests {
         Arc::new(Resource::default())
     }
 
+    /// `Aggregator::process` mutates through `&mut Event` and answers a bool now
+    /// (`crate::Transform::process`'s doc comment says why) -- this hands it an owned event to
+    /// borrow and turns the verdict back into the `Some`/`None` the assertions below were written
+    /// against, so the in-place change costs this module a helper rather than a `let mut` + an
+    /// `assert!` at every one of its call sites. `Some` is "forwarded, here's what came out the
+    /// other side"; `None` is "absorbed into the window".
+    fn feed(agg: &mut Aggregator, resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+        agg.process(resource, &mut event).then_some(event)
+    }
+
     /// Most existing assertions below don't care about the per-event `SpanLink` set `flush` now
     /// returns alongside each `Event` (`Transform::flush`'s doc comment) -- this flattens it away
     /// so those assertions keep the same shape they had before flush-side linking landed. Tests
@@ -1529,15 +1537,15 @@ mod tests {
     fn counters_sum_within_a_window() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::counter(1.0), 0))
-            .is_none());
-        assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::counter(2.0), 1))
-            .is_none());
-        assert!(agg
-            .process(&resource, metric_event("hits", MetricKind::counter(3.0), 2))
-            .is_none());
+        assert!(
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0)).is_none()
+        );
+        assert!(
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 1)).is_none()
+        );
+        assert!(
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(3.0), 2)).is_none()
+        );
 
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(flushed.len(), 1);
@@ -1552,8 +1560,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         // Deliberately out of arrival order: the later-timestamped value (5) arrives first.
-        agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
-        agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1571,7 +1579,7 @@ mod tests {
         for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
             let mut sketch = logit_core::DdSketch::new();
             sketch.add(v);
-            agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
+            feed(&mut agg, &resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
         }
 
         let flushed = flush_events(&mut agg, 100);
@@ -1591,7 +1599,7 @@ mod tests {
     fn a_second_flush_after_the_first_emits_nothing() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         assert_eq!(agg.flush(100).len(), 1, "first flush should emit the window");
         assert!(agg.flush(200).is_empty(), "tumbling: state resets, second flush is empty");
@@ -1614,7 +1622,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let passed = agg.process(&resource, log);
+        let passed = feed(&mut agg, &resource, log);
         assert!(passed.is_some(), "a log event should pass through, not be absorbed");
         assert!(agg.flush(100).is_empty(), "nothing should have been accumulated");
     }
@@ -1662,7 +1670,7 @@ mod tests {
         ] {
             let event = metric_event("m", kind, 0);
             assert!(
-                agg.process(&resource, event).is_some(),
+                feed(&mut agg, &resource, event).is_some(),
                 "a kind with no defined merge rule should pass through"
             );
         }
@@ -1679,7 +1687,7 @@ mod tests {
         let resource = default_resource();
         let event =
             metric_event("latency", MetricKind::Samples(logit_core::Samples::new([1.0])), 0);
-        assert!(agg.process(&resource, event).is_none(), "a Samples-only event should absorb");
+        assert!(feed(&mut agg, &resource, event).is_none(), "a Samples-only event should absorb");
     }
 
     /// Same as `samples_is_not_in_the_pass_through_matches`, for `SetMembers` (`sets: estimate`,
@@ -1693,7 +1701,10 @@ mod tests {
             MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]),
             0,
         );
-        assert!(agg.process(&resource, event).is_none(), "a SetMembers-only event should absorb");
+        assert!(
+            feed(&mut agg, &resource, event).is_none(),
+            "a SetMembers-only event should absorb"
+        );
     }
 
     /// Same as `samples_is_not_in_the_pass_through_matches`, for an already-summarized `Set` --
@@ -1707,7 +1718,7 @@ mod tests {
         let mut hll = logit_core::HyperLogLog::default();
         hll.insert(b"member");
         let event = metric_event("unique.users", MetricKind::Set(hll), 0);
-        assert!(agg.process(&resource, event).is_none(), "a Set-only event should absorb");
+        assert!(feed(&mut agg, &resource, event).is_none(), "a Set-only event should absorb");
     }
 
     /// The other half of `set_histogram_and_summary_pass_through_untouched`'s coverage: a
@@ -1719,7 +1730,7 @@ mod tests {
     fn a_cumulative_sum_never_merges_into_an_existing_delta_sum_series() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
+        assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
         let cumulative = metric_event(
             "m",
@@ -1730,7 +1741,7 @@ mod tests {
             }),
             0,
         );
-        let passed = agg.process(&resource, cumulative);
+        let passed = feed(&mut agg, &resource, cumulative);
         assert!(
             passed.is_some(),
             "a cumulative sum must pass through untouched, never merge with a delta series"
@@ -1752,7 +1763,8 @@ mod tests {
     fn sum_merge_carries_the_first_records_monotonic_flag() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event(
                 "m",
@@ -1764,7 +1776,8 @@ mod tests {
                 0,
             ),
         );
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event(
                 "m",
@@ -1800,7 +1813,10 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         let event = metric_event("temp", MetricKind::GaugeDelta(5.0), 0);
-        assert!(agg.process(&resource, event).is_none(), "a GaugeDelta-only event should absorb");
+        assert!(
+            feed(&mut agg, &resource, event).is_none(),
+            "a GaugeDelta-only event should absorb"
+        );
     }
 
     /// A delta opening a brand-new series resolves against 0.0 (statsd's own rule for an
@@ -1813,8 +1829,7 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
         let resource = default_resource();
 
-        assert!(agg
-            .process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0))
+        assert!(feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0))
             .is_none());
 
         let flushed = flush_events(&mut agg, 100);
@@ -1843,8 +1858,8 @@ mod tests {
     fn absolute_then_delta_adds_to_the_absolute() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1860,8 +1875,8 @@ mod tests {
     fn delta_then_absolute_is_subsumed_by_the_absolute() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 1));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1882,9 +1897,9 @@ mod tests {
     fn a_delta_never_advances_the_last_write_wins_timestamp() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 50));
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 60));
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(99.0), 50));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 50));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 60));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(99.0), 50));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1898,9 +1913,9 @@ mod tests {
     fn two_deltas_accumulate() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(-3.0), 2));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(-3.0), 2));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1917,10 +1932,10 @@ mod tests {
     fn gauge_delta_against_a_counter_series_is_a_kind_conflict_and_is_forwarded() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
+        assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
         let conflicting = metric_event("m", MetricKind::GaugeDelta(5.0), 0);
-        let passed = agg.process(&resource, conflicting);
+        let passed = feed(&mut agg, &resource, conflicting);
         assert!(passed.is_some(), "the conflicting delta should be forwarded, not absorbed");
         assert!(matches!(passed.unwrap().metrics[0].kind, MetricKind::GaugeDelta(v) if v == 5.0));
 
@@ -1935,7 +1950,7 @@ mod tests {
     fn a_gauge_delta_never_survives_aggregate() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1951,11 +1966,13 @@ mod tests {
     fn distinct_tag_sets_stay_distinct_series() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event_with_tags("hits", MetricKind::counter(1.0), 0, &[("host", "a")]),
         );
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event_with_tags("hits", MetricKind::counter(1.0), 0, &[("host", "b")]),
         );
@@ -1976,10 +1993,10 @@ mod tests {
         let team = Value::Array(vec![Value::str("a"), Value::str("b")]);
         let mut first = metric_event("hits", MetricKind::counter(1.0), 0);
         first.attributes.insert("team", team.clone());
-        agg.process(&resource, first);
+        feed(&mut agg, &resource, first);
         let mut second = metric_event("hits", MetricKind::counter(1.0), 0);
         second.attributes.insert("team", team);
-        agg.process(&resource, second);
+        feed(&mut agg, &resource, second);
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -1997,10 +2014,10 @@ mod tests {
         let resource = default_resource();
         let mut first = metric_event("hits", MetricKind::counter(1.0), 0);
         first.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
-        agg.process(&resource, first);
+        feed(&mut agg, &resource, first);
         let mut second = metric_event("hits", MetricKind::counter(1.0), 0);
         second.attributes.insert("team", Value::Array(vec![Value::str("b"), Value::str("a")]));
-        agg.process(&resource, second);
+        feed(&mut agg, &resource, second);
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2011,7 +2028,8 @@ mod tests {
     fn same_tags_in_different_insertion_order_collide_into_one_series() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event_with_tags(
                 "hits",
@@ -2020,7 +2038,8 @@ mod tests {
                 &[("host", "a"), ("env", "prod")],
             ),
         );
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event_with_tags(
                 "hits",
@@ -2044,8 +2063,8 @@ mod tests {
         let mut resource_b = Resource::default();
         resource_b.attributes.insert("host", "b");
 
-        agg.process(&Arc::new(resource_a), metric_event("hits", MetricKind::counter(1.0), 0));
-        agg.process(&Arc::new(resource_b), metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &Arc::new(resource_a), metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &Arc::new(resource_b), metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         assert_eq!(flushed.len(), 2, "distinct resources should produce distinct batches");
@@ -2060,8 +2079,8 @@ mod tests {
         let mut e2 = metric_event("hits", MetricKind::counter(1.0), 0);
         e2.attributes.insert("score", f64::NAN);
 
-        agg.process(&resource, e1);
-        agg.process(&resource, e2);
+        feed(&mut agg, &resource, e1);
+        feed(&mut agg, &resource, e2);
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2082,7 +2101,7 @@ mod tests {
 
         let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), 0);
         flagged.metrics[0].flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
-        let passed = agg.process(&resource, flagged);
+        let passed = feed(&mut agg, &resource, flagged);
         assert!(passed.is_some(), "a flagged record must be forwarded, not absorbed");
         let passed = passed.unwrap();
         assert_eq!(passed.metrics.len(), 1);
@@ -2118,9 +2137,9 @@ mod tests {
         // or silently corrupt the counter accumulator already in progress.
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
+        assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
         let conflicting = metric_event("m", MetricKind::Gauge(5.0), 0);
-        let passed = agg.process(&resource, conflicting);
+        let passed = feed(&mut agg, &resource, conflicting);
         assert!(passed.is_some(), "the conflicting event should be forwarded, not absorbed");
 
         // The counter accumulator should be untouched by the conflicting event.
@@ -2152,7 +2171,7 @@ mod tests {
         );
         event.metrics.push(MetricRecord::new(intern("hits"), MetricKind::counter(1.0)));
 
-        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
+        let passed = feed(&mut agg, &resource, event).expect("the log half should be forwarded");
         assert!(passed.metrics.is_empty(), "the counter should have been absorbed");
         assert_eq!(
             passed.log.as_ref().expect("the log should still be present").message,
@@ -2181,8 +2200,8 @@ mod tests {
             }),
         ));
 
-        let passed =
-            agg.process(&resource, event).expect("the histogram should survive as the remainder");
+        let passed = feed(&mut agg, &resource, event)
+            .expect("the histogram should survive as the remainder");
         assert_eq!(passed.metrics.len(), 1, "only the unmergeable histogram should remain");
         assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram(_)));
 
@@ -2200,7 +2219,7 @@ mod tests {
         event.metrics.push(MetricRecord::new(intern("b"), MetricKind::counter(2.0)));
 
         assert!(
-            agg.process(&resource, event).is_none(),
+            feed(&mut agg, &resource, event).is_none(),
             "an event with nothing left to forward should still return None"
         );
     }
@@ -2212,7 +2231,7 @@ mod tests {
         let mut event = metric_event("hits", MetricKind::counter(1.0), 0);
         event.metrics.push(MetricRecord::new(intern("hits"), MetricKind::counter(2.0)));
 
-        assert!(agg.process(&resource, event).is_none());
+        assert!(feed(&mut agg, &resource, event).is_none());
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2224,13 +2243,13 @@ mod tests {
     fn a_kind_conflict_leaves_only_the_conflicting_metric_on_the_event() {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
-        assert!(agg.process(&resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
+        assert!(feed(&mut agg, &resource, metric_event("m", MetricKind::counter(1.0), 0)).is_none());
 
         let mut event = metric_event("m", MetricKind::counter(1.0), 0);
         event.metrics.push(MetricRecord::new(intern("m"), MetricKind::Gauge(5.0)));
 
         let passed =
-            agg.process(&resource, event).expect("the conflicting gauge should be forwarded");
+            feed(&mut agg, &resource, event).expect("the conflicting gauge should be forwarded");
         assert_eq!(passed.metrics.len(), 1, "the absorbed counter should not also be forwarded");
         assert!(matches!(passed.metrics[0].kind, MetricKind::Gauge(v) if v == 5.0));
 
@@ -2249,11 +2268,11 @@ mod tests {
 
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         let (_, _, events) = &flushed[0];
@@ -2272,8 +2291,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         agg.observe_batch_context(TraceContext::new_root());
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         let (_, _, events) = &flushed[0];
@@ -2293,7 +2312,7 @@ mod tests {
 
         for _ in 0..9 {
             agg.observe_batch_context(TraceContext::new_root());
-            agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+            feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
         }
 
         let flushed = agg.flush(100);
@@ -2324,12 +2343,12 @@ mod tests {
         let resource = default_resource();
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
         agg.flush(100); // first window's links discarded along with its accumulator
 
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(200);
         let (_, _, events) = &flushed[0];
@@ -2386,8 +2405,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(&resource, metric_event("a", MetricKind::counter(1.0), 0));
-        agg.process(&resource, metric_event("b", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("a", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("b", MetricKind::counter(1.0), 0));
         agg.flush(100);
 
         let events = registry.drain(0);
@@ -2421,9 +2440,9 @@ mod tests {
         resource_b.insert("host", "b");
         let resource_b = Arc::new(Resource { attributes: resource_b, ..Default::default() });
 
-        agg.process(&resource_a, metric_event("a", MetricKind::counter(1.0), 0));
-        agg.process(&resource_b, metric_event("b", MetricKind::counter(1.0), 0));
-        agg.process(&resource_b, metric_event("c", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource_a, metric_event("a", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource_b, metric_event("b", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource_b, metric_event("c", MetricKind::counter(1.0), 0));
         agg.flush(100);
 
         let events = registry.drain(0);
@@ -2440,7 +2459,7 @@ mod tests {
     fn a_delta_in_the_next_window_resolves_against_the_previous_windows_final_value() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         let flushed = flush_events(&mut agg, 100);
         match kind_of(&flushed[0].1[0]) {
             MetricKind::Gauge(v) => assert_eq!(*v, 10.0),
@@ -2448,7 +2467,7 @@ mod tests {
         }
 
         // Window 2 sees only a delta, no absolute -- it must resolve against window 1's value.
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 150));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 150));
         let flushed = flush_events(&mut agg, 200);
         assert_eq!(flushed.len(), 1);
         match kind_of(&flushed[0].1[0]) {
@@ -2463,7 +2482,7 @@ mod tests {
     fn a_retained_idle_gauge_emits_nothing_that_window() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1, "window 1 emits the gauge");
 
         // Window 2: nothing touches "conns" at all -- not a repeat of 10.0, not a 0.0, nothing.
@@ -2480,13 +2499,13 @@ mod tests {
             .with_series_retention(2, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         assert_eq!(agg.flush(100).len(), 1, "window 1: emits, idle_windows resets to 0");
         assert!(agg.flush(200).is_empty(), "window 2: idle_windows -> 1, still under retention 2");
         assert!(agg.flush(300).is_empty(), "window 3: idle_windows -> 2, now evicted");
 
         // A delta after eviction opens a brand-new series, resolving against 0.0.
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(5.0), 350));
         let flushed = flush_events(&mut agg, 400);
         match kind_of(&flushed[0].1[0]) {
             MetricKind::Gauge(v) => assert_eq!(*v, 5.0, "should resolve against 0.0 post-eviction"),
@@ -2515,8 +2534,8 @@ mod tests {
     fn series_retention_zero_reproduces_the_strictly_tumbling_output() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(0, 0);
         let resource = default_resource();
-        agg.process(&resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
-        agg.process(&resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(5.0), 50));
+        feed(&mut agg, &resource, metric_event("temp", MetricKind::Gauge(1.0), 10));
 
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(flushed.len(), 1);
@@ -2544,13 +2563,13 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         // Window 1's winner is stamped at t=500.
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 500));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 500));
         flush_events(&mut agg, 1000);
 
         // Window 2: an absolute gauge stamped at t=1 -- far earlier than window 1's `at` (500).
         // If retention had carried `at` across the boundary, this would fail `>= at` and be
         // silently dropped.
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(99.0), 1));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(99.0), 1));
         let flushed = flush_events(&mut agg, 2000);
         match kind_of(&flushed[0].1[0]) {
             MetricKind::Gauge(v) => assert_eq!(
@@ -2569,7 +2588,7 @@ mod tests {
     fn a_delta_mode_counter_series_does_not_survive_its_window_even_with_series_retention() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
         assert_eq!(flush_events(&mut agg, 100).len(), 1);
         assert!(
             agg.flush(200).is_empty(),
@@ -2585,7 +2604,7 @@ mod tests {
             .with_series_retention(5, 100)
             .with_telemetry(telemetry);
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
         agg.flush(100);
         // A second flush's own `resource.groups` sample reflects state as of right before it --
         // i.e. right after the first flush pruned the now-empty counters-only group.
@@ -2608,7 +2627,11 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
         for i in 0..3 {
-            agg.process(&resource, metric_event(&format!("g{i}"), MetricKind::Gauge(i as f64), 0));
+            feed(
+                &mut agg,
+                &resource,
+                metric_event(&format!("g{i}"), MetricKind::Gauge(i as f64), 0),
+            );
         }
         // 3 fresh gauge series, all wanting retention, but the cap is 2 -- one must be evicted.
         agg.flush(100);
@@ -2640,7 +2663,7 @@ mod tests {
         let resource = default_resource();
         let ctx_a = TraceContext::new_root();
         agg.observe_batch_context(ctx_a);
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
 
         let flushed = agg.flush(100);
         let (_, _, events) = &flushed[0];
@@ -2652,7 +2675,7 @@ mod tests {
         // Touch it again with a different context and confirm only the new one is linked.
         let ctx_b = TraceContext::new_root();
         agg.observe_batch_context(ctx_b);
-        agg.process(&resource, metric_event("conns", MetricKind::GaugeDelta(1.0), 150));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::GaugeDelta(1.0), 150));
         let flushed = agg.flush(200);
         let (_, _, events) = &flushed[0];
         let (_, links) = &events[0];
@@ -2670,7 +2693,7 @@ mod tests {
     fn flush_emits_no_empty_resource_events_group() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
+        feed(&mut agg, &resource, metric_event("conns", MetricKind::Gauge(10.0), 0));
         agg.flush(100); // retains "conns", idle from here on
 
         // Window 2: "conns" is retained-idle (no event); nothing else touches this resource.
@@ -2697,12 +2720,12 @@ mod tests {
         // Unsampled: weight 1, contributes 2 raw observations to the sketch.
         let mut unsampled = Samples::new([10.0, 20.0]);
         unsampled.sample_rate = 1.0;
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(unsampled), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(unsampled), 0));
 
         // Sampled at a rate that implies a weight past MAX_WEIGHT -- clamped, not exploded.
         let mut clamped = Samples::new([30.0]);
         clamped.sample_rate = 0.0001;
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(clamped), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(clamped), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2742,10 +2765,10 @@ mod tests {
         let resource = default_resource();
         let mut a = Samples::new([1.0, 2.0]);
         a.sample_rate = 0.5;
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(a), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(a), 0));
         let mut b = Samples::new([3.0]);
         b.sample_rate = 0.5;
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(b), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(b), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2775,11 +2798,11 @@ mod tests {
 
         let mut a = Samples::new([1.0, 2.0]);
         a.sample_rate = 1.0;
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(a), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(a), 0));
 
         let mut b = Samples::new([3.0]);
         b.sample_rate = 0.5; // weight 2 -- different rate, triggers fallback
-        agg.process(&resource, metric_event("latency", MetricKind::Samples(b), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Samples(b), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2822,12 +2845,14 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("latency", MetricKind::Samples(Samples::new([1.0, 2.0])), 0),
         );
         // Pushes held (2) + incoming (2) past the cap of 2.
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("latency", MetricKind::Samples(Samples::new([3.0, 4.0])), 0),
         );
@@ -2862,13 +2887,15 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10))
             .with_distributions(Distributions::Samples, 1000);
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("latency", MetricKind::Samples(Samples::new([1.0, 2.0])), 0),
         );
         let mut incoming_sketch = logit_core::DdSketch::new();
         incoming_sketch.add(3.0);
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("latency", MetricKind::Distribution(incoming_sketch), 0),
         );
@@ -2895,7 +2922,8 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10));
         let resource = default_resource();
         for i in 0..50 {
-            agg.process(
+            feed(
+                &mut agg,
                 &resource,
                 metric_event(
                     "unique.users",
@@ -2906,7 +2934,8 @@ mod tests {
         }
         // Re-observe a few already-seen members -- must not inflate the estimate.
         for i in 0..10 {
-            agg.process(
+            feed(
+                &mut agg,
                 &resource,
                 metric_event(
                     "unique.users",
@@ -2939,11 +2968,11 @@ mod tests {
         let mut a = logit_core::HyperLogLog::new();
         a.insert(b"x");
         a.insert(b"y");
-        agg.process(&resource, metric_event("unique.users", MetricKind::Set(a), 0));
+        feed(&mut agg, &resource, metric_event("unique.users", MetricKind::Set(a), 0));
         let mut b = logit_core::HyperLogLog::new();
         b.insert(b"y");
         b.insert(b"z");
-        agg.process(&resource, metric_event("unique.users", MetricKind::Set(b), 0));
+        feed(&mut agg, &resource, metric_event("unique.users", MetricKind::Set(b), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -2960,7 +2989,8 @@ mod tests {
     fn set_members_mode_dedups_preserving_insertion_order() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, 1000);
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event(
                 "unique.users",
@@ -2968,7 +2998,8 @@ mod tests {
                 0,
             ),
         );
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event(
                 "unique.users",
@@ -3007,7 +3038,8 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event(
                 "unique.users",
@@ -3015,7 +3047,8 @@ mod tests {
                 0,
             ),
         );
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("unique.users", MetricKind::SetMembers(vec![Bytes::from_static(b"c")]), 0),
         );
@@ -3049,13 +3082,14 @@ mod tests {
     fn set_members_accumulator_converts_to_set_on_an_incoming_set() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_sets(Sets::Members, 1000);
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("unique.users", MetricKind::SetMembers(vec![Bytes::from_static(b"a")]), 0),
         );
         let mut incoming = logit_core::HyperLogLog::new();
         incoming.insert(b"b");
-        agg.process(&resource, metric_event("unique.users", MetricKind::Set(incoming), 0));
+        feed(&mut agg, &resource, metric_event("unique.users", MetricKind::Set(incoming), 0));
 
         let flushed = flush_events(&mut agg, 100);
         let (_, events) = &flushed[0];
@@ -3073,7 +3107,8 @@ mod tests {
             .with_series_retention(5, 100)
             .with_distributions(Distributions::Samples, 1000);
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("latency", MetricKind::Samples(Samples::new([1.0])), 0),
         );
@@ -3089,7 +3124,8 @@ mod tests {
             .with_series_retention(5, 100)
             .with_sets(Sets::Members, 1000);
         let resource = default_resource();
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             metric_event("unique.users", MetricKind::SetMembers(vec![Bytes::from_static(b"a")]), 0),
         );
@@ -3110,10 +3146,10 @@ mod tests {
         let scope_b = Arc::new(Scope { name: Bytes::from_static(b"scope-b"), ..Scope::default() });
 
         agg.observe_scope(Some(scope_a.clone()));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         agg.observe_scope(Some(scope_b.clone()));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         let flushed = agg.flush(100);
         assert_eq!(
@@ -3154,10 +3190,10 @@ mod tests {
         assert!(!Arc::ptr_eq(&scope_a, &scope_b), "test setup: must be distinct Arcs");
 
         agg.observe_scope(Some(scope_a));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 0));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 0));
 
         agg.observe_scope(Some(scope_b));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 1));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 1));
 
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(
@@ -3233,8 +3269,8 @@ mod tests {
         let mut agg = cumulative_agg();
         let resource = default_resource();
 
-        agg.process(&resource, metric_event("hits", MetricKind::counter(2.0), 1_000));
-        agg.process(&resource, metric_event("hits", MetricKind::counter(3.0), 1_500));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(2.0), 1_000));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(3.0), 1_500));
         let flushed = flush_events(&mut agg, 100_000);
         let first = &flushed[0].1[0];
         assert_eq!(sum_of(first).value, 5.0, "window 1's own increments");
@@ -3247,7 +3283,7 @@ mod tests {
         );
 
         // Window 2: a further increment adds to the running total rather than starting over.
-        agg.process(&resource, metric_event("hits", MetricKind::counter(4.0), 110_000));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(4.0), 110_000));
         let flushed = flush_events(&mut agg, 200_000);
         let second = &flushed[0].1[0];
         assert_eq!(sum_of(second).value, 9.0, "5 carried forward plus 4 this window");
@@ -3269,8 +3305,8 @@ mod tests {
         let up_down = |v: f64| {
             MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: false })
         };
-        agg.process(&resource, metric_event("queue.depth", up_down(5.0), 10));
-        agg.process(&resource, metric_event("queue.depth", up_down(-2.0), 20));
+        feed(&mut agg, &resource, metric_event("queue.depth", up_down(5.0), 10));
+        feed(&mut agg, &resource, metric_event("queue.depth", up_down(-2.0), 20));
 
         let flushed = flush_events(&mut agg, 100);
         let emitted = sum_of(&flushed[0].1[0]);
@@ -3285,12 +3321,12 @@ mod tests {
     fn an_idle_cumulative_series_emits_nothing_then_resumes_from_its_running_total() {
         let mut agg = cumulative_agg();
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::counter(7.0), 100));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(7.0), 100));
         assert_eq!(flush_events(&mut agg, 1_000).len(), 1, "window 1 emits the total");
 
         assert!(agg.flush(2_000).is_empty(), "an idle cumulative series emits nothing");
 
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 2_500));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 2_500));
         let flushed = flush_events(&mut agg, 3_000);
         assert_eq!(sum_of(&flushed[0].1[0]).value, 8.0, "the idle window didn't reset the total");
         assert_eq!(start_timestamp_of(&flushed[0].1[0]), 100, "still the original start");
@@ -3305,7 +3341,8 @@ mod tests {
         let resource = default_resource();
         let buckets = [(1.0, 1u64), (5.0, 2), (f64::INFINITY, 3)];
         assert!(
-            agg.process(
+            feed(
+                &mut agg,
                 &resource,
                 delta_histogram_event("sizes", &buckets, Some(30.0), Some(0.5), Some(9.0), 500)
             )
@@ -3321,7 +3358,8 @@ mod tests {
         assert_eq!(start_timestamp_of(first), 500);
 
         // Window 2: another delta histogram over the same bounds, with a lower min and higher max.
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             delta_histogram_event(
                 "sizes",
@@ -3353,11 +3391,12 @@ mod tests {
         let mut agg = cumulative_agg();
         let resource = default_resource();
         let bounds = [(1.0, 1u64), (f64::INFINITY, 1)];
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             delta_histogram_event("sizes", &bounds, Some(3.0), Some(0.5), Some(2.0), 0),
         );
-        agg.process(&resource, delta_histogram_event("sizes", &bounds, None, None, None, 1));
+        feed(&mut agg, &resource, delta_histogram_event("sizes", &bounds, None, None, None, 1));
 
         let flushed = flush_events(&mut agg, 100);
         let emitted = histogram_of(&flushed[0].1[0]);
@@ -3379,12 +3418,18 @@ mod tests {
         let mut agg = cumulative_agg();
         let resource = default_resource();
         let maxed = [(1.0, u64::MAX), (f64::INFINITY, u64::MAX)];
-        assert!(agg
-            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 0))
-            .is_none());
-        assert!(agg
-            .process(&resource, delta_histogram_event("sizes", &maxed, None, None, None, 1))
-            .is_none());
+        assert!(feed(
+            &mut agg,
+            &resource,
+            delta_histogram_event("sizes", &maxed, None, None, None, 0)
+        )
+        .is_none());
+        assert!(feed(
+            &mut agg,
+            &resource,
+            delta_histogram_event("sizes", &maxed, None, None, None, 1)
+        )
+        .is_none());
 
         let flushed = flush_events(&mut agg, 100);
         assert_eq!(
@@ -3412,7 +3457,8 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(
+        feed(
+            &mut agg,
             &resource,
             delta_histogram_event("sizes", &[(1.0, 1), (f64::INFINITY, 1)], None, None, None, 0),
         );
@@ -3424,7 +3470,7 @@ mod tests {
             None,
             1,
         );
-        let passed = agg.process(&resource, mismatched);
+        let passed = feed(&mut agg, &resource, mismatched);
         let passed = passed.expect("the mismatched histogram must be forwarded, not absorbed");
         assert_eq!(passed.metrics.len(), 1);
         assert!(matches!(passed.metrics[0].kind, MetricKind::Histogram(_)));
@@ -3458,12 +3504,12 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
 
-        agg.process(&resource, metric_event("hits", MetricKind::counter(5.0), 100));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(5.0), 100));
         assert_eq!(agg.flush(1_000).len(), 1, "window 1: emits 5, idle_windows resets to 0");
         assert!(agg.flush(2_000).is_empty(), "window 2: idle_windows -> 1, still under retention");
         assert!(agg.flush(3_000).is_empty(), "window 3: idle_windows -> 2, now evicted");
 
-        agg.process(&resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(1.0), 3_500));
         let flushed = flush_events(&mut agg, 4_000);
         let restarted = &flushed[0].1[0];
         assert_eq!(sum_of(restarted).value, 1.0, "an evicted series restarts from zero");
@@ -3496,7 +3542,7 @@ mod tests {
             .with_telemetry(telemetry);
         let resource = default_resource();
         for i in 0..3 {
-            agg.process(&resource, metric_event(&format!("c{i}"), MetricKind::counter(1.0), 0));
+            feed(&mut agg, &resource, metric_event(&format!("c{i}"), MetricKind::counter(1.0), 0));
         }
         agg.flush(100);
 
@@ -3530,7 +3576,7 @@ mod tests {
             }),
             0,
         );
-        let passed = agg.process(&resource, incoming);
+        let passed = feed(&mut agg, &resource, incoming);
         assert!(passed.is_some(), "an already-cumulative Sum must pass through untouched");
         assert!(agg.flush(100).is_empty(), "and must not have opened a series");
     }
@@ -3541,7 +3587,7 @@ mod tests {
     fn delta_mode_sums_tumble_and_emit_delta_temporality_with_no_start_timestamp() {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
-        agg.process(&resource, metric_event("hits", MetricKind::counter(4.0), 1_000));
+        feed(&mut agg, &resource, metric_event("hits", MetricKind::counter(4.0), 1_000));
 
         let flushed = flush_events(&mut agg, 10_000);
         let emitted = &flushed[0].1[0];
@@ -3559,7 +3605,7 @@ mod tests {
         let mut agg = Aggregator::new(Duration::from_secs(10)).with_series_retention(5, 100);
         let resource = default_resource();
         let event = delta_histogram_event("sizes", &[(1.0, 1)], Some(1.0), None, None, 0);
-        let passed = agg.process(&resource, event);
+        let passed = feed(&mut agg, &resource, event);
         assert!(passed.is_some(), "a delta histogram must still pass through in delta mode");
         assert!(agg.flush(100).is_empty(), "and must not have opened a series");
     }
@@ -3574,7 +3620,7 @@ mod tests {
         let resource = default_resource();
         let mut sketch = logit_core::DdSketch::new();
         sketch.add(1.0);
-        agg.process(&resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
+        feed(&mut agg, &resource, metric_event("latency", MetricKind::Distribution(sketch), 0));
         assert_eq!(agg.flush(100).len(), 1, "the first flush emits the sketch");
         assert!(agg.flush(200).is_empty(), "a Distribution series must tumble in either mode");
     }

@@ -371,13 +371,10 @@ async fn statsd_through_cumulative_aggregate_renders_a_cumulative_counter_with_c
             .expect("the Fanout channel should not have closed");
         let batch = logit_pipeline::unwrap_batch(delivered);
         let resource = batch.resource.clone();
-        for event in batch.events {
+        for mut event in batch.events {
             absorbed_events += 1;
-            let absorbed = aggregator.process(&resource, event);
-            assert!(
-                absorbed.is_none(),
-                "a delta Sum under cumulative temporality must be absorbed"
-            );
+            let forwarded = aggregator.process(&resource, &mut event);
+            assert!(!forwarded, "a delta Sum under cumulative temporality must be absorbed");
         }
     }
 
@@ -447,9 +444,9 @@ async fn internal_telemetry_through_cumulative_aggregate_renders_a_logit_compone
         .with_series_retention(5, 10_000);
 
     let mut passthrough = Vec::new();
-    for event in batch.events {
-        if let Some(forwarded) = aggregator.process(&batch.resource, event) {
-            passthrough.push(forwarded);
+    for mut event in batch.events {
+        if aggregator.process(&batch.resource, &mut event) {
+            passthrough.push(event);
         }
     }
 

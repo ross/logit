@@ -1333,8 +1333,12 @@ async fn run_transform(
 }
 
 /// The per-batch body of `run_transform`'s loop above: telemetry accounting plus feeding every
-/// event through `Transform::process`, collecting what survives. Factored out (rather than left
-/// inline) so `crates/logit-bench/tests/allocations.rs` can measure the real code path directly,
+/// event through `Transform::process`, in place, dropping what it absorbs. `Vec::retain_mut` over
+/// the batch's own `events`, not a second `out` Vec collected into: `Transform::process` takes
+/// `&mut Event` and answers `bool` (its own doc comment says why), so a forwarded event is never
+/// moved and the batch needs no allocation of its own to hold the survivors. Factored out (rather
+/// than left inline) so `crates/logit-bench/tests/allocations.rs` can measure the real code path
+/// directly,
 /// instead of a hand-written replica -- the same "call it directly" approach
 /// `docs/design/memory.md` §7 already uses for every other stage, applied to the node runtime for
 /// the first time. `run_transform` is the only caller in this crate; `pub` is for the bench.
@@ -1355,24 +1359,19 @@ pub fn process_batch(
     // flush-bearing transform can stamp its own, separately-timed emission with it too
     // (`FlushOutput`'s own doc comment) -- the same "read here, cached on self, consulted again at
     // flush" shape `observe_batch_context` already uses for `TraceContext`.
-    let scope = batch.scope.clone();
+    let EventBatch { resource, scope, mut events } = batch;
     transform.observe_scope(scope.clone());
-    let resource = transform.map_resource(&batch.resource).unwrap_or(batch.resource);
+    let resource = transform.map_resource(&resource).unwrap_or(resource);
 
     let process_timer = telemetry.timer("logit.component.process.duration");
-    let mut out = Vec::with_capacity(batch.events.len());
-    let mut absorbed: u64 = 0;
-    for event in batch.events {
-        match transform.process(&resource, event) {
-            Some(event) => out.push(event),
-            None => absorbed += 1,
-        }
-    }
+    let before = events.len();
+    events.retain_mut(|event| transform.process(&resource, event));
     // Inside the timer on purpose: whatever a transform defers to `end_batch` is still its own
     // per-batch work (`Transform::end_batch`'s doc comment), and attribution
     // (`docs/design/internal-telemetry.md`) should keep charging it to this node.
     transform.end_batch();
     drop(process_timer);
+    let absorbed = (before - events.len()) as u64;
     if absorbed > 0 {
         telemetry.count(
             "logit.component.events.dropped",
@@ -1380,10 +1379,10 @@ pub fn process_batch(
             &[("reason", "absorbed")],
         );
     }
-    if out.is_empty() {
+    if events.is_empty() {
         None
     } else {
-        Some(EventBatch { resource, scope, events: out })
+        Some(EventBatch { resource, scope, events })
     }
 }
 
@@ -2549,10 +2548,10 @@ mod tests {
     struct MutatingTransform;
 
     impl Transform for MutatingTransform {
-        fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+        fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
             use logit_core::{interner::intern, MetricKind, MetricRecord};
             event.metrics.push(MetricRecord::new(intern("extra"), MetricKind::counter(1.0)));
-            Some(event)
+            true
         }
     }
 
@@ -2563,11 +2562,11 @@ mod tests {
     }
 
     impl Transform for ResourceMappingTransform {
-        fn process(&mut self, resource: &Arc<Resource>, event: Event) -> Option<Event> {
+        fn process(&mut self, resource: &Arc<Resource>, _event: &mut Event) -> bool {
             // Proves `process_batch` passes the *mapped* resource to `process`, not the batch's
             // original one.
             assert!(Arc::ptr_eq(resource, &self.replacement));
-            Some(event)
+            true
         }
 
         fn map_resource(&mut self, _resource: &Arc<Resource>) -> Option<Arc<Resource>> {
@@ -2752,7 +2751,7 @@ mod tests {
     /// A local fake `Transform`, standing in for `logit-transforms::Aggregator` -- this crate
     /// can't depend on `logit-transforms` (`docs/design/pipeline-graph.md`'s "Crate layout": the
     /// dependency runs the other way). Absorbs every event it's given (`process` always returns
-    /// `None`) and only ever emits them from `flush`, exactly the shape needed to prove a
+    /// `false`) and only ever emits them from `flush`, exactly the shape needed to prove a
     /// shutdown-triggered close-time flush actually drains what's buffered.
     struct WindowingTransform {
         interval: Duration,
@@ -2760,9 +2759,12 @@ mod tests {
     }
 
     impl Transform for WindowingTransform {
-        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
-            self.buffered.push(event);
-            None
+        fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+            // Buffers the whole event, so it has to move it out of the caller's slot: `Event` has
+            // no `Default`, so `mem::replace` with an empty one rather than `mem::take`. The
+            // husk left behind is what `process_batch`'s `retain_mut` drops.
+            self.buffered.push(std::mem::replace(event, Event::empty(0, AttrMap::new())));
+            false
         }
 
         fn flush_interval(&self) -> Option<Duration> {
@@ -6665,8 +6667,8 @@ mod tests {
     }
 
     impl Transform for MultiGroupFlushTransform {
-        fn process(&mut self, _resource: &Arc<Resource>, _event: Event) -> Option<Event> {
-            None
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            false
         }
 
         fn flush_interval(&self) -> Option<Duration> {
@@ -6738,8 +6740,8 @@ mod tests {
     }
 
     impl Transform for ScopedFlushTransform {
-        fn process(&mut self, _resource: &Arc<Resource>, _event: Event) -> Option<Event> {
-            None
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            false
         }
 
         fn flush_interval(&self) -> Option<Duration> {
@@ -6895,8 +6897,8 @@ mod tests {
     }
 
     impl Transform for RecordProvenance {
-        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
-            Some(event)
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            true
         }
 
         fn observe_provenance(&mut self, provenance: Provenance) {
@@ -7981,8 +7983,8 @@ mod tests {
     }
 
     impl Transform for RecordDelivered {
-        fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
-            Some(event)
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            true
         }
 
         fn observe_batch_context(&mut self, ctx: TraceContext) {

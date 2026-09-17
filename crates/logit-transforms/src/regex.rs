@@ -67,33 +67,33 @@ impl Transform for RegexParser {
     /// documented behavior" precedent). Records `logit.transform.matched`/`.matched.skipped`,
     /// mirroring `scale`'s `scaled`/`scaled.skipped`, on every path -- exactly one of the two,
     /// once per event, regardless of how many attributes a match contributed. This always returns
-    /// `Some`.
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    /// `true`.
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let bytes: Bytes = match self.field {
             None => match event.log.as_ref().map(|log| &log.message) {
                 Some(Value::Str(b) | Value::Bytes(b)) => b.clone(),
                 _ => {
                     self.telemetry.count("logit.transform.matched.skipped", 1.0, &[]);
-                    return Some(event);
+                    return true;
                 }
             },
             Some(field) => match event.attributes.get_sym(field) {
                 Some(Value::Str(b) | Value::Bytes(b)) => b.clone(),
                 _ => {
                     self.telemetry.count("logit.transform.matched.skipped", 1.0, &[]);
-                    return Some(event);
+                    return true;
                 }
             },
         };
 
         let Ok(hay) = std::str::from_utf8(&bytes) else {
             self.telemetry.count("logit.transform.matched.skipped", 1.0, &[]);
-            return Some(event);
+            return true;
         };
 
         if self.re.captures_read(&mut self.locs, hay).is_none() {
             self.telemetry.count("logit.transform.matched.skipped", 1.0, &[]);
-            return Some(event);
+            return true;
         }
 
         for i in 1..self.locs.len() {
@@ -106,7 +106,7 @@ impl Transform for RegexParser {
         }
 
         self.telemetry.count("logit.transform.matched", 1.0, &[]);
-        Some(event)
+        true
     }
 }
 
@@ -165,8 +165,8 @@ mod tests {
     fn a_matching_line_populates_every_named_capture() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+) path=(?P<path>\S+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("status=200 path=/health");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("status=200 path=/health");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
         assert_eq!(attr(&event, "path"), Some(&Value::str("/health")));
     }
@@ -175,8 +175,8 @@ mod tests {
     fn only_the_first_match_contributes() {
         let mut re = RegexParser::new(r"id=(?P<id>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("id=1 and then id=2");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("id=1 and then id=2");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "id"), Some(&Value::str("1")));
     }
 
@@ -184,8 +184,8 @@ mod tests {
     fn an_unnamed_group_contributes_no_attribute() {
         let mut re = RegexParser::new(r"(\d+)-(?P<id>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("42-99");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("42-99");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "id"), Some(&Value::str("99")));
         assert_eq!(event.attributes.len(), 1, "the unnamed group must not add an attribute");
     }
@@ -194,8 +194,8 @@ mod tests {
     fn a_non_participating_optional_group_omits_its_attribute() {
         let mut re = RegexParser::new(r"(?P<a>x)?(?P<b>y)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("y");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("y");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), None, "a non-participating group must add no key at all");
         assert_eq!(attr(&event, "b"), Some(&Value::str("y")));
     }
@@ -204,8 +204,8 @@ mod tests {
     fn a_group_matching_the_empty_string_omits_its_attribute() {
         let mut re = RegexParser::new(r"(?P<a>x*)(?P<b>y)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("y");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("y");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), None, "an empty-string capture must add no key at all");
         assert_eq!(attr(&event, "b"), Some(&Value::str("y")));
     }
@@ -214,8 +214,8 @@ mod tests {
     fn a_numeric_looking_capture_stays_a_str() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("status=200");
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("status=200");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
         assert!(
             !matches!(attr(&event, "status"), Some(Value::U64(_)) | Some(Value::I64(_))),
@@ -229,7 +229,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("no match here");
         event.attributes.insert("existing", Value::str("kept"));
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.len(), 1);
         assert_eq!(attr(&event, "existing"), Some(&Value::str("kept")));
     }
@@ -238,7 +238,7 @@ mod tests {
     fn a_non_string_message_passes_through_untouched() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -251,7 +251,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -259,7 +259,7 @@ mod tests {
     fn a_non_utf8_message_passes_through_untouched() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -272,7 +272,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -280,12 +280,12 @@ mod tests {
     fn a_metric_only_event_passes_through_untouched() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = Event::metric(
+        let mut event = Event::metric(
             0,
             AttrMap::new(),
             MetricRecord::new(intern("m"), MetricKind::counter(1.0)),
         );
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -293,7 +293,7 @@ mod tests {
     fn a_span_only_event_passes_through_untouched() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = Event::span(
+        let mut event = Event::span(
             0,
             AttrMap::new(),
             SpanRecord {
@@ -310,7 +310,7 @@ mod tests {
                 ext: None,
             },
         );
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -318,9 +318,9 @@ mod tests {
     fn the_message_and_body_format_are_left_untouched() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("status=200");
+        let mut event = log_event("status=200");
         let original_message = event.log.as_ref().unwrap().message.clone();
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
         assert_eq!(event.log.as_ref().unwrap().body_format, BodyFormat::Raw);
     }
@@ -331,7 +331,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("status=200");
         event.metrics.push(MetricRecord::new(intern("m"), MetricKind::counter(1.0)));
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
     }
@@ -342,7 +342,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("status=200");
         event.attributes.insert("status", Value::str("old"));
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
     }
 
@@ -351,8 +351,9 @@ mod tests {
         let mut re =
             RegexParser::new(r"traceparent='(?P<message>[^']+)'", Some("message")).unwrap();
         let resource = default_resource();
-        let event = event_with_attrs(&[("message", Value::str("INSERT ... traceparent='abc123'"))]);
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event =
+            event_with_attrs(&[("message", Value::str("INSERT ... traceparent='abc123'"))]);
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "message"), Some(&Value::str("abc123")));
     }
 
@@ -361,8 +362,8 @@ mod tests {
         let mut re =
             RegexParser::new(r"traceparent='(?P<traceparent>[^']+)'", Some("sql")).unwrap();
         let resource = default_resource();
-        let event = event_with_attrs(&[("sql", Value::str("INSERT ... traceparent='abc123'"))]);
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("sql", Value::str("INSERT ... traceparent='abc123'"))]);
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "traceparent"), Some(&Value::str("abc123")));
     }
 
@@ -371,8 +372,8 @@ mod tests {
         let mut re =
             RegexParser::new(r"traceparent='(?P<traceparent>[^']+)'", Some("sql")).unwrap();
         let resource = default_resource();
-        let event = event_with_attrs(&[]);
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[]);
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -381,8 +382,8 @@ mod tests {
         let mut re =
             RegexParser::new(r"traceparent='(?P<traceparent>[^']+)'", Some("sql")).unwrap();
         let resource = default_resource();
-        let event = event_with_attrs(&[("sql", Value::I64(1))]);
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("sql", Value::I64(1))]);
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "traceparent"), None);
         assert_eq!(attr(&event, "sql"), Some(&Value::I64(1)), "the untouched attribute survives");
     }
@@ -402,12 +403,12 @@ mod tests {
     fn a_captured_value_shares_the_message_buffer() {
         let mut re = RegexParser::new(r"status=(?P<status>\d+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("status=200");
+        let mut event = log_event("status=200");
         let message = match &event.log.as_ref().unwrap().message {
             Value::Str(b) => b.clone(),
             _ => panic!("expected Str"),
         };
-        let event = re.process(&resource, event).expect("always forwards");
+        assert!(re.process(&resource, &mut event), "always forwards");
         match attr(&event, "status") {
             Some(Value::Str(captured)) => {
                 assert!(points_into(&message, captured), "capture must slice the message buffer")
@@ -420,8 +421,8 @@ mod tests {
     fn a_capture_containing_multibyte_utf8_survives() {
         let mut re = RegexParser::new(r"user=(?P<user>\S+)", None).unwrap();
         let resource = default_resource();
-        let event = log_event("user=Jos\u{e9}"); // "José"
-        let event = re.process(&resource, event).expect("always forwards");
+        let mut event = log_event("user=Jos\u{e9}"); // "José"
+        assert!(re.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "user"), Some(&Value::str("Jos\u{e9}")));
     }
 
@@ -441,7 +442,8 @@ mod tests {
         let mut re =
             RegexParser::new(r"status=(?P<status>\d+)", None).unwrap().with_telemetry(telemetry);
         let resource = default_resource();
-        re.process(&resource, log_event("status=200")).unwrap();
+        let mut event = log_event("status=200");
+        re.process(&resource, &mut event);
 
         let events = registry.drain(0);
         assert_eq!(matched_count(&events, "logit.transform.matched"), Some(1.0));
@@ -455,7 +457,8 @@ mod tests {
         let mut re =
             RegexParser::new(r"status=(?P<status>\d+)", None).unwrap().with_telemetry(telemetry);
         let resource = default_resource();
-        re.process(&resource, log_event("no match here")).unwrap();
+        let mut event = log_event("no match here");
+        re.process(&resource, &mut event);
 
         let events = registry.drain(0);
         assert_eq!(matched_count(&events, "logit.transform.matched"), None);
