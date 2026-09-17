@@ -677,57 +677,62 @@ already built that have a known, accepted rough edge.
   `logit-inputs::tcp::TcpListener`'s octet-counting `Framer`
   ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)), which delimits by
   declared length, not `\n` — a `0x0A` inside an octet-counted MSG now survives intact end to end.
-  `Value::Bytes` MSG (closed above) plus this framing clear the "reachable" bar on TCP; see the
-  HAProxy CBOR entry for what's still missing there (a decoder, not a transport).
-- **HAProxy's native CBOR log output (`%{+cbor}o`/`%{+cbor+bin}o`) was evaluated as a cheaper way to
-  source its access logs and deliberately not pursued** — a considered "not now," not an
-  unexplored idea, recorded here so the investigation doesn't get redone. Three findings, each
-  independently sufficient to defer it:
-  - **The reachable mode is bigger than JSON, not smaller.** HAProxy's default CBOR encoding
-    (`%{+cbor}o`, no `+bin`) is hex-encoded ASCII — a line like `BF69636C69656E745F6970…`, an
-    indefinite-length map rendered as hex text, ~2 bytes on the wire per payload byte. Only
-    `%{+cbor+bin}o` emits raw binary, which is the mode that would actually be more compact than
-    the demo's hand-rolled JSON — but see the next point.
-  - **Narrowed: binary CBOR can now reach `logit` intact over one transport, just not decode once
-    it arrives.** `syslog_in`'s UDP transport still splits every datagram on `\n` before any UTF-8
-    check runs at all (`crates/logit-inputs/src/syslog.rs`), and `0x0A` occurs freely inside CBOR —
-    it's the encoding of the integer 10, and turns up throughout length headers and float payloads
-    — so a binary payload sent over UDP is still chopped mid-value by the framing itself,
-    independent of the UTF-8 question. `tail_in`/`docker_in` are line-framed too, and Docker's
-    json-file driver wraps each line in a JSON string that can't carry arbitrary octets at all.
-    `transport: tcp` no longer has this problem, though:
-    `logit-inputs::tcp::TcpListener`'s octet-counting `Framer` delimits by declared length rather
-    than `\n`, and `SyslogInput::tcp` turns off the decoder's own line splitting to match
-    ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)) — length-delimited
-    framing, the prerequisite this finding originally said nothing in the tree offered, now exists
-    for that one transport. What remains missing isn't a transport but a decoder: nothing parses
-    CBOR itself, so a binary payload that made it through intact would land as an opaque
-    `Value::Bytes` MSG, not `trace.*`/`span.*` attributes — a `cbor_in`-shaped codec (or a
-    `syslog_in` opt-in decode path) is the piece this entry is really about, and it remains
-    unbuilt.
-  - **HAProxy's log-format item-name grammar rejects a literal `.` in a custom name, and `%{+json}o`
-    and `%{+cbor}o` share that grammar** (already recorded at `demo/haproxy/haproxy.cfg:99-117`,
-    confirmed empirically against `haproxy -c`) — but the two encodings aren't equally stuck by it.
-    JSON has an escape hatch: `demo/haproxy/haproxy.cfg:140` hand-writes the JSON text itself, with
-    per-value `json(ascii)` escaping, to get its dotted `span.*`/`trace.*` keys past the grammar.
-    CBOR has no equivalent, because binary can't be typed into a `log-format` string — `%{+cbor}o`
-    is the only way to emit it, so a CBOR-sourced HAProxy tier is stuck with undotted keys and would
-    need a rename stage the JSON tier doesn't. `SpanLiftConfig`
-    (`crates/logit-config/src/lib.rs:806-828`) has no source-field override for `span.status`,
-    `span.start_us`, or `span.duration_ms`, so `trace_context` can't absorb that rename on its own
-    either. Worth being precise about *whose* limitation this is: CBOR's own text-string keys are
-    arbitrary UTF-8 and handle dots fine — every constraint above belongs to HAProxy's log-format
-    grammar or to `logit`'s current transports, not to CBOR as a format.
+  `Value::Bytes` MSG (closed above) plus this framing clear the "reachable" bar on TCP; the HAProxy
+  CBOR entry below records why the decoder that would consume it was measured and not built.
+- **HAProxy's native CBOR log output (`%{+cbor}o` / `%{+cbor,+bin}o`) was investigated twice and
+  deliberately not pursued — a closed door now, not a "not now", recorded so it isn't reopened
+  without new evidence.** The first pass (2026-09-13) deferred it on framing grounds; the second
+  (2026-09-17) captured real HAProxy 3.0.27 output, built a throwaway decoder, and measured. What
+  that found, in decreasing order of surprise:
+  - **Binary CBOR *is* reachable, on both transports, once the flags are spelled right.** HAProxy's
+    log-format options are comma-separated: `%{+cbor,+bin}o`. `%{+cbor+bin}o` applies only the
+    last flag (`bin` alone, so plain unencoded output) and `%{+bin+cbor}o` only `cbor` (the hex
+    form) — `parse_logformat_node_args` in HAProxy's `src/log.c` resets its start pointer at every
+    `+`, and the manual never says so. With the comma form, HAProxy 3.0.27 emitted raw binary CBOR
+    in the syslog MSG both to a plain UDP `log` target and to a `ring` with
+    `server ... log-proto octet-count`. Over TCP octet-counting that MSG already lands in `logit`
+    intact as a `Value::Bytes` (the narrowed entry above); over UDP it would need a `syslog_in`
+    opt-out of newline splitting, a one-field change that was never the hard part.
+  - **Wire shape**, should anything ever decode it: an indefinite-length map (`BF … FF`) with
+    definite text keys; *untyped* string items such as `%HM` come out as indefinite-length
+    *chunked* text strings (`7F 63 'GET' FF`), `:str`-typed ones as definite strings; `:sint`
+    non-negatives are major type 0; `:bool` is simple true/false; no tags.
+  - **Size: 13–19% smaller than JSON, not more.** The demo's 20-item HAProxy access line, same
+    items from one HAProxy run: 588 bytes as `%{+json}o` (HAProxy pads after `:` and `,`), 549
+    bytes as the compact hand-written JSON `demo/haproxy/haproxy.cfg` actually emits, 476 bytes as
+    `%{+cbor,+bin}o`. The hex form is 2× the binary, i.e. larger than JSON.
+  - **Parse speed: no faster, measured.** A hand-rolled CBOR-to-attributes prototype (a twin of
+    `json`: zero-copy `Bytes` slices for definite strings, the same `KeyCache`, indefinite
+    maps/strings, an explicit depth bound) benched against `JsonParser::process` on those two
+    payloads, pinned to one core with divan's allocation profiler on, three runs: JSON 881–921
+    ns/event, CBOR 1030–1049 ns/event — 1.1–1.2× *slower*. Allocations were equal (one: the
+    `AttrMap` spilling past its 8-entry inline capacity at 20 attributes) once the chunked `%HM`
+    string was typed `:str`; as HAProxy emits it, CBOR costs two more for the chunk concatenation.
+    The per-entry budget is dominated by what both formats share — key-cache lookup, `Value`
+    construction, sorted `insert_sym`, UTF-8 validation, refcount bumps — and the syntax scanning
+    CBOR saves is a small slice of it that `serde_json`'s tuned scanner already spends well. A
+    tuned decoder could plausibly close the gap; nothing in the profile suggested a meaningful
+    lead. The prototype was not kept in tree.
+  - **The item-name grammar limitation is shared with `%{+json}o`**, and is why the demo
+    hand-writes its JSON: HAProxy rejects a literal `.` in a custom item name (confirmed against
+    `haproxy -c`, `demo/haproxy/haproxy.cfg:99-117`), so a CBOR-sourced tier would still need a
+    rename stage for its `span.*`/`trace.*` keys (`SpanLiftConfig` in `crates/logit-config` has no
+    source-field override, so `trace_context` can't absorb it), and CBOR has no hand-written escape
+    hatch because binary can't be typed into a `log-format` string. That is HAProxy's grammar, not
+    CBOR's; CBOR text keys take dots fine.
 
-  If a CBOR decoder is ever built and this is revisited, three design constraints are
-  already known and don't need rediscovering: `Value::as_str` **panics** on an invalid-UTF-8
-  `Value::Str` (`crates/logit-core/src/value.rs:33-41`), so CBOR's only-nominally-UTF-8 text-string
-  type would need validation before becoming one; a hand-rolled decoder needs an explicit recursion
-  depth bound, since `json`'s `serde_json`-based one inherits a limit for free that a hand-rolled
-  CBOR reader would not; and a length header must never size an allocation directly (an attacker can
-  claim a multi-gigabyte array in a handful of bytes). CBOR tag 1 (epoch time), decodable straight
-  into `Value::Timestamp`, is the one thing the format would offer that JSON doesn't — the reason
-  it's worth this entry rather than a closed door.
+  Net: a second decoder to build and maintain, a `syslog_in` framing knob, and a rename stage, for
+  a ~15% wire saving and no parse-time win. Not built. A `cbor_in`/`cbor_out` listener/sink pair
+  was weighed in the same pass and rejected outright: nothing in the telemetry landscape speaks
+  CBOR over a socket (Fluent forward is msgpack, Vector's native wire is protobuf, syslog is text),
+  so it would be a second native wire beside `logit_in`/`logit_out` with no producer or consumer.
+  If new evidence ever reopens this, the decoder constraints from the first pass still hold and
+  the prototype confirmed each one costs real code: `Value::as_str` **panics** on an invalid-UTF-8
+  `Value::Str` (`crates/logit-core/src/value.rs`), so CBOR's only-nominally-UTF-8 text strings need
+  validation before becoming one; a hand-rolled reader needs an explicit recursion bound, which
+  `json`'s `serde_json`-based one inherits for free; a length header must never size an allocation
+  directly; and tag 1 (epoch time), decodable straight into `Value::Timestamp`, is the one thing
+  the format offers that JSON doesn't — HAProxy doesn't emit it.
 - **Narrowed: `event.timestamp` is still receipt time, not the sender's — but that's no longer the
   only place the sender's own clock can land.** Every event is still stamped with the instant its
   datagram came off the socket (`received_at`, captured by the read half and threaded through to
