@@ -393,7 +393,7 @@ receive/processing side from their own loops, which already see every batch and 
 |---|---|---|
 | `logit.component.batches.received` / `.events.received` | count | `run_transform`, `run_output`, `run_lua`, `run_router` |
 | `logit.component.process.duration` | timing | `run_transform`, `run_lua`, `run_router` (whole batch — for a router this spans `route_batch`'s partition, not any one destination's send) |
-| `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `None` |
+| `logit.component.events.dropped{reason="absorbed"}` | count | `Transform::process` returned `false` |
 | `logit.component.events.dropped{reason="script_drop"}` | count | Lua `ProcessOutcome::Drop` |
 | `logit.component.events.dropped{reason="unrouted"}` | count | `run_router`: events no route claimed, at a router with targets and no ordinary consumers ([ADR `target-components`](../adr/target-components.md)). Counted explicitly rather than left to `Fanout`, which returns early on zero consumers and counts nothing — "unrouted events are dropped and counted, never silently" is the ADR's rule. A router *with* ordinary consumers never emits this: its unrouted events go to them. `run_lua` shares this reason with `run_router`, under exactly the same rule: a `lua`/`lua_file` component with `targets:` and no ordinary consumers counts the events no `event:to(..)` claimed here, on both its batch path and its `flush()`. |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |

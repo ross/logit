@@ -90,7 +90,7 @@ fn json_parse(bencher: Bencher) {
         .with_inputs(|| {
             decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("an event")
         })
-        .bench_local_values(|event| json.process(&resource, event));
+        .bench_local_refs(|event| json.process(&resource, event));
 }
 
 /// [`json_parse`] on the 28-key pino-shaped line (`fixtures::WIDE_JSON_SYSLOG_LINE`) -- the
@@ -105,7 +105,7 @@ fn json_parse_wide(bencher: Bencher) {
         .with_inputs(|| {
             decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("an event")
         })
-        .bench_local_values(|event| json.process(&resource, event));
+        .bench_local_refs(|event| json.process(&resource, event));
 }
 
 /// `logfmt` on `fixtures::LOGFMT_LINE` (nine fields, all zero-copy) -- the transform-level
@@ -116,7 +116,7 @@ fn logfmt_parse(bencher: Bencher) {
     let mut logfmt = fixtures::logfmt_parser();
     bencher
         .with_inputs(fixtures::logfmt_event)
-        .bench_local_values(|event| logfmt.process(&resource, event));
+        .bench_local_refs(|event| logfmt.process(&resource, event));
 }
 
 /// `kv` on `fixtures::KV_LINE` (three `a=1&b=2` pairs).
@@ -124,9 +124,7 @@ fn logfmt_parse(bencher: Bencher) {
 fn kv_parse(bencher: Bencher) {
     let resource = fixtures::resource();
     let mut kv = fixtures::kv_parser();
-    bencher
-        .with_inputs(fixtures::kv_event)
-        .bench_local_values(|event| kv.process(&resource, event));
+    bencher.with_inputs(fixtures::kv_event).bench_local_refs(|event| kv.process(&resource, event));
 }
 
 /// `graphite_in`'s plaintext decode of one line carrying two carbon tags
@@ -148,15 +146,16 @@ fn kv_metrics(bencher: Bencher) {
     let datagram = fixtures::nginx_syslog_datagram(1);
     bencher
         .with_inputs(|| {
-            let event = decoder
+            let mut event = decoder
                 .decode(datagram.clone())
                 .expect("should decode")
                 .events
                 .pop()
                 .expect("an event");
-            json.process(&resource, event).expect("json forwards")
+            assert!(json.process(&resource, &mut event), "json forwards");
+            event
         })
-        .bench_local_values(|event| kv.process(&resource, event));
+        .bench_local_refs(|event| kv.process(&resource, event));
 }
 
 #[divan::bench]
@@ -165,7 +164,7 @@ fn keep(bencher: Bencher) {
     let mut keep = fixtures::keep();
     bencher
         .with_inputs(fixtures::nginx_event)
-        .bench_local_values(|event| keep.process(&resource, event));
+        .bench_local_refs(|event| keep.process(&resource, event));
 }
 
 #[divan::bench]
@@ -174,8 +173,12 @@ fn aggregate_absorb(bencher: Bencher) {
     let mut keep = fixtures::keep();
     let mut agg = fixtures::aggregator();
     bencher
-        .with_inputs(|| keep.process(&resource, fixtures::nginx_event()).expect("keep forwards"))
-        .bench_local_values(|event| agg.process(&resource, event));
+        .with_inputs(|| {
+            let mut event = fixtures::nginx_event();
+            assert!(keep.process(&resource, &mut event), "keep forwards");
+            event
+        })
+        .bench_local_refs(|event| agg.process(&resource, event));
 }
 
 /// The interner's probes in isolation, on the six nginx keys cycled in order -- what one key of
@@ -419,11 +422,11 @@ fn full_chain(bencher: Bencher) {
 
     bencher.bench_local(|| {
         let batch = decoder.decode(divan::black_box(datagram.clone())).expect("should decode");
-        for event in batch.events {
-            let event = json.process(&resource, event).expect("json forwards");
-            let event = kv.process(&resource, event).expect("kv forwards");
-            let event = keep.process(&resource, event).expect("keep forwards");
-            drop(agg.process(&resource, event));
+        for mut event in batch.events {
+            assert!(json.process(&resource, &mut event), "json forwards");
+            assert!(kv.process(&resource, &mut event), "kv forwards");
+            assert!(keep.process(&resource, &mut event), "keep forwards");
+            agg.process(&resource, &mut event);
         }
     });
 }

@@ -693,11 +693,12 @@ fn json_parse_one_event() {
         decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("one event")
     };
 
-    let warm = decode_one();
-    drop(json.process(&resource, warm));
+    let mut warm = decode_one();
+    json.process(&resource, &mut warm);
 
-    let event = decode_one();
-    let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
+    let mut event = decode_one();
+    let (forwarded, stats) = measure(|| json.process(&resource, &mut event));
+    assert!(forwarded, "json forwards");
     assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
     expect_allocs("json: parse + merge 1 event", stats, 1);
 }
@@ -724,11 +725,12 @@ fn json_parse_wide_json_event() {
         decoder.decode(datagram.clone()).expect("should decode").events.pop().expect("one event")
     };
 
-    let warm = decode_one();
-    drop(json.process(&resource, warm));
+    let mut warm = decode_one();
+    json.process(&resource, &mut warm);
 
-    let event = decode_one();
-    let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
+    let mut event = decode_one();
+    let (forwarded, stats) = measure(|| json.process(&resource, &mut event));
+    assert!(forwarded, "json forwards");
     assert_eq!(event.attributes.len(), 32, "28 JSON fields plus 4 syslog.* attributes");
     expect_allocs("json: parse + merge 1 wide-JSON event", stats, 1);
 }
@@ -746,11 +748,13 @@ fn json_parse_reordered_keys_event() {
     let warm = fixtures::nginx_syslog_datagram(1);
     let reversed = fixtures::nginx_syslog_datagram_reversed_keys();
 
-    let warm = decoder.decode(warm).expect("should decode").events.pop().expect("one event");
-    drop(json.process(&resource, warm));
+    let mut warm = decoder.decode(warm).expect("should decode").events.pop().expect("one event");
+    json.process(&resource, &mut warm);
 
-    let event = decoder.decode(reversed).expect("should decode").events.pop().expect("one event");
-    let (event, stats) = measure(|| json.process(&resource, event).expect("json forwards"));
+    let mut event =
+        decoder.decode(reversed).expect("should decode").events.pop().expect("one event");
+    let (forwarded, stats) = measure(|| json.process(&resource, &mut event));
+    assert!(forwarded, "json forwards");
     assert_eq!(event.attributes.len(), 10, "6 JSON fields plus 4 syslog.* attributes");
     expect_allocs("json: parse + merge 1 event with the keys reordered", stats, 1);
 }
@@ -764,11 +768,12 @@ fn csv_parse_one_event() {
     let mut csv = fixtures::csv_parser();
     let resource = fixtures::resource();
 
-    let warm = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
-    drop(csv.process(&resource, warm));
+    let mut warm = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
+    csv.process(&resource, &mut warm);
 
-    let event = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
-    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    let mut event = fixtures::csv_event(fixtures::CSV_ACCESS_LINE);
+    let (forwarded, stats) = measure(|| csv.process(&resource, &mut event));
+    assert!(forwarded, "csv forwards");
     assert_eq!(event.attributes.len(), 7, "seven csv columns, no pre-existing attributes");
     expect_allocs("csv: parse + merge 1 event (quoted, no escaping)", stats, 0);
 }
@@ -782,11 +787,12 @@ fn csv_parse_quoted_field_with_doubled_quotes() {
     let resource = fixtures::resource();
     let line = r#"10.0.0.1,2026-09-07T06:52:01Z,GET,"/a""b",200,612,0.012"#;
 
-    let warm = fixtures::csv_event(line);
-    drop(csv.process(&resource, warm));
+    let mut warm = fixtures::csv_event(line);
+    csv.process(&resource, &mut warm);
 
-    let event = fixtures::csv_event(line);
-    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    let mut event = fixtures::csv_event(line);
+    let (forwarded, stats) = measure(|| csv.process(&resource, &mut event));
+    assert!(forwarded, "csv forwards");
     assert_eq!(event.attributes.get("path"), Some(&Value::str(r#"/a"b"#)));
     expect_allocs("csv: parse + merge 1 event (one doubled-quote field)", stats, 1);
 }
@@ -798,11 +804,12 @@ fn csv_parse_wide_row_event() {
     let mut csv = fixtures::csv_wide_parser();
     let resource = fixtures::resource();
 
-    let warm = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
-    drop(csv.process(&resource, warm));
+    let mut warm = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
+    csv.process(&resource, &mut warm);
 
-    let event = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
-    let (event, stats) = measure(|| csv.process(&resource, event).expect("csv forwards"));
+    let mut event = fixtures::csv_event(fixtures::CSV_WIDE_LINE);
+    let (forwarded, stats) = measure(|| csv.process(&resource, &mut event));
+    assert!(forwarded, "csv forwards");
     assert_eq!(event.attributes.len(), 16, "sixteen csv columns");
     expect_allocs("csv: parse + merge 1 wide row (16 columns)", stats, 1);
 }
@@ -816,10 +823,12 @@ fn csv_parse_wide_row_event() {
 fn regex_capture_into_an_inline_map() {
     let mut re = fixtures::regex_parser();
     let resource = fixtures::resource();
-    drop(re.process(&resource, fixtures::sshd_message_event()));
+    let mut warm = fixtures::sshd_message_event();
+    re.process(&resource, &mut warm);
 
-    let event = fixtures::sshd_message_event();
-    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    let mut event = fixtures::sshd_message_event();
+    let (forwarded, stats) = measure(|| re.process(&resource, &mut event));
+    assert!(forwarded, "regex forwards");
     assert_eq!(event.attributes.len(), 3, "ssh_user, client_address, client_port");
     expect_allocs("regex: capture into an inline map", stats, 0);
 }
@@ -831,10 +840,12 @@ fn regex_capture_into_an_inline_map() {
 fn regex_parse_one_event() {
     let mut re = fixtures::regex_parser();
     let resource = fixtures::resource();
-    drop(re.process(&resource, fixtures::sshd_event()));
+    let mut warm = fixtures::sshd_event();
+    re.process(&resource, &mut warm);
 
-    let event = fixtures::sshd_event();
-    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    let mut event = fixtures::sshd_event();
+    let (forwarded, stats) = measure(|| re.process(&resource, &mut event));
+    assert!(forwarded, "regex forwards");
     assert_eq!(event.attributes.len(), 9, "6 syslog.* attributes plus 3 captures");
     expect_allocs("regex: parse 1 event (sshd shape)", stats, 1);
 }
@@ -845,11 +856,13 @@ fn regex_parse_one_event() {
 fn regex_no_match_one_event() {
     let mut re = fixtures::regex_parser();
     let resource = fixtures::resource();
-    drop(re.process(&resource, fixtures::nginx_event()));
+    let mut warm = fixtures::nginx_event();
+    re.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event();
+    let mut event = fixtures::nginx_event();
     let attrs_before = event.attributes.len();
-    let (event, stats) = measure(|| re.process(&resource, event).expect("regex forwards"));
+    let (forwarded, stats) = measure(|| re.process(&resource, &mut event));
+    assert!(forwarded, "regex forwards");
     assert_eq!(event.attributes.len(), attrs_before, "no match, no attribute added");
     expect_allocs("regex: no match, 1 event", stats, 0);
 }
@@ -863,10 +876,12 @@ fn regex_no_match_one_event() {
 fn logfmt_parse_one_event() {
     let mut logfmt = fixtures::logfmt_parser();
     let resource = fixtures::resource();
-    drop(logfmt.process(&resource, fixtures::logfmt_event()));
+    let mut warm = fixtures::logfmt_event();
+    logfmt.process(&resource, &mut warm);
 
-    let event = fixtures::logfmt_event();
-    let (event, stats) = measure(|| logfmt.process(&resource, event).expect("logfmt forwards"));
+    let mut event = fixtures::logfmt_event();
+    let (forwarded, stats) = measure(|| logfmt.process(&resource, &mut event));
+    assert!(forwarded, "logfmt forwards");
     assert_eq!(event.attributes.len(), 9, "every logfmt field should have landed");
     expect_allocs("logfmt: parse + merge 1 event", stats, 1);
 }
@@ -878,10 +893,12 @@ fn logfmt_parse_one_event() {
 fn logfmt_parse_escaped_value_event() {
     let mut logfmt = fixtures::logfmt_parser();
     let resource = fixtures::resource();
-    drop(logfmt.process(&resource, fixtures::logfmt_escaped_event()));
+    let mut warm = fixtures::logfmt_escaped_event();
+    logfmt.process(&resource, &mut warm);
 
-    let event = fixtures::logfmt_escaped_event();
-    let (event, stats) = measure(|| logfmt.process(&resource, event).expect("logfmt forwards"));
+    let mut event = fixtures::logfmt_escaped_event();
+    let (forwarded, stats) = measure(|| logfmt.process(&resource, &mut event));
+    assert!(forwarded, "logfmt forwards");
     assert_eq!(event.attributes.len(), 3, "every logfmt field should have landed");
     expect_allocs("logfmt: parse + merge 1 escaped-value event", stats, 1);
 }
@@ -892,10 +909,12 @@ fn logfmt_parse_escaped_value_event() {
 fn kv_parse_one_event() {
     let mut kv = fixtures::kv_parser();
     let resource = fixtures::resource();
-    drop(kv.process(&resource, fixtures::kv_event()));
+    let mut warm = fixtures::kv_event();
+    kv.process(&resource, &mut warm);
 
-    let event = fixtures::kv_event();
-    let (event, stats) = measure(|| kv.process(&resource, event).expect("kv forwards"));
+    let mut event = fixtures::kv_event();
+    let (forwarded, stats) = measure(|| kv.process(&resource, &mut event));
+    assert!(forwarded, "kv forwards");
     assert_eq!(event.attributes.len(), 3, "every kv field should have landed");
     expect_allocs("kv: parse + merge 1 event", stats, 0);
 }
@@ -911,7 +930,7 @@ fn logfmt_values_share_the_message_allocation() {
     let resource = fixtures::resource();
 
     let message = bytes::Bytes::from_static(fixtures::LOGFMT_LINE.as_bytes());
-    let event = logit_core::Event::log(
+    let mut event = logit_core::Event::log(
         0,
         logit_core::AttrMap::new(),
         logit_core::LogRecord {
@@ -924,7 +943,7 @@ fn logfmt_values_share_the_message_allocation() {
             dropped_attributes_count: 0,
         },
     );
-    let event = logfmt.process(&resource, event).expect("logfmt forwards");
+    assert!(logfmt.process(&resource, &mut event), "logfmt forwards");
 
     let Some(Value::Str(status)) = event.attributes.get("status") else {
         panic!("status should be a Str")
@@ -936,7 +955,7 @@ fn logfmt_values_share_the_message_allocation() {
 
     let mut escaped = fixtures::logfmt_parser();
     let escaped_message = bytes::Bytes::from_static(fixtures::LOGFMT_ESCAPED_LINE.as_bytes());
-    let escaped_event = logit_core::Event::log(
+    let mut escaped_event = logit_core::Event::log(
         0,
         logit_core::AttrMap::new(),
         logit_core::LogRecord {
@@ -949,7 +968,7 @@ fn logfmt_values_share_the_message_allocation() {
             dropped_attributes_count: 0,
         },
     );
-    let escaped_event = escaped.process(&resource, escaped_event).expect("logfmt forwards");
+    assert!(escaped.process(&resource, &mut escaped_event), "logfmt forwards");
     let Some(Value::Str(query)) = escaped_event.attributes.get("query") else {
         panic!("query should be a Str")
     };
@@ -968,18 +987,21 @@ fn logfmt_values_share_the_message_allocation() {
 fn kv_metrics_one_event() {
     let mut kv = fixtures::kv_metrics();
     let resource = fixtures::resource();
-    drop(kv.process(&resource, fixtures::nginx_event()));
+    let mut warm = fixtures::nginx_event();
+    kv.process(&resource, &mut warm);
 
-    let event = {
+    let mut event = {
         // `nginx_event` already ran kv_metrics; rebuild the pre-kv_metrics shape by hand.
         let mut decoder = fixtures::syslog_decoder();
         let mut json = fixtures::json_parser();
         let batch = decoder.decode(fixtures::nginx_syslog_datagram(1)).expect("should decode");
-        let e = batch.events.into_iter().next().expect("one event");
-        json.process(&resource, e).expect("json forwards")
+        let mut e = batch.events.into_iter().next().expect("one event");
+        assert!(json.process(&resource, &mut e), "json forwards");
+        e
     };
 
-    let (event, stats) = measure(|| kv.process(&resource, event).expect("kv_metrics forwards"));
+    let (forwarded, stats) = measure(|| kv.process(&resource, &mut event));
+    assert!(forwarded, "kv_metrics forwards");
     assert_eq!(event.metrics.len(), 4);
     expect_allocs("kv_metrics: derive 4 metrics", stats, 1);
 }
@@ -991,10 +1013,12 @@ fn kv_metrics_one_event() {
 fn keep_one_event() {
     let mut keep = fixtures::keep();
     let resource = fixtures::resource();
-    drop(keep.process(&resource, fixtures::nginx_event()));
+    let mut warm = fixtures::nginx_event();
+    keep.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| keep.process(&resource, event).expect("keep forwards"));
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| keep.process(&resource, &mut event));
+    assert!(forwarded, "keep forwards");
     assert_eq!(event.attributes.len(), 3);
     expect_allocs("keep: filter to 3 attributes", stats, 0);
 }
@@ -1007,10 +1031,12 @@ fn keep_one_event() {
 fn keep_values_one_event() {
     let mut kv = fixtures::keep_values();
     let resource = fixtures::resource();
-    drop(kv.process(&resource, fixtures::nginx_event()));
+    let mut warm = fixtures::nginx_event();
+    kv.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| kv.process(&resource, event).expect("keep_values forwards"));
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| kv.process(&resource, &mut event));
+    assert!(forwarded, "keep_values forwards");
     assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
     expect_allocs("keep_values: host already lowercase and allowed", stats, 0);
 }
@@ -1023,10 +1049,12 @@ fn keep_values_one_event() {
 fn keep_values_one_event_needs_lowering() {
     let mut kv = fixtures::keep_values();
     let resource = fixtures::resource();
-    drop(kv.process(&resource, fixtures::nginx_event_with_uppercase_host()));
+    let mut warm = fixtures::nginx_event_with_uppercase_host();
+    kv.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event_with_uppercase_host();
-    let (event, stats) = measure(|| kv.process(&resource, event).expect("keep_values forwards"));
+    let mut event = fixtures::nginx_event_with_uppercase_host();
+    let (forwarded, stats) = measure(|| kv.process(&resource, &mut event));
+    assert!(forwarded, "keep_values forwards");
     assert_eq!(event.attributes.get("host"), Some(&Value::str("static.local")));
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
@@ -1041,14 +1069,19 @@ fn aggregate_absorb_one_event() {
     let mut agg = fixtures::aggregator();
     let resource = fixtures::resource();
     let mut keep = fixtures::keep();
-    let mut trimmed = || keep.process(&resource, fixtures::nginx_event()).expect("keep forwards");
+    let mut trimmed = || {
+        let mut event = fixtures::nginx_event();
+        assert!(keep.process(&resource, &mut event), "keep forwards");
+        event
+    };
 
     for _ in 0..4 {
-        drop(agg.process(&resource, trimmed()));
+        let mut event = trimmed();
+        agg.process(&resource, &mut event);
     }
 
-    let event = trimmed();
-    let (_, stats) = measure(|| agg.process(&resource, event));
+    let mut event = trimmed();
+    let (_, stats) = measure(|| agg.process(&resource, &mut event));
     expect_allocs("aggregate: absorb 1 event (after keep)", stats, 0);
 }
 
@@ -1065,11 +1098,12 @@ fn aggregate_absorb_without_keep() {
     let mut agg = fixtures::aggregator();
     let resource = fixtures::resource();
     for _ in 0..4 {
-        drop(agg.process(&resource, fixtures::nginx_event()));
+        let mut event = fixtures::nginx_event();
+        agg.process(&resource, &mut event);
     }
 
-    let event = fixtures::nginx_event();
-    let (_, stats) = measure(|| agg.process(&resource, event));
+    let mut event = fixtures::nginx_event();
+    let (_, stats) = measure(|| agg.process(&resource, &mut event));
     expect_allocs("aggregate: absorb 1 event (no keep)", stats, 4);
 }
 
@@ -1088,8 +1122,9 @@ fn aggregate_flush_100_series() {
     let mut keep = fixtures::keep();
     let mut agg = fixtures::aggregator();
     for _ in 0..100 {
-        let event = keep.process(&resource, fixtures::nginx_event()).expect("keep forwards");
-        drop(agg.process(&resource, event));
+        let mut event = fixtures::nginx_event();
+        assert!(keep.process(&resource, &mut event), "keep forwards");
+        agg.process(&resource, &mut event);
     }
 
     let (flushed, stats) = measure(|| agg.flush(1_000_000_000));
@@ -1117,17 +1152,14 @@ fn aggregate_flush_retained_gauges() {
     let resource = fixtures::resource();
     let mut agg = fixtures::aggregator_with_series_retention(5, 1_000);
     for i in 0..100 {
-        drop(agg.process(&resource, fixtures::wide_gauge_event(&format!("gauge{i}"), i as f64)));
+        let mut event = fixtures::wide_gauge_event(&format!("gauge{i}"), i as f64);
+        agg.process(&resource, &mut event);
     }
     drop(agg.flush(1_000_000_000)); // warm: interns every series name, grows every buffer once
 
     for i in 0..100 {
-        drop(
-            agg.process(
-                &resource,
-                fixtures::wide_gauge_event(&format!("gauge{i}"), (i + 1) as f64),
-            ),
-        );
+        let mut event = fixtures::wide_gauge_event(&format!("gauge{i}"), (i + 1) as f64);
+        agg.process(&resource, &mut event);
     }
 
     let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
@@ -1151,12 +1183,14 @@ fn aggregate_flush_cumulative_sums() {
     let resource = fixtures::resource();
     let mut agg = fixtures::aggregator_cumulative(5, 1_000);
     for i in 0..100 {
-        drop(agg.process(&resource, fixtures::wide_counter_event(&format!("counter{i}"), 1.0)));
+        let mut event = fixtures::wide_counter_event(&format!("counter{i}"), 1.0);
+        agg.process(&resource, &mut event);
     }
     drop(agg.flush(1_000_000_000)); // warm: interns every series name, grows every buffer once
 
     for i in 0..100 {
-        drop(agg.process(&resource, fixtures::wide_counter_event(&format!("counter{i}"), 1.0)));
+        let mut event = fixtures::wide_counter_event(&format!("counter{i}"), 1.0);
+        agg.process(&resource, &mut event);
     }
 
     let (flushed, stats) = measure(|| agg.flush(2_000_000_000));
@@ -1176,11 +1210,12 @@ fn aggregate_absorb_one_samples_event_sketch_mode() {
     let mut agg = fixtures::aggregator();
     let resource = fixtures::resource();
     for _ in 0..4 {
-        drop(agg.process(&resource, fixtures::samples_event("app.latency", [1.0, 2.0, 3.0])));
+        let mut event = fixtures::samples_event("app.latency", [1.0, 2.0, 3.0]);
+        agg.process(&resource, &mut event);
     }
 
-    let event = fixtures::samples_event("app.latency", [1.0, 2.0, 3.0]);
-    let (_, stats) = measure(|| agg.process(&resource, event));
+    let mut event = fixtures::samples_event("app.latency", [1.0, 2.0, 3.0]);
+    let (_, stats) = measure(|| agg.process(&resource, &mut event));
     expect_allocs("aggregate: absorb one Samples event (sketch mode)", stats, 0);
 }
 
@@ -1197,12 +1232,13 @@ fn aggregate_absorb_25_samples_values_into_one_series_samples_mode() {
     // Warm with a small, still-inline series -- isolates the spill on the *measured* record
     // rather than whatever the very first record into this series happens to cost.
     for _ in 0..4 {
-        drop(agg.process(&resource, fixtures::samples_event("app.latency", [1.0])));
+        let mut event = fixtures::samples_event("app.latency", [1.0]);
+        agg.process(&resource, &mut event);
     }
 
     let values: Vec<f64> = (0..25).map(|i| i as f64).collect();
-    let event = fixtures::samples_event("app.latency", values);
-    let (_, stats) = measure(|| agg.process(&resource, event));
+    let mut event = fixtures::samples_event("app.latency", values);
+    let (_, stats) = measure(|| agg.process(&resource, &mut event));
     expect_allocs("aggregate: absorb 25 Samples values into one series (samples mode)", stats, 1);
 }
 
@@ -1591,7 +1627,7 @@ fn route_batch_all_unrouted_costs_two() {
 /// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to
 /// this shape"): the *same* 64-event host/app split, expressed the way it has to be without
 /// targets -- a `Fanout` to two ordinary `Transform` consumers, each running its own
-/// `has_attributes` over the *whole* batch to keep its one-half. **196**, composed of three
+/// `has_attributes` over the *whole* batch to keep its one-half. **194**, composed of two
 /// directly-measured pieces (each confirmed independently, not assumed from the one-event
 /// numbers elsewhere in this file):
 ///
@@ -1609,13 +1645,14 @@ fn route_batch_all_unrouted_costs_two() {
 ///   event; those are inline `Samples` now, [`kv_metrics_one_event`].)
 ///   The other branch (`b`, unwrapping last with nothing else holding the `Arc`) is free, exactly
 ///   as in the one-event case.
-/// - **2 for the two `has_attributes` passes.** `process_batch_through_has_attributes` pins a
-///   `has_attributes` pass at 1 allocation *per batch* (its own output `Vec::with_capacity`),
-///   regardless of how many events it keeps or drops -- paid once per branch, so twice here
-///   (host_stream's filter, then app_stream's), each over the *whole* 64-event batch since
-///   neither filter narrows what the other has to scan.
+/// - **0 for the two `has_attributes` passes.** `process_batch_through_has_attributes` pins a
+///   `has_attributes` pass at 0 allocations *per batch* since `Transform::process` went in place
+///   (ADR `in-place-transform-process`) -- it used to be 1 apiece for `process_batch`'s own output
+///   `Vec`, which is where this total's missing 2 went. Each pass still scans the *whole* 64-event
+///   batch, since neither filter narrows what the other has to do; the CPU cost this comparison is
+///   about is unchanged, only its allocation share went away.
 ///
-/// `1 + 193 + 2 = 196`. The point isn't the exact total -- it's that this shape's cost scales with
+/// `1 + 193 + 0 = 194`. The point isn't the exact total -- it's that this shape's cost scales with
 /// `branches * events`, while
 /// [`route_batch_two_targets_costs_one_vec_per_used_destination`]'s scales with `destinations
 /// used` alone, flat in both event count and branch count.
@@ -1659,7 +1696,7 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
     expect_allocs(
         "today: fan-out (1 Arc + 1 clone of 64 events) + 2 has_attributes passes, same split",
         stats,
-        196,
+        194,
     );
 }
 
@@ -1990,8 +2027,12 @@ fn clone_span_event() {
 // (once per drain interval, forever, for as long as `internal` runs).
 
 /// The per-batch body with telemetry disabled (`Telemetry::default()`, what every component has
-/// with no `internal` component configured) -- everything above `keep`'s own cost
-/// (`keep_one_event`, 0) is `process_batch`'s `Vec::with_capacity(batch.events.len())` for `out`.
+/// with no `internal` component configured) -- **0**, nothing at all above `keep`'s own cost
+/// (`keep_one_event`, 0). Was 1 while `process_batch` collected survivors into its own
+/// `Vec::with_capacity(batch.events.len())`; `Transform::process` takes `&mut Event` and answers a
+/// bool now (ADR `in-place-transform-process`, `docs/design/memory.md` §8 item 14), so
+/// `process_batch` is a `Vec::retain_mut` over the batch's own `events` and there is no `out` `Vec`
+/// to allocate. Every `process_batch_*` pin below dropped by exactly that 1.
 #[test]
 fn process_batch_through_keep() {
     let mut keep = fixtures::keep();
@@ -2003,13 +2044,13 @@ fn process_batch_through_keep() {
     let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 1);
+    expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 0);
 }
 
 /// `set`'s attribute-only path through `process_batch` -- `map_resource` returns `None`
 /// immediately (`resource_pairs` is empty), so this costs exactly what `keep`'s equivalent test
-/// above costs: `process_batch`'s own `Vec::with_capacity(batch.events.len())`, nothing from
-/// `Set` itself.
+/// above costs: **0**, nothing from `process_batch`'s `retain_mut` loop and nothing from `Set`
+/// itself.
 #[test]
 fn process_batch_through_set_attributes_only() {
     let mut set = fixtures::set_attributes();
@@ -2021,14 +2062,14 @@ fn process_batch_through_set_attributes_only() {
     let (out, stats) = measure(|| process_batch(&mut set, batch, &telemetry));
     let out = out.expect("set forwards events, never absorbs");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch through set (attributes only)", stats, 1);
+    expect_allocs("runtime: process_batch through set (attributes only)", stats, 0);
 }
 
-/// `trace_context` lifting a valid `trace_id` -- **1**, identical to `keep`/`set`'s own
-/// process_batch tests: `process_batch`'s own `Vec::with_capacity(batch.events.len())` is the
-/// whole cost. `parse_trace_id` (`logit_core::trace`) works on stack arrays, and `AttrMap::remove`
-/// (the default `keep_source: false` path) is an in-place `SmallVec` shift -- `TraceContext`
-/// itself contributes nothing.
+/// `trace_context` lifting a valid `trace_id` -- **0**, identical to `keep`/`set`'s own
+/// process_batch tests now that `process_batch` allocates nothing of its own. `parse_trace_id`
+/// (`logit_core::trace`) works on stack arrays, and `AttrMap::remove` (the default
+/// `keep_source: false` path) is an in-place `SmallVec` shift -- `TraceContext` itself contributes
+/// nothing.
 #[test]
 fn trace_context_lifts_a_valid_trace_id() {
     let mut trace_context = fixtures::trace_context();
@@ -2050,12 +2091,12 @@ fn trace_context_lifts_a_valid_trace_id() {
     let (out, stats) = measure(|| process_batch(&mut trace_context, batch, &telemetry));
     let out = out.expect("trace_context forwards events, never absorbs");
     assert!(out.events[0].log.as_ref().unwrap().trace.is_some(), "the lift should have succeeded");
-    expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 1);
+    expect_allocs("transform: trace_context, lifting a valid trace_id", stats, 0);
 }
 
 /// `trace_context` with a `span:` block, minting a `SpanRecord` from the convention attributes
-/// (`docs/adr/trace-context-span-lifting.md`) -- **1**, the same `process_batch` `Vec` as the
-/// log-only row above. Everything the span lift does is on the stack or in place: ids parse into
+/// (`docs/adr/trace-context-span-lifting.md`) -- **0**, the same as the log-only row above.
+/// Everything the span lift does is on the stack or in place: ids parse into
 /// stack arrays (`parse_traceparent`/`parse_trace_id`/`parse_span_id`), the timing arithmetic is
 /// integer, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount
 /// bump), `events`/`links` are `Vec::new()` (no allocation until a push), and every consumed
@@ -2079,7 +2120,7 @@ fn trace_context_mints_a_span_from_the_convention() {
     assert!(span.parent_span_id.is_some(), "parent from the traceparent");
     assert_eq!(span.end_timestamp - event.timestamp, 4_000_000, "4ms, from span.duration_s");
     assert!(event.attributes.get("traceparent").is_none(), "consumed");
-    expect_allocs("transform: trace_context, minting a span from the convention", stats, 1);
+    expect_allocs("transform: trace_context, minting a span from the convention", stats, 0);
 }
 
 /// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
@@ -2132,11 +2173,12 @@ fn resource_with_service_name() -> Arc<Resource> {
 fn has_attributes_one_event() {
     let mut has = fixtures::has_attributes();
     let resource = fixtures::resource();
-    drop(has.process(&resource, fixtures::nginx_event()));
+    let mut warm = fixtures::nginx_event();
+    has.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| has.process(&resource, event));
-    assert!(event.is_some(), "the fixture's status should match");
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| has.process(&resource, &mut event));
+    assert!(forwarded, "the fixture's status should match");
     expect_allocs("has_attributes: match 1 attribute", stats, 0);
 }
 
@@ -2146,11 +2188,12 @@ fn has_attributes_one_event() {
 fn drop_attributes_one_event() {
     let mut drop_attrs = fixtures::drop_attributes();
     let resource = fixtures::resource();
-    let _ = drop_attrs.process(&resource, fixtures::nginx_event());
+    let mut warm = fixtures::nginx_event();
+    drop_attrs.process(&resource, &mut warm);
 
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| drop_attrs.process(&resource, event));
-    assert!(event.is_none(), "the fixture's status should match, so this drops");
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| drop_attrs.process(&resource, &mut event));
+    assert!(!forwarded, "the fixture's status should match, so this drops");
     expect_allocs("drop_attributes: match 1 attribute (dropped)", stats, 0);
 }
 
@@ -2161,11 +2204,12 @@ fn drop_attributes_one_event() {
 fn has_attributes_resource_match_cache_hit() {
     let mut has = fixtures::has_attributes_resource();
     let resource = resource_with_service_name();
-    drop(has.process(&resource, fixtures::nginx_event())); // warm the cache
+    let mut warm = fixtures::nginx_event();
+    has.process(&resource, &mut warm); // warm the cache
 
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| has.process(&resource, event));
-    assert!(event.is_some());
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| has.process(&resource, &mut event));
+    assert!(forwarded);
     expect_allocs("has_attributes: resource match, cache hit (same input Arc)", stats, 0);
 }
 
@@ -2178,18 +2222,19 @@ fn has_attributes_resource_match_cache_hit() {
 #[test]
 fn has_attributes_resource_match_cache_miss() {
     let mut has = fixtures::has_attributes_resource();
-    drop(has.process(&resource_with_service_name(), fixtures::nginx_event())); // warm, distinct Arc
+    let mut warm = fixtures::nginx_event();
+    has.process(&resource_with_service_name(), &mut warm); // warm, distinct Arc
 
     let resource = resource_with_service_name();
-    let event = fixtures::nginx_event();
-    let (event, stats) = measure(|| has.process(&resource, event));
-    assert!(event.is_some());
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| has.process(&resource, &mut event));
+    assert!(forwarded);
     expect_allocs("has_attributes: resource match, cache miss (distinct input Arc)", stats, 0);
 }
 
-/// `has_attributes` through `process_batch` -- **1**, identical to `keep`/`set`'s own
-/// `process_batch` tests: `process_batch`'s own `Vec::with_capacity(batch.events.len())` is the
-/// whole cost, whether the batch's one event is forwarded (here) or dropped (below).
+/// `has_attributes` through `process_batch` -- **0**, identical to `keep`/`set`'s own
+/// `process_batch` tests: the `retain_mut` loop allocates nothing whether the batch's one event is
+/// forwarded (here) or dropped (below).
 #[test]
 fn process_batch_through_has_attributes() {
     let mut has = fixtures::has_attributes();
@@ -2201,13 +2246,14 @@ fn process_batch_through_has_attributes() {
     let (out, stats) = measure(|| process_batch(&mut has, batch, &telemetry));
     let out = out.expect("the fixture's status should match, so this forwards");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch through has_attributes", stats, 1);
+    expect_allocs("runtime: process_batch through has_attributes", stats, 0);
 }
 
-/// The other outcome: every event in the batch dropped. Still **1** -- `process_batch` builds its
-/// output `Vec` before any event is processed, so a batch that ends up fully filtered out still
-/// pays for (and immediately drops) a `Vec` it never pushes into, the same fact
-/// `process_batch_fully_absorbed` (below) pins for `aggregate`.
+/// The other outcome: every event in the batch dropped. Still **0** -- `retain_mut` drops each
+/// rejected event in place, so a batch that ends up fully filtered out costs exactly what a fully
+/// forwarded one does, the same fact `process_batch_fully_absorbed` (below) pins for `aggregate`.
+/// (Both were 1 while `process_batch` built an output `Vec` up front and then threw it away
+/// unused -- the cost the in-place `Transform::process` removed.)
 #[test]
 fn process_batch_through_has_attributes_dropping_every_event() {
     let mut drop_attrs = fixtures::drop_attributes();
@@ -2218,7 +2264,7 @@ fn process_batch_through_has_attributes_dropping_every_event() {
     let batch = fixtures::nginx_batch(1);
     let (out, stats) = measure(|| process_batch(&mut drop_attrs, batch, &telemetry));
     assert!(out.is_none(), "the fixture's status should match, so every event is dropped");
-    expect_allocs("runtime: process_batch through drop_attributes, dropping every event", stats, 1);
+    expect_allocs("runtime: process_batch through drop_attributes, dropping every event", stats, 0);
 }
 
 /// The other outcome `process_batch` can produce: every event absorbed, nothing forwarded.
@@ -2226,12 +2272,11 @@ fn process_batch_through_has_attributes_dropping_every_event() {
 /// `Aggregator::process` return `None` for it (`logit-transforms`'
 /// `a_metric_only_event_fully_absorbed_returns_none`) rather than forwarding a log/span half.
 ///
-/// **The single allocation still costs the same 1** as the forwarding case above --
-/// `Vec::with_capacity(batch.events.len())` is built before any event is processed, so a batch
-/// that turns out to be *entirely* absorbed still pays for (and immediately drops) a `Vec` it
-/// never pushes into. Worth revisiting if a metrics-heavy `internal`-fed pipeline (mostly-absorbed
-/// batches, by construction) turns out to make this a real cost in practice -- not fixed here,
-/// since this file's job is to measure, not to optimize speculatively.
+/// **This costs the same 0** as the forwarding case above: `retain_mut` empties the batch's own
+/// `Vec` in place, so a batch that turns out to be *entirely* absorbed allocates nothing. This is
+/// the case the earlier draft of this file flagged as worth revisiting for a metrics-heavy
+/// `internal`-fed pipeline (mostly-absorbed batches, by construction) -- it used to pay 1 for an
+/// output `Vec` it never pushed into, and the in-place `Transform::process` removed it.
 #[test]
 fn process_batch_fully_absorbed() {
     let mut agg = fixtures::aggregator();
@@ -2247,7 +2292,7 @@ fn process_batch_fully_absorbed() {
     let batch = EventBatch { resource, scope: None, events: vec![fixtures::statsd_event()] };
     let (out, stats) = measure(|| process_batch(&mut agg, batch, &telemetry));
     assert!(out.is_none(), "a batch with nothing left to forward should not be forwarded");
-    expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 1);
+    expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 0);
 }
 
 /// What live telemetry costs on top of the disabled path above, in **steady state** -- every
@@ -2259,8 +2304,8 @@ fn process_batch_fully_absorbed() {
 /// narrower than the first draft's was, on review.
 ///
 /// **Measured, not assumed: in this steady state, it costs exactly what the disabled path costs**
-/// -- both this test and `process_batch_through_keep` above assert 1, the same single
-/// `Vec::with_capacity` allocation. `count`/`timer` update an existing map entry in place
+/// -- both this test and `process_batch_through_keep` above assert 0, i.e. nothing at all.
+/// `count`/`timer` update an existing map entry in place
 /// (`docs/design/internal-telemetry.md`); an `internal`-fed pipeline's steady-state cost between
 /// drains is not distinguishable from `internal` being off at all.
 #[test]
@@ -2275,17 +2320,18 @@ fn process_batch_with_live_telemetry() {
     let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch through keep, telemetry live (steady state)", stats, 1);
+    expect_allocs("runtime: process_batch through keep, telemetry live (steady state)", stats, 0);
 }
 
 /// The case steady state above doesn't cover, found in review: `internal`'s every tick calls
 /// `Registry::drain`, which `mem::take`s the component buffer's whole map
 /// (`ComponentBuffer::drain`) -- so the *first* `process_batch` call after each drain re-inserts
 /// all three of its keys (`batches.received`, `events.received`, `process.duration`) into a map
-/// that was just emptied, rather than updating existing entries. Three allocations, not one: the
+/// that was just emptied, rather than updating existing entries. Two allocations, not zero: the
 /// map's backing table (first insert into an empty `HashMap` after `mem::take` reset it to no
 /// capacity) plus the fresh `DdSketch` `process.duration`'s `Timer` creates on `Drop` (a `Pending`
-/// this key has no prior value to merge into). This is not a one-time cost -- it recurs once per
+/// this key has no prior value to merge into). Was 3 while `process_batch` also allocated an
+/// output `Vec` of its own. This is not a one-time cost -- it recurs once per
 /// `internal` drain interval, for as long as `internal` runs, which is why it needs its own
 /// assertion rather than being folded into (or assumed equal to) the steady-state number above.
 #[test]
@@ -2301,7 +2347,7 @@ fn process_batch_first_call_after_a_drain() {
     let (out, stats) = measure(|| process_batch(&mut keep, batch, &telemetry));
     let out = out.expect("keep forwards events, never fully absorbs");
     assert_eq!(out.events.len(), 1);
-    expect_allocs("runtime: process_batch, first call after an internal drain", stats, 3);
+    expect_allocs("runtime: process_batch, first call after an internal drain", stats, 2);
 }
 
 /// `unwrap_batch`'s free path: `Delivered::Owned` is already the owned `EventBatch` -- no `Arc`
@@ -3368,12 +3414,12 @@ fn full_chain_one_line() {
     macro_rules! run {
         () => {{
             let batch = decoder.decode(datagram.clone()).expect("should decode");
-            for event in batch.events {
-                let event = json.process(&resource, event).expect("json forwards");
-                let event = kv.process(&resource, event).expect("kv forwards");
-                let event = keep.process(&resource, event).expect("keep forwards");
-                let event = keep_values.process(&resource, event).expect("keep_values forwards");
-                drop(agg.process(&resource, event));
+            for mut event in batch.events {
+                assert!(json.process(&resource, &mut event), "json forwards");
+                assert!(kv.process(&resource, &mut event), "kv forwards");
+                assert!(keep.process(&resource, &mut event), "keep forwards");
+                assert!(keep_values.process(&resource, &mut event), "keep_values forwards");
+                agg.process(&resource, &mut event);
             }
         }};
     }
