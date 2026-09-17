@@ -1198,7 +1198,8 @@ Which component takes which block, in one place:
 |---|---|---|---|
 | `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 22 |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
-| `prometheus_in` | `TlsClientConfig` | an `https://` scrape target | a scrape client, not a listener; a set block with no `https://` target is rule 40 |
+| `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
+| `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |
 | `syslog_in`, `graphite_in`, `statsd_in` | `TlsServerConfig` | the block's presence | `transport: tcp` only (rule 43) |
 

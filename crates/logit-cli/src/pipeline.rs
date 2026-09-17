@@ -441,13 +441,32 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+        // The receiver half of this kind lands in the next commit; until then only scrape mode
+        // builds, and a `bind:` config is a clear error rather than a listener that silently
+        // scrapes nothing.
+        PrometheusIn {
+            scrape_targets,
+            interval,
+            timeout,
+            headers,
+            scrape_tls,
+            bind,
+            path: _,
+            bind_tls: _,
+            idle_timeout: _,
+        } => {
+            if bind.is_some() {
+                anyhow::bail!(
+                    "component '{id}': a 'bind:' prometheus_in (the remote-write receiver) isn't \
+                     built yet"
+                );
+            }
             let input = PrometheusInput::new(scrape_targets.clone(), *interval)
                 .with_timeout(*timeout)
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
+                .with_tls(&to_input_tls_client_settings(scrape_tls), base_dir)?;
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         LogitIn { bind, tls, max_frame_bytes, handshake_timeout, idle_timeout } => {
@@ -1914,7 +1933,11 @@ mod tests {
                 interval: Duration::from_secs(15),
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),
-                tls: logit_config::TlsClientConfig::default(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+                bind: None,
+                path: "/api/v1/write".to_string(),
+                bind_tls: None,
+                idle_timeout: None,
             },
         };
         assert!(matches!(
