@@ -117,12 +117,12 @@
 //! 0.0.4 every exemplar is dropped and none of it is counted: that is the operator's dialect choice,
 //! not a lossy mapping.
 
+use super::assemble::{self, Assembler, Sample};
 use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series};
 use crate::CodecError;
 use logit_core::interner::resolve;
-use logit_core::trace::{parse_span_id, parse_trace_id, to_hex};
-use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, TraceRef, Value};
-use std::collections::HashMap;
+use logit_core::trace::to_hex;
+use logit_core::Exemplar;
 use std::fmt::Write as _;
 
 /// Which exposition dialect a body is in. The parser and writer differ in the ways the module
@@ -199,103 +199,23 @@ pub fn parse_with(
     parser.finish(decoder)
 }
 
-/// Which sample of a family a line carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// The family's own value sample: a counter's `_total`, a gauge/unknown/info/stateset line.
-    Primary,
-    Bucket,
-    Sum,
-    Count,
-    Created,
-    Quantile,
-}
-
-/// Every suffix either dialect gives meaning to. Order matters only in that a longer suffix must be
-/// tried before a shorter one it ends with; none of these overlap that way today.
-const SUFFIXES: [(&str, Role); 8] = [
-    ("_total", Role::Primary),
-    ("_info", Role::Primary),
-    ("_created", Role::Created),
-    ("_bucket", Role::Bucket),
-    ("_gcount", Role::Count),
-    ("_gsum", Role::Sum),
-    ("_count", Role::Count),
-    ("_sum", Role::Sum),
-];
-
-/// Whether `role` means anything for a family of type `kind`, and -- for a `_gsum`/`_gcount` vs
-/// `_sum`/`_count` pair -- which spelling that type uses.
-fn suffix_applies(kind: FamilyType, suffix: &str, role: Role) -> bool {
-    match role {
-        Role::Primary => match kind {
-            FamilyType::Counter => suffix == "_total",
-            FamilyType::Info => suffix == "_info",
-            _ => false,
-        },
-        Role::Created => kind.has_created(),
-        Role::Bucket => matches!(kind, FamilyType::Histogram | FamilyType::GaugeHistogram),
-        Role::Sum | Role::Count => match kind {
-            FamilyType::Histogram | FamilyType::Summary => suffix == "_sum" || suffix == "_count",
-            FamilyType::GaugeHistogram => suffix == "_gsum" || suffix == "_gcount",
-            _ => false,
-        },
-        Role::Quantile => false,
-    }
-}
-
-/// The role a bare family name plays for its own type: a summary's quantile lines and a stateset's
-/// state lines are named exactly the family name, a histogram's samples never are.
-fn bare_name_role(kind: FamilyType) -> Option<Role> {
-    match kind {
-        FamilyType::Counter
-        | FamilyType::Gauge
-        | FamilyType::StateSet
-        | FamilyType::Unknown
-        | FamilyType::Untyped => Some(Role::Primary),
-        FamilyType::Summary => Some(Role::Quantile),
-        FamilyType::Histogram | FamilyType::GaugeHistogram | FamilyType::Info => None,
-    }
-}
-
-/// One family under construction. `base` is the name as it appeared on the `# TYPE` line (or the
-/// bare sample name that implied the family); `total_suffix` records that a counter's value sample
-/// arrived as `<base>_total`, which is what decides the family's model-facing name -- see
-/// [`super`]'s "Family naming" table.
-struct FamilyAccum {
-    base: String,
-    kind: FamilyType,
-    typed: bool,
-    help: Option<String>,
-    unit: Option<String>,
-    total_suffix: bool,
-    series: Vec<SeriesAccum>,
-    series_index: HashMap<Vec<(String, String)>, usize>,
-}
-
-#[derive(Default)]
-struct SeriesAccum {
-    labels: Vec<(String, String)>,
-    value: Option<f64>,
-    buckets: Vec<(f64, u64)>,
-    sum: Option<f64>,
-    count: Option<u64>,
-    quantiles: Vec<(f64, f64)>,
-    timestamp: Option<i64>,
-    created: Option<i64>,
-    exemplars: Vec<Exemplar>,
-}
-
+/// The syntax half of a parse: which dialect's grammar the lines are in, whether the OpenMetrics
+/// terminator has been seen, and an [`Assembler`] that everything parsed off a line is handed to.
+/// Every decision about which *family* a sample belongs to is the assembler's -- see its module
+/// doc for the table.
 struct Parser {
     dialect: Dialect,
-    families: Vec<FamilyAccum>,
-    index: HashMap<String, usize>,
+    assembler: Assembler,
     saw_eof: bool,
 }
 
 impl Parser {
     fn new(dialect: Dialect) -> Self {
-        Parser { dialect, families: Vec::new(), index: HashMap::new(), saw_eof: false }
+        // The "no type given" family type in this dialect: the two are the same semantics under two
+        // spellings, kept apart so a relay re-emits the one it received.
+        let implicit =
+            if dialect.is_openmetrics() { FamilyType::Unknown } else { FamilyType::Untyped };
+        Parser { dialect, assembler: Assembler::new(implicit), saw_eof: false }
     }
 
     fn line(&mut self, raw: &[u8], decoder: &mut PrometheusDecoder) -> Result<(), CodecError> {
@@ -332,13 +252,10 @@ impl Parser {
         match keyword {
             "HELP" => {
                 let (name, help) = split_field(remainder);
-                let Some(idx) = self.family_for_metadata(name, decoder) else { return };
-                if self.families[idx].help.is_some() {
-                    decoder.skipped("duplicate_metadata");
-                    return;
-                }
-                self.families[idx].help =
+                let Some(name) = metadata_name(name, decoder) else { return };
+                let help =
                     if help.is_empty() { None } else { Some(unescape_help(help, self.dialect)) };
+                self.assembler.declare_help(name, help, decoder);
             }
             "TYPE" => {
                 let (name, keyword) = split_field(remainder);
@@ -346,70 +263,18 @@ impl Parser {
                     decoder.skipped("malformed_metadata");
                     return;
                 };
-                let Some(idx) = self.family_for_metadata(name, decoder) else { return };
-                if self.families[idx].typed {
-                    if self.families[idx].kind != kind {
-                        decoder.skipped("duplicate_type");
-                    }
-                    return;
-                }
-                self.families[idx].kind = kind;
-                self.families[idx].typed = true;
+                let Some(name) = metadata_name(name, decoder) else { return };
+                self.assembler.declare_type(name, kind, decoder);
             }
             "UNIT" => {
                 let (name, unit) = split_field(remainder);
-                let Some(idx) = self.family_for_metadata(name, decoder) else { return };
-                if self.families[idx].unit.is_some() {
-                    decoder.skipped("duplicate_metadata");
-                    return;
-                }
-                self.families[idx].unit =
-                    if unit.is_empty() { None } else { Some(unit.to_string()) };
+                let Some(name) = metadata_name(name, decoder) else { return };
+                let unit = if unit.is_empty() { None } else { Some(unit.to_string()) };
+                self.assembler.declare_unit(name, unit, decoder);
             }
             // Any other `#` line is a plain comment, which both formats allow and neither gives
             // meaning to.
             _ => {}
-        }
-    }
-
-    /// The family a metadata line names, creating it untyped if this is the first mention.
-    fn family_for_metadata(
-        &mut self,
-        name: &str,
-        decoder: &mut PrometheusDecoder,
-    ) -> Option<usize> {
-        if name.is_empty() || !is_metric_name(name) {
-            decoder.skipped("malformed_metadata");
-            return None;
-        }
-        Some(self.family_index(name))
-    }
-
-    fn family_index(&mut self, name: &str) -> usize {
-        if let Some(idx) = self.index.get(name) {
-            return *idx;
-        }
-        let idx = self.families.len();
-        self.families.push(FamilyAccum {
-            base: name.to_string(),
-            kind: self.untyped(),
-            typed: false,
-            help: None,
-            unit: None,
-            total_suffix: false,
-            series: Vec::new(),
-            series_index: HashMap::new(),
-        });
-        self.index.insert(name.to_string(), idx);
-        idx
-    }
-
-    /// The "no type given" family type in this dialect.
-    fn untyped(&self) -> FamilyType {
-        if self.dialect.is_openmetrics() {
-            FamilyType::Unknown
-        } else {
-            FamilyType::Untyped
         }
     }
 
@@ -418,142 +283,7 @@ impl Parser {
             decoder.skipped("malformed_line");
             return;
         };
-        let Some((idx, role, total_suffix)) = self.route(sample.name, decoder) else { return };
-        let mut labels = sample.labels;
-        // `le`/`quantile` are part of the point, not the series identity: strip them out before the
-        // label set becomes the series key.
-        let extra = match role {
-            Role::Bucket => match take_label(&mut labels, "le").map(|v| parse_number(&v)) {
-                Some(Some(bound)) => Some(bound),
-                _ => {
-                    decoder.skipped("malformed_line");
-                    return;
-                }
-            },
-            Role::Quantile => match take_label(&mut labels, "quantile").map(|v| parse_number(&v)) {
-                Some(Some(q)) => Some(q),
-                _ => {
-                    decoder.skipped("malformed_line");
-                    return;
-                }
-            },
-            _ => None,
-        };
-        labels.sort_by(|a, b| a.0.cmp(&b.0));
-        if labels.windows(2).any(|w| w[0].0 == w[1].0) {
-            decoder.skipped("duplicate_label");
-            return;
-        }
-
-        if total_suffix {
-            self.families[idx].total_suffix = true;
-        }
-        let family = &mut self.families[idx];
-        let series_idx = match family.series_index.get(&labels) {
-            Some(i) => *i,
-            None => {
-                let i = family.series.len();
-                family.series_index.insert(labels.clone(), i);
-                family.series.push(SeriesAccum { labels, ..SeriesAccum::default() });
-                i
-            }
-        };
-        let series = &mut family.series[series_idx];
-        let duplicate = match role {
-            Role::Primary => replace_once(&mut series.value, sample.value),
-            Role::Sum => replace_once(&mut series.sum, sample.value),
-            Role::Count => match count_value(sample.value) {
-                Some(c) => replace_once(&mut series.count, c),
-                None => {
-                    decoder.skipped("malformed_line");
-                    return;
-                }
-            },
-            Role::Created => match parse_created(sample.value_text) {
-                Some(ts) => replace_once(&mut series.created, ts),
-                None => {
-                    decoder.skipped("malformed_line");
-                    return;
-                }
-            },
-            Role::Bucket => {
-                let bound = extra.unwrap_or(f64::NAN);
-                match count_value(sample.value) {
-                    Some(c) if !bound.is_nan() => {
-                        if series.buckets.iter().any(|(b, _)| *b == bound) {
-                            true
-                        } else {
-                            series.buckets.push((bound, c));
-                            false
-                        }
-                    }
-                    _ => {
-                        decoder.skipped("malformed_line");
-                        return;
-                    }
-                }
-            }
-            Role::Quantile => {
-                let q = extra.unwrap_or(f64::NAN);
-                if q.is_nan() {
-                    decoder.skipped("malformed_line");
-                    return;
-                }
-                if series.quantiles.iter().any(|(existing, _)| *existing == q) {
-                    true
-                } else {
-                    series.quantiles.push((q, sample.value));
-                    false
-                }
-            }
-        };
-        if duplicate {
-            decoder.skipped("duplicate_series");
-            return;
-        }
-        // A timestamp rides the family's value-bearing samples; a `_created` line's own "value" is
-        // the creation instant, so it never sets one.
-        if role != Role::Created {
-            if let Some(ts) = sample.timestamp {
-                series.timestamp = Some(ts);
-            }
-        }
-        if matches!(role, Role::Primary | Role::Bucket) {
-            if let Some(exemplar) = sample.exemplar {
-                series.exemplars.push(exemplar);
-            }
-        }
-    }
-
-    /// Which family and role a sample name belongs to: an exact family-name match first (so a gauge
-    /// genuinely called `foo_sum` beats a histogram called `foo`), then a known suffix over a
-    /// declared family, then a fresh implicit untyped family.
-    fn route(
-        &mut self,
-        name: &str,
-        decoder: &mut PrometheusDecoder,
-    ) -> Option<(usize, Role, bool)> {
-        if let Some(idx) = self.index.get(name).copied() {
-            return match bare_name_role(self.families[idx].kind) {
-                Some(role) => Some((idx, role, false)),
-                None => {
-                    decoder.skipped("unknown_suffix");
-                    None
-                }
-            };
-        }
-        for (suffix, role) in SUFFIXES {
-            let Some(base) = name.strip_suffix(suffix) else { continue };
-            let Some(idx) = self.index.get(base).copied() else { continue };
-            let kind = self.families[idx].kind;
-            if suffix_applies(kind, suffix, role) {
-                return Some((idx, role, suffix == "_total"));
-            }
-            decoder.skipped("unknown_suffix");
-            return None;
-        }
-        let idx = self.family_index(name);
-        Some((idx, Role::Primary, false))
+        self.assembler.push(sample, decoder);
     }
 
     fn finish(self, decoder: &mut PrometheusDecoder) -> Result<Vec<MetricFamily>, CodecError> {
@@ -562,131 +292,19 @@ impl Parser {
                 "openmetrics exposition is missing its trailing `# EOF`".into(),
             ));
         }
-        let mut out = Vec::with_capacity(self.families.len());
-        for family in self.families {
-            let name = match family.kind {
-                FamilyType::Counter if family.total_suffix => format!("{}_total", family.base),
-                _ => family.base.clone(),
-            };
-            let mut series: Vec<Series> = family
-                .series
-                .into_iter()
-                .filter_map(|accum| finish_series(accum, family.kind, decoder))
-                .collect();
-            if series.is_empty() {
-                continue;
-            }
-            series.sort_by(|a, b| a.labels.cmp(&b.labels));
-            out.push(MetricFamily {
-                name,
-                kind: family.kind,
-                help: family.help,
-                unit: family.unit,
-                series,
-            });
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        Ok(self.assembler.finish(decoder))
     }
 }
 
-/// Sets `slot` unless it already holds a value; returns whether this was a duplicate (the first
-/// value always wins, which is what a strict parser rejecting the body would effectively have
-/// kept).
-fn replace_once<T>(slot: &mut Option<T>, value: T) -> bool {
-    if slot.is_some() {
-        return true;
+/// The family a metadata line names, or `None` -- counted `malformed_metadata` -- when the line
+/// gave no name or gave one this grammar doesn't accept. Name *syntax* is the dialect's business,
+/// which is why this check stays here rather than in the assembler.
+fn metadata_name<'a>(name: &'a str, decoder: &mut PrometheusDecoder) -> Option<&'a str> {
+    if name.is_empty() || !is_metric_name(name) {
+        decoder.skipped("malformed_metadata");
+        return None;
     }
-    *slot = Some(value);
-    false
-}
-
-/// An accumulated series → its [`Point`], or `None` (counted) when the lines seen don't add up to a
-/// value of the family's type.
-fn finish_series(
-    accum: SeriesAccum,
-    kind: FamilyType,
-    decoder: &mut PrometheusDecoder,
-) -> Option<Series> {
-    let SeriesAccum {
-        labels,
-        value,
-        mut buckets,
-        sum,
-        count,
-        mut quantiles,
-        timestamp,
-        created,
-        exemplars,
-    } = accum;
-    let point = match kind {
-        FamilyType::Counter => Point::Counter(value_or_skip(value, decoder)?),
-        FamilyType::Gauge => Point::Gauge(value_or_skip(value, decoder)?),
-        FamilyType::Unknown | FamilyType::Untyped => Point::Unknown(value_or_skip(value, decoder)?),
-        FamilyType::Info => {
-            value_or_skip(value, decoder)?;
-            Point::Info
-        }
-        FamilyType::StateSet => Point::StateSet(value_or_skip(value, decoder)? != 0.0),
-        FamilyType::Histogram | FamilyType::GaugeHistogram => {
-            if buckets.is_empty() {
-                decoder.skipped("incomplete_series");
-                return None;
-            }
-            buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
-            // Every conforming exposition has a `+Inf` bucket; when one is missing the total has to
-            // come from somewhere, and `_count` (else the highest bucket) is that somewhere.
-            let highest = buckets.last().map(|(_, c)| *c).unwrap_or(0);
-            if buckets.last().map(|(b, _)| b.is_finite()).unwrap_or(true) {
-                buckets.push((f64::INFINITY, count.unwrap_or(highest).max(highest)));
-            }
-            let total = buckets.last().map(|(_, c)| *c).unwrap_or(0);
-            // The `+Inf` bucket is the total; a `_count`/`_gcount` line claiming otherwise is a
-            // producer bug, and the model has exactly one place to put a total.
-            if count.is_some_and(|c| c != total) {
-                decoder.degraded("histogram_count_mismatch");
-            }
-            Point::Histogram { buckets, sum, count: total }
-        }
-        FamilyType::Summary => {
-            if quantiles.is_empty() && sum.is_none() && count.is_none() && created.is_none() {
-                decoder.skipped("incomplete_series");
-                return None;
-            }
-            quantiles.sort_by(|a, b| a.0.total_cmp(&b.0));
-            Point::Summary { quantiles, sum, count }
-        }
-    };
-    Some(Series { labels, point, timestamp, created, exemplars })
-}
-
-fn value_or_skip(value: Option<f64>, decoder: &mut PrometheusDecoder) -> Option<f64> {
-    match value {
-        Some(v) => Some(v),
-        None => {
-            decoder.skipped("incomplete_series");
-            None
-        }
-    }
-}
-
-/// Removes and returns a label by name -- how `le`/`quantile` leave the series' own label set.
-fn take_label(labels: &mut Vec<(String, String)>, name: &str) -> Option<String> {
-    let pos = labels.iter().position(|(k, _)| k == name)?;
-    Some(labels.remove(pos).1)
-}
-
-/// One parsed sample line. Borrowed name, owned label strings -- the only allocations parsing makes
-/// beyond the accumulators themselves.
-struct Sample<'a> {
-    name: &'a str,
-    labels: Vec<(String, String)>,
-    value: f64,
-    /// The value token exactly as it appeared -- a `_created` sample's "value" is an instant, and
-    /// reading it back out of `value` would already have rounded it (see [`parse_timestamp`]).
-    value_text: &'a str,
-    timestamp: Option<i64>,
-    exemplar: Option<Exemplar>,
+    Some(name)
 }
 
 fn parse_sample(line: &str, dialect: Dialect) -> Option<Sample<'_>> {
@@ -708,7 +326,7 @@ fn parse_sample(line: &str, dialect: Dialect) -> Option<Sample<'_>> {
         return None;
     }
     let value_text = &line[value_start..value_end];
-    let value = parse_number(value_text)?;
+    let value = assemble::parse_number(value_text)?;
     i = skip_ws(bytes, value_end);
 
     let mut timestamp = None;
@@ -730,7 +348,7 @@ fn parse_sample(line: &str, dialect: Dialect) -> Option<Sample<'_>> {
             exemplar = Some(parsed);
         }
     }
-    Some(Sample { name, labels, value, value_text, timestamp, exemplar })
+    Some(Sample { name, labels, value, value_text: Some(value_text), timestamp, exemplar })
 }
 
 /// `{a="1",b="2"}` starting at `i` (which must be the `{`), appending each pair to `out`. Returns
@@ -778,7 +396,7 @@ fn parse_exemplar(line: &str, i: usize, dialect: Dialect) -> Option<Exemplar> {
         return None;
     }
     let value_end = token_end(bytes, value_start);
-    let value = parse_number(&line[value_start..value_end])?;
+    let value = assemble::parse_number(&line[value_start..value_end])?;
     i = skip_ws(bytes, value_end);
     let mut timestamp = 0;
     if i < bytes.len() {
@@ -790,30 +408,7 @@ fn parse_exemplar(line: &str, i: usize, dialect: Dialect) -> Option<Exemplar> {
         }
     }
 
-    // `trace_id`/`span_id` become a real trace reference only when both are valid hex, the same
-    // all-zero-is-invalid rule `TraceRef::from_bytes` applies everywhere else; an invalid one stays
-    // an ordinary exemplar attribute rather than being silently dropped.
-    let trace_id = labels.iter().position(|(k, _)| k == "trace_id").and_then(|i| {
-        let id = parse_trace_id(&labels[i].1)?;
-        Some((i, id))
-    });
-    let trace = trace_id.map(|(pos, trace_id)| {
-        labels.remove(pos);
-        let span = labels.iter().position(|(k, _)| k == "span_id").and_then(|i| {
-            let id = parse_span_id(&labels[i].1)?;
-            Some((i, id))
-        });
-        let span_id = span.map(|(pos, id)| {
-            labels.remove(pos);
-            id
-        });
-        TraceRef { trace_id, span_id, flags: 0 }
-    });
-    let mut filtered_attributes = AttrMap::new();
-    for (key, value) in labels {
-        filtered_attributes.insert(&key, Value::str(value));
-    }
-    Some(Exemplar { timestamp, value, trace, filtered_attributes })
+    Some(assemble::exemplar_from_labels(labels, value, timestamp))
 }
 
 /// A double-quoted, escaped label value starting just past the opening quote. Returns the unescaped
@@ -934,61 +529,11 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// A sample value: Rust's own `f64` grammar already covers Go's `ParseFloat` shapes plus
-/// case-insensitive `nan`/`inf`/`infinity` with an optional sign, which is exactly what both
-/// exposition formats allow.
-fn parse_number(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
-
-/// A count sample (`_count`, `_gcount`, a bucket) as the `u64` the model holds. OpenMetrics writes
-/// these as floats (`42.0`), and a `gaugehistogram`'s may genuinely be fractional -- rounded here,
-/// since [`logit_core::Histogram`]'s bucket counts are integers.
-fn count_value(v: f64) -> Option<u64> {
-    if v.is_finite() && v >= 0.0 {
-        Some(v.round() as u64)
-    } else {
-        None
-    }
-}
-
-/// A sample timestamp, or an OpenMetrics `_created` value. The plain `[SIGN] DIGIT+ ["." DIGIT*]`
-/// form -- everything a real exposition emits -- goes through [`parse_decimal_nanos`] digit by
-/// digit, because an epoch-nanosecond instant needs 19 significant digits and an `f64` holds
-/// 15-16: a float round trip would silently move the sample in time. OpenMetrics' `realnumber`
-/// production also permits an exponent (`1.605281325e9`), which has no digit-exact reading at all,
-/// so that form -- and only that form -- falls back to `f64`, accepting its ~1µs resolution at
-/// epoch magnitude rather than rejecting a legal timestamp. `scale` comes from the dialect
-/// (milliseconds in text 0.0.4, seconds in OpenMetrics).
+/// A sample timestamp in this dialect's own unit (milliseconds in text 0.0.4, seconds in
+/// OpenMetrics), read digit by digit rather than through an `f64` -- see
+/// [`assemble::parse_scaled_decimal`], which is the shared reader and carries the reasoning.
 fn parse_timestamp(s: &str, dialect: Dialect) -> Option<i64> {
-    let scale = dialect.timestamp_scale();
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    if let Some(nanos) = parse_decimal_nanos(digits, scale) {
-        return Some(if negative { -nanos } else { nanos });
-    }
-    let value: f64 = digits.parse().ok()?;
-    if !value.is_finite() {
-        return None;
-    }
-    let nanos = value * scale as f64;
-    if nanos.abs() >= i64::MAX as f64 {
-        return None;
-    }
-    let nanos = nanos.round() as i64;
-    Some(if negative { -nanos } else { nanos })
-}
-
-/// An OpenMetrics `_created` value: always decimal *seconds*, in both dialects (text 0.0.4 has no
-/// `_created` of its own, so a `_created` line found there is read the same way), parsed from the
-/// sample's own digits rather than from the already-parsed `f64` -- see [`parse_timestamp`].
-fn parse_created(text: &str) -> Option<i64> {
-    parse_timestamp(text, Dialect::OpenMetrics1_0)
+    assemble::parse_scaled_decimal(s, dialect.timestamp_scale())
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1568,7 +1113,7 @@ fn unescape_help(help: &str, dialect: Dialect) -> String {
 mod tests {
     use super::*;
     use logit_core::telemetry::Registry;
-    use logit_core::Telemetry;
+    use logit_core::{AttrMap, Telemetry, Value};
     use std::sync::Arc;
 
     /// The complete example from <https://prometheus.io/docs/instrumenting/exposition_formats/>,

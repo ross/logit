@@ -142,6 +142,8 @@
 /// into this the way `text.rs` plugs into `otlp::generated`.
 pub mod generated;
 
+mod assemble;
+
 pub mod text;
 
 pub use text::Dialect;
