@@ -728,9 +728,10 @@ pub fn nginx_event() -> Event {
     let resource = resource();
 
     let batch = decoder.decode(nginx_syslog_datagram(1)).expect("fixture line should decode");
-    let event = batch.events.into_iter().next().expect("fixture line should produce one event");
-    let event = json.process(&resource, event).expect("json always forwards");
-    kv.process(&resource, event).expect("kv_metrics always forwards")
+    let mut event = batch.events.into_iter().next().expect("fixture line should produce one event");
+    assert!(json.process(&resource, &mut event), "json always forwards");
+    assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
+    event
 }
 
 /// `count` copies of [`nginx_event`] in one batch, for measuring the output encoders.

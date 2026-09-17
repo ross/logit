@@ -75,17 +75,17 @@ impl Transform for CsvParser {
     /// with a throttled `parse_failure`/`field_count` diagnostic naming what went wrong.
     /// Otherwise every column lands as `Value::Str`, last-writer-wins on collision with a
     /// pre-existing attribute of the same name.
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        let Some(log) = &event.log else { return Some(event) };
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let Some(log) = &event.log else { return true };
         let raw = match &log.message {
             Value::Str(b) | Value::Bytes(b) => b.clone(),
-            _ => return Some(event),
+            _ => return true,
         };
 
         // An empty line is routine, not exceptional. Silent skip, no diagnostic.
         if raw.is_empty() {
             self.telemetry.count("logit.transform.rows.skipped", 1.0, &[("reason", "empty")]);
-            return Some(event);
+            return true;
         }
 
         // Every field below is handed to `Value::Str`, whose invariant is valid UTF-8 -- four
@@ -103,7 +103,7 @@ impl Transform for CsvParser {
                 "invalid_utf8",
                 "message is not valid UTF-8, passing event through unparsed",
             );
-            return Some(event);
+            return true;
         }
 
         if raw[..] == self.header_line[..] {
@@ -111,7 +111,7 @@ impl Transform for CsvParser {
                 "header_row",
                 "message is the configured header row, passing event through unparsed",
             );
-            return Some(event);
+            return true;
         }
 
         self.scratch.clear();
@@ -120,7 +120,7 @@ impl Transform for CsvParser {
                 "parse_failure",
                 format_args!("malformed CSV row, passing event through: {err}"),
             );
-            return Some(event);
+            return true;
         }
         if self.scratch.len() != self.columns.len() {
             self.diag.warn_throttled(
@@ -131,7 +131,7 @@ impl Transform for CsvParser {
                     self.scratch.len()
                 ),
             );
-            return Some(event);
+            return true;
         }
 
         for (&sym, &(start, end, needs_unescape)) in self.columns.iter().zip(self.scratch.iter()) {
@@ -140,7 +140,7 @@ impl Transform for CsvParser {
             event.attributes.insert_sym(sym, Value::Str(value));
         }
         self.telemetry.count("logit.transform.rows.parsed", 1.0, &[]);
-        Some(event)
+        true
     }
 }
 
@@ -369,8 +369,8 @@ mod tests {
     fn a_plain_row_populates_every_column() {
         let mut csv = parser(&["a", "b", "c"]);
         let resource = default_resource();
-        let event = log_event("1,2,3");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1,2,3");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
         assert_eq!(attr(&event, "c"), Some(&Value::str("3")));
@@ -380,8 +380,8 @@ mod tests {
     fn every_value_is_a_string_even_when_it_looks_numeric() {
         let mut csv = parser(&["status", "bytes"]);
         let resource = default_resource();
-        let event = log_event("200,612");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("200,612");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
         assert_eq!(attr(&event, "bytes"), Some(&Value::str("612")));
     }
@@ -390,8 +390,8 @@ mod tests {
     fn an_empty_field_becomes_an_empty_string_not_null() {
         let mut csv = parser(&["a", "b", "c"]);
         let resource = default_resource();
-        let event = log_event("1,,3");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1,,3");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "b"), Some(&Value::str("")));
     }
 
@@ -399,8 +399,8 @@ mod tests {
     fn a_trailing_delimiter_yields_a_final_empty_field() {
         let mut csv = parser(&["a", "b", "c"]);
         let resource = default_resource();
-        let event = log_event("1,2,");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1,2,");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "c"), Some(&Value::str("")));
     }
 
@@ -408,8 +408,8 @@ mod tests {
     fn a_tab_delimiter_parses_a_tsv_row() {
         let mut csv = CsvParser::new(vec!["a".to_string(), "b".to_string()], b'\t');
         let resource = default_resource();
-        let event = log_event("1\t2");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1\t2");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
     }
@@ -420,8 +420,8 @@ mod tests {
     fn a_quoted_field_containing_the_delimiter_keeps_it_as_data() {
         let mut csv = parser(&["path", "status"]);
         let resource = default_resource();
-        let event = log_event(r#""/a,b",200"#);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event(r#""/a,b",200"#);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "path"), Some(&Value::str("/a,b")));
         assert_eq!(attr(&event, "status"), Some(&Value::str("200")));
     }
@@ -430,8 +430,8 @@ mod tests {
     fn a_doubled_quote_inside_a_quoted_field_becomes_one_quote() {
         let mut csv = parser(&["msg", "status"]);
         let resource = default_resource();
-        let event = log_event(r#""a""b",200"#);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event(r#""a""b",200"#);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "msg"), Some(&Value::str("a\"b")));
     }
 
@@ -439,8 +439,8 @@ mod tests {
     fn an_empty_quoted_field_is_an_empty_string() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event(r#""",x"#);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event(r#""",x"#);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("")));
     }
 
@@ -448,8 +448,8 @@ mod tests {
     fn a_quote_inside_an_unquoted_field_is_data() {
         let mut csv = parser(&["msg", "status"]);
         let resource = default_resource();
-        let event = log_event(r#"he said "hi",200"#);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event(r#"he said "hi",200"#);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "msg"), Some(&Value::str(r#"he said "hi""#)));
     }
 
@@ -457,9 +457,9 @@ mod tests {
     fn an_unterminated_quote_passes_the_event_through_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event(r#"a,"b"#);
+        let mut event = log_event(r#"a,"b"#);
         let original = message_of(&log_event(r#"a,"b"#)).clone();
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &original);
     }
@@ -468,8 +468,8 @@ mod tests {
     fn content_after_a_closing_quote_passes_the_event_through_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event(r#""a"b,c"#);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event(r#""a"b,c"#);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -479,8 +479,8 @@ mod tests {
     fn too_few_fields_passes_through_with_attributes_untouched() {
         let mut csv = parser(&["a", "b", "c"]);
         let resource = default_resource();
-        let event = log_event("1,2");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1,2");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -488,8 +488,8 @@ mod tests {
     fn too_many_fields_passes_through_with_attributes_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event("1,2,3");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("1,2,3");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -499,7 +499,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("1,2");
         event.attributes.insert("preexisting", Value::str("keep-me"));
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.len(), 1);
         assert_eq!(attr(&event, "preexisting"), Some(&Value::str("keep-me")));
     }
@@ -510,8 +510,8 @@ mod tests {
     fn a_row_equal_to_the_configured_header_passes_through_unparsed() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event("a,b");
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = log_event("a,b");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -519,10 +519,12 @@ mod tests {
     fn a_header_row_arriving_after_data_rows_is_still_recognized() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let data = csv.process(&resource, log_event("1,2")).expect("always forwards");
+        let mut data = log_event("1,2");
+        assert!(csv.process(&resource, &mut data), "always forwards");
         assert_eq!(attr(&data, "a"), Some(&Value::str("1")));
 
-        let header = csv.process(&resource, log_event("a,b")).expect("always forwards");
+        let mut header = log_event("a,b");
+        assert!(csv.process(&resource, &mut header), "always forwards");
         assert!(header.attributes.is_empty(), "the header row must still be recognized");
     }
 
@@ -530,8 +532,10 @@ mod tests {
     fn a_header_row_does_not_change_how_the_next_row_parses() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        drop(csv.process(&resource, log_event("a,b")));
-        let event = csv.process(&resource, log_event("1,2")).expect("always forwards");
+        let mut header = log_event("a,b");
+        let _ = csv.process(&resource, &mut header);
+        let mut event = log_event("1,2");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
     }
@@ -548,8 +552,8 @@ mod tests {
         let diag = Diagnostics::new("csv").with_telemetry(telemetry);
         let mut csv = parser(&["a", "b"]).with_diagnostics(diag);
         let resource = default_resource();
-        let event = bytes_log_event(&[0xff, b',', 0xfe]);
-        let event = csv.process(&resource, event).expect("always forwards");
+        let mut event = bytes_log_event(&[0xff, b',', 0xfe]);
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty(), "no Value::Str may be minted from invalid UTF-8");
         assert_eq!(message_of(&event), &Value::Bytes(Bytes::from_static(&[0xff, b',', 0xfe])));
 
@@ -566,7 +570,8 @@ mod tests {
     fn a_valid_utf8_bytes_message_parses_like_a_string_message() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = csv.process(&resource, bytes_log_event(b"1,2")).expect("always forwards");
+        let mut event = bytes_log_event(b"1,2");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(attr(&event, "b"), Some(&Value::str("2")));
     }
@@ -577,7 +582,8 @@ mod tests {
     fn a_multi_byte_utf8_field_is_sliced_intact() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = csv.process(&resource, log_event("héllo,wörld")).expect("always forwards");
+        let mut event = log_event("héllo,wörld");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a").and_then(Value::as_str), Some("héllo"));
         assert_eq!(attr(&event, "b").and_then(Value::as_str), Some("wörld"));
     }
@@ -590,7 +596,8 @@ mod tests {
         let telemetry = registry.telemetry_for("csv", "csv", "transform");
         let mut csv = parser(&["a", "b"]).with_telemetry(telemetry);
         let resource = default_resource();
-        let event = csv.process(&resource, log_event("")).expect("always forwards");
+        let mut event = log_event("");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
 
         let events = registry.drain(0);
@@ -606,12 +613,12 @@ mod tests {
     fn a_metric_event_passes_through_with_attributes_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = Event::metric(
+        let mut event = Event::metric(
             0,
             AttrMap::new(),
             MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)),
         );
-        let event = csv.process(&resource, event).expect("metric-only events pass through");
+        assert!(csv.process(&resource, &mut event), "metric-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -619,7 +626,7 @@ mod tests {
     fn a_span_event_passes_through_with_attributes_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = Event::span(
+        let mut event = Event::span(
             0,
             AttrMap::new(),
             SpanRecord {
@@ -636,7 +643,7 @@ mod tests {
                 ext: None,
             },
         );
-        let event = csv.process(&resource, event).expect("span-only events pass through");
+        assert!(csv.process(&resource, &mut event), "span-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -648,7 +655,7 @@ mod tests {
         event
             .metrics
             .push(MetricRecord::new(logit_core::interner::intern("m"), MetricKind::counter(1.0)));
-        let event = csv.process(&resource, event).expect("mixed events pass through");
+        assert!(csv.process(&resource, &mut event), "mixed events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
     }
@@ -657,7 +664,7 @@ mod tests {
     fn a_non_string_message_passes_through_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -670,7 +677,7 @@ mod tests {
                 dropped_attributes_count: 0,
             },
         );
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty());
     }
 
@@ -682,7 +689,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event("1");
         event.attributes.insert("a", Value::str("old"));
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(attr(&event, "a"), Some(&Value::str("1")));
     }
 
@@ -690,9 +697,9 @@ mod tests {
     fn the_message_and_body_format_are_left_untouched() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event("1,2");
+        let mut event = log_event("1,2");
         let original_message = message_of(&event).clone();
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         assert_eq!(message_of(&event), &original_message);
         assert_eq!(
             event.log.as_ref().expect("event should carry a log").body_format,
@@ -706,12 +713,12 @@ mod tests {
     fn an_unquoted_fields_value_is_a_zero_copy_slice_of_the_message() {
         let mut csv = parser(&["a", "b"]);
         let resource = default_resource();
-        let event = log_event("hello,world");
+        let mut event = log_event("hello,world");
         let message_ptr_range = match message_of(&event) {
             Value::Str(b) => (b.as_ptr() as usize, b.as_ptr() as usize + b.len()),
             other => panic!("expected Str, got {other:?}"),
         };
-        let event = csv.process(&resource, event).expect("always forwards");
+        assert!(csv.process(&resource, &mut event), "always forwards");
         match attr(&event, "a") {
             Some(Value::Str(b)) => {
                 let start = b.as_ptr() as usize;

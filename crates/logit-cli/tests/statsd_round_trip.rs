@@ -504,8 +504,8 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_a_multi_valued_tag() {
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
     let mut forwarded = Vec::new();
-    for event in batch.events {
-        if let Some(event) = aggregator.process(&resource, event) {
+    for mut event in batch.events {
+        if aggregator.process(&resource, &mut event) {
             forwarded.push(event);
         }
     }
@@ -711,8 +711,8 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
 
     let resource = batch.resource.clone();
     let mut forwarded = Vec::new();
-    for event in batch.events {
-        if let Some(event) = aggregator.process(&resource, event) {
+    for mut event in batch.events {
+        if aggregator.process(&resource, &mut event) {
             forwarded.push(event);
         }
     }
@@ -769,8 +769,8 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
     let mut forwarded = Vec::new();
-    for event in batch.events {
-        if let Some(event) = aggregator.process(&resource, event) {
+    for mut event in batch.events {
+        if aggregator.process(&resource, &mut event) {
             forwarded.push(event);
         }
     }
@@ -806,9 +806,9 @@ async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_disti
 
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
-    for event in batch.events {
+    for mut event in batch.events {
         assert!(
-            aggregator.process(&resource, event).is_none(),
+            !aggregator.process(&resource, &mut event),
             "a delta Counter is always absorbed by aggregate"
         );
     }
@@ -854,8 +854,8 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
     let mut aggregator = Aggregator::new(Duration::from_secs(10));
     let resource = batch.resource.clone();
     let mut forwarded = Vec::new();
-    for event in batch.events {
-        if let Some(event) = aggregator.process(&resource, event) {
+    for mut event in batch.events {
+        if aggregator.process(&resource, &mut event) {
             forwarded.push(event);
         }
     }

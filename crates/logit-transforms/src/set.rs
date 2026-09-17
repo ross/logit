@@ -50,11 +50,11 @@ impl Set {
 }
 
 impl Transform for Set {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         for (key, value) in &self.attribute_pairs {
             event.attributes.insert_sym(*key, value.clone());
         }
-        Some(event)
+        true
     }
 
     fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
@@ -117,7 +117,8 @@ mod tests {
     fn process_inserts_configured_attributes() {
         let mut set = Set::new(vec![], vec![("env".to_string(), Value::str("prod"))]);
         let resource = resource(&[]);
-        let event = set.process(&resource, event()).unwrap();
+        let mut event = event();
+        assert!(set.process(&resource, &mut event));
         assert_eq!(event.attributes.get("env"), Some(&Value::str("prod")));
     }
 
@@ -127,15 +128,16 @@ mod tests {
         let resource = resource(&[]);
         let mut e = event();
         e.attributes.insert("env", Value::str("dev"));
-        let event = set.process(&resource, e).unwrap();
-        assert_eq!(event.attributes.get("env"), Some(&Value::str("prod")));
+        assert!(set.process(&resource, &mut e));
+        assert_eq!(e.attributes.get("env"), Some(&Value::str("prod")));
     }
 
     #[test]
     fn process_with_no_configured_attributes_is_a_no_op() {
         let mut set = Set::new(vec![("service.name".to_string(), Value::str("nginx"))], vec![]);
         let resource = resource(&[]);
-        let event = set.process(&resource, event()).unwrap();
+        let mut event = event();
+        assert!(set.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
     }
 
@@ -215,9 +217,9 @@ mod tests {
     fn set_does_not_touch_log_metrics_or_span() {
         let mut set = Set::new(vec![], vec![("env".to_string(), Value::str("prod"))]);
         let resource = resource(&[]);
-        let e = event();
+        let mut e = event();
         let original_message = e.log.as_ref().unwrap().message.clone();
-        let event = set.process(&resource, e).unwrap();
-        assert_eq!(event.log.as_ref().unwrap().message, original_message);
+        assert!(set.process(&resource, &mut e));
+        assert_eq!(e.log.as_ref().unwrap().message, original_message);
     }
 }

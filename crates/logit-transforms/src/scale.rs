@@ -53,12 +53,12 @@ impl Transform for Scale {
     /// output as the type it declares). A missing or non-numeric field, or a non-finite product,
     /// is a silent skip for that field only, never a dropped event -- the same posture
     /// `kv_metrics` takes toward its own fields (`docs/adr/kv-metrics-semantics.md`).
-    /// `log`/`span`/other attributes/`timestamp` are untouched, and this always returns `Some`.
+    /// `log`/`span`/other attributes/`timestamp` are untouched, and this always returns `true`.
     ///
     /// Records `logit.transform.scaled`/`.scaled.skipped` per configured field, mirroring
     /// `kv_metrics`'s `logit.transform.derived{,.skipped}` -- the skipped-vs-scaled ratio is the
     /// visible signal for this transform's documented silent-skip path.
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         for f in &self.fields {
             let scaled = event
                 .attributes
@@ -73,7 +73,7 @@ impl Transform for Scale {
                 self.telemetry.count("logit.transform.scaled.skipped", 1.0, &[]);
             }
         }
-        Some(event)
+        true
     }
 }
 
@@ -111,8 +111,8 @@ mod tests {
     fn an_integer_field_scales_to_a_float() {
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("request_time", Value::I64(2))]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("request_time", Value::I64(2))]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(2000.0)));
     }
 
@@ -120,8 +120,8 @@ mod tests {
     fn a_float_field_scales() {
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("request_time", Value::F64(0.012))]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("request_time", Value::F64(0.012))]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         match event.attributes.get("request_time") {
             Some(Value::F64(v)) => assert!((v - 12.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected F64, got {other:?}"),
@@ -132,8 +132,8 @@ mod tests {
     fn a_numeric_string_field_still_coerces() {
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("request_time", Value::str("0.5"))]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("request_time", Value::str("0.5"))]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(500.0)));
     }
 
@@ -141,8 +141,8 @@ mod tests {
     fn a_missing_field_is_a_no_op() {
         let mut scale = Scale::new(vec![("nope".to_string(), 1000.0)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.get("nope").is_none());
     }
 
@@ -156,8 +156,8 @@ mod tests {
         ] {
             let mut scale = Scale::new(vec![("f".to_string(), 1000.0)]);
             let resource = default_resource();
-            let event = event_with_attrs(&[("f", value.clone())]);
-            let event = scale.process(&resource, event).expect("always forwards");
+            let mut event = event_with_attrs(&[("f", value.clone())]);
+            assert!(scale.process(&resource, &mut event), "always forwards");
             assert_eq!(
                 event.attributes.get("f"),
                 Some(&value),
@@ -170,8 +170,8 @@ mod tests {
     fn a_non_finite_product_is_skipped_leaving_the_original_value() {
         let mut scale = Scale::new(vec![("f".to_string(), f64::MAX)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("f", Value::F64(f64::MAX))]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("f", Value::F64(f64::MAX))]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert_eq!(
             event.attributes.get("f"),
             Some(&Value::F64(f64::MAX)),
@@ -183,10 +183,10 @@ mod tests {
     fn other_attributes_and_the_log_body_are_untouched() {
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
         let resource = default_resource();
-        let event =
+        let mut event =
             event_with_attrs(&[("request_time", Value::F64(0.01)), ("status", Value::I64(200))]);
         let original_log = event.log.clone();
-        let event = scale.process(&resource, event).expect("always forwards");
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.get("status"), Some(&Value::I64(200)));
         assert_eq!(
             event.log.as_ref().map(|l| &l.message),
@@ -198,8 +198,8 @@ mod tests {
     fn multiple_fields_scale_independently_in_one_pass() {
         let mut scale = Scale::new(vec![("a".to_string(), 2.0), ("b".to_string(), 10.0)]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", Value::I64(3)), ("b", Value::I64(4))]);
-        let event = scale.process(&resource, event).expect("always forwards");
+        let mut event = event_with_attrs(&[("a", Value::I64(3)), ("b", Value::I64(4))]);
+        assert!(scale.process(&resource, &mut event), "always forwards");
         assert_eq!(event.attributes.get("a"), Some(&Value::F64(6.0)));
         assert_eq!(event.attributes.get("b"), Some(&Value::F64(40.0)));
     }
@@ -220,7 +220,8 @@ mod tests {
         let mut scale =
             Scale::new(vec![("request_time".to_string(), 1000.0)]).with_telemetry(telemetry);
         let resource = default_resource();
-        scale.process(&resource, event_with_attrs(&[("request_time", Value::F64(0.01))])).unwrap();
+        let mut event = event_with_attrs(&[("request_time", Value::F64(0.01))]);
+        assert!(scale.process(&resource, &mut event));
 
         let events = registry.drain(0);
         assert_eq!(scaled_count(&events, "logit.transform.scaled"), Some(1.0));
@@ -233,7 +234,8 @@ mod tests {
         let telemetry = registry.telemetry_for("nginx_scale", "scale", "transform");
         let mut scale = Scale::new(vec![("nope".to_string(), 1000.0)]).with_telemetry(telemetry);
         let resource = default_resource();
-        scale.process(&resource, event_with_attrs(&[])).unwrap();
+        let mut event = event_with_attrs(&[]);
+        assert!(scale.process(&resource, &mut event));
 
         let events = registry.drain(0);
         assert_eq!(scaled_count(&events, "logit.transform.scaled"), None);

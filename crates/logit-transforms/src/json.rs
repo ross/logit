@@ -63,11 +63,11 @@ impl JsonParser {
 }
 
 impl Transform for JsonParser {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
-        let Some(log) = &event.log else { return Some(event) };
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
+        let Some(log) = &event.log else { return true };
         let raw = match &log.message {
             Value::Str(b) | Value::Bytes(b) => b,
-            _ => return Some(event),
+            _ => return true,
         };
 
         let body = if self.skip_to_brace {
@@ -78,7 +78,7 @@ impl Transform for JsonParser {
                         "no_brace",
                         "no '{' found in message, passing event through unparsed",
                     );
-                    return Some(event);
+                    return true;
                 }
             }
         } else {
@@ -124,7 +124,7 @@ impl Transform for JsonParser {
             }
         }
 
-        Some(event)
+        true
     }
 }
 
@@ -418,8 +418,8 @@ mod tests {
     fn a_flat_object_populates_attributes_with_the_right_value_variants() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a":1,"b":-2,"c":1.5,"d":true,"e":null,"f":"hi"}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"a":1,"b":-2,"c":1.5,"d":true,"e":null,"f":"hi"}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
 
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
         assert_eq!(attr(&event, "b"), Some(&Value::I64(-2)));
@@ -433,8 +433,8 @@ mod tests {
     fn a_nested_object_becomes_a_map_and_an_array_stays_an_array() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"http":{"status":200},"tags":["a","b"]}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"http":{"status":200},"tags":["a","b"]}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
 
         let mut http = AttrMap::new();
         http.insert("status", Value::U64(200));
@@ -449,8 +449,8 @@ mod tests {
     fn an_escaped_string_decodes_correctly() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"msg":"a\nb"}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"msg":"a\nb"}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "msg"), Some(&Value::str("a\nb")));
     }
 
@@ -458,12 +458,12 @@ mod tests {
     fn a_metric_event_passes_through_with_attributes_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = Event::metric(
+        let mut event = Event::metric(
             0,
             AttrMap::new(),
             MetricRecord::new(intern("m"), MetricKind::counter(1.0)),
         );
-        let event = parser.process(&resource, event).expect("metric-only events pass through");
+        assert!(parser.process(&resource, &mut event), "metric-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -471,7 +471,7 @@ mod tests {
     fn a_span_event_passes_through_with_attributes_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = Event::span(
+        let mut event = Event::span(
             0,
             AttrMap::new(),
             SpanRecord {
@@ -488,7 +488,7 @@ mod tests {
                 ext: None,
             },
         );
-        let event = parser.process(&resource, event).expect("span-only events pass through");
+        assert!(parser.process(&resource, &mut event), "span-only events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -501,7 +501,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event(r#"{"a":1}"#);
         event.metrics.push(MetricRecord::new(intern("m"), MetricKind::counter(1.0)));
-        let event = parser.process(&resource, event).expect("mixed events pass through");
+        assert!(parser.process(&resource, &mut event), "mixed events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
         assert_eq!(event.metrics.len(), 1, "the metric should ride through unaffected");
         assert!(matches!(
@@ -514,8 +514,8 @@ mod tests {
     fn malformed_json_passes_through_with_attributes_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a":}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"a":}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &Value::str(r#"{"a":}"#));
     }
@@ -525,10 +525,12 @@ mod tests {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
 
-        let event = parser.process(&resource, log_event("[1,2]")).expect("passes through");
+        let mut event = log_event("[1,2]");
+        assert!(parser.process(&resource, &mut event), "passes through");
         assert!(event.attributes.is_empty());
 
-        let event = parser.process(&resource, log_event(r#""hi""#)).expect("passes through");
+        let mut event = log_event(r#""hi""#);
+        assert!(parser.process(&resource, &mut event), "passes through");
         assert!(event.attributes.is_empty());
     }
 
@@ -536,8 +538,8 @@ mod tests {
     fn without_skip_to_brace_a_prefixed_line_fails_to_parse() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"2026-08-29 INFO {"a":1}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"2026-08-29 INFO {"a":1}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -545,8 +547,8 @@ mod tests {
     fn skip_to_brace_parses_a_prefixed_line() {
         let mut parser = JsonParser::new(true);
         let resource = default_resource();
-        let event = log_event(r#"2026-08-29 INFO {"a":1}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"2026-08-29 INFO {"a":1}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
     }
 
@@ -554,8 +556,8 @@ mod tests {
     fn skip_to_brace_with_no_brace_at_all_passes_through_untouched() {
         let mut parser = JsonParser::new(true);
         let resource = default_resource();
-        let event = log_event("2026-08-29 INFO no json here");
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("2026-08-29 INFO no json here");
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -563,8 +565,8 @@ mod tests {
     fn skip_to_brace_tolerates_trailing_content_after_the_object() {
         let mut parser = JsonParser::new(true);
         let resource = default_resource();
-        let event = log_event(r#"INFO {"a":1} took=3ms"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"INFO {"a":1} took=3ms"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
     }
 
@@ -572,8 +574,8 @@ mod tests {
     fn without_skip_to_brace_trailing_content_after_the_object_is_rejected() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a":1} took=3ms"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"a":1} took=3ms"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -583,7 +585,7 @@ mod tests {
         let resource = default_resource();
         let mut event = log_event(r#"{"a":1}"#);
         event.attributes.insert("a", Value::str("old"));
-        let event = parser.process(&resource, event).expect("log events pass through");
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a"), Some(&Value::U64(1)));
     }
 
@@ -594,8 +596,8 @@ mod tests {
     fn a_duplicate_key_within_one_object_takes_the_last_value_at_every_depth() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a":1,"n":{"b":1,"b":2},"a":2}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"a":1,"n":{"b":1,"b":2},"a":2}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
 
         assert_eq!(attr(&event, "a"), Some(&Value::U64(2)));
         let mut nested = AttrMap::new();
@@ -610,14 +612,14 @@ mod tests {
     fn keys_in_a_different_order_on_the_next_event_resolve_to_the_same_symbols() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let first = log_event(r#"{"a":1,"b":2,"c":3}"#);
-        let first = parser.process(&resource, first).expect("log events pass through");
+        let mut first = log_event(r#"{"a":1,"b":2,"c":3}"#);
+        assert!(parser.process(&resource, &mut first), "log events pass through");
         assert_eq!(parser.keys.len(), 3);
 
-        let second = log_event(r#"{"c":30,"a":10}"#);
-        let second = parser.process(&resource, second).expect("log events pass through");
-        let third = log_event(r#"{"b":200,"c":300,"a":100,"d":400}"#);
-        let third = parser.process(&resource, third).expect("log events pass through");
+        let mut second = log_event(r#"{"c":30,"a":10}"#);
+        assert!(parser.process(&resource, &mut second), "log events pass through");
+        let mut third = log_event(r#"{"b":200,"c":300,"a":100,"d":400}"#);
+        assert!(parser.process(&resource, &mut third), "log events pass through");
 
         assert_eq!(attr(&second, "a"), Some(&Value::U64(10)));
         assert_eq!(attr(&second, "c"), Some(&Value::U64(30)));
@@ -641,12 +643,12 @@ mod tests {
     fn an_optional_key_missing_from_one_event_does_not_touch_the_interner() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let warm = log_event(r#"{"json_opt_a":1,"json_opt_b":2,"json_opt_c":3}"#);
-        drop(parser.process(&resource, warm));
+        let mut warm = log_event(r#"{"json_opt_a":1,"json_opt_b":2,"json_opt_c":3}"#);
+        parser.process(&resource, &mut warm);
 
         let before = interner::len();
-        let event = log_event(r#"{"json_opt_a":1,"json_opt_c":3}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"json_opt_a":1,"json_opt_c":3}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "json_opt_a"), Some(&Value::U64(1)));
         assert_eq!(attr(&event, "json_opt_c"), Some(&Value::U64(3)));
         assert_eq!(interner::len(), before, "every key was a cache hit");
@@ -657,8 +659,8 @@ mod tests {
     fn a_nested_key_that_repeats_a_top_level_name_shares_its_symbol_and_cache_entry() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"id":1,"user":{"id":2}}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"id":1,"user":{"id":2}}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
 
         assert_eq!(attr(&event, "id"), Some(&Value::U64(1)));
         let Some(Value::Map(user)) = attr(&event, "user") else { panic!("user should be a map") };
@@ -670,14 +672,14 @@ mod tests {
     fn an_escaped_key_resolves_to_the_same_symbol_as_its_unescaped_form() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a\nb":1}"#);
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(r#"{"a\nb":1}"#);
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(1)));
         assert_eq!(parser.keys.len(), 1);
 
         // Escaped and unescaped spellings of the same key are the same key.
-        let event = log_event("{\"a\nb\":2}".replace('\n', "\\u000a").as_str());
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("{\"a\nb\":2}".replace('\n', "\\u000a").as_str());
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(attr(&event, "a\nb"), Some(&Value::U64(2)));
         assert_eq!(parser.keys.len(), 1);
     }
@@ -688,8 +690,8 @@ mod tests {
         let resource = default_resource();
         let n = KeyCache::MAX_ENTRIES + 8;
         let body: Vec<String> = (0..n).map(|i| format!(r#""json_cap_{i}":{i}"#)).collect();
-        let event = log_event(&format!("{{{}}}", body.join(",")));
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event(&format!("{{{}}}", body.join(",")));
+        assert!(parser.process(&resource, &mut event), "log events pass through");
 
         assert_eq!(event.attributes.len(), n);
         for i in 0..n {
@@ -702,12 +704,12 @@ mod tests {
     fn a_failed_parse_leaves_the_cache_usable() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let bad = log_event(r#"{"a":1,"b":"#);
-        let bad = parser.process(&resource, bad).expect("log events pass through");
+        let mut bad = log_event(r#"{"a":1,"b":"#);
+        assert!(parser.process(&resource, &mut bad), "log events pass through");
         assert!(bad.attributes.is_empty());
 
-        let good = log_event(r#"{"a":1,"b":2}"#);
-        let good = parser.process(&resource, good).expect("log events pass through");
+        let mut good = log_event(r#"{"a":1,"b":2}"#);
+        assert!(parser.process(&resource, &mut good), "log events pass through");
         assert_eq!(attr(&good, "a"), Some(&Value::U64(1)));
         assert_eq!(attr(&good, "b"), Some(&Value::U64(2)));
         assert_eq!(parser.keys.len(), 2);
@@ -717,8 +719,8 @@ mod tests {
     fn an_empty_object_parses_and_inserts_nothing() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event("{}");
-        let event = parser.process(&resource, event).expect("log events pass through");
+        let mut event = log_event("{}");
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
     }
 
@@ -726,9 +728,9 @@ mod tests {
     fn the_message_and_body_format_are_left_untouched() {
         let mut parser = JsonParser::new(false);
         let resource = default_resource();
-        let event = log_event(r#"{"a":1}"#);
+        let mut event = log_event(r#"{"a":1}"#);
         let original_message = message_of(&event).clone();
-        let event = parser.process(&resource, event).expect("log events pass through");
+        assert!(parser.process(&resource, &mut event), "log events pass through");
         assert_eq!(message_of(&event), &original_message);
         assert_eq!(
             event.log.as_ref().expect("event should carry a log").body_format,

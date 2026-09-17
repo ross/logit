@@ -268,7 +268,7 @@ mod chained_pipeline_test {
 
         let raw = r#"{"status":200,"body_bytes_sent":512,"request_time":0.012,
                        "host":"junk.example","client_ip":"10.0.0.1","user_agent":"curl/8.0"}"#;
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -284,13 +284,13 @@ mod chained_pipeline_test {
 
         // json: the raw body becomes attributes.
         let mut json = JsonParser::new(false);
-        let event = json.process(&resource, event).expect("json always forwards");
+        assert!(json.process(&resource, &mut event), "json always forwards");
         assert_eq!(event.attributes.len(), 6, "every top-level JSON key should have landed");
 
         // scale: request_time converts from seconds to milliseconds before kv_metrics ever
         // reads it.
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
-        let event = scale.process(&resource, event).expect("scale always forwards");
+        assert!(scale.process(&resource, &mut event), "scale always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
 
         // kv_metrics: two counters (one no-field, one field-backed) and a distribution.
@@ -310,13 +310,13 @@ mod chained_pipeline_test {
                 unit: Some("ms".to_string()),
             }],
         );
-        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
 
         // keep: only `status`/`host` are allowed to survive as tags -- client_ip/user_agent (and
         // the now-redundant body_bytes_sent/request_time) must not reach aggregate.
         let mut keep = Keep::new(vec!["status".to_string(), "host".to_string()]);
-        let event = keep.process(&resource, event).expect("keep always forwards");
+        assert!(keep.process(&resource, &mut event), "keep always forwards");
         let mut expected_kept = AttrMap::new();
         expected_kept.insert("status", Value::Null);
         expected_kept.insert("host", Value::Null);
@@ -338,7 +338,7 @@ mod chained_pipeline_test {
                 Some(Value::str("other")),
             )],
         );
-        let event = keep_values.process(&resource, event).expect("keep_values always forwards");
+        assert!(keep_values.process(&resource, &mut event), "keep_values always forwards");
         assert_eq!(
             event.attributes.get("host"),
             Some(&Value::str("other")),
@@ -348,9 +348,9 @@ mod chained_pipeline_test {
         // aggregate: every metric here is mergeable, so it's fully absorbed -- the log half
         // (still present) is forwarded on its own as the remainder.
         let mut agg = Aggregator::new(Duration::from_secs(10));
-        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
-        assert!(passed.metrics.is_empty(), "every metric should have been absorbed");
-        assert_eq!(passed.log.as_ref().unwrap().message, Value::str(raw));
+        assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
+        assert!(event.metrics.is_empty(), "every metric should have been absorbed");
+        assert_eq!(event.log.as_ref().unwrap().message, Value::str(raw));
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
@@ -409,7 +409,7 @@ mod chained_pipeline_test {
 
         let raw = "status=200 body_bytes_sent=512 request_time=0.012 client_ip=10.0.0.1 \
                     user_agent=curl/8.0";
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -425,14 +425,14 @@ mod chained_pipeline_test {
 
         // logfmt: the raw body becomes attributes, always as Value::Str.
         let mut logfmt = Logfmt::new(false);
-        let event = logfmt.process(&resource, event).expect("logfmt always forwards");
+        assert!(logfmt.process(&resource, &mut event), "logfmt always forwards");
         assert_eq!(event.attributes.len(), 5, "every logfmt field should have landed");
         assert_eq!(event.attributes.get("status"), Some(&Value::str("200")), "never coerced");
 
         // scale: request_time converts from seconds to milliseconds before kv_metrics ever
         // reads it -- `numeric` parses logfmt's Value::Str("0.012") just fine.
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
-        let event = scale.process(&resource, event).expect("scale always forwards");
+        assert!(scale.process(&resource, &mut event), "scale always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
 
         // kv_metrics: two counters (one no-field, one field-backed) and a distribution.
@@ -452,20 +452,20 @@ mod chained_pipeline_test {
                 unit: Some("ms".to_string()),
             }],
         );
-        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 3, "two counters and one distribution should be derived");
 
         // keep: only `status` is allowed to survive as a tag.
         let mut keep = Keep::new(vec!["status".to_string()]);
-        let event = keep.process(&resource, event).expect("keep always forwards");
+        assert!(keep.process(&resource, &mut event), "keep always forwards");
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
         assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
 
         // aggregate: every metric here is mergeable, so it's fully absorbed.
         let mut agg = Aggregator::new(Duration::from_secs(10));
-        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
-        assert!(passed.metrics.is_empty(), "every metric should have been absorbed");
-        assert_eq!(passed.log.as_ref().unwrap().message, Value::str(raw));
+        assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
+        assert!(event.metrics.is_empty(), "every metric should have been absorbed");
+        assert_eq!(event.log.as_ref().unwrap().message, Value::str(raw));
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
@@ -516,7 +516,7 @@ mod chained_pipeline_test {
         let resource = Arc::new(Resource::default());
 
         let raw = r#"{"status":200,"body_bytes_sent":512}"#;
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -531,7 +531,7 @@ mod chained_pipeline_test {
         );
 
         let mut json = JsonParser::new(false);
-        let event = json.process(&resource, event).expect("json always forwards");
+        assert!(json.process(&resource, &mut event), "json always forwards");
 
         let mut kv = KvMetrics::new(
             vec![MetricSpec {
@@ -542,12 +542,12 @@ mod chained_pipeline_test {
             vec![],
             vec![],
         );
-        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 1, "one derived counter");
 
         let mut keep_logs =
             KeepSignals::new(SignalSet { logs: true, metrics: false, traces: false });
-        let event = keep_logs.process(&resource, event).expect("the log half survives");
+        assert!(keep_logs.process(&resource, &mut event), "the log half survives");
         assert!(
             event.metrics.is_empty(),
             "derived metrics must be stripped before a logs-only sink"
@@ -567,7 +567,7 @@ mod chained_pipeline_test {
     fn csv_kv_metrics_keep_aggregate_chain_produces_correctly_tagged_metrics() {
         let resource = Arc::new(Resource::default());
 
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -591,7 +591,7 @@ mod chained_pipeline_test {
             ],
             b',',
         );
-        let event = csv.process(&resource, event).expect("csv always forwards");
+        assert!(csv.process(&resource, &mut event), "csv always forwards");
         for (key, expected) in [
             ("client_ip", "10.0.0.1"),
             ("request_method", "GET"),
@@ -607,7 +607,7 @@ mod chained_pipeline_test {
         }
 
         let mut scale = Scale::new(vec![("request_time".to_string(), 1000.0)]);
-        let event = scale.process(&resource, event).expect("scale always forwards");
+        assert!(scale.process(&resource, &mut event), "scale always forwards");
         assert_eq!(event.attributes.get("request_time"), Some(&Value::F64(12.0)));
 
         let mut kv = KvMetrics::new(
@@ -623,17 +623,17 @@ mod chained_pipeline_test {
                 unit: Some("ms".to_string()),
             }],
         );
-        let event = kv.process(&resource, event).expect("kv_metrics always forwards");
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
         assert_eq!(event.metrics.len(), 2, "one counter (from a string) and one distribution");
 
         let mut keep = Keep::new(vec!["status".to_string()]);
-        let event = keep.process(&resource, event).expect("keep always forwards");
+        assert!(keep.process(&resource, &mut event), "keep always forwards");
         let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
         assert_eq!(kept, vec!["status"], "only the kept attribute should survive");
 
         let mut agg = Aggregator::new(Duration::from_secs(10));
-        let passed = agg.process(&resource, event).expect("the log half should be forwarded");
-        assert!(passed.metrics.is_empty(), "every metric should have been absorbed");
+        assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
+        assert!(event.metrics.is_empty(), "every metric should have been absorbed");
 
         let flushed = agg.flush(1_000_000_000);
         assert_eq!(flushed.len(), 1, "one resource group");
@@ -668,7 +668,7 @@ mod chained_pipeline_test {
     #[test]
     fn set_then_has_attributes_round_trips_the_stamped_tag() {
         let resource = Arc::new(Resource::default());
-        let event = Event::log(
+        let mut event = Event::log(
             0,
             AttrMap::new(),
             LogRecord {
@@ -683,18 +683,18 @@ mod chained_pipeline_test {
         );
 
         let mut tag_web = Set::new(vec![], vec![("stream".to_string(), Value::str("web"))]);
-        let tagged = tag_web.process(&resource, event).expect("set always forwards");
+        assert!(tag_web.process(&resource, &mut event), "set always forwards");
 
         let config = vec![("stream".to_string(), Value::str("web"))];
         let mut has_web = HasAttributes::new(vec![], config.clone());
         let mut drop_web = DropAttributes::new(vec![], config);
 
         assert!(
-            has_web.process(&resource, tagged.clone()).is_some(),
+            has_web.process(&resource, &mut event),
             "has_attributes must forward exactly what set stamped"
         );
         assert!(
-            drop_web.process(&resource, tagged).is_none(),
+            !drop_web.process(&resource, &mut event),
             "drop_attributes must drop exactly what set stamped"
         );
     }

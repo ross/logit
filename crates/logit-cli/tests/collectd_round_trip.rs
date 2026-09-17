@@ -1561,7 +1561,7 @@ async fn collectd_in_aggregate_collectd_out_relay_is_exact_for_cumulative_sums()
         .events
         .iter()
         .cloned()
-        .filter_map(|event| aggregator.process(&resource, event))
+        .filter_map(|mut event| aggregator.process(&resource, &mut event).then_some(event))
         .collect();
     assert_eq!(
         forwarded.len(),

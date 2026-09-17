@@ -42,10 +42,10 @@ impl Keep {
 }
 
 impl Transform for Keep {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         event.attributes =
             filtered(&event.attributes, &self.telemetry, |key| self.fields.contains(key));
-        Some(event)
+        true
     }
 }
 
@@ -68,10 +68,10 @@ impl Remove {
 }
 
 impl Transform for Remove {
-    fn process(&mut self, _resource: &Arc<Resource>, mut event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         event.attributes =
             filtered(&event.attributes, &self.telemetry, |key| !self.fields.contains(key));
-        Some(event)
+        true
     }
 }
 
@@ -137,8 +137,8 @@ mod tests {
     fn keep_drops_everything_not_named() {
         let mut keep = Keep::new(vec!["a".to_string(), "c".to_string()]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        let event = keep.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        assert!(keep.process(&resource, &mut event));
         assert_eq!(attr_keys(&event), vec!["a", "c"]);
     }
 
@@ -149,8 +149,8 @@ mod tests {
         // holding just the surviving keys would already have," not a specific string ordering.
         let mut keep = Keep::new(vec!["m".to_string(), "z".to_string(), "a".to_string()]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("z", "1"), ("a", "2"), ("m", "3"), ("x", "4")]);
-        let event = keep.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("z", "1"), ("a", "2"), ("m", "3"), ("x", "4")]);
+        assert!(keep.process(&resource, &mut event));
         let kept = attr_keys(&event);
 
         let mut expected = AttrMap::new();
@@ -167,7 +167,8 @@ mod tests {
     fn keep_is_a_no_op_on_an_event_with_no_attributes() {
         let mut keep = Keep::new(vec!["a".to_string()]);
         let resource = default_resource();
-        let event = keep.process(&resource, event_with_attrs(&[])).unwrap();
+        let mut event = event_with_attrs(&[]);
+        assert!(keep.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
     }
 
@@ -175,7 +176,8 @@ mod tests {
     fn keep_with_an_empty_list_drops_every_attribute() {
         let mut keep = Keep::new(vec![]);
         let resource = default_resource();
-        let event = keep.process(&resource, event_with_attrs(&[("a", "1"), ("b", "2")])).unwrap();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2")]);
+        assert!(keep.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
     }
 
@@ -183,7 +185,8 @@ mod tests {
     fn keep_naming_an_absent_attribute_is_not_an_error() {
         let mut keep = Keep::new(vec!["nonexistent".to_string()]);
         let resource = default_resource();
-        let event = keep.process(&resource, event_with_attrs(&[("a", "1")])).unwrap();
+        let mut event = event_with_attrs(&[("a", "1")]);
+        assert!(keep.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
     }
 
@@ -191,8 +194,8 @@ mod tests {
     fn remove_with_multiple_fields_drops_exactly_those() {
         let mut remove = Remove::new(vec!["a".to_string(), "c".to_string()]);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
-        let event = remove.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")]);
+        assert!(remove.process(&resource, &mut event));
         assert_eq!(attr_keys(&event), vec!["b", "d"]);
     }
 
@@ -204,12 +207,12 @@ mod tests {
         let original_message = event.log.as_ref().unwrap().message.clone();
 
         let mut keep = Keep::new(vec![]);
-        let event = keep.process(&resource, event).unwrap();
+        assert!(keep.process(&resource, &mut event));
         assert_eq!(event.metrics.len(), 1, "keep must not touch metrics");
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
 
         let mut remove = Remove::new(vec!["a".to_string()]);
-        let event = remove.process(&resource, event).unwrap();
+        assert!(remove.process(&resource, &mut event));
         assert_eq!(event.metrics.len(), 1, "remove must not touch metrics");
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
     }
@@ -232,8 +235,8 @@ mod tests {
         let telemetry = registry.telemetry_for("keep_fields", "keep", "transform");
         let mut keep = Keep::new(vec!["a".to_string(), "c".to_string()]).with_telemetry(telemetry);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        keep.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        assert!(keep.process(&resource, &mut event));
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
@@ -246,8 +249,8 @@ mod tests {
         let telemetry = registry.telemetry_for("remove_fields", "remove", "transform");
         let mut remove = Remove::new(vec!["a".to_string()]).with_telemetry(telemetry);
         let resource = default_resource();
-        let event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        remove.process(&resource, event).unwrap();
+        let mut event = event_with_attrs(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        assert!(remove.process(&resource, &mut event));
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.attributes.kept"), Some(2.0));
@@ -260,7 +263,8 @@ mod tests {
         // just without any recorded points (nothing to assert beyond "doesn't panic").
         let mut keep = Keep::new(vec!["a".to_string()]);
         let resource = default_resource();
-        let event = keep.process(&resource, event_with_attrs(&[("a", "1")])).unwrap();
+        let mut event = event_with_attrs(&[("a", "1")]);
+        assert!(keep.process(&resource, &mut event));
         assert_eq!(attr_keys(&event), vec!["a"]);
     }
 }

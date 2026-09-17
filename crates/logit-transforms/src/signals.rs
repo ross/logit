@@ -12,7 +12,7 @@
 //!
 //! All three drop an event that ends up carrying nothing -- for `HasSignal` because it never
 //! matched a listed signal to begin with, for `KeepSignals`/`DropSignals` because stripping left
-//! no payload behind. `Transform::process`'s `None` already means "don't forward"
+//! no payload behind. `Transform::process`'s `false` already means "don't forward"
 //! (`crates/logit-pipeline/src/transform.rs`), and an all-dropped batch simply sends nothing
 //! downstream (`crates/logit-pipeline/src/runtime.rs`'s `process_batch`) -- no runtime change was
 //! needed to support this.
@@ -74,7 +74,7 @@ impl HasSignal {
 }
 
 impl Transform for HasSignal {
-    fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let has_log = event.log.is_some();
         let has_metrics = !event.metrics.is_empty();
         let has_span = event.span.is_some();
@@ -91,10 +91,10 @@ impl Transform for HasSignal {
 
         if matched {
             self.telemetry.count("logit.transform.events.filtered", 0.0, &[]);
-            Some(event)
+            true
         } else {
             self.telemetry.count("logit.transform.events.filtered", 1.0, &[]);
-            None
+            false
         }
     }
 }
@@ -119,7 +119,7 @@ impl KeepSignals {
 }
 
 impl Transform for KeepSignals {
-    fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         strip(event, self.signals, &self.telemetry)
     }
 }
@@ -143,7 +143,7 @@ impl DropSignals {
 }
 
 impl Transform for DropSignals {
-    fn process(&mut self, _resource: &Arc<Resource>, event: Event) -> Option<Event> {
+    fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         // `DropSignals` clears exactly what `KeepSignals` would discard -- the complement of its
         // own `signals` set is what survives.
         let complement = SignalSet {
@@ -157,8 +157,8 @@ impl Transform for DropSignals {
 
 /// Shared by [`KeepSignals`] and [`DropSignals`]: clears every payload slot not named in `keep`,
 /// records `logit.transform.payloads.stripped{signal}` for each slot actually cleared, and drops
-/// the event (returns `None`) if nothing survives.
-fn strip(mut event: Event, keep: SignalSet, telemetry: &Telemetry) -> Option<Event> {
+/// the event (returns `false`) if nothing survives.
+fn strip(event: &mut Event, keep: SignalSet, telemetry: &Telemetry) -> bool {
     if event.log.is_some() && !keep.logs {
         event.log = None;
         telemetry.count("logit.transform.payloads.stripped", 1.0, &[("signal", "logs")]);
@@ -174,9 +174,9 @@ fn strip(mut event: Event, keep: SignalSet, telemetry: &Telemetry) -> Option<Eve
 
     if event.log.is_none() && event.metrics.is_empty() && event.span.is_none() {
         telemetry.count("logit.transform.events.filtered", 1.0, &[]);
-        None
+        false
     } else {
-        Some(event)
+        true
     }
 }
 
@@ -254,8 +254,8 @@ mod tests {
     fn has_signal_any_of_forwards_a_mixed_event_untouched() {
         let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf);
         let resource = default_resource();
-        let event = add_metric(span_event());
-        let event = has_signal.process(&resource, event).expect("carries a span");
+        let mut event = add_metric(span_event());
+        assert!(has_signal.process(&resource, &mut event), "carries a span");
         assert!(event.span.is_some());
         assert_eq!(event.metrics.len(), 1, "any_of must not strip the metric it didn't ask for");
     }
@@ -264,35 +264,30 @@ mod tests {
     fn has_signal_any_of_drops_an_event_missing_every_listed_signal() {
         let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf);
         let resource = default_resource();
-        assert!(has_signal.process(&resource, metric_event()).is_none());
+        assert!(!has_signal.process(&resource, &mut metric_event()));
     }
 
     #[test]
     fn has_signal_only_drops_a_mixed_event() {
         let mut has_signal = HasSignal::new(traces(), MatchMode::Only);
         let resource = default_resource();
-        let event = add_metric(span_event());
-        assert!(
-            has_signal.process(&resource, event).is_none(),
-            "carries metrics too, not span-only"
-        );
+        let mut event = add_metric(span_event());
+        assert!(!has_signal.process(&resource, &mut event), "carries metrics too, not span-only");
     }
 
     #[test]
     fn has_signal_only_forwards_a_pure_event() {
         let mut has_signal = HasSignal::new(traces(), MatchMode::Only);
         let resource = default_resource();
-        assert!(has_signal.process(&resource, span_event()).is_some());
+        assert!(has_signal.process(&resource, &mut span_event()));
     }
 
     #[test]
     fn has_signal_drops_an_empty_event_under_either_mode() {
         let resource = default_resource();
-        let empty = Event::empty(0, AttrMap::new());
-        assert!(HasSignal::new(traces(), MatchMode::AnyOf)
-            .process(&resource, empty.clone())
-            .is_none());
-        assert!(HasSignal::new(traces(), MatchMode::Only).process(&resource, empty).is_none());
+        let mut empty = Event::empty(0, AttrMap::new());
+        assert!(!HasSignal::new(traces(), MatchMode::AnyOf).process(&resource, &mut empty.clone()));
+        assert!(!HasSignal::new(traces(), MatchMode::Only).process(&resource, &mut empty));
     }
 
     // -- KeepSignals / DropSignals ------------------------------------------------------------
@@ -301,8 +296,8 @@ mod tests {
     fn keep_signals_strips_disallowed_payloads_and_keeps_the_rest() {
         let mut keep = KeepSignals::new(traces());
         let resource = default_resource();
-        let event = add_metric(span_event());
-        let event = keep.process(&resource, event).expect("span survives");
+        let mut event = add_metric(span_event());
+        assert!(keep.process(&resource, &mut event), "span survives");
         assert!(event.span.is_some());
         assert!(event.metrics.is_empty(), "metrics not in the keep set must be stripped");
     }
@@ -311,15 +306,15 @@ mod tests {
     fn keep_signals_drops_an_event_left_with_nothing() {
         let mut keep = KeepSignals::new(traces());
         let resource = default_resource();
-        assert!(keep.process(&resource, metric_event()).is_none());
+        assert!(!keep.process(&resource, &mut metric_event()));
     }
 
     #[test]
     fn drop_signals_clears_the_named_signal_and_keeps_the_rest() {
         let mut drop = DropSignals::new(metrics());
         let resource = default_resource();
-        let event = add_metric(span_event());
-        let event = drop.process(&resource, event).expect("span survives");
+        let mut event = add_metric(span_event());
+        assert!(drop.process(&resource, &mut event), "span survives");
         assert!(event.span.is_some());
         assert!(event.metrics.is_empty());
     }
@@ -328,14 +323,15 @@ mod tests {
     fn drop_signals_drops_an_event_left_with_nothing() {
         let mut drop = DropSignals::new(metrics());
         let resource = default_resource();
-        assert!(drop.process(&resource, metric_event()).is_none());
+        assert!(!drop.process(&resource, &mut metric_event()));
     }
 
     #[test]
     fn keep_signals_is_a_no_op_when_the_event_already_matches() {
         let mut keep = KeepSignals::new(logs());
         let resource = default_resource();
-        let event = keep.process(&resource, log_event()).expect("log survives");
+        let mut event = log_event();
+        assert!(keep.process(&resource, &mut event), "log survives");
         assert!(event.log.is_some());
     }
 
@@ -359,8 +355,8 @@ mod tests {
         let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf).with_telemetry(telemetry);
         let resource = default_resource();
 
-        has_signal.process(&resource, span_event());
-        has_signal.process(&resource, metric_event());
+        has_signal.process(&resource, &mut span_event());
+        has_signal.process(&resource, &mut metric_event());
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.events.filtered"), Some(1.0));
@@ -373,7 +369,7 @@ mod tests {
         let mut keep = KeepSignals::new(logs()).with_telemetry(telemetry);
         let resource = default_resource();
 
-        keep.process(&resource, add_metric(log_event()));
+        keep.process(&resource, &mut add_metric(log_event()));
 
         let events = registry.drain(0);
         assert_eq!(counter_value(&events, "logit.transform.payloads.stripped"), Some(1.0));
@@ -383,6 +379,6 @@ mod tests {
     fn a_disabled_telemetry_handle_is_the_default() {
         let mut has_signal = HasSignal::new(traces(), MatchMode::AnyOf);
         let resource = default_resource();
-        assert!(has_signal.process(&resource, span_event()).is_some());
+        assert!(has_signal.process(&resource, &mut span_event()));
     }
 }
