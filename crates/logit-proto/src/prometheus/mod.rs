@@ -535,6 +535,24 @@ pub fn families_to_events(
     received_at_nanos: i64,
     decoder: &mut PrometheusDecoder,
 ) -> Vec<Event> {
+    families_to_events_with(families, received_at_nanos, decoder, &mut |_, _| {})
+}
+
+/// [`families_to_events`] plus a report of what it stepped over: `on_skipped` is called once per
+/// [`Series`] that has no model kind at all (an empty histogram, a histogram whose cumulative
+/// bucket counts decrease -- see [`point_to_kind`]), with the family it belonged to.
+///
+/// The counted-skip telemetry is already emitted either way; this exists for a caller that has to
+/// report, per call, *how much* of its input survived -- a remote-write receiver owes its sender
+/// an `X-Prometheus-Remote-Write-Samples-Written` count of what it actually kept, and the
+/// assembler's own accepted total is a statement about an earlier stage than this one. Pair it with
+/// [`remote_write::wire_samples`] to turn the skipped series back into the wire samples they were.
+pub fn families_to_events_with(
+    families: &[MetricFamily],
+    received_at_nanos: i64,
+    decoder: &mut PrometheusDecoder,
+    on_skipped: &mut dyn FnMut(&MetricFamily, &Series),
+) -> Vec<Event> {
     let mut out = Vec::new();
     for family in families {
         let name = intern(&family.name);
@@ -542,6 +560,7 @@ pub fn families_to_events(
         let description = family.help.as_deref().map(intern);
         for series in &family.series {
             let Some((kind, flags)) = point_to_kind(&series.point, family.kind, decoder) else {
+                on_skipped(family, series);
                 continue;
             };
             let mut attributes = AttrMap::new();

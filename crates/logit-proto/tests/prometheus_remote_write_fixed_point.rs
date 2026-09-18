@@ -37,7 +37,7 @@ use logit_core::interner::resolve;
 use logit_core::{AttrMap, Exemplar, MetricKind, Registry, TraceRef, Value};
 use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
 use logit_proto::prometheus::generated::prometheus as pb1;
-use logit_proto::prometheus::remote_write::{decode, encode, Decoded, Version};
+use logit_proto::prometheus::remote_write::{decode, encode, wire_samples, Decoded, Version};
 use logit_proto::prometheus::text::{parse, write, Dialect};
 use logit_proto::prometheus::{
     is_stale_nan, FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series,
@@ -1375,6 +1375,35 @@ fn groups(version: Version) -> impl Strategy<Value = Vec<Vec<MetricFamily>>> {
         })
 }
 
+/// Every `Sample` in an encoded request, across every `TimeSeries` -- what
+/// [`wire_samples`] claims a group set is spelled as.
+fn encoded_sample_count(groups: &[Vec<MetricFamily>], version: Version) -> u64 {
+    let body = encode(groups, version, &mut PrometheusEncoder::new());
+    match version {
+        Version::V1 => pb1::WriteRequest::decode(body.as_slice())
+            .expect("our own encoder's output must decode")
+            .timeseries
+            .iter()
+            .map(|series| series.samples.len() as u64)
+            .sum(),
+        Version::V2 => pb2::Request::decode(body.as_slice())
+            .expect("our own encoder's output must decode")
+            .timeseries
+            .iter()
+            .map(|series| series.samples.len() as u64)
+            .sum(),
+    }
+}
+
+fn claimed_sample_count(groups: &[Vec<MetricFamily>], version: Version) -> u64 {
+    groups
+        .iter()
+        .flatten()
+        .flat_map(|family| family.series.iter().map(move |series| (family.kind, series)))
+        .map(|(kind, series)| wire_samples(kind, series, version))
+        .sum()
+}
+
 proptest! {
     #[test]
     fn decoding_an_encoded_group_set_is_the_identity_in_version_1(
@@ -1389,4 +1418,71 @@ proptest! {
     ) {
         prop_assert_eq!(round_trip(&groups, Version::V2).groups, groups);
     }
+
+    /// `wire_samples` is the exactness proof behind a receiver's
+    /// `X-Prometheus-Remote-Write-Samples-Written`: whatever it says a series is spelled as, the
+    /// encoder writes exactly that many `Sample`s for it. Asserted over the same generated group
+    /// sets the identity properties above use, so every `Point` variant, both `_sum`/`_count`
+    /// spellings, a gaugehistogram's `_gcount` rule and a stale marker on every family type are all
+    /// covered by construction rather than by a list of hand-written cases.
+    #[test]
+    fn wire_samples_counts_exactly_what_version_1_encodes(groups in groups(Version::V1)) {
+        prop_assert_eq!(
+            claimed_sample_count(&groups, Version::V1),
+            encoded_sample_count(&groups, Version::V1),
+        );
+    }
+
+    #[test]
+    fn wire_samples_counts_exactly_what_version_2_encodes(groups in groups(Version::V2)) {
+        prop_assert_eq!(
+            claimed_sample_count(&groups, Version::V2),
+            encoded_sample_count(&groups, Version::V2),
+        );
+    }
+}
+
+/// The one place `wire_samples` and `encode` deliberately disagree, and the reason it takes a
+/// `Version` at all. 1.0 spells a created timestamp as a `_created` sample of its own, which
+/// `decode` reads and counts -- so a receiver kept it and must report it -- while `encode` drops it,
+/// 1.0 having no field to put it in (this module's permitted-normalization list). 2.0 carries it as
+/// `Sample.start_timestamp`, a field *on* a sample rather than a sample, so it adds nothing there.
+#[test]
+fn a_created_timestamp_is_a_wire_sample_in_version_1_and_a_field_in_version_2() {
+    let mut family = MetricFamily::new("requests", FamilyType::Counter);
+    family.series.push(Series {
+        labels: vec![("job".to_string(), "api".to_string())],
+        point: Point::Counter(7.0),
+        timestamp: Some(1_605_281_325_000_000_000),
+        created: Some(1_605_281_000_000_000_000),
+        exemplars: Vec::new(),
+    });
+    let groups = vec![vec![family]];
+
+    // 1.0: `requests_total` and `requests_created`, two samples on the wire, and `decode` counts
+    // both -- which the round trip below confirms rather than assumes.
+    assert_eq!(claimed_sample_count(&groups, Version::V1), 2);
+    // 2.0: one sample carrying its own `start_timestamp`.
+    assert_eq!(claimed_sample_count(&groups, Version::V2), 1);
+    assert_eq!(encoded_sample_count(&groups, Version::V2), 1);
+
+    // And `encode` writes only the value sample on 1.0, which is the disagreement being pinned.
+    assert_eq!(encoded_sample_count(&groups, Version::V1), 1);
+
+    // A 1.0 request that really does carry a `_created` sample: `decode` counts two, so a receiver
+    // reporting `wire_samples` reports two.
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![
+            v1_series(&[("__name__", "requests_total")], 7.0),
+            v1_series(&[("__name__", "requests_created")], 1_605_281_000.0),
+        ],
+        metadata: vec![pb1::MetricMetadata {
+            r#type: pb1::metric_metadata::MetricType::Counter as i32,
+            metric_family_name: "requests".to_string(),
+            help: String::new(),
+            unit: String::new(),
+        }],
+    });
+    assert_eq!(decoded.samples, 2);
+    assert_eq!(claimed_sample_count(&decoded.groups, Version::V1), 2, "{:#?}", decoded.groups);
 }

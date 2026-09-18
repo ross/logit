@@ -137,9 +137,12 @@
 //! *Samples-written is measured on the way out, not on the way in.* The codec's own accepted count
 //! is a statement about what the assembler took, and the model mapping that runs afterwards can
 //! still drop a whole series (an empty histogram, a histogram whose bucket counts decrease). So
-//! the number reported is [`wire_samples`] summed over the events that reached the `Fanout` --
-//! a request whose every series was dropped answers `204` with `Samples-Written: 0` and sends no
-//! batch, which is the honest report of having stored nothing.
+//! the number reported is every decoded series' wire samples minus the ones belonging to a series
+//! that mapping dropped, both measured by [`logit_proto::prometheus::remote_write::wire_samples`]
+//! -- which reads the [`logit_proto::prometheus::Point`], and so still sees the `Option`s the wire
+//! had (a summary sent as quantiles alone is two samples, not four). A request whose every series
+//! was dropped answers `204` with `Samples-Written: 0` and sends no batch, which is the honest
+//! report of having stored nothing.
 //!
 //! ## What a decoded request becomes
 //!
@@ -201,11 +204,10 @@
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
 //! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. `logit.input.write.duration`
 //! -- a timing sample per request, recorded regardless of outcome. `logit.input.samples` --
-//! reused from scrape mode, counting the wire samples that actually reached the `Fanout`: the
-//! codec's own accepted total minus every series the model mapping then dropped (an empty
-//! histogram, a histogram whose bucket counts decrease), measured off the events themselves. That
-//! is the same number the `-Written` header reports, deliberately -- a counter and a header
-//! disagreeing about one request would be worse than either being slightly coarse. The connection
+//! reused from scrape mode, counting the wire samples that actually reached the `Fanout` -- every
+//! decoded series' worth minus every series the model mapping then dropped, exactly the number the
+//! `-Written` header reports. Deliberately the same number: a counter and a header disagreeing
+//! about one request would be a puzzle with no right answer. The connection
 //! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
 //! since this is the same accept loop. A rejected request also reports
 //! `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address in the message text
@@ -232,7 +234,8 @@ use logit_core::{
 };
 use logit_pipeline::Fanout;
 use logit_proto::prometheus::{
-    families_to_events, remote_write, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
+    families_to_events, families_to_events_with, remote_write, text, Dialect, MetricFamily,
+    PrometheusDecoder, Series, ATTR_TARGET, LABEL_INSTANCE,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1208,19 +1211,37 @@ async fn write_response(
 
     // One batch per request, on an empty `Resource`, built by concatenating the timestamp groups
     // in ascending order -- this module's "Timestamps and timestamp groups" doc section.
+    //
+    // The samples-kept count is built here rather than read off `Decoded::samples`, because that
+    // is the count the *assembler* accepted and the model mapping below runs after it: a series
+    // whose point has no model kind (an empty histogram, a histogram whose cumulative bucket
+    // counts decrease) is dropped here, having already been counted there. `-Written` is the one
+    // thing 2.0 defines as a report of what the receiver *kept*, so it is every decoded series'
+    // wire samples minus the ones belonging to series this mapping then dropped -- both sides
+    // measured by the codec's own `wire_samples`, which reads the `Point` and so still sees the
+    // `Option`s the wire had.
     let received_at = now_nanos();
+    let mut total: u64 = 0;
+    let mut dropped: u64 = 0;
     let mut events = Vec::new();
     for group in &decoded.groups {
-        events.extend(families_to_events(group, received_at, &mut decoder));
+        for family in group {
+            for series in &family.series {
+                total += remote_write::wire_samples(family.kind, series, version);
+            }
+        }
+        events.extend(families_to_events_with(
+            group,
+            received_at,
+            &mut decoder,
+            &mut |family: &MetricFamily, series: &Series| {
+                dropped += remote_write::wire_samples(family.kind, series, version);
+            },
+        ));
     }
-    // Counted off the events that were actually built, **not** `Decoded::samples`:
-    // `families_to_events` runs after the assembler and drops a whole series whose point has no
-    // model kind (an empty histogram, a histogram whose bucket counts decrease), so the
-    // assembler's own total would report samples this receiver went on to discard. The `-Written`
-    // header is the one thing 2.0 defines as a report of what the receiver *kept*, so it has to
-    // be this number -- and `logit.input.samples` is the same number, since a counter and a header
-    // disagreeing about one request would be worse than either being slightly coarse.
-    let written: u64 = events.iter().flat_map(|e| e.metrics.iter()).map(wire_samples).sum();
+    // `saturating_sub` only because a panic is a poor way to learn that the callback fired for a
+    // series the loop above did not count -- it cannot, since both walk the same `decoded.groups`.
+    let written = total.saturating_sub(dropped);
     telemetry.count("logit.input.samples", written as f64, &[]);
     if !events.is_empty() {
         // **Before** the response is built, the ordering `otlp_in` uses: channel backpressure
@@ -1231,30 +1252,6 @@ async fn write_response(
     ("ok", no_content(seen, written, decoded.exemplars))
 }
 
-/// How many remote-write samples one kept [`MetricRecord`] accounts for -- the wire's own unit,
-/// which is what 2.0's `-Written` header is defined in. One series is one sample for every kind
-/// that is one number, and several for the kinds this wire spells as a family of suffixed series:
-/// a classic histogram is one `_bucket` sample per bucket (`+Inf` included, so the bucket list's
-/// own length), plus `_count`, plus `_sum` where there is one; a summary is one sample per
-/// quantile plus `_sum` and `_count`.
-///
-/// Exact for anything a conforming sender produces, which is what makes it the right number to
-/// report back. It can over-count by one where a sender omitted a `_count`/`_sum` the assembler
-/// then synthesized, because [`logit_core::Summary`] has no `Option` to remember the omission by
-/// -- a malformed-input edge, not a mapping choice, and it can only ever err on the side of
-/// claiming a sample the sender did send.
-fn wire_samples(record: &MetricRecord) -> u64 {
-    match &record.kind {
-        MetricKind::Histogram(histogram) => {
-            histogram.buckets.len() as u64 + 1 + u64::from(histogram.sum.is_some())
-        }
-        MetricKind::Summary(summary) => summary.quantiles.len() as u64 + 2,
-        // Every other kind this decode path can produce -- `Sum`, `Gauge`, and the zero-shaped
-        // kinds a stale marker takes -- is one series and one wire sample.
-        _ => 1,
-    }
-}
-
 /// `""` for an absent or non-ASCII header -- both are "this header said nothing this receiver can
 /// use", and the caller's message quotes whatever came back.
 fn header_str(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
@@ -1262,9 +1259,9 @@ fn header_str(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
 }
 
 /// `204 No Content`, plus 2.0's `-Written` report of what this receiver actually stored --
-/// `samples` is [`wire_samples`] summed over the events that reached the fanout, never the
-/// assembler's own total. Native histograms are skipped, so the histogram count is always `0` --
-/// an honest report, not a placeholder.
+/// `samples` is the wire samples of the series that reached the fanout, never the assembler's own
+/// accepted total. Native histograms are skipped, so the histogram count is always `0` -- an
+/// honest report, not a placeholder.
 fn no_content(
     version: Option<remote_write::Version>,
     samples: u64,
@@ -1976,10 +1973,18 @@ mod tests {
     }
 
     /// The protocol headers a well-formed request carries, ready to splice into [`post_raw`].
+    /// `Connection: close` so [`post_raw`]'s `read_to_end` terminates on the response rather than
+    /// on a keep-alive connection's own lifetime -- a test that needs the connection kept alive
+    /// uses [`keep_alive_write_headers`] instead.
     fn write_headers(version: remote_write::Version) -> String {
+        format!("{}Connection: close\r\n", keep_alive_write_headers(version))
+    }
+
+    /// [`write_headers`] without the `Connection: close`, so HTTP/1.1's own default (keep-alive)
+    /// applies and the *listener* is the only thing that can end the connection.
+    fn keep_alive_write_headers(version: remote_write::Version) -> String {
         format!(
-            "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nUser-Agent: test\r\n\
-             Connection: close\r\n",
+            "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nUser-Agent: test\r\n",
             version.content_type(),
             remote_write::CONTENT_ENCODING_SNAPPY,
             remote_write::HEADER_VERSION,
@@ -2533,6 +2538,102 @@ mod tests {
         assert_eq!(batch.events.len(), 1, "four wire samples, one model series");
     }
 
+    /// A summary sent as quantiles alone -- no `_sum`, no `_count` -- is two wire samples, and the
+    /// report has to say two. This is the case a count derived from the built `MetricRecord` could
+    /// not get right: `logit_core::Summary`'s `sum`/`count` are plain numbers, so the model has
+    /// forgotten that the wire omitted them, while the codec's `Point::Summary` still carries the
+    /// `Option`s and `wire_samples` reads them.
+    #[tokio::test]
+    async fn a_quantiles_only_summary_reports_only_its_quantiles() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry);
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let mut family = MetricFamily::new("request_seconds", FamilyType::Summary);
+        family.series.push(Series {
+            labels: vec![("job".to_string(), "api".to_string())],
+            point: Point::Summary {
+                quantiles: vec![(0.5, 1.0), (0.9, 2.0)],
+                sum: None,
+                count: None,
+            },
+            timestamp: Some(millis(1_700_000_000_000)),
+            created: None,
+            exemplars: Vec::new(),
+        });
+        let body = request_body(&[vec![family]], remote_write::Version::V2);
+
+        let response = post_write(&addr, "/api/v1/write", remote_write::Version::V2, &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains(&format!("{}: 2", remote_write::HEADER_SAMPLES_WRITTEN)),
+            "two quantiles and nothing else -- got: {response}"
+        );
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(batch.events.len(), 1);
+        let events = registry.drain(0);
+        assert_eq!(counter_in(&events, "logit.input.samples", ("component", "receive")), Some(2.0));
+    }
+
+    /// 1.0 spells a created timestamp as a `_created` sample of its own, which the codec counts and
+    /// this receiver keeps (as `Series::created`) -- so both of the request's samples are reported.
+    /// Hand-built, because `remote_write::encode` drops `created` on 1.0, 1.0 having no field for
+    /// it: the shape under test only exists on the wire.
+    #[tokio::test]
+    async fn a_1_0_created_sample_is_reported_as_a_sample_it_kept() {
+        use logit_proto::prometheus::generated::prometheus as pb1;
+        use prost::Message;
+
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry);
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let series = |name: &str, value: f64| pb1::TimeSeries {
+            labels: vec![pb1::Label { name: "__name__".to_string(), value: name.to_string() }],
+            samples: vec![pb1::Sample { value, timestamp: 1_700_000_000_000 }],
+            exemplars: Vec::new(),
+            histograms: Vec::new(),
+        };
+        let request = pb1::WriteRequest {
+            timeseries: vec![
+                series("requests_total", 7.0),
+                series("requests_created", 1_699_000_000.0),
+            ],
+            // A `_created` sample only means anything once something says the family is a counter;
+            // without metadata `requests_created` is just another untyped series.
+            metadata: vec![pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Counter as i32,
+                metric_family_name: "requests".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            }],
+        };
+        let body = snappy(&request.encode_to_vec());
+
+        let response = post_write(&addr, "/api/v1/write", remote_write::Version::V1, &body).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(batch.events.len(), 1, "one series, whatever it was spelled as");
+        assert_eq!(
+            batch.events[0].metrics[0].start_timestamp, 1_699_000_000_000_000_000,
+            "the `_created` sample became the record's start timestamp"
+        );
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.samples", ("component", "receive")),
+            Some(2.0),
+            "the value sample and the `_created` sample were both kept"
+        );
+    }
+
     /// The `408` row of the routes table, and the whole reason `collect_with_stall_bound` was
     /// hoisted: `drive_with_idle` applies no deadline while a request is in flight, so a peer that
     /// sends a head and then stops mid-body would otherwise hold its connection-limit permit
@@ -2556,12 +2657,15 @@ mod tests {
             remote_write::Version::V1,
         );
 
-        // A `Content-Length` promising the whole body, then half of it and silence.
+        // A `Content-Length` promising the whole body, then half of it and silence. Sent
+        // **keep-alive** -- no `Connection: close` -- so nothing but this listener's own
+        // `Activity::request_close` can end the connection, which is what makes the close below an
+        // assertion about the code under test rather than about the request this test wrote.
         let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let head = format!(
             "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{}\r\n",
             body.len(),
-            write_headers(remote_write::Version::V1)
+            keep_alive_write_headers(remote_write::Version::V1)
         );
         stalled.write_all(head.as_bytes()).await.unwrap();
         stalled.write_all(&body[..body.len() / 2]).await.unwrap();
