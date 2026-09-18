@@ -225,23 +225,41 @@ already built that have a known, accepted rough edge.
   where it matters, a host agent sharing a netns with everything else on the box. If these are
   ever wanted, they belong to a process-level scope — alongside `logit.process.*`, which `internal`
   already samples for itself — and not to any listener.
-- **A UDP listener reads one datagram per syscall.** `read_loop` (`logit-inputs::udp`,
-  [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
-  amortizes that across a batch — rsyslog's own high-throughput reference config sets `batchSize`
-  to 128, gostatsd's `--receive-batch-size` defaults to 50 — and syscall overhead is the read half's
-  dominant remaining cost now that a stalled downstream no longer stops it running. Not built:
-  `tokio::net::UdpSocket` doesn't expose `recvmmsg`, so this needs raw-fd work via `try_io` plus a
-  `libc` binding.
-- **One reader per UDP listener.** A single `recv_from` loop is one core's worth of read capacity.
+- ~~**A UDP listener reads one datagram per syscall**~~ — **closed** on Linux
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
+  `read_loop` (`logit-inputs::udp`) now takes up to `receive.read_batch` datagrams per `recvmmsg(2)`
+  call (default 64, ceiling `UIO_MAXIOV`), through `tokio::net::UdpSocket::async_io` — which is the
+  raw-fd seam this entry said the work would need, and the same one
+  `crates/logit-inputs/src/tail/watch.rs`'s `inotify` backend already uses. The `mmsghdr`/`iovec`
+  arrays are rebuilt inside the readiness closure on every call over `Vec<u64>` backing storage, so
+  no raw pointer is ever held across an `.await` and the read future stays ordinarily `Send` with no
+  `unsafe impl` behind it.
+
+  `read_batch` also sizes the decode half's `pop_many`, so one knob governs both ends of the receive
+  queue, and `logit.input.reads` alongside `logit.input.datagrams` makes the mean fill of a syscall
+  batch — the number that says whether the knob is doing anything — directly observable.
+
+  **Linux only, and that is the whole of it.** `recvmmsg` is a Linux syscall with no portable
+  equivalent worth a second implementation; every other target keeps the one-`recv_from`-per-datagram
+  loop behind the same interface, and `read_batch` is documented as parsed-and-ignored there.
+- **One reader per UDP listener.** A single read loop is one core's worth of read capacity.
   `SO_REUSEPORT` lets multiple sockets share one port with the kernel load-balancing datagrams
   across them — gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener
-  thread count (capped at 32). Not built, partly because it interacts with the previous entry (a
-  batched read raises the single-reader ceiling before more readers are worth adding) and partly
-  because N readers each holding their own `Fanout` clone would need its own answer to the
-  cancel-by-drop shutdown cascade ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that
-  today assumes exactly one `Fanout` per listener.
-- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram *pushed*, not every
-  batch — the pop half is closed.** `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`)
+  thread count (capped at 32). Still not built, and the reasoning has moved on rather than
+  disappeared. **The prerequisite is done**: the entry above used to say a batched read should raise
+  the single-reader ceiling before more readers are worth adding, and it has —
+  `recvmmsg(2)` with `read_batch: 64` cut the CPU cost per event on the single-datagram-per-packet
+  workload substantially, so the question "is one reader still the bottleneck?" now has measurements
+  behind it rather than an assumption
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)'s
+  sweep). What has not changed is the cost of building it: N readers each holding their own `Fanout`
+  clone would need its own answer to the cancel-by-drop shutdown cascade
+  ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that today
+  assumes exactly one `Fanout` per listener. A related, smaller question that same work would have
+  to settle: the read and decode halves currently share **one** task, so they interleave but never
+  run on two cores at once.
+- ~~**A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, on both sides of
+  the queue**~~ — **closed, both halves.** `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`)
   call `update_gauges` — three `Telemetry::gauge` calls, each locking `ComponentBuffer`'s
   `Mutex<HashMap>` (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item.
   On a `SinkQueue` that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it was
@@ -255,12 +273,12 @@ already built that have a known, accepted rough edge.
   three gauges once per popped batch instead of once per datagram. Per-item admission, drop counting
   and `Block` waiting are unchanged; only the bookkeeping around them batches.
 
-  **The push side closes with W4's `recvmmsg` read.** `read_loop` still calls `push` once per
-  datagram, because it still reads one datagram per `recv_from`: batching the push without batching
-  the read would mean calling `push_many` with a one-item `Vec`, which is the same gauge update
-  under another name. When the read path becomes `recvmmsg` with `vlen = read_batch`, the datagrams
-  arrive already batched and `push_many` takes them as one, which is what closes this entry the rest
-  of the way. Until then, the contention is halved, not removed.
+  **And the push side closed with the `recvmmsg` read.** The condition this entry set was that
+  batching the push without batching the read would just be the same gauge update with a one-item
+  `Vec` around it. The read path is now `recvmmsg` with `vlen = read_batch` (the entry above), so
+  the datagrams arrive already batched and `read_loop` hands the whole batch to `push_many` in one
+  call. Both of the two loops that used to contend on the component's telemetry mutex once per
+  datagram now touch it once per batch, which is what this entry asked for.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
   **closed, both halves** (`docs/adr/relative-gauge-adjustments.md`). Landed as two
   independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no

@@ -789,7 +789,10 @@ Zero-copy slicing trades allocation count for **retention**. Every field of ever
 from a datagram holds a reference to that one datagram buffer, so the buffer lives until the last
 event derived from it is dropped. This is the right trade here because the buffer is right-sized:
 `SyslogInput::run` and `StatsdInput::run` do `Bytes::copy_from_slice(&buf[..n])`, allocating exactly
-`n` bytes, not the 64 KB of the reusable receive buffer.
+`n` bytes, not the 64 KB of the reusable receive buffer. The batched `recvmmsg(2)` read
+([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md))
+does not change this: it reads into a slab of `read_batch` such buffers (§5) and still makes exactly
+one right-sized copy per datagram out of the slot it landed in.
 
 **The obvious "optimization" here is a trap, and is deliberately not taken.** Reading straight into
 a large shared `BytesMut` and `split_to`-ing each datagram off it would save that one allocation per
@@ -1159,6 +1162,39 @@ section's opening complaint ("batch size is unbounded... one 65 KB syslog datagr
 hundreds of events") *at the listener edge itself*, rather than only downstream of it via
 `SinkQueue`. The `CHANNEL_CAPACITY = 64` gap this section names — an ordinary transform-to-transform
 edge still has no byte bound, only a batch-count one — is unchanged and stays open.
+
+### The batched read's slab: a fixed per-listener cost, mostly virtual
+
+The `recvmmsg(2)` read half ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md))
+needs one receive buffer per message the syscall may return, so a UDP listener owns a slab of
+`receive.read_batch` × 65,507-byte slots (`BatchReader::slots`, `crates/logit-inputs/src/udp.rs`) —
+one allocation, made at startup, never resized, replacing the single 65,507-byte buffer the
+`recv_from` loop held. It is a fixed per-listener cost, independent of load, and the only figure in
+this document where the difference between *virtual* and *resident* is the whole point:
+
+| `read_batch` | slab, virtual | resident at allocation | resident once every slot has held a small datagram | resident if every slot holds a maximum-size datagram |
+|---|---|---|---|---|
+| 1 (the pre-ADR shape) | 64 KiB | ~0 | 4 KiB | 64 KiB |
+| **64** (the default) | **4.0 MiB** | **+52 KiB** | **+308 KiB** | **+4.1 MiB** |
+| 1024 (the rule 57 ceiling) | 64.0 MiB | +96 KiB | ~4.1 MiB | ~64 MiB |
+
+Measured, not assumed — `vec![0u8; n]` under this codebase's jemalloc global allocator (§6) is
+`alloc_zeroed`, which for an allocation this size is a fresh `mmap` of zero pages: **untouched pages
+are never faulted in**, so allocating the slab costs address space and a few tens of KiB of
+allocator bookkeeping, not its nominal size. Resident cost then tracks what the traffic actually
+writes — one 4 KiB page per slot for any datagram up to 4 KiB, which is every statsd or syslog
+datagram in practice, so the default's realistic steady state is the ~256-308 KiB column rather than
+the 4 MiB one. (The numbers above are a direct probe under the release profile; the
+`udp-statsd-small` perf scenario's own `max_rss_bytes` moved by less than its run-to-run noise
+across this change, which is the same finding at the whole-process scale.)
+
+Two consequences worth stating plainly. A deployment with many UDP listeners multiplies the
+*virtual* figure, which on a 64-bit host is free, and the resident one, which is not — a host agent
+with four listeners at the default pays roughly a megabyte of real memory for the slabs, once.
+And raising `read_batch` to its ceiling is not a 64 MiB decision on a small-datagram workload; it is
+a ~4 MiB one. `docs/deploying.md`'s "Listener intake" section is where an operator is pointed at the
+`logit.input.datagrams / logit.input.reads` ratio that says whether raising it would buy anything at
+all.
 
 ## 6. The allocator
 

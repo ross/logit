@@ -491,8 +491,60 @@ the full requested size. The granted value is always gauged
 (`logit.input.receive_buffer.bytes`), even when you never set an override, so you can see the
 kernel default before deciding whether to raise it.
 
+### `read_batch`: how many datagrams one syscall takes
+
+`receive.read_batch` (64 by default) is how many datagrams one `recvmmsg(2)` call may return, and —
+the same number, deliberately — how many the decode half takes off the receive queue at a time. One
+knob, both ends of one queue. `read_batch: 1` is one datagram per syscall, which is what every UDP
+listener here did before
+[ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md).
+
+```yaml
+components:
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+    receive:
+      read_batch: 64             # the default
+```
+
+**Linux only, in effect.** `recvmmsg` is a Linux syscall; on any other target the read loop still
+takes one datagram per `recv_from` and this field is parsed, validated and then ignored, so one
+config file stays portable. (The decode-side batch it also sets applies everywhere.) `logit validate`
+rejects `0` and anything above `1024` — the kernel's own `UIO_MAXIOV` ceiling on a vectored I/O call.
+
+**When raising it is worth anything: watch the mean fill.** Divide `logit.input.datagrams` by
+`logit.input.reads` and you get how many datagrams an average syscall actually returned.
+
+- A fill sitting at (or near) `read_batch` means every read is coming back full — the batch size is
+  the limit, and raising it will take more datagrams per syscall. This is the regime a busy
+  listener fed by many unbuffered clients lands in.
+- A fill near 1 means datagrams are arriving one at a time and there is simply never more than one
+  waiting when the reader asks. Raising `read_batch` cannot help, because the value was never the
+  constraint; lowering it costs nothing either. A listener at a low rate, or one fed by a single
+  buffered client sending large packed datagrams, looks like this.
+
+**What it costs.** The read half holds one buffer per message the syscall may return: a slab of
+`read_batch` × 65,507 bytes per listener, allocated once at startup. At the default that is 4 MiB of
+*address space* and, in practice, a few hundred KiB of real memory — only the pages a datagram is
+actually written into are ever faulted in, so a listener seeing ordinary small statsd or syslog
+datagrams touches one 4 KiB page per slot and no more (`docs/design/memory.md` §5 has the measured
+figures). The ceiling of 1024 is a ~4 MiB resident decision on that traffic, not a 64 MiB one — but
+it is still 64 MiB of address space per listener, and there is rarely a reason to go near it.
+
+**One thing it widens.** A shutdown landing while the reader is handing a batch to a full queue
+drops whatever it was still holding, uncounted — up to `read_batch` datagrams now, rather than
+exactly one. Bounded, and only on the shutdown path.
+
+A `read_batch` larger than `receive.max_datagrams` is legal and behaves the way you would expect: a
+batch that cannot fit is admitted item by item under the configured `overflow` policy, exactly as a
+sequence of single pushes would have been.
+
 ### What to watch
 
+- `logit.input.datagrams` / `logit.input.reads` (counts) — datagrams read off the socket, and the
+  read syscalls that returned them. Their ratio is the mean fill described under `read_batch` above,
+  and it is the only number that says whether that knob is doing anything for this listener.
 - `logit.component.receive.utilization` (gauge) — the fill ratio of whichever of `max_datagrams`/
   `max_bytes` is closer to tripping. Sustained values near 1.0 mean decode is falling behind the
   socket; under `block`, that's also back-pressuring the sender (or, for a local process, the OS).
@@ -624,7 +676,7 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
   stream cannot have — so only `batch_max_events`, `batch_max_bytes`, `batch_flush_interval` and
   `shutdown_grace` apply to it. A queue-bounding field (`max_datagrams`, `max_bytes`, `overflow`,
-  `receive_buffer_bytes`) on a TCP `graphite_in` is a `logit validate` error naming the field, not
+  `receive_buffer_bytes`), or `read_batch`, on a TCP `graphite_in` is a `logit validate` error naming the field, not
   a setting that is silently ignored. A stalled TCP `graphite_in` therefore shows up as
   backpressure at the *sender*, which is what you want, rather than as a drop counter here.
 - **`protocol: pickle` requires `transport: tcp`.** Carbon's pickle batch protocol (port 2004) is a

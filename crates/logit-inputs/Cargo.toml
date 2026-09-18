@@ -53,8 +53,10 @@ snap.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) --
-# already present transitively at this exact version (see the workspace Cargo.toml comment).
+# tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) and the
+# UDP listener's batched `recvmmsg(2)` read
+# (docs/adr/udp-intake-batching-and-socket-visibility.md) -- already present transitively at this
+# exact version (see the workspace Cargo.toml comment).
 libc.workspace = true
 
 [dev-dependencies]

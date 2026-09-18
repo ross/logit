@@ -1152,6 +1152,7 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
         batch_max_bytes: receive.batch_max_bytes,
         batch_flush_interval: receive.batch_flush_interval,
         shutdown_grace: receive.shutdown_grace,
+        read_batch: receive.read_batch,
     }
 }
 
