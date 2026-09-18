@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-13
+updated: 2026-09-18
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -185,6 +185,38 @@ problem to solve, and does have the opposite one: attributing per-node time mean
 underneath it) directly, the same way `crates/logit-bench` already does. `tools/*`'s isolation
 exists to keep something out of the main build graph; `logit-perf` needs to be squarely inside it
 to reuse the exact codec the runtime it's measuring already ships.
+
+### Extended 2026-09-18: a second kind of scenario, driven over a real socket
+
+This ADR's "a scenario is nothing more than a `logit` YAML under `perf/scenarios/`" is still true,
+and the one assumption underneath it — that the load comes from a `generate_in` component *inside*
+the process under test — is not. [ADR
+`udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md) adds a
+second workload kind for measuring the UDP intake path itself, which a `generate_in` scenario
+structurally cannot reach: no socket, no datagram, no kernel receive buffer.
+
+What that ADR decides, and this one is amended by rather than contradicted:
+
+- **`Workload::{Generated, Driven}`.** A driven scenario (`perf/scenarios/udp-statsd*.yaml`) is an
+  ordinary validating config with **no `generate_in` at all**, plus a sidecar load spec at
+  `perf/load/<scenario>.yaml`. `perf/load/` is a new directory rather than more files under
+  `perf/scenarios/` for the reason this ADR's own consequences list implies: everything in
+  `perf/scenarios/` is covered by `script/validate` and
+  `every_shipped_config_loads_and_validates`, so anything dropped there has to be a valid `logit`
+  config.
+- **The sender runs inside `logit-perf`**, so the child's `wait4` rusage stays pure receive-side
+  CPU and "CPU microseconds per event is the headline number" keeps meaning what it means here.
+- **The denominator is events *delivered*.** This is the first scenario family where events
+  produced and events measured can honestly differ — a real socket may drop. `Sample` gains an
+  optional `udp:` block carrying sent/received/kernel-dropped/queue-dropped/delivered, and
+  `compare` reports a drop-rate delta it never gates on.
+- **The `internal → file_out native` leg this ADR built for `attribute` is now also attached at run
+  time** for a driven scenario, because the delivered-event count only exists in the child's own
+  telemetry. The machinery moved to `crates/logit-perf/src/telemetry_leg.rs` unchanged and is
+  shared; it is still never checked into a scenario's YAML.
+- **`--pin-sender`/`--pin-child`.** This ADR's "not a dedicated, pinned-core bench host" caveat
+  still describes every generated scenario. A driven one is required to pin, because its numbers
+  are otherwise bimodal on a heterogeneous-core box.
 
 ### Open question, deliberately not decided here: when the harness runs
 
