@@ -410,9 +410,13 @@ pub fn decode_with(
 /// the first hands the rest.
 type ResolvedSeries<'a> = Option<(&'a str, Vec<(String, String)>)>;
 
-/// A help/unit pair a 2.0 series carried without a type, which therefore describes no family until
+/// A `# HELP`/`# UNIT` pair off the wire, either half of it absent. Shared by both versions'
+/// "describes a family but declares no type" path -- see [`UntypedDescription`] and `decode_v1`.
+type Description = (Option<Arc<str>>, Option<Arc<str>>);
+
+/// A [`Description`] a 2.0 series carried without a type, which therefore describes no family until
 /// its samples have routed -- `None` for a series that carried no such pair. See `decode_v2`.
-type UntypedDescription = Option<(Option<Arc<str>>, Option<Arc<str>>)>;
+type UntypedDescription = Option<Description>;
 
 /// One series, once its labels have been resolved and validated and its samples have been routed:
 /// the sample name, the series labels, and the groups a sample of it actually landed in (ascending,
@@ -636,7 +640,7 @@ fn decode_v1(
     // an entry can be describing -- and an entry naming a family this request has no samples for
     // describes nothing, which is the right answer rather than a lost one.
     let mut declarations = Declarations::default();
-    let mut described: HashMap<&str, (Option<Arc<str>>, Option<Arc<str>>)> = HashMap::new();
+    let mut described: HashMap<&str, Description> = HashMap::new();
     for metadata in &request.metadata {
         let kind = family_type_v1(metadata.r#type);
         let help = non_empty(&metadata.help);
@@ -648,7 +652,14 @@ fn decode_v1(
             }
             continue;
         }
-        merge_declaration(&mut declarations, &metadata.metric_family_name, kind, help, unit, decoder);
+        merge_declaration(
+            &mut declarations,
+            &metadata.metric_family_name,
+            kind,
+            help,
+            unit,
+            decoder,
+        );
     }
 
     let mut groups = Groups::new(&declarations, seed);
