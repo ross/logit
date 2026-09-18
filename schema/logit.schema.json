@@ -1959,32 +1959,70 @@
           }
         },
         {
-          "description": "A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of current series that an HTTP handler renders on demand, rather than one that writes anywhere. The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and `logit_outputs::prometheus`'s module doc (the spec).\n\nA future remote-write **sender** is an optional `endpoint:` on this same variant, with a graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config written today keeps working.",
+          "description": "Prometheus in either of its two sink shapes, chosen by which mode field is set (rule 56 requires exactly one). `bind:` is an **exposition** endpoint: a stateful sink holding a registry of current series that an HTTP handler renders on demand, the mirror of `PrometheusIn`'s scrape, serving both text dialects negotiated on the scraping client's `Accept`. `endpoint:` is a **remote-write sender**: a stateless sink that POSTs each batch to a remote-write receiver, the mirror of `PrometheusIn`'s own `bind:`.\n\nThe two modes share no field. A field belonging to the mode that isn't set is a config error rather than a silent no-op (rule 56). See `docs/adr/prometheus-scrape-and-exposition.md`, `docs/adr/prometheus-remote-write.md`, and `logit_outputs::prometheus`'s module doc (the spec).",
           "type": "object",
           "required": [
-            "bind",
             "type"
           ],
           "properties": {
             "bind": {
-              "description": "`host:port` to serve the exposition on. Required, and bound when the pipeline starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure rather than a scrape that silently answers nothing.\n\n**There is no TLS and no auth on this endpoint**, and it serves every label of every series the registry holds to anything that connects: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with something that has both. See the ADR's \"Security posture\" section and `docs/known-gaps.md`.",
-              "type": "string"
+              "description": "`host:port` to serve the exposition on -- **registry mode**. Bound when the pipeline starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure rather than a scrape that silently answers nothing.\n\n**There is no TLS and no auth on this endpoint**, and it serves every label of every series the registry holds to anything that connects: bind loopback or pod-local (`127.0.0.1:9464`, as every shipped example does) and front it with something that has both. See the ADR's \"Security posture\" section and `docs/known-gaps.md`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endpoint": {
+              "description": "An absolute `http://`/`https://` remote-write URL, **path included** (typically `/api/v1/write`) -- **sender mode**. Unlike `bind:` this is never resolved at config-load time; a receiver that isn't up yet is not a config error, the same `otlp_out`/`syslog_out` precedent. Rule 56 checks the scheme and authority.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "endpoint_tls": {
+              "description": "Client-side TLS tuning for an `https://` `endpoint:` -- see [`TlsClientConfig`]. Named for the mode it serves, matching `prometheus_in`'s `scrape_tls:`/`bind_tls:` pair: one kind with two TLS-shaped roles must never spell either of them as a bare `tls:`. A non-default value under a plain `http://` endpoint is a config error (rule 56), not silently ignored. Sender mode only.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
             },
             "expire_after": {
-              "description": "A series not updated within this window is dropped from the registry and stops being exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this sink stops exposing is one a Prometheus-native exporter's consumer would already have treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.",
+              "description": "A series not updated within this window is dropped from the registry and stops being exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this sink stops exposing is one a Prometheus-native exporter's consumer would already have treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound. Registry mode only (rule 56).",
               "default": "300s",
               "type": "string"
             },
+            "headers": {
+              "description": "Extra headers sent on every remote-write request -- e.g. `X-Scope-OrgID` for a multi-tenant Mimir. A value is a plain string like any other field, so `!env` works on it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token without inlining it. A name the protocol owns (`content-type`, `content-encoding`, `content-length`, `x-prometheus-remote-write-version`, `user-agent`) or an HTTP/2 pseudo-header starting with `:` is rejected at config-validation time (rule 56) rather than silently overridden, as are two keys naming the same header once case is ignored. Sender mode only.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
             "max_series": {
-              "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}` -- the same shape as `aggregate`'s `max_retained_gauge_series`, applied to registry memory instead of window memory.",
+              "description": "A hard cap on distinct series held in the registry; over it, the least-recently-updated series is evicted to admit a new one, counted `logit.output.series.evicted{reason=\"cardinality\"}` -- the same shape as `aggregate`'s `max_retained_gauge_series`, applied to registry memory instead of window memory. Registry mode only (rule 56).",
               "default": 100000,
               "type": "integer",
               "format": "uint",
               "minimum": 0.0
             },
             "path": {
-              "description": "The HTTP path the exposition is served on; any other path is a `404`. Defaults to `/metrics`, what every Prometheus scrape config assumes when a target's own `metrics_path` is unset.",
+              "description": "The HTTP path the exposition is served on; any other path is a `404`. Defaults to `/metrics`, what every Prometheus scrape config assumes when a target's own `metrics_path` is unset. Registry mode only -- a non-default value alongside `endpoint:` is rejected (rule 56).",
               "default": "/metrics",
+              "type": "string"
+            },
+            "timeout": {
+              "description": "Per-request timeout on the remote-write POST. Defaults to 10s, `otlp_out`'s own default. Rule 56 rejects `0s`. Sender mode only.",
+              "default": "10s",
               "type": "string"
             },
             "type": {
@@ -1992,6 +2030,13 @@
               "enum": [
                 "prometheus_out"
               ]
+            },
+            "version": {
+              "description": "Which remote-write protocol version this sender writes -- see [`RemoteWriteVersion`]. Defaults to `1`, what every deployed receiver accepts. There is no negotiation and no fallback: pick the version the receiver speaks, exactly as a scrape target's own dialect is picked for it. Sender mode only (rule 56).\n\n`serde` reads and writes [`RemoteWriteVersion`] as the integer, so the schema has to say so here: the derived variant-name schema would publish a spelling (`\"V1\"`) config never accepts. The same `#[schemars(with = ..)]` hint the hand-rolled `Duration` codec carries on every field that uses it (ADR `config-yaml-jsonschema`).",
+              "default": 1,
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
             }
           }
         },
