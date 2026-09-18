@@ -422,6 +422,19 @@ benchmarking work on this box, not specific to UDP. `--pin-sender`/`--pin-child`
 (`sched_setaffinity`) are not optional flourishes for this scenario family; every recorded
 `udp-statsd*` number states which CPUs it pinned to.
 
+**And paired in one sitting, interleaved — not diffed against a stored baseline.** Pinning fixes
+*which* cores a run lands on; it does nothing about what those cores are willing to do an hour
+later. Measured during W2: the same specs, the same commit and the same pins, re-run 90 minutes
+further into a benchmarking session, moved CPU µs/event by ~23% and `udp-statsd-small`'s drop rate
+from 3.1% to 12.4%; re-running the *earlier* commit immediately afterwards reproduced the *later*
+numbers, so it was the box settling into a lower sustained power state rather than anything in the
+code. A drop rate is especially exposed to this, being the difference between two nearly-equal
+rates. So a delta is a parent/branch pair taken back to back and interleaved (parent, branch,
+parent, branch …) within one session, and a results file from another day is not a control.
+`docs/plans/udp-intake.md`'s "Baseline/delta recording protocol" is the procedure; `logit-perf run`
+records what it can of the box's power state into the results file and warns on `powersave` or
+battery, because a number whose conditions aren't recorded can't be re-read later.
+
 ### Representative traffic, calibrated against a recorded real-client capture
 
 "Real statsd traffic" is a *traffic model calibrated against a recorded real-client capture*, not N
