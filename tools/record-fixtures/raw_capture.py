@@ -116,6 +116,11 @@ def capture_tcp(port: int, out_dir: pathlib.Path, prefix: str, count: int, timeo
     return got
 
 
+#: How often the HTTP accept loop wakes to notice that its handler threads have finished the
+#: capture. See `capture_http`'s loop for why an accept-shaped wait is not enough on its own.
+POLL_SECONDS = 0.25
+
+
 def capture_http(port: int, out_dir: pathlib.Path, prefix: str, count: int, timeout: float) -> int:
     # Stdlib only, on purpose: this runs in a bare `python:3.12-slim` with no `pip install` step,
     # same as the UDP/TCP modes (see this module's docstring and `script/record-fixtures`).
@@ -146,16 +151,32 @@ def capture_http(port: int, out_dir: pathlib.Path, prefix: str, count: int, time
         def do_POST(self) -> None:
             # A body this mode cannot capture verbatim is refused, never recorded empty. Chunked
             # transfer would have to be de-framed to be written out, and de-framing is exactly the
-            # re-encoding a recorded fixture exists to avoid; an absent Content-Length leaves no
-            # way to know where the body ends. Both would otherwise land a 0-byte `.bin`, answer
-            # `204` and count toward --count -- the silent empty-fixture outcome this module's
-            # docstring and `finish_capture` both promise cannot happen. `411 Length Required` is
-            # the status HTTP has for exactly this, and the request is *not* counted, so a run
-            # against such a producer times out and exits 1 rather than committing nothing.
-            length_header = self.headers.get("Content-Length")
+            # re-encoding a recorded fixture exists to avoid; an absent or unparseable
+            # Content-Length leaves no way to know where the body ends. All three would otherwise
+            # land a 0-byte `.bin`, answer `204` and count toward --count -- the silent
+            # empty-fixture outcome this module's docstring and `finish_capture` both promise
+            # cannot happen. (An unparseable one would not even get that far: `int()` would raise
+            # on this handler's own thread, and the sender would see a dropped connection with no
+            # status at all.) `411 Length Required` is the status HTTP has for exactly this, and
+            # the request is *not* counted, so a run against such a producer times out and exits 1
+            # rather than committing nothing.
+            why = None
+            length = 0
             encoding = self.headers.get("Transfer-Encoding")
-            if length_header is None or encoding:
-                why = f"Transfer-Encoding: {encoding}" if encoding else "no Content-Length"
+            length_header = self.headers.get("Content-Length")
+            if encoding:
+                why = f"Transfer-Encoding: {encoding}"
+            elif length_header is None:
+                why = "no Content-Length"
+            else:
+                try:
+                    length = int(length_header)
+                except ValueError:
+                    why = f"unparseable Content-Length: {length_header!r}"
+                else:
+                    if length < 0:
+                        why = f"negative Content-Length: {length_header!r}"
+            if why is not None:
                 print(
                     f"raw_capture: refusing a request from {self.client_address} -- {why};"
                     " this mode records a body verbatim or not at all",
@@ -171,7 +192,6 @@ def capture_http(port: int, out_dir: pathlib.Path, prefix: str, count: int, time
                 return
             # Exactly Content-Length bytes, straight to disk: no decoding, no decompression, no
             # re-encoding, so the fixture is the producer's bytes and nothing else.
-            length = int(length_header)
             body = self.rfile.read(length) if length else b""
 
             # Handlers run on their own threads, so the sequence number is claimed under the lock:
@@ -273,7 +293,14 @@ def capture_http(port: int, out_dir: pathlib.Path, prefix: str, count: int, time
                     file=sys.stderr,
                 )
                 break
-            server.timeout = remaining
+            # A short slice rather than the whole remaining budget, because `handle_request()` only
+            # returns on an accept or its own timeout -- it does not wake when a *handler thread*
+            # finishes the last request. A producer that sends all --count requests down one
+            # kept-alive connection and then goes quiet opens no further connection, so without
+            # this the loop would sit here until the overall deadline with the capture already
+            # complete. Re-checking `done` every POLL_SECONDS costs one wakeup per slice and bounds
+            # that wait instead.
+            server.timeout = min(POLL_SECONDS, remaining)
             server.handle_request()
     finally:
         server.server_close()

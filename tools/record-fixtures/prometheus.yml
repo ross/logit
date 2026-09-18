@@ -15,11 +15,13 @@
 # (the rsyslog/collectd producers' reason for mounting elsewhere and passing `-f`/`-C`).
 
 global:
-  # Short for the sample captures so a capture finishes in seconds; long for the metadata-only
-  # capture, where sparse scrapes are what keeps sample requests out of the way of the 1.0 sender's
-  # separate metadata requests. Prometheus staggers a target's first scrape by a hash-derived
-  # offset within the interval, so this is also the worst-case wait before anything is sent at all
-  # -- which is what sets the `start_capture` timeout in script/record-fixtures.
+  # Short, and the same for all three renderings: a capture should finish in seconds. It is a
+  # placeholder only because it was one when the metadata run relied on sparse scrapes to keep
+  # sample requests out of its way -- that run now drops every sample outright (see
+  # `write_relabel_configs` below), so nothing here depends on the interval any more. Prometheus
+  # staggers a target's first scrape by a hash-derived offset within this interval, which is part of
+  # the worst-case wait before anything is sent at all and hence part of why the `start_capture`
+  # timeout in script/record-fixtures is as generous as it is.
   scrape_interval: @@SCRAPE_INTERVAL@@
   scrape_timeout: 5s
   # One recognisable label on every remote-written series, the same trick collectd.conf's

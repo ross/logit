@@ -329,11 +329,19 @@ record_graphite() {
 # shape `record_collectd`'s two captures use, and for the same reason: each set has to be exactly
 # one thing, so a consuming test can name the file it means.
 #   prometheus-v1          -- remote-write 1.0 (`prometheus.WriteRequest`) sample requests.
-#   prometheus-v1-metadata -- 1.0 again, but with the sender's *separate* metadata requests turned
-#                             up (`metadata_config.send_interval: 1s`, against a 30s scrape) so a
-#                             `MetricMetadata`-only request lands quickly. The capture takes several
-#                             requests and the replay test picks the metadata-only one; nothing here
-#                             post-processes or hand-picks bytes, which would defeat the point.
+#   prometheus-v1-metadata -- 1.0 again, but every request a `MetricMetadata`-only one **by
+#                             construction**, not by luck: this run renders
+#                             `write_relabel_configs` as `action: drop` over `.*`, so no sample can
+#                             reach the wire at all, while 1.0 metadata -- which does not go through
+#                             `write_relabel_configs`, it comes from the scrape cache -- still ships
+#                             on `metadata_config.send_interval`. The replay test asserts all three
+#                             of these captures are metadata-only, so the recipe has to guarantee it
+#                             rather than win a race against the first scrape's sample batch.
+#                             Nothing here post-processes or hand-picks bytes, which would defeat
+#                             the point. That run also scrapes a small static target rather than
+#                             Prometheus's own `/metrics`, so the families it declares are exactly
+#                             the ones the sample captures carry -- see
+#                             tools/record-fixtures/prometheus-metadata-target.prom.
 #   prometheus-v2          -- remote-write 2.0 (`io.prometheus.write.v2.Request`), whose metadata
 #                             rides inline per series instead.
 # `protobuf_message` is set explicitly on all three, including the two 1.0 runs where 3.x would
@@ -347,10 +355,14 @@ record_graphite() {
 # `testdata/interop/README.md` budgets low single-digit KB per fixture and well under 100 KB for the
 # whole directory, and this corpus exercises decoder paths rather than being a dataset.
 #
-# 90s timeouts, matching `record_rsyslog`'s: the image is already local by the time a capture starts
-# (the `--version` run below pulls it), but Prometheus staggers a target's first scrape by a
-# hash-derived offset *within* `scrape_interval`, and nothing is remote-written before that first
-# scrape -- so the metadata run's 30s interval alone can account for half a minute of waiting.
+# 90s timeouts, matching `record_rsyslog`'s. The image is already local by the time a capture starts
+# (the `--version` run below pulls it) and every rendering scrapes on 5s, so a healthy run finishes
+# in a few seconds. The margin is for what happens before the first scrape rather than between
+# scrapes: container start plus TSDB and remote-write-WAL replay, Prometheus staggering a target's
+# first scrape by a hash-derived offset *within* `scrape_interval`, and -- on the metadata run --
+# `metadata_config`'s own first tick, with nothing remote-written until all of that has happened.
+# Generous on purpose: the cost of a timeout that is too short is a spuriously failed re-record, and
+# the cost of one that is too long is only that a genuinely broken run takes 90s to say so.
 record_prometheus() {
     echo "== recording: Prometheus remote-write (prom/prometheus:v3.14.0) =="
     local out="${OUT_ROOT}/prometheus"
