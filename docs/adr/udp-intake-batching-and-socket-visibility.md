@@ -282,16 +282,52 @@ branch would buy over letting the general case degrade to it. Non-Linux targets 
 `recv_from` loop unconditionally; `read_batch` still parses and validates there (so a config is
 portable across targets), and is documented as ignored.
 
-**Default 64 — provisional pending W4's sweep.** Telegraf's UDP reader and rsyslog's `imudp` both
-default their own batch-equivalent knob in the same rough range (rsyslog's reference high-throughput
-config sets `batchSize: 128`; gostatsd's `--receive-batch-size` defaults to 50), and 64 sits between
-them as a starting point, not a measured optimum for this codebase's own decode/queue costs.
+**Default 64 — confirmed by W4's sweep, and for a reason worth knowing.** Telegraf's UDP reader and
+rsyslog's `imudp` both default their own batch-equivalent knob in the same rough range (rsyslog's
+reference high-throughput config sets `batchSize: 128`; gostatsd's `--receive-batch-size` defaults to
+50), and 64 sat between them as a starting point. The sweep says it is past the knee for both shapes
+of traffic this family models, and that where the knee is has almost nothing to do with 64 itself.
 
-> **Evidence placeholder — W4.** The 16/32/64/128 sweep that either confirms or revises this default
-> is a W4 deliverable (`docs/plans/udp-intake.md`'s W4 row), run against the pinned `udp-statsd`
-> scenario once `recvmmsg` exists to sweep over. This section gets the sweep's numbers and the
-> resulting default (confirmed-64 or a revised value) filled in as part of that workstream; until
-> then, 64 is a reasoned starting point, not a measured one.
+`read_batch` ∈ {1, 16, 32, 64, 128, 256}, `--repeat 3`, pinned `--pin-sender 0,1 --pin-child 2,3`,
+each value set on both scenarios at once, everything else held (see "Pinned runs only" and the
+`powersave` caveat below — these are provisional numbers, not final ones):
+
+| `read_batch` | **`udp-statsd-small`** µs/ev | fill | kernel drop % | max rcvbuf | | **`udp-statsd`** µs/ev | fill | kernel drop % | max rcvbuf |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | **1.718** | 1.0 | **3.65%** | **0.98** | | 0.663 | 1.0 | 0.44% | 0.39 |
+| 16 | 1.107 | 3.2 | 0.00% | 0.05 | | 0.660 | 11.9 | 0.74% | 0.39 |
+| 32 | 0.979 | 3.6 | 0.00% | 0.01 | | 0.652 | 18.5 | 0.34% | 0.47 |
+| **64** | **1.128** | **3.1** | **0.00%** | **0.03** | | **0.648** | **24.2** | **0.44%** | **0.26** |
+| 128 | 1.117 | 3.0 | 0.00% | 0.06 | | 0.660 | 26.8 | 0.35% | 0.26 |
+| 256 | 1.112 | 3.7 | 0.00% | 0.04 | | 0.654 | 24.3 | 0.63% | 0.25 |
+
+Two things fall out of it. **The step is from 1 to "batched at all", not from 64 to 128.** On the
+single-datagram-per-packet scenario, `read_batch: 1` costs 1.72 µs/event, loses 3.65% of datagrams
+to the kernel and sits at 98% receive-buffer utilization; every value from 16 up delivers the whole
+paced load with a kernel drop rate of zero and a buffer that never gets above 6% full, at ~1.0-1.13
+µs/event. Between 16 and 256 the curve is flat — the 0.979 at 32 is a single low sample, not a
+trend, since 16, 64, 128 and 256 all land within 2% of each other.
+
+**And the `fill` column says why, which is the part worth carrying forward.** `fill` is
+`logit.input.datagrams / logit.input.reads`, the mean number of datagrams one syscall actually
+returned. On `udp-statsd-small` it is ~3 at every `read_batch` from 16 upward — at 760,000 datagrams
+a second the reader keeps up so comfortably that only about three datagrams are ever waiting when it
+asks. Raising the ceiling above the arrival burst cannot buy anything, which is exactly the shape
+the table shows. On `udp-statsd` (bigger, multi-line datagrams, more decode work per datagram) the
+fill climbs to ~24 and then plateaus there regardless of whether the ceiling is 64, 128 or 256.
+
+So 64 is chosen as the smallest power of two comfortably above both workloads' observed plateau,
+with the slab cost that implies (4 MiB of address space, a few hundred KiB resident — see below)
+rather than the 16 MiB/64 MiB a higher default would ask every listener to reserve for nothing. The
+knob still earns its place: a deployment whose fill sits pinned at 64 is telling its operator that
+its arrival bursts are larger than this default, and `docs/deploying.md` says so in those terms.
+
+**The slab is not resident, and the sweep is the proof.** `udp-statsd-small`'s peak RSS is
+**21.7 MiB at every one of `read_batch` 16, 32, 64, 128 and 256** — a sixteenfold change in the
+nominal size of the read slab (1 MiB to 16 MiB) with no movement in resident memory at all, because
+`vec![0u8; n]` under this codebase's jemalloc is a fresh zeroed mapping and a small datagram touches
+one 4 KiB page of each 65,507-byte slot. `docs/design/memory.md` §5 carries the direct probe
+alongside it.
 
 **Ceiling 1024 = `UIO_MAXIOV`.** `recvmmsg` takes an array of `mmsghdr`, each wrapping an `iovec`;
 `UIO_MAXIOV` (1024 on Linux) is the kernel's hard limit on how many `iovec`s a single vectored I/O
@@ -300,6 +336,17 @@ either be silently clamped by the kernel or rejected outright depending on call 
 above 1024 at config-validation time (new graph rule 57, alongside rule 18's existing `read_batch: 0`
 rejection) turns a kernel-dependent runtime surprise into a config-time error with a name attached
 to it.
+
+**`read_batch` larger than `receive.max_datagrams` is deliberately legal, and there is no rule
+against it.** It looks like it should be one — a single read whose batch cannot fit in the whole
+queue even when the queue is empty — but `push_many` already has a defined answer for exactly that
+case, per item, identical to what a sequence of single `push` calls would have done: evict or reject
+under `drop_oldest`/`drop_newest`, or wait for room under `block`. A validation rule here would refuse
+a configuration that works. It is worth naming, though, because it is the configuration that made a
+real bug visible: `push_many` under `block` originally notified `not_empty` only once its whole batch
+had landed, which with `max_datagrams < read_batch` and no flush timer left the reader waiting for
+room while the decoder waited for an item already sitting in the queue. Fixed in W3 (notify before
+each wait), and pinned end to end from the listener's own tests rather than only from the queue's.
 
 ### One `received_at` per syscall batch — a named accuracy concession
 
@@ -320,12 +367,29 @@ concession does not reintroduce: the stamp is still taken at receipt (of the bat
 **Headers rebuilt per call, not held across an await, so the read future stays `Send`.** The
 `mmsghdr`/`iovec` arrays `recvmmsg` needs are raw-pointer-bearing C structs; building them once and
 reusing them across calls would mean holding raw pointers into a buffer across the `.await` inside
-`socket.async_io(Interest::READABLE, ...)`, which is exactly the shape that forces an `unsafe impl
+`socket.async_io(...)`, which is exactly the shape that forces an `unsafe impl
 Send` or blocks compilation outright depending on how the pointers are held. Building the arrays
 fresh inside the `async_io` closure on every call — pure CPU, no allocation the buffer reuse doesn't
 already amortize — keeps the whole read path an ordinary `Send` future with no unsafe trait impl,
 matching this codebase's existing raw-fd precedent (`crates/logit-inputs/src/tail/watch.rs`'s
 `inotify` read: a `// SAFETY:` comment on the one `unsafe` block, no pointer held across an await).
+
+The implementation took one step further than this paragraph originally
+described, and the extra step is the load-bearing one. "Rebuilt per call" only settles *when* the
+structs are written; the storage they are written *into* still has to live somewhere, and a
+`Vec<libc::mmsghdr>` field on `BatchReader` would be `!Send` whether or not its contents are
+refreshed each call — the struct outlives the `.await` regardless. So the backing storage is
+`Vec<u64>`, plain integer words that the closure casts and writes the C structs into on each call
+(`BatchReader::hdr_words`/`iov_words`), with a compile-time assertion that `u64`'s alignment is at
+least the structs' own. That keeps the alloc-free reuse this paragraph claims *and* the `Send`-ness
+it claims, which storing the structs themselves would have made mutually exclusive. A compile-time
+`assert_send` on the read future pins the property next to the code that exists for it.
+
+**One correction to the call itself:** the interest is `READABLE | ERROR`, not `READABLE` alone.
+That is what `tokio::net::UdpSocket::recv_from` — the call this replaces — waits on internally, and
+for a good reason: a socket with only a pending error queued is not "readable" to the poller, so an
+arm registered for readability alone can fail to wake at all. Matching the interest the replaced
+call used keeps the failure behaviour identical rather than subtly narrower.
 
 ### `push_many`/`pop_many` live on `BoundedQueue` itself; `push`/`pop` untouched
 
@@ -361,6 +425,40 @@ today's implicit batch size (`read_batch`'s own default, 64) until W4 threads th
 through; `receive.latency` (arrival → dequeue) stays recorded per datagram inside the popped batch,
 not coarsened to a per-batch figure — the number that says whether event timestamps are trustworthy
 under load loses none of its resolution from this change.
+
+### The coop-budget question a batched read raises, and why it needed no answer
+
+`tokio` gives each task a cooperative-scheduling budget of 128 units per poll and every resource
+operation spends one — the property the "Sampling cadence" section above already turns on. A batched
+read changes the arithmetic underneath it: `read_loop` spends about three units per iteration (the
+syscall plus its two `shutdown.wait_for` arms) whether that iteration returned one datagram or
+sixty-four, so per *datagram* it now spends roughly forty times less budget than the `recv_from` loop
+did. Since `read_loop` and `decode_loop` are driven by **one** task — `run_until_shutdown`'s two-arm
+`select!`, deliberately, so the shutdown/drain ordering stays a local property — the obvious worry is
+that the read arm now runs far longer before a coop-`Pending` hands the poll to the decode arm,
+deepening the receive queue and inflating `logit.component.receive.latency`.
+
+It does not, and the reason is that the same arithmetic applies to the other arm. `decode_loop`'s
+per-iteration cost is also ~2 units per *batch* (one `pop_many`, one flush-deadline `Sleep`), because
+W3 batched the pop for the same reason W4 batched the read. Both sides got roughly forty times
+cheaper in budget per datagram at once, so their ratio — which is what fairness actually depends on —
+is unchanged. The outer `select!` is not `biased`, so tokio polls its two arms in a random order each
+time, which is what keeps a budget exhausted by one arm from systematically starving the other.
+
+Measured rather than argued, since the reasoning above would be easy to get wrong: **queue drops are
+zero in every run at every `read_batch` from 1 to 256**, so the queue never came close to its 10,000
+bound; and `logit.component.receive.latency` did not regress — on `udp-statsd-small` it *improved*
+(p50 64 µs → 55 µs, p99 ~190-410 µs → ~100-250 µs) and on `udp-statsd` it is unchanged within the
+run-to-run spread (p50 ~0.35-0.59 ms before, ~0.29-0.80 ms after). **No fairness yield was added** —
+no `consume_budget`/`yield_now` every N batches — because there is nothing in the measurements for
+one to fix, and an unmotivated yield in the hottest loop in the read path is a cost with no benefit
+behind it.
+
+What the batched read *did* move is peak RSS on the two large-datagram scenarios: `udp-statsd-packed`
+went from a tight 44.4-47.5 MiB across five repeats to 50.4-62.3 MiB. That is not the slab — the
+sweep holds RSS flat across a sixteenfold change in slab size — it is simply more datagram bytes in
+flight per turn of the loop. Worth recording, not worth acting on: the receive queue's own
+`max_bytes` bound (32 MiB by default) is what an operator sizes this with, and it was never reached.
 
 ### Cancellation of `push_many`: the remainder is dropped uncounted, ≤ `read_batch`, shutdown path only
 
@@ -545,12 +643,16 @@ ahead of evidence this same plan is about to produce.
   exits — see "Sampling cadence" above for why this is a new select, not a third arm of either
   existing one) and, on Linux, a `BatchReader` built on `recvmmsg(2)`. `crates/logit-inputs/src/tcp.rs`
   gains a `listen_queue` sample in its accept loop.
-- Six new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
+- Seven new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
   `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.limit`,
-  `.utilization` — see `docs/design/internal-telemetry.md`'s catalog once W1 lands.
-- New config field `read_batch: usize` (default 64, provisional pending W4's sweep) on
+  `.utilization` (all W1), and `logit.input.reads` (W4, the denominator that turns
+  `logit.input.datagrams` into a mean batch fill) — see `docs/design/internal-telemetry.md`'s
+  catalog.
+- New config field `read_batch: usize` (default 64, confirmed by W4's sweep) on
   `ReceiveConfig`/`UdpListenerConfig`; new graph rule 57 (reject `read_batch > 1024`), alongside
-  existing rule 18. `script/schema` regenerated in that commit.
+  rule 18 (reject `0`) and rule 17 (queue-only, so rejected by name on a stream or tail listener).
+  `script/schema` regenerated in that commit. `read_batch` also replaces W3's `DECODE_POP_BATCH`
+  stand-in, so one setting governs both ends of the receive queue.
 - `crates/logit-pipeline/src/queue.rs`: `BoundedQueue::push_many`/`pop_many`, additive; `push`/`pop`
   and every existing call site unchanged.
 - New `crates/logit-perf` module (`load.rs`) and a real-socket `Workload::Driven` scenario kind,
@@ -565,6 +667,13 @@ ahead of evidence this same plan is about to produce.
   `decoupled-listener-io.md` gains a `> **Revised by ...**` forward-pointer blockquote at those
   bullets and a bumped `updated` date, following the same convention `buffered-sink-delivery` used
   on `service-lifecycle-and-output-retry.md`.
-- The `read_batch` default (64) and the eventual `SO_REUSEPORT`/`UDP_GRO` decision both remain
-  explicitly open, pending W4's sweep and this plan's measurements respectively — not assumed by
-  anything built here.
+- The `SO_REUSEPORT`/`UDP_GRO` decision remains explicitly open, pending this plan's measurements —
+  not assumed by anything built here. The `read_batch` default is no longer open: W4's sweep
+  confirmed 64, and recorded that the flat part of the curve above ~16 is a property of the arrival
+  pattern rather than of the knob.
+- A question this work surfaced and did not answer: `read_loop` and `decode_loop` share one task, so
+  they interleave but never run on two cores at once. The coop-budget section above shows that
+  sharing is not currently costing anything measurable; whether *splitting* them would buy anything
+  is a separate question, and one that overlaps with `SO_REUSEPORT`'s own redesign of
+  `run_until_shutdown`'s two-arm select, the `&mut self.decoder` borrow and `Fanout` ownership.
+  Recorded in `docs/known-gaps.md` next to the `SO_REUSEPORT` entry rather than designed here.

@@ -1184,9 +1184,22 @@ are never faulted in**, so allocating the slab costs address space and a few ten
 allocator bookkeeping, not its nominal size. Resident cost then tracks what the traffic actually
 writes — one 4 KiB page per slot for any datagram up to 4 KiB, which is every statsd or syslog
 datagram in practice, so the default's realistic steady state is the ~256-308 KiB column rather than
-the 4 MiB one. (The numbers above are a direct probe under the release profile; the
-`udp-statsd-small` perf scenario's own `max_rss_bytes` moved by less than its run-to-run noise
-across this change, which is the same finding at the whole-process scale.)
+the 4 MiB one.
+
+The numbers above come from a direct probe under the release profile, and the whole-process
+measurement agrees with them by a stronger test than a before/after: across the `read_batch` sweep
+([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)),
+the `udp-statsd-small` scenario's peak RSS is **21.7 MiB at every one of `read_batch` 16, 32, 64, 128
+and 256** — the slab's nominal size changes sixteenfold, from 1 MiB to 16 MiB, and resident memory
+does not move at all. A slab that were really resident could not do that.
+
+**What *did* move, and is not the slab:** peak RSS on the two large-datagram scenarios
+(`udp-statsd`, `udp-statsd-packed`) rose by several MiB when the read became batched at all —
+`udp-statsd-packed` went from 44.4-47.5 MiB across five repeats to 50.4-62.3 MiB. It shows up at
+`read_batch: 16` and does not grow from there to 256, which is what rules the slab out as its cause:
+it is simply more datagram bytes in flight per turn of the read loop, at the ~1.4 KB datagram size
+those scenarios send. `receive.max_bytes` (32 MiB by default) is the bound that governs it, and it
+was never reached.
 
 Two consequences worth stating plainly. A deployment with many UDP listeners multiplies the
 *virtual* figure, which on a 64-bit host is free, and the resident one, which is not — a host agent
