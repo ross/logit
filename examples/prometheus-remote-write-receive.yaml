@@ -31,8 +31,16 @@ components:
     #   cert_file: server.pem     # resolved against this config file's directory
     #   key_file: server.key
     #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
-    # idle_timeout: 5m            # off by default -- bounds the quiet gap between requests on a
-    #                             # kept-alive connection (docs/adr/idle-connection-timeout.md)
+    # Off by default, and set here on purpose. It bounds the quiet gap between requests on a
+    # kept-alive connection (docs/adr/idle-connection-timeout.md, whose rule is "opt-in, but
+    # recommend it on wherever consistent traffic is expected" -- a remote-write listener is the
+    # definition of that: senders write on a fixed cadence, so a connection quiet for a minute is
+    # one that is not coming back). It also does a second job nothing else does: the bound on a
+    # request whose *body* stalls mid-upload is derived from this field, so leaving it off means a
+    # half-uploaded request holds one of the listener's 1024 connection permits until the sender
+    # goes away. Size it above the senders' longest normal gap; 60s is comfortable against
+    # Prometheus's own 30s default `remote_timeout`.
+    idle_timeout: 60s
     #
     # WHY THE CACHE IS NOT OPTIONAL FOR A 1.0 SENDER. Prometheus's own remote-write 1.0 sender
     # ships metric metadata in requests of its *own*, on its own schedule (`metadata_config`, once

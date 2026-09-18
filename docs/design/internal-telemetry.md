@@ -655,7 +655,10 @@ Worked examples, one per shipped component:
   "bad_request"}` (count, one per request — one class per row of the module doc's routes table, so
   `unsupported` is a `415` on `Content-Encoding` *or* `Content-Type`, `oversize` a `413` from either
   the compressed body or Snappy's declared decompressed length, and `timeout` a `408` from a body
-  that stopped arriving) and `logit.input.write.duration` (timing, one per request, every exit
+  that stopped arriving — **only reachable where `idle_timeout:` is set**, since the per-frame stall
+  bound is derived from it and it is off by default, so on a default `bind:` this class never fires
+  and a half-uploaded request holds its connection permit instead) and
+  `logit.input.write.duration` (timing, one per request, every exit
   included — which is why the count and the timer live in one wrapper around the routing itself).
   Deliberately this component's own scrape-side spelling rather than `otlp_in`'s, which has no
   request-level counters to mirror.

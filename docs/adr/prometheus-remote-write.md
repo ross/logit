@@ -292,7 +292,7 @@ misconfigured sender, not a tuning problem.
 | other method on `path` | `405` + `Allow: POST` |
 | missing or other `Content-Encoding`, missing or unrecognised `Content-Type` | `415` |
 | compressed body, or Snappy `decompress_len`, over `MAX_REQUEST_BYTES` | `413` |
-| a body that stops arriving mid-upload | `408`, and the connection closes |
+| a body that stops arriving mid-upload, **when `idle_timeout:` is set** | `408`, and the connection closes |
 | Snappy or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
 
 `204` is what the spec recommends for a successful write, and the batch is handed to the `Fanout`
@@ -310,9 +310,25 @@ a bug.
 A **missing `Content-Type` is a `415`, not a default**, where `otlp_in` treats an absent type as
 protobuf: `otlp_in` has a history of clients predating its JSON support, and remote-write has none —
 both specs require the header, so guessing 1.0 would turn a 2.0 sender's misconfiguration into a
-wall of protobuf decode errors instead of the one status the spec has for exactly this. And a body
-that *stalls* mid-upload gets `408` rather than being left to the whole-connection idle deadline,
-which would otherwise let a half-uploaded request hold its connection-limit permit indefinitely.
+wall of protobuf decode errors instead of the one status the spec has for exactly this.
+
+A body that *stalls* mid-upload gets `408` rather than being left to the whole-connection idle
+deadline — **but only where `idle_timeout:` is set**, because that field is where the bound comes
+from: the per-frame stall timer is derived from it, and a connection with no idle bound configured
+gets no per-frame one either
+(`crates/logit-inputs/src/prometheus.rs`'s `collect_with_stall_bound` call site). `idle_timeout:`
+defaults to **off**, so on a default `bind:` a half-uploaded request holds its
+[`MAX_CONCURRENT_CONNECTIONS`] permit until the sender goes away — 1024 of those and the listener
+stops accepting. [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s "opt-in, but
+recommend it on wherever consistent traffic is expected" applies squarely here: a remote-write
+listener is the definition of consistent traffic, so `docs/deploying.md`'s remote-write section
+recommends setting it and
+[`examples/prometheus-remote-write-receive.yaml`](../../examples/prometheus-remote-write-receive.yaml)
+ships with a real value rather than a commented-out one. Making the stall bound unconditional —
+independent of the idle field — would be the more thorough answer and is deliberately *not* done
+here: it would mean a second timeout constant on a listener whose timeouts an operator already
+configures in one place, and it is the shared `crates/logit-inputs/src/http.rs` helper's decision
+to change, not this kind's.
 
 The 2.0 `-Written` headers are set on both 2xx and 4xx, as 2.0 requires — zeros on a rejection, a
 1.0 request getting none at all since 1.0 defines none. They are the receiver's report of what it

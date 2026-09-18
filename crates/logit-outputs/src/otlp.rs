@@ -28,7 +28,7 @@
 //! | Connect refused, DNS failure (the request never reached anything) | `Clean` |
 //! | Request timeout | `Ambiguous` |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` |
-//! | Any HTTP 3xx | `Permanent` -- [`crate::http::build_client`] turns `reqwest`'s own `limited(10)` redirect policy off, so a redirect is reported against the URL the operator configured rather than followed. OTLP defines no redirect, and following one would break this table's premise that one request went to the configured endpoint: a `301`/`302`/`303` is replayed as a body-less `GET`, so whatever answers it becomes the verdict on a batch that was never written, and a `307`/`308` carries the operator's `headers:` to the `Location` host past rule 22's `https://` check |
+//! | Any HTTP 3xx | `Permanent` -- [`crate::http::build_client`] turns `reqwest`'s own `limited(10)` redirect policy off, so a redirect is reported against the URL the operator configured rather than followed. OTLP defines no redirect, and following one would break this table's premise that one request went to the configured endpoint: a `301`/`302`/`303` is replayed as a body-less `GET`, so whatever answers it becomes the verdict on a batch that was never written, and a `307`/`308` carries the operator's `headers:` to the `Location` host past rule 24's `https://` check |
 //! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED` | `Permanent` |
 //! | Any other gRPC status | `Permanent` (never retry a code this sink doesn't positively recognize) |
 //!
@@ -184,7 +184,7 @@ impl OtlpOutput {
     /// mutual TLS, or disabling verification entirely. A no-op if `settings` is empty: both
     /// transports already default to a working TLS configuration (the bundled Mozilla root set)
     /// for an `https://` endpoint without this ever being called.
-    /// `logit-pipeline::graph::resolve`'s rule 22 rejects a non-empty `tls:` on a non-`https://`
+    /// `logit-pipeline::graph::resolve`'s rule 24 rejects a non-empty `tls:` on a non-`https://`
     /// endpoint before this ever runs, and requires `cert_file`/`key_file` together -- this method
     /// still loads and validates every file itself, since `graph::resolve` never touches the
     /// filesystem.

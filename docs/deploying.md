@@ -1055,10 +1055,21 @@ components:
     type: prometheus_in
     bind: 127.0.0.1:9201
     path: /api/v1/write      # default; the route POSTs are accepted on
+    idle_timeout: 60s        # off by default -- set it, see below
     metadata_cache:          # what 1.0 metric types are remembered between requests
       max_families: 10000    #   0 turns the cache off entirely
       ttl: 10m
 ```
+
+**Set `idle_timeout:` on a remote-write receiver.** It is opt-in across every listener
+([ADR `idle-connection-timeout`](adr/idle-connection-timeout.md)), and its own rule — recommend it
+on wherever consistent traffic is expected — describes a remote-write listener exactly: senders
+write on a fixed cadence, so a connection quiet for a minute is a connection that is not coming
+back. It also does a second job here that nothing else does: the bound on a request whose **body
+stalls mid-upload** is derived from this field, so with `idle_timeout:` unset a half-uploaded
+request holds one of the listener's 1024 connection permits until the sender goes away, and the
+`408` the routes table describes never fires. Size it above the senders' longest normal gap;
+`60s` is comfortable for Prometheus's default `remote_timeout` of 30s.
 
 A Prometheus writing into that needs a `remote_write:` block of its own and nothing else — it is the
 sender, so no server-side flag is involved:

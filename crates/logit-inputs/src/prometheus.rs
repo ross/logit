@@ -116,7 +116,7 @@
 //! | any other method on `path` | `405` + `Allow: POST` |
 //! | missing or other `Content-Encoding`, unrecognised or missing `Content-Type` | `415` |
 //! | a body, or a Snappy `decompress_len`, over [`MAX_REQUEST_BYTES`] | `413` |
-//! | a body that stops arriving mid-upload | `408`, and the connection closes |
+//! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
 //! | Snappy or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
 //!
 //! **`405` is a deliberate divergence from `otlp_in`**, which answers `404` for a non-`POST`.
@@ -259,9 +259,15 @@
 //! `idle_timeout:` closes a connection that sits with no request in flight, via the shared
 //! tracker in [`crate::http`] -- `otlp_in`'s module doc holds the reasoning (why the clock is at
 //! the service rather than the socket, why it resets on request *completion*, and why the close is
-//! `graceful_shutdown` plus a bounded grace rather than a drop). A request whose *body* stalls
-//! gets the narrower per-frame bound instead and answers `408`. There is no listener-level
-//! graceful shutdown here or anywhere else in this repo: shutdown is per connection.
+//! `graceful_shutdown` plus a bounded grace rather than a drop). A request whose *body* stalls gets
+//! the narrower per-frame bound instead and answers `408` -- **derived from the same field, so it
+//! exists only where `idle_timeout:` is set.** It is off by default, and a default `bind:`
+//! therefore has no bound on a half-uploaded request at all: it holds its
+//! [`MAX_CONCURRENT_CONNECTIONS`] permit until the sender goes away. Set it on any listener a real
+//! fleet writes to ([ADR `idle-connection-timeout`](../../../docs/adr/idle-connection-timeout.md)'s
+//! "recommend it on wherever consistent traffic is expected"; `examples/prometheus-remote-write-receive.yaml`
+//! ships a value). There is no listener-level graceful shutdown here or anywhere else in this
+//! repo: shutdown is per connection.
 //!
 //! ## Security posture
 //!
@@ -1540,6 +1546,11 @@ async fn write_response(
         // applies no deadline while a request is in flight, so without this bound a half-uploaded
         // request would hold its connection-limit permit forever; the connection closes once this
         // response is out rather than waiting for the whole-connection deadline.
+        //
+        // Reachable only where `idle_timeout:` is set: `stall` is derived from it, and a connection
+        // with no idle bound configured gets no per-frame one either. `idle_timeout:` is off by
+        // default, so a default `bind:` has no stall bound at all -- the module doc's routes table
+        // and the ADR both say so, and the shipped example sets a value.
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
             let message = format!("request body stalled for {stall:?}");
