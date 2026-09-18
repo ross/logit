@@ -95,11 +95,38 @@ running count with no accompanying buffer-occupancy context, so it would need `S
 procfs) alongside it anyway to explain *why* drops are happening, not just that they are. `SO_MEMINFO`
 alone gives both, from a call site that isn't the hot path.
 
-`SK_MEMINFO_*` field indices into `SO_MEMINFO`'s returned array, and `SO_MEMINFO` itself if libc
-0.2.189 (the version already in `Cargo.lock`) doesn't define it, are declared locally in the new
-`sockstat` module with a comment citing the kernel header they come from — no new crate dependency,
-matching how this codebase already prefers a small `libc::` constant with a citation over pulling in
-a crate for one syscall.
+No new crate dependency either way. This ADR originally anticipated declaring `SO_MEMINFO` and the
+`SK_MEMINFO_*` field indices locally with a header citation, in case libc 0.2.189 (the version
+already in `Cargo.lock`) lacked them; **it does not** — that version exports `SO_MEMINFO` and all
+nine `SK_MEMINFO_*` indices, and `sockstat` uses `libc::`'s own constants for them. The one constant
+that genuinely is not in libc for Linux is `TCP_LISTEN` (only its Hurd module defines one), so that
+single value is declared locally with a comment citing `include/net/tcp_states.h` — which is the
+codebase convention this paragraph was reaching for: a small local constant with a citation over a
+crate for one syscall.
+
+### `sockstat` lives in `logit-pipeline`
+
+Three crates could hold it, and two of them are wrong for reasons worth recording.
+
+Not **`logit-inputs`**, where the only caller lives today: `logit-outputs` is the foreseeable second
+consumer (a UDP sink's own `sk_drops`, a TCP sink's send-side fill), and an output crate must not
+depend on an input crate to read a socket counter.
+
+Not **`logit-core`**, which is where this ADR first put it on the strength of that same argument.
+That crate's own doc says "no I/O, no pipeline, no protocol codecs live here," and
+[`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s "Crate layout" section leans on
+that sentence explicitly ("weakening that would blur a boundary the crate exists to hold") when it
+places socket-level mechanics — the `SO_RCVBUF` setsockopt, the `recv_from` loop — outside it. A raw
+`getsockopt` plus a `libc` dependency would have been the first I/O in a crate that says it has
+none, and neither text would have been true any more.
+
+**`logit-pipeline`** satisfies the original requirement without that cost: both impl crates already
+depend on it, it is where the generic, protocol-free machinery already lives (`BoundedQueue`,
+`BatchAccumulator`, `Fanout`), and it already performs real I/O without claiming otherwise —
+`disk_queue.rs` writes and fsyncs segment files. The split with `logit-inputs` is the one that crate
+boundary already draws everywhere else: fd-level *readings* any component could want live in
+`logit-pipeline`; opening the socket, sizing it and reading datagrams off it stay in
+`logit-inputs::udp`/`tcp`.
 
 ### TCP listeners: `TCP_INFO` on the `LISTEN` socket, same PR
 
@@ -137,7 +164,7 @@ than folded in:
   metrics catalog that already has a convention (`docs/design/internal-telemetry.md`'s "Why this
   exists") of learning what matters by running the thing rather than exposing everything a syscall
   happens to return. Of the remaining five, `SockMeminfo` reads all of `RMEM_ALLOC`/`RCVBUF`/
-  `WMEM_ALLOC`/`SNDBUF`/`DROPS` (`crates/logit-core/src/sockstat.rs`) — but W1 only emits `DROPS`/
+  `WMEM_ALLOC`/`SNDBUF`/`DROPS` (`crates/logit-pipeline/src/sockstat.rs`) — but W1 only emits `DROPS`/
   `RMEM_ALLOC`/`RCVBUF` as metrics. `WMEM_ALLOC`/`SNDBUF` are carried on the struct for a future
   sink-side consumer rather than read and then discarded; they're not emitted here because that's
   exactly the send-buffer visibility the bullet above rules out building today, on the sink side —
@@ -207,16 +234,20 @@ component-specific detail nothing generic could know), the new points are:
   drains it (`mem::take` on each drain window, `docs/design/internal-telemetry.md`'s buffer
   section) — a bind-only gauge would otherwise read as "vanished" after one window rather than
   "unchanged."
-- `logit.input.accept_queue.depth` / `.utilization` (gauge) — `TCP_INFO`'s `tcpi_unacked` over
-  `tcpi_sacked`, sampled on the same cadence, plus once in the accept loop right before each
-  `accept()` so an idle listener that never accepts still reports a value.
+- `logit.input.accept_queue.depth` / `.limit` / `.utilization` (gauge) — `TCP_INFO`'s
+  `tcpi_unacked`, `tcpi_sacked`, and the first over the second, sampled on the same cadence, plus
+  once in the accept loop right before each `accept()` so an idle listener that never accepts still
+  reports a value. `.limit` is re-emitted each tick for the same `mem::take` reason
+  `receive_buffer.bytes` is, and is a gauge in its own right rather than left implicit in the ratio:
+  an operator deciding whether to raise `net.core.somaxconn` needs the ceiling itself, and backing
+  it out of `depth / utilization` is undefined at the depth of 0 an idle listener always reports.
 
-All five are `logit.input.*`, not `logit.component.*` — they're genuinely impl-known, the same
+All six are `logit.input.*`, not `logit.component.*` — they're genuinely impl-known, the same
 reasoning `internal-telemetry.md` already gives for the pre-existing `logit.input.datagrams`/
 `.datagram.bytes` arrival counters and `receive_buffer.bytes`/`.requested.bytes`: nothing generic in
 the runtime can see a socket's kernel-side state, only the listener impl holding the fd can.
 
-`kernel` appears in exactly one of the five names, `logit.input.kernel.drops`, and deliberately not
+`kernel` appears in exactly one of the six names, `logit.input.kernel.drops`, and deliberately not
 in the others, for the same reason `internal-telemetry.md` already gives for keeping *userspace*
 drops (`logit.component.datagrams.dropped{reason=...}`, `ReceiveQueue` eviction) unqualified: an
 operator alerting on data loss shouldn't have to union namespaces, but a drop `logit` counted itself
@@ -467,7 +498,8 @@ ahead of evidence this same plan is about to produce.
 
 ## Consequences
 
-- New `crates/logit-core/src/sockstat.rs` (Linux-gated `libc` dep on `logit-core`):
+- New `crates/logit-pipeline/src/sockstat.rs` (Linux-gated `libc` dep on `logit-pipeline` — see
+  "`sockstat` lives in `logit-pipeline`" above for why not `logit-core` or `logit-inputs`):
   `SockMeminfo { rmem_alloc, rcvbuf, wmem_alloc, sndbuf, drops }`, `meminfo(RawFd) -> Option<_>`,
   `listen_queue(RawFd) -> Option<(u32, u32)>`, a wrap-safe `DropCounter::delta`. Non-Linux twins
   return `None`/0.
@@ -476,9 +508,9 @@ ahead of evidence this same plan is about to produce.
   exits — see "Sampling cadence" above for why this is a new select, not a third arm of either
   existing one) and, on Linux, a `BatchReader` built on `recvmmsg(2)`. `crates/logit-inputs/src/tcp.rs`
   gains a `listen_queue` sample in its accept loop.
-- Five new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
-  `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.utilization` — see
-  `docs/design/internal-telemetry.md`'s catalog once W1 lands.
+- Six new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
+  `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.limit`,
+  `.utilization` — see `docs/design/internal-telemetry.md`'s catalog once W1 lands.
 - New config field `read_batch: usize` (default 64, provisional pending W4's sweep) on
   `ReceiveConfig`/`UdpListenerConfig`; new graph rule 57 (reject `read_batch > 1024`), alongside
   existing rule 18. `script/schema` regenerated in that commit.

@@ -537,10 +537,12 @@ On a **TCP** listener there is no receive queue and no kernel receive buffer to 
 flow control is the backpressure), but there is an accept queue, and it has the same shape of
 problem:
 
-- `logit.input.accept_queue.depth` / `.utilization` (gauges, Linux only) — connections that have
-  completed their TCP handshake and are waiting for this listener to accept them, against the
-  backlog ceiling the kernel enforces. Sampled before each accept and once a second while waiting,
-  so an idle listener still reports. A depth that is anything but near-zero means connections are
+- `logit.input.accept_queue.depth` / `.limit` / `.utilization` (gauges, Linux only) — connections
+  that have completed their TCP handshake and are waiting for this listener to accept them, the
+  backlog ceiling the kernel enforces, and the first as a fraction of the second. Sampled before
+  each accept and once a second while waiting, so an idle listener still reports. `.limit` is
+  reported on its own so you can see what `listen(2)` actually got after `net.core.somaxconn`
+  clamped it, without having to back it out of the ratio. A depth that is anything but near-zero means connections are
   arriving faster than they're being accepted; a utilization approaching 1.0 means the kernel is
   about to start refusing new connections outright, which a client sees as a connect timeout or a
   reset with nothing in `logit`'s own logs to explain it. Sustained pressure here is usually

@@ -181,7 +181,7 @@ already built that have a known, accepted rough edge.
   A listener's `ReceiveQueue` ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md),
   directly above) always counted every datagram *it* dropped; a datagram the kernel discarded
   before `recv_from` could return it was invisible to `logit` entirely, which left the one loss
-  path nothing could attribute to a component. `logit_core::sockstat` now reads the kernel's own
+  path nothing could attribute to a component. `logit_pipeline::sockstat` now reads the kernel's own
   per-socket counters straight off the listener's fd, once a second and once more after the read
   loop stops, and reports `logit.input.kernel.drops` (a count) alongside
   `logit.input.receive_buffer.used.bytes` / `.utilization` (gauges) — the fill level that says
@@ -194,7 +194,7 @@ already built that have a known, accepted rough edge.
   make genuinely ambiguous — and it returns the receive buffer's fill in the same call. **And the
   same helper covers TCP listeners**: `getsockopt(TCP_INFO)` on a socket in `LISTEN` aliases
   `tcpi_unacked`/`tcpi_sacked` onto the accept queue's depth and its backlog ceiling, reported as
-  `logit.input.accept_queue.depth` / `.utilization` by every stream input (`syslog_in`,
+  `logit.input.accept_queue.depth` / `.limit` / `.utilization` by every stream input (`syslog_in`,
   `graphite_in`, TCP `statsd_in`, `logit_in`, `otlp_in`, `prometheus_in`'s remote-write receiver).
   The note this entry ended on still holds: almost nothing in the field does either in-process —
   syslog-ng, rsyslog, Telegraf and gostatsd all tell operators to run `netstat -su`/`ss -u`

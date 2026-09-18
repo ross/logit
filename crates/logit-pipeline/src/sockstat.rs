@@ -12,10 +12,23 @@
 //! approximates. `SK_MEMINFO_DROPS` is the same `sk->sk_drops` that procfs's `drops` column
 //! prints, so the two agree by construction.
 //!
-//! **Crate placement.** `logit-core`, not `logit-inputs`: `logit-outputs` is the foreseeable
-//! second consumer (a UDP sink's own `sk_drops` and send-buffer fill), and nothing here knows
-//! anything about a listener, a datagram, or a pipeline -- it is a thin, typed reading of four
-//! `getsockopt` options, in the same spirit as the rest of this crate's platform-free helpers.
+//! **Crate placement.** `logit-pipeline`, and the reasoning is worth keeping because two other
+//! crates look like better fits until you check them. Not `logit-inputs`, where the only caller
+//! lives today: `logit-outputs` is the foreseeable second consumer (a UDP sink's own `sk_drops`,
+//! a TCP sink's send-side fill), and an output crate must not depend on an input crate to read a
+//! socket counter. Not `logit-core` either, which is where an earlier draft put it for exactly
+//! that reason -- that crate's own doc says "no I/O, no pipeline, no protocol codecs live here,"
+//! and `docs/design/pipeline-graph.md`'s "Crate layout" section leans on that sentence when it
+//! puts socket-level mechanics outside it; a raw `getsockopt` and a `libc` dependency are the
+//! first things that would have contradicted both. `logit-pipeline` is where the generic,
+//! protocol-free machinery already lives (`BoundedQueue`, `BatchAccumulator`, `Fanout`), both
+//! impl crates already depend on it, and it already performs real I/O without claiming otherwise
+//! (`disk_queue.rs` writes and fsyncs segment files). Nothing here knows about a listener, a
+//! datagram or a node -- it is a thin, typed reading of two `getsockopt` options over a raw fd.
+//!
+//! The division of labour with `logit-inputs` is the same one this crate draws everywhere else:
+//! fd-level *readings* that any component could want are here; opening the socket, setting
+//! `SO_RCVBUF` on it and reading datagrams off it stay in `logit-inputs::udp`/`tcp`.
 //!
 //! **Everything here is Linux-only, and says so by returning `None`.** Each function has a
 //! non-Linux twin with an identical signature that reports nothing, so a caller never needs a

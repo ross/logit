@@ -21,8 +21,8 @@
 //! `Registry` drain, nothing queue-shaped. Don't generalize this module toward it.
 
 use bytes::Bytes;
-use logit_core::sockstat;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
 use logit_proto::Decoder;
@@ -547,6 +547,13 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// that result. The socket is still open at that point (it is owned by `run_until_shutdown`, which
 /// outlives this future), so the counters are still readable.
 ///
+/// **Once the sampler has disabled itself, no timer is armed at all** and this is exactly
+/// [`read_loop`]. That is the other half of `sockstat`'s "report once and stop asking": a listener
+/// on a non-Linux build (or a kernel without `SO_MEMINFO`) would otherwise wake once a second,
+/// forever, to call a function that returns immediately -- a cost this would have added to every
+/// idle listener on those platforms in exchange for nothing. The final sample still runs in that
+/// state, where it is a no-op.
+///
 /// Sampling is synchronous and inline -- one `getsockopt` on an fd this process owns, which is a
 /// bounded read of kernel memory with no I/O wait, so `spawn_blocking` would cost more than the
 /// call it wrapped.
@@ -557,11 +564,34 @@ async fn read_loop_sampled(
     diag: Diagnostics,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
+    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
+    read_loop_sampled_with(sampler, socket, queue, telemetry, shutdown).await
+}
+
+/// [`read_loop_sampled`] with the sampler supplied rather than built from `socket` -- split out for
+/// exactly the reason [`bind_first_available`] is: it is the only way to drive the *disabled*
+/// sampler's path (the non-Linux shape, unreachable on the Linux this is tested on) from a test.
+async fn read_loop_sampled_with(
+    mut sampler: ReceiveBufferSampler,
+    socket: &tokio::net::UdpSocket,
+    queue: Arc<ReceiveQueue>,
+    telemetry: Telemetry,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut read = std::pin::pin!(read_loop(socket, queue, telemetry, shutdown));
     let result = loop {
         sampler.sample_once();
+        if !sampler.enabled {
+            break (&mut read).await;
+        }
+        // `biased`: the read loop finishing always beats a tick that is due. Draining the socket
+        // (and, at the end, reporting cleanly) is the work; the sample only describes it. Nothing
+        // is starved by the ordering -- `read_loop` is one long-lived future that returns `Pending`
+        // whenever it parks, which is what lets the timer arm be polled at all, and one poll is all
+        // a due timer needs. It also makes the guaranteed final sample below the one that reports a
+        // shutdown's last drops, rather than an already-due tick racing it for them.
         tokio::select! {
+            biased;
             result = &mut read => break result,
             () = tokio::time::sleep(KERNEL_SAMPLE_INTERVAL) => {}
         }
@@ -578,7 +608,7 @@ async fn read_loop_sampled(
 /// syscall per second forever in exchange for nothing. One `warn` says so, once.
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
-    /// descriptors at all, where [`logit_core::sockstat`] reports nothing anyway. Safe to hold as
+    /// descriptors at all, where [`logit_pipeline::sockstat`] reports nothing anyway. Safe to hold as
     /// a bare fd rather than a borrow: this sampler is created and dropped inside
     /// [`read_loop_sampled`], whose `socket` argument outlives it.
     fd: Option<sockstat::RawFd>,
@@ -599,7 +629,7 @@ impl ReceiveBufferSampler {
         }
     }
 
-    /// One `getsockopt`, and the three metrics it feeds.
+    /// One `getsockopt`, and the four metrics it feeds.
     ///
     /// `logit.input.kernel.drops` is reported only when the delta is nonzero, matching how every
     /// other loss counter here behaves (`logit.component.datagrams.dropped` does not emit a zero
@@ -1366,11 +1396,19 @@ mod tests {
     /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
     /// last fraction of a second before the reader stops are still reported.
     ///
-    /// Constructed so that the interval sampler provably cannot be the one that sees them. The
-    /// future is polled exactly once up front -- which takes the first sample (of a socket nothing
-    /// has sent to yet: zero drops) and parks `read_loop` -- and then is not polled again at all
-    /// while the overrun happens, because it is a plain local future, not a spawned task. The one
-    /// remaining sample is the final one, taken after `read_loop` has returned.
+    /// Constructed so the interval sampler is not the one that sees them. Two things arrange that,
+    /// and it is worth being precise about which is a guarantee and which is not. The future is
+    /// polled exactly once up front -- taking the first sample, of a socket nothing has sent to
+    /// yet, and parking `read_loop` -- and is then not polled *at all* while the overrun happens,
+    /// because it is a plain local future rather than a spawned task: no interval sample can occur
+    /// during the blast, and that part is absolute. On the resume after `shutdown` fires, the
+    /// wrapper's `select!` is `biased` toward the read arm, so `read_loop` completing (which it
+    /// does immediately, shutdown already being signalled) is preferred over an interval tick that
+    /// has come due meanwhile -- which is what leaves the final sample as the one that reports the
+    /// drops. That preference is an ordering, not a proof: if the blast ever took longer than
+    /// `KERNEL_SAMPLE_INTERVAL` *and* `read_loop` parked at least once on the way out, a tick could
+    /// still slip in first. The assertion below is on the total either way, so the test is not
+    /// sensitive to that; only this rationale is.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_final_sample_reports_drops_that_happened_just_before_shutdown() {
@@ -1422,6 +1460,62 @@ mod tests {
             kernel_drops(&registry.drain(0)) > 0.0,
             "drops taken after the last interval sample must still be reported -- that is what \
              the guaranteed final sample is for"
+        );
+    }
+
+    /// A sampler with nothing to read latches itself off on its very first call -- the state
+    /// [`read_loop_sampled_with`] checks before arming its interval timer, and the reason a
+    /// listener on a platform without these counters goes back to parking instead of waking once a
+    /// second forever.
+    #[test]
+    fn a_sampler_that_cannot_read_the_counters_disables_itself_on_the_first_sample() {
+        let mut sampler = ReceiveBufferSampler {
+            // The non-Linux shape: `sockstat::fd_of` has no descriptor to hand back.
+            fd: None,
+            drops: sockstat::DropCounter::new(),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+            enabled: true,
+        };
+        assert!(sampler.enabled, "a fresh sampler always tries once");
+        sampler.sample_once();
+        assert!(!sampler.enabled, "one failed read is enough -- these counters never appear later");
+        sampler.sample_once(); // still a harmless no-op, which is what the final sample relies on
+        assert!(!sampler.enabled);
+    }
+
+    /// The disabled path end to end: with no timer armed at all, `read_loop_sampled_with` is
+    /// exactly `read_loop`, and must still forward its result and leave the queue closed behind it
+    /// -- the shape every non-Linux build runs, and one no Linux CI run would otherwise exercise.
+    #[tokio::test]
+    async fn a_disabled_sampler_still_reads_and_closes_the_queue() {
+        let socket = bind_ephemeral().await;
+        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        // Already signalled, so `read_loop` returns on its first poll and this test needs no timer
+        // of its own -- which is also what would hang it if a disabled sampler still armed one and
+        // this assertion depended on the clock. It doesn't; the point is the result and the close.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let sampler = ReceiveBufferSampler {
+            fd: None,
+            drops: sockstat::DropCounter::new(),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+            enabled: true,
+        };
+
+        read_loop_sampled_with(
+            sampler,
+            &socket,
+            Arc::clone(&queue),
+            Telemetry::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("a disabled sampler must not change how the read loop reports its result");
+
+        assert!(
+            queue.pop().await.is_none(),
+            "the queue must still be closed on the way out -- that is what lets decode_loop finish"
         );
     }
 
