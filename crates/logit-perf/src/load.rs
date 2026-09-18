@@ -74,35 +74,57 @@ const SEND_BATCH: usize = 64;
 /// catch that.
 const MAX_CONSECUTIVE_SEND_ERRORS: u64 = 100_000;
 
-/// How many `ECONNREFUSED`s the whole blast tolerates before concluding nothing is listening.
+/// How many `ECONNREFUSED`s **one blast** tolerates, across every sender thread, before concluding
+/// nothing is listening.
 ///
 /// Counted in total, not consecutively, precisely because the pending-error semantics above make
 /// "consecutive" meaningless here. Between the child's `ready` line and its shutdown a connected
 /// sender should see *no* port-unreachable at all; a couple are conceivable from an ICMP in flight
 /// from before the bind, so the threshold is low but not one. A steady stream of them is a socket
 /// that closed or a port nothing ever bound.
+///
+/// **Shared across the sender threads, not per thread.** A per-thread counter would make the real
+/// tolerance `MAX_CONNECTION_REFUSED × threads` -- 128 for every spec that ships, which run
+/// `threads: 2` -- while the number here, and the message quoting it, said otherwise. The threads
+/// share one [`AtomicU64`](std::sync::atomic::AtomicU64) so the documented total is the actual
+/// total. The check is `fetch_add`-then-test, so two threads crossing the line together can push
+/// the reported count up to `MAX_CONNECTION_REFUSED + threads` before the first one returns; that
+/// is the bound, and the test asserts it.
 const MAX_CONNECTION_REFUSED: u64 = 64;
 
-/// A flag the sender reads between `sendmmsg` batches to decide whether to stop early.
+/// A one-shot "stop, and here's why" channel the sender polls between `sendmmsg` batches.
 ///
-/// The case it exists for is the process under test dying mid-blast: `crate::run` sets it from the
-/// child's own stderr reaching EOF, which happens when the child exits. Without it the sender
-/// cheerfully finishes a multi-second blast into a socket whose peer is gone (see
-/// [`MAX_CONSECUTIVE_SEND_ERRORS`] for why the errno path does not notice), and the run fails much
-/// later with a confusing accounting mismatch instead of "the child died".
+/// The case it exists for is the process under test dying mid-blast: `crate::run` fills it when the
+/// child's own stderr ends. Without it the sender cheerfully finishes a multi-second blast into a
+/// socket whose peer is gone (see [`MAX_CONSECUTIVE_SEND_ERRORS`] for why the errno path does not
+/// notice), and the run fails much later with a confusing accounting mismatch instead of "the child
+/// died".
 ///
-/// `&AtomicBool` rather than a closure so it costs one relaxed load per 64 datagrams and is
-/// trivially `Sync` across the scoped sender threads.
+/// A `OnceLock<String>` rather than a flag plus a fixed message, because the two things worth
+/// distinguishing -- the child exiting, and this harness failing to read its stderr -- are not
+/// known until the moment one of them happens. It is also the flag: `get()` being `Some` *is* the
+/// abort, so there is one piece of shared state rather than two that could disagree. `get()` is a
+/// relaxed atomic load on the fast path, which is what makes it cheap enough to poll per batch.
 #[derive(Clone, Copy)]
 pub struct Abort<'a> {
-    pub flag: &'a std::sync::atomic::AtomicBool,
-    /// What to say when it fires -- the caller knows what it is watching, the sender doesn't.
-    pub reason: &'a str,
+    pub cause: &'a std::sync::OnceLock<String>,
 }
 
-impl Abort<'_> {
-    fn fired(&self) -> bool {
-        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+/// The two ways a blast gives up before sending everything it was asked to, bundled because both
+/// are shared across the sender threads and both are read on the same hot path.
+#[derive(Clone, Copy)]
+struct StopConditions<'a> {
+    /// The process under test went away -- see [`Abort`].
+    abort: Option<Abort<'a>>,
+    /// `ECONNREFUSED`s so far, across every thread -- see [`MAX_CONNECTION_REFUSED`].
+    refused: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<'a> Abort<'a> {
+    /// The cause, once there is one. Borrowed from the shared `OnceLock` (`'a`), not from `self`,
+    /// so a caller can hold the reason after the `Abort` copy it came from has gone out of scope.
+    fn fired(&self) -> Option<&'a str> {
+        self.cause.get().map(String::as_str)
     }
 }
 
@@ -923,6 +945,12 @@ pub fn blast(
     let per_thread = spec.datagrams / spec.threads as u64;
     let remainder = spec.datagrams % spec.threads as u64;
 
+    // Shared across the sender threads, not one per thread: `MAX_CONNECTION_REFUSED`'s own doc has
+    // why the distinction matters, and what it used to get wrong. Borrowed, not moved, so every
+    // thread increments the same counter.
+    let refused = std::sync::atomic::AtomicU64::new(0);
+    let stop = StopConditions { abort, refused: &refused };
+
     let started = Instant::now();
     let outcomes: Vec<anyhow::Result<LoadOutcome>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(spec.threads);
@@ -942,7 +970,7 @@ pub fn blast(
                         format!("pinning sender thread {thread_index} to CPUs {pin}")
                     })?;
                 }
-                send_block(&plan.ring, &mine, start, count, rate, plan.target, abort)
+                send_block(&plan.ring, &mine, start, count, rate, plan.target, stop)
             }));
         }
         handles.into_iter().map(|handle| handle.join().expect("sender thread panicked")).collect()
@@ -988,13 +1016,12 @@ fn send_block(
     count: u64,
     rate: Option<f64>,
     target: SocketAddr,
-    abort: Option<Abort<'_>>,
+    stop: StopConditions<'_>,
 ) -> anyhow::Result<LoadOutcome> {
     let mut outcome = LoadOutcome::default();
     if count == 0 {
         return Ok(outcome);
     }
-    let mut refused = 0u64;
     // SAFETY: both are plain C aggregates of integers and pointers with no validity invariants
     // beyond "some bit pattern"; every field that `sendmmsg` reads is overwritten below before the
     // call, and an all-zero `msghdr` is the documented starting point for one.
@@ -1008,14 +1035,11 @@ fn send_block(
     while done < count {
         // Once per batch -- one relaxed load per 64 datagrams, which is nothing next to the
         // syscall it precedes.
-        if let Some(abort) = abort {
-            if abort.fired() {
-                bail!(
-                    "stopped after {} of {count} datagrams to {target}: {}",
-                    outcome.sent_datagrams,
-                    abort.reason
-                );
-            }
+        if let Some(cause) = stop.abort.and_then(|abort| abort.fired()) {
+            bail!(
+                "stopped after {} of {count} datagrams to {target}: {cause}",
+                outcome.sent_datagrams,
+            );
         }
         let batch = SEND_BATCH.min((count - done) as usize);
         for slot in 0..batch {
@@ -1098,15 +1122,14 @@ fn send_block(
                 // in total across the whole blast instead. See `MAX_CONNECTION_REFUSED`.
                 Some(libc::ECONNREFUSED) => {
                     outcome.send_errors += 1;
-                    refused += 1;
-                    if refused > MAX_CONNECTION_REFUSED {
+                    let total = stop.refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if total > MAX_CONNECTION_REFUSED {
                         return Err(anyhow::Error::new(err)).with_context(|| {
                             format!(
-                                "nothing is listening on {target}: {refused} ICMP \
-                                 port-unreachable errors after {} datagrams. A connected UDP \
-                                 socket reports these one send late, so the count is the signal, \
-                                 not any single failure",
-                                outcome.sent_datagrams
+                                "nothing is listening on {target}: {total} ICMP \
+                                 port-unreachable errors across all sender threads. A connected \
+                                 UDP socket reports these one send late, so the count is the \
+                                 signal, not any single failure"
                             )
                         });
                     }
@@ -1554,12 +1577,50 @@ mod tests {
         assert!(err.contains(&target.to_string()), "{err}");
     }
 
+    /// The refusal budget is the **blast's**, not each thread's. With a per-thread counter the real
+    /// tolerance was `MAX_CONNECTION_REFUSED × threads` -- 128 for every shipped spec, since they
+    /// all run `threads: 2` -- while the constant and the message quoting it both said 64.
+    #[test]
+    fn the_connection_refused_budget_is_shared_across_sender_threads() {
+        let target = {
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+
+        let mut spec = spec(vec![single()]);
+        spec.datagrams = 100_000;
+        spec.ring_datagrams = 64;
+        spec.sockets = 2;
+        spec.threads = 2;
+        let ring = Ring::render(&spec, &model(&[(1, "shared.{seq%4}:1|c")])).unwrap();
+        let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
+
+        let err = format!("{:#}", blast(&plan, None, None).expect_err("nothing is listening"));
+        assert!(err.contains("nothing is listening on"), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+        assert!(err.contains("across all sender threads"), "{err}");
+
+        // The reported total is the documented one, not a multiple of it. Both threads can cross
+        // the line before either returns, so the bound is `MAX + threads`, not `MAX + 1`.
+        let total: u64 = err
+            .split(&format!("{target}: "))
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("the message quotes the total")
+            .parse()
+            .expect("...as a number");
+        assert!(
+            (MAX_CONNECTION_REFUSED + 1..=MAX_CONNECTION_REFUSED + 2).contains(&total),
+            "gave up at {total}, expected just past {MAX_CONNECTION_REFUSED} -- a per-thread \
+             budget would have run to {}",
+            MAX_CONNECTION_REFUSED * 2
+        );
+    }
+
     /// The abort probe: a child that dies mid-blast stops the sender promptly and by name, rather
     /// than letting it finish a multi-second blast into a socket whose peer is gone.
     #[test]
     fn a_fired_abort_probe_stops_the_blast_and_says_why() {
-        use std::sync::atomic::AtomicBool;
-
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         set_receive_buffer(&receiver, 4 * 1024 * 1024);
         let target = receiver.local_addr().unwrap();
@@ -1572,10 +1633,11 @@ mod tests {
         let ring = Ring::render(&spec, &model(&[(1, "gone.{seq%4}:1|c")])).unwrap();
         let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
 
-        // Already set, so the very first batch sees it -- this is about the message and the fact
-        // that it stops, not about racing a real child's death.
-        let flag = AtomicBool::new(true);
-        let err = blast(&plan, None, Some(Abort { flag: &flag, reason: "the child exited" }))
+        // Already filled, so the very first batch sees it -- this is about the message and the
+        // fact that it stops, not about racing a real child's death.
+        let cause = std::sync::OnceLock::new();
+        cause.set("the child exited".to_string()).unwrap();
+        let err = blast(&plan, None, Some(Abort { cause: &cause }))
             .expect_err("a fired abort must stop the blast");
         let err = format!("{err:#}");
         assert!(err.contains("the child exited"), "{err}");
@@ -1584,8 +1646,6 @@ mod tests {
 
     #[test]
     fn a_clear_abort_probe_lets_the_whole_blast_through() {
-        use std::sync::atomic::AtomicBool;
-
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         set_receive_buffer(&receiver, 4 * 1024 * 1024);
         let target = receiver.local_addr().unwrap();
@@ -1598,8 +1658,8 @@ mod tests {
         let ring = Ring::render(&spec, &model(&[(1, "fine.{seq%4}:1|c")])).unwrap();
         let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
 
-        let flag = AtomicBool::new(false);
-        let outcome = blast(&plan, None, Some(Abort { flag: &flag, reason: "unused" })).unwrap();
+        let cause = std::sync::OnceLock::new();
+        let outcome = blast(&plan, None, Some(Abort { cause: &cause })).unwrap();
         assert_eq!(outcome.sent_datagrams, 200);
     }
 

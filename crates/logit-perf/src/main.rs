@@ -84,9 +84,14 @@ enum Command {
         pin_child: Option<load::CpuSet>,
         /// Hold every real-socket scenario to the strict expectation -- zero drops, and an
         /// exactly-equal delivered event count -- instead of only checking that the datagram
-        /// accounting closes. Implies `--rate-scale 0.25`, since a shipped spec is paced
-        /// deliberately *above* what the receiver sustains; an explicit `--rate-scale` overrides
-        /// that, and a spec with no `rate` at all is rejected rather than asked to be lossless.
+        /// accounting closes. A spec with no `rate` at all is rejected rather than asked to be
+        /// lossless.
+        ///
+        /// Implies `--rate-scale 0.25`, since a shipped spec is paced deliberately *above* what
+        /// the receiver sustains. An explicit `--rate-scale` overrides **that derate only**, never
+        /// the exactness assertion -- so `--verify --rate-scale 1.0` asks "is this spec's own rate
+        /// loss-free?" and is expected to fail whenever anything drops. That is the point of it,
+        /// not a misuse.
         #[arg(long)]
         verify: bool,
         /// Multiply every real-socket spec's `rate` by this factor. The shipped rates sit just
@@ -95,6 +100,11 @@ enum Command {
         /// spec. Recorded in the results file, and `compare` warns when two runs used different
         /// ones, because they are different points on the load curve rather than a before and
         /// after.
+        ///
+        /// Given alongside `--verify` it replaces that flag's own 0.25 derate but leaves its
+        /// exact-delivery assertion in place, which is how one asks whether a particular rate is
+        /// loss-free: `--verify --rate-scale 1.0` holds the spec's shipped rate to zero drops, and
+        /// fails if it drops anything.
         #[arg(long = "rate-scale")]
         rate_scale: Option<f64>,
     },

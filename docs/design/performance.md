@@ -140,9 +140,12 @@ capture. Four things about reading its numbers differ from everything else in th
   with zero drops.
 - **`--rate-scale` moves the operating point without editing a spec.** The shipped rates sit just
   above the drop knee, which is what a baseline wants and what reading a stable CPU µs/event does
-  not; `--rate-scale 0.5` gets the second. The effective rate is recorded in the results file and
-  `compare` warns when two runs used different ones — they are different points on the load curve,
-  not a before and after.
+  not; `--rate-scale 0.5` gets the second. The effective rate is recorded in the results file, shown
+  in `run`'s driven table, and `compare` warns when two runs used different ones — they are
+  different points on the load curve, not a before and after. Given alongside `--verify` it replaces
+  that flag's own 0.25 derate but **not** its exact-delivery assertion, so `--verify --rate-scale
+  1.0` asks "is this spec's shipped rate loss-free?" and is expected to fail whenever anything
+  drops — which, since the rates are tuned to drop a little, is the healthy answer.
 
 ## 1. Results: all ten scenarios, median of 3
 
