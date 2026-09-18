@@ -75,3 +75,11 @@ tokio-rustls.workspace = true
 # this exact version via `logit-inputs`/`logit-outputs`, so this adds no new crate version to the
 # graph.
 reqwest.workspace = true
+# tests/prometheus_remote_write_round_trip.rs hand-builds the two request shapes only a real
+# Prometheus 1.0 sender produces -- a metadata-only `WriteRequest` and a samples-only one, which
+# `logit`'s own sender never writes because it always attaches `metadata[]` to the samples it
+# describes -- straight onto `logit_proto::prometheus::generated`'s prost types, and Snappy-block-
+# compresses them the way both specs require. Both are already transitive dependencies at these
+# exact versions via `logit-proto`, so naming them here adds no new crate version to the graph.
+prost.workspace = true
+snap.workspace = true
