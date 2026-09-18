@@ -641,6 +641,85 @@ Worked examples, one per shipped component:
   there: that is what a TCP health check looks like, and counting it would put one point per probe
   interval on this key forever. There is no
   TLS-specific metric: a handshake failure surfaces through that same diagnostic.
+- `prometheus_in` (`crates/logit-inputs/src/prometheus.rs`, codec in
+  `crates/logit-proto/src/prometheus/`, [ADR
+  `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md) and
+  [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)): **two modes, two
+  request-level pairs, one shared sample counter.** In scrape mode,
+  `logit.input.scrapes{class="2xx"|"4xx"|"5xx"|"other"|"network_error"|"timeout"|"parse_error"|
+  "oversize"}` (count, one per target per tick — the HTTP classes plus the three ways a scrape
+  fails before or after a status, `parse_error` being a 2xx body that wouldn't decode) and
+  `logit.input.scrape.duration` (timing, one per target per tick, recorded regardless of outcome).
+  In bind mode the sibling pair is the receiver's:
+  `logit.input.writes{class="ok"|"not_found"|"method"|"unsupported"|"oversize"|"timeout"|
+  "bad_request"}` (count, one per request — one class per row of the module doc's routes table, so
+  `unsupported` is a `415` on `Content-Encoding` *or* `Content-Type`, `oversize` a `413` from either
+  the compressed body or Snappy's declared decompressed length, and `timeout` a `408` from a body
+  that stopped arriving — **only reachable where `idle_timeout:` is set**, since the per-frame stall
+  bound is derived from it and it is off by default, so on a default `bind:` this class never fires
+  and a half-uploaded request holds its connection permit instead) and
+  `logit.input.write.duration` (timing, one per request, every exit
+  included — which is why the count and the timer live in one wrapper around the routing itself).
+  Deliberately this component's own scrape-side spelling rather than `otlp_in`'s, which has no
+  request-level counters to mirror.
+
+  `logit.input.samples` is reported by **both** modes and means a different unit in each: the series
+  a scrape decoded (one event per series) in scrape mode, and the **wire samples** that reached the
+  `Fanout` in bind mode — every decoded series' worth minus the ones belonging to a series the model
+  mapping then dropped, which is exactly the number the 2.0
+  `X-Prometheus-Remote-Write-Samples-Written` header reports for that request. Same number by
+  design: a counter and a header disagreeing about one request would be a puzzle with no right
+  answer. `docs/known-gaps.md` carries the unit difference as its own row.
+
+  Bind mode also holds the one piece of cross-request state on this kind, and reports it:
+  `logit.input.metadata_cache.size` (gauge — families currently remembered, published whenever the
+  table changes, a transition like `logit.input.connections` rather than a per-request restatement),
+  `logit.input.metadata_cache.evicted{reason="expired"|"cardinality"}` (count — a family whose `ttl`
+  ran out, versus one pushed out of `max_families` by a newer one; the same two reasons and the same
+  least-recently-used shape `prometheus_out`'s `max_series:` uses) and
+  `logit.input.metadata_cache.replaced` (count — one per family a request retyped, which is the
+  counter to watch when a sender's model kinds look wrong: a healthy fleet retypes almost nothing,
+  and a steady stream here is two senders disagreeing about one family name) and
+  `logit.input.metadata_cache.truncated` (count — one per `# HELP` or `# UNIT` string cut to
+  `MAX_METADATA_TEXT_BYTES` on its way into the table, since what is remembered outlives the request
+  that carried it and the request's own size cap does not bound a table that keeps entries; the
+  *type* is remembered exactly either way, so this bounds what one entry costs rather than what it
+  types). The connection
+  counters are `otlp_in`'s spelling verbatim, since bind mode runs the same accept loop and the same
+  shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections` (gauge),
+  `logit.input.connections.rejected{reason="limit"}` and
+  `logit.input.connections.closed{reason="idle"}` (count). Scrape mode has none of them — it is a
+  client, with no socket of its own.
+
+  The codec's own counters, on the decode side of both modes:
+  `logit.input.metrics.skipped{reason=…}` and `logit.input.metrics.degraded{reason=…}`. The text
+  assembler's reasons (`malformed_line`, `malformed_metadata`, `duplicate_label`,
+  `duplicate_series`, `duplicate_type`, `duplicate_metadata`, `unknown_suffix`,
+  `incomplete_series`, `empty_histogram`, `non_monotonic_buckets`, plus
+  `degraded{reason="histogram_count_mismatch"}`) are unchanged and shared, since remote-write
+  decodes through the same `assemble::Assembler`. Remote-write adds three of its own:
+  `skipped{reason="invalid_labels"}` (a series with no `__name__`, an empty label name or value, or
+  a label set that isn't strictly ascending by byte order — all of which both specs forbid a sender
+  from producing, and none of which is worth failing the whole request over),
+  `skipped{reason="native_histogram"}` (one `histograms[]` entry — see `docs/known-gaps.md`; it is
+  also why a 2.0 response's `Histograms-Written` is always `0`), and
+  `degraded{reason="exemplar_dropped"}` (an exemplar whose series has no sample anywhere in the
+  request, or whose series was itself skipped — the first time this reason appears on the *input*
+  side, where it has been an encoder reason all along). The two are not additive: a series with bad
+  labels and three exemplars raises one `invalid_labels` and three `exemplar_dropped`, because they
+  answer different questions. A fourth reason belongs to the metadata cache rather than to the
+  wire: `degraded{reason="seed_mismatch"}`, raised where a *remembered* type would have made the
+  assembler throw a sample away and gives way instead, letting the sample open an implicit family
+  of its own (`crates/logit-proto/src/prometheus/assemble.rs`'s "A seeded type is advisory"
+  table — a declaration the request itself carried is a statement about the samples in front of it,
+  one from the cache is a memory of what some other message said). It never appears with an empty
+  cache, and a steady stream of it means the table and the senders disagree about a family's shape.
+  `Diagnostics` keys, mirrored as `logit.component.diagnostics{key}` by
+  the bridge: `bound` (bind mode's listener), `scrape_failed` (scrape mode, carrying the failing
+  target's redacted URL in the message text only, never a tag), `write_rejected` (bind mode, every
+  `400`/`408`/`413`/`415`, with the peer address in the message text only, for the same
+  tag-cardinality reason) and `connection_error` — never an idle close, which is counted, not
+  diagnosed.
 - `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/driver.rs`, `docker.rs` — one shared
   `Tailer<D, F>` driver, [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)
   and [ADR `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md)):
@@ -939,7 +1018,9 @@ Worked examples, one per shipped component:
   and `syslog_out`'s `ok`/`error` pair are, just with this sink's own vocabulary.
 - `prometheus_out` (`crates/logit-outputs/src/prometheus.rs`, codec in
   `crates/logit-proto/src/prometheus/`, [ADR
-  `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)): the one pull
+  `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md) and
+  [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)): **two modes, and the split
+  runs right through this list.** Registry mode (`bind:`) is the one pull
   sink, so no `requests`/`request.duration`/`batch.bytes` — nothing is pushed per batch. In their
   place, `logit.output.scrapes{class="ok"|"not_found"|"method"}` (count, one per inbound HTTP
   request — `ok` means *rendered*, not acknowledged, since a `Full<Bytes>` body has no completion
@@ -948,18 +1029,53 @@ Worked examples, one per shipped component:
   held after each `send`), `logit.output.series.evicted{reason="expired"|"cardinality"}` (the
   `expire_after` sweep — run on every `send` *and* every scrape — and the `max_series` LRU cap), and
   `logit.output.metrics.type_conflict` (a family re-typed across batches, evicting every series held
-  under the old type). The codec's `PrometheusEncoder`, shared by `send` and render so both sides
-  total under one component: `logit.output.metrics.skipped{metric_kind="delta_sum"|
+  under the old type).
+
+  Sender mode (`endpoint:`) is the ordinary push shape instead, and takes `otlp_out`'s vocabulary
+  **exactly**, because it reuses that transport's own `Fault` table as code
+  (`crates/logit-outputs/src/http.rs`): `logit.output.requests{class="1xx"|"2xx"|"3xx"|"4xx"|"5xx"|
+  "other"|"network_error"}` (count, one per request issued). There is deliberately no `429` class —
+  a 429 is a `4xx`, and splitting it out would contradict `is_retryable_http_status`, which reads
+  the same status to pick the `Fault` — and no `timeout` class, since a timeout is a transport error
+  and lands in `network_error`; `3xx` is a real class here rather than a theoretical one, because
+  this client does not follow redirects. Nor is there `otlp_out`'s `signal` tag: this sink carries
+  exactly one signal, and hard-coding a tag that never varies is noise.
+  `logit.output.request.duration` (timing, one per request actually issued — the spelling
+  `graphite_out`/`collectd_out`/`syslog_out`/`statsd_out`/`influxdb_out` already use, and which
+  `otlp_out` does not have) and `logit.output.samples` (count, on a successful request only —
+  samples in the body as the codec counted them while encoding, not guessed from family counts,
+  since one `Series` is one sample for a gauge and several for a histogram). `logit.output.samples`
+  has no precedent in the tree and is kept deliberately: it is the mirror of `prometheus_in`'s own
+  `logit.input.samples` in bind mode, so the two ends of a remote-write relay are comparable. A
+  batch that produces no series at all issues no request and therefore reports none of the three.
+
+  The codec's `PrometheusEncoder` counts under **both** modes — in registry mode it is shared by
+  `send` and render so both sides total under one component, and in sender mode it is a plain field
+  with one direction: `logit.output.metrics.skipped{metric_kind="delta_sum"|
   "delta_histogram"|"gauge_delta"|"exponential_histogram"}` and `{reason="no_recorded_value"|
   "type_conflict"|"name_collision"}` (the latter two *within* one batch, distinct from the
   cross-batch `type_conflict` counter above), `logit.output.metrics.degraded{metric_kind=
   "non_monotonic_sum"|"distribution"|"samples"|"set"|"set_members"}` and `{reason=
   "exemplar_dropped"|"unit_not_suffix"}` (render-side), and `logit.output.labels.dropped{reason=
-  "unrepresentable"|"reserved"|"collision"}`. Diagnostics: `delta_temporality_unresolved` (both
+  "unrepresentable"|"reserved"|"collision"}`. Four more reasons exist only on one path or the other.
+  `skipped{reason="stale"}` is the text writer stepping over a `Point::Stale`, which it only ever
+  sees on a relay that fed it one. `skipped{reason="no_timestamp"}`,
+  `skipped{reason="invalid_labels"}` (a family with an empty name — `__name__` may not be empty),
+  `degraded{reason="sub_ms_collapsed"}` (two readings of one series landing on one millisecond, the
+  later winning — `docs/known-gaps.md`) and `labels.dropped{reason="empty_value"}` are remote-write
+  encode's, where the wire forbids what the exposition grammar merely renders differently.
+  `skipped{reason="no_recorded_value"}` means something narrower in sender mode: the encoder runs
+  with `with_stale_markers(true)` there, so a flagged `Gauge`/`Sum`/marker-untyped record is written
+  as a stale marker rather than skipped, and only a flagged `Histogram`/`Summary`/sketch — kinds
+  that expand to several derived series — still counts. Diagnostics:
+  `delta_temporality_unresolved` (both
   delta arms, naming the `aggregate` with `temporality: cumulative` fix), the shared
   `gauge_delta_unresolved` key `influxdb_out`/`statsd_out` use, `prometheus_exponential_histogram_
-  skipped`, and `prometheus_accept_failed` from the scrape listener's accept loop. Retry stays a
-  Layer 2 metric, though for a pull sink `send` is an in-memory upsert that has nothing to retry.
+  skipped`, `prometheus_accept_failed` from the registry-mode listener's accept loop, and
+  `remote_write_rejected` — one per non-2xx in sender mode, carrying the status and the first 256
+  bytes of the response body, read bounded rather than read whole and then trimmed. Retry stays a
+  Layer 2 metric in both modes: in registry mode `send` is an in-memory upsert with nothing to
+  retry, and in sender mode one `send` is one attempt by design, with `write_loop` owning the retry.
 - `null_out` (`crates/logit-outputs/src/null.rs`, `docs/plans/load-test-harness.md`): **Layer 2
   only** -- `send` does no encoding and no I/O, so it has nothing of its own to report. The generic
   write loop's `logit.component.batches.received`/`events.received`/`send.duration` already say

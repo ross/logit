@@ -22,6 +22,10 @@ logit-transforms.workspace = true
 logit-script.workspace = true
 logit-proto.workspace = true
 bytes.workspace = true
+# The remote-write fixtures below build a `prometheus.WriteRequest` / `io.prometheus.write.v2.Request`
+# straight from the vendored prompb types rather than through `logit_proto::prometheus::remote_write`
+# itself -- a fixture that is the output of the code it measures is not a fixture.
+prost.workspace = true
 serde.workspace = true
 # The native-wire-format bake-off's other two arms (docs/design/wire-protocol.md's "Encoding:
 # decide with a benchmark, not up front", docs/adr/native-wire-format-encoding.md). Both serialize

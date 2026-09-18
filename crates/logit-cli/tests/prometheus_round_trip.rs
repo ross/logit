@@ -1,7 +1,7 @@
 //! `prometheus_in -> prometheus_out` round trip over real sockets -- the Prometheus counterpart to
 //! `syslog_round_trip.rs`/`otlp_round_trip.rs`. A canned `hyper` server plays the scraped target
 //! (serving a fixture's `.in` body under the right `Content-Type`); a real, bound [`PrometheusInput`]
-//! scrapes it and forwards through a [`Fanout`] into a real [`PrometheusOutput`], which a `reqwest`
+//! scrapes it and forwards through a [`Fanout`] into a real [`ExposeOutput`], which a `reqwest`
 //! client then scrapes in turn with a chosen `Accept`. `docs/plans/prometheus-scrape-and-exposition.md`'s
 //! W5 workstream.
 //!
@@ -99,7 +99,7 @@ use logit_core::{EventBatch, Registry};
 use logit_inputs::internal::InternalInput;
 use logit_inputs::prometheus::PrometheusInput;
 use logit_inputs::statsd::StatsdInput;
-use logit_outputs::prometheus::PrometheusOutput;
+use logit_outputs::prometheus::ExposeOutput;
 use logit_pipeline::{Fanout, Input, Output};
 use logit_proto::prometheus::text::{self, Dialect};
 use logit_transforms::{AggregateTemporality, Aggregator};
@@ -185,7 +185,7 @@ fn http_client() -> reqwest::Client {
 
 /// Scrapes `target_addr` (a [`canned_server`]) with a real, bound [`PrometheusInput`] on a very
 /// short interval, waits for the one `EventBatch` it forwards through a bare [`Fanout`], then feeds
-/// that batch into a fresh [`PrometheusOutput`] and returns the exposition body a real `reqwest` GET
+/// that batch into a fresh [`ExposeOutput`] and returns the exposition body a real `reqwest` GET
 /// against it gets back for `accept`, alongside `target_addr` itself (what the caller substitutes
 /// for `{port}`).
 async fn scrape_relay_and_fetch(target_addr: SocketAddr, accept: &str) -> (String, SocketAddr) {
@@ -211,13 +211,13 @@ async fn scrape_relay_and_fetch(target_addr: SocketAddr, accept: &str) -> (Strin
     (body, target_addr)
 }
 
-/// Binds a fresh [`PrometheusOutput`], sends every batch in `batches` into it, then fetches its
+/// Binds a fresh [`ExposeOutput`], sends every batch in `batches` into it, then fetches its
 /// exposition with `accept`. Returns the response body and the sink's own bound address (unused by
 /// the fixed-point cases, which care about the *target's* address instead -- see
 /// [`scrape_relay_and_fetch`]; the pipeline cases below use this directly and ignore the target
 /// address entirely).
 async fn expose_and_fetch(batches: &[EventBatch], accept: &str) -> (String, SocketAddr) {
-    let mut output = PrometheusOutput::new("127.0.0.1:0");
+    let mut output = ExposeOutput::new("127.0.0.1:0");
     output.bind().await.expect("binding prometheus_out");
     let addr = output.local_addr().expect("bind() should leave a real address behind");
     for batch in batches {

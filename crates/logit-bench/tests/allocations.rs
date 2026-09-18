@@ -552,6 +552,53 @@ fn prometheus_decode_one_scrape() {
     expect_allocs("prometheus_in: decode 1 scrape (11 series)", stats, 161);
 }
 
+/// The other Prometheus ingress: one remote-write request through
+/// `logit_proto::prometheus::remote_write::decode`, over
+/// `fixtures::remote_write_request_v1`'s 100 single-sample gauge series. Only the *codec* is
+/// measured -- Snappy and HTTP are the receiver's, and `families_to_events` is the row above's.
+///
+/// Where a scrape decodes bytes into families, this decodes protobuf into families through the same
+/// shared assembler, so the two numbers are comparable per series. Warmed first so prost's own
+/// one-time costs and the interner don't inflate the steady state.
+#[test]
+fn remote_write_decode_one_request_v1() {
+    use logit_proto::prometheus::remote_write::{decode, Version};
+
+    let mut decoder = fixtures::prometheus_decoder();
+    let body = fixtures::remote_write_request_v1();
+    drop(decode(&body, Version::V1, &mut decoder).expect("fixture must decode"));
+
+    let (decoded, stats) =
+        measure(|| decode(&body, Version::V1, &mut decoder).expect("fixture must decode"));
+    assert_eq!(decoded.samples, 100);
+    assert_eq!(decoded.groups.len(), 1, "one timestamp, one group");
+    expect_allocs("prometheus_in: decode 1 remote-write 1.0 request (100 series)", stats, 1526);
+}
+
+/// The same request in 2.0: 1428 against 1.0's 1526, so the symbol table pays for itself on the way
+/// in as well as on the wire. Both versions build the same owned `String` label pairs for the model
+/// -- `MetricFamily` holds owned labels -- so the difference is upstream of this codec, in what
+/// prost has to materialize: 1.0 decodes a `Label { name, value }` pair per label per series (~200
+/// `String`s here), 2.0 decodes the symbol table once (~105) and `labels_refs` as plain `u32`s.
+///
+/// The per-series `Metadata` 2.0 repeats on every one of a family's series costs nothing extra,
+/// because declarations are deduplicated by family name before any group opens -- without that,
+/// this row was 1624 and every repeat also counted a bogus `duplicate_metadata`.
+#[test]
+fn remote_write_decode_one_request_v2() {
+    use logit_proto::prometheus::remote_write::{decode, Version};
+
+    let mut decoder = fixtures::prometheus_decoder();
+    let body = fixtures::remote_write_request_v2();
+    drop(decode(&body, Version::V2, &mut decoder).expect("fixture must decode"));
+
+    let (decoded, stats) =
+        measure(|| decode(&body, Version::V2, &mut decoder).expect("fixture must decode"));
+    assert_eq!(decoded.samples, 100);
+    assert_eq!(decoded.groups.len(), 1, "one timestamp, one group");
+    expect_allocs("prometheus_in: decode 1 remote-write 2.0 request (100 series)", stats, 1428);
+}
+
 /// `generate_in`'s **prototype** render path: no placeholder anywhere in the template, so one
 /// `Event` is rendered once at construction and `clone`d per generated event with only
 /// `timestamp` overwritten (`crates/logit-inputs/src/generate.rs`'s module doc).
@@ -2859,6 +2906,44 @@ fn prometheus_encode_100_series() {
     let series = text.lines().filter(|line| line.starts_with("prom_bench_gauge{")).count();
     assert_eq!(series, 100, "expected all 100 distinct series to render, got:\n{text}");
     expect_allocs("prometheus_out: encode 100 series", stats, 414);
+}
+
+/// `prometheus_out`'s other egress: `remote_write::encode` over the 100-series gauge family
+/// `fixtures::remote_write_families` holds -- the protobuf half only, the same way the decode rows
+/// measure only the codec. `events_to_families` is already pinned by the row above and Snappy is
+/// the sink's.
+#[test]
+fn remote_write_encode_100_series_v1() {
+    use logit_proto::prometheus::remote_write::{encode, Version};
+
+    let mut encoder = fixtures::prometheus_encoder();
+    let families = fixtures::remote_write_families(100);
+    let groups = std::slice::from_ref(&families);
+    drop(encode(groups, Version::V1, &mut encoder));
+
+    let (body, stats) = measure(|| encode(groups, Version::V1, &mut encoder));
+    assert!(!body.is_empty());
+    expect_allocs("prometheus_out: encode 100 series, remote-write 1.0", stats, 1223);
+}
+
+/// And in 2.0, where every label name, label value and help string goes through the symbol table
+/// once instead of being repeated inline: a smaller body for more bookkeeping, and the bookkeeping
+/// is what this pair prices. 1434 against 1.0's 1223 -- the extra ~2/series is the symbol table's
+/// owned-`String` key per distinct value, which for this fixture's `shard` labels is one per
+/// series by construction. Note this is the opposite sign to the decode pair above, where 2.0
+/// wins: interning costs the sender and saves the receiver.
+#[test]
+fn remote_write_encode_100_series_v2() {
+    use logit_proto::prometheus::remote_write::{encode, Version};
+
+    let mut encoder = fixtures::prometheus_encoder();
+    let families = fixtures::remote_write_families(100);
+    let groups = std::slice::from_ref(&families);
+    drop(encode(groups, Version::V2, &mut encoder));
+
+    let (body, stats) = measure(|| encode(groups, Version::V2, &mut encoder));
+    assert!(!body.is_empty());
+    expect_allocs("prometheus_out: encode 100 series, remote-write 2.0", stats, 1434);
 }
 
 // ---------------------------------------------------------------------------------------------

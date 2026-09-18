@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-09-12
+updated: 2026-09-17
 ---
 
 # Enabling plan: Prometheus scrape ingestion and exposition
@@ -220,6 +220,11 @@ precisely that signal, and the bounded-retention machinery the gauge amendment a
 answers the other half of the original objection, unbounded per-series state.
 
 ### 5. Remote-write forward compatibility (design only, no code this round)
+
+**2026-09-17: designed and planned as [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)
+and [`docs/plans/prometheus-remote-write.md`](prometheus-remote-write.md)**, which take this seam as
+given — except that the `tls:` field on `prometheus_in` is renamed `scrape_tls:` there, now that the
+kind has a second, server-side TLS role (`bind_tls:`).
 
 Recorded in the ADR, not built here: (a) the semantic mapping already lives behind `MetricFamily`
 in `logit_proto::prometheus::{mod, text}`, so a future `remote_write.rs` maps prompb messages to

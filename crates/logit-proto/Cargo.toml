@@ -37,6 +37,10 @@ crc32c.workspace = true
 # types are never hand-edited -- ADR `committed-pregenerated-otlp-protobuf`).
 serde_json.workspace = true
 base64.workspace = true
+# Prometheus remote-write's Snappy block compression (crates/logit-proto/src/prometheus) -- not yet
+# used by any codec (that's W2's remote_write.rs); a round-trip sanity test in
+# prometheus/generated/mod.rs exercises it so lint doesn't flag it as unused in the meantime.
+snap.workspace = true
 
 [dev-dependencies]
 # The OTLP fixed-point tests (tests/otlp_fixed_point.rs): decode(encode(b)) == b over a generated

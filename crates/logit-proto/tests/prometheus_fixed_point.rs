@@ -262,6 +262,74 @@ fn a_hand_built_family_list_is_a_model_fixed_point() {
     assert_model_fixed_point(&[counter]);
 }
 
+/// `Point::Stale` is deliberately absent from the generators below: property 1 is stated under the
+/// *default* encoder, which skips a flagged record outright (neither exposition dialect can express
+/// a stale marker), so a generated `Stale` would fail by construction rather than by a codec bug.
+/// Remote-write can express one, so it gets its own case here with the two switches its transport
+/// turns on -- the same shape `logit_proto::prometheus`'s own unit tests pin per family type, stated
+/// once more at the level this file works at.
+#[test]
+fn a_stale_family_is_a_model_fixed_point_with_the_remote_write_switches_on() {
+    let families: Vec<MetricFamily> = [
+        FamilyType::Counter,
+        FamilyType::Gauge,
+        FamilyType::Unknown,
+        FamilyType::Info,
+        FamilyType::StateSet,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, kind)| {
+        let name = match kind {
+            FamilyType::Counter => format!("m{i}_total"),
+            _ => format!("m{i}"),
+        };
+        MetricFamily {
+            series: vec![Series {
+                timestamp: Some(1_605_281_325_000_000_000),
+                ..Series::new(vec![("shard".to_string(), "7".to_string())], Point::Stale)
+            }],
+            ..MetricFamily::new(name, kind)
+        }
+    })
+    .collect();
+
+    // The receiver's decoder settings: the timestamp is real, the "the producer chose to expose
+    // one" marker is not.
+    let events = families_to_events(
+        &families,
+        RECEIVED_AT,
+        &mut PrometheusDecoder::new().with_timestamp_marker(false),
+    );
+    for event in &events {
+        assert!(event.metrics[0].is_no_recorded_value(), "a stale point must set the flag");
+    }
+    let resource = Resource::default();
+    // The sender's encoder settings.
+    let mut encoder =
+        PrometheusEncoder::new().with_stale_markers(true).with_timestamps_always(true);
+    let round_tripped =
+        events_to_families(events.iter().map(|event| (&resource, event)), &mut encoder);
+    assert_eq!(round_tripped, families);
+}
+
+/// And the default is unchanged: the same families through a plain encoder are skipped, which is
+/// what keeps every other property in this file stated under the settings the exposition path uses.
+#[test]
+fn a_stale_family_is_skipped_by_the_default_encoder() {
+    let families = vec![MetricFamily {
+        series: vec![Series::new(vec![], Point::Stale)],
+        ..MetricFamily::new("m", FamilyType::Gauge)
+    }];
+    let events = families_to_events(&families, RECEIVED_AT, &mut PrometheusDecoder::new());
+    let resource = Resource::default();
+    let round_tripped = events_to_families(
+        events.iter().map(|event| (&resource, event)),
+        &mut PrometheusEncoder::new(),
+    );
+    assert!(round_tripped.is_empty());
+}
+
 // -------------------------------------------------------------------------------------------------
 // Property 3: a generator over the text grammar
 // -------------------------------------------------------------------------------------------------

@@ -1,0 +1,119 @@
+# Prometheus config template for script/record-fixtures's `prometheus` producer: scrape one target
+# (Prometheus itself) and remote-write the result to the raw_capture.py listener (the "capture"
+# container, on the shared Docker network), so the captured request bodies are exactly what a real
+# Prometheus 3.x put on the wire -- which is the whole point of the corpus, per
+# testdata/interop/README.md and docs/plans/recorded-interop-fixtures.md.
+#
+# **A template, not a config**: the three `@@NAME@@` placeholders below are substituted by `sed` at
+# record time (see `record_prometheus` in script/record-fixtures) because the three fixture sets
+# this producer records differ in exactly three values and in nothing else. One file with three
+# holes keeps that "nothing else" verifiable at a glance; three near-identical files would invite
+# the same drift `collectd.conf`/`collectd-threshold.conf` already have to warn about.
+#
+# Mounted straight over the image's own /etc/prometheus/prometheus.yml, with no command override, so
+# the container runs the image's stock command line -- there is no dpkg-style conffile hazard here
+# (the rsyslog/collectd producers' reason for mounting elsewhere and passing `-f`/`-C`).
+
+global:
+  # Short, and the same for all three renderings: a capture should finish in seconds. It is a
+  # placeholder only because it was one when the metadata run relied on sparse scrapes to keep
+  # sample requests out of its way -- that run now drops every sample outright (see
+  # `write_relabel_configs` below), so nothing here depends on the interval any more. Prometheus
+  # staggers a target's first scrape by a hash-derived offset within this interval, which is part of
+  # the worst-case wait before anything is sent at all and hence part of why the `start_capture`
+  # timeout in script/record-fixtures is as generous as it is.
+  scrape_interval: @@SCRAPE_INTERVAL@@
+  scrape_timeout: 5s
+  # One recognisable label on every remote-written series, the same trick collectd.conf's
+  # `Hostname "logit-fixture"` uses: a consuming test can assert on it instead of on whatever
+  # container id or measured value this particular run produced.
+  external_labels:
+    monitor: logit-fixture
+
+# The **sample** captures render this as `localhost:9090` -- Prometheus scraping its own /metrics,
+# the standard way to get a real, fully-formed scrape without standing up a second container. Its
+# exposition covers every metric type that matters here (counter, gauge, histogram, summary); see
+# the `write_relabel_configs` below for why only a handful of its several hundred families reach
+# the wire.
+#
+# The **metadata** capture renders it as the small static target
+# `tools/record-fixtures/prometheus-metadata-target.prom` instead, for the reason that file's own
+# header gives: metadata is not relabel-filtered, so a self-scrape would put several hundred
+# families behind the `metadata_config` ticker and which ten a run shipped would not be
+# reproducible. `job_name` stays `prometheus` either way, so the recorded `job` label does not move
+# between captures.
+scrape_configs:
+  - job_name: prometheus
+    # Prometheus 3.x refuses a response whose `Content-Type` it does not recognise unless a
+    # fallback is named ("received unsupported Content-Type ... and no fallback_scrape_protocol
+    # specified"), and the static metadata target is served by `python3 -m http.server`, which
+    # answers `application/octet-stream` for any file. This is what lets that scrape parse. It
+    # never fires on the self-scrape renderings: Prometheus's own /metrics sends a real
+    # `text/plain; version=0.0.4` and the negotiated protocol wins.
+    fallback_scrape_protocol: PrometheusText0.0.4
+    static_configs:
+      - targets: ['@@SCRAPE_TARGET@@']
+
+remote_write:
+  # The path is logit's own default receiver route (`crates/logit-inputs/src/prometheus.rs`'s
+  # `path:`, default /api/v1/write), so the captured `.headers` sidecar records the path a
+  # `prometheus_in(bind)` would actually be answering on.
+  - url: http://capture:9091/api/v1/write
+    remote_timeout: 10s
+    # 1.0 (`prometheus.WriteRequest`) or 2.0 (`io.prometheus.write.v2.Request`). 3.x defaults to
+    # 1.0 when this is unset; it is set explicitly on every run so the fixture records a deliberate
+    # choice rather than a default that a later Prometheus release could move. No feature flag is
+    # needed for 2.0 on 3.x -- it went stable in Prometheus 3.0, unlike 2.x.
+    #
+    # Worth knowing before reading the 2.0 fixtures: 3.14.0 sends them with **empty** inline
+    # `Metadata` (`type: UNSPECIFIED`, no help/unit refs) on every series in this topology -- with
+    # and without `--enable-feature=metadata-wal-records`, on the first request and on the tenth.
+    # See testdata/interop/prometheus/README.md, which records that finding and what was tried.
+    protobuf_message: @@PROTOBUF_MESSAGE@@
+    # The 1.0 sender ships `MetricMetadata` in requests of its own, on this ticker, rather than
+    # alongside samples -- which is the whole reason `prometheus_in`'s `metadata_cache:` exists, and
+    # what the `prometheus-v1-metadata` capture records. 2.0 warns that this block is redundant for
+    # it (its metadata rides inline on each series), and ignores it. `send_interval` is the
+    # placeholder: 1s for the metadata-only capture, long enough to be irrelevant for the sample
+    # captures. `max_samples_per_send` is small on purpose and for every run: metadata is *not*
+    # subject to `write_relabel_configs` below -- it comes from the scrape cache, all several
+    # hundred families of it, help text and all -- so this is the only thing keeping a metadata
+    # request inside testdata/interop/README.md's per-fixture size budget. It is also why the
+    # families a metadata capture happens to declare are not the four the sample captures carry.
+    metadata_config:
+      send: true
+      send_interval: @@METADATA_SEND_INTERVAL@@
+      max_samples_per_send: 10
+    # One shard, one in-flight request, and a deadline short enough that a scrape's samples are
+    # flushed rather than sat on: a fixture wants the smallest well-formed request a real sender
+    # produces, not the largest batch it can be talked into. `capacity` stays comfortably above
+    # `max_samples_per_send`, which Prometheus validates.
+    queue_config:
+      capacity: 500
+      max_samples_per_send: 100
+      batch_send_deadline: 1s
+      min_shards: 1
+      max_shards: 1
+    # The size budget, enforced at the source. Prometheus's own /metrics is several hundred
+    # families; writing all of it would produce a fixture one or two orders of magnitude over the
+    # "low single-digit KB per fixture, whole directory well under 100 KB" budget
+    # testdata/interop/README.md sets. These four families are kept because between them they cover
+    # all four classic metric types -- gauge (`prometheus_build_info`), counter (`_total`),
+    # histogram (`_bucket`/`_sum`/`_count`) and summary (`quantile` + `_sum`/`_count`) -- which is
+    # exactly the decoder surface this corpus exists to exercise, and because between them they are
+    # 26 series, so one scrape's worth fits comfortably inside one `max_samples_per_send` request
+    # rather than being split across several. Relabel regexes are fully anchored, so this matches
+    # those names and nothing else. The alternation itself lives in `record_prometheus` rather than
+    # here, since the action and the pattern move together between renderings.
+    #
+    # The metadata capture renders this as `action: drop` over `.*` instead, which is what makes it
+    # **deterministic**: with every series dropped, that run can put no samples on the wire at all,
+    # so every request it produces is necessarily a metadata request. Nothing is left to the race
+    # between the metadata ticker and the first scrape's sample batch -- and the committed replay
+    # test asserts all three of those captures are metadata-only, so a racy recipe would have meant
+    # a re-record that legitimately fails the suite. It works precisely because of the paragraph
+    # above: metadata is not subject to `write_relabel_configs`.
+    write_relabel_configs:
+      - source_labels: [__name__]
+        action: @@RELABEL_ACTION@@
+        regex: "@@RELABEL_REGEX@@"

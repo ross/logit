@@ -450,15 +450,22 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     the consumer that mode exists for. `series_retention: 0` stays legal under the default
     `temporality: delta`, where it is the documented opt-out from gauge retention
     (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
-40. A `prometheus_in` `scrape_targets` must name at least one absolute `http://`/`https://` scrape URL with
+40. A **scrape-mode** `prometheus_in`'s scrape settings. Every check in this rule is a statement
+    about an outbound scrape, so the whole rule is gated on a non-empty `scrape_targets` and says
+    nothing at all about a `bind:` receiver; rule 55 owns the mode itself, including the
+    neither-mode case this rule's empty-list bail used to catch by accident
+    ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). Each `scrape_targets`
+    entry must be an absolute `http://`/`https://` scrape URL with
     a non-empty authority — `logit-pipeline` doesn't depend on `reqwest`/`url` (this document's own
     "Crate layout" section), so this is a small hand-rolled scheme/authority check, not a full URL
     parse. `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's `interval`
-    (which also covers `prometheus_in`'s own `interval: 0s`, via the same generic check). A `tls:`
+    (which also covers `prometheus_in`'s own `interval: 0s`, via the same generic check). A
+    `scrape_tls:`
     block must be internally consistent — `cert_file`/`key_file` set together, no
     `insecure_skip_verify` alongside `ca_file` — the same two checks rule 24 makes for `otlp_out`'s
     own `tls:` block (and rule 34 for `logit_out`'s) — and is rejected outright unless at least one
-    target is `https://` — TLS is selected per-target by its own scheme, so a `tls:` block with
+    target is `https://` — TLS is selected per-target by its own scheme, so a `scrape_tls:` block
+    with
     nothing to tune would otherwise be silently ignored, the same reasoning as rule 24's third
     check. `headers` may not name a header this input sets
     itself (`accept`, `user-agent`, and the other protocol-owned names) or collide with another
@@ -607,7 +614,8 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     own `tls:` internals. `logit_outputs::statsd::StatsdOutput::with_tls` re-checks the
     `transport: udp` one itself, since `graph::resolve` isn't the only possible caller.
 53. An `idle_timeout`, where set, must be greater than `0s` on every kind that has one —
-    `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` — and must not be set at all
+    `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in`, `prometheus_in` — and must not
+    be set at all
     where it could never take effect: a `syslog_in`, a `graphite_in` or a `statsd_in` with
     `transport: udp`, which has no connection to time out
     ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)). `0s` is rule 45's
@@ -616,7 +624,7 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     the instant it stopped sending — rules 9/15/18/28/45's "0 is impossible, not just small" call
     either way. The context check is rule 43's reasoning and rule 45's shape, one field over.
 
-    **One rule, five kinds — and no default to exempt.** Like rule 43 (and unlike the per-sink
+    **One rule, six kinds — and no default to exempt.** Like rule 43 (and unlike the per-sink
     rules 24/34/44/52) the check, the message and the reasoning are identical on every kind it
     covers, so a listener joins by adding an arm to its match. Each kind's arm landed in the same
     PR that made that listener *honour* the field, so no released state ever accepted a
@@ -624,7 +632,10 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     this field is an `Option`: absent *is* "no idle timeout", so every `Some` is a set value and
     the UDP check rejects any of them rather than only a non-default one. That is also why the
     zero message names the fix — "omit the field to disable the idle timeout" — instead of a legal
-    value to use instead.
+    value to use instead. `prometheus_in` carries the field for its `bind:` receiver only; in
+    *scrape* mode there is no connection to time out either, but that is a wrong-*mode* field
+    rather than a wrong-*transport* one, so rule 55 rejects it instead of this rule growing a
+    second axis.
 54. A `keep_values` with neither `resource` nor `attributes` configured is rejected — rule 12's
     "can only ever be a no-op" reasoning. An empty field name in either map is rejected — rules
     19/20's reasoning. A field's `allow` list being empty is rejected too, naming the alternative:
@@ -636,6 +647,52 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     field's `normalize:` list is rejected too, the same no-op reasoning once more. An *empty*
     `normalize:` list is legal — it's the default, meaning no normalization at all
     ([ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md)).
+55. A `prometheus_in` is in exactly one mode, and every field belongs to the mode it is written
+    under ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A non-empty
+    `scrape_targets:` is a scrape client; `bind:` is a remote-write receiver accepting 1.0 and 2.0
+    on one listener. Both together is two components' worth of config in one, and neither is a
+    listener that could never produce an event — rules 7/12's "can only ever be a no-op" instinct,
+    answered with a message rather than a process that starts up listening on nothing. Then a
+    non-default `interval`, `timeout`, `headers` or `scrape_tls` alongside `bind:` is rejected (a
+    receiver performs no scrape), and a non-default `path`, `bind_tls`, `idle_timeout` or
+    `metadata_cache` alongside `scrape_targets:` is rejected (a scrape client binds nothing, and
+    reads a `# TYPE` line in every response it scrapes rather than remembering one). That is rule
+    45's and rule 53's shape one kind over, and it exists for their reason: a setting silently
+    doing nothing is worse than a startup failure naming it. Only *non-default* values are
+    rejected — which is what lets `interval` keep its default in bind mode, so rule 9's
+    `interval: 0s` rejection stays satisfied there with no mode-specific carve-out. In bind mode
+    the `path` itself must also start with `/` — rule 41's check for `prometheus_out`, for rule
+    41's reason: a request URI's path is always absolute, so a relative or empty one could never
+    match, and every write would `404` against a listener that looks configured — and
+    `metadata_cache.ttl` must be greater than `0s`, rule 9's zero-interval reasoning: an entry
+    expiring the instant it is written is a cache that does nothing while still sweeping on every
+    request, and `metadata_cache: {max_families: 0}` is the spelling that turns it off — which is
+    why that pairing, where the `ttl` governs nothing at all, is the one case the zero check lets
+    through.
+
+56. A `prometheus_out` has exactly one of `bind:` (serve an exposition) and `endpoint:` (write to
+    a remote-write receiver) — never both, never neither
+    ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A **non-default** value
+    of a field belonging to the mode that isn't set is rejected rather than silently ignored:
+    `path`, `expire_after` or `max_series` alongside `endpoint:`; `version`, `timeout`, `headers`
+    or `endpoint_tls` alongside `bind:`. That's rule 45's and rule 53's shape and it exists for
+    their reason — a setting that quietly does nothing is worse than a startup failure naming it
+    — and like rule 45 it compares against `logit_config`'s own default functions rather than
+    mirroring their values, so the default stays legal in both modes. Rule 41's `path`/`max_series`
+    checks are registry-mode-only for the same reason: two rules, one gate each, rather than rule
+    41 silently acquiring a second job. In sender mode the remaining checks are rule 40's, restated
+    against this kind's fields: `endpoint` must be an absolute `http://`/`https://` URL, path
+    included (a remote-write receiver's write path — typically `/api/v1/write` — lives there, not
+    in `path:`); `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's
+    `interval`; `headers` may not be empty-named, `:`-prefixed (an HTTP/2 pseudo-header), collide
+    with another entry once case is ignored, or name one this output sets itself — `content-type`,
+    `content-encoding`, `content-length`, `x-prometheus-remote-write-version`, `user-agent`, the
+    five in `graph::RESERVED_REMOTE_WRITE_HEADERS`; the `endpoint_tls:` block must be internally
+    consistent (`cert_file`/`key_file` together, no `insecure_skip_verify` alongside `ca_file` —
+    rules 24/34/44/52's two checks, since this is a sink's own TLS block); and a non-default
+    `endpoint_tls:` under a plain `http://` endpoint is rejected — a *scheme* check, exactly rule
+    40's third TLS check, since TLS is selected by the endpoint's own scheme and a block under
+    `http://` could only ever be ignored.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

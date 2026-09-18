@@ -1550,34 +1550,79 @@ pub enum ComponentKind {
     /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
     /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
     /// `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See
-    /// `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant
-    /// (a remote-write receiver) is planned as an additive, non-breaking change -- "exactly one of
-    /// `scrape_targets`/`bind`" would become a graph rule once it lands, not a new kind.
+    /// `docs/adr/prometheus-scrape-and-exposition.md`.
+    ///
+    /// **Two modes, one kind.** `scrape_targets:` is the scrape client above; `bind:` is a
+    /// remote-write *receiver* (`docs/adr/prometheus-remote-write.md`), accepting 1.0 and 2.0
+    /// requests on one listener. Exactly one of the two is set (rule 55), and a field belonging
+    /// to the other mode is a config error rather than a silently ignored setting -- also rule
+    /// 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape. It does
+    /// hold one piece of cross-request state, and only one: [`MetadataCacheConfig`], which is what
+    /// makes a Prometheus 1.0 sender's writes decode as typed families.
     ///
     /// Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
     /// target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]`
     /// can't have two fields answer to the same key.
     PrometheusIn {
-        /// Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).
+        /// Scrape mode: absolute `http://`/`https://` scrape URLs. Non-empty selects scrape mode
+        /// (rule 55), and every entry is checked by rule 40.
+        #[serde(default)]
         scrape_targets: Vec<String>,
-        /// Scrape cadence. Rule 9 rejects `0s`.
+        /// Scrape cadence. Rule 9 rejects `0s`. Scrape-mode-only: a non-default value alongside
+        /// `bind:` is rejected by rule 55.
         #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// Per-request timeout. Rule 40 rejects `0s`.
+        /// Per-request timeout. Rule 40 rejects `0s`. Scrape-mode-only (rule 55).
         #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         timeout: Duration,
         /// Extra headers sent on every scrape request. A name this input sets itself (`accept`,
         /// `user-agent`, and the other protocol-owned names -- rule 40) is rejected at
         /// config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).
+        /// Scrape-mode-only (rule 55).
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Client-side TLS tuning for any `https://` target -- see [`TlsClientConfig`]. A
+        /// Client-side TLS tuning for any `https://` *scrape* target -- see [`TlsClientConfig`]. A
         /// non-default value with no `https://` target is a config error (rule 40), not silently
-        /// ignored.
+        /// ignored. Scrape-mode-only (rule 55).
+        ///
+        /// Named `scrape_tls`, not `tls`: this kind has two TLS-shaped roles -- client TLS for
+        /// outbound scrapes, server TLS for the inbound receiver -- and a bare `tls:` next to a
+        /// `bind_tls:` would be a coin flip for a reader. Every TLS key here is prefixed by the
+        /// socket it governs (`docs/adr/prometheus-remote-write.md`).
         #[serde(default)]
-        tls: TlsClientConfig,
+        scrape_tls: TlsClientConfig,
+        /// Receiver mode: `host:port` to accept Prometheus remote-write requests on. Set selects
+        /// bind mode (rule 55). Both wire versions are accepted on the one listener, chosen per
+        /// request from its own `Content-Type` -- there is nothing to configure.
+        #[serde(default)]
+        bind: Option<String>,
+        /// The path the receiver answers `POST`s on; anything else is a `404`. Defaults to
+        /// `/api/v1/write`, which is where every remote-write sender points by convention.
+        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        #[serde(default = "default_prometheus_write_path")]
+        path: String,
+        /// Server-side TLS for the receiver's listener -- see [`TlsServerConfig`]. Its mere
+        /// presence turns TLS on. Bind-mode-only (rule 55).
+        ///
+        /// Transport security only: the receiver has no authentication of any kind, so a listener
+        /// reachable from an untrusted network belongs behind something that does
+        /// (`docs/known-gaps.md`).
+        #[serde(default)]
+        bind_tls: Option<TlsServerConfig>,
+        /// How long a receiver connection may sit with no request in flight before it is closed
+        /// and its connection-limit permit handed back. Omitted -- the default -- means no idle
+        /// timeout at all. Rule 53 rejects `0s`; rule 55 rejects it alongside `scrape_targets:`.
+        /// See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+        /// What the receiver remembers about metric *types* between requests, so a Prometheus 1.0
+        /// sender's series decode as the families they are -- see [`MetadataCacheConfig`].
+        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        #[serde(default)]
+        metadata_cache: MetadataCacheConfig,
     },
     /// A synthetic event source for load testing -- the listener end of the perf harness
     /// (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative
@@ -1637,34 +1682,40 @@ pub enum ComponentKind {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },
-    /// A Prometheus/OpenMetrics **exposition** endpoint: a stateful sink holding a registry of
-    /// current series that an HTTP handler renders on demand, rather than one that writes anywhere.
-    /// The mirror of `PrometheusIn` (scrape). Both text dialects are served, negotiated on the
-    /// scraping client's `Accept`. See `docs/adr/prometheus-scrape-and-exposition.md` and
-    /// `logit_outputs::prometheus`'s module doc (the spec).
+    /// Prometheus in either of its two sink shapes, chosen by which mode field is set (rule 56
+    /// requires exactly one). `bind:` is an **exposition** endpoint: a stateful sink holding a
+    /// registry of current series that an HTTP handler renders on demand, the mirror of
+    /// `PrometheusIn`'s scrape, serving both text dialects negotiated on the scraping client's
+    /// `Accept`. `endpoint:` is a **remote-write sender**: a stateless sink that POSTs each batch
+    /// to a remote-write receiver, the mirror of `PrometheusIn`'s own `bind:`.
     ///
-    /// A future remote-write **sender** is an optional `endpoint:` on this same variant, with a
-    /// graph rule requiring exactly one of `bind`/`endpoint` -- purely additive, so a config
-    /// written today keeps working.
+    /// The two modes share no field. A field belonging to the mode that isn't set is a config
+    /// error rather than a silent no-op (rule 56). See
+    /// `docs/adr/prometheus-scrape-and-exposition.md`,
+    /// `docs/adr/prometheus-remote-write.md`, and `logit_outputs::prometheus`'s module doc (the
+    /// spec).
     PrometheusOut {
-        /// `host:port` to serve the exposition on. Required, and bound when the pipeline starts
-        /// (`Output::bind`'s pre-spawn pass), so an address already in use is a startup failure
-        /// rather than a scrape that silently answers nothing.
+        /// `host:port` to serve the exposition on -- **registry mode**. Bound when the pipeline
+        /// starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup
+        /// failure rather than a scrape that silently answers nothing.
         ///
         /// **There is no TLS and no auth on this endpoint**, and it serves every label of every
         /// series the registry holds to anything that connects: bind loopback or pod-local
         /// (`127.0.0.1:9464`, as every shipped example does) and front it with something that has
         /// both. See the ADR's "Security posture" section and `docs/known-gaps.md`.
-        bind: String,
+        #[serde(default)]
+        bind: Option<String>,
         /// The HTTP path the exposition is served on; any other path is a `404`. Defaults to
         /// `/metrics`, what every Prometheus scrape config assumes when a target's own
-        /// `metrics_path` is unset.
+        /// `metrics_path` is unset. Registry mode only -- a non-default value alongside
+        /// `endpoint:` is rejected (rule 56).
         #[serde(default = "default_prometheus_path")]
         path: String,
         /// A series not updated within this window is dropped from the registry and stops being
         /// exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this
         /// sink stops exposing is one a Prometheus-native exporter's consumer would already have
         /// treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.
+        /// Registry mode only (rule 56).
         #[serde(default = "default_prometheus_expire_after", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         expire_after: Duration,
@@ -1672,8 +1723,52 @@ pub enum ComponentKind {
         /// series is evicted to admit a new one, counted
         /// `logit.output.series.evicted{reason="cardinality"}` -- the same shape as `aggregate`'s
         /// `max_retained_gauge_series`, applied to registry memory instead of window memory.
+        /// Registry mode only (rule 56).
         #[serde(default = "default_prometheus_max_series")]
         max_series: usize,
+        /// An absolute `http://`/`https://` remote-write URL, **path included** (typically
+        /// `/api/v1/write`) -- **sender mode**. Unlike `bind:` this is never resolved at
+        /// config-load time; a receiver that isn't up yet is not a config error, the same
+        /// `otlp_out`/`syslog_out` precedent. Rule 56 checks the scheme and authority.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Which remote-write protocol version this sender writes -- see [`RemoteWriteVersion`].
+        /// Defaults to `1`, what every deployed receiver accepts. There is no negotiation and no
+        /// fallback: pick the version the receiver speaks, exactly as a scrape target's own
+        /// dialect is picked for it. Sender mode only (rule 56).
+        ///
+        /// `serde` reads and writes [`RemoteWriteVersion`] as the integer, so the schema has to
+        /// say so here: the derived variant-name schema would publish a spelling (`"V1"`) config
+        /// never accepts. The same `#[schemars(with = ..)]` hint the hand-rolled `Duration` codec
+        /// carries on every field that uses it (ADR `config-yaml-jsonschema`).
+        #[serde(default)]
+        #[schemars(with = "u8")]
+        version: RemoteWriteVersion,
+        /// Per-request timeout on the remote-write POST. Defaults to 10s, `otlp_out`'s own
+        /// default. Rule 56 rejects `0s`. Sender mode only.
+        #[serde(
+            default = "default_prometheus_endpoint_timeout",
+            with = "humantime_serde_duration"
+        )]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every remote-write request -- e.g. `X-Scope-OrgID` for a
+        /// multi-tenant Mimir. A value is a plain string like any other field, so `!env` works on
+        /// it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token
+        /// without inlining it. A name the protocol owns (`content-type`, `content-encoding`,
+        /// `content-length`, `x-prometheus-remote-write-version`, `user-agent`) or an HTTP/2
+        /// pseudo-header starting with `:` is rejected at config-validation time (rule 56) rather
+        /// than silently overridden, as are two keys naming the same header once case is ignored.
+        /// Sender mode only.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Client-side TLS tuning for an `https://` `endpoint:` -- see [`TlsClientConfig`]. Named
+        /// for the mode it serves, matching `prometheus_in`'s `scrape_tls:`/`bind_tls:` pair: one
+        /// kind with two TLS-shaped roles must never spell either of them as a bare `tls:`. A
+        /// non-default value under a plain `http://` endpoint is a config error (rule 56), not
+        /// silently ignored. Sender mode only.
+        #[serde(default)]
+        endpoint_tls: TlsClientConfig,
     },
     /// A sink that drops everything, as cheaply as the runtime allows -- the sink end of the perf
     /// harness (`docs/plans/load-test-harness.md`). Its point is measuring everything *upstream*
@@ -1692,8 +1787,162 @@ pub enum ComponentKind {
     Target {},
 }
 
-fn default_prometheus_path() -> String {
+/// Which remote-write protobuf message `prometheus_out`'s `endpoint:` sender writes, spelled in
+/// config as the bare integer the specs themselves are numbered by: `version: 1` or `version: 2`.
+/// An integer rather than a string enum because that is how both specs, Prometheus's own
+/// `remote_write` config and every receiver's documentation name them -- `version: v1` would be a
+/// spelling this project invented.
+///
+/// Defaults to `1` (`prometheus.WriteRequest`): it is what every remote-write receiver deployed
+/// today accepts, where 2.0 support is still uneven. Maps onto
+/// `logit_proto::prometheus::remote_write::Version`, which holds the `Content-Type` and
+/// `X-Prometheus-Remote-Write-Version` spellings both ends need.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum RemoteWriteVersion {
+    /// `prometheus.WriteRequest` -- remote-write 1.0.
+    #[default]
+    V1,
+    /// `io.prometheus.write.v2.Request` -- remote-write 2.0: symbol table, inline metadata,
+    /// created timestamps.
+    V2,
+}
+
+impl TryFrom<u8> for RemoteWriteVersion {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(RemoteWriteVersion::V1),
+            2 => Ok(RemoteWriteVersion::V2),
+            other => {
+                Err(format!("unknown remote-write version {other} -- only 1 and 2 are defined"))
+            }
+        }
+    }
+}
+
+impl From<RemoteWriteVersion> for u8 {
+    fn from(version: RemoteWriteVersion) -> u8 {
+        match version {
+            RemoteWriteVersion::V1 => 1,
+            RemoteWriteVersion::V2 => 2,
+        }
+    }
+}
+
+/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
+/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
+/// the default beats hand-mirroring it in another crate.
+pub fn default_prometheus_path() -> String {
     "/metrics".to_string()
+}
+
+/// `prometheus_in`'s remote-write receiver remembering metric types across requests
+/// (`metadata_cache:`), so a Prometheus **1.0** sender's writes decode as typed families.
+///
+/// 1.0 carries a family's type, `# HELP` and `# UNIT` in `WriteRequest.metadata[]`, and
+/// Prometheus's own sender ships those in **separate requests** on their own schedule
+/// (`metadata_config`, by default once a minute) rather than attached to the samples they
+/// describe. A receiver that remembers nothing therefore sees, for nearly every request, a bag of
+/// flat series with no type anywhere in the message: every family decodes as `unknown`, and
+/// `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three unrelated series instead
+/// of one histogram. Nothing is *lost* -- the samples and labels are exact, and a relay back out to
+/// remote-write is still a fixed point -- but the model kinds are flatter than the producer's.
+///
+/// So the receiver keeps a table of `family name -> (type, help, unit)`, fed by every declaration
+/// any request carries that actually names a type -- 1.0's `metadata[]` and 2.0's inline
+/// `Metadata` alike, so a mixed fleet fills one table, but a 1.0 `UNKNOWN` or a 2.0 `UNSPECIFIED`
+/// entry declares nothing and is not learned -- and consulted for a family whose own request
+/// declared nothing. **The request always wins**: a sender that retypes a family retypes it
+/// immediately, however stale the remembered entry.
+///
+/// That table is per-family state on a component that otherwise has none, so it is bounded on both
+/// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
+/// request, and so is any 1.0 sender that attaches metadata to its own writes.
+///
+/// **It is one table per component, shared by every sender that can reach the listener.** That is
+/// what lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer
+/// that declares a great many families evicts other peers' entries, by `last_seen` and with no
+/// attribution -- leaving well-behaved senders untyped (their samples still arrive, as flat
+/// families) until their next metadata write. The receiver authenticates no one, so this is the
+/// same rule `bind_tls:` already carries rather than a new one: do not point it at untrusted
+/// senders (`docs/known-gaps.md`). `max_families: 0` turns the sharing off along with the typing.
+///
+/// See `docs/adr/prometheus-remote-write.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataCacheConfig {
+    /// How many families the receiver will remember at once. Over the cap the
+    /// **least-recently-seen** entry is evicted first, counted
+    /// `logit.input.metadata_cache.evicted{reason="cardinality"}` -- the same policy and the same
+    /// counter shape `prometheus_out`'s exposition `max_series:` uses, because it answers the same
+    /// question: the bound has to be a number of things, and the thing worth keeping is whatever
+    /// was written to most recently.
+    ///
+    /// Defaults to `10000`, which is a generous ceiling on the *distinct families* (not series) a
+    /// sender writes -- a large Prometheus scrapes tens of thousands of series across low
+    /// thousands of families.
+    ///
+    /// **What it costs.** An entry is a family name plus its `# HELP` and `# UNIT` text, each of
+    /// the two bounded at 1 KiB as it is remembered (past that the text is truncated and counted
+    /// `logit.input.metadata_cache.truncated`), so the resident bound is roughly
+    /// `max_families x (name + 2 KiB)` -- about 20 MiB at the default, and far less in practice,
+    /// since a real `# HELP` is a sentence and most families have no `# UNIT` at all. The family
+    /// *name* is the sender's and is not bounded here; the listener is not built to face a hostile
+    /// one (see "Security posture" in `crates/logit-inputs/src/prometheus.rs`).
+    ///
+    /// **`0` turns the cache off entirely**: nothing is remembered, nothing is swept, and 1.0
+    /// requests decode exactly as a stateless receiver's do. That is the setting for a pure-2.0
+    /// fleet, or for one where the extra state is not wanted.
+    #[serde(default = "default_metadata_cache_max_families")]
+    pub max_families: usize,
+    /// How long a family is remembered after the last request that declared it. Defaults to `10m`,
+    /// an order of magnitude over Prometheus's own default one-minute metadata cadence, so a
+    /// sender has to miss ten refreshes running before its types lapse.
+    ///
+    /// An expired entry is dropped, counted `logit.input.metadata_cache.evicted{reason="expired"}`,
+    /// and the families it typed decode as `unknown` again until the sender's next metadata
+    /// request. That is the point of the bound rather than a flaw in it: a sender that has stopped
+    /// writing should stop costing memory, and a remembered type nothing has reasserted in ten
+    /// minutes is a guess about a series that may no longer exist.
+    ///
+    /// Rule 55 rejects `0s` -- an entry that expires the instant it is written is a cache that does
+    /// nothing while still sweeping and locking on every request; `max_families: 0` is how the
+    /// cache is turned off.
+    #[serde(default = "default_metadata_cache_ttl", with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub ttl: Duration,
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        MetadataCacheConfig {
+            max_families: default_metadata_cache_max_families(),
+            ttl: default_metadata_cache_ttl(),
+        }
+    }
+}
+
+/// `MetadataCacheConfig::max_families`' default. `pub` for rule 55's sake, see
+/// [`default_prometheus_scrape_interval`].
+pub fn default_metadata_cache_max_families() -> usize {
+    10_000
+}
+
+/// `MetadataCacheConfig::ttl`'s default. `pub` for rule 55's sake, see
+/// [`default_prometheus_scrape_interval`].
+pub fn default_metadata_cache_ttl() -> Duration {
+    Duration::from_secs(600)
+}
+
+/// `PrometheusIn::path`'s default -- the remote-write receiver's route. Prometheus's own
+/// `remote_write.url` examples, the 1.0 and 2.0 specs' examples, and every receiver in the
+/// ecosystem use `/api/v1/write`, so a sender configured against a stock deployment needs no
+/// `path:` here at all.
+/// `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+pub fn default_prometheus_write_path() -> String {
+    "/api/v1/write".to_string()
 }
 
 fn default_generate_batch() -> usize {
@@ -1704,12 +1953,25 @@ fn default_generate_metric_value() -> f64 {
     1.0
 }
 
-fn default_prometheus_expire_after() -> Duration {
+/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
+/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
+/// the default beats hand-mirroring it in another crate.
+pub fn default_prometheus_expire_after() -> Duration {
     Duration::from_secs(300)
 }
 
-fn default_prometheus_max_series() -> usize {
+/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
+/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
+/// the default beats hand-mirroring it in another crate.
+pub fn default_prometheus_max_series() -> usize {
     100_000
+}
+
+/// `PrometheusOut::timeout`'s default -- the same 10s `default_prometheus_scrape_timeout` and
+/// `otlp_out` already use for one HTTP request. `pub` for rule 56, see
+/// [`default_prometheus_path`].
+pub fn default_prometheus_endpoint_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_max_message_bytes() -> u64 {
@@ -1999,13 +2261,17 @@ fn default_graphite_connect_timeout() -> Duration {
 
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
 /// interval.
-fn default_prometheus_scrape_interval() -> Duration {
+/// `pub`, like [`default_handshake_timeout`]: graph rule 55 has to tell a *set* `interval` from a
+/// defaulted one when deciding whether a scrape-only field was written under `bind:`, and
+/// `logit-pipeline` already depends on this crate, so it imports this rather than mirroring the
+/// number by hand.
+pub fn default_prometheus_scrape_interval() -> Duration {
     Duration::from_secs(15)
 }
 
 /// `PrometheusIn::timeout`'s default -- matches `OtlpOutput`'s/`OtlpInput`'s own 10s default
-/// request timeout.
-fn default_prometheus_scrape_timeout() -> Duration {
+/// request timeout. `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+pub fn default_prometheus_scrape_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
@@ -4344,8 +4610,18 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusOut { bind, path, expire_after, max_series } => {
-                assert_eq!(bind, "127.0.0.1:9464");
+            ComponentKind::PrometheusOut {
+                bind,
+                path,
+                expire_after,
+                max_series,
+                endpoint,
+                version,
+                timeout,
+                headers,
+                endpoint_tls,
+            } => {
+                assert_eq!(bind.as_deref(), Some("127.0.0.1:9464"));
                 assert_eq!(path, "/metrics");
                 assert_eq!(
                     expire_after,
@@ -4353,6 +4629,11 @@ mod tests {
                     "Prometheus's own staleness horizon"
                 );
                 assert_eq!(max_series, 100_000);
+                assert_eq!(endpoint, None, "registry mode sets no sender field");
+                assert_eq!(version, RemoteWriteVersion::V1);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert_eq!(endpoint_tls, TlsClientConfig::default());
             }
             other => panic!("expected PrometheusOut, got {other:?}"),
         }
@@ -4391,13 +4672,75 @@ mod tests {
         }
     }
 
-    /// `bind:` has no default, deliberately -- unlike `admin:`'s own `Option<String>`, an
-    /// exposition sink with nowhere to listen has nothing to do at all.
+    /// Neither mode field is required *by serde* any more -- which of `bind:`/`endpoint:` is set
+    /// is graph rule 56's business, since "exactly one of two fields" is not a shape `serde` can
+    /// state. Both absent therefore deserializes and is rejected at `logit validate` time, with a
+    /// message naming both fields rather than `serde`'s "missing field `bind`".
     #[test]
-    fn prometheus_out_without_a_bind_is_rejected() {
-        let result: Result<Component, _> =
-            serde_json::from_str(r#"{"type": "prometheus_out", "sources": ["in"]}"#);
-        assert!(result.is_err(), "bind is required");
+    fn prometheus_out_with_neither_mode_field_deserializes_and_is_left_to_rule_56() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "prometheus_out", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::PrometheusOut { bind, endpoint, .. } => {
+                assert_eq!(bind, None);
+                assert_eq!(endpoint, None);
+            }
+            other => panic!("expected PrometheusOut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prometheus_out_reads_the_sender_mode_fields() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "prometheus_out", "sources": ["in"],
+                "endpoint": "https://mimir:8080/api/v1/push", "version": 2, "timeout": "30s",
+                "headers": {"X-Scope-OrgID": "tenant-a"},
+                "endpoint_tls": {"ca_file": "ca.pem"}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::PrometheusOut {
+                bind,
+                endpoint,
+                version,
+                timeout,
+                headers,
+                endpoint_tls,
+                ..
+            } => {
+                assert_eq!(bind, None);
+                assert_eq!(endpoint.as_deref(), Some("https://mimir:8080/api/v1/push"));
+                assert_eq!(version, RemoteWriteVersion::V2);
+                assert_eq!(timeout, Duration::from_secs(30));
+                assert_eq!(headers.get("X-Scope-OrgID").map(String::as_str), Some("tenant-a"));
+                assert_eq!(endpoint_tls.ca_file.as_deref(), Some("ca.pem"));
+            }
+            other => panic!("expected PrometheusOut, got {other:?}"),
+        }
+    }
+
+    /// `version:` is the integer both specs are numbered by, not a string enum -- and an integer
+    /// that names no spec is a deserialization error rather than a silent fallback to `1`.
+    #[test]
+    fn prometheus_out_version_is_an_integer_and_rejects_anything_but_1_or_2() {
+        for (text, expected) in [("1", RemoteWriteVersion::V1), ("2", RemoteWriteVersion::V2)] {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "prometheus_out", "sources": ["in"],
+                     "endpoint": "http://mimir:8080/api/v1/push", "version": {text}}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::PrometheusOut { version, .. } => assert_eq!(version, expected),
+                other => panic!("expected PrometheusOut, got {other:?}"),
+            }
+        }
+        for text in ["0", "3", "\"v1\""] {
+            let result: Result<Component, _> = serde_json::from_str(&format!(
+                r#"{{"type": "prometheus_out", "sources": ["in"],
+                     "endpoint": "http://mimir:8080/api/v1/push", "version": {text}}}"#
+            ));
+            assert!(result.is_err(), "version: {text} should be rejected");
+        }
     }
 
     #[test]
@@ -4899,32 +5242,99 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+            ComponentKind::PrometheusIn {
+                scrape_targets,
+                interval,
+                timeout,
+                headers,
+                scrape_tls,
+                bind,
+                path,
+                bind_tls,
+                idle_timeout,
+                metadata_cache,
+            } => {
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
-                assert_eq!(tls, TlsClientConfig::default());
+                assert_eq!(scrape_tls, TlsClientConfig::default());
+                // The receiver half all defaults away, so a scrape config is untouched by its
+                // existence -- and graph rule 55 reads exactly these defaults.
+                assert_eq!(bind, None);
+                assert_eq!(path, "/api/v1/write");
+                assert_eq!(bind_tls, None);
+                assert_eq!(idle_timeout, None);
+                assert_eq!(metadata_cache, MetadataCacheConfig::default());
+                assert_eq!(metadata_cache.max_families, 10_000);
+                assert_eq!(metadata_cache.ttl, Duration::from_secs(600));
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
     }
 
+    /// The cache's two bounds are independent: either may be set on its own, and `0` families is
+    /// a legal value (it's how the cache is turned off) where `0s` is not -- rule 55's, not
+    /// serde's.
     #[test]
-    fn prometheus_in_interval_timeout_headers_and_tls_can_all_be_set() {
+    fn prometheus_in_metadata_cache_deserializes_each_bound_on_its_own() {
+        let cache = |json: &str| -> MetadataCacheConfig {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "metadata_cache": {json}}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::PrometheusIn { metadata_cache, .. } => metadata_cache,
+                other => panic!("expected PrometheusIn, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            cache(r#"{"max_families": 250, "ttl": "90s"}"#),
+            MetadataCacheConfig { max_families: 250, ttl: Duration::from_secs(90) }
+        );
+        // Each field defaults on its own, so setting one never silently resets the other.
+        assert_eq!(
+            cache(r#"{"max_families": 0}"#),
+            MetadataCacheConfig { max_families: 0, ttl: Duration::from_secs(600) }
+        );
+        assert_eq!(
+            cache(r#"{"ttl": "1h"}"#),
+            MetadataCacheConfig { max_families: 10_000, ttl: Duration::from_secs(3600) }
+        );
+        assert_eq!(cache("{}"), MetadataCacheConfig::default());
+    }
+
+    /// Every other all-defaulted sub-block here denies unknown fields, and this one has the sharper
+    /// reason: a misspelled key would otherwise deserialize to the defaults, so the cap an operator
+    /// wrote would be ignored *and* rule 55 would see a defaulted block -- letting the same typo
+    /// resolve under `scrape_targets:`, which is precisely the "a setting silently doing nothing"
+    /// failure rule 55 exists to prevent.
+    #[test]
+    fn prometheus_in_metadata_cache_rejects_a_misspelled_key() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "prometheus_in", "bind": "0.0.0.0:9090",
+                "metadata_cache": {"max_familes": 500}}"#,
+        )
+        .expect_err("a misspelled key must not deserialize to the defaults");
+        assert!(err.to_string().contains("max_familes"), "got: {err}");
+    }
+
+    #[test]
+    fn prometheus_in_interval_timeout_headers_and_scrape_tls_can_all_be_set() {
         let component: Component = serde_json::from_str(
             r#"{"type": "prometheus_in", "scrape_targets": ["https://node-exporter:9100/metrics"],
                 "interval": "30s", "timeout": "5s",
                 "headers": {"X-Scope-OrgID": "tenant-a"},
-                "tls": {"ca_file": "ca.pem"}}"#,
+                "scrape_tls": {"ca_file": "ca.pem"}}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { interval, timeout, headers, tls, .. } => {
+            ComponentKind::PrometheusIn { interval, timeout, headers, scrape_tls, .. } => {
                 assert_eq!(interval, Duration::from_secs(30));
                 assert_eq!(timeout, Duration::from_secs(5));
                 assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
-                assert_eq!(tls.ca_file, Some("ca.pem".to_string()));
+                assert_eq!(scrape_tls.ca_file, Some("ca.pem".to_string()));
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }

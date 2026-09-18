@@ -3,7 +3,8 @@
 # Runs `logit validate` over every shipped config -- demo/logit.yaml and every examples/*.yaml --
 # so a component field rename or a new validation rule doesn't silently leave a config broken.
 # Part of script/cibuild. Needs INFLUXDB_TOKEN resolvable (every shipped config's `influxdb_out`
-# uses `!env INFLUXDB_TOKEN`, ADR `env-yaml-tag`).
+# uses `!env INFLUXDB_TOKEN`, ADR `env-yaml-tag`), and PROMETHEUS_REMOTE_WRITE_AUTHORIZATION for
+# the one `prometheus_out` example that carries an auth header the same way.
 #
 # Defaulted here, not left to compose.yaml's `dev` service `environment:` -- common.sh's `run()`
 # execs directly in CI (no `docker compose run`, so that default never applies there), only going
@@ -16,6 +17,9 @@ SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 export INFLUXDB_TOKEN="${INFLUXDB_TOKEN:-logit-dev-token}"
+# examples/prometheus-remote-write-send.yaml's `headers:` map. The whole header value, `Bearer `
+# prefix included: `!env` substitutes a field rather than interpolating into one.
+export PROMETHEUS_REMOTE_WRITE_AUTHORIZATION="${PROMETHEUS_REMOTE_WRITE_AUTHORIZATION:-Bearer logit-dev-token}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

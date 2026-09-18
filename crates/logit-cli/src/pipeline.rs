@@ -20,7 +20,7 @@ use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::internal::InternalInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
-use logit_inputs::prometheus::PrometheusInput;
+use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
 use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
@@ -34,13 +34,13 @@ use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
-use logit_outputs::prometheus::PrometheusOutput;
+use logit_outputs::prometheus::{ExposeOutput, PrometheusOutput, RemoteWriteOutput};
 use logit_outputs::statsd::{StatsdEncoder, StatsdOutput};
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
 use logit_pipeline::graph::{self, ResolvedComponent};
 use logit_pipeline::{
-    DiskQueueConfig, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
+    DiskQueueConfig, Input, InputRuntimeConfig, NodeSpec, Readiness, RetryConfig, RunError,
     SinkQueueConfig, SinkStoreConfig, WriteLoopConfig,
 };
 use logit_proto::collectd::{CollectdEncoder, TypesDb};
@@ -441,14 +441,50 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
-            let input = PrometheusInput::new(scrape_targets.clone(), *interval)
-                .with_timeout(*timeout)
-                .with_headers(headers)?
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone())
-                .with_tls(&to_input_tls_client_settings(tls), base_dir)?;
-            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        // Two modes, one kind -- graph rule 55 has already established that exactly one of
+        // `scrape_targets`/`bind` is set, so this dispatches on `bind` and trusts it. The two
+        // modes are two types (`PrometheusInput`, `PrometheusReceiver`) rather than one enum: a
+        // scrape client and an HTTP listener share no field and no builder, and `NodeSpec::Input`
+        // already takes a `Box<dyn Input>`, so the kind's config is the only thing that needs to
+        // know about both.
+        PrometheusIn {
+            scrape_targets,
+            interval,
+            timeout,
+            headers,
+            scrape_tls,
+            bind,
+            path,
+            bind_tls,
+            idle_timeout,
+            metadata_cache,
+        } => {
+            let input: Box<dyn Input + Send> = match bind {
+                Some(bind) => {
+                    let mut receiver = PrometheusReceiver::new(bind.clone(), path.clone())
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .with_idle_timeout(*idle_timeout)
+                        // `max_families: 0` is the operator's "off" and the receiver reads it as
+                        // one, so this is passed through unconditionally rather than branched on
+                        // here -- rule 55 has already rejected a zero `ttl`.
+                        .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
+                    if let Some(bind_tls) = bind_tls {
+                        receiver =
+                            receiver.with_bind_tls(&to_tls_server_settings(bind_tls), base_dir)?;
+                    }
+                    Box::new(receiver)
+                }
+                None => Box::new(
+                    PrometheusInput::new(scrape_targets.clone(), *interval)
+                        .with_timeout(*timeout)
+                        .with_headers(headers)?
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .with_tls(&to_input_tls_client_settings(scrape_tls), base_dir)?,
+                ),
+            };
+            NodeSpec::Input(input, input_runtime_config(&component.receive))
         }
         LogitIn { bind, tls, max_frame_bytes, handshake_timeout, idle_timeout } => {
             let mut input = LogitInput::new(bind.clone())
@@ -884,16 +920,49 @@ fn build_spec(
             )
         }
 
-        PrometheusOut { bind, path, expire_after, max_series } => {
-            // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
-            // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
-            // address already in use into a startup failure that names this component.
-            let output = PrometheusOutput::new(bind.clone())
-                .with_path(path.clone())
-                .with_expire_after(*expire_after)
-                .with_max_series(*max_series)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+        PrometheusOut {
+            bind,
+            path,
+            expire_after,
+            max_series,
+            endpoint,
+            version,
+            timeout,
+            headers,
+            endpoint_tls,
+        } => {
+            // Graph rule 56 guarantees exactly one of the two mode fields is set, so this is the
+            // one place the choice is made; `PrometheusOutput` carries it from here as a variant
+            // and nothing downstream branches on it again.
+            let output: PrometheusOutput = match (bind, endpoint) {
+                (Some(bind), _) => {
+                    // Nothing is bound here: `ExposeOutput::bind` opens the listening socket in
+                    // the runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what
+                    // turns an address already in use into a startup failure that names this
+                    // component.
+                    ExposeOutput::new(bind.clone())
+                        .with_path(path.clone())
+                        .with_expire_after(*expire_after)
+                        .with_max_series(*max_series)
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .into()
+                }
+                (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
+                    .with_version(to_remote_write_version(*version))
+                    .with_timeout(*timeout)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone())
+                    .with_headers(headers)?
+                    .with_tls(&to_tls_client_settings(endpoint_tls), base_dir)?
+                    .into(),
+                // Unreachable behind rule 56, and an error rather than a panic for the same
+                // reason every other `build_spec` arm reports rather than asserts: `build_spec` is
+                // callable without `graph::resolve` having run.
+                (None, None) => anyhow::bail!(
+                    "component '{id}': prometheus_out needs exactly one of 'bind' or 'endpoint'"
+                ),
+            };
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1345,6 +1414,20 @@ fn to_tls_client_settings(
     }
 }
 
+/// `logit_config`'s config-facing `version: 1 | 2` into the codec's own [`remote_write::Version`].
+/// The same translation `otlp_out_transport` does for `protocol:` and for the same reason:
+/// `logit-outputs` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), so `build_spec` is where the two spellings meet.
+fn to_remote_write_version(
+    version: logit_config::RemoteWriteVersion,
+) -> logit_proto::prometheus::remote_write::Version {
+    use logit_proto::prometheus::remote_write::Version;
+    match version {
+        logit_config::RemoteWriteVersion::V1 => Version::V1,
+        logit_config::RemoteWriteVersion::V2 => Version::V2,
+    }
+}
+
 /// The `logit-inputs` mirror of [`to_tls_client_settings`].
 fn to_tls_server_settings(
     tls: &logit_config::TlsServerConfig,
@@ -1764,16 +1847,56 @@ mod tests {
             targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::PrometheusOut {
-                bind: "127.0.0.1:0".to_string(),
+                bind: Some("127.0.0.1:0".to_string()),
                 path: "/metrics".to_string(),
                 expire_after: Duration::from_secs(300),
                 max_series: 100_000,
+                endpoint: None,
+                version: logit_config::RemoteWriteVersion::default(),
+                timeout: logit_config::default_prometheus_endpoint_timeout(),
+                headers: HashMap::new(),
+                endpoint_tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(
             build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_, _, _)
         ));
+    }
+
+    /// The other half of the same arm: `endpoint:` builds the remote-write sender, with the
+    /// config-facing integer `version:` translated into the codec's own `Version`. Nothing is
+    /// dialed here -- this sink connects per request.
+    #[test]
+    fn build_spec_builds_a_prometheus_remote_write_sink() {
+        for version in [logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteVersion::V2]
+        {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                targets: Vec::new(),
+                consumers: vec![],
+                kind: ComponentKind::PrometheusOut {
+                    bind: None,
+                    path: logit_config::default_prometheus_path(),
+                    expire_after: logit_config::default_prometheus_expire_after(),
+                    max_series: logit_config::default_prometheus_max_series(),
+                    endpoint: Some("http://mimir:8080/api/v1/push".to_string()),
+                    version,
+                    timeout: Duration::from_secs(30),
+                    headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
+                    endpoint_tls: logit_config::TlsClientConfig::default(),
+                },
+            };
+            assert!(
+                matches!(
+                    build_spec("out", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Output(_, _, _)
+                ),
+                "version {version:?}"
+            );
+        }
     }
 
     #[test]
@@ -1914,7 +2037,42 @@ mod tests {
                 interval: Duration::from_secs(15),
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),
-                tls: logit_config::TlsClientConfig::default(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+                bind: None,
+                path: "/api/v1/write".to_string(),
+                bind_tls: None,
+                idle_timeout: None,
+                metadata_cache: logit_config::MetadataCacheConfig::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    /// The other half of the same kind: `bind:` set instead of `scrape_targets:` builds the
+    /// remote-write receiver rather than the scrape client, which is the whole of what the arm
+    /// dispatches on.
+    #[test]
+    fn build_spec_builds_a_prometheus_receiver() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::PrometheusIn {
+                scrape_targets: Vec::new(),
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+                bind: Some("127.0.0.1:0".to_string()),
+                path: "/api/v1/write".to_string(),
+                bind_tls: None,
+                idle_timeout: Some(Duration::from_secs(60)),
+                metadata_cache: logit_config::MetadataCacheConfig::default(),
             },
         };
         assert!(matches!(

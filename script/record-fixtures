@@ -1,6 +1,7 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
-#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite
+#   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
+#              prometheus
 #   With no arguments, records every producer in `all` below.
 #
 # Captures real wire traffic from real third-party producers (syslog senders, OTel SDKs) into
@@ -27,6 +28,7 @@ source "${SCRIPT_PATH}/common.sh"
 TOOLS_DIR="${ROOT}/tools/record-fixtures"
 OUT_ROOT="${ROOT}/testdata/interop"
 NET="logit-record-fixtures"
+PROM_CFG_DIR="" # set by record_prometheus, removed by cleanup()
 
 # ---- shared plumbing ---------------------------------------------------------------------------
 
@@ -62,8 +64,12 @@ finish_capture() {
 }
 
 cleanup() {
-    ${DOCKER} rm -f capture otelcol >/dev/null 2>&1 || true
+    ${DOCKER} rm -f capture otelcol prometheus metatarget >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
+    # record_prometheus renders its config template into a temp dir per run; drop it here too so a
+    # run that dies mid-capture doesn't leave one behind.
+    [ -n "${PROM_CFG_DIR}" ] && rm -rf "${PROM_CFG_DIR}"
+    return 0
 }
 
 # ---- producers ----------------------------------------------------------------------------------
@@ -305,9 +311,136 @@ record_graphite() {
     finish_capture
 }
 
+# Prometheus remote-write, captured from a real `prom/prometheus:v3.14.0` through raw_capture.py's
+# `--proto http` mode: W6 of `docs/plans/prometheus-remote-write.md` (§6, "Recorded interop
+# fixtures"). That pinned tag is not incidental -- it is the Prometheus whose `prompb` and
+# `io.prometheus.write.v2` protos this repo vendors under `crates/logit-proto/proto/prometheus/`, so
+# the fixture and the generated decoder come from the same upstream revision.
+#
+# HTTP, not `--proto tcp`, because a remote-write sender expects an answer: raw_capture.py's HTTP
+# mode replies `204 No Content` (the status `docs/adr/prometheus-remote-write.md`'s response table
+# gives a successful write), and a Prometheus that never got a response to its first request would
+# never send a second. Each request lands as a `.bin` body plus a `.headers` sidecar; the sidecar is
+# what lets a replay test read the wire version off `Content-Type` /
+# `X-Prometheus-Remote-Write-Version` rather than guess it.
+#
+# **Three fixture sets, three runs**, each with its own `start_capture`/`docker run`/
+# `finish_capture` cycle and its own rendered config -- the same sequential, one-listener-at-a-time
+# shape `record_collectd`'s two captures use, and for the same reason: each set has to be exactly
+# one thing, so a consuming test can name the file it means.
+#   prometheus-v1          -- remote-write 1.0 (`prometheus.WriteRequest`) sample requests.
+#   prometheus-v1-metadata -- 1.0 again, but every request a `MetricMetadata`-only one **by
+#                             construction**, not by luck: this run renders
+#                             `write_relabel_configs` as `action: drop` over `.*`, so no sample can
+#                             reach the wire at all, while 1.0 metadata -- which does not go through
+#                             `write_relabel_configs`, it comes from the scrape cache -- still ships
+#                             on `metadata_config.send_interval`. The replay test asserts all three
+#                             of these captures are metadata-only, so the recipe has to guarantee it
+#                             rather than win a race against the first scrape's sample batch.
+#                             Nothing here post-processes or hand-picks bytes, which would defeat
+#                             the point. That run also scrapes a small static target rather than
+#                             Prometheus's own `/metrics`, so the families it declares are exactly
+#                             the ones the sample captures carry -- see
+#                             tools/record-fixtures/prometheus-metadata-target.prom.
+#   prometheus-v2          -- remote-write 2.0 (`io.prometheus.write.v2.Request`), whose metadata
+#                             rides inline per series instead.
+# `protobuf_message` is set explicitly on all three, including the two 1.0 runs where 3.x would
+# default to it anyway, so the fixture records a deliberate choice rather than a default a later
+# release could move.
+#
+# **Size**: `tools/record-fixtures/prometheus.yml`'s `write_relabel_configs` keeps four metric
+# families out of the several hundred Prometheus's own `/metrics` exposes -- between them a counter,
+# a gauge, a histogram and a summary, i.e. the decoder surface, at a few KB per request instead of a
+# few hundred. Counts here are small for the same reason `record_graphite` pins `RUN_SECONDS=3`:
+# `testdata/interop/README.md` budgets low single-digit KB per fixture and well under 100 KB for the
+# whole directory, and this corpus exercises decoder paths rather than being a dataset.
+#
+# 90s timeouts, matching `record_rsyslog`'s. The image is already local by the time a capture starts
+# (the `--version` run below pulls it) and every rendering scrapes on 5s, so a healthy run finishes
+# in a few seconds. The margin is for what happens before the first scrape rather than between
+# scrapes: container start plus TSDB and remote-write-WAL replay, Prometheus staggering a target's
+# first scrape by a hash-derived offset *within* `scrape_interval`, and -- on the metadata run --
+# `metadata_config`'s own first tick, with nothing remote-written until all of that has happened.
+# Generous on purpose: the cost of a timeout that is too short is a spuriously failed re-record, and
+# the cost of one that is too long is only that a genuinely broken run takes 90s to say so.
+record_prometheus() {
+    echo "== recording: Prometheus remote-write (prom/prometheus:v3.14.0) =="
+    local out="${OUT_ROOT}/prometheus"
+    # Printed the way collectd-entrypoint.sh prints collectd's, so a re-record's drift from
+    # testdata/interop/prometheus/README.md's provenance table shows up in this script's own output.
+    ${DOCKER} run --rm prom/prometheus:v3.14.0 --version 2>&1 | sed 's/^/  [prometheus] /'
+
+    # One template, three renderings. The three sets differ in exactly five values, so a `sed` over
+    # a single commented file keeps that "and nothing else" checkable at a glance -- see
+    # tools/record-fixtures/prometheus.yml's own header. The rendered file goes in a temp dir rather
+    # than back into tools/: it is a per-run artifact, not a reviewable input.
+    PROM_CFG_DIR="$(mktemp -d)"
+    chmod 755 "${PROM_CFG_DIR}"
+
+    # The four families the sample captures keep: between them a gauge, a counter, a histogram and a
+    # summary, in 26 series -- one `max_samples_per_send` request's worth, so a capture is a whole
+    # scrape rather than a fragment. See prometheus.yml's `write_relabel_configs` comment.
+    local keep_regex="prometheus_build_info|prometheus_tsdb_wal_page_flushes_total"
+    keep_regex="${keep_regex}|prometheus_tsdb_compaction_duration_seconds_(bucket|sum|count)"
+    keep_regex="${keep_regex}|go_gc_duration_seconds(_sum|_count)?"
+    # The metadata capture instead drops *every* series, which is what makes it deterministic: with
+    # no samples able to reach the wire, every request that run produces is a metadata request, and
+    # the committed replay test's "all three of these are metadata-only" assertion cannot lose a
+    # coin flip against the first scrape's sample batch. Metadata is not subject to this relabel --
+    # it comes from the scrape cache, which is the same property `metadata_config`'s own comment
+    # warns about for size.
+    #
+    # The metadata run scrapes a small static exposition instead of Prometheus's own /metrics, so
+    # the families it declares are exactly the four the sample captures carry -- see
+    # tools/record-fixtures/prometheus-metadata-target.prom's header. Served by a plain
+    # `python3 -m http.server` out of the image the capture sink already uses, so this adds a
+    # container but no new image to pull.
+    ${DOCKER} run -d --name metatarget --network "${NET}" -w /srv \
+        -v "${TOOLS_DIR}/prometheus-metadata-target.prom:/srv/metrics:ro,z" \
+        python:3.12-slim \
+        python3 -m http.server 9100 >/dev/null
+    sleep 1
+
+    # prefix:count:protobuf_message:scrape_interval:metadata_send_interval:relabel_action:target
+    for spec in \
+        "prometheus-v1:2:prometheus.WriteRequest:5s:1m:keep:localhost:9090" \
+        "prometheus-v1-metadata:3:prometheus.WriteRequest:5s:1s:drop:metatarget:9100" \
+        "prometheus-v2:2:io.prometheus.write.v2.Request:5s:1m:keep:localhost:9090"; do
+        local prefix count message scrape_interval metadata_interval action host port regex
+        IFS=: read -r prefix count message scrape_interval metadata_interval action host port \
+            <<<"${spec}"
+        if [ "${action}" = "drop" ]; then regex=".*"; else regex="${keep_regex}"; fi
+        # `#` as the delimiter for these two, not the `|` the others use: the keep pattern is an
+        # alternation and is full of `|`.
+        echo "-- ${prefix} (protobuf_message: ${message}, relabel: ${action}, target: ${host}:${port})"
+        sed -e "s|@@PROTOBUF_MESSAGE@@|${message}|" \
+            -e "s|@@SCRAPE_INTERVAL@@|${scrape_interval}|" \
+            -e "s|@@METADATA_SEND_INTERVAL@@|${metadata_interval}|" \
+            -e "s|@@SCRAPE_TARGET@@|${host}:${port}|" \
+            -e "s#@@RELABEL_ACTION@@#${action}#" \
+            -e "s#@@RELABEL_REGEX@@#${regex}#" \
+            "${TOOLS_DIR}/prometheus.yml" >"${PROM_CFG_DIR}/prometheus.yml"
+
+        start_capture http 9091 "${out}" "${prefix}" "${count}" 90
+        # Mounted straight over the image's own config path with no command override, so this runs
+        # prom/prometheus's stock command line and the capture records a stock sender.
+        ${DOCKER} run -d --name prometheus --network "${NET}" \
+            -v "${PROM_CFG_DIR}/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z" \
+            prom/prometheus:v3.14.0 \
+            >/dev/null
+        finish_capture
+        ${DOCKER} logs prometheus 2>&1 | sed 's/^/  [prometheus] /'
+        ${DOCKER} rm -f prometheus >/dev/null 2>&1 || true
+    done
+
+    ${DOCKER} rm -f metatarget >/dev/null 2>&1 || true
+    rm -rf "${PROM_CFG_DIR}"
+    PROM_CFG_DIR=""
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -326,6 +459,7 @@ for p in "${producers[@]}"; do
     collectd) record_collectd ;;
     otlp) record_otlp ;;
     graphite) record_graphite ;;
+    prometheus) record_prometheus ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2
         exit 1

@@ -4,13 +4,18 @@
 //!
 //! **This module doc is the mapping table** (house convention, see `crate::otlp`'s module doc).
 //!
-//! **Why the split.** [`MetricFamily`] is the seam: `text.rs` maps bytes ↔ families, this module
-//! maps families ↔ [`Event`]s. A future `remote_write.rs` (prompb ↔ families, see
-//! [ADR `prometheus-scrape-and-exposition`](../../../../docs/adr/prometheus-scrape-and-exposition.md)'s
-//! forward-compatibility section) plugs into the same seam and reuses every rule below unchanged --
+//! **Why the split.** [`MetricFamily`] is the seam: [`text`] maps exposition bytes ↔ families,
+//! [`remote_write`] maps prompb 1.0/2.0 ↔ families, [`assemble`] holds the flat-sample reassembly
+//! both of those need, and *this* module maps families ↔ [`Event`]s. The second syntax module
+//! ([ADR `prometheus-remote-write`](../../../../docs/adr/prometheus-remote-write.md)) plugged into
+//! the seam [ADR `prometheus-scrape-and-exposition`](../../../../docs/adr/prometheus-scrape-and-exposition.md)'s
+//! forward-compatibility section reserved for it and **changed none of the mapping tables below** --
 //! remote-write is a transport for exactly the semantics the exposition format already describes
 //! (`docs/design/telemetry-landscape.md`'s remote-write section), so the model mapping must not
-//! depend on text syntax, and doesn't.
+//! depend on wire syntax, and doesn't. What it did add is three switches
+//! ([`PrometheusDecoder::with_timestamp_marker`], [`PrometheusEncoder::with_timestamps_always`],
+//! [`PrometheusEncoder::with_stale_markers`]) and one [`Point`] variant ([`Point::Stale`]), each of
+//! which defaults to the exposition path's existing behaviour.
 //!
 //! **No [`crate::Encoder`]/[`crate::Decoder`]/[`crate::SignalEncoder`]/[`crate::SignalDecoder`]
 //! implementation here**, deliberately, for the reason `statsd_out`/`syslog_out` don't have one
@@ -61,7 +66,8 @@
 //! | `stateset` (OM) | one `Gauge(0\|1)` per state line + `prometheus.type: "stateset"` |
 //! | `# HELP` / `# UNIT` | `description` / `unit` (interned) |
 //! | `_created` (OM) | `start_timestamp` (seconds → nanos) |
-//! | sample timestamp | `Event::timestamp` + `prometheus.timestamp: true`; absent → `received_at_nanos`, no marker |
+//! | [`Point::Stale`] (remote-write's stale-marker NaN) | the family type's own kind with an empty payload -- `counter` → `Sum{NaN, Cumulative, monotonic}`, `gauge`/`unknown`/`untyped`/`info`/`stateset` → `Gauge(NaN)`, `histogram`/`gaugehistogram` → a bucket-less `Histogram`, `summary` → an empty `Summary` -- and **`flags = FLAG_NO_RECORDED_VALUE`**, which is where the meaning actually lives ([`logit_core::MetricRecord::flags`]). The `prometheus.type` marker is unchanged |
+//! | sample timestamp | `Event::timestamp` + `prometheus.timestamp: true`; absent → `received_at_nanos`, no marker. The marker says *the producer chose to expose a timestamp on this line*, so a transport that mandates one turns it off with [`PrometheusDecoder::with_timestamp_marker`]`(false)` and sets only the timestamp |
 //! | OM exemplar | `Exemplar { value, timestamp, trace, filtered_attributes }` -- `trace_id`/`span_id` labels become a [`logit_core::TraceRef`] when both are valid hex (consumed); every other exemplar label, and an invalid id, stays in `filtered_attributes`. Bucket exemplars all collect onto the one record. |
 //!
 //! ## Encode: events → families ([`events_to_families`])
@@ -82,9 +88,10 @@
 //! | `Samples` | `Samples::sketch()`, then exactly as above -- `degraded{metric_kind="samples"}` |
 //! | `Set` / `SetMembers` | `gauge` of `estimate()` / the distinct member count -- `degraded{metric_kind="set"\|"set_members"}` |
 //! | `ExponentialHistogram` | **skipped**, `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` -- neither text dialect has native-histogram syntax |
-//! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) |
+//! | `flags & NO_RECORDED_VALUE` | **skipped**, `logit.output.metrics.skipped{reason="no_recorded_value"}` (`MetricRecord::flags`' own doc: every non-OTLP sink must treat a flagged point as carrying no reading) -- unless [`PrometheusEncoder::with_stale_markers`]`(true)`, see the row below |
+//! | `flags & NO_RECORDED_VALUE` on a `Gauge` or `Sum`, with [`PrometheusEncoder::with_stale_markers`]`(true)` | [`Point::Stale`] in the family the kind would have chosen anyway (`Sum{monotonic}` → `counter`, `Sum{!monotonic}` → `gauge` + `degraded{metric_kind="non_monotonic_sum"}`, `Gauge` → `gauge` or whatever `prometheus.type` says). Temporality is ignored on this path: a stale marker has no value to be delta about. A flagged `Histogram`/`Summary`/`ExponentialHistogram`/sketch/set stays on the skip row above -- those expand to several derived series and one flag says nothing about which of them existed (`docs/known-gaps.md`) |
 //! | exemplars | carried onto the family; [`text`] emits them on `_total`/`_bucket` lines in OpenMetrics only, at most one per line, each on the bucket its own value falls in. One that has no line left to sit on -- a counter's second exemplar, two in one bucket's range, one over OpenMetrics' 128-code-point label budget -- is dropped, `logit.output.metrics.degraded{reason="exemplar_dropped"}` (text 0.0.4 drops all of them uncounted: that is the operator's dialect choice, not a lossy mapping) |
-//! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) |
+//! | `Event::timestamp` | emitted only when `prometheus.timestamp: true` is present (consumed) -- or on every series, marker or not, under [`PrometheusEncoder::with_timestamps_always`]`(true)`, which is what a transport with no way to omit a timestamp needs |
 //! | labels | `Value::Str/I64/U64/F64/Bool` stringified; `Null/Bytes/Timestamp/Map` dropped -- `logit.output.labels.dropped{reason="unrepresentable"}`. An `Array` (a repeated DogStatsD tag key, `logit_inputs::statsd::insert_tags`) renders its **last** representable element -- a Prometheus label set is a map, so there is no multi-value label -- counted `logit.output.labels.normalized{reason="multi_value"}`; an empty or entirely unrepresentable one stays on the `dropped{reason="unrepresentable"}` path |
 //! | names | sanitized ([`sanitize_metric_name`], [`sanitize_label_name`]); labels are ordered and collision-checked on their **rendered** names, and on a collision the one whose *original* attribute name sorts first wins -- `logit.output.labels.dropped{reason="collision"}`; a label sanitizing onto a generated one (`le` on a histogram, `quantile` on a summary) is dropped -- `logit.output.labels.dropped{reason="reserved"}` |
 //! | two names sanitizing onto one wire name | the family whose *model* name sorts first is exposed, the rest are **skipped** -- `logit.output.metrics.skipped{reason="name_collision"}`. Both cannot be exposed: a second `# TYPE` line for one name makes Prometheus reject the whole scrape, so one clash would poison every other metric in the body. The tie-break is on model names, which means a name that needed no sanitizing can lose to one that did (`a.b` sorts before `a_b`) -- deterministic and counted, but worth knowing before reading it as a bug |
@@ -136,6 +143,16 @@
 //!
 //! Everything else is an error or a counted skip, never a silent reinterpretation.
 
+/// The committed, pre-generated prompb protobuf types (`docs/adr/committed-pregenerated-otlp-protobuf.md`'s
+/// scheme, extended to this second proto family -- see `crates/logit-proto/proto/README.md`'s
+/// "Vendored Prometheus prompb" section for the pinned tag/commit). Remote-write's own codec plugs
+/// into this the way `text.rs` plugs into `otlp::generated`.
+pub mod generated;
+
+mod assemble;
+
+pub mod remote_write;
+
 pub mod text;
 
 pub use text::Dialect;
@@ -165,6 +182,22 @@ pub const ATTR_TARGET: &str = "prometheus.target";
 /// distinct series through a relay because of it; an event-level `instance` wins over the
 /// resource's (`honor_labels` semantics), which falls out of the resource/event merge for free.
 pub const LABEL_INSTANCE: &str = "instance";
+
+/// The bit pattern of the NaN Prometheus reserves for a **stale marker**: a sample whose value is
+/// exactly this says "this series has gone away", and one whose value is any other NaN (including
+/// `f64::NAN`) is an ordinary reading that happens to be NaN. The two are indistinguishable through
+/// `==`, `is_nan()` or a float round trip -- only the bits tell them apart, which is why this is a
+/// constant and [`is_stale_nan`] compares `to_bits`.
+///
+/// Prometheus' own `value.StaleNaN`. See the module doc's [`Point::Stale`] rows for the mapping in
+/// both directions.
+pub const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+/// Whether `value` is Prometheus' stale marker rather than an ordinary NaN -- see
+/// [`STALE_NAN_BITS`].
+pub fn is_stale_nan(value: f64) -> bool {
+    value.to_bits() == STALE_NAN_BITS
+}
 
 /// The `prometheus.` prefix every well-known attribute above shares; the encode side skips the
 /// whole namespace when building labels rather than matching the four names individually, so a
@@ -275,6 +308,20 @@ pub enum Point {
     StateSet(bool),
     /// An `untyped`/`unknown` sample.
     Unknown(f64),
+    /// A **stale marker**: this series has gone away, and the sample carries no reading at all.
+    ///
+    /// Prometheus spells this as a sample whose value is the specific NaN payload
+    /// [`STALE_NAN_BITS`]; the model spells it as `MetricRecord::flags`'
+    /// `FLAG_NO_RECORDED_VALUE` over an empty payload of the family's own kind (see the module
+    /// doc's decode table). It is a [`Point`] variant rather than a `bool` on [`Series`] so that
+    /// every exhaustive match in this codec is a compile error until it has been considered, and
+    /// so no existing struct literal had to change.
+    ///
+    /// Neither exposition dialect has a spelling for it: [`text::write`] skips a `Stale` series
+    /// and counts `logit.output.metrics.skipped{reason="stale"}`. Under the default encoder
+    /// settings one never reaches the text writer at all, because only
+    /// [`PrometheusEncoder::with_stale_markers`]`(true)` produces one.
+    Stale,
 }
 
 /// One series of a family: a label set and its single point, plus the three per-series wire extras.
@@ -325,15 +372,40 @@ impl MetricFamily {
 /// Counts the decode side's skips (and carries the throttled-diagnostics handle a parse needs).
 /// `Telemetry::default()`/`Diagnostics::default()` make every call a no-op, so a decoder used as a
 /// pure codec -- [`text::parse`] with no component attached -- costs nothing to carry.
-#[derive(Default)]
 pub struct PrometheusDecoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
+    timestamp_marker: bool,
+}
+
+impl Default for PrometheusDecoder {
+    fn default() -> Self {
+        PrometheusDecoder {
+            telemetry: Telemetry::default(),
+            diagnostics: Diagnostics::default(),
+            timestamp_marker: true,
+        }
+    }
 }
 
 impl PrometheusDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether [`families_to_events`] stamps `prometheus.timestamp: true` on a series that carried
+    /// its own timestamp. Default `true`, which is what a *scrape* wants: an exposition sample's
+    /// timestamp is optional, so its presence is a producer choice worth preserving across a round
+    /// trip.
+    ///
+    /// A remote-write receiver sets this `false`. Every remote-write sample carries a timestamp --
+    /// it is not optional there -- so the marker would record a choice nobody made, and a
+    /// remote-write → exposition relay would then stamp an explicit timestamp on every line it
+    /// writes, which no scrape of the same data would have produced.
+    /// `Event::timestamp` is set from the sample either way.
+    pub fn with_timestamp_marker(mut self, marker: bool) -> Self {
+        self.timestamp_marker = marker;
+        self
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -369,11 +441,37 @@ impl PrometheusDecoder {
 pub struct PrometheusEncoder {
     telemetry: Telemetry,
     diagnostics: Diagnostics,
+    timestamps_always: bool,
+    stale_markers: bool,
 }
 
 impl PrometheusEncoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether every series gets `Series::timestamp = Some(event.timestamp)` regardless of the
+    /// `prometheus.timestamp` marker. Default `false`, the mirror of
+    /// [`PrometheusDecoder::with_timestamp_marker`]: exposition timestamps are optional, so only a
+    /// sample that arrived with one gets one back.
+    ///
+    /// A remote-write sender sets this `true`, because that wire has no way to omit a timestamp.
+    pub fn with_timestamps_always(mut self, always: bool) -> Self {
+        self.timestamps_always = always;
+        self
+    }
+
+    /// Whether a record carrying `FLAG_NO_RECORDED_VALUE` becomes a [`Point::Stale`] series instead
+    /// of being skipped. Default `false`, so the exposition path is exactly as it was -- neither
+    /// dialect can express a stale marker, and a bare NaN sample would read as a real reading of
+    /// NaN.
+    ///
+    /// A remote-write sender sets this `true`. Only single-series kinds convert (`Gauge`, `Sum`,
+    /// and a `prometheus.type`-marked gauge); a flagged `Histogram`, `Summary` or sketch kind stays
+    /// skipped and counted, for the reason the module doc's encode table gives.
+    pub fn with_stale_markers(mut self, stale: bool) -> Self {
+        self.stale_markers = stale;
+        self
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
@@ -437,13 +535,34 @@ pub fn families_to_events(
     received_at_nanos: i64,
     decoder: &mut PrometheusDecoder,
 ) -> Vec<Event> {
+    families_to_events_with(families, received_at_nanos, decoder, &mut |_, _| {})
+}
+
+/// [`families_to_events`] plus a report of what it stepped over: `on_skipped` is called once per
+/// [`Series`] that has no model kind at all (an empty histogram, a histogram whose cumulative
+/// bucket counts decrease -- see [`point_to_kind`]), with the family it belonged to.
+///
+/// The counted-skip telemetry is already emitted either way; this exists for a caller that has to
+/// report, per call, *how much* of its input survived -- a remote-write receiver owes its sender
+/// an `X-Prometheus-Remote-Write-Samples-Written` count of what it actually kept, and the
+/// assembler's own accepted total is a statement about an earlier stage than this one. Pair it with
+/// [`remote_write::wire_samples`] to turn the skipped series back into the wire samples they were.
+pub fn families_to_events_with(
+    families: &[MetricFamily],
+    received_at_nanos: i64,
+    decoder: &mut PrometheusDecoder,
+    on_skipped: &mut dyn FnMut(&MetricFamily, &Series),
+) -> Vec<Event> {
     let mut out = Vec::new();
     for family in families {
         let name = intern(&family.name);
         let unit = family.unit.as_deref().map(intern);
         let description = family.help.as_deref().map(intern);
         for series in &family.series {
-            let Some(kind) = point_to_kind(&series.point, decoder) else { continue };
+            let Some((kind, flags)) = point_to_kind(&series.point, family.kind, decoder) else {
+                on_skipped(family, series);
+                continue;
+            };
             let mut attributes = AttrMap::new();
             for (label, value) in &series.labels {
                 attributes.insert(label, Value::str(value.as_str()));
@@ -453,7 +572,9 @@ pub fn families_to_events(
             }
             let timestamp = match series.timestamp {
                 Some(ts) => {
-                    attributes.insert(ATTR_TIMESTAMP, Value::Bool(true));
+                    if decoder.timestamp_marker {
+                        attributes.insert(ATTR_TIMESTAMP, Value::Bool(true));
+                    }
                     ts
                 }
                 None => received_at_nanos,
@@ -464,7 +585,7 @@ pub fn families_to_events(
                 description,
                 start_timestamp: series.created.unwrap_or(0),
                 exemplars: series.exemplars.clone(),
-                flags: 0,
+                flags,
                 kind,
             };
             out.push(Event::metric(timestamp, attributes, record));
@@ -473,35 +594,85 @@ pub fn families_to_events(
     out
 }
 
-/// One [`Point`] → one [`MetricKind`], or `None` for a series this codec steps over (counted).
-/// The cumulative → per-bucket conversion lives here rather than in [`text`] on purpose: it is a
-/// model rule, not a syntax one, so a future remote-write path gets it for free.
-fn point_to_kind(point: &Point, decoder: &mut PrometheusDecoder) -> Option<MetricKind> {
-    Some(match point {
-        Point::Counter(v) => MetricKind::Sum(Sum {
-            value: *v,
+/// One [`Point`] → one [`MetricKind`] and the record `flags` that go with it, or `None` for a
+/// series this codec steps over (counted). The cumulative → per-bucket conversion lives here rather
+/// than in [`text`] on purpose: it is a model rule, not a syntax one, so the remote-write path gets
+/// it for free.
+///
+/// `family` is the point's own family type, which only [`Point::Stale`] needs: a stale marker has
+/// no payload of its own, so the kind it takes is the one the family would have produced anyway.
+fn point_to_kind(
+    point: &Point,
+    family: FamilyType,
+    decoder: &mut PrometheusDecoder,
+) -> Option<(MetricKind, u32)> {
+    if matches!(point, Point::Stale) {
+        return Some((stale_kind(family), MetricRecord::FLAG_NO_RECORDED_VALUE));
+    }
+    Some((
+        match point {
+            Point::Counter(v) => MetricKind::Sum(Sum {
+                value: *v,
+                temporality: Temporality::Cumulative,
+                monotonic: true,
+            }),
+            Point::Gauge(v) | Point::Unknown(v) => MetricKind::Gauge(*v),
+            Point::Info => MetricKind::Gauge(1.0),
+            Point::StateSet(on) => MetricKind::Gauge(if *on { 1.0 } else { 0.0 }),
+            Point::Histogram { buckets, sum, .. } => {
+                let buckets = per_bucket_counts(buckets, decoder)?;
+                MetricKind::Histogram(Histogram {
+                    buckets,
+                    temporality: Temporality::Cumulative,
+                    sum: *sum,
+                    min: None,
+                    max: None,
+                })
+            }
+            Point::Summary { quantiles, sum, count } => MetricKind::Summary(Summary {
+                quantiles: quantiles.clone(),
+                count: count.unwrap_or(0),
+                sum: sum.unwrap_or(0.0),
+            }),
+            // Handled above, before any of the value-bearing arms can be reached.
+            Point::Stale => unreachable!("stale markers return early"),
+        },
+        0,
+    ))
+}
+
+/// The empty payload a [`Point::Stale`] takes for its family's type. The model has no "there is no
+/// reading" variant -- `FLAG_NO_RECORDED_VALUE` on the record is what says that -- so the kind has
+/// to be *something*, and the something that loses the least is the kind the family would have
+/// produced had the series carried a value: a downstream `aggregate` or sink sees the same shape
+/// before and after a series goes stale, and the encode side can put the marker back on the right
+/// family type without guessing.
+///
+/// `NaN` rather than `0` for the scalar kinds, because `0` is a perfectly good counter reading and
+/// a consumer that ignores the flag would silently read a reset.
+fn stale_kind(family: FamilyType) -> MetricKind {
+    match family {
+        FamilyType::Counter => MetricKind::Sum(Sum {
+            value: f64::NAN,
             temporality: Temporality::Cumulative,
             monotonic: true,
         }),
-        Point::Gauge(v) | Point::Unknown(v) => MetricKind::Gauge(*v),
-        Point::Info => MetricKind::Gauge(1.0),
-        Point::StateSet(on) => MetricKind::Gauge(if *on { 1.0 } else { 0.0 }),
-        Point::Histogram { buckets, sum, .. } => {
-            let buckets = per_bucket_counts(buckets, decoder)?;
-            MetricKind::Histogram(Histogram {
-                buckets,
-                temporality: Temporality::Cumulative,
-                sum: *sum,
-                min: None,
-                max: None,
-            })
-        }
-        Point::Summary { quantiles, sum, count } => MetricKind::Summary(Summary {
-            quantiles: quantiles.clone(),
-            count: count.unwrap_or(0),
-            sum: sum.unwrap_or(0.0),
+        FamilyType::Histogram | FamilyType::GaugeHistogram => MetricKind::Histogram(Histogram {
+            buckets: Vec::new(),
+            temporality: Temporality::Cumulative,
+            sum: None,
+            min: None,
+            max: None,
         }),
-    })
+        FamilyType::Summary => {
+            MetricKind::Summary(Summary { quantiles: Vec::new(), count: 0, sum: 0.0 })
+        }
+        FamilyType::Gauge
+        | FamilyType::Info
+        | FamilyType::StateSet
+        | FamilyType::Unknown
+        | FamilyType::Untyped => MetricKind::Gauge(f64::NAN),
+    }
 }
 
 /// Cumulative `le` counts → [`logit_core::Histogram`]'s per-bucket counts, by successive
@@ -557,19 +728,29 @@ pub fn events_to_families<'a>(
     let mut families: BTreeMap<String, FamilyEntry> = BTreeMap::new();
     for (resource, event) in events {
         for record in &event.metrics {
-            if record.is_no_recorded_value() {
+            let stale = record.is_no_recorded_value();
+            if stale && !encoder.stale_markers {
                 encoder.skipped_reason("no_recorded_value");
                 continue;
             }
-            let Some((kind, point)) = record_to_point(record, event, encoder) else { continue };
+            let converted = if stale {
+                stale_point(record, event, encoder)
+            } else {
+                record_to_point(record, event, encoder)
+            };
+            let Some((kind, point)) = converted else { continue };
             let name = resolve(record.name);
             // Borrows `name` whenever it already conforms, which is nearly always -- one allocation
             // per *family*, not per point, and only for a name that really has to change.
             let key = sanitize_metric_name(name);
             let labels = build_labels(resource, event, kind, encoder);
-            let timestamp = match event.attributes.get(ATTR_TIMESTAMP) {
-                Some(Value::Bool(true)) => Some(event.timestamp),
-                _ => None,
+            let timestamp = if encoder.timestamps_always {
+                Some(event.timestamp)
+            } else {
+                match event.attributes.get(ATTR_TIMESTAMP) {
+                    Some(Value::Bool(true)) => Some(event.timestamp),
+                    _ => None,
+                }
             };
             let created = if kind.has_created() && record.start_timestamp != 0 {
                 Some(record.start_timestamp)
@@ -664,10 +845,7 @@ fn record_to_point(
     event: &Event,
     encoder: &mut PrometheusEncoder,
 ) -> Option<(FamilyType, Point)> {
-    let declared = match event.attributes.get(ATTR_TYPE).and_then(|v| v.as_str()) {
-        Some(s) => FamilyType::from_keyword(s),
-        None => None,
-    };
+    let declared = declared_type(event);
     Some(match &record.kind {
         MetricKind::Sum(s) => match (s.temporality, s.monotonic) {
             (Temporality::Cumulative, true) => (FamilyType::Counter, Point::Counter(s.value)),
@@ -751,6 +929,50 @@ fn record_to_point(
             (FamilyType::Gauge, Point::Gauge(distinct as f64))
         }
     })
+}
+
+/// The wire family type a `prometheus.type` attribute names, when the event carries one this codec
+/// recognizes -- the five types the model has no distinct kind for (see the module doc's well-known
+/// attribute section).
+fn declared_type(event: &Event) -> Option<FamilyType> {
+    event.attributes.get(ATTR_TYPE).and_then(|v| v.as_str()).and_then(FamilyType::from_keyword)
+}
+
+/// A record carrying `FLAG_NO_RECORDED_VALUE` → the family its stale marker belongs on, under
+/// [`PrometheusEncoder::with_stale_markers`]. `None` -- skipped and counted exactly as an unflagged
+/// skip would be -- for every kind that expands to more than one wire series.
+///
+/// Temporality is deliberately not consulted: `Sum{Delta}` is normally skipped because Prometheus
+/// cannot express a delta *reading*, and a stale marker has no reading to be delta about. The
+/// family type otherwise follows [`record_to_point`]'s own choices, so a series that went stale
+/// lands on the same family it was on while it had values.
+fn stale_point(
+    record: &MetricRecord,
+    event: &Event,
+    encoder: &mut PrometheusEncoder,
+) -> Option<(FamilyType, Point)> {
+    let kind = match &record.kind {
+        MetricKind::Sum(s) => {
+            if s.monotonic {
+                FamilyType::Counter
+            } else {
+                encoder.degraded("non_monotonic_sum");
+                FamilyType::Gauge
+            }
+        }
+        MetricKind::Gauge(_) => match declared_type(event) {
+            Some(FamilyType::Untyped) => FamilyType::Untyped,
+            Some(FamilyType::Unknown) => FamilyType::Unknown,
+            Some(FamilyType::Info) => FamilyType::Info,
+            Some(FamilyType::StateSet) => FamilyType::StateSet,
+            _ => FamilyType::Gauge,
+        },
+        _ => {
+            encoder.skipped_reason("no_recorded_value");
+            return None;
+        }
+    };
+    Some((kind, Point::Stale))
 }
 
 /// The one diagnostic both delta arms report under -- a single greppable key naming the fix, the
@@ -1898,5 +2120,238 @@ mod tests {
         let families = events_to_families(std::iter::once((&resource, &event)), &mut encoder);
         assert_eq!(families[0].name, "a_b");
         assert!(!counted(&registry, "logit.output.metrics.skipped", ("reason", "name_collision")));
+    }
+
+    // --- stale markers and the three transport switches ----------------------------------------
+
+    /// One `Stale` series per family type, decoded: the *kind* is the one the family would have
+    /// produced anyway, the payload is empty, and `FLAG_NO_RECORDED_VALUE` is what carries the
+    /// meaning. A downstream stage that ignores the flag therefore still sees a shape it
+    /// recognizes rather than a missing series.
+    #[test]
+    fn a_stale_point_decodes_to_its_family_type_with_the_no_recorded_value_flag() {
+        for kind in [
+            FamilyType::Counter,
+            FamilyType::Gauge,
+            FamilyType::Unknown,
+            FamilyType::Untyped,
+            FamilyType::Info,
+            FamilyType::StateSet,
+            FamilyType::Histogram,
+            FamilyType::GaugeHistogram,
+            FamilyType::Summary,
+        ] {
+            let families = [family("m", kind, vec![Series::new(vec![], Point::Stale)])];
+            let events = decode(&families);
+            assert_eq!(events.len(), 1, "{kind:?}");
+            let record = &events[0].metrics[0];
+            assert!(record.is_no_recorded_value(), "{kind:?} must set the flag");
+            let shaped = match (kind, &record.kind) {
+                (FamilyType::Counter, MetricKind::Sum(sum)) => {
+                    sum.value.is_nan()
+                        && sum.monotonic
+                        && sum.temporality == Temporality::Cumulative
+                }
+                (
+                    FamilyType::Gauge
+                    | FamilyType::Unknown
+                    | FamilyType::Untyped
+                    | FamilyType::Info
+                    | FamilyType::StateSet,
+                    MetricKind::Gauge(v),
+                ) => v.is_nan(),
+                (
+                    FamilyType::Histogram | FamilyType::GaugeHistogram,
+                    MetricKind::Histogram(histogram),
+                ) => histogram.buckets.is_empty() && histogram.sum.is_none(),
+                (FamilyType::Summary, MetricKind::Summary(summary)) => {
+                    summary.quantiles.is_empty() && summary.count == 0 && summary.sum == 0.0
+                }
+                _ => false,
+            };
+            assert!(shaped, "{kind:?} got {:?}", record.kind);
+            // The five marker types still say what they were on the wire.
+            if kind.needs_marker() {
+                assert_eq!(
+                    events[0].attributes.get(ATTR_TYPE).and_then(|v| v.as_str()),
+                    Some(kind.as_str()),
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+
+    /// The stale NaN is a specific bit pattern, not "a NaN": every other NaN, `f64::NAN` included,
+    /// is an ordinary reading.
+    #[test]
+    fn only_the_reserved_bit_pattern_is_a_stale_nan() {
+        assert!(is_stale_nan(f64::from_bits(STALE_NAN_BITS)));
+        assert!(f64::from_bits(STALE_NAN_BITS).is_nan());
+        assert!(!is_stale_nan(f64::NAN));
+        assert!(!is_stale_nan(0.0));
+        assert!(!is_stale_nan(f64::INFINITY));
+    }
+
+    /// `with_timestamp_marker(false)`: the timestamp still lands on the event, the marker doesn't.
+    #[test]
+    fn the_timestamp_marker_can_be_turned_off_without_losing_the_timestamp() {
+        let stamped = [family(
+            "m",
+            FamilyType::Gauge,
+            vec![Series { timestamp: Some(42), ..Series::new(vec![], Point::Gauge(1.0)) }],
+        )];
+
+        let marked = families_to_events(&stamped, RECEIVED_AT, &mut PrometheusDecoder::new());
+        assert_eq!(marked[0].timestamp, 42);
+        assert_eq!(marked[0].attributes.get(ATTR_TIMESTAMP), Some(&Value::Bool(true)));
+
+        let mut decoder = PrometheusDecoder::new().with_timestamp_marker(false);
+        let bare = families_to_events(&stamped, RECEIVED_AT, &mut decoder);
+        assert_eq!(bare[0].timestamp, 42);
+        assert_eq!(bare[0].attributes.get(ATTR_TIMESTAMP), None);
+
+        // A series with no timestamp of its own is unaffected either way.
+        let unstamped =
+            [family("m", FamilyType::Gauge, vec![Series::new(vec![], Point::Gauge(1.0))])];
+        let events = families_to_events(&unstamped, RECEIVED_AT, &mut decoder);
+        assert_eq!(events[0].timestamp, RECEIVED_AT);
+        assert_eq!(events[0].attributes.get(ATTR_TIMESTAMP), None);
+    }
+
+    /// `with_timestamps_always(true)`: every series gets one, marker or not.
+    #[test]
+    fn timestamps_always_fills_a_timestamp_the_marker_did_not_ask_for() {
+        let event = event_with(&[], record("m", MetricKind::Gauge(1.0)));
+        assert_eq!(encode(&Resource::default(), &event)[0].series[0].timestamp, None);
+
+        let mut encoder = PrometheusEncoder::new().with_timestamps_always(true);
+        let families =
+            events_to_families(std::iter::once((&Resource::default(), &event)), &mut encoder);
+        assert_eq!(families[0].series[0].timestamp, Some(RECEIVED_AT));
+    }
+
+    fn encode_stale(event: &Event) -> (Vec<MetricFamily>, Arc<Registry>) {
+        let (registry, telemetry) = telemetry();
+        let mut encoder =
+            PrometheusEncoder::new().with_stale_markers(true).with_telemetry(telemetry);
+        let families =
+            events_to_families(std::iter::once((&Resource::default(), event)), &mut encoder);
+        (families, registry)
+    }
+
+    /// `with_stale_markers(true)`: the single-series kinds convert, on the family type they would
+    /// have been on anyway.
+    #[test]
+    fn stale_markers_convert_the_single_series_kinds() {
+        let sum = |temporality| MetricKind::Sum(Sum { value: 0.0, temporality, monotonic: true });
+        let cases = [
+            (None, sum(Temporality::Cumulative), FamilyType::Counter),
+            // Temporality is not consulted: a stale marker has no reading to be delta about, so
+            // the `delta_sum` skip that would apply to a *valued* record does not apply here.
+            (None, sum(Temporality::Delta), FamilyType::Counter),
+            (None, MetricKind::Gauge(0.0), FamilyType::Gauge),
+            (Some("unknown"), MetricKind::Gauge(0.0), FamilyType::Unknown),
+            (Some("untyped"), MetricKind::Gauge(0.0), FamilyType::Untyped),
+            (Some("info"), MetricKind::Gauge(0.0), FamilyType::Info),
+            (Some("stateset"), MetricKind::Gauge(0.0), FamilyType::StateSet),
+        ];
+        for (declared, kind, expected) in cases {
+            let mut rec = record("m", kind.clone());
+            rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+            let attrs: Vec<(&str, Value)> =
+                declared.into_iter().map(|d| (ATTR_TYPE, Value::str(d))).collect();
+            let (families, _) = encode_stale(&event_with(&attrs, rec));
+            assert_eq!(families.len(), 1, "{kind:?} {declared:?}");
+            assert_eq!(families[0].kind, expected, "{kind:?} {declared:?}");
+            assert_eq!(families[0].series[0].point, Point::Stale, "{kind:?} {declared:?}");
+        }
+    }
+
+    /// A flagged non-monotonic sum is still a `gauge`, and still counted as the degradation it is.
+    #[test]
+    fn a_stale_non_monotonic_sum_degrades_to_a_gauge() {
+        let mut rec = record(
+            "m",
+            MetricKind::Sum(Sum {
+                value: 0.0,
+                temporality: Temporality::Cumulative,
+                monotonic: false,
+            }),
+        );
+        rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        let (families, registry) = encode_stale(&event_with(&[], rec));
+        assert_eq!(families[0].kind, FamilyType::Gauge);
+        assert!(counted(
+            &registry,
+            "logit.output.metrics.degraded",
+            ("metric_kind", "non_monotonic_sum")
+        ));
+    }
+
+    /// The multi-series kinds stay skipped even with the switch on: one flag says nothing about
+    /// which of a histogram's derived series existed, so there is nothing to reconstruct.
+    #[test]
+    fn stale_markers_do_not_convert_the_multi_series_kinds() {
+        let kinds = [
+            MetricKind::Histogram(Histogram {
+                buckets: vec![(1.0, 1)],
+                temporality: Temporality::Cumulative,
+                sum: Some(1.0),
+                min: None,
+                max: None,
+            }),
+            MetricKind::Summary(Summary { quantiles: vec![], count: 1, sum: 1.0 }),
+            MetricKind::Set(HyperLogLog::new()),
+        ];
+        for kind in kinds {
+            let mut rec = record("m", kind.clone());
+            rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+            let (families, registry) = encode_stale(&event_with(&[], rec));
+            assert!(families.is_empty(), "{kind:?}");
+            assert!(
+                counted(&registry, "logit.output.metrics.skipped", ("reason", "no_recorded_value")),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The default is unchanged: without the switch, a flagged record is skipped exactly as
+    /// `a_no_recorded_value_point_is_skipped_and_counted` pins.
+    #[test]
+    fn stale_markers_are_off_by_default() {
+        let mut rec = record("m", MetricKind::Gauge(0.0));
+        rec.flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
+        assert!(encode(&Resource::default(), &event_with(&[], rec)).is_empty());
+    }
+
+    /// The round trip the receiver/sender pair actually runs: a `Stale` family through
+    /// `families_to_events` and back with both switches on comes out unchanged.
+    #[test]
+    fn a_stale_series_round_trips_through_the_model_with_the_switches_on() {
+        for kind in [
+            FamilyType::Counter,
+            FamilyType::Gauge,
+            FamilyType::Unknown,
+            FamilyType::Untyped,
+            FamilyType::Info,
+            FamilyType::StateSet,
+        ] {
+            let families = vec![family(
+                "m",
+                kind,
+                vec![Series {
+                    timestamp: Some(RECEIVED_AT),
+                    ..Series::new(labels(&[("shard", "3")]), Point::Stale)
+                }],
+            )];
+            let mut decoder = PrometheusDecoder::new().with_timestamp_marker(false);
+            let events = families_to_events(&families, 0, &mut decoder);
+            let resource = Resource::default();
+            let mut encoder =
+                PrometheusEncoder::new().with_stale_markers(true).with_timestamps_always(true);
+            let round_tripped =
+                events_to_families(events.iter().map(|event| (&resource, event)), &mut encoder);
+            assert_eq!(round_tripped, families, "{kind:?}");
+        }
     }
 }

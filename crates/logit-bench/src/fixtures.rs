@@ -1356,6 +1356,104 @@ pub fn prometheus_gauge_events(count: usize) -> Vec<Event> {
         .collect()
 }
 
+/// The one instant every remote-write fixture below stamps: whole milliseconds, which is the only
+/// resolution either version carries.
+const REMOTE_WRITE_TIMESTAMP_MS: i64 = 1_700_000_000_000;
+
+/// `count` distinct gauge series under one family, the family shape
+/// `remote_write_encode_100_series_v1`/`_v2` (`tests/allocations.rs`) encode --
+/// [`prometheus_gauge_events`]'s workload already through `events_to_families`, so the measurement
+/// is the *protobuf* half rather than the model mapping the `prometheus_out` rows already pin.
+pub fn remote_write_families(count: usize) -> Vec<logit_proto::prometheus::MetricFamily> {
+    use logit_proto::prometheus::{FamilyType, MetricFamily, Point, Series};
+
+    let series = (0..count)
+        .map(|i| Series {
+            timestamp: Some(REMOTE_WRITE_TIMESTAMP_MS * 1_000_000),
+            ..Series::new(vec![("shard".to_string(), i.to_string())], Point::Gauge(i as f64))
+        })
+        .collect();
+    vec![MetricFamily {
+        help: Some("Bench gauge.".to_string()),
+        series,
+        ..MetricFamily::new("prom_bench_gauge", FamilyType::Gauge)
+    }]
+}
+
+/// One **uncompressed** remote-write 1.0 request carrying 100 gauge series of one family, the shape
+/// a sender with `max_samples_per_send` well under its default produces -- `remote_write_decode_one_request_v1`
+/// (`tests/allocations.rs`).
+///
+/// Built from the vendored `prometheus.WriteRequest` types directly, not through
+/// `logit_proto::prometheus::remote_write::encode`: the request this measures decoding has to be an
+/// independent statement of what the wire looks like, or the measurement is circular. The label
+/// order is the byte order both specs require of a sender (`__name__` before `shard`, since `_` is
+/// `0x5f`).
+pub fn remote_write_request_v1() -> Vec<u8> {
+    use logit_proto::prometheus::generated::prometheus as pb;
+    use prost::Message;
+
+    let timeseries = (0..100)
+        .map(|i| pb::TimeSeries {
+            labels: vec![
+                pb::Label { name: "__name__".to_string(), value: "prom_bench_gauge".to_string() },
+                pb::Label { name: "shard".to_string(), value: i.to_string() },
+            ],
+            samples: vec![pb::Sample { value: i as f64, timestamp: REMOTE_WRITE_TIMESTAMP_MS }],
+            ..Default::default()
+        })
+        .collect();
+    pb::WriteRequest {
+        timeseries,
+        metadata: vec![pb::MetricMetadata {
+            r#type: pb::metric_metadata::MetricType::Gauge as i32,
+            metric_family_name: "prom_bench_gauge".to_string(),
+            help: "Bench gauge.".to_string(),
+            unit: String::new(),
+        }],
+    }
+    .encode_to_vec()
+}
+
+/// The same request in remote-write 2.0 -- same series, same values, expressed through the symbol
+/// table and per-series inline `Metadata` that version replaces `metadata[]` with. Symbol `0` is the
+/// mandatory empty string; the shard values dominate the table, which is what a real 2.0 request
+/// looks like too.
+pub fn remote_write_request_v2() -> Vec<u8> {
+    use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb;
+    use prost::Message;
+
+    // "", "__name__", "prom_bench_gauge", "shard", "Bench gauge.", then one per shard value.
+    let mut symbols = vec![
+        String::new(),
+        "__name__".to_string(),
+        "prom_bench_gauge".to_string(),
+        "shard".to_string(),
+        "Bench gauge.".to_string(),
+    ];
+    let first_shard = symbols.len() as u32;
+    let timeseries = (0..100u32)
+        .map(|i| {
+            symbols.push(i.to_string());
+            pb::TimeSeries {
+                labels_refs: vec![1, 2, 3, first_shard + i],
+                samples: vec![pb::Sample {
+                    value: f64::from(i),
+                    timestamp: REMOTE_WRITE_TIMESTAMP_MS,
+                    start_timestamp: 0,
+                }],
+                metadata: Some(pb::Metadata {
+                    r#type: pb::metadata::MetricType::Gauge as i32,
+                    help_ref: 4,
+                    unit_ref: 0,
+                }),
+                ..Default::default()
+            }
+        })
+        .collect();
+    pb::Request { symbols, timeseries }.encode_to_vec()
+}
+
 /// A collectd-shaped like-relay event: `collectd.host`/`collectd.plugin`/`collectd.type`/
 /// `collectd.interval` present, one gauge record -- the shape `collectd_in` produces and
 /// `collectd_out`'s encoder fast-paths straight into one Values part

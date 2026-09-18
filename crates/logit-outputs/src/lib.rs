@@ -9,6 +9,7 @@ mod attrs;
 pub mod collectd;
 pub mod file;
 pub mod graphite;
+mod http;
 pub mod influxdb;
 pub mod logit;
 pub mod null;

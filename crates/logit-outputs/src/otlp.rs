@@ -28,8 +28,15 @@
 //! | Connect refused, DNS failure (the request never reached anything) | `Clean` |
 //! | Request timeout | `Ambiguous` |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` |
+//! | Any HTTP 3xx | `Permanent` -- [`crate::http::build_client`] turns `reqwest`'s own `limited(10)` redirect policy off, so a redirect is reported against the URL the operator configured rather than followed. OTLP defines no redirect, and following one would break this table's premise that one request went to the configured endpoint: a `301`/`302`/`303` is replayed as a body-less `GET`, so whatever answers it becomes the verdict on a batch that was never written, and a `307`/`308` carries the operator's `headers:` to the `Location` host past rule 24's `https://` check |
 //! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED` | `Permanent` |
 //! | Any other gRPC status | `Permanent` (never retry a code this sink doesn't positively recognize) |
+//!
+//! A non-2xx HTTP response's body is quoted in the error message, bounded to
+//! [`crate::http::ERROR_BODY_SNIPPET_BYTES`] (256) bytes plus a character's slack -- and read
+//! bounded rather than read whole and then trimmed ([`crate::http::read_body_prefix`]), so a
+//! collector answering an error with an endless body costs a snippet rather than a connection's
+//! worth of allocation on every retry.
 //!
 //! **Partial success.** A 2xx/`OK` response can still say "I only accepted part of this" via OTLP's
 //! own `Export*ServiceResponse.partial_success` field (`rejected_<signal>` + `error_message`) --
@@ -59,6 +66,13 @@ use logit_proto::{Signal, SignalEncoder};
 use rustls_pki_types::pem::PemObject;
 #[cfg(test)]
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+// Shared with `prometheus_out`'s remote-write sender, which reuses this transport's `Fault` table
+// by name (`docs/adr/prometheus-remote-write.md`) -- see `crate::http`.
+use crate::http::{
+    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
+    status_class, ERROR_BODY_SNIPPET_BYTES,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -170,7 +184,7 @@ impl OtlpOutput {
     /// mutual TLS, or disabling verification entirely. A no-op if `settings` is empty: both
     /// transports already default to a working TLS configuration (the bundled Mozilla root set)
     /// for an `https://` endpoint without this ever being called.
-    /// `logit-pipeline::graph::resolve`'s rule 22 rejects a non-empty `tls:` on a non-`https://`
+    /// `logit-pipeline::graph::resolve`'s rule 24 rejects a non-empty `tls:` on a non-`https://`
     /// endpoint before this ever runs, and requires `cert_file`/`key_file` together -- this method
     /// still loads and validates every file itself, since `graph::resolve` never touches the
     /// filesystem.
@@ -332,7 +346,15 @@ impl OtlpOutput {
                     1.0,
                     &[("signal", signal.as_str()), ("class", status_class(status))],
                 );
-                let text = resp.text().await.unwrap_or_default();
+                // A bounded read, not `text()`: a collector answering an error with an
+                // arbitrarily long body would otherwise cost this sink that much allocation per
+                // attempt, and an erroring sink is the one that keeps retrying. The message keeps
+                // as much of it as is useful, ellipsised past that -- see
+                // `crate::http::read_body_prefix`.
+                let text = body_snippet(
+                    &read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await,
+                    ERROR_BODY_SNIPPET_BYTES,
+                );
                 let fault = if is_retryable_http_status(status) {
                     Fault::Ambiguous
                 } else {
@@ -455,18 +477,6 @@ impl Output for OtlpOutput {
     }
 }
 
-/// Builds the HTTP transport's client. `tls` is `None` for the common case (no `tls:` block set)
-/// -- `reqwest`'s own default TLS configuration already trusts the bundled Mozilla root set for
-/// an `https://` endpoint, so there's nothing to override. `Some` only once
-/// [`OtlpOutput::with_tls`] has built a customized `rustls::ClientConfig`.
-fn build_client(timeout: Duration, tls: Option<&rustls::ClientConfig>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
-    if let Some(cfg) = tls {
-        builder = builder.use_preconfigured_tls(cfg.clone());
-    }
-    builder.build().expect("reqwest client should build with the configured TLS settings")
-}
-
 /// The gRPC transport's default trust: the same bundled Mozilla root set `reqwest`'s own default
 /// TLS configuration uses for the HTTP transport, via the `ring` crypto provider (never
 /// `aws-lc-rs` -- `docs/adr/otlp-tls-and-pooled-grpc-client.md`). Built once at [`OtlpOutput::new`]
@@ -520,36 +530,6 @@ fn normalize_grpc_endpoint(endpoint: &str) -> String {
         format!("http://{}", &trimmed[7..])
     } else {
         format!("http://{trimmed}")
-    }
-}
-
-/// A coarse HTTP response-status bucket -- see `crate::influxdb::status_class`'s identical
-/// reasoning; duplicated rather than shared because these are two independently-evolving outputs.
-fn status_class(status: reqwest::StatusCode) -> &'static str {
-    match status.as_u16() / 100 {
-        1 => "1xx",
-        2 => "2xx",
-        3 => "3xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "other",
-    }
-}
-
-/// 429 and any 5xx are transient (`Fault::Ambiguous`); every other 4xx is a configuration error
-/// (`Fault::Permanent`) -- see this module's doc comment table.
-fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error() || status.as_u16() == 429
-}
-
-/// See `crate::influxdb::classify_transport_error`'s doc comment -- same underlying
-/// `reqwest::Error::is_connect()` distinction, duplicated (not shared) per this module's own doc
-/// comment on why `Fault` classification isn't shared between the two outputs.
-fn classify_reqwest_error(err: &reqwest::Error) -> Fault {
-    if err.is_connect() {
-        Fault::Clean
-    } else {
-        Fault::Ambiguous
     }
 }
 
