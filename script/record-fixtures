@@ -64,7 +64,7 @@ finish_capture() {
 }
 
 cleanup() {
-    ${DOCKER} rm -f capture otelcol prometheus >/dev/null 2>&1 || true
+    ${DOCKER} rm -f capture otelcol prometheus metatarget >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
     # record_prometheus renders its config template into a temp dir per run; drop it here too so a
     # run that dies mid-capture doesn't leave one behind.
@@ -358,24 +358,55 @@ record_prometheus() {
     # testdata/interop/prometheus/README.md's provenance table shows up in this script's own output.
     ${DOCKER} run --rm prom/prometheus:v3.14.0 --version 2>&1 | sed 's/^/  [prometheus] /'
 
-    # One template, three renderings. The three sets differ in exactly three values, so a `sed` over
+    # One template, three renderings. The three sets differ in exactly five values, so a `sed` over
     # a single commented file keeps that "and nothing else" checkable at a glance -- see
     # tools/record-fixtures/prometheus.yml's own header. The rendered file goes in a temp dir rather
     # than back into tools/: it is a per-run artifact, not a reviewable input.
     PROM_CFG_DIR="$(mktemp -d)"
     chmod 755 "${PROM_CFG_DIR}"
 
-    # prefix:count:protobuf_message:scrape_interval:metadata_send_interval
+    # The four families the sample captures keep: between them a gauge, a counter, a histogram and a
+    # summary, in 26 series -- one `max_samples_per_send` request's worth, so a capture is a whole
+    # scrape rather than a fragment. See prometheus.yml's `write_relabel_configs` comment.
+    local keep_regex="prometheus_build_info|prometheus_tsdb_wal_page_flushes_total"
+    keep_regex="${keep_regex}|prometheus_tsdb_compaction_duration_seconds_(bucket|sum|count)"
+    keep_regex="${keep_regex}|go_gc_duration_seconds(_sum|_count)?"
+    # The metadata capture instead drops *every* series, which is what makes it deterministic: with
+    # no samples able to reach the wire, every request that run produces is a metadata request, and
+    # the committed replay test's "all three of these are metadata-only" assertion cannot lose a
+    # coin flip against the first scrape's sample batch. Metadata is not subject to this relabel --
+    # it comes from the scrape cache, which is the same property `metadata_config`'s own comment
+    # warns about for size.
+    #
+    # The metadata run scrapes a small static exposition instead of Prometheus's own /metrics, so
+    # the families it declares are exactly the four the sample captures carry -- see
+    # tools/record-fixtures/prometheus-metadata-target.prom's header. Served by a plain
+    # `python3 -m http.server` out of the image the capture sink already uses, so this adds a
+    # container but no new image to pull.
+    ${DOCKER} run -d --name metatarget --network "${NET}" -w /srv \
+        -v "${TOOLS_DIR}/prometheus-metadata-target.prom:/srv/metrics:ro,z" \
+        python:3.12-slim \
+        python3 -m http.server 9100 >/dev/null
+    sleep 1
+
+    # prefix:count:protobuf_message:scrape_interval:metadata_send_interval:relabel_action:target
     for spec in \
-        "prometheus-v1:2:prometheus.WriteRequest:5s:1m" \
-        "prometheus-v1-metadata:3:prometheus.WriteRequest:30s:1s" \
-        "prometheus-v2:2:io.prometheus.write.v2.Request:5s:1m"; do
-        local prefix count message scrape_interval metadata_interval
-        IFS=: read -r prefix count message scrape_interval metadata_interval <<<"${spec}"
-        echo "-- ${prefix} (protobuf_message: ${message})"
+        "prometheus-v1:2:prometheus.WriteRequest:5s:1m:keep:localhost:9090" \
+        "prometheus-v1-metadata:3:prometheus.WriteRequest:5s:1s:drop:metatarget:9100" \
+        "prometheus-v2:2:io.prometheus.write.v2.Request:5s:1m:keep:localhost:9090"; do
+        local prefix count message scrape_interval metadata_interval action host port regex
+        IFS=: read -r prefix count message scrape_interval metadata_interval action host port \
+            <<<"${spec}"
+        if [ "${action}" = "drop" ]; then regex=".*"; else regex="${keep_regex}"; fi
+        # `#` as the delimiter for these two, not the `|` the others use: the keep pattern is an
+        # alternation and is full of `|`.
+        echo "-- ${prefix} (protobuf_message: ${message}, relabel: ${action}, target: ${host}:${port})"
         sed -e "s|@@PROTOBUF_MESSAGE@@|${message}|" \
             -e "s|@@SCRAPE_INTERVAL@@|${scrape_interval}|" \
             -e "s|@@METADATA_SEND_INTERVAL@@|${metadata_interval}|" \
+            -e "s|@@SCRAPE_TARGET@@|${host}:${port}|" \
+            -e "s#@@RELABEL_ACTION@@#${action}#" \
+            -e "s#@@RELABEL_REGEX@@#${regex}#" \
             "${TOOLS_DIR}/prometheus.yml" >"${PROM_CFG_DIR}/prometheus.yml"
 
         start_capture http 9091 "${out}" "${prefix}" "${count}" 90
@@ -390,6 +421,7 @@ record_prometheus() {
         ${DOCKER} rm -f prometheus >/dev/null 2>&1 || true
     done
 
+    ${DOCKER} rm -f metatarget >/dev/null 2>&1 || true
     rm -rf "${PROM_CFG_DIR}"
     PROM_CFG_DIR=""
 }

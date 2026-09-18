@@ -20,25 +20,28 @@ never replied to the first.
 
 All seven came out of one `script/record-fixtures prometheus` run, in three captures against
 `tools/record-fixtures/prometheus.yml` rendered three ways -- the only differences between the
-renderings are `protobuf_message`, `scrape_interval` and `metadata_config.send_interval`.
+renderings are `protobuf_message`, `metadata_config.send_interval`, the scrape target, and whether
+`write_relabel_configs` keeps the four families or drops everything.
 
 | File | Producer | Invocation | Captured | Construct exercised |
 |---|---|---|---|---|
 | `prometheus-v1-000.bin` (860 bytes) | Prometheus 3.14.0 (`prom/prometheus:v3.14.0`, the upstream revision this repo's `prompb` is vendored from -- `crates/logit-proto/proto/README.md`) | stock image command line, `tools/record-fixtures/prometheus.yml` with `protobuf_message: prometheus.WriteRequest`, `scrape_interval: 5s`, `metadata_config.send_interval: 1m`; Prometheus scraping its own `/metrics`, `remote_write[].url: http://capture:9091/api/v1/write` | 2026-09-18 | One scrape's samples as remote-write **1.0**, and the shape that motivates the metadata cache: `WriteRequest.metadata[]` is **empty**, because Prometheus's 1.0 sender ships metadata in requests of its own. 26 series over the four families `write_relabel_configs` keeps -- a gauge (`prometheus_build_info`, ten labels), a counter (`prometheus_tsdb_wal_page_flushes_total`), a histogram (`prometheus_tsdb_compaction_duration_seconds`, 15 `le` buckets plus `_sum`/`_count`) and a summary (`go_gc_duration_seconds`, five `quantile` lines plus `_sum`/`_count`) |
 | `prometheus-v1-001.bin` (861 bytes) | Same | Same | 2026-09-18 | The next scrape of the same series -- same shape, later timestamps, so a consuming test can see one request is not a one-off |
-| `prometheus-v1-metadata-000.bin` (909 bytes) | Same | Same config rendered with `scrape_interval: 30s` and `metadata_config.send_interval: 1s`, so the metadata ticker fires between scrapes rather than alongside them | 2026-09-18 | A **metadata-only 1.0 request**: ten `MetricMetadata` entries, no `timeseries` at all. This is the message `prometheus_in`'s `metadata_cache:` exists to remember. Carries a real spread of declared types (`Summary`, `Gauge`, `Counter`) with their help text, and -- the reason this file is the one a consuming test seeds from -- `go_gc_duration_seconds`, which is also one of the four families the sample captures carry |
-| `prometheus-v1-metadata-001.bin` (1088 bytes) | Same | Same | 2026-09-18 | The next ten families on the same ticker, including a `Histogram` declaration |
-| `prometheus-v1-metadata-002.bin` (795 bytes) | Same | Same | 2026-09-18 | Ten more again -- between the three, 30 of Prometheus's own several hundred families, which is all `metadata_config.max_samples_per_send: 10` lets into one request |
+| `prometheus-v1-metadata-000.bin` (399 bytes) | Same | Same config rendered with `metadata_config.send_interval: 1s`, `write_relabel_configs` as `action: drop` over `.*`, and the scrape target pointed at the static `tools/record-fixtures/prometheus-metadata-target.prom` served by `python3 -m http.server` | 2026-09-18 | A **metadata-only 1.0 request**: `MetricMetadata` entries and no `timeseries` at all -- the message `prometheus_in`'s `metadata_cache:` exists to remember. Deterministic on both counts: dropping every series means this run *cannot* put a sample on the wire, and the small static target means the entries are exactly the four families the sample captures carry (`Summary`, `Gauge`, `Counter`, `Histogram`, with their help text) plus the five synthetic scrape series |
+| `prometheus-v1-metadata-001.bin` (379 bytes) | Same | Same | 2026-09-18 | The same declarations one ticker interval later -- Prometheus re-sends a family's metadata every `send_interval`, which is the repetition `MetadataCache::learn` must recognise as a no-op |
+| `prometheus-v1-metadata-002.bin` (379 bytes) | Same | Same | 2026-09-18 | And again, so a consuming test can seed from all three and get the same table it would from one |
 | `prometheus-v2-000.bin` (771 bytes) | Same | Same config rendered with `protobuf_message: io.prometheus.write.v2.Request` | 2026-09-18 | The same 26 series as remote-write **2.0**: an interned `symbols` table with every label name and value referenced by index, one `Metadata` per series, `Sample.start_timestamp` present on the wire. See "What isn't covered here (yet)" for what 3.14.0 actually puts in that `Metadata` |
 | `prometheus-v2-001.bin` (786 bytes) | Same | Same | 2026-09-18 | The next scrape, as above |
 
 The Prometheus version is what `prom/prometheus:v3.14.0 --version` reported inside the recording
 container; `record_prometheus` prints it on every run, so a re-record's drift from this table is
-visible in the script's own output. Total fixture bytes here are ~6 KB across the seven bodies,
+visible in the script's own output. Total fixture bytes here are ~4.4 KB across the seven bodies,
 inside `../README.md`'s "low single-digit KB per fixture, whole directory well under 100 KB"
-budget; the four families `write_relabel_configs` keeps are what holds it there, and they were
-chosen because between them they cover all four classic metric types in 26 series -- one
-`max_samples_per_send` request's worth, so a capture is one whole scrape rather than a fragment.
+budget. Two things hold it there: the four families `write_relabel_configs` keeps on the sample
+side -- chosen because between them they cover all four classic metric types in 26 series, one
+`max_samples_per_send` request's worth, so a capture is one whole scrape rather than a fragment --
+and the small static target the metadata side scrapes, which keeps a *complete* metadata request
+under 400 bytes where a self-scrape's would be ~16 KB.
 
 `crates/logit-proto/tests/prometheus_remote_write_interop.rs` consumes these: that every body
 decodes with nothing `Malformed` and **nothing skipped or degraded**; that the sidecar's
@@ -47,8 +50,8 @@ decodes with nothing `Malformed` and **nothing skipped or degraded**; that the s
 metadata behind it decodes to eight flat `unknown` families (every suffixed name its own family,
 `quantile` and `le` ordinary labels); that a metadata-only request decodes to declarations and no
 groups at all; and -- the one that puts both halves together -- that seeding a sample request with
-the declarations the *metadata* captures reported folds three of those eight back into the one
-`Summary` Prometheus meant.
+the declarations the *metadata* captures reported folds those eight back into the four families
+Prometheus meant, each with its own type and with `quantile`/`le` moved into the point.
 
 **This corpus found a codec bug, which is what it was for.** Recorded against the assembler as it
 stood, the first of those assertions read `["unknown_suffix"]` for every sample capture. A summary

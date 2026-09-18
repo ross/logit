@@ -329,23 +329,21 @@ fn a_recorded_1_0_metadata_request_declares_families_with_no_groups() {
 
 /// The whole mechanism, on real bytes from both halves of one real sender: the declarations a
 /// recorded **metadata-only** request reported, used as the seed for a recorded **sample** request
-/// that carries none of its own, turn three flat untyped families into the one summary Prometheus
+/// that carries none of its own, fold eight flat untyped families back into the four Prometheus
 /// meant.
 ///
 /// What the cache buys is **typing, never samples**. Stateless, the same request already decodes
 /// losslessly ([`every_recorded_request_decodes_with_nothing_skipped_or_degraded`]) -- it just
 /// decodes to eight flat families where the producer had four, with `quantile` and `le` sitting on
 /// the label set as ordinary labels and `_sum`/`_count` standing alone. The seed is what collapses
-/// `go_gc_duration_seconds`, `..._sum` and `..._count` back into a single `Summary` series with
-/// its quantiles in the point.
+/// them, gives each family its type, and moves `quantile`/`le` into the point.
 ///
-/// `go_gc_duration_seconds` is the overlap between the two -- `write_relabel_configs` keeps it on
-/// the sample side, and it happened to fall in the ten families `metadata_config`'s ticker shipped
-/// on the metadata side. That overlap is a property of *these committed fixtures*, not of the
-/// producer: `metadata_config.max_samples_per_send` bounds a metadata request to ten of
-/// Prometheus's several hundred families, and which ten is map order. If a re-record loses the
-/// overlap this test says so by name, and the answer is to re-run `script/record-fixtures
-/// prometheus` until it comes back, not to weaken the assertion.
+/// The overlap between the two halves is guaranteed by the recipe rather than left to luck: the
+/// metadata capture scrapes a small static target declaring exactly these four families
+/// (`tools/record-fixtures/prometheus-metadata-target.prom`), because metadata is not subject to
+/// `write_relabel_configs` and a self-scrape would put several hundred families behind
+/// `metadata_config`'s ticker in map order. That is also why all three metadata captures fit in
+/// ~400 bytes each.
 #[test]
 fn recorded_metadata_types_a_recorded_sample_request() {
     let mut seed = Declarations::default();
@@ -369,23 +367,21 @@ fn recorded_metadata_types_a_recorded_sample_request() {
 
     let typed: BTreeMap<&str, FamilyType> =
         seeded.families.iter().map(|family| (family.name.as_str(), family.kind)).collect();
-    // Three flat families became one: the summary's own name, and the two suffixed families that
-    // stood alone with no declaration to attach them to.
+    // Eight flat families became the producer's four, each with the type Prometheus gives it: the
+    // suffixed names are gone, folded into the families they were always parts of.
+    assert_eq!(
+        typed,
+        BTreeMap::from([
+            ("go_gc_duration_seconds", FamilyType::Summary),
+            ("prometheus_build_info", FamilyType::Gauge),
+            ("prometheus_tsdb_compaction_duration_seconds", FamilyType::Histogram),
+            ("prometheus_tsdb_wal_page_flushes_total", FamilyType::Counter),
+        ]),
+        "the recorded metadata should type every family the recorded samples carry"
+    );
     assert!(
-        !typed.contains_key("go_gc_duration_seconds_sum")
-            && !typed.contains_key("go_gc_duration_seconds_count"),
-        "the seed folds the suffixed families into the summary, got {typed:?}"
-    );
-    assert_eq!(
-        seeded.families.len(),
-        FLAT_SAMPLE_FAMILIES.len() - 2,
-        "eight flat families, minus the two the seed folded in"
-    );
-    assert_eq!(
-        typed.get("go_gc_duration_seconds").copied(),
-        Some(FamilyType::Summary),
-        "the recorded metadata declares go_gc_duration_seconds a summary, so the recorded samples \
-         should decode as one -- see this test's own doc if a re-record lost the overlap"
+        seeded.families.len() < FLAT_SAMPLE_FAMILIES.len(),
+        "the seed folds families together; it never adds any"
     );
 
     // The summary really did reassemble, rather than merely being relabelled: its quantiles are
@@ -402,11 +398,32 @@ fn recorded_metadata_types_a_recorded_sample_request() {
         summary.series[0].labels
     );
 
-    // And a family the metadata never mentioned is untouched by the seed -- the seed types what it
-    // knows and says nothing about the rest.
-    assert_eq!(
-        typed.get("prometheus_build_info").copied(),
-        Some(FamilyType::Unknown),
-        "no declaration covers prometheus_build_info, so it stays untyped"
+    // And the histogram, whose flat form is the `_bucket`/`_sum`/`_count` trio the ADR's own prose
+    // uses as the example of what comes apart without a cache.
+    let histogram = seeded
+        .families
+        .iter()
+        .find(|family| family.name == "prometheus_tsdb_compaction_duration_seconds")
+        .expect("the histogram family is on the wire");
+    assert_eq!(histogram.series.len(), 1, "fifteen buckets plus sum and count are one series");
+    assert!(
+        histogram.series[0].labels.iter().all(|(key, _)| key != "le"),
+        "`le` is consumed into the point: {:?}",
+        histogram.series[0].labels
     );
+
+    // A family the seed says nothing about is untouched by it -- the seed types what it knows and
+    // stays out of the way otherwise.
+    let mut narrow = Declarations::default();
+    narrow.insert("go_gc_duration_seconds", FamilyType::Summary, None, None);
+    let partial = replay_with(&capture, &narrow);
+    let partial_typed: BTreeMap<&str, FamilyType> =
+        partial.families.iter().map(|family| (family.name.as_str(), family.kind)).collect();
+    assert_eq!(partial_typed.get("go_gc_duration_seconds").copied(), Some(FamilyType::Summary));
+    assert_eq!(
+        partial_typed.get("prometheus_build_info").copied(),
+        Some(FamilyType::Unknown),
+        "nothing declares prometheus_build_info here, so it stays untyped"
+    );
+    assert_eq!(partial.reasons, Vec::<String>::new(), "a partial seed still loses nothing");
 }
