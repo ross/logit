@@ -208,9 +208,25 @@
 //! **Bounds.** `max_families` caps the table; over it, the **least-recently-seen** family is
 //! evicted first (ties broken by name, so it is a function of the data rather than of map order),
 //! the same policy and the same one-pass shape `prometheus_out`'s exposition `max_series:` uses.
-//! `max_families: 0` is not a zero-size cache but no cache at all: nothing is allocated, no lock is
-//! taken, and requests decode through the stateless [`remote_write::decode`] exactly as they did
-//! before this existed. Rule 55 rejects `ttl: 0s`, which would be the pointless version of that.
+//! A family's `# HELP` and `# UNIT` are each cut to [`MAX_METADATA_TEXT_BYTES`] as they are
+//! remembered, counted `logit.input.metadata_cache.truncated` -- the request cap bounds a request,
+//! not a table that keeps things. `max_families: 0` is not a zero-size cache but no cache at all:
+//! nothing is allocated, no lock is taken, and requests decode through the stateless
+//! [`remote_write::decode`] exactly as they did before this existed. Rule 55 rejects `ttl: 0s`,
+//! which would be the pointless version of that.
+//!
+//! **Whose table it is.** One per component, not one per sender: every peer that can `POST` to this
+//! listener writes to the same table, is typed from the same table, and is evicted by the same
+//! `last_seen` order. So a peer's declarations are visible to every other peer -- which is the
+//! point, since it is what lets a 2.0 sender type a 1.0 one -- and a peer that declares a great
+//! many families evicts everyone else's, counted `evicted{reason="cardinality"}` but not
+//! attributed. Repeated faster than the victims' own metadata cadence, that keeps well-behaved
+//! senders permanently untyped. The cache does not *drop* their samples -- a remembered type gives
+//! way to a sample it cannot place rather than rejecting it ([`remote_write::decode_with`]) -- but
+//! flat families are what they get. Nothing here authenticates a sender, so this is the
+//! "Security posture" section's rule again rather than a new one: do not point this listener at
+//! untrusted senders. An operator who has to, and would rather have flat families than a table
+//! anyone can churn, sets `max_families: 0` -- which turns the sharing off along with the typing.
 //!
 //! **Concurrency, and what a request actually pays.** One `std::sync::Mutex` guards the table,
 //! taken to build the seed and taken again to learn, **never held across the decode** -- a

@@ -1859,6 +1859,15 @@ pub fn default_prometheus_path() -> String {
 /// That table is per-family state on a component that otherwise has none, so it is bounded on both
 /// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
 /// request, and so is any 1.0 sender that attaches metadata to its own writes.
+///
+/// **It is one table per component, shared by every sender that can reach the listener.** That is
+/// what lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer
+/// that declares a great many families evicts other peers' entries, by `last_seen` and with no
+/// attribution -- leaving well-behaved senders untyped (their samples still arrive, as flat
+/// families) until their next metadata write. The receiver authenticates no one, so this is the
+/// same rule `bind_tls:` already carries rather than a new one: do not point it at untrusted
+/// senders (`docs/known-gaps.md`). `max_families: 0` turns the sharing off along with the typing.
+///
 /// See `docs/adr/prometheus-remote-write.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MetadataCacheConfig {
