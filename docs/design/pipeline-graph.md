@@ -666,7 +666,9 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     match, and every write would `404` against a listener that looks configured — and
     `metadata_cache.ttl` must be greater than `0s`, rule 9's zero-interval reasoning: an entry
     expiring the instant it is written is a cache that does nothing while still sweeping on every
-    request, and `metadata_cache: {max_families: 0}` is the spelling that turns it off.
+    request, and `metadata_cache: {max_families: 0}` is the spelling that turns it off — which is
+    why that pairing, where the `ttl` governs nothing at all, is the one case the zero check lets
+    through.
 
 56. A `prometheus_out` has exactly one of `bind:` (serve an exposition) and `endpoint:` (write to
     a remote-write receiver) — never both, never neither

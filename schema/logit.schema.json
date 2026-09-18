@@ -2363,7 +2363,8 @@
           "default": "600s",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "MetricSpec": {
       "description": "One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`. See `ComponentKind::KvMetrics` and `docs/adr/kv-metrics-semantics.md`.",

@@ -1870,6 +1870,7 @@ pub fn default_prometheus_path() -> String {
 ///
 /// See `docs/adr/prometheus-remote-write.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataCacheConfig {
     /// How many families the receiver will remember at once. Over the cap the
     /// **least-recently-seen** entry is evicted first, counted
@@ -5301,6 +5302,21 @@ mod tests {
             MetadataCacheConfig { max_families: 10_000, ttl: Duration::from_secs(3600) }
         );
         assert_eq!(cache("{}"), MetadataCacheConfig::default());
+    }
+
+    /// Every other all-defaulted sub-block here denies unknown fields, and this one has the sharper
+    /// reason: a misspelled key would otherwise deserialize to the defaults, so the cap an operator
+    /// wrote would be ignored *and* rule 55 would see a defaulted block -- letting the same typo
+    /// resolve under `scrape_targets:`, which is precisely the "a setting silently doing nothing"
+    /// failure rule 55 exists to prevent.
+    #[test]
+    fn prometheus_in_metadata_cache_rejects_a_misspelled_key() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "prometheus_in", "bind": "0.0.0.0:9090",
+                "metadata_cache": {"max_familes": 500}}"#,
+        )
+        .expect_err("a misspelled key must not deserialize to the defaults");
+        assert!(err.to_string().contains("max_familes"), "got: {err}");
     }
 
     #[test]
