@@ -3876,6 +3876,67 @@ mod tests {
         assert!(!Arc::ptr_eq(&second, &third), "a retype is a change");
     }
 
+    /// The other half of the rule above, and the one the seed's own identity cannot see: on a no-op
+    /// re-declaration the **entry** must keep its `Arc<str>`s too, not adopt the request's clones.
+    ///
+    /// The seed is not rebuilt for a no-op (the test above), so it goes on holding the originals --
+    /// and if `learn` overwrote the entry anyway, cache and seed would hold equal strings in two
+    /// separate allocations, one more pair per shard per `send_interval`, for as long as nothing
+    /// really changed. `declarations()` above deliberately inserts `help: None`, which is why this
+    /// case needs its own builder: with no description there is no per-entry `Arc<str>` to observe.
+    #[test]
+    fn re_declaring_what_is_already_remembered_keeps_the_entrys_own_arc() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+
+        let described = |help: &str| {
+            let mut declarations = remote_write::Declarations::default();
+            declarations.insert("foo", FamilyType::Counter, Some(Arc::from(help)), None);
+            declarations
+        };
+
+        cache.learn(&described("Total requests."), start, &telemetry);
+        let seed = cache.seed(start, &telemetry);
+        let seeded_help = seed
+            .iter()
+            .find(|(name, _)| *name == "foo")
+            .and_then(|(_, declaration)| declaration.help.clone())
+            .expect("the entry was learned with a help string");
+
+        // A *fresh* `Arc` carrying the same text, which is what a second identical request brings:
+        // the bytes match, the allocation does not.
+        cache.learn(&described("Total requests."), start + Duration::from_secs(60), &telemetry);
+        let after = cache.seed(start + Duration::from_secs(60), &telemetry);
+        assert!(Arc::ptr_eq(&seed, &after), "nothing changed, so nothing was rebuilt");
+
+        let entry_help = cache
+            .lock()
+            .families
+            .get("foo")
+            .and_then(|family| family.help.clone())
+            .expect("still remembered");
+        assert!(
+            Arc::ptr_eq(&entry_help, &seeded_help),
+            "a no-op re-declaration must leave the entry's own Arc in place -- the un-rebuilt seed \
+             is still sharing it"
+        );
+
+        // And a help string that really differs is adopted, seed rebuilt with it.
+        cache.learn(&described("Requests served."), start + Duration::from_secs(120), &telemetry);
+        let changed = cache.seed(start + Duration::from_secs(120), &telemetry);
+        assert!(!Arc::ptr_eq(&after, &changed), "new help text is a change");
+        assert_eq!(
+            changed
+                .iter()
+                .find(|(name, _)| *name == "foo")
+                .and_then(|(_, declaration)| declaration.help.clone())
+                .as_deref(),
+            Some("Requests served.")
+        );
+    }
+
     /// The expiry sweep is checked per request, not performed: until the earliest entry could
     /// possibly have expired there is nothing to find, and walking the table anyway would be a
     /// per-request cost that scales with what is remembered. Only the sweep's own counter can see
