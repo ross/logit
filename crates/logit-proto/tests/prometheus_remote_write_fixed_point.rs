@@ -37,7 +37,9 @@ use logit_core::interner::resolve;
 use logit_core::{AttrMap, Exemplar, MetricKind, Registry, TraceRef, Value};
 use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
 use logit_proto::prometheus::generated::prometheus as pb1;
-use logit_proto::prometheus::remote_write::{decode, encode, Decoded, Version};
+use logit_proto::prometheus::remote_write::{
+    decode, decode_with, encode, Declarations, Decoded, Version,
+};
 use logit_proto::prometheus::text::{parse, write, Dialect};
 use logit_proto::prometheus::{
     is_stale_nan, FamilyType, MetricFamily, Point, PrometheusDecoder, PrometheusEncoder, Series,
@@ -1389,4 +1391,199 @@ proptest! {
     ) {
         prop_assert_eq!(round_trip(&groups, Version::V2).groups, groups);
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// `decode_with`: a seed for what the request didn't declare, and a report of what it did
+// -------------------------------------------------------------------------------------------------
+
+/// The flat series `version_1_without_metadata_decodes_flat_untyped_families` pins as unrelated
+/// untyped families -- what Prometheus' own 1.0 sender writes, since it ships metadata in requests
+/// of its own.
+fn untyped_histogram_request() -> pb1::WriteRequest {
+    pb1::WriteRequest {
+        timeseries: vec![
+            v1_series(&[("__name__", "foo_bucket"), ("le", "1")], 3.0),
+            v1_series(&[("__name__", "foo_bucket"), ("le", "+Inf")], 4.0),
+            v1_series(&[("__name__", "foo_count")], 4.0),
+            v1_series(&[("__name__", "foo_sum")], 2.5),
+        ],
+        metadata: Vec::new(),
+    }
+}
+
+fn decode_v1_with(request: pb1::WriteRequest, seed: &Declarations) -> Decoded {
+    decode_with(&request.encode_to_vec(), Version::V1, &mut PrometheusDecoder::new(), seed)
+        .expect("must decode")
+}
+
+/// The whole point of the seed: the request carrying the samples carries no metadata at all, and a
+/// caller that remembers an earlier request's histogram declaration gets one assembled `Histogram`
+/// instead of four unrelated untyped series.
+#[test]
+fn a_seed_types_a_metadata_less_version_1_request() {
+    let mut seed = Declarations::default();
+    seed.insert("foo", FamilyType::Histogram, Some("A histogram.".to_string()), None);
+
+    let decoded = decode_v1_with(untyped_histogram_request(), &seed);
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo");
+    assert_eq!(families[0].kind, FamilyType::Histogram);
+    assert_eq!(families[0].help.as_deref(), Some("A histogram."));
+    assert_eq!(
+        families[0].series[0].point,
+        Point::Histogram { buckets: vec![(1.0, 3), (f64::INFINITY, 4)], sum: Some(2.5), count: 4 }
+    );
+    // The seed is the caller's, not the request's: a request that declared nothing reports nothing,
+    // so a cache refreshing itself off this can never renew an entry out of its own memory.
+    assert!(decoded.declarations.is_empty());
+
+    // The same request with no seed is still the three untyped families the stateless decode
+    // produces (`foo_bucket`, `foo_count`, `foo_sum`, the two bucket lines being two series of one
+    // `foo_bucket` family) -- the seed is the only difference.
+    assert_eq!(decode_v1(untyped_histogram_request()).groups[0].len(), 3);
+}
+
+/// A remembered declaration never outranks the request in hand: a sender that says `foo` is a gauge
+/// today is describing today's series.
+#[test]
+fn a_request_declaration_beats_the_seed() {
+    let mut seed = Declarations::default();
+    seed.insert("foo", FamilyType::Histogram, Some("Remembered.".to_string()), None);
+    seed.insert("bar", FamilyType::Counter, None, None);
+
+    let decoded = decode_v1_with(
+        pb1::WriteRequest {
+            timeseries: vec![
+                v1_series(&[("__name__", "foo")], 7.0),
+                v1_series(&[("__name__", "bar_total")], 9.0),
+            ],
+            metadata: vec![pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Gauge as i32,
+                metric_family_name: "foo".to_string(),
+                help: "Said now.".to_string(),
+                unit: String::new(),
+            }],
+        },
+        &seed,
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 2, "{families:#?}");
+    // `foo`: the request's `GAUGE` wins over the seed's `HISTOGRAM`, help and all. Under the seed's
+    // type a bare `foo` would have been `skipped{reason="unknown_suffix"}` instead -- a histogram
+    // has no bare-named sample -- so this shows in the family list, not only in the `kind`.
+    assert_eq!(families[1].name, "foo");
+    assert_eq!(families[1].kind, FamilyType::Gauge);
+    assert_eq!(families[1].help.as_deref(), Some("Said now."));
+    // `bar`: the request says nothing about it, so the seed still applies -- precedence is per
+    // family name, not per table. The model name keeps the `_total` its value sample carried
+    // (this module's "Family naming" table); the seed declared the family `bar`, which is the name
+    // a `# TYPE` line would carry.
+    assert_eq!(families[0].name, "bar_total");
+    assert_eq!(families[0].kind, FamilyType::Counter);
+}
+
+/// What a caller learns from a 1.0 request: one entry per `metadata[]` family, deduped, with an
+/// empty `help`/`unit` absent rather than `Some("")`.
+#[test]
+fn decoded_declarations_report_version_1_metadata() {
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![v1_series(&[("__name__", "foo_count")], 4.0)],
+        metadata: vec![
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Histogram as i32,
+                metric_family_name: "foo".to_string(),
+                help: "A histogram.".to_string(),
+                unit: "seconds".to_string(),
+            },
+            // The same thing said twice is one entry, not a conflict: 1.0 senders repeat.
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Histogram as i32,
+                metric_family_name: "foo".to_string(),
+                help: "A histogram.".to_string(),
+                unit: "seconds".to_string(),
+            },
+            // Declared but never sampled -- still learnable: the request that carries its samples
+            // is a later one, which is the entire reason a cache exists.
+            pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Counter as i32,
+                metric_family_name: "never_sampled".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            },
+        ],
+    });
+
+    let mut learned: Vec<(&str, FamilyType, Option<&str>, Option<&str>)> = decoded
+        .declarations
+        .iter()
+        .map(|(name, declaration)| {
+            (name, declaration.kind, declaration.help.as_deref(), declaration.unit.as_deref())
+        })
+        .collect();
+    learned.sort_by_key(|entry| entry.0);
+    assert_eq!(
+        learned,
+        [
+            ("foo", FamilyType::Histogram, Some("A histogram."), Some("seconds")),
+            ("never_sampled", FamilyType::Counter, None, None),
+        ]
+    );
+    assert_eq!(decoded.declarations.len(), 2);
+}
+
+/// 2.0 declares per series and names no family, so what a caller learns is the *family base* the
+/// type implies -- and an `UNSPECIFIED` series declares nothing at all, however much help text it
+/// carries, for `decode_v2`'s own reason: with no type there is no suffix to strip and no family to
+/// name. So a mixed 2.0/1.0 fleet fills one cache.
+#[test]
+fn decoded_declarations_report_version_2_metadata_but_not_unspecified() {
+    let request = pb2::Request {
+        symbols: vec![
+            String::new(),
+            "__name__".to_string(),
+            "foo_bucket".to_string(),
+            "A histogram.".to_string(),
+            "seconds".to_string(),
+            "bare".to_string(),
+            "Described, not declared.".to_string(),
+        ],
+        timeseries: vec![
+            pb2::TimeSeries {
+                labels_refs: vec![1, 2],
+                samples: vec![pb2::Sample { value: 1.0, timestamp: 1, start_timestamp: 0 }],
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Histogram as i32,
+                    help_ref: 3,
+                    unit_ref: 4,
+                }),
+                ..Default::default()
+            },
+            pb2::TimeSeries {
+                labels_refs: vec![1, 5],
+                samples: vec![pb2::Sample { value: 2.0, timestamp: 1, start_timestamp: 0 }],
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Unspecified as i32,
+                    help_ref: 6,
+                    unit_ref: 0,
+                }),
+                ..Default::default()
+            },
+        ],
+    };
+    let decoded = decode(&request.encode_to_vec(), Version::V2, &mut PrometheusDecoder::new())
+        .expect("must decode");
+
+    let learned: Vec<(&str, FamilyType)> =
+        decoded.declarations.iter().map(|(name, declaration)| (name, declaration.kind)).collect();
+    assert_eq!(learned, [("foo", FamilyType::Histogram)], "`_bucket` stripped, `bare` absent");
+    // The `UNSPECIFIED` series' help still reached its own family, through `describe` -- it is
+    // unlearnable, not ignored.
+    let bare = decoded.groups[0]
+        .iter()
+        .find(|family| family.name == "bare")
+        .expect("the untyped series is still a family");
+    assert_eq!(bare.help.as_deref(), Some("Described, not declared."));
 }

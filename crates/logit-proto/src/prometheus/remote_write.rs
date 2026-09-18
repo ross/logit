@@ -64,6 +64,17 @@
 //! Everything else is the assembler's, unchanged: suffix routing, `le`/`quantile` stripping, the
 //! cumulative-bucket rules, the skip reasons.
 //!
+//! ### Metadata the request doesn't carry
+//!
+//! [`decode`] is stateless: a family is typed by metadata *in the body being decoded*, and nothing
+//! else. That is the whole story for 2.0, which puts `Metadata` on every series, and for any 1.0
+//! sender that attaches `metadata[]` to its own writes -- but not for Prometheus' own 1.0 sender,
+//! which ships metadata in **separate requests** on its own schedule. So [`decode_with`] takes a
+//! `seed` table to fall back on per family name, the request's own metadata always winning, and
+//! every [`Decoded`] reports the declarations its request carried ([`Decoded::declarations`]) for a
+//! caller to learn from. What is remembered, for how long, and how much of it is the caller's
+//! decision entirely -- `prometheus_in`'s `metadata_cache:` is the one that exists.
+//!
 //! ### Malformed input: what is a `400`, and what is a counted skip
 //!
 //! [`CodecError::Malformed`] is reserved for a request that is *structurally* broken, where no part
@@ -157,7 +168,8 @@
 //! [`Assembler`]: assemble::Assembler
 //! [`CodecError::Malformed`]: crate::CodecError::Malformed
 
-use super::assemble::{self, Assembler, Declaration, Declarations, Sample};
+use super::assemble::{self, Assembler, Sample};
+pub use super::assemble::{Declaration, Declarations};
 use super::generated::io::prometheus::write::v2 as pb2;
 use super::generated::prometheus as pb1;
 use super::{
@@ -277,6 +289,15 @@ pub struct Decoded {
     /// Native-histogram entries skipped, each also counted
     /// `logit.input.metrics.skipped{reason="native_histogram"}`.
     pub histograms_skipped: u64,
+    /// Exactly what **this request** declared -- 1.0's `metadata[]`, 2.0's inline `Metadata` with a
+    /// type that is not `UNSPECIFIED` -- deduped to one entry per family and keyed by the family's
+    /// own name. Not the table the decode ran against: a [`decode_with`] seed is the caller's, and
+    /// giving it back would let a cache refresh entries off its own memory forever.
+    ///
+    /// This is how a caller *learns*. A 1.0 sender ships metadata in requests of its own, on its
+    /// own schedule, so the request that declares `foo` a histogram carries no samples and the
+    /// requests that carry `foo_bucket` declare nothing -- see [`decode_with`].
+    pub declarations: Declarations,
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -285,14 +306,42 @@ pub struct Decoded {
 
 /// Decodes one **decompressed** request body -- see this module's doc for the mapping, the
 /// timestamp-group rule, and what is `Malformed` versus counted.
+///
+/// Stateless: a family is typed only by metadata this request carries. [`decode_with`] is the same
+/// decode against a caller's memory of earlier ones.
 pub fn decode(
     body: &[u8],
     version: Version,
     decoder: &mut PrometheusDecoder,
 ) -> Result<Decoded, CodecError> {
+    decode_with(body, version, decoder, &Declarations::default())
+}
+
+/// [`decode`], plus a `seed` of declarations to fall back on for a family this request says nothing
+/// about -- and reporting, in [`Decoded::declarations`], exactly what it *did* say, so the caller
+/// can keep its seed current.
+///
+/// **The request wins, per family name.** A request that declares `foo` a counter decodes its own
+/// `foo` samples as a counter even where the seed remembers a histogram, and a request that
+/// declares nothing at all decodes entirely against the seed. Neither table is merged into the
+/// other: the seed is consulted only on a name the request's own metadata does not cover.
+///
+/// This exists for Prometheus 1.0, whose sender ships `MetricMetadata` in **separate requests** on
+/// its own schedule (`metadata_config`, by default once a minute) rather than attached to the
+/// samples it describes. Decoding those sample-only requests against nothing types every family
+/// `Unknown` and leaves `foo_bucket`/`foo_sum`/`foo_count` as three unrelated series instead of one
+/// histogram. The seed is the receiver's memory of the metadata requests
+/// (`prometheus_in`'s `metadata_cache:`, `crates/logit-inputs/src/prometheus.rs`); this codec holds
+/// no state of its own and decides nothing about what is remembered or for how long.
+pub fn decode_with(
+    body: &[u8],
+    version: Version,
+    decoder: &mut PrometheusDecoder,
+    seed: &Declarations,
+) -> Result<Decoded, CodecError> {
     match version {
-        Version::V1 => decode_v1(body, decoder),
-        Version::V2 => decode_v2(body, decoder),
+        Version::V1 => decode_v1(body, decoder, seed),
+        Version::V2 => decode_v2(body, decoder, seed),
     }
 }
 
@@ -343,21 +392,24 @@ impl Routed<'_> {
 /// "Declaring lazily" section -- both of those numbers come off the wire).
 struct Groups<'a> {
     declarations: &'a Declarations,
+    /// What the caller remembered, consulted per family name where `declarations` has nothing --
+    /// see [`decode_with`]. Shared by reference exactly as the request's own table is.
+    seed: &'a Declarations,
     groups: BTreeMap<i64, Assembler<'a>>,
 }
 
 impl<'a> Groups<'a> {
-    fn new(declarations: &'a Declarations) -> Self {
-        Groups { declarations, groups: BTreeMap::new() }
+    fn new(declarations: &'a Declarations, seed: &'a Declarations) -> Self {
+        Groups { declarations, seed, groups: BTreeMap::new() }
     }
 
     /// The group for `timestamp_nanos`, opening it if this is the first sample at that instant.
     fn at(&mut self, timestamp_nanos: i64) -> &mut Assembler<'a> {
-        let declarations = self.declarations;
+        let (declarations, seed) = (self.declarations, self.seed);
         self.groups.entry(timestamp_nanos).or_insert_with(|| {
             // Remote-write has no "untyped" spelling of its own, so an undeclared family is
             // `Unknown` -- OpenMetrics' spelling, and what both metadata enums' zero value means.
-            Assembler::new(FamilyType::Unknown).with_declarations(declarations)
+            Assembler::new(FamilyType::Unknown).with_declarations(declarations).with_seed(seed)
         })
     }
 
@@ -388,7 +440,7 @@ fn merge_declaration(
     decoder: &mut PrometheusDecoder,
 ) {
     let Some(existing) = declarations.get_mut(name) else {
-        declarations.insert(name.to_string(), Declaration { kind, help, unit });
+        declarations.insert(name, kind, help, unit);
         return;
     };
     if existing.kind != kind {
@@ -493,7 +545,11 @@ fn family_type_v2(value: i32) -> FamilyType {
     }
 }
 
-fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, CodecError> {
+fn decode_v1(
+    body: &[u8],
+    decoder: &mut PrometheusDecoder,
+    seed: &Declarations,
+) -> Result<Decoded, CodecError> {
     let request = pb1::WriteRequest::decode(body)
         .map_err(|e| CodecError::Malformed(format!("prometheus.WriteRequest: {e}")))?;
     if !body.is_empty() && request.timeseries.is_empty() && request.metadata.is_empty() {
@@ -506,7 +562,7 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     // Pass one: the declaration table. 1.0 names the family explicitly, so an `UNKNOWN` type is
     // still a real statement about a family that exists -- unlike 2.0's `UNSPECIFIED`, which names
     // no family at all (see `decode_v2`).
-    let mut declarations = Declarations::new();
+    let mut declarations = Declarations::default();
     for metadata in &request.metadata {
         merge_declaration(
             &mut declarations,
@@ -518,7 +574,7 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
         );
     }
 
-    let mut groups = Groups::new(&declarations);
+    let mut groups = Groups::new(&declarations, seed);
     let mut decoded = Decoded::default();
 
     // Pass two: labels and samples.
@@ -584,6 +640,8 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     }
 
     decoded.groups = groups.finish(decoder);
+    // `groups` borrowed the table until `finish` consumed it; the caller gets it now.
+    decoded.declarations = declarations;
     Ok(decoded)
 }
 
@@ -658,7 +716,11 @@ fn resolve_refs<'a>(
     Ok(out)
 }
 
-fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, CodecError> {
+fn decode_v2(
+    body: &[u8],
+    decoder: &mut PrometheusDecoder,
+    seed: &Declarations,
+) -> Result<Decoded, CodecError> {
     let request = pb2::Request::decode(body)
         .map_err(|e| CodecError::Malformed(format!("io.prometheus.write.v2.Request: {e}")))?;
     if !body.is_empty() && request.symbols.is_empty() && request.timeseries.is_empty() {
@@ -699,7 +761,7 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     // declaration of `foo` and leave that histogram bucket-less. Any help or unit such a series
     // carries is applied after its samples route, to whatever family they landed in
     // (`Assembler::describe`), which is the only question that has an answer.
-    let mut declarations = Declarations::new();
+    let mut declarations = Declarations::default();
     let mut described: Vec<UntypedDescription> = Vec::with_capacity(request.timeseries.len());
     for (series, resolved) in request.timeseries.iter().zip(&resolved) {
         let Some((name, _)) = resolved else {
@@ -728,7 +790,7 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
         );
     }
 
-    let mut groups = Groups::new(&declarations);
+    let mut groups = Groups::new(&declarations, seed);
     let mut decoded = Decoded::default();
 
     // Pass three: samples, created timestamps, and the untyped descriptions.
@@ -808,6 +870,8 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     }
 
     decoded.groups = groups.finish(decoder);
+    // `groups` borrowed the table until `finish` consumed it; the caller gets it now.
+    decoded.declarations = declarations;
     Ok(decoded)
 }
 

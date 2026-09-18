@@ -41,6 +41,15 @@
 //! when a sample name actually routes to it** -- one hash lookup per suffix on the miss path in
 //! [`Assembler::route`], and nothing at all for a family nobody sampled.
 //!
+//! [`Assembler::with_seed`] adds a **second** table under the first, for the transport whose
+//! metadata does not arrive with its samples *at all* (a Prometheus 1.0 sender ships it in requests
+//! of its own): what the caller remembers from earlier requests. The lookup is per family name and
+//! the request's own table always wins, so a request that retypes `foo` retypes it for that
+//! request's samples, and a request that says nothing about `foo` gets the remembered type. Two
+//! tables rather than one merged table because merging is proportional to what is *remembered* --
+//! bounded by a cap the operator sets -- while everything else on this path is proportional to the
+//! request in hand.
+//!
 //! That laziness is a bound, not a micro-optimization. Remote-write decodes into one assembler per
 //! distinct sample timestamp, and both the timestamp count and the declaration count come off the
 //! wire; replaying every declaration into every group would let a small compressed body ask for
@@ -137,11 +146,59 @@ fn bare_name_role(kind: FamilyType) -> Option<Role> {
 /// A family's declared type and metadata, keyed by the family's own (base) name. A transport that
 /// carries a request's metadata separately from its samples builds one of these and shares it
 /// across every assembler the request needs -- see the module doc's "Declaring lazily" section.
-pub(super) type Declarations = HashMap<String, Declaration>;
+///
+/// Public, and re-exported as [`super::remote_write::Declarations`], because a transport's *caller*
+/// holds one too: `prometheus_in`'s metadata cache seeds
+/// [`decode_with`](super::remote_write::decode_with) with the declarations it remembers from
+/// earlier requests, and learns from the table the request it just decoded carried. Nothing outside
+/// this module reads an entry back out by name -- [`Declarations::iter`] is how a cache walks one --
+/// so [`Declarations::get`] stays crate-internal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Declarations {
+    entries: HashMap<String, Declaration>,
+}
+
+impl Declarations {
+    /// Declares `name`, **replacing** anything this table already said about it. Last write wins
+    /// because a table built from a cache is built in the order its builder wants applied; the
+    /// first-wins merge a request's own repeated metadata needs is the transport's decision
+    /// (`remote_write::merge_declaration`), not this type's.
+    pub fn insert(
+        &mut self,
+        name: impl Into<String>,
+        kind: FamilyType,
+        help: Option<String>,
+        unit: Option<String>,
+    ) {
+        self.entries.insert(name.into(), Declaration { kind, help, unit });
+    }
+
+    /// Every declaration in the table, in no particular order -- `HashMap`'s, which is neither
+    /// stable across runs nor meaningful here.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Declaration)> {
+        self.entries.iter().map(|(name, declaration)| (name.as_str(), declaration))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(super) fn get(&self, name: &str) -> Option<&Declaration> {
+        self.entries.get(name)
+    }
+
+    pub(super) fn get_mut(&mut self, name: &str) -> Option<&mut Declaration> {
+        self.entries.get_mut(name)
+    }
+}
 
 /// One entry of a [`Declarations`] table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Declaration {
+pub struct Declaration {
     pub kind: FamilyType,
     pub help: Option<String>,
     pub unit: Option<String>,
@@ -210,19 +267,40 @@ pub(super) struct Assembler<'a> {
     /// Declarations this assembler may materialize on demand, shared by reference with every other
     /// assembler decoding the same request -- see the module doc's "Declaring lazily" section.
     declarations: Option<&'a Declarations>,
+    /// A second table, consulted only where [`Assembler::declarations`] has nothing to say about a
+    /// name: what a *caller* remembers from earlier requests, where this one carries none. Two
+    /// tables rather than one merged table because the merge would be per request over the whole
+    /// remembered set, and the remembered set is the one thing here that is bounded by a config cap
+    /// rather than by the request in hand.
+    seed: Option<&'a Declarations>,
     families: Vec<FamilyAccum>,
     index: HashMap<String, usize>,
 }
 
 impl<'a> Assembler<'a> {
     pub(super) fn new(implicit: FamilyType) -> Self {
-        Assembler { implicit, declarations: None, families: Vec::new(), index: HashMap::new() }
+        Assembler {
+            implicit,
+            declarations: None,
+            seed: None,
+            families: Vec::new(),
+            index: HashMap::new(),
+        }
     }
 
     /// Declarations to materialize lazily, as sample names route to them. Sharing one table across
     /// the assemblers of one request is the point: see the module doc.
     pub(super) fn with_declarations(mut self, declarations: &'a Declarations) -> Self {
         self.declarations = Some(declarations);
+        self
+    }
+
+    /// Declarations to fall back on, per family name, where [`Assembler::with_declarations`]'s
+    /// table has none -- a caller's memory of what earlier requests declared. The request in hand
+    /// always wins: a sender that says `foo` is a counter today is describing today's series,
+    /// whatever it said when the cache entry was written.
+    pub(super) fn with_seed(mut self, seed: &'a Declarations) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -564,12 +642,11 @@ impl<'a> Assembler<'a> {
     /// miss path -- see the module doc's "Declaring lazily" section for why this is on demand
     /// rather than replayed into every assembler up front.
     fn materialize(&mut self, name: &str, decoder: &mut PrometheusDecoder) {
-        let Some(declarations) = self.declarations else { return };
-        if declarations.is_empty() {
+        if self.nothing_declared() {
             return;
         }
         if !self.index.contains_key(name) {
-            if let Some(declaration) = declarations.get(name) {
+            if let Some(declaration) = self.declared(name) {
                 self.declare_from(name, declaration.clone(), decoder);
             }
         }
@@ -578,10 +655,26 @@ impl<'a> Assembler<'a> {
             if self.index.contains_key(base) {
                 continue;
             }
-            if let Some(declaration) = declarations.get(base) {
+            if let Some(declaration) = self.declared(base) {
                 self.declare_from(base, declaration.clone(), decoder);
             }
         }
+    }
+
+    /// What either table says about one family name, the request's own first. Per *name* rather
+    /// than per table: a request that declares `foo` and nothing else still gets the seed's
+    /// `bar`, and its own `foo` still beats the seed's.
+    fn declared(&self, name: &str) -> Option<&'a Declaration> {
+        self.declarations
+            .and_then(|declarations| declarations.get(name))
+            .or_else(|| self.seed.and_then(|seed| seed.get(name)))
+    }
+
+    /// Whether [`Assembler::materialize`] has anything at all to look through -- the common case
+    /// for text, which declares eagerly and attaches no table.
+    fn nothing_declared(&self) -> bool {
+        self.declarations.is_none_or(Declarations::is_empty)
+            && self.seed.is_none_or(Declarations::is_empty)
     }
 
     fn declare_from(
