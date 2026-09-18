@@ -40,11 +40,11 @@ usage() {
 # subscription first so it's never a surprise.
 LOGIT_VM_SUBSCRIPTION="${LOGIT_VM_SUBSCRIPTION:-}"
 
-LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-centralus}"
+LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-westus2}"
 LOGIT_VM_ZONE="${LOGIT_VM_ZONE:-1}"
 # 4 vCPU = 4 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
 LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F4as_v6}"
-# gen2 only for this series; verified present in centralus (and eastus, westus2). Pin an
+# gen2 only for this series; verified present in westus2 (and eastus, centralus). Pin an
 # explicit version instead of `latest` to compare across sessions -- logit-vm-metadata.txt
 # records whichever version `latest` actually resolved to.
 LOGIT_VM_IMAGE="${LOGIT_VM_IMAGE:-Debian:debian-13:13-gen2:latest}"
@@ -75,9 +75,9 @@ LOGIT_VM_REPO_REF="${LOGIT_VM_REPO_REF:-main}"
 LOGIT_VM_SSH_KEY="${LOGIT_VM_SSH_KEY:-${HOME}/.ssh/logit-perf-vm}"
 LOGIT_VM_KNOWN_HOSTS="${LOGIT_VM_KNOWN_HOSTS:-${HOME}/.ssh/logit-perf-vm.known_hosts}"
 
-# VM + 128GiB Premium SSD + a Standard static public IP, centralus PAYG Linux -- for status's
+# VM + 128GiB Premium SSD + a Standard static public IP, westus2 PAYG Linux -- for status's
 # running-cost line. A rough nag, not a bill.
-LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.34}"
+LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.305}"
 
 VNET="${LOGIT_VM_RESOURCE_GROUP}-vnet"
 SUBNET="${LOGIT_VM_RESOURCE_GROUP}-subnet"
@@ -133,11 +133,16 @@ preflight() {
 # `az vm list-usage` returns currentValue and limit as JSON *strings*, so a JMESPath numeric
 # filter on them crashes the CLI outright -- pulled out as text and compared in the shell instead.
 check_quota() {
+    # `[0].[currentValue, limit]` returns a bare 2-element array, and `-o tsv` prints a bare
+    # array one element per line, not tab-joined -- so a single `read var1 var2 <<<...` only ever
+    # captured the first element, leaving the second empty and the arithmetic below silently
+    # comparing against 0. Shaping the query as a one-row object instead
+    # (`{u:...currentValue, l:...limit}`) is what actually gets both values onto one TSV line.
     local family_used family_limit core_used core_limit
     read -r family_used family_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
-        --query "[?name.value=='StandardFasv6Family']|[0].[currentValue,limit]" -o tsv)"
+        --query "{u:[?name.value=='StandardFasv6Family']|[0].currentValue, l:[?name.value=='StandardFasv6Family']|[0].limit}" -o tsv)"
     read -r core_used core_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
-        --query "[?name.value=='cores']|[0].[currentValue,limit]" -o tsv)"
+        --query "{u:[?name.value=='cores']|[0].currentValue, l:[?name.value=='cores']|[0].limit}" -o tsv)"
     echo "quota:         Fasv6 ${family_used}/${family_limit} vCPU, regional ${core_used}/${core_limit} vCPU"
     if [ $((family_limit - family_used)) -lt 4 ] || [ $((core_limit - core_used)) -lt 4 ]; then
         echo "not enough vCPU quota in ${LOGIT_VM_LOCATION} for a 4-vCPU VM." >&2

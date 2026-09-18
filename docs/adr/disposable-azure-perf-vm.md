@@ -51,20 +51,17 @@ laptop's Zen 5 / Zen 5c split can't offer: four *identical* cores, not two kinds
 (see Consequences). 16 GiB over the 8 GiB `F4als_v6` variant costs $0.03/hr more and gives real
 headroom for a cold release build plus a warm `CARGO_HOME` and `target/`.
 
-Default region is **`centralus`**: this subscription's `eastus` quota didn't hold up for this
-family in practice, despite `az vm list-usage` displaying the same unused `StandardFasv6Family`
-0/20 and regional 2/20 there that `centralus` and `westus2` also show — Azure's per-family display
-quota is a default placeholder, not proof the family is actually provisioned for a subscription.
-`centralus` is verified to have the `13-gen2` Debian image and a 0/20 `StandardFasv6Family` /
-0/20 regional vCPU reading; `westus2` reads the same and is the documented fallback
-(`LOGIT_VM_LOCATION=westus2`) if `centralus` also turns out not to hold up. Either way, a create
-that fails with a quota or `SkuNotAvailable` error despite `check_quota` passing means the display
-number wasn't the real answer — the fix is trying the other region, a different zone
-(`LOGIT_VM_ZONE`), or an actual quota-increase request in the Azure portal, not a `script/vm` bug.
+Default region is **`westus2`** (Quincy, Washington — there is no Azure region physically in
+Oregon; this is the nearest Pacific-Northwest one). It's not privileged over `eastus`/`centralus`
+for any Azure-side reason: all three read the identical `StandardFasv6Family` 0/20 and regional
+vCPU 0/20 quota and all three carry the `13-gen2` Debian image. The apparent "no quota" failures
+against `eastus` and then `centralus` were **`check_quota`'s own bug**, not a real limit — see
+Consequences. `westus2` is kept as the default (rather than reverting to `eastus`) simply because
+it's the one that was in hand once the real bug was found and confirmed fixed against all three.
 
 ### Debian 13 (gen2), pinned by version for real comparisons, and no in-place upgrade
 
-`Debian:debian-13:13-gen2:latest` — verified present in `centralus` (and `eastus`, `westus2`),
+`Debian:debian-13:13-gen2:latest` — verified present in `westus2` (and `eastus`, `centralus`),
 gen2 as the size requires.
 `script/vm-cloud-init.yaml` sets `package_update: true` but **`package_upgrade: false`**: an
 in-place upgrade would make the kernel and libc a function of which day the VM happened to be
@@ -283,7 +280,16 @@ set, and every subcommand prints the resolved subscription first.
 - **Nothing here runs in CI.** CI has no Azure credentials, and this workflow costs real money —
   entirely consistent with `script/bench`/`script/perf` already being excluded from
   `script/cibuild` for the same "measures the runner, not the code" reason.
-- **Cost**: ~$0.34/hour running in `centralus` (VM $0.309 + 128 GiB Premium SSD ~$0.027 + the
-  static IP ~$0.005), $0 once `down`
-  completes. A `Makefile` `vm` target defaults its bare form to `status` (read-only) rather than
-  `up`, so `make vm` can't accidentally start spending.
+- **`check_quota`'s first cut had a real bug**, caught only by an actual `up` run: its
+  `az vm list-usage --query "[0].[currentValue,limit]" -o tsv` returns a bare 2-element array,
+  and `-o tsv` prints a bare array one element per line rather than tab-joined on one line. A
+  single `read family_used family_limit <<<...` therefore only ever captured the *first* line,
+  leaving `family_limit` empty and the arithmetic silently comparing against 0 — so the check
+  failed unconditionally, on every region, regardless of actual quota. It's what produced the
+  false "not enough vCPU quota" reports against both `eastus` and `centralus` before this was
+  found. Fixed by shaping the query as a one-row object (`{u: ...currentValue, l: ...limit}`)
+  instead, which `-o tsv` does put on a single tab-separated line; re-verified against all three
+  regions once fixed. There is no `--no-check-quota` escape hatch, since the bug is what needed
+  fixing, not the check itself.
+- **Cost**: ~$0.305/hour running in `westus2` (VM $0.273 + 128 GiB Premium SSD ~$0.027 + the
+  static IP ~$0.005), $0 once `down` completes.
