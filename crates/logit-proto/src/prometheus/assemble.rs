@@ -18,6 +18,7 @@
 //! | a sample name that *is* a declared family's name | that family, in the role its type gives a bare name ([`bare_name_role`]): a counter/gauge/stateset/unknown value, a summary's quantile line. A histogram has no bare-named sample, so this is `skipped{reason="unknown_suffix"}` |
 //! | a sample name that is a declared family's name plus a suffix that type gives meaning to ([`SUFFIXES`], [`suffix_applies`]) | that family, in the suffix's role |
 //! | a sample name that is a declared family's name plus a suffix that type has *no* meaning for (`x_sum` under `# TYPE x counter`) | `skipped{reason="unknown_suffix"}` |
+//! | a sample name that is an **implicit** family's name plus a suffix (`x_sum` where `x` was itself only an undeclared sample) | *not* that family -- a fresh implicit family of its own, see below |
 //! | any other sample name | a fresh family of the assembler's *implicit* type -- [`FamilyType::Untyped`] for text 0.0.4, [`FamilyType::Unknown`] for OpenMetrics and remote-write |
 //! | `le`/`quantile` | part of the [`Point`], not of the series identity: stripped from the label set before it becomes the series key |
 //! | a second value for one (family, label set, role) | `skipped{reason="duplicate_series"}`, first wins ([`replace_once`]) |
@@ -32,6 +33,25 @@
 //! `skipped{reason="duplicate_type"|"duplicate_metadata"}` and the first wins; a second that says
 //! the same thing is neither counted nor an error, since every format lets a producer repeat
 //! itself and a counter an operator reads as "input was dropped" should not fire when nothing was.
+//!
+//! ## Only a declared base claims a suffix
+//!
+//! The suffix scan in [`Assembler::route`] matches `x_sum` against a family called `x` **only when
+//! something declared `x`**. An implicit family exists because some earlier sample was called
+//! exactly that and nothing said what it was: a guess about one name, not a statement about a
+//! family that has parts. Since [`suffix_applies`] is false for every role under
+//! [`FamilyType::Unknown`]/[`FamilyType::Untyped`], a match there could only ever end in the
+//! `unknown_suffix` skip above -- so the suffix scan steps over it and the raw name opens its own
+//! implicit family instead.
+//!
+//! Which matters most for the one classic kind whose *bare* name is a sample. A summary with no
+//! metadata behind it arrives as `x{quantile=…}`, `x_sum`, `x_count`, and remote-write sorts a
+//! request's series by name, so the bare one always lands first and opens the implicit `x`. Without
+//! this rule its two suffixed siblings would both be thrown away -- which is exactly what a
+//! recorded corpus of real Prometheus 3.14 requests turned out to be losing, two samples per scrape
+//! (`testdata/interop/prometheus/README.md`). A histogram never armed it, having no bare-named
+//! sample at all, which is why the round trip looked sound. The flat decode is *flatter* than the
+//! producer's shape; it is not lossier.
 //!
 //! ## Declaring lazily
 //!
@@ -668,6 +688,18 @@ impl<'a> Assembler<'a> {
         for (suffix, role) in SUFFIXES {
             let Some(base) = name.strip_suffix(suffix) else { continue };
             let Some(idx) = self.index.get(base).copied() else { continue };
+            // **Only a declared base claims a suffix.** An implicit family exists because some
+            // earlier sample was called exactly that and nothing said what it was -- it is a guess
+            // about one name, not a statement about a family that has parts. `suffix_applies` is
+            // false for every role under `Unknown`/`Untyped`, so matching here could only ever
+            // reach the skip below and throw the sample away: a summary arriving with no metadata
+            // opens the implicit `foo` on its `foo{quantile=..}` line (remote-write sorts by name,
+            // so the bare one comes first) and then loses `foo_sum` and `foo_count` to it. The raw
+            // name is free to be a family of its own instead, which is what the flat, untyped
+            // decode the module doc describes actually means.
+            if !self.families[idx].typed {
+                continue;
+            }
             let kind = self.families[idx].kind;
             if suffix_applies(kind, suffix, role) && !self.seed_would_reject(idx, role, labels) {
                 return Some((idx, role, suffix == "_total"));
@@ -805,6 +837,14 @@ impl<'a> Assembler<'a> {
         for (suffix, role) in SUFFIXES {
             let Some(base) = name.strip_suffix(suffix) else { continue };
             let Some(idx) = self.index.get(base).copied() else { continue };
+            // The same "only a declared base claims a suffix" rule [`Assembler::route`] applies,
+            // mirrored so this read-only lookup and the routing decision it is asking about can
+            // never disagree: a `foo_sum` whose samples opened their own implicit `foo_sum` family
+            // must have its help and its exemplars land there too, not on an unrelated implicit
+            // `foo`.
+            if !self.families[idx].typed {
+                continue;
+            }
             return suffix_applies(self.families[idx].kind, suffix, role).then_some((idx, role));
         }
         None

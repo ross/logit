@@ -567,18 +567,9 @@ fn v1_series(name: &str, value: f64, timestamp_ms: i64) -> pb1::TimeSeries {
     }
 }
 
-/// The W5 metadata cache doing the one job it exists for: a real Prometheus 1.0 sender ships
-/// `MetricMetadata` in requests of its own (`metadata_config.send_interval`, a minute by default)
-/// rather than attached to the samples it describes, so the sample-only requests that follow carry
-/// no `# TYPE` equivalent anywhere. Stateless, they decode as three unrelated `Unknown` series;
-/// against the cache they reassemble into the one `Histogram` the sender meant.
-#[tokio::test]
-async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
-    let (receiver_addr, mut rx) =
-        start_receiver(16, Some((10_000, Duration::from_secs(600)))).await;
-
-    // Request one: metadata, no series at all -- Prometheus's own `metadata_config` request.
-    let metadata_only = pb1::WriteRequest {
+/// Prometheus's own `metadata_config` request: one `MetricMetadata`, no series at all.
+fn latency_seconds_metadata_request() -> pb1::WriteRequest {
+    pb1::WriteRequest {
         timeseries: Vec::new(),
         metadata: vec![pb1::MetricMetadata {
             r#type: pb1::metric_metadata::MetricType::Histogram as i32,
@@ -586,11 +577,14 @@ async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
             help: "Request latency.".to_string(),
             unit: "seconds".to_string(),
         }],
-    };
-    assert_eq!(post_v1(receiver_addr, &metadata_only).await, 204);
+    }
+}
 
-    // Request two: the flat samples one scrape of that histogram produces, and nothing else.
-    let samples_only = pb1::WriteRequest {
+/// The flat samples one scrape of that histogram produces, and nothing else -- one shared builder
+/// so the cache test and its no-cache control are demonstrably the same bytes, rather than two
+/// similar-looking literals.
+fn latency_seconds_samples_request() -> pb1::WriteRequest {
+    pb1::WriteRequest {
         timeseries: vec![
             pb1::TimeSeries {
                 labels: vec![
@@ -605,8 +599,23 @@ async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
             v1_series("latency_seconds_count", 4.0, 1_700_000_000_000),
         ],
         metadata: Vec::new(),
-    };
-    assert_eq!(post_v1(receiver_addr, &samples_only).await, 204);
+    }
+}
+
+/// The W5 metadata cache doing the one job it exists for: a real Prometheus 1.0 sender ships
+/// `MetricMetadata` in requests of its own (`metadata_config.send_interval`, a minute by default)
+/// rather than attached to the samples it describes, so the sample-only requests that follow carry
+/// no `# TYPE` equivalent anywhere. Stateless, they decode as three unrelated `Unknown` series;
+/// against the cache they reassemble into the one `Histogram` the sender meant.
+#[tokio::test]
+async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
+    let (receiver_addr, mut rx) =
+        start_receiver(16, Some((10_000, Duration::from_secs(600)))).await;
+
+    // Request one: metadata, no series at all -- Prometheus's own `metadata_config` request.
+    assert_eq!(post_v1(receiver_addr, &latency_seconds_metadata_request()).await, 204);
+    // Request two: the flat samples one scrape of that histogram produces, and nothing else.
+    assert_eq!(post_v1(receiver_addr, &latency_seconds_samples_request()).await, 204);
 
     // The metadata-only request declares a family and carries no group, so it produces no events
     // at all -- only the samples request delivers a batch.
@@ -629,32 +638,23 @@ async fn a_metadata_only_1_0_request_types_the_samples_that_follow_it() {
     assert_eq!(logit_core::interner::resolve(records[0].name), "latency_seconds");
 }
 
-/// The same two requests against a receiver with **no** cache (`max_families: 0`), so the
-/// difference the cache makes is asserted rather than assumed: stateless, the flat series stay
-/// three unrelated untyped records.
+/// **Exactly** the two requests above against a receiver with no cache at all, so the difference
+/// the cache makes is asserted rather than assumed. `start_receiver`'s `None` is what an operator
+/// spells `metadata_cache: {max_families: 0}`: `PrometheusReceiver::with_metadata_cache` turns a
+/// zero cap into no table rather than an empty one, so the two are the same receiver and this is
+/// the control for [`a_metadata_only_1_0_request_types_the_samples_that_follow_it`], not a
+/// near-miss.
+///
+/// Stateless, the three flat series stay three unrelated untyped records -- and **all three**
+/// arrive. What the cache buys is typing, never samples: the request is not lossier without it,
+/// only flatter (`crates/logit-proto/src/prometheus/assemble.rs`'s "Only a declared base claims a
+/// suffix").
 #[tokio::test]
 async fn without_the_cache_the_same_samples_stay_three_untyped_series() {
     let (receiver_addr, mut rx) = start_receiver(16, None).await;
 
-    let metadata_only = pb1::WriteRequest {
-        timeseries: Vec::new(),
-        metadata: vec![pb1::MetricMetadata {
-            r#type: pb1::metric_metadata::MetricType::Histogram as i32,
-            metric_family_name: "latency_seconds".to_string(),
-            help: "Request latency.".to_string(),
-            unit: "seconds".to_string(),
-        }],
-    };
-    assert_eq!(post_v1(receiver_addr, &metadata_only).await, 204);
-
-    let samples_only = pb1::WriteRequest {
-        timeseries: vec![
-            v1_series("latency_seconds_sum", 2.5, 1_700_000_000_000),
-            v1_series("latency_seconds_count", 4.0, 1_700_000_000_000),
-        ],
-        metadata: Vec::new(),
-    };
-    assert_eq!(post_v1(receiver_addr, &samples_only).await, 204);
+    assert_eq!(post_v1(receiver_addr, &latency_seconds_metadata_request()).await, 204);
+    assert_eq!(post_v1(receiver_addr, &latency_seconds_samples_request()).await, 204);
 
     let received = collect_batches(&mut rx, 1).await;
     let records: Vec<&MetricRecord> = received
@@ -662,7 +662,19 @@ async fn without_the_cache_the_same_samples_stay_three_untyped_series() {
         .flat_map(|batch| batch.events.iter())
         .flat_map(|e| e.metrics.iter())
         .collect();
-    assert_eq!(records.len(), 2, "stateless, the two series stay separate, got {records:?}");
+    assert_eq!(
+        records.len(),
+        3,
+        "stateless, the three series stay separate -- and none of them is dropped: {records:?}"
+    );
+    let mut names: Vec<&str> =
+        records.iter().map(|record| logit_core::interner::resolve(record.name)).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["latency_seconds_bucket", "latency_seconds_count", "latency_seconds_sum"],
+        "each suffixed name is its own untyped family with no metadata to attach it to"
+    );
     for record in records {
         assert!(
             matches!(record.kind, MetricKind::Gauge(_)),

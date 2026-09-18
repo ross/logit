@@ -1436,7 +1436,11 @@ already built that have a known, accepted rough edge.
   ships those in **separate requests** on its own schedule (`metadata_config`, once a minute by
   default) rather than attached to the samples they describe — so without a cache every family in
   nearly every 1.0 request decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/
-  `_count` arrive as three unrelated series instead of one histogram. `metadata_cache:` closes that
+  `_count` arrive as three unrelated series instead of one histogram. No sample is *lost* either
+  way — only a **declared** family name claims a suffix, so an undeclared `foo_sum` is a family of
+  its own rather than a sample thrown away
+  (`crates/logit-proto/src/prometheus/assemble.rs`) — what the cache buys is typing, not data.
+  `metadata_cache:` closes that
   (`max_families: 10000`, `ttl: 10m`; `max_families: 0` turns it off entirely, which is the setting
   for a pure-2.0 fleet), least-recently-seen evicted first over the cap. What remains a gap is what
   the bound *means*: **an expiry puts a family back to decoding untyped** — its next samples are

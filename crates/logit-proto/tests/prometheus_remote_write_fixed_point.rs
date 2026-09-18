@@ -302,6 +302,79 @@ fn version_1_without_metadata_decodes_flat_untyped_families() {
     assert_eq!(decoded.samples, 3);
 }
 
+/// The summary-shaped sibling of the test above, and the case it could not reach: a summary is the
+/// one classic kind whose *bare* name is a sample, so its flat series are `foo{quantile=…}`,
+/// `foo_sum` and `foo_count` -- and remote-write sorts a request's series by name, so the bare one
+/// always arrives first and opens the implicit family `foo` before its two suffixed siblings show
+/// up.
+///
+/// That ordering is what made this the shape a real Prometheus lost samples on (`testdata/interop/
+/// prometheus/README.md`, and `prometheus_remote_write_interop.rs`'s own doc): the suffix scan
+/// matched `foo_sum`'s base against that implicit `foo`, found no role for `_sum` under an untyped
+/// family, and skipped the sample. `foo_bucket`/`foo_count`/`foo_sum` above never armed it, having
+/// no bare-named sample between them. **Only a declared base claims a suffix**, so all three are
+/// families of their own here and every sample survives.
+#[test]
+fn version_1_without_metadata_keeps_a_summarys_suffixed_series() {
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![
+            v1_series(&[("__name__", "foo"), ("quantile", "0.5")], 0.2),
+            v1_series(&[("__name__", "foo"), ("quantile", "0.99")], 0.9),
+            v1_series(&[("__name__", "foo_count")], 100.0),
+            v1_series(&[("__name__", "foo_sum")], 12.5),
+        ],
+        metadata: Vec::new(),
+    });
+    let families = &decoded.groups[0];
+    assert_eq!(
+        families.iter().map(|family| family.name.as_str()).collect::<Vec<_>>(),
+        ["foo", "foo_count", "foo_sum"],
+        "three unrelated families, not one summary and two dropped samples: {families:#?}"
+    );
+    for family in families {
+        assert_eq!(family.kind, FamilyType::Unknown);
+    }
+    // `quantile` was not stripped, for the reason `le` is not stripped above: nothing declared
+    // `foo` a summary, so it is an ordinary label on two ordinary series of one untyped family.
+    assert_eq!(families[0].series.len(), 2);
+    assert_eq!(families[0].series[0].labels, [("quantile".to_string(), "0.5".to_string())]);
+    assert_eq!(decoded.samples, 4, "every sample the request carried is accounted for");
+}
+
+/// The same four series seeded with `# TYPE foo summary`: one summary, assembled, its quantiles in
+/// the point rather than on the label set. The seed buys *typing*, which is all it ever buys --
+/// the stateless decode above already kept every sample.
+#[test]
+fn a_seed_types_a_metadata_less_summary() {
+    let mut seed = Declarations::default();
+    seed.insert("foo", FamilyType::Summary, None, None);
+    let request = pb1::WriteRequest {
+        timeseries: vec![
+            v1_series(&[("__name__", "foo"), ("quantile", "0.5")], 0.2),
+            v1_series(&[("__name__", "foo"), ("quantile", "0.99")], 0.9),
+            v1_series(&[("__name__", "foo_count")], 100.0),
+            v1_series(&[("__name__", "foo_sum")], 12.5),
+        ],
+        metadata: Vec::new(),
+    };
+    let decoded =
+        decode_with(&request.encode_to_vec(), Version::V1, &mut PrometheusDecoder::new(), &seed)
+            .expect("must decode");
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo");
+    assert_eq!(families[0].kind, FamilyType::Summary);
+    assert_eq!(
+        families[0].series[0].point,
+        Point::Summary {
+            quantiles: vec![(0.5, 0.2), (0.99, 0.9)],
+            sum: Some(12.5),
+            count: Some(100),
+        }
+    );
+    assert!(families[0].series[0].labels.is_empty(), "`quantile` is in the point now");
+}
+
 /// The same three series *with* metadata: one histogram, assembled.
 #[test]
 fn version_1_with_metadata_assembles_one_histogram() {

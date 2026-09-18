@@ -41,19 +41,28 @@ chosen because between them they cover all four classic metric types in 26 serie
 `max_samples_per_send` request's worth, so a capture is one whole scrape rather than a fragment.
 
 `crates/logit-proto/tests/prometheus_remote_write_interop.rs` consumes these: that every body
-decodes with nothing `Malformed`; that the sidecar's `Content-Type` alone selects the wire version;
-that `instance`, `job` and Prometheus's own `external_labels` arrive as ordinary labels and stay
-that way; that a sample request with no metadata behind it decodes to six flat `unknown` families
-(the histogram's three suffixes as three families, the summary's `quantile` as an ordinary label);
-that a metadata-only request decodes to declarations and no groups at all; and -- the one that puts
-both halves together -- that seeding a sample request with the declarations the *metadata* captures
-reported reassembles `go_gc_duration_seconds` into one `Summary` series and loses nothing, where
-the stateless decode drops its `_sum`/`_count` to
-`logit.input.metrics.skipped{reason="unknown_suffix"}`.
+decodes with nothing `Malformed` and **nothing skipped or degraded**; that the sidecar's
+`Content-Type` alone selects the wire version; that `instance`, `job` and Prometheus's own
+`external_labels` arrive as ordinary labels and stay that way; that a sample request with no
+metadata behind it decodes to eight flat `unknown` families (every suffixed name its own family,
+`quantile` and `le` ordinary labels); that a metadata-only request decodes to declarations and no
+groups at all; and -- the one that puts both halves together -- that seeding a sample request with
+the declarations the *metadata* captures reported folds three of those eight back into the one
+`Summary` Prometheus meant.
 
-That last pair is the corpus earning its keep: it is the same real bytes, decoded with and without
-the memory `prometheus_in`'s `metadata_cache:` holds, and the difference between them is two
-samples per scrape.
+**This corpus found a codec bug, which is what it was for.** Recorded against the assembler as it
+stood, the first of those assertions read `["unknown_suffix"]` for every sample capture. A summary
+is the one classic kind whose bare name is a sample, so `go_gc_duration_seconds{quantile=…}` opened
+the implicit family `go_gc_duration_seconds` -- remote-write sorts a request's series by name, so
+the bare one always arrives first -- and `…_sum` and `…_count` were then matched against that
+implicit base by the suffix scan and thrown away, since no suffix has a role under an untyped
+family. Two real samples per scrape, on every metadata-less request: 1.0 before the first metadata
+write, after a TTL lapse, and permanently under `max_families: 0` — including a pure-2.0 fleet,
+given the finding below. A histogram never armed it, having no bare-named sample, which is why the
+round trip and the fixed-point suites looked sound. The fix is in the assembler ("only a declared
+base claims a suffix"), and what the cache buys is now exactly what it always should have been:
+**typing, never samples**. A metadata-less request is flatter than the producer's shape, not
+lossier.
 
 ## What isn't covered here (yet)
 

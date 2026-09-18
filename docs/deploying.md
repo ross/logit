@@ -1073,7 +1073,9 @@ remote_write:
 `# HELP` and `# UNIT` in *separate* requests on its own schedule (`metadata_config`, once a minute
 by default) rather than attached to the samples they describe, so a receiver that remembers nothing
 decodes nearly every 1.0 request as untyped `unknown` families — and a histogram arrives as three
-unrelated `_bucket`/`_sum`/`_count` series instead of one record. The cache is what fixes that;
+unrelated `_bucket`/`_sum`/`_count` series instead of one record. No samples are dropped either way;
+what you lose without it is the metric *kinds*, and with them the ability to write a rate over a
+counter or a quantile over a histogram downstream. The cache is what fixes that;
 `max_families: 0` turns it off, which is the right setting only for a pure-2.0 fleet. Watch
 `logit.input.metadata_cache.evicted{reason="expired"}` against a live sender: a steady stream there
 means `ttl` is shorter than that sender's metadata cadence, and families are lapsing back to untyped

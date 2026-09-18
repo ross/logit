@@ -77,7 +77,7 @@
 //! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family *disagreeing with the first*; the first wins. A producer repeating itself verbatim is neither counted nor an error, the same rule `duplicate_type` has always had |
 //! | `duplicate_series` | one sample repeated: the same label set twice for a family's primary/`_sum`/`_count`/`_created` sample, or the same `le`/`quantile` twice. Both formats require "a unique combination of a metric name and labels"; the first wins |
 //! | `duplicate_label` | one line naming the same label twice -- an invalid label set, so the whole sample goes |
-//! | `unknown_suffix` | a sample whose name is a declared family's name plus a suffix that type has no meaning for (`foo_sum` under `# TYPE foo counter`) |
+//! | `unknown_suffix` | a sample whose name is a **declared** family's name plus a suffix that type has no meaning for (`foo_sum` under `# TYPE foo counter`). An *implicit* family never claims a suffix: with no `# TYPE` anywhere, `foo` and `foo_sum` are two untyped families and neither sample is lost |
 //! | `incomplete_series` | a series with no value at all for its type: a counter with only a `_created`, a histogram with no buckets |
 //!
 //! One further skip reason (`non_monotonic_buckets`, with `empty_histogram` for a bucket-less
@@ -1994,6 +1994,27 @@ mod tests {
             parse_reasons("# TYPE foo counter\nfoo 1\nfoo_sum 2\n", Dialect::Text0_0_4);
         assert_eq!(families[0].series.len(), 1);
         assert!(reasons.contains(&"unknown_suffix".to_string()));
+    }
+
+    /// The other half of the rule above: the suffix only belongs to a family something **declared**.
+    /// With no `# TYPE` anywhere, `foo` is an implicit untyped family -- a guess about one name,
+    /// not a statement about a family that has parts -- so `foo_total` is a family of its own
+    /// rather than a sample thrown away for not fitting a type nobody claimed. See
+    /// `assemble.rs`'s "What an assembler decides" table; a recorded real-Prometheus corpus found
+    /// this the other way round (`testdata/interop/prometheus/README.md`).
+    #[test]
+    fn a_suffix_never_routes_against_an_undeclared_family() {
+        let (families, reasons) = parse_reasons("foo 1\nfoo_total 2\n", Dialect::Text0_0_4);
+        assert_eq!(
+            families.iter().map(|family| family.name.as_str()).collect::<Vec<_>>(),
+            ["foo", "foo_total"],
+            "two untyped families, not one sample dropped: {families:#?}"
+        );
+        for family in &families {
+            assert_eq!(family.kind, FamilyType::Untyped);
+            assert_eq!(family.series.len(), 1);
+        }
+        assert!(reasons.is_empty(), "nothing is skipped or degraded: {reasons:?}");
     }
 
     #[test]

@@ -157,17 +157,22 @@ fn all_captures() -> Vec<&'static str> {
 
 /// What `tools/record-fixtures/prometheus.yml`'s `write_relabel_configs` lets onto the wire, as the
 /// **decoder** sees it with no metadata to type it by: four families in Prometheus's own
-/// exposition -- a gauge, a counter, a histogram and a summary -- arriving as six flat, untyped
+/// exposition -- a gauge, a counter, a histogram and a summary -- arriving as eight flat, untyped
 /// ones, because a remote-write series is a label set and a number and nothing else.
 ///
-/// The histogram's three suffixes become three separate families and the summary's `quantile`
-/// stays an ordinary label: exactly the "the model kinds are flatter than the producer's"
-/// paragraph in [ADR `prometheus-remote-write`], stated against a real sender rather than against
-/// this codec's own encoder.
+/// Every suffixed name becomes a family of its own (the histogram's three, the summary's two) and
+/// the summary's `quantile` and the histogram's `le` stay ordinary labels: exactly the "the model
+/// kinds are flatter than the producer's" paragraph in [ADR `prometheus-remote-write`], stated
+/// against a real sender rather than against this codec's own encoder. **Flatter, and nothing
+/// else** -- every sample the request carried is in one of these eight, which is what that
+/// paragraph's "Nothing is lost" means and what the assembler's "only a *declared* base claims a
+/// suffix" rule is there to guarantee.
 ///
 /// [ADR `prometheus-remote-write`]: ../../../docs/adr/prometheus-remote-write.md
-const FLAT_SAMPLE_FAMILIES: [&str; 6] = [
+const FLAT_SAMPLE_FAMILIES: [&str; 8] = [
     "go_gc_duration_seconds",
+    "go_gc_duration_seconds_count",
+    "go_gc_duration_seconds_sum",
     "prometheus_build_info",
     "prometheus_tsdb_compaction_duration_seconds_bucket",
     "prometheus_tsdb_compaction_duration_seconds_count",
@@ -175,29 +180,28 @@ const FLAT_SAMPLE_FAMILIES: [&str; 6] = [
     "prometheus_tsdb_wal_page_flushes_total",
 ];
 
-/// Every capture decodes -- nothing `Malformed`, nothing rejected -- and the only thing any of
-/// them loses is the one documented consequence of a 1.0 sender shipping metadata separately.
+/// Every capture decodes -- nothing `Malformed`, nothing rejected -- and **nothing is skipped or
+/// degraded on the way**, which is the ADR's own claim about a metadata-less request: the model
+/// kinds come out flatter than the producer's, and that is the whole of it.
 ///
-/// **`unknown_suffix` on a sample capture is the corpus doing its job, not a defect.** With no
-/// metadata to type it, `go_gc_duration_seconds` opens an implicit `unknown` family, and an
-/// `unknown` family has no meaning for a `_sum` or a `_count` suffix -- so those two samples are
-/// skipped and counted (`crates/logit-proto/src/prometheus/assemble.rs`'s "What an assembler
-/// decides" table). That is real loss on a real request, it is named in a counter rather than
-/// silent, and [`recorded_metadata_types_a_recorded_sample_request`] is the same bytes with the
-/// cache's memory in front of them, losing nothing.
+/// This assertion is the one the corpus was worth having for. Written against the codec as it
+/// stood when these fixtures were recorded, it read `["unknown_suffix"]` for every sample capture:
+/// with no metadata, `go_gc_duration_seconds{quantile=..}` opened the implicit family
+/// `go_gc_duration_seconds` (remote-write sorts its series by name, so the bare one always arrives
+/// first), and `go_gc_duration_seconds_sum`/`_count` were then matched against that implicit base
+/// by the suffix scan and thrown away, because no suffix has a role under an untyped family. Two
+/// real samples per scrape, from a real Prometheus. The fix is in the assembler -- only a
+/// *declared* base claims a suffix -- and this test is what holds it.
 #[test]
-fn every_recorded_request_decodes_with_only_the_documented_loss() {
+fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
     for name in all_captures() {
         let capture = read_capture(name);
         let replayed = replay(&capture);
-        let expected: Vec<String> = if V1_METADATA.contains(&name) {
-            Vec::new()
-        } else {
-            vec!["unknown_suffix".to_string()]
-        };
         assert_eq!(
-            replayed.reasons, expected,
-            "{name}: see this test's own doc for why a sample capture loses exactly this much"
+            replayed.reasons,
+            Vec::<String>::new(),
+            "{name}: a real Prometheus request must decode with nothing skipped or degraded -- \
+             see this test's own doc for the bug this corpus found"
         );
         assert!(
             !replayed.families.is_empty() || !replayed.declarations.is_empty(),
@@ -229,11 +233,11 @@ fn the_recorded_content_types_select_the_wire_version() {
     }
 }
 
-/// Both versions' sample requests decode to the same six flat, untyped families -- the wire
+/// Both versions' sample requests decode to the same eight flat, untyped families -- the wire
 /// carries a label set and a number, and neither Prometheus 3.14.0 sender attached usable metadata
 /// to these requests (see this module's doc). A summary's `quantile` and a histogram's `le` survive
-/// as ordinary labels rather than being reassembled, because nothing in the request says which
-/// family they belong to.
+/// as ordinary labels rather than being reassembled, and each suffixed name is its own family,
+/// because nothing in the request says which family any of them belongs to.
 #[test]
 fn a_recorded_sample_request_decodes_to_flat_untyped_families() {
     for name in V1_SAMPLES.iter().chain(V2_SAMPLES.iter()) {
@@ -325,7 +329,15 @@ fn a_recorded_1_0_metadata_request_declares_families_with_no_groups() {
 
 /// The whole mechanism, on real bytes from both halves of one real sender: the declarations a
 /// recorded **metadata-only** request reported, used as the seed for a recorded **sample** request
-/// that carries none of its own, turn a flat untyped series into the family Prometheus meant.
+/// that carries none of its own, turn three flat untyped families into the one summary Prometheus
+/// meant.
+///
+/// What the cache buys is **typing, never samples**. Stateless, the same request already decodes
+/// losslessly ([`every_recorded_request_decodes_with_nothing_skipped_or_degraded`]) -- it just
+/// decodes to eight flat families where the producer had four, with `quantile` and `le` sitting on
+/// the label set as ordinary labels and `_sum`/`_count` standing alone. The seed is what collapses
+/// `go_gc_duration_seconds`, `..._sum` and `..._count` back into a single `Summary` series with
+/// its quantiles in the point.
 ///
 /// `go_gc_duration_seconds` is the overlap between the two -- `write_relabel_configs` keeps it on
 /// the sample side, and it happened to fall in the ten families `metadata_config`'s ticker shipped
@@ -351,16 +363,24 @@ fn recorded_metadata_types_a_recorded_sample_request() {
     let capture = read_capture(V1_SAMPLES[0]);
     let seeded = replay_with(&capture, &seed);
 
-    // Nothing skipped at all this time: the two `go_gc_duration_seconds_sum`/`_count` samples that
-    // the stateless decode loses to `unknown_suffix` now route into the summary they belong to.
-    assert_eq!(
-        seeded.reasons,
-        Vec::<String>::new(),
-        "with the metadata the same sender shipped, the same request loses nothing"
-    );
+    // Still nothing skipped -- the stateless decode loses nothing either, so a seed that changed
+    // that in *either* direction would be the thing to notice.
+    assert_eq!(seeded.reasons, Vec::<String>::new(), "typing a request must not cost it a sample");
 
     let typed: BTreeMap<&str, FamilyType> =
         seeded.families.iter().map(|family| (family.name.as_str(), family.kind)).collect();
+    // Three flat families became one: the summary's own name, and the two suffixed families that
+    // stood alone with no declaration to attach them to.
+    assert!(
+        !typed.contains_key("go_gc_duration_seconds_sum")
+            && !typed.contains_key("go_gc_duration_seconds_count"),
+        "the seed folds the suffixed families into the summary, got {typed:?}"
+    );
+    assert_eq!(
+        seeded.families.len(),
+        FLAT_SAMPLE_FAMILIES.len() - 2,
+        "eight flat families, minus the two the seed folded in"
+    );
     assert_eq!(
         typed.get("go_gc_duration_seconds").copied(),
         Some(FamilyType::Summary),
