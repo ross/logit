@@ -288,7 +288,10 @@
 //! ran out, `cardinality` for one pushed out of `max_families` by a newer one.
 //! `logit.input.metadata_cache.replaced` -- one count per family a request retyped, which is the
 //! counter to watch when a sender's model kinds look wrong: a healthy fleet retypes almost nothing,
-//! and a steady stream here is two senders disagreeing about one family name. The connection
+//! and a steady stream here is two senders disagreeing about one family name.
+//! `logit.input.metadata_cache.truncated` -- one count per help or unit string cut to
+//! [`MAX_METADATA_TEXT_BYTES`] on its way into the table; the type is still remembered exactly, so
+//! this bounds what one entry costs rather than what it types. The connection
 //! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
 //! since this is the same accept loop. A rejected request also reports
 //! `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address in the message text
@@ -1010,18 +1013,26 @@ impl MetadataCache {
             truncated += u64::from(help_cut) + u64::from(unit_cut);
             match state.families.get_mut(name) {
                 Some(existing) => {
-                    if existing.kind != declaration.kind {
+                    let retyped = existing.kind != declaration.kind;
+                    if retyped {
                         // Two senders disagreeing about one family name, or one that changed its
                         // mind. Either way the newest statement is the one to keep -- the alternative
                         // is typing a live sender's series from a declaration nothing has repeated.
                         replaced += 1;
-                        changed = true;
-                    } else if existing.help != help || existing.unit != unit {
+                    }
+                    if retyped || existing.help != help || existing.unit != unit {
+                        existing.kind = declaration.kind;
+                        existing.help = help;
+                        existing.unit = unit;
                         changed = true;
                     }
-                    existing.kind = declaration.kind;
-                    existing.help = help;
-                    existing.unit = unit;
+                    // Assigned only on a real change, deliberately: an identical re-declaration
+                    // (the common case -- Prometheus re-sends a family's metadata every
+                    // `send_interval`, from every shard) must leave the entry's own `Arc`s where
+                    // they are. The seed the decoder reads shares them, and it is not rebuilt for
+                    // a no-op, so adopting the request's clones here would quietly leave the two
+                    // holding equal strings in separate allocations.
+                    //
                     // Touched whether or not anything else moved: the TTL measures how long ago a
                     // sender last said this, and it just said it again.
                     existing.last_seen = now;

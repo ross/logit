@@ -1851,10 +1851,11 @@ pub fn default_prometheus_path() -> String {
 /// remote-write is still a fixed point -- but the model kinds are flatter than the producer's.
 ///
 /// So the receiver keeps a table of `family name -> (type, help, unit)`, fed by every declaration
-/// any request carries (1.0's `metadata[]` and 2.0's inline `Metadata` alike, so a mixed fleet
-/// fills one table) and consulted for a family whose own request declared nothing. **The request
-/// always wins**: a sender that retypes a family retypes it immediately, however stale the
-/// remembered entry.
+/// any request carries that actually names a type -- 1.0's `metadata[]` and 2.0's inline
+/// `Metadata` alike, so a mixed fleet fills one table, but a 1.0 `UNKNOWN` or a 2.0 `UNSPECIFIED`
+/// entry declares nothing and is not learned -- and consulted for a family whose own request
+/// declared nothing. **The request always wins**: a sender that retypes a family retypes it
+/// immediately, however stale the remembered entry.
 ///
 /// That table is per-family state on a component that otherwise has none, so it is bounded on both
 /// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
