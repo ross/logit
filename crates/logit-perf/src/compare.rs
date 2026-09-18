@@ -40,6 +40,16 @@ pub struct Deltas {
     /// observed a `ready` line) -- a delta needs both ends, and there is nothing to warn about
     /// when one is missing.
     pub startup_s_pct: Option<f64>,
+    /// The change in datagram drop rate, in **percentage points** (not a percent change): a
+    /// baseline that dropped 3.0% of datagrams against an "after" that drops 1.2% gives `-1.8`.
+    ///
+    /// Percentage points rather than a relative percentage because the quantity is already a rate,
+    /// and a relative delta on a small rate is nearly all noise -- 0.1% to 0.2% reads as "+100%"
+    /// and means almost nothing, while "+0.1 points" is exactly as much as it is.
+    ///
+    /// `None` unless both sides are real-socket scenarios carrying a `UdpSample`. **Reported,
+    /// never gated**: see [`Deltas::is_regression`].
+    pub drop_rate_points: Option<f64>,
 }
 
 impl Deltas {
@@ -52,6 +62,10 @@ impl Deltas {
                 (Some(a), Some(b)) => Some(pct_change(a, b)),
                 _ => None,
             },
+            drop_rate_points: match (a.udp, b.udp) {
+                (Some(a), Some(b)) => Some(100.0 * (b.drop_rate() - a.drop_rate())),
+                _ => None,
+            },
         }
     }
 
@@ -61,7 +75,12 @@ impl Deltas {
     /// tripped the threshold, the same verdict [`CompareReport::has_regression`] gates the exit
     /// code on.
     ///
-    /// `startup_s_pct` deliberately never participates here -- see [`Deltas::startup_regressed`].
+    /// `startup_s_pct` and `drop_rate_points` deliberately never participate here -- see
+    /// [`Deltas::startup_regressed`] and [`Deltas::drop_rate_points`]. A UDP scenario's drop rate
+    /// is a property of how hard the harness chose to push it, tuned on purpose into a lossy
+    /// regime (ADR `udp-intake-batching-and-socket-visibility`); gating on it would fail a run for
+    /// being configured the way it was meant to be. It is printed because a *change* in it between
+    /// two runs of the same spec is exactly what `push_many`/`recvmmsg` are supposed to move.
     pub fn is_regression(&self, threshold_pct: f64, rss_threshold_pct: Option<f64>) -> bool {
         let events_regressed = self.events_per_s_pct < -threshold_pct;
         let cpu_regressed = self.cpu_us_per_event_pct > threshold_pct;
@@ -200,7 +219,28 @@ mod tests {
             max_rss_bytes,
             events_per_s,
             cpu_us_per_event,
+            udp: None,
         }
+    }
+
+    /// A driven scenario's report, dropping `kernel_dropped` of 10,000 datagrams.
+    fn driven_report(
+        events_per_s: f64,
+        cpu_us_per_event: f64,
+        kernel_dropped: u64,
+    ) -> ScenarioReport {
+        let mut sample = sample(events_per_s, cpu_us_per_event, 1024);
+        sample.udp = Some(crate::result::UdpSample {
+            sent_datagrams: 10_000,
+            sent_lines: 10_000,
+            received_datagrams: 10_000 - kernel_dropped,
+            kernel_dropped,
+            queue_dropped: 0,
+            events_delivered: 10_000 - kernel_dropped,
+            send_errors: 0,
+            kernel_rcvbuf_utilization_max: 0.9,
+        });
+        ScenarioReport { count: 10_000, repeats: vec![sample], median: sample, min: sample }
     }
 
     fn scenario_report(
@@ -407,6 +447,57 @@ mod tests {
         let deltas = cmp.scenarios[0].deltas.unwrap();
         assert_eq!(deltas.startup_s_pct, None);
         assert!(!deltas.startup_regressed(0.0), "no delta means nothing to warn about");
+    }
+
+    #[test]
+    fn a_drop_rate_improvement_is_reported_in_percentage_points_and_never_gates() {
+        let mut before = BTreeMap::new();
+        before.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 300)); // 3.0%
+        let mut after = BTreeMap::new();
+        after.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 120)); // 1.2%
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        let deltas = cmp.scenarios[0].deltas.unwrap();
+        assert!((deltas.drop_rate_points.unwrap() + 1.8).abs() < 1e-9);
+        assert!(!cmp.has_regression(5.0, None));
+    }
+
+    #[test]
+    fn a_drop_rate_that_got_worse_is_still_never_a_regression_on_its_own() {
+        let mut before = BTreeMap::new();
+        before.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 0));
+        let mut after = BTreeMap::new();
+        after.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 5_000)); // 50%
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        let deltas = cmp.scenarios[0].deltas.unwrap();
+        assert!((deltas.drop_rate_points.unwrap() - 50.0).abs() < 1e-9);
+        assert!(
+            !cmp.has_regression(0.0, Some(0.0)),
+            "the drop rate is reported, never folded into the verdict"
+        );
+    }
+
+    #[test]
+    fn a_generated_scenario_has_no_drop_rate_delta_at_all() {
+        let mut before = BTreeMap::new();
+        before.insert("passthrough".to_string(), scenario_report(1_000_000.0, 2.0, 1024));
+        let mut after = BTreeMap::new();
+        after.insert("passthrough".to_string(), scenario_report(1_000_000.0, 2.0, 1024));
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        assert_eq!(cmp.scenarios[0].deltas.unwrap().drop_rate_points, None);
+    }
+
+    #[test]
+    fn comparing_a_driven_run_against_a_generated_one_reports_no_drop_delta() {
+        let mut before = BTreeMap::new();
+        before.insert("udp-statsd".to_string(), scenario_report(1_000_000.0, 2.0, 1024));
+        let mut after = BTreeMap::new();
+        after.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 300));
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        assert_eq!(cmp.scenarios[0].deltas.unwrap().drop_rate_points, None);
     }
 
     #[test]

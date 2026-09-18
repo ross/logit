@@ -94,12 +94,13 @@ pub fn clear(root: &Path, scenario: &Scenario) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scenario::Workload;
 
     fn scenario(path: &str, disk_spool_paths: &[&str]) -> Scenario {
         Scenario {
             name: "buffered".to_string(),
             path: PathBuf::from(path),
-            count: 100,
+            workload: Workload::Generated { count: 100 },
             needs_sigterm: false,
             disk_spool_paths: disk_spool_paths.iter().map(PathBuf::from).collect(),
         }
@@ -195,7 +196,7 @@ mod tests {
         let s = Scenario {
             name: "buffered".to_string(),
             path: scenario_dir.join("buffered.yaml"),
-            count: 1,
+            workload: Workload::Generated { count: 1 },
             needs_sigterm: false,
             disk_spool_paths: vec![PathBuf::from("../results/spool")],
         };
@@ -213,7 +214,7 @@ mod tests {
         let s = Scenario {
             name: "buffered".to_string(),
             path: root.join("perf/scenarios/buffered.yaml"),
-            count: 1,
+            workload: Workload::Generated { count: 1 },
             needs_sigterm: false,
             disk_spool_paths: vec![PathBuf::from("../results/spool")],
         };
@@ -233,7 +234,7 @@ mod tests {
         let s = Scenario {
             name: "evil".to_string(),
             path: scenario_dir.join("evil.yaml"),
-            count: 1,
+            workload: Workload::Generated { count: 1 },
             needs_sigterm: false,
             disk_spool_paths: vec![PathBuf::from("spool")],
         };

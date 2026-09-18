@@ -1,0 +1,89 @@
+# The statsd traffic model every `udp-statsd*` scenario shares. One file, referenced by all three
+# specs' `model:`, because the three differ *only* in how they pack these lines into datagrams --
+# copying the list into each would be three places for one traffic model to drift apart in.
+#
+# **How this was derived is in `perf/load/README.md`**, which is the document to read before
+# changing any weight here: line lengths, tag counts and the tagged/tagless split come from a real
+# client capture (`testdata/interop/statsd/`), while the metric-type mix and the cardinality knobs
+# are stated choices, not measurements. Every number below traces back to one or the other.
+#
+# Syntax: `{seq%N}` only (`logit_core::template`), one per placeholder, cycling 0..N-1 off *this
+# template's own* counter -- so two placeholders in one line advance together and a template's
+# distinct-name count is the lcm of the moduli in its name. A bare `{seq}` is rejected: the
+# receiver interns every distinct metric name, so an unbounded one would measure a leak.
+#
+# Weights sum to 1000, purely so each one reads as a per-mille share at a glance.
+lines:
+  # ---------------------------------------------------------------------------------------------
+  # Counters -- 500/1000. DogStatsD-tagged: short hierarchical name, cardinality carried in tags.
+  # ---------------------------------------------------------------------------------------------
+  - weight: 150
+    template: "app.http.requests.count:1|c|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},endpoint:/api/v1/orders/{seq%100},status:200"
+  - weight: 45
+    template: "app.http.requests.count:1|c|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},endpoint:/api/v1/users/{seq%100},status:404"
+  - weight: 30
+    template: "app.http.requests.count:1|c|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},endpoint:/api/v1/checkout,status:500"
+  - weight: 40
+    template: "app.checkout.attempts.count:{seq%9}|c|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},tier:t{seq%3},payment_method:card"
+  # Sampled: what a hot path sends to keep its own reporting cheap. `|@0.1` makes the receiver
+  # extrapolate the value at decode time, a code path an unsampled-only model would never reach.
+  - weight: 45
+    template: "app.cache.lookups.count:1|c|@0.1|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50}"
+  - weight: 35
+    template: "app.render.calls.count:1|c|@0.5|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},component:tmpl{seq%17}"
+  # The wide end of the measured tag range: eight keys on one line.
+  - weight: 30
+    template: "app.queue.jobs.enqueued.count:{seq%4}|c|#env:prod,service:worker,region:us-east-1,host:worker-{seq%20},queue:q{seq%7},priority:high,shard:{seq%11},dc:iad{seq%3}"
+  # The narrow end: three.
+  - weight: 25
+    template: "app.auth.logins.count:1|c|#env:prod,service:identity,host:auth-{seq%12}"
+  # Plain statsd, no tags: the same information has to live in the name instead, which is why
+  # these names are twice as long and far more numerous than the tagged ones above.
+  - weight: 55
+    template: "app.checkout_api.web{seq%50}.http.orders_{seq%100}.200.count:1|c"
+  - weight: 25
+    template: "app.checkout_api.web{seq%50}.http.users_{seq%100}.404.count:1|c"
+  - weight: 20
+    template: "app.checkout_api.cache.lookups.web{seq%50}:1|c|@0.1"
+
+  # ---------------------------------------------------------------------------------------------
+  # Timers, histograms and distributions -- 300/1000. All three wire letters, since `ms`/`h`/`d`
+  # take the same `Samples` path in the decoder but arrive under different type bytes.
+  # ---------------------------------------------------------------------------------------------
+  - weight: 90
+    template: "app.http.request.duration_ms:{seq%400}.{seq%7}|h|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},endpoint:/api/v1/orders/{seq%100},status:200"
+  - weight: 50
+    template: "app.db.query.duration_ms:{seq%90}.{seq%9}|ms|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},query:select_user,db:primary"
+  - weight: 45
+    template: "app.http.response.size_bytes:{seq%60000}|d|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},endpoint:/api/v1/orders/{seq%100},status:200"
+  - weight: 30
+    template: "app.upstream.latency_ms:{seq%250}.{seq%3}|ms|@0.5|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},upstream:svc{seq%23}"
+  - weight: 25
+    template: "app.worker.job.duration_ms:{seq%800}.{seq%5}|h|#env:prod,service:worker,region:us-east-1,host:worker-{seq%20},queue:q{seq%7},job:job{seq%31},shard:{seq%11}"
+  - weight: 35
+    template: "app.checkout_api.web{seq%50}.http.orders_{seq%100}.duration:{seq%300}.{seq%9}|ms"
+  - weight: 25
+    template: "app.checkout_api.web{seq%50}.db.select_user.duration:{seq%80}.{seq%7}|ms"
+
+  # ---------------------------------------------------------------------------------------------
+  # Gauges -- 150/1000.
+  # ---------------------------------------------------------------------------------------------
+  - weight: 60
+    template: "app.worker.queue.depth:{seq%250}|g|#env:prod,service:worker,region:us-east-1,host:worker-{seq%20},queue:q{seq%7}"
+  - weight: 35
+    template: "app.pool.connections.active:{seq%64}|g|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50},pool:pg-primary"
+  - weight: 25
+    template: "app.jvm.heap.used_ratio:0.{seq%100}|g|#env:prod,service:search,region:us-east-1,host:search-{seq%30},node_role:data,az:us-east-1{seq%3}"
+  - weight: 20
+    template: "app.checkout_api.web{seq%50}.pool.connections.active:{seq%64}|g"
+  - weight: 10
+    template: "app.worker.host{seq%20}.queue.q{seq%7}.depth:{seq%250}|g"
+
+  # ---------------------------------------------------------------------------------------------
+  # Sets -- 50/1000. The one metric type whose decoded value is a list of `Bytes` slices rather
+  # than a number, so leaving it out would leave that path unmeasured.
+  # ---------------------------------------------------------------------------------------------
+  - weight: 40
+    template: "app.users.active:{seq%5000}|s|#env:prod,service:checkout-api,region:us-east-1,host:web-{seq%50}"
+  - weight: 10
+    template: "app.checkout_api.users.active:{seq%5000}|s"

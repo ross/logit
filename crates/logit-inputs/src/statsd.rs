@@ -2446,4 +2446,167 @@ mod tests {
         running.shutdown.send(true).ok();
         running.handle.abort();
     }
+
+    // -------------------------------------------------------------------------------------------
+    // Recorded interop fixtures (testdata/interop/statsd/, docs/plans/recorded-interop-fixtures.md)
+    //
+    // Real UDP datagrams from two real clients -- Datadog's `datadog` package and the plain-statsd
+    // `statsd` package -- recorded by `script/record-fixtures statsd`. Everything above this line
+    // checks the grammar against this team's own reading of it; these check it against what a real
+    // client actually puts on the wire, which is the only way a *shared* misunderstanding surfaces.
+    //
+    // Asserted on decoded values, never on bytes: a re-record produces a different container id and
+    // different flush boundaries by design -- see that directory's own README.
+    // -------------------------------------------------------------------------------------------
+
+    fn interop_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/statsd")
+    }
+
+    fn interop_fixture(name: &str) -> Bytes {
+        let path = interop_dir().join(name);
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading interop fixture {}: {e}", path.display()));
+        Bytes::from(raw)
+    }
+
+    /// Every captured datagram whose filename starts with `prefix`, in name order.
+    fn interop_fixtures(prefix: &str) -> Vec<(String, Bytes)> {
+        let dir = interop_dir();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(prefix) && name.ends_with(".raw"))
+            .collect();
+        names.sort();
+        assert!(!names.is_empty(), "no fixture matching `{prefix}*` under {}", dir.display());
+        names
+            .into_iter()
+            .map(|name| {
+                let bytes = interop_fixture(&name);
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    /// Decodes one captured datagram through a `Diagnostics` wired to a drainable `Registry`, so a
+    /// test can assert **zero** decode diagnostics rather than only that some events came out -- a
+    /// datagram every one of whose lines was rejected would otherwise sail past a length check.
+    fn decode_interop(datagram: &Bytes) -> (Vec<Event>, Vec<String>) {
+        let registry = logit_core::telemetry::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_diagnostics(Diagnostics::new("statsd_in").with_telemetry(telemetry));
+        let mut events = Vec::new();
+        decoder
+            .decode_into(datagram.clone(), 0, &mut events)
+            .expect("a captured datagram must decode as a whole");
+        let keys = registry
+            .drain(0)
+            .into_iter()
+            .filter_map(|event| match event.attributes.get("key") {
+                Some(Value::Str(key)) => Some(String::from_utf8_lossy(key).into_owned()),
+                _ => None,
+            })
+            .collect();
+        (events, keys)
+    }
+
+    #[test]
+    fn interop_fixture_every_captured_datagram_decodes_with_no_diagnostics() {
+        let mut datagrams = 0usize;
+        let mut events = 0usize;
+        for (name, bytes) in interop_fixtures("statsd-") {
+            let (decoded, diagnostics) = decode_interop(&bytes);
+            assert!(diagnostics.is_empty(), "{name} raised {diagnostics:?}");
+            assert!(!decoded.is_empty(), "{name} decoded to no events at all");
+            datagrams += 1;
+            events += decoded.len();
+        }
+        assert!(datagrams >= 50, "expected the whole capture, got {datagrams} datagrams");
+        assert!(events >= 100, "expected a real workload, got {events} events");
+    }
+
+    #[test]
+    fn interop_fixture_a_buffered_dogstatsd_datagram_carries_a_whole_packed_batch() {
+        // What this fixture exists to prove: the client packed many independent metrics into one
+        // datagram and cut it on a line boundary, and `decode_into`'s own `\n` split recovers every
+        // one of them.
+        let bytes = interop_fixture("statsd-dogstatsd-buffered-000.raw");
+        assert!(bytes.len() > 1_000, "the client packs close to its 1432-byte UDP ceiling");
+        assert!(bytes.len() <= 1_432, "and never past it");
+        let (events, diagnostics) = decode_interop(&bytes);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            events.len() >= 8,
+            "a packed DogStatsD datagram holds many metrics, got {}",
+            events.len()
+        );
+
+        // Each metric type letter survives the decode as the shape this model gives it: counters as
+        // a `Sum`, `ms`/`h`/`d` as `Samples`. Only these two are asserted per datagram -- which
+        // types land in *this* datagram depends on the client's own flush boundary, and pinning the
+        // full set here would make the test depend on that.
+        let mut sums = 0;
+        let mut samples = 0;
+        for event in &events {
+            for metric in &event.metrics {
+                match &metric.kind {
+                    MetricKind::Sum(_) => sums += 1,
+                    MetricKind::Samples(_) => samples += 1,
+                    MetricKind::SetMembers(_) | MetricKind::Gauge(_) => {}
+                    other => panic!("unexpected metric kind from a real client: {other:?}"),
+                }
+            }
+        }
+        assert!(sums > 0 && samples > 0, "got {sums} counters, {samples} timings");
+    }
+
+    #[test]
+    fn interop_fixture_a_real_dogstatsd_line_carries_its_tags_and_container_id() {
+        // Tag syntax and the `|c:<id>` container-id segment, as a real client wrote them. The
+        // client detected its own container and volunteered that id unprompted -- exactly the kind
+        // of thing a hand-written fixture wouldn't have thought to include.
+        let (events, diagnostics) =
+            decode_interop(&interop_fixture("statsd-dogstatsd-unbuffered-000.raw"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let event = &events[0];
+        assert_eq!(
+            event.attributes.get("env").and_then(Value::as_str),
+            Some("prod"),
+            "the workload's own `env:prod` tag"
+        );
+        assert_eq!(event.attributes.get("service").and_then(Value::as_str), Some("checkout-api"));
+        assert!(
+            event.attributes.get("endpoint").is_some(),
+            "a per-request tag the client hung off the line"
+        );
+        assert!(
+            event.attributes.get("statsd.container_id").is_some(),
+            "DogStatsd volunteers `|c:<id>` when it can see its own container"
+        );
+    }
+
+    #[test]
+    fn interop_fixture_plain_statsd_carries_its_cardinality_in_the_name_and_no_tags() {
+        // The other dialect, from a different package: no tag syntax at all, so everything the
+        // tagged client put in tags lives in the metric name instead.
+        let (events, diagnostics) =
+            decode_interop(&interop_fixture("statsd-plain-unbuffered-000.raw"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(events.len(), 1, "one metric per datagram, unbuffered");
+        let event = &events[0];
+        let name = metric_name(event);
+        assert!(name.starts_with("app.checkout_api."), "got {name:?}");
+        assert!(
+            name.len() > 40,
+            "a tagless name carries the cardinality: {name:?} is {} bytes",
+            name.len()
+        );
+        assert!(
+            event.attributes.get("env").is_none()
+                && event.attributes.get("statsd.container_id").is_none(),
+            "the plain-statsd dialect has no tag or container-id syntax at all"
+        );
+    }
 }

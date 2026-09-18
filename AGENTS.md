@@ -282,7 +282,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
 | `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
-| `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
+| `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, and is denominated over events *delivered* ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -451,6 +451,15 @@ crates/
 `generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
 `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`; `perf/results/` is
 where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
+
+`perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
+([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):
+a `udp-statsd*` scenario has no `generate_in` at all, and `logit-perf` sends it real UDP traffic
+from the matching `perf/load/<scenario>.yaml` instead. They are a separate directory, not more
+files under `perf/scenarios/`, because both `script/validate` and the shipped-config test glob that
+directory unconditionally — anything in it has to be a valid `logit` config. `perf/load/README.md`
+has the spec format and how its traffic model was calibrated against the real-client capture under
+`testdata/interop/statsd/`.
 
 `logit-inputs`/`logit-outputs`/`logit-transforms` depend on `logit-pipeline` for their trait, not
 the other way around (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this is what

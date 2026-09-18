@@ -1,0 +1,21 @@
+# Real-socket UDP intake, **every datagram packed to <=1432 bytes** -- DogStatsD's own UDP default,
+# and the decode-bound end of the same axis `udp-statsd-small` anchors. Same graph as `udp-statsd`,
+# a distinct bind port, sidecar load spec `perf/load/udp-statsd-packed.yaml`.
+#
+#   script/perf run --scenario udp-statsd-packed --repeat 5 --pin-sender 1 --pin-child 2
+#
+# Ten-plus metrics arrive per syscall here (the real DogStatsD capture under
+# testdata/interop/statsd/ shows 10-11), so the per-datagram costs `recvmmsg` and batched gauge
+# updates attack are amortized away and what is left is the decoder and `BatchAccumulator`. A
+# number taken only here would understate the batching work; a number taken only on
+# `udp-statsd-small` would overstate it. Both, plus the mixed `udp-statsd`, are reported together.
+components:
+  statsd:
+    type: statsd_in
+    bind: 127.0.0.1:18127
+    receive:
+      receive_buffer_bytes: 1MiB
+
+  out:
+    type: null_out
+    sources: [statsd]

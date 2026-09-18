@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-14
+updated: 2026-09-18
 ---
 
 # Enabling plan: a load-test harness for the real `logit` binary
@@ -189,3 +189,20 @@ runnable by hand, and now carries one real recorded run
   explicitly-deferred decision — when and how this harness runs in the ongoing development
   process. None of these block using the harness by hand today, which is all this plan ever
   promised.
+
+## Extension, 2026-09-18: real-socket scenarios
+
+[ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)
+and [`docs/plans/udp-intake.md`](udp-intake.md)'s W2 add a second workload kind to this harness:
+`Workload::{Generated, Driven}` on `Scenario`, a sidecar load-spec directory (`perf/load/`, with
+its own README), a `sendmmsg(2)` sender inside the `logit-perf` process (`load.rs`), the
+`internal` telemetry leg hoisted out of `attribute.rs` into `telemetry_leg.rs` and shared with
+`run`, optional `udp:` fields on `Sample`/`compare`, and `--pin-sender`/`--pin-child`.
+
+Everything this plan built stays as it was — every `generate_in` scenario runs on exactly the
+path it always did, and the four checks `scenario.rs` applies to a `generate_in` component are
+unchanged, message for message. What is new is a scenario kind this plan could not have measured:
+one where the load arrives over a real socket, the denominator is events *delivered* rather than
+generated, and a drop rate is a first-class number rather than an impossibility. The details, the
+calibration against a recorded real-client capture, and the tuning live with that plan and with
+`perf/load/README.md`, not here.

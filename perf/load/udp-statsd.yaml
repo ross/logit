@@ -1,0 +1,24 @@
+# Load spec for `perf/scenarios/udp-statsd.yaml` -- the headline UDP scenario, **mixed packing**.
+# See perf/load/README.md for the format, and for how these weights were derived.
+target: statsd
+datagrams: 620000
+sockets: 8
+threads: 2
+seed: 20260918
+ring_datagrams: 8191
+model: statsd-app.yaml
+
+# Paced a few percent above what the receiver sustains, so the baseline sits in a small-but-non-zero
+# kernel-drop regime rather than at either extreme -- see perf/load/README.md's "Tuning". This mix
+# averages ~17.9 lines per datagram, so 90,000 datagrams/s is ~1.6M metrics/s offered.
+rate: 90000
+
+# Mixed, because datagram size is the axis that decides which half of the pipeline a number is
+# about. Weights: the single-line share is what an unbuffered client sends and what
+# `udp-statsd-small` isolates; 1432 B is DogStatsD's own UDP default and what the committed capture
+# shows that client actually cutting at; 8192 B is the local-agent shape, given the smallest weight
+# because nothing in the capture measures it (see README).
+datagram_mix:
+  - { weight: 45, single: true }
+  - { weight: 40, max_bytes: 1432 }
+  - { weight: 15, max_bytes: 8192 }

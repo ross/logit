@@ -17,6 +17,8 @@ Everything here is reproducible:
 | A flamegraph | `script/perf flamegraph --scenario passthrough` |
 | Before/after regression check | `script/perf compare <a.json> <b.json> --threshold 5` |
 | What's discoverable | `script/perf list` |
+| A real-socket UDP scenario | `script/perf run --scenario udp-statsd --repeat 5 --pin-sender 0,1 --pin-child 2,3` |
+| Its zero-drop self-check | `script/perf run --scenario udp-statsd --verify --pin-sender 0,1 --pin-child 2,3` |
 
 > Numbers below were taken on a Fedora Linux 44 (Workstation Edition) host, kernel
 > `7.2.4-200.fc44.x86_64`, x86-64, AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 logical CPUs), inside
@@ -89,6 +91,40 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
 - **Isolation from the rest of the box.** This runs in the same kind of dev-container environment
   every other `script/*` command does, not a dedicated, pinned-core bench host — see the preamble's
   ~20% caveat.
+
+### Driven scenarios: `udp-statsd*` is measured differently, on purpose
+
+The `udp-statsd`/`-small`/`-packed` family ([ADR
+`udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md),
+added 2026-09-18) is the first that isn't generator-driven. Its config has **no `generate_in`**;
+real UDP datagrams arrive over a loopback socket, sent by `logit-perf` itself from a traffic model
+in [`perf/load/`](../../perf/load/README.md) calibrated against a real DogStatsD/statsd client
+capture. Four things about reading its numbers differ from everything else in this document:
+
+- **The denominator is events *delivered*, never events sent.** This is the first scenario family
+  where those two can honestly differ: a real socket may drop datagrams in the kernel before
+  `logit` ever sees them, and the baseline is deliberately tuned into a regime where a small
+  fraction does. `events_per_s` and `cpu_us_per_event` are computed over
+  `logit.component.events.received` at the sink; denominating over sent would silently understate
+  the per-event cost by exactly the drop rate. The results JSON carries the whole picture in a
+  `udp:` block (sent / received / kernel-dropped / queue-dropped / delivered), and `run`'s table
+  prints it.
+- **The telemetry leg is inside the measured process.** That delivered count only exists in the
+  child's own self-telemetry, so `run` attaches the same `internal → file_out format: native` leg
+  `attribute` uses — meaning a driven scenario's `wait4` rusage includes two of the harness's own
+  nodes. **Its absolute CPU µs/event is therefore comparable only to its own history**, never to a
+  generated scenario's number, which pays neither that cost nor loopback UDP's kernel-side one.
+  Relative movement run to run is the signal; the absolute figure is not a cross-scenario ranking.
+- **Pinning is required, not advisory.** `--pin-sender`/`--pin-child` (`sched_setaffinity`, applied
+  to the child between `fork` and `exec` so every thread it creates inherits the mask). This box's
+  heterogeneous cores — `lscpu -e`'s `MAXMHZ` column separates the 5,158 MHz Zen 5 cores (CPUs 0–3
+  and their SMT siblings 12–15) from the 3,289 MHz Zen 5c ones (4–11, 16–23) — make an unpinned run
+  bimodal by roughly 2×. Every recorded `udp-statsd*` number below states which CPUs it used.
+- **Every run self-checks before its numbers count.** `sent == received + kernel-dropped` has to
+  close exactly (on loopback there is nowhere else for a datagram to go), and the listener must
+  report no decode diagnostics — otherwise the scenario would be benchmarking the malformed-line
+  path, which is *faster* than the real one. `--verify` adds the strict form: halve the spec's rate
+  and require an exactly-equal delivered event count with zero drops.
 
 ## 1. Results: all ten scenarios, median of 3
 

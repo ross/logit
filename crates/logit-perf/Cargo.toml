@@ -33,3 +33,12 @@ logit-core.workspace = true
 # `Bytes` is `read_frame`'s cursor type -- the whole dump file is read into one and each frame
 # split off its front.
 bytes.workspace = true
+
+[dev-dependencies]
+# Tests only, and only to check the *load model* against the real decoder: every line
+# `perf/load/statsd-app.yaml` renders has to parse cleanly through the very `StatsdDecoder` the
+# scenario's `statsd_in` will run, or the scenario would be benchmarking the malformed-line path
+# (docs/plans/udp-intake.md's W2 test list). A dev-dependency, not a dependency: nothing in the
+# shipped harness binary decodes statsd -- the running check is telemetry-based
+# (`logit.component.diagnostics{key="bad_line"}`), which needs no decoder here at all.
+logit-inputs.workspace = true
