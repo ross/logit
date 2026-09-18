@@ -257,6 +257,7 @@ mod tests {
             sent_datagrams: 10_000,
             sent_lines: 10_000,
             received_datagrams: 10_000 - kernel_dropped,
+            reads: 10_000 - kernel_dropped,
             kernel_dropped,
             queue_dropped: 0,
             events_delivered: 10_000 - kernel_dropped,

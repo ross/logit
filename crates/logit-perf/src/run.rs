@@ -531,6 +531,7 @@ fn run_one_driven(
             sent_datagrams: load.sent_datagrams,
             sent_lines: load.sent_lines,
             received_datagrams: input.datagrams,
+            reads: input.reads,
             kernel_dropped: input.kernel_drops,
             queue_dropped: input.queue_dropped,
             events_delivered: delivered,
@@ -577,6 +578,9 @@ fn run_one_driven(
 struct InputStats {
     /// `logit.input.datagrams` -- every datagram the listener actually received.
     datagrams: u64,
+    /// `logit.input.reads` -- read syscalls made. `datagrams / reads` is the mean fill of one
+    /// `recvmmsg(2)` batch (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
+    reads: u64,
     /// `logit.input.kernel.drops` -- what the kernel discarded before `recv_from` could return it.
     /// A delta per sample, summed here; not emitted at all when zero, so an absent metric is 0.
     kernel_drops: u64,
@@ -606,6 +610,7 @@ struct InputStats {
 }
 
 const INPUT_DATAGRAMS: &str = "logit.input.datagrams";
+const INPUT_READS: &str = "logit.input.reads";
 const KERNEL_DROPS: &str = "logit.input.kernel.drops";
 const RCVBUF_UTILIZATION: &str = "logit.input.receive_buffer.utilization";
 const RCVBUF_USED: &str = "logit.input.receive_buffer.used.bytes";
@@ -622,6 +627,7 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
             let name = interner::resolve(metric.name);
             match (name, &metric.kind) {
                 (INPUT_DATAGRAMS, MetricKind::Sum(sum)) => stats.datagrams += sum.value as u64,
+                (INPUT_READS, MetricKind::Sum(sum)) => stats.reads += sum.value as u64,
                 (KERNEL_DROPS, MetricKind::Sum(sum)) => stats.kernel_drops += sum.value as u64,
                 (DATAGRAMS_DROPPED, MetricKind::Sum(sum)) => {
                     stats.queue_dropped += sum.value as u64
@@ -1283,10 +1289,11 @@ fn print_udp_table(report: &RunReport) {
         return;
     }
     println!(
-        "\n{:<22} {:>11} {:>11} {:>11} {:>11} {:>12} {:>8} {:>9}",
+        "\n{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>8} {:>9}",
         "scenario",
         "sent dg",
         "recv dg",
+        "fill",
         "kern drop",
         "queue drop",
         "delivered",
@@ -1295,10 +1302,11 @@ fn print_udp_table(report: &RunReport) {
     );
     for (name, udp) in driven {
         println!(
-            "{:<22} {:>11} {:>11} {:>11} {:>11} {:>12} {:>7.2}% {:>8.2}",
+            "{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>7.2}% {:>8.2}",
             name,
             udp.sent_datagrams,
             udp.received_datagrams,
+            udp.mean_fill().map_or_else(|| "-".to_string(), |fill| format!("{fill:.1}")),
             udp.kernel_dropped,
             udp.queue_dropped,
             udp.events_delivered,
@@ -1518,6 +1526,7 @@ mod tests {
             sent_datagrams: sent,
             sent_lines: sent,
             received_datagrams: received,
+            reads: received,
             kernel_dropped: kernel,
             queue_dropped: 0,
             events_delivered: delivered,

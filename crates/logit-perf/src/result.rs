@@ -157,6 +157,17 @@ pub struct UdpSample {
     pub sent_lines: u64,
     /// `logit.input.datagrams`: what the listener actually read off the socket.
     pub received_datagrams: u64,
+    /// `logit.input.reads`: read syscalls the listener made. `received_datagrams / reads` is the
+    /// **mean fill** of one `recvmmsg(2)` batch -- the number that says whether `receive.read_batch`
+    /// is the constraint or an irrelevance (`docs/deploying.md`'s "Listener intake").
+    ///
+    /// `#[serde(default)]` because a results file written before `logit.input.reads` existed has
+    /// no such key, and a `compare` against one must still load -- the same optional-field shape
+    /// [`Sample::startup_s`] established. `0` there means "not recorded", which is also what a
+    /// non-UDP run would report, and [`UdpSample::mean_fill`] returns `None` for it rather than
+    /// dividing by it.
+    #[serde(default)]
+    pub reads: u64,
     /// `logit.input.kernel.drops`: discarded by the kernel before `recv_from` could return them.
     /// On loopback `sent == received + this`, which `crate::run`'s self-check asserts.
     pub kernel_dropped: u64,
@@ -189,6 +200,13 @@ impl UdpSample {
     /// together, since someone watching data loss cares that it happened, not which side of the
     /// socket boundary it happened on. `0.0` for a run that sent nothing, rather than a `NaN` that
     /// would poison every median it lands in.
+    /// Datagrams per read syscall, or `None` when the read counter was not recorded (a results
+    /// file from before it existed). Not a rate and not comparable across scenarios with different
+    /// datagram sizes -- it is only ever read against the `read_batch` that produced it.
+    pub fn mean_fill(&self) -> Option<f64> {
+        (self.reads > 0).then(|| self.received_datagrams as f64 / self.reads as f64)
+    }
+
     pub fn drop_rate(&self) -> f64 {
         if self.sent_datagrams == 0 {
             return 0.0;
@@ -332,6 +350,7 @@ fn reduce_udp(
         sent_datagrams: field_u64(|u| u.sent_datagrams),
         sent_lines: field_u64(|u| u.sent_lines),
         received_datagrams: field_u64(|u| u.received_datagrams),
+        reads: field_u64(|u| u.reads),
         kernel_dropped: field_u64(|u| u.kernel_dropped),
         queue_dropped: field_u64(|u| u.queue_dropped),
         events_delivered: field_u64(|u| u.events_delivered),
@@ -372,6 +391,7 @@ mod tests {
             sent_datagrams: sent,
             sent_lines: sent,
             received_datagrams: sent - kernel_dropped,
+            reads: sent - kernel_dropped,
             kernel_dropped,
             queue_dropped: 0,
             events_delivered: delivered,
