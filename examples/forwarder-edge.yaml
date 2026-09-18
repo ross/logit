@@ -35,6 +35,7 @@ components:
     #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
     #                               # 0s disables the timer, leaving the two bounds above as the only trigger
     #   receive_buffer_bytes: null  # SO_RCVBUF requested at bind; null leaves the kernel default alone
+    #   read_batch: 64              # datagrams per recvmmsg(2) read, and per receive-queue pop
     #   shutdown_grace: 5s          # how long a graceful shutdown waits to drain in-flight work
 
   central_out:

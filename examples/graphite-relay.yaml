@@ -97,7 +97,8 @@ components:
     # deployment. Under transport: udp the whole block applies, the same as collectd_in/statsd_in/
     # syslog_in; under transport: tcp there is no receive queue at all (TCP's own flow control is
     # the backpressure), so only the four batch-assembly/shutdown fields apply and the
-    # queue-bounding ones (max_datagrams, max_bytes, overflow, receive_buffer_bytes) are a
+    # queue-bounding ones (max_datagrams, max_bytes, overflow, receive_buffer_bytes, read_batch)
+    # are a
     # `logit validate` error naming the field, not a setting that is silently ignored.
     # receive:
     #   max_datagrams: 10000        # udp only: receive-queue depth, in datagrams
@@ -109,6 +110,8 @@ components:
     #                               # disables the timer, leaving the two bounds above as the only
     #                               # trigger
     #   # receive_buffer_bytes: 8MiB  # udp only: SO_RCVBUF, requested at bind
+    #   read_batch: 64              # udp only: datagrams per recvmmsg(2) read, and per receive-queue
+    #                               # pop. Linux-only effect; parsed and ignored elsewhere
     #   shutdown_grace: 5s          # how long SIGTERM waits for in-flight connections/datagrams to
     #                               # drain before dropping the rest
 

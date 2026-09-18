@@ -196,10 +196,6 @@ pub struct UdpSample {
 }
 
 impl UdpSample {
-    /// Datagrams lost anywhere, as a fraction of those sent -- kernel and receive-queue drops
-    /// together, since someone watching data loss cares that it happened, not which side of the
-    /// socket boundary it happened on. `0.0` for a run that sent nothing, rather than a `NaN` that
-    /// would poison every median it lands in.
     /// Datagrams per read syscall, or `None` when the read counter was not recorded (a results
     /// file from before it existed). Not a rate and not comparable across scenarios with different
     /// datagram sizes -- it is only ever read against the `read_batch` that produced it.
@@ -207,6 +203,10 @@ impl UdpSample {
         (self.reads > 0).then(|| self.received_datagrams as f64 / self.reads as f64)
     }
 
+    /// Datagrams lost anywhere, as a fraction of those sent -- kernel and receive-queue drops
+    /// together, since someone watching data loss cares that it happened, not which side of the
+    /// socket boundary it happened on. `0.0` for a run that sent nothing, rather than a `NaN` that
+    /// would poison every median it lands in.
     pub fn drop_rate(&self) -> f64 {
         if self.sent_datagrams == 0 {
             return 0.0;

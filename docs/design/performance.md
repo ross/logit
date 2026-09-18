@@ -107,8 +107,11 @@ capture. Four things about reading its numbers differ from everything else in th
   fraction does. `events_per_s` and `cpu_us_per_event` are computed over
   `logit.component.events.received` at the sink; denominating over sent would silently understate
   the per-event cost by exactly the drop rate. The results JSON carries the whole picture in a
-  `udp:` block (sent / received / kernel-dropped / queue-dropped / delivered), and `run`'s table
-  prints it.
+  `udp:` block (sent / received / read syscalls / kernel-dropped / queue-dropped / delivered), and
+  `run`'s table prints it -- including a `fill` column, `received / reads`, which is the mean number
+  of datagrams one `recvmmsg(2)` call returned and so the only reading of whether
+  `receive.read_batch` is the constraint on this workload or an irrelevance
+  (ADR `udp-intake-batching-and-socket-visibility`).
 - **The telemetry leg is inside the measured process.** That delivered count only exists in the
   child's own self-telemetry, so `run` attaches the same `internal → file_out format: native` leg
   `attribute` uses — meaning a driven scenario's `wait4` rusage includes two of the harness's own
