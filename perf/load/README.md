@@ -24,7 +24,8 @@ wire syntax inside `lines:`.
 
 ```
 script/perf run --scenario udp-statsd --repeat 5 --pin-sender 0,1 --pin-child 2,3
-script/perf run --scenario udp-statsd-small --verify   # the strict, zero-drop self-check
+script/perf run --scenario udp-statsd-small --verify         # the strict, zero-drop self-check
+script/perf run --scenario udp-statsd --rate-scale 0.5       # a stable point below the drop knee
 ```
 
 ## The spec format
@@ -32,6 +33,9 @@ script/perf run --scenario udp-statsd-small --verify   # the strict, zero-drop s
 ```yaml
 target: statsd            # the component in the scenario whose `bind:` receives the load. Named,
                           # not repeated as an address, so the two files can't disagree on the port
+# sink: out               # the component whose `events.received` is the run's denominator. Omitted
+                          # by every scenario today: with one sink in the graph the harness finds it
+                          # by its `role` stamp, and only a multi-sink graph has to say which counts
 datagrams: 620000         # total datagrams to send. NOT the measurement's denominator -- that is
                           # events *delivered* -- but it is what sets how long the run takes
 sockets: 8                # distinct connected sockets, i.e. distinct source ports ~ distinct clients
@@ -94,11 +98,21 @@ Be precise about which half of this model is measured and which is chosen.
 | Buffered DogStatsD datagram size | 1,341–1,418 B, 10–11 lines each | `max_bytes: 1432` is the client's own ceiling, and it never splits a line — so the model packs to a ceiling rather than to a line count |
 | Buffered plain-statsd datagram size | 467–507 B, 7–8 lines each | Confirms a second, independent client cuts at *its* own buffer (512 B), not at an MTU — which is why `datagram_mix` is a weighted list rather than one number |
 | Unbuffered datagram size | 95–165 B (tagged), 53–76 B (tagless) | `single: true` datagrams land in the same band without being told to; the model's line lengths are what put them there |
-| Line length | 94–164 B tagged (median 137), 53–76 B tagless (median 60) | Model: 33–134 B, median 116 over all templates. Slightly shorter at the top end — the capture's longest lines carry a `\|c:in-<id>` container-id segment this model omits (see below) |
+| Line length | 94–164 B tagged (median 139), 53–76 B tagless (median 61) | Model: 33–134 B, median 116 over all templates. Slightly shorter at the top end — the capture's longest lines carry a `\|c:in-<id>` container-id segment this model omits (see below) |
 | Tags per line | 4–6, median 6 | Model: 3–8, median 6. Widened on purpose, to exercise the decoder's tag loop either side of what this one app happened to emit |
 | Tag keys | `env`, `service`, `region`, `host`, `endpoint`, `status`, `queue`, `query`, `db` | The model uses these plus `tier`, `payment_method`, `priority`, `shard`, `dc`, `component`, `upstream`, `job`, `pool`, `node_role`, `az` — ~20 distinct keys, which is what exercises the decoder's `KeyCache` |
-| Metric name length | 16–28 B tagged, 46–64 B tagless | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
+| Metric name length | 16–28 B tagged (median 23), 46–64 B tagless (median 56) | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
 | Both dialects are real | 2 of the 4 captures are tagless | The model is 80% tagged / 20% tagless |
+
+Every capture figure in that table is over the whole corpus — all 65 tagged and all 55 tagless
+lines — not over any one file. An earlier revision quoted two per-file medians (137 B and 60 B, from
+the buffered DogStatsD and pipelined plain-statsd captures respectively) as if they were corpus-wide;
+the corpus-wide figures are 139 B and 61 B. **Nothing in the model moves as a result**: no weight
+here was derived from a median. The packing targets come from the two clients' buffer ceilings
+(1,432 B and 512 B, unchanged), the tag range from the tag counts (4–6, unchanged), and the line
+lengths are an *output* of the templates that the table compares against the capture rather than an
+input taken from it. The comparison reads the same either way — the model's median line is ~20 B
+shorter than the tagged capture's and ~55 B longer than the tagless one's, because it mixes both.
 
 ### Chosen, not measured
 
@@ -112,7 +126,7 @@ Be precise about which half of this model is measured and which is chosen.
   them.
 - **Cardinality.** 50 hosts, 100 endpoints, 5-ish statuses, ~600 distinct metric names across the
   model. Same reason: the capture's own cardinality is whatever the producer script's topology was
-  (7 tagged names, 18 tagless).
+  (8 tagged names, 18 tagless).
 - **The 80/20 tagged/tagless split.** Both dialects are in the capture; their *ratio* there is
   1:1 because the recording runs two clients, which says nothing about how common each is.
 - **The ≤8192 B packing target.** Nothing in the capture measures it — neither client packs that
@@ -177,9 +191,30 @@ pins:
   box that moved, not the code.
 
 Two rules follow. Take a baseline on an idle, rested box; and **take a baseline and the delta it is
-compared against back to back in one sitting** — a delta measured an hour after its baseline is
-measuring the machine as much as the change. `compare` warns on a host/CPU-model mismatch for a
-related reason, but it cannot see this one.
+compared against back to back in one sitting, interleaved** (parent, branch, parent, branch …) — a
+delta measured an hour after its baseline is measuring the machine as much as the change, and two
+unbroken blocks put one side on the cool half of the session and the other on the warm half.
+`compare` warns on a host/CPU-model mismatch for a related reason, but it cannot see this one.
+
+### Box state
+
+Before a run whose numbers are going to be written down anywhere:
+
+| Check | Why | Where to look |
+|---|---|---|
+| On AC, not battery | Every absolute number is depressed on battery, and drifts as the run goes on | `/sys/class/power_supply/*/online` for the supply whose `type` is `Mains` (`ACAD` on this box, not `AC`) |
+| Governor is `performance`, not `powersave` | The single largest source of unexplained movement here | `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` |
+| Energy-performance preference is not a power-saving one | The finer knob under the governor | `…/cpu0/cpufreq/energy_performance_preference` |
+| Platform profile is not `low-power`, where the machine has one | Firmware-level cap under everything above | `/sys/firmware/acpi/platform_profile` — **absent on this box**, so don't expect it |
+| Thermal headroom: rested box, gaps between repeats, watch for a frequency drop | The 90-minute drift above is exactly this | `grep MHz /proc/cpuinfo` before and after |
+| Nothing else building | A concurrent `cargo build` turned 1.4% into 35% | `uptime`, `ps aux --sort=-%cpu` |
+| Sender and child pinned to distinct **fast physical** cores | See "Pinning" below | `lscpu -e`'s `MAXMHZ` column |
+
+`logit-perf run` reads the first four best-effort and records them in the results file's preamble
+(`box_state`), printing a warning before the first scenario when the governor is `powersave` or the
+box is on battery — early enough to stop and fix it rather than discover it in the JSON afterwards.
+Anything it can't see is recorded as `null`: inside this repo's dev container the two `cpufreq`
+files and the mains supply are visible, and the ACPI platform profile is not.
 
 `receive_buffer_bytes: 1MiB` on all three. Linux grants double what is requested, and clamps at
 `net.core.rmem_max` — **4 MiB in this dev container**, so 1 MiB is requested, 2 MiB is granted, and
@@ -195,6 +230,13 @@ the change; it moves only when a new baseline is being established.
 Every driven run is checked before its numbers are believed (`crates/logit-perf/src/run.rs`'s
 `self_check`):
 
+0. **The kernel socket sampler reported at all.** `getsockopt(SO_MEMINFO)` needs Linux 4.12+ and a
+   sandbox that permits it; where it isn't available W1's sampler disables itself for the process
+   after one failed call and says so through a log line that carries no counter. Then
+   `logit.input.kernel.drops` reads as a flat zero, the accounting below cannot close, and every
+   repeat would fail blaming a `--settle` that was never the problem. Detected by the *presence* of
+   a `receive_buffer.*` gauge rather than its value — each of those numbers is legitimately zero at
+   times — and reported as itself.
 1. **`sent == received + kernel-dropped`, exactly.** On loopback a datagram either arrives or the
    kernel drops it — there is no lossy link, no fragmentation, no middlebox. A mismatch means
    something the harness believes about the run is wrong, not that something interesting happened,

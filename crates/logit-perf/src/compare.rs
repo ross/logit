@@ -99,6 +99,12 @@ impl Deltas {
     }
 }
 
+/// An effective pacing rate for the warning above -- "unpaced" reads better than a bare `None`,
+/// and distinguishes a spec with no `rate:` from one whose results predate the field.
+fn render_rate(rate: Option<u64>) -> String {
+    rate.map(|rate| rate.to_string()).unwrap_or_else(|| "unpaced/unrecorded".to_string())
+}
+
 fn pct_change(a: f64, b: f64) -> f64 {
     if a == 0.0 {
         if b == 0.0 {
@@ -172,6 +178,23 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
                         a_scenario.count, b_scenario.count
                     ));
                 }
+                // A driven scenario read at two different `--rate-scale`s is two different
+                // operating points, and a real-socket pipeline's CPU/event moves with where on the
+                // load curve it sat. Nothing else in a results file would say so, so this is the
+                // one place it can be caught.
+                let (a_rate, b_rate) = (
+                    a_scenario.median.udp.and_then(|udp| udp.effective_rate),
+                    b_scenario.median.udp.and_then(|udp| udp.effective_rate),
+                );
+                if a_rate != b_rate {
+                    warnings.push(format!(
+                        "scenario `{name}`: the two runs were paced differently ({} vs {} \
+                         datagrams/s) -- they are different operating points on the load curve, \
+                         not a before and after",
+                        render_rate(a_rate),
+                        render_rate(b_rate),
+                    ));
+                }
                 ScenarioComparison {
                     name: name.clone(),
                     deltas: Some(Deltas::between(&a_scenario.median, &b_scenario.median)),
@@ -239,6 +262,7 @@ mod tests {
             events_delivered: 10_000 - kernel_dropped,
             send_errors: 0,
             kernel_rcvbuf_utilization_max: 0.9,
+            effective_rate: Some(90_000),
         });
         ScenarioReport { count: 10_000, repeats: vec![sample], median: sample, min: sample }
     }
@@ -276,6 +300,7 @@ mod tests {
             rustc: "rustc 1.98.1".to_string(),
             profile: "release".to_string(),
             label: None,
+            box_state: None,
             scenarios,
         }
     }
@@ -498,6 +523,40 @@ mod tests {
 
         let cmp = compare(&report("h", "c", before), &report("h", "c", after));
         assert_eq!(cmp.scenarios[0].deltas.unwrap().drop_rate_points, None);
+    }
+
+    #[test]
+    fn two_driven_runs_paced_differently_are_warned_about() {
+        let mut before = BTreeMap::new();
+        before.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 300));
+        let mut after = BTreeMap::new();
+        let mut derated = driven_report(1_000_000.0, 2.0, 0);
+        // What `--rate-scale 0.25` / `--verify` would have produced.
+        derated.median.udp.as_mut().unwrap().effective_rate = Some(22_500);
+        derated.repeats[0].udp.as_mut().unwrap().effective_rate = Some(22_500);
+        after.insert("udp-statsd".to_string(), derated);
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        assert!(
+            cmp.warnings.iter().any(|w| w.contains("paced differently") && w.contains("22500")),
+            "{:?}",
+            cmp.warnings
+        );
+    }
+
+    #[test]
+    fn two_driven_runs_at_the_same_pace_are_not_warned_about() {
+        let mut before = BTreeMap::new();
+        before.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 300));
+        let mut after = BTreeMap::new();
+        after.insert("udp-statsd".to_string(), driven_report(1_000_000.0, 2.0, 120));
+
+        let cmp = compare(&report("h", "c", before), &report("h", "c", after));
+        assert!(
+            !cmp.warnings.iter().any(|w| w.contains("paced differently")),
+            "{:?}",
+            cmp.warnings
+        );
     }
 
     #[test]

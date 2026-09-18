@@ -327,7 +327,7 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
         // or `shutdown` firing -- and whichever way it finishes, it always closes `queue` first
         // (see `read_loop`'s own doc comment; `read_loop_sampled` only wraps it, adding the
         // kernel-counter sampler and forwarding its result unchanged), which is what lets
-        // `decode`'s `pop()` discover
+        // `decode`'s `pop_many` discover
         // "closed and empty" and return on its own. `decode` therefore never needs to be raced
         // away from early the way `run_output`'s `write`/`drain` dance does: once `read` is done,
         // simply drive `decode` to completion so it drains whatever `read` already queued and
@@ -1035,8 +1035,9 @@ impl ReceiveBufferSampler {
 /// Owns `sink` (the `Fanout`) -- dropping this future is what closes every downstream inbox, the
 /// shutdown cascade `docs/adr/service-lifecycle-and-output-retry.md` established.
 ///
-/// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop()` reports
-/// closed-and-empty -- i.e. only after `read_loop` can no longer push anything new, the same
+/// Flushes the accumulator's final contents (`FlushReason::Shutdown`) only once `pop_many` reports
+/// closed-and-empty (a return of `0`) -- i.e. only after `read_loop` can no longer push anything
+/// new, the same
 /// "flush only once nothing can race it" reasoning `finish_and_flush`
 /// (`logit_pipeline::runtime`) uses on the sink side. Reuses `run_transform`'s deadline-race
 /// pattern for the interval trigger via `BatchAccumulator::next_deadline`, rather than a second

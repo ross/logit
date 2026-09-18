@@ -84,11 +84,19 @@ enum Command {
         pin_child: Option<load::CpuSet>,
         /// Hold every real-socket scenario to the strict expectation -- zero drops, and an
         /// exactly-equal delivered event count -- instead of only checking that the datagram
-        /// accounting closes. Quarters each spec's own `rate` for the run, since a shipped spec is
-        /// paced deliberately *above* what the receiver sustains; a spec with no `rate` at all is
-        /// rejected rather than asked to be lossless.
+        /// accounting closes. Implies `--rate-scale 0.25`, since a shipped spec is paced
+        /// deliberately *above* what the receiver sustains; an explicit `--rate-scale` overrides
+        /// that, and a spec with no `rate` at all is rejected rather than asked to be lossless.
         #[arg(long)]
         verify: bool,
+        /// Multiply every real-socket spec's `rate` by this factor. The shipped rates sit just
+        /// above the drop knee, which is what a baseline wants and what reading a stable CPU
+        /// µs/event does not -- `--rate-scale 0.5` moves the operating point without editing any
+        /// spec. Recorded in the results file, and `compare` warns when two runs used different
+        /// ones, because they are different points on the load curve rather than a before and
+        /// after.
+        #[arg(long = "rate-scale")]
+        rate_scale: Option<f64>,
     },
     /// Diff two results files' medians and exit non-zero on a regression past `--threshold`.
     Compare {
@@ -182,6 +190,7 @@ fn main() {
             pin_sender,
             pin_child,
             verify,
+            rate_scale,
         } => run::run(
             &repo_root(),
             run::RunArgs {
@@ -197,6 +206,7 @@ fn main() {
                 pin_sender,
                 pin_child,
                 verify,
+                rate_scale,
             },
         ),
         Command::Compare { before, after, threshold, rss_threshold } => {

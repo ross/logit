@@ -26,7 +26,7 @@
 //! event count the load spec's ring says it sent.
 
 use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
-use crate::result::{GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
+use crate::result::{BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
 use crate::rusage::{self, Usage};
 use crate::scenario::{self, Scenario, Workload};
 use crate::telemetry_leg::{self, RemoveOnDrop};
@@ -82,6 +82,11 @@ pub struct RunArgs {
     /// delivered event count. Meant to be run against a paced spec -- an unpaced blast is tuned to
     /// drop on purpose and will (correctly) fail this.
     pub verify: bool,
+    /// Multiplies every driven spec's `rate`. `None` means "whatever the run implies": 1.0
+    /// ordinarily, `load::VERIFY_RATE_SCALE` under `--verify`. Set explicitly it wins over both,
+    /// which is what lets a `--verify` run be paced by hand if the default derate is wrong for a
+    /// particular box.
+    pub rate_scale: Option<f64>,
 }
 
 pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
@@ -103,6 +108,14 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         bail!("no scenarios to run");
     }
 
+    // Read and reported *before* the first scenario, not only into the results file: a run taken
+    // under `powersave` or on battery is worth aborting and restarting, and finding that out ten
+    // minutes later from the JSON is finding it out too late.
+    let state = box_state();
+    for warning in state.warnings() {
+        eprintln!("warning: {warning}");
+    }
+
     let logit_bin = build_and_locate(root, &args.profile, args.no_build)?;
 
     let mut reports: BTreeMap<String, ScenarioReport> = BTreeMap::new();
@@ -121,7 +134,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         // about.
         let plan = match &scenario.workload {
             Workload::Generated { .. } => None,
-            Workload::Driven(_) => match driven_plan(scenario, args.verify) {
+            Workload::Driven(_) => match driven_plan(scenario, &args) {
                 Ok(plan) => Some(plan),
                 Err(err) => {
                     eprintln!("   FAILED: {err:#}");
@@ -216,6 +229,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         rustc: rustc_version(),
         profile: args.profile.clone(),
         label: args.label.clone(),
+        box_state: Some(state),
         scenarios: reports,
     };
 
@@ -242,21 +256,31 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     print_udp_table(&report);
     println!("\nwrote {}", path.display());
 
+    // Every driven repeat removed its own dump on success and kept it on failure, so this takes
+    // the scratch directory with it exactly when there is nothing left in it worth keeping.
+    telemetry_leg::remove_workdir_if_empty("run");
+
     if any_failed {
         bail!("one or more scenarios failed -- see above");
     }
     Ok(())
 }
 
-/// Reads a driven scenario's sidecar spec and renders its ring, derating its `rate` when this is a
-/// `--verify` run (`LoadPlan::derate_for_verify` has why).
-fn driven_plan(scenario: &Scenario, verify: bool) -> anyhow::Result<LoadPlan> {
+/// Reads a driven scenario's sidecar spec and renders its ring, applying whatever rate scale the
+/// run asked for (`LoadPlan::scale_rate` has why one would).
+fn driven_plan(scenario: &Scenario, args: &RunArgs) -> anyhow::Result<LoadPlan> {
     let source = std::fs::read_to_string(&scenario.path)
         .with_context(|| format!("reading {}", scenario.path.display()))?;
     let mut plan = LoadPlan::build(&scenario.load_spec_path()?, &source)?;
-    if verify {
-        let derated = plan.derate_for_verify()?;
-        println!("   --verify: pacing at {derated} datagrams/s, a quarter of the spec's own rate");
+    // An explicit `--rate-scale` wins over `--verify`'s own default, so a box where a quarter is
+    // still not enough headroom (or is more than needed) can be paced by hand.
+    let scale = args.rate_scale.unwrap_or(if args.verify { load::VERIFY_RATE_SCALE } else { 1.0 });
+    if scale != 1.0 {
+        let scaled = plan.scale_rate(scale)?;
+        println!(
+            "   --rate-scale {scale}: pacing at {scaled} datagrams/s{}",
+            if args.verify && args.rate_scale.is_none() { " (--verify's default)" } else { "" }
+        );
     }
     Ok(plan)
 }
@@ -494,35 +518,55 @@ fn run_one_driven(
     })?;
     let load = measured.load.expect("a driven measurement always carries its sender's outcome");
 
-    let events = telemetry_leg::decode_dump(&dump_path, true)?;
-    let nodes = crate::attribute::aggregate(&events);
-    let delivered = crate::attribute::peak_received(&nodes);
-    let input = input_stats(&events, &spec.target);
+    let outcome = (|| -> anyhow::Result<Sample> {
+        let events = telemetry_leg::decode_dump(&dump_path, true)?;
+        let nodes = crate::attribute::aggregate(&events);
+        // The terminal sink, not the peak receiver -- `delivered_at_sink`'s own doc has why the
+        // two agree today and would stop agreeing the moment a driven scenario grew a transform
+        // that drops.
+        let delivered = crate::attribute::delivered_at_sink(&nodes, spec.sink.as_deref())?;
+        let input = input_stats(&events, &spec.target);
 
-    let udp = UdpSample {
-        sent_datagrams: load.sent_datagrams,
-        sent_lines: load.sent_lines,
-        received_datagrams: input.datagrams,
-        kernel_dropped: input.kernel_drops,
-        queue_dropped: input.queue_dropped,
-        events_delivered: delivered,
-        send_errors: load.send_errors,
-        kernel_rcvbuf_utilization_max: input.rcvbuf_utilization_max,
-    };
-    self_check(scenario, plan, &udp, &input, args.verify)?;
+        let udp = UdpSample {
+            sent_datagrams: load.sent_datagrams,
+            sent_lines: load.sent_lines,
+            received_datagrams: input.datagrams,
+            kernel_dropped: input.kernel_drops,
+            queue_dropped: input.queue_dropped,
+            events_delivered: delivered,
+            send_errors: load.send_errors,
+            kernel_rcvbuf_utilization_max: input.rcvbuf_utilization_max,
+            // What the blast actually paced at, after `--rate-scale`/`--verify` -- not the spec's
+            // own `rate:`, which is what it would have been.
+            effective_rate: plan.spec.rate,
+        };
+        self_check(scenario, plan, &udp, &input, args.verify)?;
 
-    if delivered == 0 {
-        bail!(
-            "no events reached the sink at all -- {} datagrams were sent to {} and {} arrived; \
-             check the scenario's `bind:` matches the load spec's `target:`",
-            udp.sent_datagrams,
-            plan.target,
-            udp.received_datagrams
-        );
+        if delivered == 0 {
+            bail!(
+                "no events reached the sink at all -- {} datagrams were sent to {} and {} \
+                 arrived; check the scenario's `bind:` matches the load spec's `target:`",
+                udp.sent_datagrams,
+                plan.target,
+                udp.received_datagrams
+            );
+        }
+        let mut sample = measured.sample(delivered);
+        sample.udp = Some(udp);
+        Ok(sample)
+    })();
+
+    match &outcome {
+        // A per-repeat artifact of a run that worked, and `run` may do dozens of these in one
+        // invocation -- left alone they fill the temp directory for no reason. Mirrors
+        // `attribute`: removed on success, kept and named on failure, since a failed repeat's dump
+        // is the one thing anyone debugging it would want to look at.
+        Ok(_) => {
+            let _ = std::fs::remove_file(&dump_path);
+        }
+        Err(_) => eprintln!("note: the telemetry dump is left at {}", dump_path.display()),
     }
-    let mut sample = measured.sample(delivered);
-    sample.udp = Some(udp);
-    Ok(sample)
+    outcome
 }
 
 /// The listener-side counters a driven run needs, folded out of the decoded telemetry dump for one
@@ -540,8 +584,21 @@ struct InputStats {
     /// loss `logit` chose and counted itself, downstream of the kernel's.
     queue_dropped: u64,
     /// The high-water mark of `logit.input.receive_buffer.utilization`. 1.0 is not "nearly full":
-    /// it is exactly where the kernel starts dropping.
+    /// it is exactly where the kernel starts dropping, and a reading a little above it is normal
+    /// under load (the kernel charges an arriving packet and then tests the total).
     rcvbuf_utilization_max: f64,
+    /// Whether the kernel socket sampler ever produced a reading at all.
+    ///
+    /// Tracked as **presence of a sample**, never as a value: every one of the numbers it reports
+    /// is legitimately zero at times, so `== 0.0` cannot tell "the sampler said zero" from "the
+    /// sampler never ran". `used.bytes` and `utilization` are the two the sampler alone emits
+    /// (`receive_buffer.bytes` is also written once at bind, so its presence proves nothing).
+    ///
+    /// `false` with datagrams received means `getsockopt(SO_MEMINFO)` was unavailable and W1's
+    /// sampler disabled itself for the process -- a `diag.warn`, which emits no counter, so this
+    /// is the only evidence of it the dump carries. `self_check` has to notice, or it blames a
+    /// `--settle` that was never the problem.
+    kernel_sampled: bool,
     /// `logit.component.diagnostics{key=...}` -- every throttled warning the component raised.
     /// `bad_line` (a statsd line that didn't parse) and `bad_datagram` (a datagram that wasn't
     /// UTF-8) are the two that would mean the scenario is measuring the error path.
@@ -551,6 +608,7 @@ struct InputStats {
 const INPUT_DATAGRAMS: &str = "logit.input.datagrams";
 const KERNEL_DROPS: &str = "logit.input.kernel.drops";
 const RCVBUF_UTILIZATION: &str = "logit.input.receive_buffer.utilization";
+const RCVBUF_USED: &str = "logit.input.receive_buffer.used.bytes";
 const DATAGRAMS_DROPPED: &str = "logit.component.datagrams.dropped";
 const DIAGNOSTICS: &str = "logit.component.diagnostics";
 
@@ -569,8 +627,13 @@ fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
                     stats.queue_dropped += sum.value as u64
                 }
                 (RCVBUF_UTILIZATION, MetricKind::Gauge(value)) => {
+                    stats.kernel_sampled = true;
                     stats.rcvbuf_utilization_max = stats.rcvbuf_utilization_max.max(*value)
                 }
+                // Read for its *presence* only: the sampler emits it unconditionally on every
+                // successful `SO_MEMINFO` read, including when the utilization above can't be
+                // computed because the granted buffer came back as zero.
+                (RCVBUF_USED, MetricKind::Gauge(_)) => stats.kernel_sampled = true,
                 (DIAGNOSTICS, MetricKind::Sum(sum)) => {
                     let key = event
                         .attributes
@@ -609,6 +672,24 @@ fn self_check(
     input: &InputStats,
     verify: bool,
 ) -> anyhow::Result<()> {
+    // Checked before the accounting, because without a kernel sampler the accounting *cannot*
+    // close -- `kernel_dropped` is unknowable, reads as 0, and every repeat would fail blaming a
+    // `--settle` that was never the problem. W1's sampler disables itself for the process after
+    // one failed `getsockopt(SO_MEMINFO)` and says so through `Diagnostics::warn`, which emits no
+    // counter, so the absence of a reading is the only evidence in the dump.
+    if udp.received_datagrams > 0 && !input.kernel_sampled {
+        bail!(
+            "{}: the kernel's per-socket counters were never reported -- {} datagrams arrived but \
+             no `logit.input.receive_buffer.*` sample appeared in the whole run. \
+             `getsockopt(SO_MEMINFO)` needs Linux 4.12+ and a sandbox that permits it; without it \
+             `logit.input.kernel.drops` is unknowable, so a driven scenario cannot account for \
+             where its datagrams went and its drop rate would read as a flat zero. Run the child's \
+             own stderr to see the listener's one-off warning",
+            scenario.name,
+            udp.received_datagrams,
+        );
+    }
+
     let accounted = udp.received_datagrams + udp.kernel_dropped;
     if accounted != udp.sent_datagrams {
         bail!(
@@ -746,6 +827,14 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 
     let stderr = child.stderr.take().expect("stderr was piped");
     let (event_tx, event_rx) = mpsc::channel::<ChildEvent>();
+    // Set once the child's stderr reaches EOF, which happens when the process exits -- `logit`
+    // never closes the stream itself. The cheapest honest liveness signal available here: no extra
+    // thread, no `try_wait` poll, and the stream is already being watched for other reasons. A
+    // driven blast reads it between batches, so a child that dies mid-run stops the sender instead
+    // of letting it finish several seconds of traffic into a socket whose peer is gone. The errno
+    // path cannot do this job -- see `crate::load::MAX_CONSECUTIVE_SEND_ERRORS`.
+    let child_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_gone_writer = std::sync::Arc::clone(&child_gone);
     let stderr_reader = std::thread::spawn(move || -> String {
         let mut capture = StderrCapture::new();
         let mut sent_ready = false;
@@ -764,6 +853,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
             }
             capture.push(line);
         }
+        child_gone_writer.store(true, std::sync::atomic::Ordering::Relaxed);
         capture.into_string()
     });
 
@@ -846,7 +936,11 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                     }
                 }
             }
-            match load::blast(plan, pin_sender) {
+            let abort = load::Abort {
+                flag: &child_gone,
+                reason: "the process under test exited mid-blast (its stderr reached EOF)",
+            };
+            match load::blast(plan, pin_sender, Some(abort)) {
                 Ok(outcome) => {
                     wall_ends_at = Instant::now();
                     load = Some(outcome);
@@ -1038,6 +1132,42 @@ fn hostname() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Reads a sysfs one-liner, or `None` if it isn't there / isn't readable. Everything
+/// [`box_state`] wants is optional by construction, so a missing file is an answer, not an error.
+fn sysfs_line(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The box's power/thermal policy, best-effort -- see [`BoxState`] for why it's recorded.
+///
+/// Checked against this repo's own dev container: the two `cpufreq` files are visible inside it,
+/// `/sys/firmware/acpi/platform_profile` does not exist on this box at all, and the mains supply
+/// is `ACAD` rather than `AC` -- hence the scan by `type` below rather than a hard-coded name.
+fn box_state() -> BoxState {
+    let mains = std::fs::read_dir("/sys/class/power_supply")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|entry| {
+            sysfs_line(&entry.path().join("type").to_string_lossy()).as_deref() == Some("Mains")
+        })
+        .and_then(|entry| sysfs_line(&entry.path().join("online").to_string_lossy()))
+        .map(|online| online == "1");
+
+    BoxState {
+        scaling_governor: sysfs_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        energy_performance_preference: sysfs_line(
+            "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference",
+        ),
+        platform_profile: sysfs_line("/sys/firmware/acpi/platform_profile"),
+        on_ac_power: mains,
+    }
 }
 
 fn cpu_model() -> String {
@@ -1393,7 +1523,44 @@ mod tests {
             events_delivered: delivered,
             send_errors: 0,
             kernel_rcvbuf_utilization_max: 0.5,
+            effective_rate: Some(90_000),
         }
+    }
+
+    /// An `InputStats` from a run whose kernel sampler worked -- the ordinary case. The `Default`
+    /// has `kernel_sampled: false`, which now means "`SO_MEMINFO` was unavailable" and is its own
+    /// failure, so every test about a *later* check has to start from a sampled run.
+    fn sampled() -> InputStats {
+        InputStats { kernel_sampled: true, ..InputStats::default() }
+    }
+
+    #[test]
+    fn self_check_rejects_a_run_whose_kernel_sampler_never_reported() {
+        // What a kernel older than 4.12, or a sandbox that blocks `getsockopt(SO_MEMINFO)`, looks
+        // like from here: datagrams arrived, no `receive_buffer.*` gauge ever did. Detected by the
+        // gauge's *presence*, since every value it carries is legitimately zero at times.
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        let udp = udp_sample(100, 100, 0, 100);
+        let err = self_check(&scenario, &plan, &udp, &InputStats::default(), false)
+            .expect_err("without kernel counters a driven run cannot account for its datagrams");
+        let err = format!("{err:#}");
+        assert!(err.contains("never reported"), "{err}");
+        assert!(err.contains("SO_MEMINFO"), "{err}");
+        // And specifically *not* the settle advice, which would be a red herring here.
+        assert!(!err.contains("--settle"), "{err}");
+    }
+
+    #[test]
+    fn a_run_that_received_nothing_is_not_blamed_on_the_kernel_sampler() {
+        // Nothing arrived, so no sample is expected either: this has to fall through to the
+        // accounting check, which is the one with something useful to say.
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        let err =
+            self_check(&scenario, &plan, &udp_sample(100, 0, 0, 0), &InputStats::default(), false)
+                .expect_err("100 sent, nothing accounted for");
+        assert!(format!("{err:#}").contains("does not close"), "{err:#}");
     }
 
     #[test]
@@ -1401,7 +1568,7 @@ mod tests {
         let scenario = driven_scenario();
         let plan = plan_for(100);
         let udp = udp_sample(100, 90, 10, 90);
-        self_check(&scenario, &plan, &udp, &InputStats::default(), false).unwrap();
+        self_check(&scenario, &plan, &udp, &sampled(), false).unwrap();
     }
 
     #[test]
@@ -1409,7 +1576,7 @@ mod tests {
         let scenario = driven_scenario();
         let plan = plan_for(100);
         let udp = udp_sample(100, 90, 5, 90);
-        let err = self_check(&scenario, &plan, &udp, &InputStats::default(), false)
+        let err = self_check(&scenario, &plan, &udp, &sampled(), false)
             .expect_err("95 accounted for out of 100 sent");
         let err = format!("{err:#}");
         assert!(err.contains("does not close"), "{err}");
@@ -1421,7 +1588,7 @@ mod tests {
         let scenario = driven_scenario();
         let plan = plan_for(100);
         let udp = udp_sample(100, 100, 0, 100);
-        let mut input = InputStats::default();
+        let mut input = sampled();
         input.diagnostics.insert("bad_line".to_string(), 12);
         let err = self_check(&scenario, &plan, &udp, &input, false)
             .expect_err("a malformed line means the wrong path is being measured");
@@ -1435,22 +1602,15 @@ mod tests {
         // The ring is one single-value counter line per datagram, so 100 datagrams is 100 events.
         assert_eq!(plan.expected().events, 100);
 
-        self_check(&scenario, &plan, &udp_sample(100, 100, 0, 100), &InputStats::default(), true)
+        self_check(&scenario, &plan, &udp_sample(100, 100, 0, 100), &sampled(), true)
             .expect("an exact, lossless run verifies");
 
-        let dropped =
-            self_check(&scenario, &plan, &udp_sample(100, 99, 1, 99), &InputStats::default(), true)
-                .expect_err("--verify requires a zero-drop run");
+        let dropped = self_check(&scenario, &plan, &udp_sample(100, 99, 1, 99), &sampled(), true)
+            .expect_err("--verify requires a zero-drop run");
         assert!(format!("{dropped:#}").contains("zero-drop"), "{dropped:#}");
 
-        let short = self_check(
-            &scenario,
-            &plan,
-            &udp_sample(100, 100, 0, 97),
-            &InputStats::default(),
-            true,
-        )
-        .expect_err("--verify requires an exact delivered count");
+        let short = self_check(&scenario, &plan, &udp_sample(100, 100, 0, 97), &sampled(), true)
+            .expect_err("--verify requires an exact delivered count");
         assert!(format!("{short:#}").contains("exactly 100 events"), "{short:#}");
     }
 
