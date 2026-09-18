@@ -23,6 +23,9 @@
 //! path: /api/v1/write   # the one route POSTs are accepted on; default /api/v1/write
 //! bind_tls: {}          # TlsServerConfig -- its presence turns TLS on
 //! idle_timeout: 60s     # optional; omitted means no idle timeout
+//! metadata_cache:       # what 1.0 metric types are remembered between requests
+//!   max_families: 10000 #   0 turns the cache off
+//!   ttl: 10m
 //! ```
 //!
 //! Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
@@ -169,6 +172,51 @@
 //! remote-write → exposition relay stamp an explicit timestamp on every line it writes, which no
 //! scrape of the same data would have produced.
 //!
+//! ## Metadata cache
+//!
+//! **Why there is one at all.** Remote-write carries a family's type, `# HELP` and `# UNIT` as
+//! *metadata*, and 1.0 puts it in `WriteRequest.metadata[]` -- which Prometheus's own sender ships
+//! in **separate requests**, on its own schedule (`metadata_config`, by default once a minute),
+//! rather than attached to the samples it describes. A receiver that remembers nothing therefore
+//! sees, for nearly every 1.0 request, a bag of flat series with no type anywhere in the message:
+//! every family decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count`
+//! arrive as three unrelated series instead of one histogram. Nothing is lost -- the samples and
+//! labels are exact, and a relay back out to remote-write is still a fixed point -- but the model
+//! kinds are flatter than the producer's, which is what the cache fixes.
+//!
+//! [`MetadataCache`] holds `family name -> (type, help, unit, last seen)`, seeded into every decode
+//! ([`remote_write::decode_with`]) and learned from every request's own
+//! [`Decoded::declarations`](remote_write::Decoded::declarations) -- 1.0's `metadata[]` and 2.0's
+//! inline `Metadata` alike, so a mixed-version fleet fills one table and a 2.0 sender's
+//! declarations type a 1.0 sender's series.
+//!
+//! **Precedence: the request, then the cache.** A declaration in the request being decoded always
+//! wins, per family name; the cache answers only for a family that request said nothing about. A
+//! sender that retypes a family retypes it immediately, however stale the remembered entry.
+//!
+//! **What a TTL expiry means.** An expired family stops being typed -- its next samples decode as
+//! `unknown` and its `_bucket`/`_sum`/`_count` series come apart again -- until the sender's next
+//! metadata request re-declares it. That is the bound working, not a fault: a sender that has
+//! stopped writing should stop costing memory, and a remembered type nothing has reasserted within
+//! the TTL is a guess about a series that may no longer exist. The default 10m is an order of
+//! magnitude over Prometheus's own metadata cadence, so a live sender has to miss ten refreshes
+//! running to lapse.
+//!
+//! **Bounds.** `max_families` caps the table; over it, the **least-recently-seen** family is
+//! evicted first (ties broken by name, so it is a function of the data rather than of map order),
+//! the same policy and the same one-pass shape `prometheus_out`'s exposition `max_series:` uses.
+//! `max_families: 0` is not a zero-size cache but no cache at all: nothing is allocated, no lock is
+//! taken, and requests decode through the stateless [`remote_write::decode`] exactly as they did
+//! before this existed. Rule 55 rejects `ttl: 0s`, which would be the pointless version of that.
+//!
+//! **Concurrency.** One `Mutex` guards the table, taken to build the seed and taken again to learn,
+//! **never held across the decode** -- a connection's requests are served concurrently and the
+//! decode is the expensive part. The seed handed to the codec is an `Arc` of the table in the
+//! codec's own shape, rebuilt only when the table actually changes, so the overwhelmingly common
+//! request -- one that carries samples and declares nothing -- costs a lock, a sweep and a refcount
+//! bump rather than a copy of every remembered family. A request that declares nothing does not
+//! take the lock a second time at all.
+//!
 //! ## Size, concurrency, and shutdown
 //!
 //! [`MAX_REQUEST_BYTES`] (4 MiB) bounds the **decompressed** body, checked against Snappy's own
@@ -207,6 +255,14 @@
 //! is the same number the `-Written` header reports, deliberately -- a counter and a header
 //! disagreeing about one request would be worse than either being slightly coarse. The connection
 //! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
+//! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
+//! whenever the table changes (a transition, like `logit.input.connections`, not a per-request
+//! restatement). `logit.input.metadata_cache.evicted{reason}` -- `expired` for a family whose `ttl`
+//! ran out, `cardinality` for one pushed out of `max_families` by a newer one.
+//! `logit.input.metadata_cache.replaced` -- one count per family a request retyped, which is the
+//! counter to watch when a sender's model kinds look wrong: a healthy fleet retypes almost nothing,
+//! and a steady stream here is two senders disagreeing about one family name. The connection
+//! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
 //! since this is the same accept loop. A rejected request also reports
 //! `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address in the message text
 //! only -- never a tag (a peer address isn't `&'static` and isn't safe to intern per-peer,
@@ -232,13 +288,14 @@ use logit_core::{
 };
 use logit_pipeline::Fanout;
 use logit_proto::prometheus::{
-    families_to_events, remote_write, text, Dialect, PrometheusDecoder, ATTR_TARGET, LABEL_INSTANCE,
+    families_to_events, remote_write, text, Dialect, FamilyType, PrometheusDecoder, ATTR_TARGET,
+    LABEL_INSTANCE,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
@@ -728,6 +785,173 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// path to import per socket.
 pub use crate::tls::TlsServerSettings;
 
+const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
+const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
+const METADATA_CACHE_REPLACED: &str = "logit.input.metadata_cache.replaced";
+
+/// One remembered family declaration. The family's own name is the map key, not a field here.
+#[derive(Debug, Clone)]
+struct CachedFamily {
+    kind: FamilyType,
+    help: Option<String>,
+    unit: Option<String>,
+    /// When a request last *declared* this family -- not when one last carried its samples. The
+    /// TTL is a bound on how long a declaration is trusted, and a 1.0 sender re-declares on its own
+    /// schedule regardless of how busy the series are.
+    last_seen: Instant,
+}
+
+/// What the receiver remembers about metric types between requests -- `metadata_cache:` in config.
+/// See this module's "Metadata cache" doc section for why it exists and what its bounds mean; this
+/// type is the table and the two operations a request performs on it.
+///
+/// Built only when the cache is on: `max_families: 0` leaves [`PrometheusReceiver::metadata_cache`]
+/// `None`, and nothing here is allocated, locked or swept.
+struct MetadataCache {
+    /// Always `> 0` -- a zero cap is no cache at all, which is `None` one level up.
+    max_families: usize,
+    ttl: Duration,
+    state: Mutex<CacheState>,
+}
+
+/// Everything behind the one lock. `families` is authoritative; `seed` is the same content in the
+/// codec's own shape, rebuilt only when `families` changes, so the overwhelmingly common request --
+/// samples, no declarations -- hands the decoder a refcount bump rather than a copy of every
+/// remembered family.
+#[derive(Default)]
+struct CacheState {
+    families: HashMap<String, CachedFamily>,
+    seed: Arc<remote_write::Declarations>,
+}
+
+impl CacheState {
+    fn rebuild_seed(&mut self) {
+        let mut seed = remote_write::Declarations::default();
+        for (name, family) in &self.families {
+            seed.insert(name.as_str(), family.kind, family.help.clone(), family.unit.clone());
+        }
+        self.seed = Arc::new(seed);
+    }
+}
+
+impl MetadataCache {
+    fn new(max_families: usize, ttl: Duration) -> Self {
+        MetadataCache { max_families, ttl, state: Mutex::new(CacheState::default()) }
+    }
+
+    /// Expires what the TTL has run out on, then hands back the table to decode this request
+    /// against. Counted `logit.input.metadata_cache.evicted{reason="expired"}`.
+    ///
+    /// The sweep is per request rather than on a timer of its own: this input has no clock task,
+    /// and a receiver that is not being written to has nothing to spend memory on either way. It is
+    /// one allocation-free pass over a table an operator capped.
+    fn seed(&self, now: Instant, telemetry: &Telemetry) -> Arc<remote_write::Declarations> {
+        let mut state = self.lock();
+        let ttl = self.ttl;
+        let mut expired = 0u64;
+        state.families.retain(|_, family| {
+            let stale = now.saturating_duration_since(family.last_seen) > ttl;
+            expired += u64::from(stale);
+            !stale
+        });
+        if expired > 0 {
+            telemetry.count(METADATA_CACHE_EVICTED, expired as f64, &[("reason", "expired")]);
+            state.rebuild_seed();
+            telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+        }
+        Arc::clone(&state.seed)
+    }
+
+    /// Folds one request's own declarations in -- the newest statement about a family wins, and a
+    /// *retype* is counted `logit.input.metadata_cache.replaced` -- then evicts back down to the
+    /// cap.
+    ///
+    /// Returns before taking the lock when the request declared nothing, which is nearly every 1.0
+    /// request: there is no entry to touch, nothing can have grown past the cap, and the alternative
+    /// is a lock per request to learn an empty table.
+    fn learn(
+        &self,
+        declarations: &remote_write::Declarations,
+        now: Instant,
+        telemetry: &Telemetry,
+    ) {
+        if declarations.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        let mut replaced = 0u64;
+        for (name, declaration) in declarations.iter() {
+            match state.families.get_mut(name) {
+                Some(existing) => {
+                    if existing.kind != declaration.kind {
+                        // Two senders disagreeing about one family name, or one that changed its
+                        // mind. Either way the newest statement is the one to keep -- the alternative
+                        // is typing a live sender's series from a declaration nothing has repeated.
+                        replaced += 1;
+                    }
+                    existing.kind = declaration.kind;
+                    existing.help.clone_from(&declaration.help);
+                    existing.unit.clone_from(&declaration.unit);
+                    existing.last_seen = now;
+                }
+                None => {
+                    state.families.insert(
+                        name.to_string(),
+                        CachedFamily {
+                            kind: declaration.kind,
+                            help: declaration.help.clone(),
+                            unit: declaration.unit.clone(),
+                            last_seen: now,
+                        },
+                    );
+                }
+            }
+        }
+        if replaced > 0 {
+            telemetry.count(METADATA_CACHE_REPLACED, replaced as f64, &[]);
+        }
+        self.enforce_cap(&mut state, telemetry);
+        state.rebuild_seed();
+        telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+    }
+
+    /// Evicts least-recently-seen families until at most `max_families` remain, in **one pass over
+    /// the table** however many have to go -- `prometheus_out`'s `Registry::enforce_cap` one crate
+    /// over, for its reasoning: being over the cap is the steady state the cap exists for, so a
+    /// `while len() > max` loop calling `min_by` would re-scan and re-allocate every candidate once
+    /// per eviction, exactly when cardinality is what is being diagnosed.
+    ///
+    /// The tie-break past `last_seen` is the family's own name, so which of two families declared
+    /// in one request goes is a function of the data rather than of `Instant` resolution or map
+    /// iteration order.
+    fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) {
+        let total = state.families.len();
+        if total <= self.max_families {
+            return;
+        }
+        let excess = total - self.max_families;
+        let mut candidates: Vec<(Instant, &str)> =
+            state.families.iter().map(|(name, family)| (family.last_seen, name.as_str())).collect();
+        // `excess <= total` and `total > max_families >= 1`, so `excess - 1` indexes `candidates`.
+        candidates.select_nth_unstable(excess - 1);
+        let doomed: Vec<String> =
+            candidates[..excess].iter().map(|(_, name)| (*name).to_string()).collect();
+        drop(candidates);
+
+        for name in doomed {
+            state.families.remove(&name);
+        }
+        telemetry.count(METADATA_CACHE_EVICTED, excess as f64, &[("reason", "cardinality")]);
+    }
+
+    /// The lock, unpoisoned. Nothing here can panic while it is held -- the body is map operations
+    /// on owned data -- and a receiver that stopped remembering metric types because one request
+    /// panicked would be a worse failure than the one that caused it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// `prometheus_in` in **bind mode**: a Prometheus remote-write receiver. See this module's doc
 /// comment for the config table, the routes table, and every mapping decision; this type is the
 /// accept loop and the request handler that implement them.
@@ -744,6 +968,11 @@ pub struct PrometheusReceiver {
     /// `None` -- the default -- means no idle timeout at all. See this module's "Shutdown and
     /// connection lifetime" doc section.
     idle_timeout: Option<Duration>,
+    /// The one piece of state this receiver holds across requests, and `None` unless an operator
+    /// asked for it -- `metadata_cache: {max_families: 0}`, and every config predating the field,
+    /// leaves the stateless decode path exactly as it was. Shared by every connection, hence the
+    /// `Arc`; see this module's "Metadata cache" doc section.
+    metadata_cache: Option<Arc<MetadataCache>>,
     handshake_timeout: Duration,
     max_connections: usize,
     /// The empty `Resource` every batch this receiver builds carries, allocated once. A receiver
@@ -765,6 +994,7 @@ impl PrometheusReceiver {
             tls: None,
             listener: None,
             idle_timeout: None,
+            metadata_cache: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: MAX_CONCURRENT_CONNECTIONS,
             resource: Arc::new(Resource::default()),
@@ -798,6 +1028,16 @@ impl PrometheusReceiver {
     /// every other listener's own `with_idle_timeout`.
     pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
         self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Turns on the metadata cache -- `metadata_cache:` in config, whose defaults this takes
+    /// verbatim. `max_families == 0` is the operator's "off", and leaves this receiver on the
+    /// stateless decode path rather than building a table it would never put anything in. Graph
+    /// rule 55 rejects a zero `ttl` before it can reach here.
+    pub fn with_metadata_cache(mut self, max_families: usize, ttl: Duration) -> Self {
+        self.metadata_cache =
+            (max_families > 0).then(|| Arc::new(MetadataCache::new(max_families, ttl)));
         self
     }
 
@@ -856,6 +1096,7 @@ impl Input for PrometheusReceiver {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
+        let metadata_cache = self.metadata_cache.clone();
         loop {
             let (stream, peer) = listener.accept().await?;
 
@@ -881,6 +1122,7 @@ impl Input for PrometheusReceiver {
             let tls_acceptor = tls_acceptor.clone();
             let live_connections = Arc::clone(&live_connections);
             let resource = Arc::clone(&self.resource);
+            let metadata_cache = metadata_cache.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
@@ -902,6 +1144,7 @@ impl Input for PrometheusReceiver {
                                     peer,
                                     path,
                                     resource,
+                                    metadata_cache,
                                     sink,
                                     telemetry.clone(),
                                     diag.clone(),
@@ -933,6 +1176,7 @@ impl Input for PrometheusReceiver {
                                     peer,
                                     path,
                                     resource,
+                                    metadata_cache,
                                     sink,
                                     telemetry.clone(),
                                     diag.clone(),
@@ -971,6 +1215,7 @@ async fn serve_write_connection<IO>(
     peer: SocketAddr,
     path: Arc<str>,
     resource: Arc<Resource>,
+    metadata_cache: Option<Arc<MetadataCache>>,
     sink: Fanout,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -995,6 +1240,7 @@ where
             let in_flight = activity.enter();
             let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
             let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
+            let metadata_cache = metadata_cache.clone();
             let activity = Arc::clone(&activity);
             async move {
                 let _in_flight = in_flight;
@@ -1002,6 +1248,7 @@ where
                     req,
                     &path,
                     resource,
+                    metadata_cache.as_deref(),
                     peer,
                     sink,
                     telemetry,
@@ -1037,6 +1284,7 @@ async fn handle_write(
     req: http::Request<Incoming>,
     path: &str,
     resource: Arc<Resource>,
+    metadata_cache: Option<&MetadataCache>,
     peer: SocketAddr,
     sink: Fanout,
     telemetry: Telemetry,
@@ -1045,8 +1293,19 @@ async fn handle_write(
     stall: Option<Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
     let started = Instant::now();
-    let (class, response) =
-        write_response(req, path, resource, peer, &sink, &telemetry, diag, activity, stall).await;
+    let (class, response) = write_response(
+        req,
+        path,
+        resource,
+        metadata_cache,
+        peer,
+        &sink,
+        &telemetry,
+        diag,
+        activity,
+        stall,
+    )
+    .await;
     telemetry.count("logit.input.writes", 1.0, &[("class", class)]);
     telemetry.timing("logit.input.write.duration", started.elapsed(), &[]);
     Ok(response)
@@ -1059,6 +1318,7 @@ async fn write_response(
     req: http::Request<Incoming>,
     path: &str,
     resource: Arc<Resource>,
+    metadata_cache: Option<&MetadataCache>,
     peer: SocketAddr,
     sink: &Fanout,
     telemetry: &Telemetry,
@@ -1194,7 +1454,15 @@ async fn write_response(
         .with_timestamp_marker(false)
         .with_telemetry(telemetry.clone())
         .with_diagnostics(diag.clone());
-    let decoded = match remote_write::decode(&body, version, &mut decoder) {
+    // The cache's lock is taken to build the seed and taken again below to learn, never held
+    // across the decode -- a connection's requests are served concurrently and the decode is the
+    // expensive part. With no cache configured this is the stateless `decode` verbatim.
+    let seeded = metadata_cache.map(|cache| cache.seed(Instant::now(), telemetry));
+    let result = match &seeded {
+        Some(seed) => remote_write::decode_with(&body, version, &mut decoder, seed),
+        None => remote_write::decode(&body, version, &mut decoder),
+    };
+    let decoded = match result {
         Ok(decoded) => decoded,
         Err(err) => {
             let message = err.to_string();
@@ -1205,6 +1473,12 @@ async fn write_response(
             return ("bad_request", text_response(seen, StatusCode::BAD_REQUEST, &message));
         }
     };
+    // Learned from what *this* request declared, never from the seed: a cache that refreshed
+    // entries out of its own memory would never let one expire. A malformed request teaches
+    // nothing, which is why this sits after the `400` above rather than beside the seed.
+    if let Some(cache) = metadata_cache {
+        cache.learn(&decoded.declarations, Instant::now(), telemetry);
+    }
 
     // One batch per request, on an empty `Resource`, built by concatenating the timestamp groups
     // in ascending order -- this module's "Timestamps and timestamp groups" doc section.

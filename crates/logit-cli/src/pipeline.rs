@@ -457,14 +457,18 @@ fn build_spec(
             path,
             bind_tls,
             idle_timeout,
-            metadata_cache: _,
+            metadata_cache,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
                     let mut receiver = PrometheusReceiver::new(bind.clone(), path.clone())
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone())
-                        .with_idle_timeout(*idle_timeout);
+                        .with_idle_timeout(*idle_timeout)
+                        // `max_families: 0` is the operator's "off" and the receiver reads it as
+                        // one, so this is passed through unconditionally rather than branched on
+                        // here -- rule 55 has already rejected a zero `ttl`.
+                        .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
                     if let Some(bind_tls) = bind_tls {
                         receiver =
                             receiver.with_bind_tls(&to_tls_server_settings(bind_tls), base_dir)?;
