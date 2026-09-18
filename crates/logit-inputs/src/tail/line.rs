@@ -48,9 +48,13 @@ pub trait TailDecoder: Send {
     fn reset(&mut self) {}
 
     /// This decoder's resource, without decoding a line -- needed to seed accounting before
-    /// anything has been read. Every decoder here builds one `Resource` per file and never
-    /// changes it afterward (`docs/adr/decoupled-listener-io.md`'s "never merges across a
-    /// resource change" rule, upheld the same way `syslog_in`/`docker_in` uphold it).
+    /// anything has been read. `tail_in`'s [`LineDecoder`] builds one `Resource` per file and
+    /// never changes it (`docs/adr/decoupled-listener-io.md`'s "never merges across a resource
+    /// change" rule). `docker_in`'s `DockerDecoder` is the one exception: its own
+    /// `DecoderFactory::refresh` may swap this to a freshly-read identity mid-stream
+    /// (`docs/adr/docker-container-identity-and-minimal-watches.md`) -- `BatchAccumulator::
+    /// absorb`'s `Arc::ptr_eq` check is what keeps that from mixing two identities in one batch
+    /// regardless.
     fn resource(&self) -> Arc<Resource>;
 }
 
