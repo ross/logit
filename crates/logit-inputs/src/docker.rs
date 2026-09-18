@@ -322,13 +322,6 @@ impl TailDecoder for DockerDecoder {
     }
 }
 
-/// Turns a discovered `<root>/<id>/<id>-json.log` path into a [`DockerDecoder`]: applies
-/// [`ContainerFilter`] (reading `config.v2.json` only when it needs the container's name to do
-/// so -- `discover: true` never reads it at this stage) in [`accept`](DecoderFactory::accept),
-/// then reads it again in [`open`](DecoderFactory::open) to build the resource every line
-/// carries. A metadata read failure at `open` time degrades to a `container.id`-only resource
-/// (diagnosed `metadata_error`) rather than refusing to tail the container at all -- lines still
-/// flow, just without the richer identity.
 /// Enough of `config.v2.json`'s own stat to notice it was rewritten -- Docker typically rewrites
 /// it via a tmp-file-plus-rename, so `ino` usually changes too, not just `mtime`/`len`; comparing
 /// all four is cheap and catches either style of rewrite.
@@ -390,6 +383,17 @@ fn id_only_resource(container_dir: &Path) -> Arc<Resource> {
     Arc::new(Resource { attributes: attrs, ..Default::default() })
 }
 
+/// Turns a discovered `<root>/<id>/<id>-json.log` path into a [`DockerDecoder`]: applies
+/// [`ContainerFilter`] (reading `config.v2.json` only when it needs the container's name to do
+/// so -- `discover: true` never reads it at this stage) in [`accept`](DecoderFactory::accept),
+/// builds the resource every line carries from that same cached read in
+/// [`open`](DecoderFactory::open), and keeps it current from there through
+/// [`refresh`](DecoderFactory::refresh) on every later scan. Every one of those three goes
+/// through `meta`/[`refresh_cache`](DockerDecoderFactory::refresh_cache), so a poll tick costs
+/// one `stat` per container rather than a read and a parse. A container whose metadata has never
+/// been read successfully degrades to a `container.id`-only resource (diagnosed
+/// `metadata_error`) rather than not being tailed at all -- lines still flow, just without the
+/// richer identity, until a later read succeeds.
 struct DockerDecoderFactory {
     filter: ContainerFilter,
     labels: Vec<String>,
