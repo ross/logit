@@ -457,6 +457,7 @@ fn build_spec(
             path,
             bind_tls,
             idle_timeout,
+            metadata_cache: _,
         } => {
             let input: Box<dyn Input + Send> = match bind {
                 Some(bind) => {
@@ -1950,6 +1951,7 @@ mod tests {
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
                 idle_timeout: None,
+                metadata_cache: logit_config::MetadataCacheConfig::default(),
             },
         };
         assert!(matches!(
@@ -1979,6 +1981,7 @@ mod tests {
                 path: "/api/v1/write".to_string(),
                 bind_tls: None,
                 idle_timeout: Some(Duration::from_secs(60)),
+                metadata_cache: logit_config::MetadataCacheConfig::default(),
             },
         };
         assert!(matches!(

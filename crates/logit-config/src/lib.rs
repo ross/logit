@@ -1556,7 +1556,9 @@ pub enum ComponentKind {
     /// remote-write *receiver* (`docs/adr/prometheus-remote-write.md`), accepting 1.0 and 2.0
     /// requests on one listener. Exactly one of the two is set (rule 55), and a field belonging
     /// to the other mode is a config error rather than a silently ignored setting -- also rule
-    /// 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape.
+    /// 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape. It does
+    /// hold one piece of cross-request state, and only one: [`MetadataCacheConfig`], which is what
+    /// makes a Prometheus 1.0 sender's writes decode as typed families.
     ///
     /// Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
     /// target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]`
@@ -1616,6 +1618,11 @@ pub enum ComponentKind {
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
+        /// What the receiver remembers about metric *types* between requests, so a Prometheus 1.0
+        /// sender's series decode as the families they are -- see [`MetadataCacheConfig`].
+        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        #[serde(default)]
+        metadata_cache: MetadataCacheConfig,
     },
     /// A synthetic event source for load testing -- the listener end of the perf harness
     /// (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative
@@ -1732,6 +1739,86 @@ pub enum ComponentKind {
 
 fn default_prometheus_path() -> String {
     "/metrics".to_string()
+}
+
+/// `prometheus_in`'s remote-write receiver remembering metric types across requests
+/// (`metadata_cache:`), so a Prometheus **1.0** sender's writes decode as typed families.
+///
+/// 1.0 carries a family's type, `# HELP` and `# UNIT` in `WriteRequest.metadata[]`, and
+/// Prometheus's own sender ships those in **separate requests** on their own schedule
+/// (`metadata_config`, by default once a minute) rather than attached to the samples they
+/// describe. A receiver that remembers nothing therefore sees, for nearly every request, a bag of
+/// flat series with no type anywhere in the message: every family decodes as `unknown`, and
+/// `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three unrelated series instead
+/// of one histogram. Nothing is *lost* -- the samples and labels are exact, and a relay back out to
+/// remote-write is still a fixed point -- but the model kinds are flatter than the producer's.
+///
+/// So the receiver keeps a table of `family name -> (type, help, unit)`, fed by every declaration
+/// any request carries (1.0's `metadata[]` and 2.0's inline `Metadata` alike, so a mixed fleet
+/// fills one table) and consulted for a family whose own request declared nothing. **The request
+/// always wins**: a sender that retypes a family retypes it immediately, however stale the
+/// remembered entry.
+///
+/// That table is per-family state on a component that otherwise has none, so it is bounded on both
+/// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
+/// request, and so is any 1.0 sender that attaches metadata to its own writes.
+/// See `docs/adr/prometheus-remote-write.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MetadataCacheConfig {
+    /// How many families the receiver will remember at once. Over the cap the
+    /// **least-recently-seen** entry is evicted first, counted
+    /// `logit.input.metadata_cache.evicted{reason="cardinality"}` -- the same policy and the same
+    /// counter shape `prometheus_out`'s exposition `max_series:` uses, because it answers the same
+    /// question: the bound has to be a number of things, and the thing worth keeping is whatever
+    /// was written to most recently.
+    ///
+    /// Defaults to `10000`, which is a generous ceiling on the *distinct families* (not series) a
+    /// sender writes -- a large Prometheus scrapes tens of thousands of series across low
+    /// thousands of families. Each entry is a family name plus its help and unit text, so the cap
+    /// bounds a few megabytes at the very most.
+    ///
+    /// **`0` turns the cache off entirely**: nothing is remembered, nothing is swept, and 1.0
+    /// requests decode exactly as a stateless receiver's do. That is the setting for a pure-2.0
+    /// fleet, or for one where the extra state is not wanted.
+    #[serde(default = "default_metadata_cache_max_families")]
+    pub max_families: usize,
+    /// How long a family is remembered after the last request that declared it. Defaults to `10m`,
+    /// an order of magnitude over Prometheus's own default one-minute metadata cadence, so a
+    /// sender has to miss ten refreshes running before its types lapse.
+    ///
+    /// An expired entry is dropped, counted `logit.input.metadata_cache.evicted{reason="expired"}`,
+    /// and the families it typed decode as `unknown` again until the sender's next metadata
+    /// request. That is the point of the bound rather than a flaw in it: a sender that has stopped
+    /// writing should stop costing memory, and a remembered type nothing has reasserted in ten
+    /// minutes is a guess about a series that may no longer exist.
+    ///
+    /// Rule 55 rejects `0s` -- an entry that expires the instant it is written is a cache that does
+    /// nothing while still sweeping and locking on every request; `max_families: 0` is how the
+    /// cache is turned off.
+    #[serde(default = "default_metadata_cache_ttl", with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub ttl: Duration,
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        MetadataCacheConfig {
+            max_families: default_metadata_cache_max_families(),
+            ttl: default_metadata_cache_ttl(),
+        }
+    }
+}
+
+/// `MetadataCacheConfig::max_families`' default. `pub` for rule 55's sake, see
+/// [`default_prometheus_scrape_interval`].
+pub fn default_metadata_cache_max_families() -> usize {
+    10_000
+}
+
+/// `MetadataCacheConfig::ttl`'s default. `pub` for rule 55's sake, see
+/// [`default_prometheus_scrape_interval`].
+pub fn default_metadata_cache_ttl() -> Duration {
+    Duration::from_secs(600)
 }
 
 /// `PrometheusIn::path`'s default -- the remote-write receiver's route. Prometheus's own
@@ -4960,6 +5047,7 @@ mod tests {
                 path,
                 bind_tls,
                 idle_timeout,
+                metadata_cache,
             } => {
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
@@ -4972,9 +5060,44 @@ mod tests {
                 assert_eq!(path, "/api/v1/write");
                 assert_eq!(bind_tls, None);
                 assert_eq!(idle_timeout, None);
+                assert_eq!(metadata_cache, MetadataCacheConfig::default());
+                assert_eq!(metadata_cache.max_families, 10_000);
+                assert_eq!(metadata_cache.ttl, Duration::from_secs(600));
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
+    }
+
+    /// The cache's two bounds are independent: either may be set on its own, and `0` families is
+    /// a legal value (it's how the cache is turned off) where `0s` is not -- rule 55's, not
+    /// serde's.
+    #[test]
+    fn prometheus_in_metadata_cache_deserializes_each_bound_on_its_own() {
+        let cache = |json: &str| -> MetadataCacheConfig {
+            let component: Component = serde_json::from_str(&format!(
+                r#"{{"type": "prometheus_in", "bind": "0.0.0.0:9090", "metadata_cache": {json}}}"#
+            ))
+            .unwrap();
+            match component.kind {
+                ComponentKind::PrometheusIn { metadata_cache, .. } => metadata_cache,
+                other => panic!("expected PrometheusIn, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            cache(r#"{"max_families": 250, "ttl": "90s"}"#),
+            MetadataCacheConfig { max_families: 250, ttl: Duration::from_secs(90) }
+        );
+        // Each field defaults on its own, so setting one never silently resets the other.
+        assert_eq!(
+            cache(r#"{"max_families": 0}"#),
+            MetadataCacheConfig { max_families: 0, ttl: Duration::from_secs(600) }
+        );
+        assert_eq!(
+            cache(r#"{"ttl": "1h"}"#),
+            MetadataCacheConfig { max_families: 10_000, ttl: Duration::from_secs(3600) }
+        );
+        assert_eq!(cache("{}"), MetadataCacheConfig::default());
     }
 
     #[test]

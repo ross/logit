@@ -274,12 +274,18 @@
 //!     (a receiver performs no scrape), and a non-default `path`, `bind_tls` or `idle_timeout`
 //!     alongside `scrape_targets:` is rejected (a scrape client binds nothing) -- rule 45's and
 //!     rule 53's shape one kind over, for their reason: a setting silently doing nothing is worse
-//!     than a startup failure naming it. Only *non-default* values are rejected, which is also
-//!     what lets `interval` keep its default in bind mode and so keeps rule 9's `interval: 0s`
-//!     rejection satisfied there with no mode-specific carve-out. In bind mode the `path` itself
-//!     must also start with `/` -- rule 41's check for `prometheus_out`, for its reason: a request
-//!     URI's path is always absolute, so a relative or empty one could never match and every write
-//!     would `404` against a listener that looks configured.
+//!     than a startup failure naming it. A non-default `metadata_cache` alongside
+//!     `scrape_targets:` joins that second list: it configures what the *receiver* remembers about
+//!     metric types between requests, and a scrape client reads a `# TYPE` line in every response.
+//!     Only *non-default* values are rejected, which is also what lets `interval` keep its default
+//!     in bind mode and so keeps rule 9's `interval: 0s` rejection satisfied there with no
+//!     mode-specific carve-out. In bind mode the `path` itself must also start with `/` -- rule
+//!     41's check for `prometheus_out`, for its reason: a request URI's path is always absolute, so
+//!     a relative or empty one could never match and every write would `404` against a listener
+//!     that looks configured -- and `metadata_cache.ttl` must be greater than `0s`, rule 9's
+//!     zero-interval reasoning: an entry that expires the instant it is written is a cache that
+//!     does nothing while still sweeping on every request, and `max_families: 0` is the spelling
+//!     for turning it off.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -292,8 +298,8 @@
 use logit_config::{
     default_handshake_timeout, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
-    ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, ReceiveConfig,
-    StatsdTransport, StreamFormat, SyslogTransport,
+    ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MetadataCacheConfig,
+    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -2411,6 +2417,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             path,
             bind_tls,
             idle_timeout,
+            metadata_cache,
         } = &component.kind
         else {
             continue;
@@ -2457,6 +2464,18 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      could never take effect"
                 );
             }
+            // Rule 9's `interval: 0s` reasoning, one field over: a time bound whose zero value
+            // would make the thing it bounds do nothing is a typo, not a setting. An entry that
+            // expires the instant it is written would have the receiver sweep and lock on every
+            // request to keep a table that can never answer -- and `max_families: 0`, which is
+            // *not* rejected, is the spelling that turns the cache off for real.
+            if metadata_cache.ttl.is_zero() {
+                anyhow::bail!(
+                    "component '{id}': 'metadata_cache.ttl' is 0s, so every remembered metric \
+                     type would expire before the next request could use it -- set a positive \
+                     duration, or 'metadata_cache: {{max_families: 0}}' to turn the cache off"
+                );
+            }
         } else {
             let wrong = if *path != default_prometheus_write_path() {
                 Some("path")
@@ -2464,14 +2483,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("bind_tls")
             } else if idle_timeout.is_some() {
                 Some("idle_timeout")
+            } else if *metadata_cache != MetadataCacheConfig::default() {
+                Some("metadata_cache")
             } else {
                 None
             };
             if let Some(wrong) = wrong {
                 anyhow::bail!(
-                    "component '{id}': '{wrong}' configures the remote-write receiver's own \
-                     listener, and this prometheus_in has 'scrape_targets' set -- a scrape client \
-                     binds nothing, so the value could never take effect"
+                    "component '{id}': '{wrong}' configures the remote-write receiver, and this \
+                     prometheus_in has 'scrape_targets' set -- a scrape client binds nothing and \
+                     reads a '# TYPE' line in every response it scrapes, so the value could never \
+                     take effect"
                 );
             }
         }
@@ -2989,6 +3011,7 @@ mod tests {
             path: default_prometheus_write_path(),
             bind_tls: None,
             idle_timeout: None,
+            metadata_cache: MetadataCacheConfig::default(),
         }
     }
 
@@ -3003,6 +3026,7 @@ mod tests {
             path: default_prometheus_write_path(),
             bind_tls: None,
             idle_timeout: None,
+            metadata_cache: MetadataCacheConfig::default(),
         }
     }
 
@@ -7373,7 +7397,54 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "metadata_cache",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { metadata_cache, .. } = kind {
+                        metadata_cache.max_families = 250;
+                    }
+                }),
+            ),
         ]
+    }
+
+    /// The cache is what the *receiver* remembers about metric types between requests. A scrape
+    /// client reads a `# TYPE` line in every response it gets, so there is nothing for it to
+    /// remember and the setting could never take effect -- rule 55's wrong-mode shape, and the
+    /// reason `metadata_cache` is in `bind_only_mutations` above rather than a rule of its own.
+    /// (Its default, on the other hand, is invisible: a scrape config that never mentions the key
+    /// resolves.)
+    #[test]
+    fn a_default_metadata_cache_alongside_scrape_targets_resolves() {
+        resolve(cfg(vec![
+            ("in", vec![], prometheus_in(vec!["http://localhost:9100/metrics"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("an untouched metadata_cache is not a wrong-mode value");
+    }
+
+    /// Rule 9's `interval: 0s` reasoning, one field over: a bound whose zero value makes the thing
+    /// it bounds do nothing is a typo. `max_families: 0`, which *is* how the cache is turned off,
+    /// stays legal -- the asymmetry is the point, so the message names it.
+    #[test]
+    fn a_zero_metadata_cache_ttl_on_a_bind_mode_prometheus_in_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { metadata_cache, .. } = &mut kind {
+            metadata_cache.ttl = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'metadata_cache.ttl' is 0s"), "got: {err}");
+        assert!(err.contains("max_families: 0"), "the message names the off switch: {err}");
+    }
+
+    #[test]
+    fn a_disabled_metadata_cache_on_a_bind_mode_prometheus_in_resolves_fine() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { metadata_cache, .. } = &mut kind {
+            metadata_cache.max_families = 0;
+        }
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("'max_families: 0' is how an operator turns the cache off");
     }
 
     // ---- collectd_in (docs/adr/collectd-binary-relay.md) --------------------------------------

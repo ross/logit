@@ -655,15 +655,19 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     listener that could never produce an event — rules 7/12's "can only ever be a no-op" instinct,
     answered with a message rather than a process that starts up listening on nothing. Then a
     non-default `interval`, `timeout`, `headers` or `scrape_tls` alongside `bind:` is rejected (a
-    receiver performs no scrape), and a non-default `path`, `bind_tls` or `idle_timeout` alongside
-    `scrape_targets:` is rejected (a scrape client binds nothing). That is rule 45's and rule 53's
-    shape one kind over, and it exists for their reason: a setting silently doing nothing is worse
-    than a startup failure naming it. Only *non-default* values are rejected — which is what lets
-    `interval` keep its default in bind mode, so rule 9's `interval: 0s` rejection stays satisfied
-    there with no mode-specific carve-out. In bind mode the `path` itself must also start with
-    `/` — rule 41's check for `prometheus_out`, for rule 41's reason: a request URI's path is
-    always absolute, so a relative or empty one could never match, and every write would `404`
-    against a listener that looks configured.
+    receiver performs no scrape), and a non-default `path`, `bind_tls`, `idle_timeout` or
+    `metadata_cache` alongside `scrape_targets:` is rejected (a scrape client binds nothing, and
+    reads a `# TYPE` line in every response it scrapes rather than remembering one). That is rule
+    45's and rule 53's shape one kind over, and it exists for their reason: a setting silently
+    doing nothing is worse than a startup failure naming it. Only *non-default* values are
+    rejected — which is what lets `interval` keep its default in bind mode, so rule 9's
+    `interval: 0s` rejection stays satisfied there with no mode-specific carve-out. In bind mode
+    the `path` itself must also start with `/` — rule 41's check for `prometheus_out`, for rule
+    41's reason: a request URI's path is always absolute, so a relative or empty one could never
+    match, and every write would `404` against a listener that looks configured — and
+    `metadata_cache.ttl` must be greater than `0s`, rule 9's zero-interval reasoning: an entry
+    expiring the instant it is written is a cache that does nothing while still sweeping on every
+    request, and `metadata_cache: {max_families: 0}` is the spelling that turns it off.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
