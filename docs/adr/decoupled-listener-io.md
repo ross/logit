@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-12
+updated: 2026-09-18
 ---
 
 # Decoupled listener I/O
@@ -350,6 +350,15 @@ to ignore the one warning that matters.
   Genuinely valuable — almost no tool in the field does this in-process, they all tell operators to
   run `netstat -su` — but Linux-only and a separate, self-contained addition; recorded as a new
   `docs/known-gaps.md` entry rather than folded in here.
+
+> **Revised by [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md).**
+> Both bullets above are now designed and scheduled rather than merely deferred: `recvmmsg` batched
+> reads land unconditionally on Linux (`SO_REUSEPORT` fan-in stays out of scope, deferred again
+> pending that work's own measurements), and kernel-side drop visibility is built on
+> `getsockopt(SO_MEMINFO)` against the socket's own fd, not the `/proc/net/udp[6]` scrape named
+> here — that ADR's `SO_MEMINFO` section explains why the procfs approach was superseded before
+> being built. This section's account of what was known and out of scope when written is otherwise
+> unaffected.
 
 ## Consequences
 

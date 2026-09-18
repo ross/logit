@@ -27,6 +27,13 @@ serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads -- Linux-only socket
+# options, so a Linux-only dependency, exactly as `logit-inputs` already declares `libc` for its
+# inotify wake source. Already present transitively at this exact version, so this adds no new
+# entry to the dependency tree.
+libc.workspace = true
+
 [dev-dependencies]
 # `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) is enabled per
 # crate that has paused-clock tests, here and in `logit-inputs` -- a `dev-dependencies` override

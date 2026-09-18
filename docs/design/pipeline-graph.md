@@ -1045,6 +1045,15 @@ unremarkable; only `logit-pipeline` itself is barred from depending on the impl 
   that *uses* them (`logit-inputs::udp::UdpListener`) stay in `logit-inputs`, following the same
   "traits and generic machinery here, concrete protocol impls there" split the crate already
   applies everywhere else.
+- Owns `sockstat` (`docs/adr/udp-intake-batching-and-socket-visibility.md`) on the same line: a
+  `getsockopt`-level *reading* of a file descriptor the caller already holds — the kernel's
+  per-socket drop counter and receive-buffer fill (`SO_MEMINFO`), a listening socket's accept-queue
+  depth (`TCP_INFO`) — with no notion of a listener, a datagram or a node. It is here rather than in
+  `logit-inputs` because `logit-outputs` is the foreseeable second consumer and must not depend on
+  an input crate, and rather than in `logit-core` because that crate's "no I/O" boundary (two
+  bullets up) is exactly what a raw syscall and a `libc` dependency would have broken; this crate
+  already does real I/O (`disk_queue.rs`) without claiming otherwise. Everything that *operates* a
+  socket — binding it, sizing it, reading from it — still stays in `logit-inputs`.
 
 `graph.rs` (resolution + the validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's

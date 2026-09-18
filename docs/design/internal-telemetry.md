@@ -464,11 +464,12 @@ point every datagram passes through:
 | `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
 | `logit.input.receive_buffer.requested.bytes` | gauge | what `receive.receive_buffer_bytes` asked for, absent when unset — sampled once at bind, and genuinely bind-only: it is config, not a kernel reading |
 | `logit.input.receive_buffer.used.bytes` | gauge | `SO_MEMINFO`'s `SK_MEMINFO_RMEM_ALLOC`: bytes the kernel currently charges this socket's receive queue. **Not** queued payload bytes — each packet is charged its `skb->truesize`, several hundred bytes above its own length |
-| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is exactly where the kernel begins dropping |
+| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is where the kernel begins dropping. Readings a little *above* 1.0 are normal under load: the kernel charges an arriving packet and then tests the total, so a sample can land mid-drop |
 | `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
 
-The last three are Linux-only (`logit_core::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+) and
-are simply absent elsewhere, with one `warn` on the first failed read saying so. They are sampled
+The last three are Linux-only (`logit_pipeline::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+)
+and are simply absent elsewhere, with one `warn` on the first failed read saying so, after which the
+listener stops sampling — and stops arming the interval timer — for the rest of its run. They are sampled
 once a second for as long as the read loop runs, plus **once more after it stops** — a listener
 usually stops *because* something went wrong, and the drops in the last second before it did are
 the ones most worth having.
@@ -491,7 +492,8 @@ also Linux-only, from `getsockopt(TCP_INFO)` on the listening socket:
 | Name | Kind | Meaning |
 |---|---|---|
 | `logit.input.accept_queue.depth` | gauge | connections that have completed their handshake and are waiting to be accepted (`tcpi_unacked`, which the kernel aliases onto `sk_ack_backlog` for a socket in `LISTEN`) |
-| `logit.input.accept_queue.utilization` | gauge | that depth against the backlog ceiling (`tcpi_sacked`, aliased onto `sk_max_ack_backlog`) — 1.0 is where the kernel starts refusing connections outright |
+| `logit.input.accept_queue.limit` | gauge | the backlog ceiling itself (`tcpi_sacked`, aliased onto `sk_max_ack_backlog`) — what `listen(2)` was given, after `net.core.somaxconn` clamped it. Re-emitted each sample, same reason as `receive_buffer.bytes` |
+| `logit.input.accept_queue.utilization` | gauge | that depth against that ceiling — 1.0 is where the kernel starts refusing connections outright |
 
 Sampled before each `accept()` *and* on the same one-second interval: the per-accept sample is the
 depth at the instant that matters, and the interval one is what keeps a listener that is blocked in
@@ -519,7 +521,10 @@ twice. `utilization` is also deliberately the same last segment as
 buffers, one convention — a 0-to-1 fill ratio against whatever bound that buffer actually has — so
 an operator who learns to read one reads all three. `accept_queue.*` follows the same rule for the
 same reason: no `kernel` segment, because a listener has no accept queue of its own to confuse it
-with.
+with. `accept_queue.limit` is reported in its own right rather than left implicit in the ratio
+because an operator deciding whether to raise `net.core.somaxconn` needs the ceiling itself, and
+backing it out of `depth / utilization` is undefined at the depth of 0 an idle listener always
+reports.
 
 **Layer 3: a component adds only what only it knows**, via the same `with_telemetry` builder
 idiom `with_diagnostics`/`with_timeout`/`with_retry` already established

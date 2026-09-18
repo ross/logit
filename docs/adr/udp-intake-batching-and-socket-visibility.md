@@ -34,13 +34,17 @@ to measure the result. [`docs/plans/udp-intake.md`](../plans/udp-intake.md) is t
 schedule and baseline/delta protocol this record is built on; this document is about the decisions,
 not the sequencing.
 
-**This amends [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s "Alternatives considered"
+**This revises [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s "Alternatives considered"
 section**, specifically its `recvmmsg`/`SO_REUSEPORT` bullet and its kernel-drop-counter bullet
 (`decoupled-listener-io.md:344-352`), both of which deferred with "recorded as a new
-`docs/known-gaps.md` entry" — this record is that deferred work, now designed. `decoupled-listener-io`
-itself is not edited and stays **Accepted**; its own text is a snapshot of what was known and
-deliberately out of scope when it was written, the same way it left `service-lifecycle-and-output-retry`
-in place while revising it in the same way `buffered-sink-delivery` revised the entry before that.
+`docs/known-gaps.md` entry" — this record is that deferred work, now designed.
+`decoupled-listener-io` stays **Accepted**; this repo's existing convention for a revision like this
+one is a forward-pointer left on the older record itself, not a silent one-way reference — the
+`> **Revised by [ADR ...]**` blockquote `buffered-sink-delivery` added to
+`service-lifecycle-and-output-retry.md:72` when it revised that ADR's retry-budget section is the
+precedent — so `decoupled-listener-io.md` gains the equivalent blockquote at those two bullets, and
+its own `updated` frontmatter (and README index row) move to today. Its surrounding Decision text is
+otherwise untouched.
 
 ## Decision
 
@@ -72,10 +76,14 @@ socket at the same local address, and nothing in `/proc/net/udp`'s columns tells
 dropping" — `RMEM_ALLOC` is the kernel's own current accounting of bytes queued against this
 socket's receive buffer, `RCVBUF` is the granted ceiling (the same value ADR `decoupled-listener-io`
 already gauges once at bind as `logit.input.receive_buffer.bytes`, doubled by Linux's own
-bookkeeping convention) — `RMEM_ALLOC >= RCVBUF` **is** the kernel's drop condition for this socket,
-not an approximation of it. Sampling both turns `logit.input.kernel.drops` from a bare count into an
-explainable one: an operator watching a rising `receive_buffer.utilization` alongside `kernel.drops`
-sees the mechanism, not just the symptom.
+bookkeeping convention). `RMEM_ALLOC` against `RCVBUF` is the very pair the kernel's UDP enqueue
+path (`__udp_enqueue_schedule_skb`) compares when deciding whether to drop an arriving datagram —
+this gauge samples the drop condition's own inputs, not a proxy for them. That's deliberately not
+the same as claiming a fixed operator here: the exact comparison has changed across kernel versions
+(it also weighs the incoming skb's own `truesize`, not just its payload length), so `logit` reports
+the two raw numbers rather than asserting a threshold it doesn't own. Sampling both turns
+`logit.input.kernel.drops` from a bare count into an explainable one: an operator watching a rising
+`receive_buffer.utilization` alongside `kernel.drops` sees the mechanism, not just the symptom.
 
 **`SO_RXQ_OVFL` was also considered and rejected.** It's the other Linux mechanism for the same
 data — enabling it makes the kernel attach an ancillary `SCM_RXQ_OVFL` control message (a `u32`
@@ -87,25 +95,53 @@ running count with no accompanying buffer-occupancy context, so it would need `S
 procfs) alongside it anyway to explain *why* drops are happening, not just that they are. `SO_MEMINFO`
 alone gives both, from a call site that isn't the hot path.
 
-`SK_MEMINFO_*` field indices into `SO_MEMINFO`'s returned array, and `SO_MEMINFO` itself if libc
-0.2.189 (the version already in `Cargo.lock`) doesn't define it, are declared locally in the new
-`sockstat` module with a comment citing the kernel header they come from — no new crate dependency,
-matching how this codebase already prefers a small `libc::` constant with a citation over pulling in
-a crate for one syscall.
+No new crate dependency either way. This ADR originally anticipated declaring `SO_MEMINFO` and the
+`SK_MEMINFO_*` field indices locally with a header citation, in case libc 0.2.189 (the version
+already in `Cargo.lock`) lacked them; **it does not** — that version exports `SO_MEMINFO` and all
+nine `SK_MEMINFO_*` indices, and `sockstat` uses `libc::`'s own constants for them. The one constant
+that genuinely is not in libc for Linux is `TCP_LISTEN` (only its Hurd module defines one), so that
+single value is declared locally with a comment citing `include/net/tcp_states.h` — which is the
+codebase convention this paragraph was reaching for: a small local constant with a citation over a
+crate for one syscall.
+
+### `sockstat` lives in `logit-pipeline`
+
+Three crates could hold it, and two of them are wrong for reasons worth recording.
+
+Not **`logit-inputs`**, where the only caller lives today: `logit-outputs` is the foreseeable second
+consumer (a UDP sink's own `sk_drops`, a TCP sink's send-side fill), and an output crate must not
+depend on an input crate to read a socket counter.
+
+Not **`logit-core`**, which is where this ADR first put it on the strength of that same argument.
+That crate's own doc says "no I/O, no pipeline, no protocol codecs live here," and
+[`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s "Crate layout" section leans on
+that sentence explicitly ("weakening that would blur a boundary the crate exists to hold") when it
+places socket-level mechanics — the `SO_RCVBUF` setsockopt, the `recv_from` loop — outside it. A raw
+`getsockopt` plus a `libc` dependency would have been the first I/O in a crate that says it has
+none, and neither text would have been true any more.
+
+**`logit-pipeline`** satisfies the original requirement without that cost: both impl crates already
+depend on it, it is where the generic, protocol-free machinery already lives (`BoundedQueue`,
+`BatchAccumulator`, `Fanout`), and it already performs real I/O without claiming otherwise —
+`disk_queue.rs` writes and fsyncs segment files. The split with `logit-inputs` is the one that crate
+boundary already draws everywhere else: fd-level *readings* any component could want live in
+`logit-pipeline`; opening the socket, sizing it and reading datagrams off it stay in
+`logit-inputs::udp`/`tcp`.
 
 ### TCP listeners: `TCP_INFO` on the `LISTEN` socket, same PR
 
 `syslog_in`'s TCP/TLS ingress ([ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md))
 has the same blind spot on the accept side that UDP had on the receive side: a `LISTEN` socket's
 accept queue can back up with no visibility into it. `getsockopt(fd, SOL_TCP, TCP_INFO, ...)` on a
-listening socket is a Linux-specific special case (since kernel 4.16): `tcpi_unacked` reports the
-current accept-queue depth and `tcpi_sacked` reports the configured backlog, rather than their
-ordinary per-connection meanings (unacked segments / SACK'd segments), because the kernel reuses the
-same `struct tcp_info` fields for both roles. This is a genuinely separate socket type and syscall
-from the UDP work, but it's the same shape (one `getsockopt` on a fd this process already owns,
-sampled on a timer) and the same helper module, so it lands in the same PR/commit as the UDP
-`sockstat` work rather than as a follow-up — Ross's call, recorded here since it widens this ADR's
-scope beyond its title.
+listening socket is a Linux-specific special case, and a long-standing one — since Linux 2.6.24
+(2007), so unlike `SO_MEMINFO`'s 4.12 floor there is no practical kernel-version floor to worry
+about here: `tcpi_unacked` reports the current accept-queue depth and `tcpi_sacked` reports the
+configured backlog, rather than their ordinary per-connection meanings (unacked segments / SACK'd
+segments), because the kernel reuses the same `struct tcp_info` fields for both roles. This is a
+genuinely separate socket type and syscall from the UDP work, but it's the same shape (one
+`getsockopt` on a fd this process already owns, sampled on a timer) and the same helper module, so
+it lands in the same PR/commit as the UDP `sockstat` work rather than as a follow-up — Ross's call,
+recorded here since it widens this ADR's scope beyond its title.
 
 ### What socket visibility deliberately does not cover
 
@@ -121,21 +157,68 @@ than folded in:
   aggregated across every socket in the network namespace, not attributable to any one `logit`
   component — exactly the identification problem `SO_MEMINFO` was chosen to avoid, at a wider scope
   where there's no fd to disambiguate with at all.
-- **`SK_MEMINFO_BACKLOG`/`FWD_ALLOC`/`OPTMEM`.** Real fields `SO_MEMINFO` also returns, but they're
-  socket-internal bookkeeping (the backlog processing queue, forward-allocated memory, ancillary
-  option memory) that doesn't map to an operator-actionable question the way `RMEM_ALLOC`/`RCVBUF`/
-  `DROPS` do. Noise, not signal, for a metrics catalog that already has a convention
-  (`docs/design/internal-telemetry.md`'s "Why this exists") of learning what matters by running the
-  thing rather than exposing everything a syscall happens to return.
+- **`SK_MEMINFO_BACKLOG`/`FWD_ALLOC`/`WMEM_QUEUED`/`OPTMEM`.** Four of `SO_MEMINFO`'s nine returned
+  fields — real, but socket-internal bookkeeping (the backlog processing queue, forward-allocated
+  memory, the queued-for-send byte count, ancillary option memory) that doesn't map to an
+  operator-actionable question the way `RMEM_ALLOC`/`RCVBUF`/`DROPS` do. Noise, not signal, for a
+  metrics catalog that already has a convention (`docs/design/internal-telemetry.md`'s "Why this
+  exists") of learning what matters by running the thing rather than exposing everything a syscall
+  happens to return. Of the remaining five, `SockMeminfo` reads all of `RMEM_ALLOC`/`RCVBUF`/
+  `WMEM_ALLOC`/`SNDBUF`/`DROPS` (`crates/logit-pipeline/src/sockstat.rs`) — but W1 only emits
+  `DROPS`/`RMEM_ALLOC`/`RCVBUF` as metrics. `WMEM_ALLOC`/`SNDBUF` are carried on the struct for a future
+  sink-side consumer rather than read and then discarded; they're not emitted here because that's
+  exactly the send-buffer visibility the bullet above rules out building today, on the sink side —
+  reading them once, cheaply, alongside the receive-side fields costs nothing and leaves the seam
+  open without shipping a gauge nobody asked for yet.
 
 ### Sampling cadence: a 1 s timer, no config knob, a guaranteed final sample
 
-Socket stats are sampled on a fixed 1 s interval, pinned into the same `select!` that already races
-`read_loop`/`decode_loop`/`shutdown` — not a separate task, specifically so sampling continues while
-`read_loop` is parked inside a blocked `push` (`overflow: block`), which is exactly the moment drops
-are most likely to be happening and the moment a separately-scheduled task would be competing for
-the same runtime attention. A **guaranteed final sample** runs after the read loop exits (shutdown
-or fatal error) so a short-lived process — the same concern ADR `load-test-harness` raised for
+Socket stats are sampled on a fixed 1 s interval by a new `read_loop_sampled` wrapper
+(`crates/logit-inputs/src/udp.rs`) — **not** a separate task, and **not** a third arm of either
+`select!` that already exists there. It holds a pinned `read_loop` future and a 1 s
+`tokio::time::interval` in one new `select!`, looped so a tick never resolves the wrapper itself:
+each tick samples and the loop goes back around to `select!` again, while `read_loop`'s own future —
+polled by reference every iteration — keeps running underneath it, untouched. `read_loop_sampled`
+then takes `read_loop`'s place as the future `run_until_shutdown` races against `decode`
+(`udp.rs:269-270,296-298`), so sampling continues while `read_loop` is parked inside a blocked `push`
+(`overflow: block`) — exactly the moment drops are most likely to be happening.
+
+This has to be a wrapping loop, not a third arm of either existing `select!`, for two different
+reasons:
+
+- **`run_until_shutdown`'s own `select!` (`udp.rs:296-298`) is a one-shot race**, not a loop: it
+  decides once which of the whole `read`/`decode` futures finishes first, guarded by the `Option`
+  indirection the code comment there explains is specifically there to avoid double-polling
+  whichever one didn't win. A periodically-firing arm there would resolve that same race on every
+  tick instead of only when `read`/`decode` actually finish — it would need its own wrapping loop
+  regardless, which is exactly what `read_loop_sampled` provides, one layer down, next to the socket
+  it's actually sampling.
+- **`read_loop`'s own two nested per-iteration `select!`s** (`recv_from` vs. `shutdown`, `queue.push`
+  vs. `shutdown`) are genuine two-way races, and `tokio::select!` drops whichever future didn't win.
+  Adding a timer arm to either would cancel an in-flight `recv_from`/`push` on every ordinary tick —
+  silently dropping the very datagram the sampler exists to observe, exactly the loss this ADR
+  elsewhere bounds to the shutdown path only (see "Cancellation of `push_many`" below). Sampling has
+  to run *alongside* whatever `read_loop` is doing, never race it.
+
+**The sampler's `select!` is `biased` with the timer arm first, and W4 must not undo that.** The
+intuitive ordering is the other one — prefer the work, sample while idle — and it silences the
+sampler for the entire duration of the overload it exists to report. `tokio` gives each task a
+cooperative-scheduling budget of 128 units per poll and every resource operation spends one, so
+under a flood `read_loop` never parks for a real reason: it returns `Pending` only once that budget
+is gone. `Sleep::poll` opens with `coop::poll_proceed` (`tokio/src/time/sleep.rs`), so a timer arm
+polled *after* the read arm sees a budget of zero and returns `Pending` however far past its
+deadline it is; the next wake repeats it, forever. A `Pending` caused by the coop budget is not a
+park, and an arm behind one never runs. Measured on a release build, eight senders flooding one
+listener for 10 s at ~90% kernel loss: read-arm-first carried the drop counter and buffer gauges in
+0 of 10 one-second windows (41–47M drops arriving as a single lump from the final sample after
+SIGTERM); timer-arm-first carried them in 11 of 11, with no measurable throughput difference. This
+is a property of `read_loop` being one long-lived future that does not return between samples, so
+W4's `recvmmsg` rewrite of that loop inherits the constraint unchanged — `crate::udp::sample_while`
+carries the full reasoning, and a regression test that fails with the arms swapped pins it.
+
+A **guaranteed final sample** runs after the read loop exits (shutdown or fatal error), immediately
+before `read_loop_sampled` itself returns — the one thing no `select!`'s arm ordering already
+guarantees — so a short-lived process — the same concern ADR `load-test-harness` raised for
 `internal`'s own drain tick — doesn't lose its last interval of drop/buffer data.
 
 No config knob for the interval. Every other timer this codebase exposes as configuration
@@ -167,16 +250,20 @@ component-specific detail nothing generic could know), the new points are:
   drains it (`mem::take` on each drain window, `docs/design/internal-telemetry.md`'s buffer
   section) — a bind-only gauge would otherwise read as "vanished" after one window rather than
   "unchanged."
-- `logit.input.accept_queue.depth` / `.utilization` (gauge) — `TCP_INFO`'s `tcpi_unacked` over
-  `tcpi_sacked`, sampled on the same cadence, plus once in the accept loop right before each
-  `accept()` so an idle listener that never accepts still reports a value.
+- `logit.input.accept_queue.depth` / `.limit` / `.utilization` (gauge) — `TCP_INFO`'s
+  `tcpi_unacked`, `tcpi_sacked`, and the first over the second, sampled on the same cadence, plus
+  once in the accept loop right before each `accept()` so an idle listener that never accepts still
+  reports a value. `.limit` is re-emitted each tick for the same `mem::take` reason
+  `receive_buffer.bytes` is, and is a gauge in its own right rather than left implicit in the ratio:
+  an operator deciding whether to raise `net.core.somaxconn` needs the ceiling itself, and backing
+  it out of `depth / utilization` is undefined at the depth of 0 an idle listener always reports.
 
-All five are `logit.input.*`, not `logit.component.*` — they're genuinely impl-known, the same
+All six are `logit.input.*`, not `logit.component.*` — they're genuinely impl-known, the same
 reasoning `internal-telemetry.md` already gives for the pre-existing `logit.input.datagrams`/
 `.datagram.bytes` arrival counters and `receive_buffer.bytes`/`.requested.bytes`: nothing generic in
 the runtime can see a socket's kernel-side state, only the listener impl holding the fd can.
 
-`kernel` appears in exactly one of the five names, `logit.input.kernel.drops`, and deliberately not
+`kernel` appears in exactly one of the six names, `logit.input.kernel.drops`, and deliberately not
 in the others, for the same reason `internal-telemetry.md` already gives for keeping *userspace*
 drops (`logit.component.datagrams.dropped{reason=...}`, `ReceiveQueue` eviction) unqualified: an
 operator alerting on data loss shouldn't have to union namespaces, but a drop `logit` counted itself
@@ -390,8 +477,8 @@ ahead of evidence this same plan is about to produce.
 - **Netns-wide `/proc/net/snmp`/`netstat` counters.** Rejected — not attributable to any one
   component; the same identification problem `SO_MEMINFO` was chosen specifically to avoid, at a
   wider scope with no fd to disambiguate against.
-- **Exposing `SK_MEMINFO_BACKLOG`/`FWD_ALLOC`/`OPTMEM` alongside `DROPS`/`RMEM_ALLOC`/`RCVBUF`.**
-  Rejected as noise — real fields, but socket-internal bookkeeping with no operator-actionable
+- **Exposing `SK_MEMINFO_BACKLOG`/`FWD_ALLOC`/`WMEM_QUEUED`/`OPTMEM` alongside `DROPS`/`RMEM_ALLOC`/
+  `RCVBUF`.** Rejected as noise — real fields, but socket-internal bookkeeping with no operator-actionable
   question behind them.
 - **UDP sink send-buffer gauges (`wmem_alloc` polling).** Rejected — almost always reports ~0 for a
   connectionless socket in practice; send-side loss is better observed as errno-tagged send-error
@@ -427,16 +514,19 @@ ahead of evidence this same plan is about to produce.
 
 ## Consequences
 
-- New `crates/logit-core/src/sockstat.rs` (Linux-gated `libc` dep on `logit-core`):
+- New `crates/logit-pipeline/src/sockstat.rs` (Linux-gated `libc` dep on `logit-pipeline` — see
+  "`sockstat` lives in `logit-pipeline`" above for why not `logit-core` or `logit-inputs`):
   `SockMeminfo { rmem_alloc, rcvbuf, wmem_alloc, sndbuf, drops }`, `meminfo(RawFd) -> Option<_>`,
   `listen_queue(RawFd) -> Option<(u32, u32)>`, a wrap-safe `DropCounter::delta`. Non-Linux twins
   return `None`/0.
-- `crates/logit-inputs/src/udp.rs` gains a `read_loop_sampled` wrapper (1 s sampler pinned into the
-  existing `select!`, guaranteed final sample) and, on Linux, a `BatchReader` built on `recvmmsg(2)`.
-  `crates/logit-inputs/src/tcp.rs` gains a `listen_queue` sample in its accept loop.
-- Five new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
-  `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.utilization` — see
-  `docs/design/internal-telemetry.md`'s catalog once W1 lands.
+- `crates/logit-inputs/src/udp.rs` gains a `read_loop_sampled` wrapper (a new, looped `select!`
+  racing a pinned `read_loop` against a 1 s interval, guaranteed final sample after `read_loop`
+  exits — see "Sampling cadence" above for why this is a new select, not a third arm of either
+  existing one) and, on Linux, a `BatchReader` built on `recvmmsg(2)`. `crates/logit-inputs/src/tcp.rs`
+  gains a `listen_queue` sample in its accept loop.
+- Six new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
+  `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.limit`,
+  `.utilization` — see `docs/design/internal-telemetry.md`'s catalog once W1 lands.
 - New config field `read_batch: usize` (default 64, provisional pending W4's sweep) on
   `ReceiveConfig`/`UdpListenerConfig`; new graph rule 57 (reject `read_batch > 1024`), alongside
   existing rule 18. `script/schema` regenerated in that commit.
@@ -449,9 +539,11 @@ ahead of evidence this same plan is about to produce.
 - `docs/known-gaps.md`: the kernel-drop-visibility entry (`:176-184`) and the one-datagram-per-syscall
   entry (`:185-191`) close as their respective workstreams land (W1, W4); the gauge-update-contention
   entry (`:200-214`) closes at W3.
-- Amends `decoupled-listener-io.md`'s "Alternatives considered" recvmmsg/`SO_REUSEPORT` bullet and
+- Revises `decoupled-listener-io.md`'s "Alternatives considered" recvmmsg/`SO_REUSEPORT` bullet and
   kernel-drop-counter bullet — both now designed and scheduled rather than merely deferred;
-  `decoupled-listener-io.md` itself is unedited.
+  `decoupled-listener-io.md` gains a `> **Revised by ...**` forward-pointer blockquote at those
+  bullets and a bumped `updated` date, following the same convention `buffered-sink-delivery` used
+  on `service-lifecycle-and-output-retry.md`.
 - The `read_batch` default (64) and the eventual `SO_REUSEPORT`/`UDP_GRO` decision both remain
   explicitly open, pending W4's sweep and this plan's measurements respectively — not assumed by
   anything built here.

@@ -21,8 +21,8 @@
 //! `Registry` drain, nothing queue-shaped. Don't generalize this module toward it.
 
 use bytes::Bytes;
-use logit_core::sockstat;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
 use logit_proto::Decoder;
@@ -547,9 +547,18 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// that result. The socket is still open at that point (it is owned by `run_until_shutdown`, which
 /// outlives this future), so the counters are still readable.
 ///
+/// **Once the sampler has disabled itself, no timer is armed at all** and this is exactly
+/// [`read_loop`]. That is the other half of `sockstat`'s "report once and stop asking": a listener
+/// on a non-Linux build (or a kernel without `SO_MEMINFO`) would otherwise wake once a second,
+/// forever, to call a function that returns immediately -- a cost this would have added to every
+/// idle listener on those platforms in exchange for nothing. The final sample still runs in that
+/// state, where it is a no-op.
+///
 /// Sampling is synchronous and inline -- one `getsockopt` on an fd this process owns, which is a
 /// bounded read of kernel memory with no I/O wait, so `spawn_blocking` would cost more than the
 /// call it wrapped.
+///
+/// The `select!`'s arm ordering is not incidental -- see [`sample_while`], which holds the loop.
 async fn read_loop_sampled(
     socket: &tokio::net::UdpSocket,
     queue: Arc<ReceiveQueue>,
@@ -557,13 +566,60 @@ async fn read_loop_sampled(
     diag: Diagnostics,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
-    let mut read = std::pin::pin!(read_loop(socket, queue, telemetry, shutdown));
+    let sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
+    let read = read_loop(socket, queue, telemetry, shutdown);
+    sample_while(sampler, read, KERNEL_SAMPLE_INTERVAL).await
+}
+
+/// [`read_loop_sampled`]'s loop, over an arbitrary `read` future and an arbitrary interval --
+/// split out for exactly the reason [`bind_first_available`] is, to make two paths reachable from
+/// a test that production never reaches on its own: the *disabled* sampler (the non-Linux shape,
+/// unreachable on the Linux this is tested on), and the coop-budget starvation the arm ordering
+/// below exists to prevent, which needs a `read` future that misbehaves in a specific way and an
+/// interval short enough to observe in a test.
+///
+/// **The timer arm comes first, and that ordering is load-bearing.** The intuitive order is the
+/// other one -- prefer the work, treat the sample as something to do while idle -- and it is
+/// wrong, for a reason that is invisible until you measure it. `tokio` gives each task a
+/// cooperative-scheduling budget of 128 units per poll, and every resource operation spends one:
+/// each `recv_from`, and each `shutdown.wait_for`, inside `read_loop`. Under the overload this
+/// sampler exists to report, `read_loop` never parks for a real reason -- there is always another
+/// datagram -- so the only way it returns `Pending` is by running that budget to zero. `Sleep`'s
+/// own poll opens with `coop::poll_proceed` (`tokio/src/time/sleep.rs`), so a timer arm polled
+/// *after* the read arm finds a budget of zero and returns `Pending` with its deadline long since
+/// past. The next wake re-polls in the same order with the same result, forever: **a `Pending`
+/// caused by the coop budget is not a park, and an arm placed behind one never runs.**
+///
+/// Measured on a release build, eight senders flooding one listener for 10 s at roughly 90% kernel
+/// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
+/// gauges at all -- 41-47M drops surfaced as a single lump from the final sample after SIGTERM,
+/// which is precisely the "you cannot see it while it is happening" this work set out to fix. With
+/// the timer arm first, 11 of 11 windows carried them, the final sample still landed separately
+/// with a non-zero residual, and throughput did not measurably move (4.7M datagrams read, against
+/// 4.7-5.0M).
+///
+/// The cost of this ordering is one `Sleep::poll` per wake before the read arm is polled -- a
+/// deadline comparison against a timer that is nearly always not yet due. The guaranteed final
+/// sample is unaffected: the read arm still wins the moment `read_loop` actually returns, and a
+/// tick that beats it to the punch only means the remainder is what the final sample reports.
+async fn sample_while<F>(
+    mut sampler: ReceiveBufferSampler,
+    read: F,
+    interval: Duration,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut read = std::pin::pin!(read);
     let result = loop {
         sampler.sample_once();
+        if !sampler.enabled {
+            break (&mut read).await;
+        }
         tokio::select! {
+            biased;
+            () = tokio::time::sleep(interval) => {}
             result = &mut read => break result,
-            () = tokio::time::sleep(KERNEL_SAMPLE_INTERVAL) => {}
         }
     };
     sampler.sample_once();
@@ -578,8 +634,8 @@ async fn read_loop_sampled(
 /// syscall per second forever in exchange for nothing. One `warn` says so, once.
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
-    /// descriptors at all, where [`logit_core::sockstat`] reports nothing anyway. Safe to hold as
-    /// a bare fd rather than a borrow: this sampler is created and dropped inside
+    /// descriptors at all, where [`logit_pipeline::sockstat`] reports nothing anyway. Safe to
+    /// hold as a bare fd rather than a borrow: this sampler is created and dropped inside
     /// [`read_loop_sampled`], whose `socket` argument outlives it.
     fd: Option<sockstat::RawFd>,
     drops: sockstat::DropCounter,
@@ -599,7 +655,7 @@ impl ReceiveBufferSampler {
         }
     }
 
-    /// One `getsockopt`, and the three metrics it feeds.
+    /// One `getsockopt`, and the four metrics it feeds.
     ///
     /// `logit.input.kernel.drops` is reported only when the delta is nonzero, matching how every
     /// other loss counter here behaves (`logit.component.datagrams.dropped` does not emit a zero
@@ -1349,9 +1405,13 @@ mod tests {
             .expect("the utilization gauge should have been sampled");
         assert!(used > 0.0, "the buffer was full when it was sampled, got {used} bytes");
         assert!(granted > 0.0, "a live socket always has a receive-buffer ceiling");
+        // No upper bound of 1.0 here, deliberately: the kernel charges an arriving packet's
+        // `truesize` and *then* tests the total against the ceiling, so a sample taken mid-drop
+        // legitimately reads a little over 1.0 -- observed at 1.17 against a real flood. Asserting
+        // `<= 1.0` would be a flake waiting to happen. See `SockMeminfo::receive_utilization`.
         assert!(
-            utilization > 0.0 && utilization <= 1.0,
-            "utilization is rmem_alloc/rcvbuf, so it lives in (0, 1] on a socket this full, got \
+            utilization > 0.0,
+            "the buffer was full when it was sampled, so utilization must be nonzero, got \
              {utilization}"
         );
         // The pairing the metric's whole meaning depends on: both terms come from the same
@@ -1366,11 +1426,18 @@ mod tests {
     /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
     /// last fraction of a second before the reader stops are still reported.
     ///
-    /// Constructed so that the interval sampler provably cannot be the one that sees them. The
-    /// future is polled exactly once up front -- which takes the first sample (of a socket nothing
-    /// has sent to yet: zero drops) and parks `read_loop` -- and then is not polled again at all
-    /// while the overrun happens, because it is a plain local future, not a spawned task. The one
-    /// remaining sample is the final one, taken after `read_loop` has returned.
+    /// One guarantee holds the test up, and it is not the arm ordering. The future is polled
+    /// exactly once up front -- taking the first sample, of a socket nothing has sent to yet, and
+    /// parking `read_loop` -- and is then not polled *at all* while the overrun happens, because it
+    /// is a plain local future rather than a spawned task. So no interval sample can occur during
+    /// the blast, and every drop below is taken while the only sample that has ever run saw zero.
+    ///
+    /// On the resume after `shutdown` fires, [`sample_while`]'s `select!` is `biased` toward the
+    /// *timer*, for the reason that function's doc gives -- so if the blast happened to outlast
+    /// `KERNEL_SAMPLE_INTERVAL`, a due tick wins that poll, reports what it sees, and the final
+    /// sample reports the remainder. Either way both samples are part of the same total, and the
+    /// assertion is on the total. The final sample's guarantee is that nothing is left behind when
+    /// the loop exits, not that it is the only sample to have run.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_final_sample_reports_drops_that_happened_just_before_shutdown() {
@@ -1422,6 +1489,127 @@ mod tests {
             kernel_drops(&registry.drain(0)) > 0.0,
             "drops taken after the last interval sample must still be reported -- that is what \
              the guaranteed final sample is for"
+        );
+    }
+
+    /// A sampler with nothing to read latches itself off on its very first call -- the state
+    /// [`sample_while`] checks before arming its interval timer, and the reason a listener on a
+    /// platform without these counters goes back to parking instead of waking once a second
+    /// forever.
+    #[test]
+    fn a_sampler_that_cannot_read_the_counters_disables_itself_on_the_first_sample() {
+        let mut sampler = ReceiveBufferSampler {
+            // The non-Linux shape: `sockstat::fd_of` has no descriptor to hand back.
+            fd: None,
+            drops: sockstat::DropCounter::new(),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+            enabled: true,
+        };
+        assert!(sampler.enabled, "a fresh sampler always tries once");
+        sampler.sample_once();
+        assert!(!sampler.enabled, "one failed read is enough -- these counters never appear later");
+        sampler.sample_once(); // still a harmless no-op, which is what the final sample relies on
+        assert!(!sampler.enabled);
+    }
+
+    /// The disabled path end to end: with no timer armed at all, [`sample_while`] is exactly its
+    /// `read` future, and must still forward that future's result and leave the queue closed
+    /// behind it -- the shape every non-Linux build runs, and one no Linux CI run would otherwise
+    /// exercise.
+    #[tokio::test]
+    async fn a_disabled_sampler_still_reads_and_closes_the_queue() {
+        let socket = bind_ephemeral().await;
+        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        // Already signalled, so `read_loop` returns on its first poll and this test needs no timer
+        // of its own -- which is also what would hang it if a disabled sampler still armed one and
+        // this assertion depended on the clock. It doesn't; the point is the result and the close.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let sampler = ReceiveBufferSampler {
+            fd: None,
+            drops: sockstat::DropCounter::new(),
+            telemetry: Telemetry::default(),
+            diag: Diagnostics::default(),
+            enabled: true,
+        };
+
+        sample_while(
+            sampler,
+            read_loop(&socket, Arc::clone(&queue), Telemetry::default(), shutdown_rx),
+            KERNEL_SAMPLE_INTERVAL,
+        )
+        .await
+        .expect("a disabled sampler must not change how the read loop reports its result");
+
+        assert!(
+            queue.pop().await.is_none(),
+            "the queue must still be closed on the way out -- that is what lets decode_loop finish"
+        );
+    }
+
+    /// A future that never finishes and returns `Pending` **only** by exhausting its task's
+    /// cooperative-scheduling budget, self-waking each time -- the exact shape `read_loop` takes
+    /// under a flood, where there is always another datagram and it never parks for a real reason.
+    /// `tokio::task::consume_budget` spends one unit per call and yields once the whole 128-unit
+    /// budget is gone, which is all it takes to reproduce the condition.
+    #[cfg(target_os = "linux")]
+    async fn burns_its_whole_coop_budget_forever() -> anyhow::Result<()> {
+        loop {
+            tokio::task::consume_budget().await;
+        }
+    }
+
+    /// The regression the `select!`'s arm ordering in [`sample_while`] exists to prevent: a read
+    /// future that only ever yields on coop-budget exhaustion must not silence the sampler.
+    ///
+    /// **This test fails with the arms swapped back** (read first): the read arm spends all 128
+    /// units, the timer arm is then polled with a budget of zero, `Sleep`'s own
+    /// `coop::poll_proceed` returns `Pending` regardless of how far past its deadline it is, and
+    /// the next wake repeats it forever -- so `ticks` below stays at 0 instead of reaching the
+    /// interval's own cadence.
+    ///
+    /// Real time, not a paused clock: the task under test is never idle (it self-wakes
+    /// continuously), so tokio's auto-advance would never engage. The sampler runs on its own
+    /// spawned task for the same reason -- a `tokio::time::timeout` wrapped around this future in
+    /// the test's own task would have its own `Sleep` starved by the very budget exhaustion under
+    /// test, and would never fire.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sampler_keeps_ticking_while_the_read_future_burns_its_whole_coop_budget() {
+        const INTERVAL: Duration = Duration::from_millis(10);
+        const WINDOW: Duration = Duration::from_millis(60);
+        const WINDOWS: usize = 6;
+
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        // A real socket, so the sampler stays enabled and actually has counters to write.
+        let socket = bind_ephemeral().await;
+        let sampler = ReceiveBufferSampler::new(&socket, telemetry, Diagnostics::default());
+        let sampling =
+            tokio::spawn(sample_while(sampler, burns_its_whole_coop_budget_forever(), INTERVAL));
+
+        // Let the loop's opening `sample_once` land and throw it away: that one runs before the
+        // `select!` is ever reached, so it happens under either arm ordering and proves nothing.
+        tokio::time::sleep(WINDOW).await;
+        registry.drain(0);
+
+        let mut ticks = 0;
+        for _ in 0..WINDOWS {
+            tokio::time::sleep(WINDOW).await;
+            // A gauge is last-write-wins per drain, so its presence means "at least one sample ran
+            // in this window" -- which is the question, not how many.
+            if gauge(&registry.drain(0), "logit.input.receive_buffer.used.bytes").is_some() {
+                ticks += 1;
+            }
+        }
+        sampling.abort();
+
+        assert!(
+            ticks >= 3,
+            "the sampler must keep reporting while the read side is saturated -- that is the only \
+             time its numbers matter. Saw samples in {ticks} of {WINDOWS} windows of {WINDOW:?}, \
+             at an interval of {INTERVAL:?}; 0 means the timer arm is starved behind the read arm \
+             by the coop budget"
         );
     }
 
