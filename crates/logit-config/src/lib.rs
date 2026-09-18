@@ -2850,8 +2850,9 @@ pub struct ReceiveConfig {
     /// validates everywhere so one config file stays portable across targets. The decode-side pop
     /// batch it also sets is not platform-specific and applies everywhere.
     ///
-    /// **What it costs.** The read half owns one slab of `read_batch` x 65,507-byte slots (the
-    /// largest possible UDP payload) per listener -- 4 MiB of *address space* at the default 64,
+    /// **What it costs.** The read half owns one slab of `read_batch` x 65,507-byte slots (IPv4's
+    /// largest payload, and the size every UDP read buffer in this codebase has always been) per
+    /// listener -- 4 MiB of *address space* at the default 64,
     /// 64 MiB at the 1024 ceiling. Only the pages a datagram is actually written into are ever
     /// faulted in, so the resident cost tracks the traffic's real datagram sizes rather than the
     /// slab's virtual size (`docs/design/memory.md` has the measured figures).
@@ -2862,7 +2863,9 @@ pub struct ReceiveConfig {
     ///
     /// `0` is rejected (graph rule 18 -- no datagram could ever be read); above `1024` is rejected
     /// (graph rule 57 -- `UIO_MAXIOV`, the kernel's own ceiling on how many `iovec`s one vectored
-    /// I/O call may carry).
+    /// I/O call may carry). A `read_batch` **larger than `max_datagrams`** is deliberately legal
+    /// and needs no rule: a batch that cannot fit in the whole queue is admitted item by item under
+    /// the configured `overflow` policy, exactly as a sequence of single pushes would have been.
     pub read_batch: usize,
 }
 

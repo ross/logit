@@ -1169,7 +1169,8 @@ The `recvmmsg(2)` read half ([ADR `udp-intake-batching-and-socket-visibility`](.
 needs one receive buffer per message the syscall may return, so a UDP listener owns a slab of
 `receive.read_batch` × 65,507-byte slots (`BatchReader::slots`, `crates/logit-inputs/src/udp.rs`) —
 one allocation, made at startup, never resized, replacing the single 65,507-byte buffer the
-`recv_from` loop held. It is a fixed per-listener cost, independent of load, and the only figure in
+`recv_from` loop held (65,507 is IPv4's maximum payload; see the ADR for why the slots were not
+grown to IPv6's 65,527). It is a fixed per-listener cost, independent of load, and the only figure in
 this document where the difference between *virtual* and *resident* is the whole point:
 
 | `read_batch` | slab, virtual | resident at allocation | resident once every slot has held a small datagram | resident if every slot holds a maximum-size datagram |

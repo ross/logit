@@ -348,7 +348,7 @@ had landed, which with `max_datagrams < read_batch` and no flush timer left the 
 room while the decoder waited for an item already sitting in the queue. Fixed in W3 (notify before
 each wait), and pinned end to end from the listener's own tests rather than only from the queue's.
 
-### One `received_at` per syscall batch — a named accuracy concession
+### One `received_at` per syscall batch, offset per datagram — a named accuracy concession
 
 `decode_into`'s `received_at` parameter (ADR `decoupled-listener-io`) already means "arrival time,"
 not "decode time" — widened specifically so decode running behind arrival under backlog doesn't
@@ -357,12 +357,41 @@ datagrams no longer have individually-observable arrival instants at the point `
 them at all: the kernel doesn't report a per-message receive timestamp through this path (that would
 need `SO_TIMESTAMP`, a separate cmsg-based mechanism, per message, which reintroduces exactly the
 per-message ancillary-data cost `SO_RXQ_OVFL` was rejected for above). One `now_nanos()` call is
-made per batch, immediately after the syscall returns, and stamped on every datagram the batch
-contains. This is a real, named accuracy concession — datagrams later in a large batch are stamped
-slightly earlier than they actually arrived — bounded by how large a batch actually gets (`read_batch`
-at most, typically far fewer under normal load), and strictly better than today's alternative of
-`decode_loop`'s own clock skewing arbitrarily far behind arrival under backlog, which this
-concession does not reintroduce: the stamp is still taken at receipt (of the batch), not at decode.
+made per batch, immediately after the syscall returns, and datagram `i` of that batch is stamped
+`base + i` nanoseconds.
+
+**Exactly what that guarantees, and what it does not.** It guarantees that every datagram's stamp is
+distinct, and that stamps increase in arrival order — within a batch by construction, and across
+batches because the next batch's `base` is read only after the previous batch's per-datagram copies
+have run, which takes microseconds against offsets of at most `read_batch` nanoseconds. It does
+**not** claim the one-nanosecond spacing measures anything: the real inter-arrival gaps inside a
+batch are unknown and certainly not uniform. So this stays a named accuracy concession — datagrams
+later in a large batch are stamped earlier than they actually arrived, bounded by however long the
+batch took to accumulate — and it stays strictly better than the alternative of `decode_loop`'s own
+clock skewing arbitrarily far behind arrival under backlog, which it does not reintroduce: the stamp
+is still taken at receipt (of the batch), not at decode. Nothing here forces monotonicity across a
+backwards wall-clock step, either; `received_at` follows `SystemTime` exactly as it always has,
+because an arrival timestamp that silently stopped tracking the clock would be worse than one that
+reflects an NTP correction.
+
+**The `+ i` is not decoration, and it was not in this ADR's first draft.** A sink keyed on
+(series, timestamp) treats two points sharing both as *one* point. `influxdb_out` is the live case:
+line protocol overwrites on exactly that key, and its `allocate_timestamp` disambiguation
+(`crates/logit-outputs/src/influxdb.rs`) is cleared at the top of every `Encoder::encode` — it is
+deliberately batch-scoped, so it only ever resolves collisions *inside* one output batch. A whole
+read batch stamped with a single instant would routinely produce same-series same-timestamp points
+straddling an output-batch boundary, where nothing disambiguates them and the later silently
+overwrites the earlier. One nanosecond per datagram costs no extra clock read, is strictly ordered,
+and is orders of magnitude below the batch's own arrival uncertainty, so it removes the collision
+without pretending to precision the batch does not have.
+
+Two neighbours worth naming, because `+ i` does not fix them and is not meant to.
+**`prometheus_out`'s remote-write** encoder truncates to milliseconds and collapses same-series
+samples landing in the same millisecond, counting each dropped reading as
+`logit.output.metrics.degraded{reason="sub_ms_collapsed"}`; a nanosecond offset cannot separate
+those. **`graphite_out`** works in whole seconds, with the same answer. Neither is a new consequence
+of the batched read — a statsd datagram's own multi-value expansion already shared one timestamp
+across many points long before this ADR, which is what both mechanisms were built for.
 
 **Headers rebuilt per call, not held across an await, so the read future stays `Send`.** The
 `mmsghdr`/`iovec` arrays `recvmmsg` needs are raw-pointer-bearing C structs; building them once and
@@ -605,6 +634,18 @@ ahead of evidence this same plan is about to produce.
 - **A second Linux code path for `read_batch: 1`, avoiding `recvmmsg` for the single-datagram case.**
   Rejected — `vlen = 1` already is one datagram per syscall; a branch to avoid it buys nothing and
   doubles the code paths to test.
+- **Sizing the read slots at 65,527 bytes (IPv6's maximum payload) rather than 65,507 (IPv4's).**
+  Rejected. 65,507 is the bound every UDP listener in this codebase has always used, including the
+  `recv_from` loop `recvmmsg` replaces, so an IPv6 datagram past it was already truncated silently
+  and nothing about that behaviour changes here. Twenty extra bytes per slot is 20 x `read_batch` of
+  address space to remove a case only a deliberately-jumbo IPv6 sender produces, and it would leave
+  a `65_527` next to every other `65_507` in the codebase inviting the question forever. What the
+  batched read does add for free is *visibility*: `recvmmsg` reports `MSG_TRUNC` in each message's
+  `msg_flags`, in the same header the reader already reads `msg_len` out of, so a truncated datagram
+  is counted as `logit.input.datagrams.truncated` instead of losing bytes with nothing to show for
+  it. (Linux-only: `recv_from` gives a build on any other target no way to see it. And `msg_len`
+  alone cannot detect it — it is the *copied* length, so it reads exactly 65,507 both for a
+  truncated datagram and for one that happened to fit precisely.)
 - **Holding `mmsghdr`/`iovec` arrays across the read future's await points, reused between calls.**
   Rejected — forces either an `unsafe impl Send` or blocks compilation outright; rebuilding them
   inside the `async_io` closure each call is pure CPU with no added allocation and keeps the future
@@ -643,11 +684,12 @@ ahead of evidence this same plan is about to produce.
   exits — see "Sampling cadence" above for why this is a new select, not a third arm of either
   existing one) and, on Linux, a `BatchReader` built on `recvmmsg(2)`. `crates/logit-inputs/src/tcp.rs`
   gains a `listen_queue` sample in its accept loop.
-- Seven new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
+- Eight new metrics: `logit.input.kernel.drops`, `logit.input.receive_buffer.used.bytes`,
   `logit.input.receive_buffer.utilization`, `logit.input.accept_queue.depth`, `.limit`,
-  `.utilization` (all W1), and `logit.input.reads` (W4, the denominator that turns
-  `logit.input.datagrams` into a mean batch fill) — see `docs/design/internal-telemetry.md`'s
-  catalog.
+  `.utilization` (all W1), and `logit.input.reads` plus `logit.input.datagrams.truncated` (W4 —
+  the denominator that turns `logit.input.datagrams` into a mean batch fill, and the IPv6-only
+  oversize-datagram loss `recvmmsg`'s `MSG_TRUNC` makes visible) — see
+  `docs/design/internal-telemetry.md`'s catalog.
 - New config field `read_batch: usize` (default 64, confirmed by W4's sweep) on
   `ReceiveConfig`/`UdpListenerConfig`; new graph rule 57 (reject `read_batch > 1024`), alongside
   rule 18 (reject `0`) and rule 17 (queue-only, so rejected by name on a stream or tail listener).
