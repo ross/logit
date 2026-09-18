@@ -51,13 +51,21 @@ laptop's Zen 5 / Zen 5c split can't offer: four *identical* cores, not two kinds
 (see Consequences). 16 GiB over the 8 GiB `F4als_v6` variant costs $0.03/hr more and gives real
 headroom for a cold release build plus a warm `CARGO_HOME` and `target/`.
 
-Verified live in this subscription: unrestricted and available in `eastus` zones 1/2/3, with
-`StandardFasv6Family` quota 0/20 used and regional vCPU quota 2/20 used — room for this VM with no
-quota request.
+Default region is **`centralus`**: this subscription's `eastus` quota didn't hold up for this
+family in practice, despite `az vm list-usage` displaying the same unused `StandardFasv6Family`
+0/20 and regional 2/20 there that `centralus` and `westus2` also show — Azure's per-family display
+quota is a default placeholder, not proof the family is actually provisioned for a subscription.
+`centralus` is verified to have the `13-gen2` Debian image and a 0/20 `StandardFasv6Family` /
+0/20 regional vCPU reading; `westus2` reads the same and is the documented fallback
+(`LOGIT_VM_LOCATION=westus2`) if `centralus` also turns out not to hold up. Either way, a create
+that fails with a quota or `SkuNotAvailable` error despite `check_quota` passing means the display
+number wasn't the real answer — the fix is trying the other region, a different zone
+(`LOGIT_VM_ZONE`), or an actual quota-increase request in the Azure portal, not a `script/vm` bug.
 
 ### Debian 13 (gen2), pinned by version for real comparisons, and no in-place upgrade
 
-`Debian:debian-13:13-gen2:latest` — verified present in `eastus`, gen2 as the size requires.
+`Debian:debian-13:13-gen2:latest` — verified present in `centralus` (and `eastus`, `westus2`),
+gen2 as the size requires.
 `script/vm-cloud-init.yaml` sets `package_update: true` but **`package_upgrade: false`**: an
 in-place upgrade would make the kernel and libc a function of which day the VM happened to be
 created, which is exactly the nondeterminism this machine exists to remove, and would ask for a
@@ -275,6 +283,7 @@ set, and every subcommand prints the resolved subscription first.
 - **Nothing here runs in CI.** CI has no Azure credentials, and this workflow costs real money —
   entirely consistent with `script/bench`/`script/perf` already being excluded from
   `script/cibuild` for the same "measures the runner, not the code" reason.
-- **Cost**: ~$0.305/hour running (VM + 128 GiB Premium SSD + the static IP), $0 once `down`
+- **Cost**: ~$0.34/hour running in `centralus` (VM $0.309 + 128 GiB Premium SSD ~$0.027 + the
+  static IP ~$0.005), $0 once `down`
   completes. A `Makefile` `vm` target defaults its bare form to `status` (read-only) rather than
   `up`, so `make vm` can't accidentally start spending.

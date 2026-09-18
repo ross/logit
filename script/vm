@@ -40,13 +40,13 @@ usage() {
 # subscription first so it's never a surprise.
 LOGIT_VM_SUBSCRIPTION="${LOGIT_VM_SUBSCRIPTION:-}"
 
-LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-eastus}"
+LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-centralus}"
 LOGIT_VM_ZONE="${LOGIT_VM_ZONE:-1}"
 # 4 vCPU = 4 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
 LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F4as_v6}"
-# gen2 only for this series; verified present in eastus. Pin an explicit version instead of
-# `latest` to compare across sessions -- logit-vm-metadata.txt records whichever version
-# `latest` actually resolved to.
+# gen2 only for this series; verified present in centralus (and eastus, westus2). Pin an
+# explicit version instead of `latest` to compare across sessions -- logit-vm-metadata.txt
+# records whichever version `latest` actually resolved to.
 LOGIT_VM_IMAGE="${LOGIT_VM_IMAGE:-Debian:debian-13:13-gen2:latest}"
 # The image default (30 GiB) doesn't fit rust:1.98.1-bookworm + logit-dev:local + a warm
 # CARGO_HOME + a release target/.
@@ -75,9 +75,9 @@ LOGIT_VM_REPO_REF="${LOGIT_VM_REPO_REF:-main}"
 LOGIT_VM_SSH_KEY="${LOGIT_VM_SSH_KEY:-${HOME}/.ssh/logit-perf-vm}"
 LOGIT_VM_KNOWN_HOSTS="${LOGIT_VM_KNOWN_HOSTS:-${HOME}/.ssh/logit-perf-vm.known_hosts}"
 
-# VM + 128GiB Premium SSD + a Standard static public IP, eastus PAYG Linux -- for status's
+# VM + 128GiB Premium SSD + a Standard static public IP, centralus PAYG Linux -- for status's
 # running-cost line. A rough nag, not a bill.
-LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.305}"
+LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.34}"
 
 VNET="${LOGIT_VM_RESOURCE_GROUP}-vnet"
 SUBNET="${LOGIT_VM_RESOURCE_GROUP}-subnet"
