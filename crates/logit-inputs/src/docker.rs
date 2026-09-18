@@ -1129,6 +1129,16 @@ mod tests {
             r#"{"Name":"/after","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
+        // Give a poll tick a chance to refresh the identity *before* the next line exists to
+        // read: identity refresh only ever happens on a `scan` (`Tailer::refresh_identity`), but
+        // `drain` -- the thing that actually decodes a line -- runs on every loop iteration,
+        // including one driven by the (equally 15ms) flush timer rather than the poll timer. A
+        // line written immediately after the rewrite, with no gap, can race a flush-driven drain
+        // that reads it before the next poll-driven scan has refreshed anything, and get decoded
+        // under the stale identity -- not a production bug (identity refresh is documented as
+        // bounded by `poll_interval`, not "as of the very next byte"), but this test's own
+        // assertion needs the refresh to have already landed.
+        tokio::time::sleep(Duration::from_millis(60)).await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
@@ -1201,6 +1211,12 @@ mod tests {
             r#"{"Name":"/recovered","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
+        // Give a poll tick a chance to refresh the identity before the next line exists to read
+        // -- see the identically-shaped sleep and comment in
+        // `a_rewritten_config_v2_json_changes_the_name_on_a_fresh_batch_boundary` above for why
+        // this is needed: a flush-driven `drain` can otherwise decode this line before the next
+        // poll-driven `scan` has refreshed anything.
+        tokio::time::sleep(Duration::from_millis(60)).await;
         std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
