@@ -212,13 +212,22 @@
 //! taken, and requests decode through the stateless [`remote_write::decode`] exactly as they did
 //! before this existed. Rule 55 rejects `ttl: 0s`, which would be the pointless version of that.
 //!
-//! **Concurrency.** One `Mutex` guards the table, taken to build the seed and taken again to learn,
-//! **never held across the decode** -- a connection's requests are served concurrently and the
-//! decode is the expensive part. The seed handed to the codec is an `Arc` of the table in the
-//! codec's own shape, rebuilt only when the table actually changes, so the overwhelmingly common
-//! request -- one that carries samples and declares nothing -- costs a lock, a sweep and a refcount
-//! bump rather than a copy of every remembered family. A request that declares nothing does not
-//! take the lock a second time at all.
+//! **Concurrency, and what a request actually pays.** One `std::sync::Mutex` guards the table,
+//! taken to build the seed and taken again to learn, **never held across the decode** -- a
+//! connection's requests are served concurrently and the decode is the expensive part. A blocking
+//! mutex parks the Tokio worker thread of anyone waiting on it, so the rule here is that the held
+//! section is `O(1)` unless something really changed:
+//!
+//! - the seed handed to the codec is an `Arc` of the table in the codec's own shape, rebuilt only
+//!   when the table's *contents* change -- re-declaring what is already remembered (which is what
+//!   Prometheus does every `send_interval`, from every shard) touches `last_seen` and nothing else;
+//! - the expiry sweep is *checked* per request, not performed: the table carries the earliest
+//!   instant at which any entry could go, so until then expiry costs one comparison;
+//! - a request that declares nothing -- nearly every 1.0 request -- does not take the lock a second
+//!   time at all.
+//!
+//! So a sample-only request pays a lock, a comparison and a refcount bump, and the passes that
+//! scale with what is remembered happen only when an entry is really added, retyped or expired.
 //!
 //! ## Size, concurrency, and shutdown
 //!
@@ -833,6 +842,12 @@ struct MetadataCache {
     max_families: usize,
     ttl: Duration,
     state: Mutex<CacheState>,
+    /// Test-only: how many times the expiry sweep has actually walked the table. Not otherwise
+    /// observable -- a sweep that expires nothing leaves behind no counter and no rebuild -- and
+    /// "a sample-only request does not sweep" is the property [`CacheState::next_expiry`] exists
+    /// for.
+    #[cfg(test)]
+    sweeps: std::sync::atomic::AtomicU64,
 }
 
 /// Everything behind the one lock. `families` is authoritative; `seed` is the same content in the
@@ -843,9 +858,35 @@ struct MetadataCache {
 struct CacheState {
     families: HashMap<String, CachedFamily>,
     seed: Arc<remote_write::Declarations>,
+    /// The earliest instant at which *any* entry could have expired, and `None` when the table is
+    /// empty -- what lets a request that declares nothing skip the sweep entirely.
+    ///
+    /// A **lower bound**, never an over-estimate, which is the whole of its correctness: a sweep
+    /// skipped because `now` has not reached this cannot have missed an expiry. Every sweep
+    /// recomputes it exactly; a learn only ever *lowers* it, because an entry whose `last_seen`
+    /// moves forward can only expire later than this said it would. Cap eviction may leave it
+    /// early, which costs one sweep that finds nothing and recomputes.
+    next_expiry: Option<Instant>,
 }
 
 impl CacheState {
+    /// Recomputes [`CacheState::next_expiry`] exactly, from every entry still in the table. One
+    /// pass, and only ever from a sweep -- which has just made one anyway.
+    fn recompute_expiry(&mut self, ttl: Duration) {
+        self.next_expiry =
+            self.families.values().filter_map(|family| family.last_seen.checked_add(ttl)).min();
+    }
+
+    /// Lowers [`CacheState::next_expiry`] to account for an entry that will expire at `now + ttl`.
+    /// Never raises it: a stale-early watermark costs one sweep, a stale-late one loses an expiry.
+    fn note_expiry(&mut self, now: Instant, ttl: Duration) {
+        let Some(expires_at) = now.checked_add(ttl) else { return };
+        self.next_expiry = Some(match self.next_expiry {
+            Some(earliest) => earliest.min(expires_at),
+            None => expires_at,
+        });
+    }
+
     /// The table in the codec's own shape. The family names are copied (a `Declarations` owns its
     /// keys); the descriptions, which are the bulk of it, are `Arc` clones.
     fn rebuild_seed(&mut self) {
@@ -875,17 +916,37 @@ fn bounded_text(text: &Option<Arc<str>>) -> (Option<Arc<str>>, bool) {
 
 impl MetadataCache {
     fn new(max_families: usize, ttl: Duration) -> Self {
-        MetadataCache { max_families, ttl, state: Mutex::new(CacheState::default()) }
+        MetadataCache {
+            max_families,
+            ttl,
+            state: Mutex::new(CacheState::default()),
+            #[cfg(test)]
+            sweeps: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Expires what the TTL has run out on, then hands back the table to decode this request
     /// against. Counted `logit.input.metadata_cache.evicted{reason="expired"}`.
     ///
-    /// The sweep is per request rather than on a timer of its own: this input has no clock task,
-    /// and a receiver that is not being written to has nothing to spend memory on either way. It is
-    /// one allocation-free pass over a table an operator capped.
+    /// Expiry is checked per request rather than on a timer of its own -- this input has no clock
+    /// task, and a receiver nothing is writing to has nothing to spend memory on either way -- but
+    /// it is *checked*, not performed: [`CacheState::next_expiry`] says when the first entry could
+    /// possibly go, so until then this is one comparison and a refcount bump. A pass over the whole
+    /// table on every request would be a cost that scales with what is remembered rather than with
+    /// the request, which is exactly the shape the seed is an `Arc` to avoid.
     fn seed(&self, now: Instant, telemetry: &Telemetry) -> Arc<remote_write::Declarations> {
         let mut state = self.lock();
+        if state.next_expiry.is_some_and(|earliest| now > earliest) {
+            self.sweep(&mut state, now, telemetry);
+        }
+        Arc::clone(&state.seed)
+    }
+
+    /// One pass, dropping every entry the TTL has run out on and recomputing the watermark from
+    /// what is left. Allocation-free; the rebuild below it happens only if something actually went.
+    fn sweep(&self, state: &mut CacheState, now: Instant, telemetry: &Telemetry) {
+        #[cfg(test)]
+        self.sweeps.fetch_add(1, Ordering::Relaxed);
         let ttl = self.ttl;
         let mut expired = 0u64;
         state.families.retain(|_, family| {
@@ -893,12 +954,12 @@ impl MetadataCache {
             expired += u64::from(stale);
             !stale
         });
+        state.recompute_expiry(ttl);
         if expired > 0 {
             telemetry.count(METADATA_CACHE_EVICTED, expired as f64, &[("reason", "expired")]);
             state.rebuild_seed();
             telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
         }
-        Arc::clone(&state.seed)
     }
 
     /// Folds one request's own declarations in -- the newest statement about a family wins, and a
@@ -920,6 +981,11 @@ impl MetadataCache {
         let mut state = self.lock();
         let mut replaced = 0u64;
         let mut truncated = 0u64;
+        // Whether the *seed* has to be rebuilt -- which a re-declaration of what is already
+        // remembered does not. Prometheus re-sends a family's metadata every `send_interval` from
+        // every shard, so "identical to what is already there" is the common case, and rebuilding
+        // for it would copy the whole table under the lock once a minute per shard.
+        let mut changed = false;
         for (name, declaration) in declarations.iter() {
             // Bounded on the way in, not on the way out: what is remembered is what outlives the
             // request, and the request's own cap does not bound a table that keeps entries.
@@ -933,10 +999,15 @@ impl MetadataCache {
                         // mind. Either way the newest statement is the one to keep -- the alternative
                         // is typing a live sender's series from a declaration nothing has repeated.
                         replaced += 1;
+                        changed = true;
+                    } else if existing.help != help || existing.unit != unit {
+                        changed = true;
                     }
                     existing.kind = declaration.kind;
                     existing.help = help;
                     existing.unit = unit;
+                    // Touched whether or not anything else moved: the TTL measures how long ago a
+                    // sender last said this, and it just said it again.
                     existing.last_seen = now;
                 }
                 None => {
@@ -944,6 +1015,7 @@ impl MetadataCache {
                         name.to_string(),
                         CachedFamily { kind: declaration.kind, help, unit, last_seen: now },
                     );
+                    changed = true;
                 }
             }
         }
@@ -953,9 +1025,15 @@ impl MetadataCache {
         if truncated > 0 {
             telemetry.count(METADATA_CACHE_TRUNCATED, truncated as f64, &[]);
         }
-        self.enforce_cap(&mut state, telemetry);
-        state.rebuild_seed();
-        telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+        changed |= self.enforce_cap(&mut state, telemetry);
+        // Every entry this touched expires at `now + ttl` at the latest, which can only be later
+        // than whatever the table already held -- unless it was empty, which is the case this is
+        // here for.
+        state.note_expiry(now, self.ttl);
+        if changed {
+            state.rebuild_seed();
+            telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+        }
     }
 
     /// Evicts least-recently-seen families until at most `max_families` remain, in **one pass over
@@ -967,10 +1045,10 @@ impl MetadataCache {
     /// The tie-break past `last_seen` is the family's own name, so which of two families declared
     /// in one request goes is a function of the data rather than of `Instant` resolution or map
     /// iteration order.
-    fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) {
+    fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) -> bool {
         let total = state.families.len();
         if total <= self.max_families {
-            return;
+            return false;
         }
         let excess = total - self.max_families;
         let mut candidates: Vec<(Instant, &str)> =
@@ -985,6 +1063,9 @@ impl MetadataCache {
             state.families.remove(&name);
         }
         telemetry.count(METADATA_CACHE_EVICTED, excess as f64, &[("reason", "cardinality")]);
+        // The watermark may now point at an entry that is gone -- the oldest are exactly the ones
+        // evicted -- which costs one sweep that finds nothing and recomputes it.
+        true
     }
 
     /// The lock, unpoisoned. Nothing here can panic while it is held -- the body is map operations
@@ -3726,5 +3807,65 @@ mod tests {
             Some(1.0),
             "one string cut, not one entry"
         );
+    }
+
+    /// Prometheus re-sends a family's metadata every `send_interval`, from every shard, so
+    /// "identical to what is already remembered" is the common write. Rebuilding the seed for it
+    /// would copy the whole table under the lock on every one -- so the seed handed out must be the
+    /// *same* `Arc`, which is the only way to observe that no rebuild happened.
+    #[test]
+    fn re_declaring_what_is_already_remembered_does_not_rebuild_the_seed() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+        let declaration = declarations(&[("foo", FamilyType::Counter)]);
+
+        cache.learn(&declaration, start, &telemetry);
+        let first = cache.seed(start, &telemetry);
+
+        cache.learn(&declaration, start + Duration::from_secs(60), &telemetry);
+        let second = cache.seed(start + Duration::from_secs(60), &telemetry);
+        assert!(Arc::ptr_eq(&first, &second), "nothing changed, so nothing was rebuilt");
+
+        // A declaration that really says something new does rebuild.
+        cache.learn(
+            &declarations(&[("foo", FamilyType::Gauge)]),
+            start + Duration::from_secs(120),
+            &telemetry,
+        );
+        let third = cache.seed(start + Duration::from_secs(120), &telemetry);
+        assert!(!Arc::ptr_eq(&second, &third), "a retype is a change");
+    }
+
+    /// The expiry sweep is checked per request, not performed: until the earliest entry could
+    /// possibly have expired there is nothing to find, and walking the table anyway would be a
+    /// per-request cost that scales with what is remembered. Only the sweep's own counter can see
+    /// this -- one that finds nothing leaves no counter and no rebuild behind.
+    #[test]
+    fn a_request_before_the_watermark_does_not_sweep() {
+        use std::sync::atomic::Ordering;
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+
+        // An empty table has no earliest expiry at all, so not even the first request sweeps.
+        let _ = cache.seed(start, &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 0);
+
+        cache.learn(&declarations(&[("foo", FamilyType::Counter)]), start, &telemetry);
+        for seconds in [1, 60, 599, 600] {
+            let _ = cache.seed(start + Duration::from_secs(seconds), &telemetry);
+        }
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 0, "nothing could have expired yet");
+
+        // Past it, once -- and the watermark it recomputes is `None`, the table now being empty.
+        let seed = cache.seed(start + Duration::from_secs(601), &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1);
+        assert!(seed.is_empty());
+        let _ = cache.seed(start + Duration::from_secs(3_600), &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1, "an empty table has nothing to sweep");
     }
 }
