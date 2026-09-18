@@ -47,7 +47,7 @@ Prometheus's own sender ships in its own requests, decoupled from the samples th
 Remote-write 2.0
 ([`prometheus.io/docs/specs/remote_write_spec_2_0`](https://prometheus.io/docs/specs/remote_write_spec_2_0/))
 is `io.prometheus.write.v2.Request`: an interned symbol table with every label name, label value,
-help and unit string referenced by index, `Metadata` inline on each series, a `created_timestamp`
+help and unit string referenced by index, `Metadata` inline on each series, a `start_timestamp`
 per sample, native histograms, and a response contract that reports what the receiver actually
 wrote. The two share a transport — `POST`, protobuf body, Snappy **block** compression, a required
 `User-Agent` — and differ in `Content-Type` and the `X-Prometheus-Remote-Write-Version` header:
@@ -59,7 +59,7 @@ wrote. The two share a transport — `POST`, protobuf body, Snappy **block** com
 | `X-Prometheus-Remote-Write-Version` | `0.1.0` | `2.0.0` |
 | `Content-Encoding` | `snappy` | `snappy` |
 | Metadata | separate `WriteRequest.metadata[]`, own requests | inline `Metadata` per series |
-| Created timestamp | none | `Sample.created_timestamp` / `Histogram.created_timestamp` |
+| Start timestamp | none | `Sample.start_timestamp` (field 3) / `Histogram.start_timestamp`, ms, `0` = unset |
 | Response on 2xx/4xx | body ignored | `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` |
 
 Decisions settled with Ross (2026-09-17) and recorded in full in
@@ -89,6 +89,16 @@ and rule 53's shape (`handshake_timeout` and `idle_timeout` on a UDP listener), 
 the same reason: a setting silently doing nothing is worse than a startup failure naming it.
 `interval` keeps its default in bind mode so rule 9's `interval: 0s` rejection stays satisfied
 without a mode-specific carve-out.
+
+**Rule 40's body becomes scrape-mode-only.** It is the rule that today makes bind mode
+unreachable, not rule 9: it runs over every `PrometheusIn` and bails when `scrape_targets` is empty
+(`crates/logit-pipeline/src/graph.rs:1818-1826`, *"'scrape_targets' must name at least one scrape
+URL"*), and its `timeout: 0s` check, its header validation, and its "TLS settings with no `https`
+target" check (`:1854-1856`, bound to the very field this ADR renames `scrape_tls`) are all
+statements about a scrape that bind mode never performs. So rule 40 runs only when
+`scrape_targets` is non-empty, and rule 55 owns everything about the mode itself: the
+exactly-one-of check, and the wrong-mode-field checks in both directions. Two rules, one gate
+each — rather than rule 40 silently acquiring a second job.
 
 **`prometheus_in`'s `tls:` is renamed `scrape_tls:`.** One kind now has two TLS-shaped roles —
 client TLS for outbound scrapes, server TLS for the inbound receiver — and a bare `tls:` next to a
@@ -195,6 +205,13 @@ transport that mandates one is not that choice. Setting it would make a remote-w
 relay stamp an explicit timestamp on *every* line it writes, which no scrape of that same data would
 have produced.
 
+Suppressing the marker takes a decoder-side switch, because the marker is not the receiver's to
+omit today: `families_to_events` inserts `prometheus.timestamp: true` whenever `Series.timestamp`
+is `Some` (`crates/logit-proto/src/prometheus/mod.rs:454-459`), and on this transport it always is.
+`PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly today's
+behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still set from
+the sample, only the marker attribute is omitted.
+
 The sender goes the other way and **always emits a timestamp**, via
 `PrometheusEncoder::with_timestamps_always(true)`, because the wire has no way to omit one. Net:
 remote-write → remote-write is a fixed point on timestamps, and remote-write → exposition is an
@@ -225,13 +242,20 @@ text writer skips a `Stale` point and counts it. The `prometheus_fixed_point.rs`
 stays free of `Stale`, so property 1 (whole-value `PartialEq` round trip) still holds under the
 default encoder, and `Stale` gets its own dedicated test with the switch on.
 
-### 2.0's `created_timestamp` ↔ `Series.created`, and exemplars both ways
+### 2.0's `start_timestamp` ↔ `Series.created`, and exemplars both ways
 
-2.0's `created_timestamp` maps to `Series.created` and through to
-`MetricRecord::start_timestamp` — the same field the OpenMetrics `_created` series already
-populates, so a counter's start time survives `_created` → remote-write 2.0 → `_created` unchanged.
-1.0 has no equivalent field; a 1.0 relay drops it, which is the version's own limitation, not a
-mapping choice.
+2.0 carries the created timestamp **per sample**: `Sample.start_timestamp` (field 3, milliseconds,
+`0` meaning unset) and `Histogram.start_timestamp`, in the Prometheus v3.14.0
+`prompb/io/prometheus/write/v2/types.proto` this work vendors. `TimeSeries` field 6 — where the 2.0
+spec's own prose once put a series-level `created_timestamp` — is `reserved` in that proto, and no
+`Sample.created_timestamp` exists; the per-sample placement is the one to build against. It is also
+the easier one: because the field rides on the sample, the cross-group merge of identical label
+sets into one `TimeSeries` has no created-timestamp collision to resolve.
+
+It maps to `Series.created` and through to `MetricRecord::start_timestamp` — the same field the
+OpenMetrics `_created` series already populates, so a counter's start time survives `_created` →
+remote-write 2.0 → `_created` unchanged. 1.0 has no equivalent field; a 1.0 relay drops it, which
+is the version's own limitation, not a mapping choice.
 
 Exemplars map through the existing `Exemplar` conversion in both directions, including the
 `trace_id`/`span_id` label consumption into a `TraceRef`. The sender emits them on counter and
@@ -285,9 +309,10 @@ request through `remote_write::encode`, Snappy-block-compresses it with `snap::r
 `POST`s it. **An empty batch sends no request at all**, rather than an empty `WriteRequest`. Four
 protocol headers — `Content-Type`, `Content-Encoding`, `X-Prometheus-Remote-Write-Version`,
 `User-Agent` — are `insert`ed *over* a clone of the operator's `headers:` map, the same merge order
-`otlp_out` uses, so a protocol-owned name always wins; those four are also on
-`RESERVED_REMOTE_WRITE_HEADERS`, rejected at config time by rule 56 rather than silently overridden
-at runtime.
+`otlp_out` uses, so a protocol-owned name always wins. `RESERVED_REMOTE_WRITE_HEADERS` is those
+four plus `content-length`, which the client sets itself — five names, the same shape
+`RESERVED_PROMETHEUS_HEADERS` already takes — and rule 56 rejects any of them at config time rather
+than letting the sink silently override an operator's value at runtime.
 
 **The sink does not retry.** One `send` is one attempt; retry is `write_loop`'s job, and the sink's
 only contribution is classifying the outcome into a `Fault`, exactly as `otlp_out` does:
@@ -407,9 +432,10 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
 - **`prometheus_in`'s `tls:` key is gone**, renamed `scrape_tls:`. Pre-release, so no alias and no
   deprecation window; the config, `crates/logit-cli/src/pipeline.rs`'s arm, the input's module doc,
   and this pair's ADR and plan prose all move together.
-- **`Point` gains a `Stale` variant and `PrometheusEncoder` two builder switches**
-  (`with_stale_markers`, `with_timestamps_always`), both defaulting off, so the exposition path's
-  behaviour and its fixed-point properties are unchanged by their existence.
+- **`Point` gains a `Stale` variant, `PrometheusEncoder` two builder switches**
+  (`with_stale_markers`, `with_timestamps_always`, both defaulting off) **and `PrometheusDecoder`
+  one** (`with_timestamp_marker`, defaulting on). Every default is today's behaviour, so the
+  exposition path and its fixed-point properties are unchanged by their existence.
 - **The flat-sample assembler is shared, not duplicated.** `text.rs` shrinks to text syntax;
   `assemble.rs` owns family assembly for both syntaxes, and a third one would reuse it as-is.
 - **`logit-proto` grows a second vendored proto family and a second generated tree**, and

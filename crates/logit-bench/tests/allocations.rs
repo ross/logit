@@ -572,14 +572,18 @@ fn remote_write_decode_one_request_v1() {
         measure(|| decode(&body, Version::V1, &mut decoder).expect("fixture must decode"));
     assert_eq!(decoded.samples, 100);
     assert_eq!(decoded.groups.len(), 1, "one timestamp, one group");
-    expect_allocs("prometheus_in: decode 1 remote-write 1.0 request (100 series)", stats, 1525);
+    expect_allocs("prometheus_in: decode 1 remote-write 1.0 request (100 series)", stats, 1526);
 }
 
-/// The same request in 2.0, which costs *more* to decode rather than less (1624 against 1525) even
-/// though the body is smaller. The symbol table saves bytes on the wire, not allocations on the way
-/// in: every label pair still becomes an owned `String` pair, because `MetricFamily` holds owned
-/// labels, and 2.0 adds a resolution step per series on top. The wire-size win is real and the
-/// allocation win is not -- worth knowing before reading 2.0 as strictly cheaper.
+/// The same request in 2.0: 1428 against 1.0's 1526, so the symbol table pays for itself on the way
+/// in as well as on the wire. Both versions build the same owned `String` label pairs for the model
+/// -- `MetricFamily` holds owned labels -- so the difference is upstream of this codec, in what
+/// prost has to materialize: 1.0 decodes a `Label { name, value }` pair per label per series (~200
+/// `String`s here), 2.0 decodes the symbol table once (~105) and `labels_refs` as plain `u32`s.
+///
+/// The per-series `Metadata` 2.0 repeats on every one of a family's series costs nothing extra,
+/// because declarations are deduplicated by family name before any group opens -- without that,
+/// this row was 1624 and every repeat also counted a bogus `duplicate_metadata`.
 #[test]
 fn remote_write_decode_one_request_v2() {
     use logit_proto::prometheus::remote_write::{decode, Version};
@@ -592,7 +596,7 @@ fn remote_write_decode_one_request_v2() {
         measure(|| decode(&body, Version::V2, &mut decoder).expect("fixture must decode"));
     assert_eq!(decoded.samples, 100);
     assert_eq!(decoded.groups.len(), 1, "one timestamp, one group");
-    expect_allocs("prometheus_in: decode 1 remote-write 2.0 request (100 series)", stats, 1624);
+    expect_allocs("prometheus_in: decode 1 remote-write 2.0 request (100 series)", stats, 1428);
 }
 
 /// `generate_in`'s **prototype** render path: no placeholder anywhere in the template, so one
@@ -2926,7 +2930,8 @@ fn remote_write_encode_100_series_v1() {
 /// once instead of being repeated inline: a smaller body for more bookkeeping, and the bookkeeping
 /// is what this pair prices. 1434 against 1.0's 1223 -- the extra ~2/series is the symbol table's
 /// owned-`String` key per distinct value, which for this fixture's `shard` labels is one per
-/// series by construction.
+/// series by construction. Note this is the opposite sign to the decode pair above, where 2.0
+/// wins: interning costs the sender and saves the receiver.
 #[test]
 fn remote_write_encode_100_series_v2() {
     use logit_proto::prometheus::remote_write::{encode, Version};
