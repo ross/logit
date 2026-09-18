@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-13
+updated: 2026-09-18
 ---
 
 # Recorded interop fixtures: real producers, captured once, replayed as tests forever
@@ -322,3 +322,46 @@ re-record. One of them (`interop_fixture_python_syslog_handler_json_body_is_clea
 goes one step further and round-trips the decoded message through `serde_json::from_str`, which is
 the actual empirical check that `NoNulSysLogHandler`'s fix still holds against Python's real
 handler output today, not just against a hand-typed literal shaped like it.
+
+## Amendment (2026-09-18): statsd/DogStatsD, recorded
+
+A **seventh producer** landed with W2 of [`docs/plans/udp-intake.md`](udp-intake.md), closing the
+"statsd/DogStatsD producer fixtures" item this document has named as owed future work in three
+separate places since it was written: `testdata/interop/statsd/`, 56 UDP datagrams, ~12 KB, from two
+real clients — Datadog's own `datadog` package (`DogStatsd`) and the plain-statsd `statsd` package
+(`StatsClient`), each in a buffered and an unbuffered mode over one shared app-like workload.
+`script/record-fixtures statsd` records them through the existing `raw_capture.py --proto udp` sink;
+that directory's README carries the provenance table and what was measured out of it.
+`crates/logit-inputs/src/statsd.rs` gains four `interop_fixture_*` tests over them.
+
+Two things about this producer are worth naming here rather than only in its own README:
+
+- **It is the first `pip install` in `script/record-fixtures`.** Every earlier producer either ran a
+  stock image as-is or `apt-get install`ed the real Debian package at record time; the two Python
+  producers before this one needed only the stdlib. `python:3.12-slim` has pip and network already,
+  so this is the same "install the real third-party software fresh, print its resolved version"
+  shape rather than a new capability — and it has the same consequence: a re-record picks up
+  whatever version is current, and the provenance table has to be updated from the producer's own
+  first line of output rather than assumed.
+- **What it records is *packing*, not grammar.** `crates/logit-cli/tests/fixtures/statsd/` already
+  holds 40 hand-written line/expectation pairs covering the grammar. What those can't cover, because
+  this team wrote them, is where a real client cuts a buffer, how long its names get, and how many
+  tags it hangs off a line. That is why there are four captures of one workload rather than one
+  capture of four workloads, and it is why this corpus does double duty as the calibration ground
+  truth for [`perf/load/README.md`](../../perf/load/README.md)'s traffic model. The capture answered
+  a question the model could otherwise only have guessed at — both clients pack to *their own*
+  buffer size (1,432 B and 512 B), not to an MTU, and neither ever splits a line.
+
+One thing it deliberately did *not* settle, recorded here because a later reader will want to know:
+the **metric-type mix** in this capture (`c` 43 / `ms` 22 / `g` 21 / `h` 14 / `d` 13 / `s` 7 across
+120 lines) is a property of the producer script's synthetic workload, not of production traffic. A
+fixture corpus recorded from a client this team drives can calibrate wire *shape*; it cannot
+calibrate what a real application chooses to measure. `perf/load/README.md` says so where it picks
+its own type weights instead.
+
+The remaining follow-on list is unchanged and now one item shorter: syslog-ng, Docker json-file
+cross-version fixtures, and `logit_in`/`logit_out` cross-version compatibility fixtures are still not
+started. DogStatsD events (`_e{...}`) and service checks (`_sc|...`) are *newly* named as uncovered —
+neither client's high-level API emits them in an ordinary application workload, so a capture would
+need a producer written specifically for them; see `testdata/interop/statsd/README.md`'s own "what
+isn't covered here (yet)" section for the rest.

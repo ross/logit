@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
 #   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
-#              prometheus
+#              prometheus, statsd
 #   With no arguments, records every producer in `all` below.
 #
 # Captures real wire traffic from real third-party producers (syslog senders, OTel SDKs) into
@@ -438,9 +438,55 @@ record_prometheus() {
     PROM_CFG_DIR=""
 }
 
+# statsd/DogStatsD, from the two clients an application actually reaches for: Datadog's own
+# `datadog` package (`DogStatsd`) and the plain-statsd `statsd` package (`StatsClient`). Closes
+# `docs/plans/recorded-interop-fixtures.md`'s long-standing "statsd/DogStatsD producer fixtures"
+# gap, and is the ground truth `perf/load/README.md`'s traffic model is calibrated against
+# (`docs/plans/udp-intake.md`'s W2).
+#
+# **Four captures, not one**, because the property this corpus is being asked for is *datagram
+# packing*, and each client decides it differently:
+#   statsd-dogstatsd-unbuffered  one metric per datagram -- the syscall-bound shape
+#   statsd-dogstatsd-buffered    the same client's own send buffer deciding where to cut
+#   statsd-plain-unbuffered      StatsClient, one metric per datagram, tagless dialect
+#   statsd-plain-pipeline        StatsClient's `pipeline()` batching, its own 512 B cut
+# All four run the *same* app-like workload (see python_statsd_producer.py's docstring), so the
+# difference between the files is the client's packing and nothing else.
+#
+# First `pip install` in this script: `python:3.12-slim` has pip and network already, so this is
+# the Python twin of the `apt-get install` the rsyslog/collectd producers do, not a new capability.
+# The resolved version prints on stdout (the producer's own first line) for
+# testdata/interop/statsd/README.md's provenance table.
+#
+# Counts are deliberately well under what each mode actually sends -- an unbuffered mode emits a
+# couple of hundred datagrams for 40 rounds and a buffered one a dozen-plus, so capturing 24/4
+# stops early rather than racing the producer. `raw_capture.py` fails a *short* capture, never a
+# truncated one, which is the direction that keeps a partial fixture set out of the tree.
+record_statsd() {
+    local out="${OUT_ROOT}/statsd"
+    # prefix:client:mode:count
+    for spec in \
+        "statsd-dogstatsd-unbuffered:dogstatsd:unbuffered:24" \
+        "statsd-dogstatsd-buffered:dogstatsd:buffered:4" \
+        "statsd-plain-unbuffered:statsd:plain:24" \
+        "statsd-plain-pipeline:statsd:pipeline:4"; do
+        local prefix client mode count package
+        IFS=: read -r prefix client mode count <<<"${spec}"
+        if [ "${client}" = "dogstatsd" ]; then package="datadog"; else package="statsd"; fi
+        echo "== recording: ${client} (${mode}), python:3.12-slim + pip install ${package} =="
+        start_capture udp 8125 "${out}" "${prefix}" "${count}"
+        ${DOCKER} run --rm --network "${NET}" \
+            -v "${TOOLS_DIR}/python_statsd_producer.py:/producer/run.py:ro,z" \
+            -w /producer python:3.12-slim \
+            bash -c "python3 --version && pip install --quiet --disable-pip-version-check ${package} \
+                && python3 run.py --host capture --port 8125 --client ${client} --mode ${mode}"
+        finish_capture
+    done
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus statsd)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -460,6 +506,7 @@ for p in "${producers[@]}"; do
     otlp) record_otlp ;;
     graphite) record_graphite ;;
     prometheus) record_prometheus ;;
+    statsd) record_statsd ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2
         exit 1

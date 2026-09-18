@@ -1,8 +1,9 @@
 # Recorded interop fixtures
 
 Real wire traffic captured once from real third-party producers (syslog senders, collectd, OTel
-SDKs, carbon senders, Prometheus) and committed here, so `logit`'s decoders
-(`crates/logit-inputs/src/syslog.rs`, `crates/logit-proto/src/collectd/`,
+SDKs, carbon senders, Prometheus, statsd/DogStatsD clients) and committed here, so `logit`'s
+decoders (`crates/logit-inputs/src/syslog.rs`, `crates/logit-inputs/src/statsd.rs`,
+`crates/logit-proto/src/collectd/`,
 `crates/logit-proto/src/otlp/`, `crates/logit-proto/src/graphite/`,
 `crates/logit-proto/src/prometheus/remote_write.rs`) get checked against what those producers
 actually put on the wire -- not only against this team's own reading of RFC 3164/5424, collectd's
@@ -37,6 +38,13 @@ testdata/interop/
   prometheus/*.headers -- one sidecar per body, holding that request's method, path and request
                           headers -- which is what carries the `Content-Type` and
                           `X-Prometheus-Remote-Write-Version` the wire version is read from
+  statsd/README.md     -- provenance table for statsd/*.raw
+  statsd/*.raw         -- raw captured UDP datagrams from two real statsd clients (Datadog's
+                          `datadog` package and the plain-statsd `statsd` package), each in a
+                          buffered and an unbuffered mode over one shared workload, one file per
+                          datagram -- the corpus that records how a real client *packs* metrics,
+                          which the hand-written grammar fixtures under
+                          `crates/logit-cli/tests/fixtures/statsd/` deliberately don't
 ```
 
 `syslog/*.raw`/`collectd/*.raw`/`graphite/*.raw`, `otlp/*.json` and `prometheus/*.bin` are captured
@@ -51,10 +59,11 @@ subdirectory's own README for the rest.
 producer list and how to add one. Like `script/protogen` and `testdata/tls/regen.sh`, this is a
 **deliberate, reviewed act**, not part of `script/cibuild`: it pulls real third-party images from
 Docker Hub/ghcr.io and runs them against the internet-facing package mirrors those images
-themselves use (the `rsyslog` and `collectd` producers in particular each do a fresh `apt-get
-install` every run), which is exactly the kind of non-determinism CI should never re-run on every
-push. Run it by hand, read `git diff testdata/interop/` (`git diff --stat` for `collectd/*.raw`,
-which is the one genuinely binary corner of this directory), and commit.
+themselves use (the `rsyslog` and `collectd` producers each do a fresh `apt-get install` every run,
+and the `statsd` producer a fresh `pip install`), which is exactly the kind of non-determinism CI
+should never re-run on every push. Run it by hand, read `git diff testdata/interop/` (`git diff
+--stat` for `collectd/*.raw`, which is the one genuinely binary corner of this directory), and
+commit.
 
 Re-running won't reproduce these exact bytes -- container hostnames, timestamps, trace/span ids,
 every value collectd actually measured, and (for OTLP) telemetrygen's synthetic attribute values
@@ -69,7 +78,9 @@ Every fixture here is a handful of syslog datagrams, one collectd datagram, or a
 OTLP/JSON -- there's no reason for one to be bigger. As a rule of thumb: **a few hundred bytes per
 syslog fixture, ~1.3 KB per collectd fixture -- one packed datagram, just under collectd's
 1452-byte `MaxPacketSize` -- low
-single-digit KB per OTLP fixture, and this whole directory should stay well under 100 KB total**
+single-digit KB per OTLP fixture, ~12 KB for the whole statsd corpus (56 small datagrams, and it
+needs several because its subject is the *distribution* of datagram sizes rather than one message
+shape), and this whole directory should stay well under 100 KB total**
 (it's a few KB as of this writing). If a producer's natural output is bigger than that (a verbose
 OTLP payload with many spans, say), trim it at record time -- `script/record-fixtures`'s OTLP
 producer already does this (`--traces=3`/`--logs=3`/`--metrics=3`, not an open-ended `--duration`)

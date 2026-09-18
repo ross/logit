@@ -1,0 +1,11 @@
+app.http.requests.count:1|c|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/api/v1/orders,status:200|c:in-82046
+app.http.request.duration_ms:0.05|h|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/api/v1/orders,status:200|c:in-82046
+app.http.response.size_bytes:60196|d|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/api/v1/orders,status:200|c:in-82046
+app.render.calls.count:1|c|@0.5|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/api/v1/orders,status:200|c:in-82046
+app.db.query.duration_ms:0.33313615206930347|ms|#env:prod,service:checkout-api,region:us-east-1,host:web-07,query:select_user,db:primary|c:in-82046
+app.worker.queue.depth:110|g|#env:prod,service:checkout-api,region:us-east-1,host:web-07,queue:email|c:in-82046
+app.worker.queue.depth:90|g|#env:prod,service:checkout-api,region:us-east-1,host:web-07,queue:webhooks|c:in-82046
+app.worker.queue.depth:210|g|#env:prod,service:checkout-api,region:us-east-1,host:web-07,queue:reindex|c:in-82046
+app.users.active:2665|s|#env:prod,service:checkout-api,region:us-east-1,host:web-07|c:in-82046
+app.http.requests.count:1|c|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/healthz,status:200|c:in-82046
+app.http.request.duration_ms:23.483176616760144|h|#env:prod,service:checkout-api,region:us-east-1,host:web-07,endpoint:/healthz,status:200|c:in-82046
