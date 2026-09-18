@@ -1003,17 +1003,22 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F1: `PathPattern::docker_containers`'s old `watch_dirs()`-less behavior watched only `root`
-    /// -- a container's own subdirectory (where its log file actually lives) was never watched, so
-    /// under `inotify` the log file's own creation never woke a scan; only the 30s `poll_interval`
-    /// here ever would. `discover: true` -- selection isn't what's under test.
+    /// F1, superseded by `docs/adr/docker-container-identity-and-minimal-watches.md`: `docker_in`
+    /// no longer watches each container's own subdirectory, only `root` (Docker's per-container
+    /// state directories are direct children of it, so `root` alone already catches a container
+    /// *arriving*). A log file appearing a moment later *inside an already-existing* container
+    /// directory is therefore not an `inotify` event at all -- nothing changed under `root`
+    /// itself -- and is picked up on the next `poll_interval` tick instead, exactly as it would be
+    /// under `watch: poll`. This pins that contract, inverted from what this test asserted before
+    /// the watch-set change: discovery here is poll-bound even under `WatchMode::Inotify`.
+    /// `discover: true` -- selection isn't what's under test.
     #[tokio::test]
-    async fn under_inotify_a_container_log_created_after_its_directory_is_discovered_before_the_poll_interval(
+    async fn under_inotify_a_container_log_created_after_its_directory_is_discovered_only_on_the_poll_tick(
     ) {
         let root = scratch_dir("docker-inotify-new-log");
         let mut config = fast_tail_config();
         config.watch = WatchMode::Inotify;
-        config.poll_interval = Duration::from_secs(30);
+        config.poll_interval = Duration::from_millis(300);
 
         let (fanout, mut rx) = recording_fanout(8);
         let filter = ContainerFilter::new(vec![], true);
@@ -1029,10 +1034,9 @@ mod tests {
         // creates (the container directory appears a moment before the log file inside it).
         let log_path = container(&root, &id, "web", "nginx:1.25");
 
-        // Long enough that a scan woken only by `root`'s own IN_CREATE (the container directory
-        // appearing) has already run and found no log file -- this delay is what makes the test
-        // fail before the fix, since nothing would then wake a further scan short of the 30s poll.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Give `root`'s own IN_CREATE (the container directory appearing) time to be handled --
+        // it finds no log file yet, since none exists at that point.
+        tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(
             &log_path,
             format!(
@@ -1042,21 +1046,32 @@ mod tests {
         )
         .unwrap();
 
-        let events =
-            tokio::time::timeout(Duration::from_secs(3), expect_events(&mut rx, 1)).await.expect(
-                "inotify should discover the container's log file well within 3s, nowhere near \
-                 the 30s poll_interval -- this requires the container's own subdirectory to be \
-                 watched, not just root",
-            );
+        // Well within the 300ms poll_interval, and nothing under `root` itself changed when the
+        // log file appeared inside the already-existing container directory -- must not be
+        // discovered yet.
+        let too_soon =
+            tokio::time::timeout(Duration::from_millis(100), expect_events(&mut rx, 1)).await;
+        assert!(
+            too_soon.is_err(),
+            "must not be discovered before the poll tick -- the container's own subdirectory \
+             isn't watched any more, only root, and root saw no event"
+        );
+
+        // The very next poll tick picks it up.
+        let events = tokio::time::timeout(Duration::from_secs(2), expect_events(&mut rx, 1))
+            .await
+            .expect("the poll tick should discover it shortly after");
         assert_eq!(messages(&events), vec!["hello"]);
 
         shutdown(tx, handle).await;
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F1's other half: a truncation of an already-tracked container log must also be noticed via
-    /// `inotify`, not just the initial appearance -- both rely on the container's own subdirectory
-    /// being watched, not only `root`.
+    /// F1's other half, still true after `docs/adr/docker-container-identity-and-minimal-watches.md`
+    /// (unlike its sibling above): a truncation of an already-tracked container log is still
+    /// noticed via `inotify`, near-immediately -- not because the container's directory is
+    /// watched (it isn't, any more), but because the *file itself* now has its own watch,
+    /// registered when `docker_in` opened it. `O_TRUNC` fires `IN_MODIFY` on that watch directly.
     #[tokio::test]
     async fn under_inotify_a_truncated_container_log_is_noticed_before_the_poll_interval() {
         let root = scratch_dir("docker-inotify-truncate");
