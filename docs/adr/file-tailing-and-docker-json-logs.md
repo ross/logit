@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-07
+updated: 2026-09-17
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -84,6 +84,16 @@ they always watched, but `docker_in`'s reaches `root` plus every container subdi
 currently exists, so a container's own subdirectory — where its log file actually appears, a
 moment after the directory itself does — is watched as soon as it exists, and unwatched again once
 it's gone.
+
+**Superseded (2026-09-17):** `docker_in`'s per-container directory watches are gone — see
+[ADR `docker-container-identity-and-minimal-watches`](docker-container-identity-and-minimal-watches.md).
+On a host running many containers, any one of them writing a log line woke a full `scan`
+regardless of selection, which is O(containers) work per host-wide log line, not proportional to
+what `docker_in` was configured to follow. The watch set is now `root` (which alone still catches a
+container's directory appearing or disappearing, since those directories are direct children of
+`root`) plus one watch per file `docker_in` actually has open; a log file's own first appearance
+inside an existing container directory, rotation, and `config.v2.json` changes all move to the
+poll tick instead.
 
 ### Rotation and truncation: identity by `(dev, ino)`
 
@@ -277,6 +287,13 @@ trade-off, not hidden in a compose file comment alone.
   read once, when a container's log file is first opened, and never re-read for the life of that
   handle. A rename after that point is invisible until the container restarts (a new inode, a fresh
   `open`). Documented as a known gap, not silently promised.
+
+  **Superseded (2026-09-17):** identity is no longer frozen at open — see
+  [ADR `docker-container-identity-and-minimal-watches`](docker-container-identity-and-minimal-watches.md).
+  `config.v2.json`'s own stat is checked on every poll tick, and a change (a rename, a metadata
+  read recovering from a prior failure) refreshes the resource stamped on subsequent events without
+  a socket, an API version to negotiate, or a directory watch — the `poll_interval` bound this
+  record already treats as acceptable elsewhere in this ADR turned out to be enough here too.
 
 ## Consequences
 
