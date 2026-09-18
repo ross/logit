@@ -41,10 +41,18 @@ For the load model in `perf/load/`, and recorded here so the two documents can't
 | Datagram size, buffered | 1,341–1,418 B (client ceiling 1,432) | 467–507 B (client ceiling 512) |
 | Datagram size, unbuffered | 95–165 B (median 142) | 53–76 B (median 66) |
 | Lines per buffered datagram | 10–11 | 7–8 |
-| Line length | 94–164 B (median 137) | 53–76 B (median 60) |
+| Line length | 94–164 B (median 139) | 53–76 B (median 61) |
 | Tags per line | 4–6 (median 6) | 0 |
-| Metric name length | 16–28 B | 46–64 B |
-| Distinct metric names in this workload | 7 | 18 |
+| Metric name length | 16–28 B (median 23) | 46–64 B (median 56) |
+| Distinct metric names in this workload | 8 | 18 |
+
+Every figure above is over the whole corpus — all 65 tagged and all 55 tagless lines — not over any
+one capture. The per-file medians differ (the buffered DogStatsD capture alone medians at 137 B,
+the pipelined plain-statsd one at 60 B), which is what an earlier revision of this table quoted by
+mistake. The eight distinct DogStatsD names are `app.cache.lookups.count`,
+`app.db.query.duration_ms`, `app.http.request.duration_ms`, `app.http.requests.count`,
+`app.http.response.size_bytes`, `app.render.calls.count`, `app.users.active` and
+`app.worker.queue.depth`.
 
 Metric-type mix across all 120 captured lines: `c` 43, `ms` 22, `g` 21, `h` 14, `d` 13, `s` 7.
 **Read that as a property of the producer script, not of production traffic** — it is what this

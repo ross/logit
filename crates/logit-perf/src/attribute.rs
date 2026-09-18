@@ -458,16 +458,78 @@ pub fn verdict(
     lines
 }
 
-/// The largest `events.received` any node under test recorded -- the deepest point the event
-/// stream actually reached, and the honest denominator for a graph that may have lost events
-/// upstream of it. The harness's own two nodes are excluded: `__perf_dump` receives the
-/// telemetry stream, which has nothing to do with the workload.
+/// The largest `events.received` any node under test recorded. The harness's own two nodes are
+/// excluded: `__perf_dump` receives the telemetry stream, which has nothing to do with the
+/// workload.
+///
+/// **A summary line, not a denominator.** This is the *shallowest* interesting number, not the
+/// deepest: in a graph where a transform drops events, the node with the largest `events.received`
+/// is the one *before* the drop. That is the right thing for `attribute`'s table, which is
+/// describing where work happened; it is the wrong thing for events/s, which has to be denominated
+/// over what actually came out the far end. `crate::run` uses [`delivered_at_sink`] for that.
 pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
     nodes
         .iter()
         .filter(|(id, _)| !NodeStats::is_harness(id))
         .map(|(_, node)| node.events_received)
         .fold(0.0_f64, f64::max) as u64
+}
+
+/// `events.received` at the graph's terminal sink -- the denominator a driven scenario's
+/// `events_per_s`/`cpu_us_per_event` and `--verify`'s exact-count assertion are computed over.
+///
+/// Selected by the `role` attribute the drain stamps on every point
+/// (`docs/design/internal-telemetry.md`), not by taking a maximum: the maximum is the shallowest
+/// receiver, which equals the sink only for a graph that drops nothing between them. Today's
+/// `statsd_in → null_out` scenarios are such a graph, so the two agree; the moment a driven
+/// scenario grows a filtering transform they stop agreeing, and the maximum would quietly
+/// overstate delivery by exactly what the transform dropped.
+///
+/// A graph with several sinks has no single answer, so it is asked for one rather than guessed at:
+/// the load spec's `sink:` names which to denominate over. With one sink -- every scenario that
+/// exists today -- the field is unnecessary and omitted.
+pub fn delivered_at_sink(
+    nodes: &BTreeMap<String, NodeStats>,
+    named: Option<&str>,
+) -> anyhow::Result<u64> {
+    if let Some(named) = named {
+        let node = nodes.get(named).with_context(|| {
+            format!(
+                "the load spec names `{named}` as its sink, but the run's telemetry has no such \
+                 component -- known: {}",
+                render_ids(nodes.keys().filter(|id| !NodeStats::is_harness(id)))
+            )
+        })?;
+        return Ok(node.events_received as u64);
+    }
+
+    let sinks: Vec<(&String, &NodeStats)> = nodes
+        .iter()
+        .filter(|(id, node)| !NodeStats::is_harness(id) && node.role == "sink")
+        .collect();
+    match sinks.as_slice() {
+        [(_, sink)] => Ok(sink.events_received as u64),
+        [] => bail!(
+            "the run's telemetry shows no sink at all (nodes: {}) -- a driven scenario needs one \
+             to denominate events/s and CPU/event over",
+            render_ids(nodes.keys().filter(|id| !NodeStats::is_harness(id)))
+        ),
+        several => bail!(
+            "this scenario has {} sinks ({}), so `events delivered` is ambiguous -- name the one \
+             to denominate over with `sink: <id>` in its load spec under perf/load/",
+            several.len(),
+            render_ids(several.iter().map(|(id, _)| *id))
+        ),
+    }
+}
+
+fn render_ids<'a>(ids: impl Iterator<Item = &'a String>) -> String {
+    let ids: Vec<&str> = ids.map(String::as_str).collect();
+    if ids.is_empty() {
+        "none".to_string()
+    } else {
+        ids.join(", ")
+    }
 }
 
 /// Checks the decoded counters against what the scenario said it would produce, since a per-node
@@ -807,5 +869,68 @@ mod tests {
             ("__perf_dump".to_string(), counted("file_out", 0.0, 9_999.0)),
         ]);
         assert_eq!(peak_received(&nodes), 42);
+    }
+
+    fn roled(kind: &str, role: &str, received: f64) -> NodeStats {
+        NodeStats {
+            kind: kind.to_string(),
+            role: role.to_string(),
+            events_received: received,
+            ..NodeStats::default()
+        }
+    }
+
+    /// The case that makes the denominator's *definition* matter rather than its value: a middle
+    /// node that received more than the sink did. `peak_received` reports the middle node, which
+    /// is right for `attribute`'s table and would silently overstate delivery by exactly what the
+    /// transform dropped if it were used as the denominator.
+    #[test]
+    fn delivered_at_sink_reports_the_sink_not_the_busiest_node() {
+        let nodes = BTreeMap::from([
+            ("statsd".to_string(), roled("statsd_in", "listener", 0.0)),
+            // A filtering transform: 1,000 in, 400 dropped, 600 out.
+            ("keep".to_string(), roled("keep", "transform", 1_000.0)),
+            ("out".to_string(), roled("null_out", "sink", 600.0)),
+            ("__perf_dump".to_string(), roled("file_out", "sink", 9_999.0)),
+        ]);
+        assert_eq!(delivered_at_sink(&nodes, None).unwrap(), 600);
+        assert_eq!(peak_received(&nodes), 1_000, "the table still wants the busiest node");
+    }
+
+    #[test]
+    fn delivered_at_sink_refuses_to_guess_between_several_sinks() {
+        let nodes = BTreeMap::from([
+            ("statsd".to_string(), roled("statsd_in", "listener", 0.0)),
+            ("a".to_string(), roled("null_out", "sink", 600.0)),
+            ("b".to_string(), roled("null_out", "sink", 400.0)),
+        ]);
+        let err = delivered_at_sink(&nodes, None).expect_err("two sinks, no single denominator");
+        let err = format!("{err:#}");
+        assert!(err.contains("2 sinks"), "{err}");
+        assert!(err.contains("sink: <id>"), "{err}");
+
+        // ...and takes the answer when the load spec gives one.
+        assert_eq!(delivered_at_sink(&nodes, Some("b")).unwrap(), 400);
+    }
+
+    #[test]
+    fn delivered_at_sink_reports_a_named_sink_that_is_not_in_the_run() {
+        let nodes = BTreeMap::from([("out".to_string(), roled("null_out", "sink", 600.0))]);
+        let err = delivered_at_sink(&nodes, Some("typo"))
+            .expect_err("a spec naming a component the run doesn't have");
+        let err = format!("{err:#}");
+        assert!(err.contains("no such component"), "{err}");
+        assert!(err.contains("known: out"), "{err}");
+    }
+
+    #[test]
+    fn delivered_at_sink_says_so_when_the_graph_has_no_sink_at_all() {
+        let nodes = BTreeMap::from([
+            ("statsd".to_string(), roled("statsd_in", "listener", 0.0)),
+            // The harness's own sink is excluded, so this graph has none of its own.
+            ("__perf_dump".to_string(), roled("file_out", "sink", 9.0)),
+        ]);
+        let err = delivered_at_sink(&nodes, None).expect_err("no sink under test");
+        assert!(format!("{err:#}").contains("no sink at all"), "{err:#}");
     }
 }

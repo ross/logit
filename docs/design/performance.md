@@ -120,11 +120,29 @@ capture. Four things about reading its numbers differ from everything else in th
   heterogeneous cores — `lscpu -e`'s `MAXMHZ` column separates the 5,158 MHz Zen 5 cores (CPUs 0–3
   and their SMT siblings 12–15) from the 3,289 MHz Zen 5c ones (4–11, 16–23) — make an unpinned run
   bimodal by roughly 2×. Every recorded `udp-statsd*` number below states which CPUs it used.
+- **A delta is a pair taken in one sitting, interleaved, on a box in a known state.** Pinning fixes
+  which cores a run gets; it says nothing about what they will do an hour later. Measured: the same
+  specs, commit and pins, 90 minutes further into a session, moved CPU µs/event ~23% and a drop rate
+  from 3.1% to 12.4% — confirmed as the box, not the code, by re-running the earlier commit straight
+  afterwards and reproducing the later numbers. So parent/branch runs alternate within one session
+  and are never diffed against a stored file from another day, and the box is checked first: on AC,
+  `performance` governor, rested, nothing else building, sender and child on distinct fast physical
+  cores. [`perf/load/README.md`](../../perf/load/README.md)'s "Box state" has the checklist; `run`
+  records what it can of it into the results file (`box_state`) and warns before the first scenario
+  on `powersave` or battery. Tables in this document are labelled by session, not presented as one
+  series across days.
 - **Every run self-checks before its numbers count.** `sent == received + kernel-dropped` has to
-  close exactly (on loopback there is nowhere else for a datagram to go), and the listener must
-  report no decode diagnostics — otherwise the scenario would be benchmarking the malformed-line
-  path, which is *faster* than the real one. `--verify` adds the strict form: halve the spec's rate
-  and require an exactly-equal delivered event count with zero drops.
+  close exactly (on loopback there is nowhere else for a datagram to go), the kernel socket sampler
+  has to have reported at all (without `getsockopt(SO_MEMINFO)` the drop count is unknowable and
+  would read as a flat zero), and the listener must report no decode diagnostics — otherwise the
+  scenario would be benchmarking the malformed-line path, which is *faster* than the real one.
+  `--verify` adds the strict form: `--rate-scale 0.25` plus an exactly-equal delivered event count
+  with zero drops.
+- **`--rate-scale` moves the operating point without editing a spec.** The shipped rates sit just
+  above the drop knee, which is what a baseline wants and what reading a stable CPU µs/event does
+  not; `--rate-scale 0.5` gets the second. The effective rate is recorded in the results file and
+  `compare` warns when two runs used different ones — they are different points on the load curve,
+  not a before and after.
 
 ## 1. Results: all ten scenarios, median of 3
 

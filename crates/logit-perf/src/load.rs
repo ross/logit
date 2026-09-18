@@ -63,10 +63,48 @@ use std::time::{Duration, Instant};
 /// a `udp-statsd` number is actually measuring.
 const SEND_BATCH: usize = 64;
 
-/// How many consecutive send attempts may fail with a retryable errno before the blast gives up.
-/// Generous: a real `ENOBUFS` burst clears in microseconds, so hitting this means the target is
-/// gone (a child that died, or a port nothing is bound to) rather than merely busy.
+/// How many consecutive send attempts may fail with `ENOBUFS`/`EAGAIN` before the blast gives up.
+/// Generous: a real `ENOBUFS` burst clears in microseconds, so hitting this means the local send
+/// path is wedged rather than merely busy.
+///
+/// **This does not catch a dead target**, and used to claim it did. On a *connected* UDP socket the
+/// ICMP port-unreachable is a pending socket error that the next `sendmmsg` both reports and
+/// clears: the send after it succeeds, the counter resets, and a peer that is not there gets the
+/// whole blast at full pace. [`MAX_CONNECTION_REFUSED`] and the [`Abort`] probe are what actually
+/// catch that.
 const MAX_CONSECUTIVE_SEND_ERRORS: u64 = 100_000;
+
+/// How many `ECONNREFUSED`s the whole blast tolerates before concluding nothing is listening.
+///
+/// Counted in total, not consecutively, precisely because the pending-error semantics above make
+/// "consecutive" meaningless here. Between the child's `ready` line and its shutdown a connected
+/// sender should see *no* port-unreachable at all; a couple are conceivable from an ICMP in flight
+/// from before the bind, so the threshold is low but not one. A steady stream of them is a socket
+/// that closed or a port nothing ever bound.
+const MAX_CONNECTION_REFUSED: u64 = 64;
+
+/// A flag the sender reads between `sendmmsg` batches to decide whether to stop early.
+///
+/// The case it exists for is the process under test dying mid-blast: `crate::run` sets it from the
+/// child's own stderr reaching EOF, which happens when the child exits. Without it the sender
+/// cheerfully finishes a multi-second blast into a socket whose peer is gone (see
+/// [`MAX_CONSECUTIVE_SEND_ERRORS`] for why the errno path does not notice), and the run fails much
+/// later with a confusing accounting mismatch instead of "the child died".
+///
+/// `&AtomicBool` rather than a closure so it costs one relaxed load per 64 datagrams and is
+/// trivially `Sync` across the scoped sender threads.
+#[derive(Clone, Copy)]
+pub struct Abort<'a> {
+    pub flag: &'a std::sync::atomic::AtomicBool,
+    /// What to say when it fires -- the caller knows what it is watching, the sender doesn't.
+    pub reason: &'a str,
+}
+
+impl Abort<'_> {
+    fn fired(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Spec
@@ -83,6 +121,12 @@ pub struct LoadSpec {
     /// The component id in the scenario config whose `bind:` is the destination. Named rather than
     /// repeated as an address so the two files can never disagree about the port.
     pub target: String,
+    /// The component id whose `events.received` is the run's denominator. Optional, and omitted by
+    /// every scenario that exists today: with a single sink in the graph the harness finds it by
+    /// its `role` stamp. Only a multi-sink driven scenario needs to say which one counts -- see
+    /// `crate::attribute::delivered_at_sink`.
+    #[serde(default)]
+    pub sink: Option<String>,
     /// Total datagrams to send. The run's denominator is events *delivered*, not this -- but this
     /// is what sets how long the run takes.
     pub datagrams: u64,
@@ -657,13 +701,13 @@ pub struct LoadPlan {
     pub target: SocketAddr,
 }
 
-/// How much of a spec's configured `rate` a `--verify` run uses.
+/// The `--rate-scale` a `--verify` run uses when the caller didn't pick one.
 ///
 /// A shipped spec is deliberately paced a few percent *above* what the receiver sustains, because
 /// the baseline wants a small non-zero drop rate to have somewhere to improve from -- which is
-/// exactly the thing `--verify`'s zero-drop expectation forbids. Derating for a verification run is
-/// what makes the check runnable against the specs as they ship, instead of needing a hand-edited
-/// copy of each one.
+/// exactly the thing `--verify`'s zero-drop expectation forbids. Scaling the rate down for a
+/// verification run is what makes the check runnable against the specs as they ship, instead of
+/// needing a hand-edited copy of each one.
 ///
 /// **A quarter, measured rather than picked.** At half rate, `udp-statsd`/`-packed` verified
 /// cleanly but `udp-statsd-small` still lost 21 of 5,000,000 datagrams -- not to sustained
@@ -672,7 +716,7 @@ pub struct LoadPlan {
 /// enough below the knee that a stall of that size has nowhere near enough backlog to overflow.
 /// The cost is only that a verification run takes four times as long as a measured one, which is
 /// the right trade for a check whose entire value is being exact.
-const VERIFY_RATE_DIVISOR: u64 = 4;
+pub const VERIFY_RATE_SCALE: f64 = 0.25;
 
 impl LoadPlan {
     /// Reads spec + model, renders the ring, and resolves the target address out of the scenario
@@ -692,21 +736,35 @@ impl LoadPlan {
         self.ring.window(0, self.spec.datagrams)
     }
 
-    /// Derates this plan's `rate` for a `--verify` run -- see [`VERIFY_RATE_DIVISOR`]. Fails on a
-    /// spec with no `rate` at all: an unpaced blast saturates the receiver by construction, so
-    /// holding one to a zero-drop expectation would be asking it to fail.
-    pub fn derate_for_verify(&mut self) -> anyhow::Result<u64> {
+    /// Multiplies this plan's `rate` by `scale`, returning the rate the blast will actually run
+    /// at.
+    ///
+    /// The point is reading a scenario at a chosen operating point without editing its spec: the
+    /// shipped rates sit just above the drop knee, which is right for a baseline whose whole job is
+    /// to have drops to improve, and wrong for reading a stable CPU µs/event. `--rate-scale 0.5`
+    /// gets the second without disturbing the first, and `--verify` is that same knob at
+    /// [`VERIFY_RATE_SCALE`] plus an exactness assertion.
+    ///
+    /// Fails on a spec with no `rate` at all: there is nothing to scale, and an unpaced blast
+    /// saturates the receiver by construction, so both the verification and the stable-operating-
+    /// point readings it is asked for would be meaningless.
+    pub fn scale_rate(&mut self, scale: f64) -> anyhow::Result<u64> {
+        if !(scale.is_finite() && scale > 0.0) {
+            bail!("--rate-scale must be a finite number greater than 0, got {scale}");
+        }
         let rate = self.spec.rate.with_context(|| {
             format!(
-                "{} has no `rate:`, so it sends as fast as the sender can go -- which saturates \
-                 the receiver by construction. --verify needs a paced spec; add a `rate:` (see \
-                 perf/load/README.md's \"Tuning\") or drop --verify",
+                "{} has no `rate:`, so it sends as fast as the sender can go -- there is nothing \
+                 to scale, and an unpaced blast saturates the receiver by construction. Add a \
+                 `rate:` (see perf/load/README.md's \"Tuning\") or drop the flag",
                 self.spec_path.display()
             )
         })?;
-        let derated = (rate / VERIFY_RATE_DIVISOR).max(1);
-        self.spec.rate = Some(derated);
-        Ok(derated)
+        // At least 1: a scale small enough to round the rate to zero would mean "send nothing",
+        // which is never what anyone meant by it.
+        let scaled = ((rate as f64 * scale).round() as u64).max(1);
+        self.spec.rate = Some(scaled);
+        Ok(scaled)
     }
 }
 
@@ -724,6 +782,24 @@ pub struct CpuSet {
     cpus: Vec<usize>,
 }
 
+/// One CPU number from a `--pin-*` list, range-checked at the point it is read.
+///
+/// `whole` is the comma-separated entry it came from, so a bad end of a range reports the range
+/// rather than just the digits. The `CPU_SETSIZE` check lives here, before any range is expanded --
+/// see [`CpuSet::parse`].
+fn parse_cpu(text: &str, whole: &str) -> anyhow::Result<usize> {
+    let cpu: usize =
+        text.parse().with_context(|| format!("`{whole}`: `{text}` is not a CPU number"))?;
+    if cpu >= libc::CPU_SETSIZE as usize {
+        bail!(
+            "`{whole}`: CPU {cpu} is beyond CPU_SETSIZE ({}) -- this box has {} of them",
+            libc::CPU_SETSIZE,
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        );
+    }
+    Ok(cpu)
+}
+
 impl CpuSet {
     pub fn parse(list: &str) -> anyhow::Result<CpuSet> {
         let mut cpus = Vec::new();
@@ -734,21 +810,18 @@ impl CpuSet {
             }
             match part.split_once('-') {
                 Some((lo, hi)) => {
-                    let lo: usize = lo
-                        .trim()
-                        .parse()
-                        .with_context(|| format!("`{part}`: `{lo}` is not a CPU number"))?;
-                    let hi: usize = hi
-                        .trim()
-                        .parse()
-                        .with_context(|| format!("`{part}`: `{hi}` is not a CPU number"))?;
+                    let lo = parse_cpu(lo.trim(), part)?;
+                    let hi = parse_cpu(hi.trim(), part)?;
                     if hi < lo {
                         bail!("`{part}` runs backwards");
                     }
+                    // Both ends checked *before* the range is expanded. `--pin-sender
+                    // 0-99999999999` is a plausible typo, and `extend`ing that range would try to
+                    // allocate a hundred billion `usize`s before the bound below ever looked at
+                    // the result -- a parse error has to stay a parse error, not an OOM.
                     cpus.extend(lo..=hi);
                 }
-                None => cpus
-                    .push(part.parse().with_context(|| format!("`{part}` is not a CPU number"))?),
+                None => cpus.push(parse_cpu(part, part)?),
             }
         }
         cpus.sort_unstable();
@@ -756,6 +829,9 @@ impl CpuSet {
         if cpus.is_empty() {
             bail!("`{list}` names no CPUs");
         }
+        // A backstop, not the real check: every value reached here through `parse_cpu`, which
+        // already rejected anything out of range. Kept so a future edit that adds another way into
+        // `cpus` still can't produce a set `CPU_SET` would index out of bounds.
         if let Some(&highest) = cpus.last() {
             if highest >= libc::CPU_SETSIZE as usize {
                 bail!("CPU {highest} is beyond CPU_SETSIZE ({})", libc::CPU_SETSIZE);
@@ -830,7 +906,14 @@ pub struct LoadOutcome {
 ///
 /// Blocking, and meant to be: the caller has already waited for the child's `ready` line, and
 /// `wall` for a driven scenario is exactly `ready` → this function returning.
-pub fn blast(plan: &LoadPlan, pin: Option<&CpuSet>) -> anyhow::Result<LoadOutcome> {
+///
+/// `abort`, when given, is polled between batches so a child that dies mid-blast stops the sender
+/// promptly and by name -- see [`Abort`].
+pub fn blast(
+    plan: &LoadPlan,
+    pin: Option<&CpuSet>,
+    abort: Option<Abort<'_>>,
+) -> anyhow::Result<LoadOutcome> {
     let spec = &plan.spec;
     let sockets = open_sockets(plan.target, spec.sockets)?;
 
@@ -859,7 +942,7 @@ pub fn blast(plan: &LoadPlan, pin: Option<&CpuSet>) -> anyhow::Result<LoadOutcom
                         format!("pinning sender thread {thread_index} to CPUs {pin}")
                     })?;
                 }
-                send_block(&plan.ring, &mine, start, count, rate, plan.target)
+                send_block(&plan.ring, &mine, start, count, rate, plan.target, abort)
             }));
         }
         handles.into_iter().map(|handle| handle.join().expect("sender thread panicked")).collect()
@@ -905,11 +988,13 @@ fn send_block(
     count: u64,
     rate: Option<f64>,
     target: SocketAddr,
+    abort: Option<Abort<'_>>,
 ) -> anyhow::Result<LoadOutcome> {
     let mut outcome = LoadOutcome::default();
     if count == 0 {
         return Ok(outcome);
     }
+    let mut refused = 0u64;
     // SAFETY: both are plain C aggregates of integers and pointers with no validity invariants
     // beyond "some bit pattern"; every field that `sendmmsg` reads is overwritten below before the
     // call, and an all-zero `msghdr` is the documented starting point for one.
@@ -921,6 +1006,17 @@ fn send_block(
     let mut socket_cursor = 0usize;
 
     while done < count {
+        // Once per batch -- one relaxed load per 64 datagrams, which is nothing next to the
+        // syscall it precedes.
+        if let Some(abort) = abort {
+            if abort.fired() {
+                bail!(
+                    "stopped after {} of {count} datagrams to {target}: {}",
+                    outcome.sent_datagrams,
+                    abort.reason
+                );
+            }
+        }
         let batch = SEND_BATCH.min((count - done) as usize);
         for slot in 0..batch {
             let payload = ring.datagram(start + done + slot as u64);
@@ -980,27 +1076,42 @@ fn send_block(
                 Some(libc::EINTR) => continue,
                 // ENOBUFS: the local send path is momentarily full. EAGAIN: the socket is blocking,
                 // so this shouldn't happen, but a kernel is allowed to return it and spinning
-                // briefly is the right response either way.
-                //
-                // ECONNREFUSED: a *connected* UDP socket reports an earlier datagram's ICMP
-                // port-unreachable asynchronously, on a later send. Between `ready` and the child's
-                // shutdown this can only be a stale ICMP from before the bind, so it is counted and
-                // retried rather than treated as fatal -- the error is cleared by the read, and the
-                // next send succeeds. A target that genuinely never listens fails this loop below
-                // instead, by never making progress.
-                Some(libc::ENOBUFS) | Some(libc::EAGAIN) | Some(libc::ECONNREFUSED) => {
+                // briefly is the right response either way. Both clear on their own, so these are
+                // retried and only a long unbroken run of them is fatal.
+                Some(libc::ENOBUFS) | Some(libc::EAGAIN) => {
                     outcome.send_errors += 1;
                     consecutive_errors += 1;
                     if consecutive_errors > MAX_CONSECUTIVE_SEND_ERRORS {
                         return Err(anyhow::Error::new(err)).with_context(|| {
                             format!(
                                 "sendmmsg to {target} failed {consecutive_errors} times in a row \
-                                 with no datagram accepted -- nothing is listening there, or the \
-                                 process under test has gone away"
+                                 with no datagram accepted -- the local send path is wedged"
                             )
                         });
                     }
                     std::thread::yield_now();
+                }
+                // ECONNREFUSED: a *connected* UDP socket reports an earlier datagram's ICMP
+                // port-unreachable asynchronously, as a pending socket error that this very call
+                // both reports and **clears**. So the next send succeeds and a consecutive-failure
+                // counter never climbs, however dead the peer is -- which is why this is counted
+                // in total across the whole blast instead. See `MAX_CONNECTION_REFUSED`.
+                Some(libc::ECONNREFUSED) => {
+                    outcome.send_errors += 1;
+                    refused += 1;
+                    if refused > MAX_CONNECTION_REFUSED {
+                        return Err(anyhow::Error::new(err)).with_context(|| {
+                            format!(
+                                "nothing is listening on {target}: {refused} ICMP \
+                                 port-unreachable errors after {} datagrams. A connected UDP \
+                                 socket reports these one send late, so the count is the signal, \
+                                 not any single failure",
+                                outcome.sent_datagrams
+                            )
+                        });
+                    }
+                    // Deliberately no yield: the error was cleared by this call, so the resubmit
+                    // below is expected to go through.
                 }
                 _ => {
                     return Err(anyhow::Error::new(err))
@@ -1049,6 +1160,7 @@ mod tests {
     fn spec(mix: Vec<PackingWeight>) -> LoadSpec {
         LoadSpec {
             target: "statsd".to_string(),
+            sink: None,
             datagrams: 1_000,
             sockets: 2,
             threads: 1,
@@ -1341,14 +1453,50 @@ mod tests {
         assert!(CpuSet::parse("1,,2").is_err());
     }
 
+    /// A CPU beyond `CPU_SETSIZE` is rejected **before** any range is expanded. Without the
+    /// up-front check `0-99999999999` tries to allocate a hundred billion `usize`s on its way to
+    /// the bound, i.e. a typo becomes an OOM instead of an error message.
+    #[test]
+    fn an_out_of_range_cpu_is_rejected_without_expanding_the_range() {
+        for list in ["0-99999999999", "99999999999", "99999999999-99999999999", "0-1023,2048"] {
+            let err = CpuSet::parse(list).expect_err("{list} is beyond CPU_SETSIZE");
+            assert!(format!("{err:#}").contains("CPU_SETSIZE"), "{list}: {err:#}");
+        }
+        // The largest legal CPU still parses, so the bound is exclusive in the right direction.
+        let highest = libc::CPU_SETSIZE as usize - 1;
+        assert_eq!(CpuSet::parse(&highest.to_string()).unwrap().cpus(), &[highest]);
+    }
+
+    /// `SO_RCVBUF` on a test's own receiving socket, so a test about the *sender* can't fail on a
+    /// kernel drop. `std::net::UdpSocket` has no safe setter for it.
+    fn set_receive_buffer(socket: &UdpSocket, bytes: libc::c_int) {
+        // SAFETY: `socket` is a live, owned `UdpSocket` for the duration of the call, so its fd is
+        // valid; `&bytes` is a `c_int` out-living the call and `size_of::<c_int>()` is exactly the
+        // length `SO_RCVBUF` expects. Standard `setsockopt(2)` contract.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::addr_of!(bytes).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "setsockopt(SO_RCVBUF): {}", std::io::Error::last_os_error());
+    }
+
     /// The sender against a real loopback socket, end to end: every datagram arrives, in
     /// ring order, with the byte counts the outcome claims.
     #[test]
     fn a_blast_delivers_every_datagram_to_a_real_socket() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         receiver.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        // 4 MiB of receive buffer for a 200-datagram test: this test is about the sender, and a
-        // kernel drop here would make it flaky rather than informative.
+        // The whole 200-datagram blast lands before this test reads a byte of it, so the receive
+        // buffer has to hold all of it at once or the test fails on a kernel drop it is not about.
+        // Asked for explicitly rather than left to `rmem_default` (212,992 B on a stock kernel,
+        // and each ~30-byte datagram is charged several hundred bytes of `skb->truesize`): this
+        // must pass by design, not by margin.
+        set_receive_buffer(&receiver, 4 * 1024 * 1024);
         let target = receiver.local_addr().unwrap();
 
         let mut spec = spec(vec![single()]);
@@ -1365,7 +1513,7 @@ mod tests {
             target,
         };
 
-        let outcome = blast(&plan, None).unwrap();
+        let outcome = blast(&plan, None, None).unwrap();
         assert_eq!(outcome.sent_datagrams, 200);
         assert_eq!(outcome.sent_lines, 200);
         assert_eq!(outcome.sent_bytes, expected_bytes);
@@ -1375,6 +1523,130 @@ mod tests {
             let (read, _) = receiver.recv_from(&mut buffer).expect("every datagram arrives");
             assert_eq!(&buffer[..read], plan.ring.datagram(index), "datagram {index}");
         }
+    }
+
+    /// A blast at a port nobody is listening on must fail *as that*, not run to completion.
+    ///
+    /// This is the case the old consecutive-error counter claimed to catch and could not: on a
+    /// connected UDP socket each `ECONNREFUSED` is a pending error that the failing send clears, so
+    /// the next send succeeds and a consecutive counter never climbs. Counting them in total is
+    /// what makes the claim true.
+    #[test]
+    fn a_blast_at_a_port_nobody_listens_on_fails_naming_the_target() {
+        // Bound and dropped: the port is almost certainly free, and free is what this needs.
+        let target = {
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+
+        let mut spec = spec(vec![single()]);
+        spec.datagrams = 100_000;
+        spec.ring_datagrams = 64;
+        spec.sockets = 1;
+        spec.threads = 1;
+        let ring = Ring::render(&spec, &model(&[(1, "dead.{seq%4}:1|c")])).unwrap();
+        let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
+
+        let err = blast(&plan, None, None)
+            .expect_err("a blast into a port nothing is bound to must fail, not succeed quietly");
+        let err = format!("{err:#}");
+        assert!(err.contains("nothing is listening on"), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+    }
+
+    /// The abort probe: a child that dies mid-blast stops the sender promptly and by name, rather
+    /// than letting it finish a multi-second blast into a socket whose peer is gone.
+    #[test]
+    fn a_fired_abort_probe_stops_the_blast_and_says_why() {
+        use std::sync::atomic::AtomicBool;
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        set_receive_buffer(&receiver, 4 * 1024 * 1024);
+        let target = receiver.local_addr().unwrap();
+
+        let mut spec = spec(vec![single()]);
+        spec.datagrams = 1_000_000;
+        spec.ring_datagrams = 64;
+        spec.sockets = 1;
+        spec.threads = 1;
+        let ring = Ring::render(&spec, &model(&[(1, "gone.{seq%4}:1|c")])).unwrap();
+        let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
+
+        // Already set, so the very first batch sees it -- this is about the message and the fact
+        // that it stops, not about racing a real child's death.
+        let flag = AtomicBool::new(true);
+        let err = blast(&plan, None, Some(Abort { flag: &flag, reason: "the child exited" }))
+            .expect_err("a fired abort must stop the blast");
+        let err = format!("{err:#}");
+        assert!(err.contains("the child exited"), "{err}");
+        assert!(err.contains("of 1000000 datagrams"), "{err}");
+    }
+
+    #[test]
+    fn a_clear_abort_probe_lets_the_whole_blast_through() {
+        use std::sync::atomic::AtomicBool;
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        set_receive_buffer(&receiver, 4 * 1024 * 1024);
+        let target = receiver.local_addr().unwrap();
+
+        let mut spec = spec(vec![single()]);
+        spec.datagrams = 200;
+        spec.ring_datagrams = 64;
+        spec.sockets = 1;
+        spec.threads = 1;
+        let ring = Ring::render(&spec, &model(&[(1, "fine.{seq%4}:1|c")])).unwrap();
+        let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
+
+        let flag = AtomicBool::new(false);
+        let outcome = blast(&plan, None, Some(Abort { flag: &flag, reason: "unused" })).unwrap();
+        assert_eq!(outcome.sent_datagrams, 200);
+    }
+
+    fn plan_with_rate(rate: Option<u64>) -> LoadPlan {
+        let mut spec = spec(vec![single()]);
+        spec.rate = rate;
+        spec.ring_datagrams = 16;
+        let ring = Ring::render(&spec, &model(&[(1, "r.{seq%4}:1|c")])).unwrap();
+        LoadPlan {
+            spec,
+            spec_path: PathBuf::from("/nowhere/udp-statsd.yaml"),
+            ring,
+            target: "127.0.0.1:1".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn scale_rate_multiplies_the_specs_own_pacing() {
+        let mut plan = plan_with_rate(Some(100_000));
+        assert_eq!(plan.scale_rate(0.5).unwrap(), 50_000);
+        assert_eq!(plan.spec.rate, Some(50_000));
+
+        // `--verify`'s own scale is just this knob at a fixed value.
+        let mut plan = plan_with_rate(Some(760_000));
+        assert_eq!(plan.scale_rate(VERIFY_RATE_SCALE).unwrap(), 190_000);
+    }
+
+    #[test]
+    fn scale_rate_never_rounds_a_rate_down_to_nothing() {
+        let mut plan = plan_with_rate(Some(10));
+        assert_eq!(plan.scale_rate(0.000_01).unwrap(), 1, "0 would mean `send nothing`");
+    }
+
+    #[test]
+    fn scale_rate_rejects_a_scale_that_is_not_a_positive_number() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut plan = plan_with_rate(Some(1_000));
+            let err = plan.scale_rate(bad).expect_err("{bad} is not a usable scale");
+            assert!(format!("{err:#}").contains("greater than 0"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn scale_rate_refuses_a_spec_with_no_rate_at_all() {
+        let mut plan = plan_with_rate(None);
+        let err = plan.scale_rate(0.5).expect_err("there is nothing to scale");
+        assert!(format!("{err:#}").contains("nothing"), "{err:#}");
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1508,7 +1780,7 @@ mod tests {
         spec.rate = Some(2_000);
         let ring = Ring::render(&spec, &model(&[(1, "p.{seq%4}:1|c")])).unwrap();
         let plan = LoadPlan { spec, spec_path: PathBuf::from("/nowhere/x.yaml"), ring, target };
-        let outcome = blast(&plan, None).unwrap();
+        let outcome = blast(&plan, None, None).unwrap();
         assert_eq!(outcome.sent_datagrams, 256);
         // 256 datagrams at 2000/s is 128ms; pacing is per 64-datagram batch, so the last batch
         // isn't waited out -- three batches' worth (96ms) is the floor this can assert.

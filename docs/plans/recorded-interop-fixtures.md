@@ -58,6 +58,8 @@ same misunderstanding.
   brief — real future work, not overlooked:_ statsd/DogStatsD producer fixtures, Docker
   json-file cross-version fixtures, and `logit_in`/`logit_out` cross-version compatibility
   fixtures. None of these have any code or design started here.
+  <br>**Since amended:** the statsd/DogStatsD half of that landed on 2026-09-18 — see the
+  amendment at the end of this document. The other two are still unstarted.
 - **OTLP/protobuf and OTLP/HTTP fixtures.** Every OTLP fixture here is JSON, by the design in §1 —
   capturing protobuf would mean a genuinely different (raw-byte, not `file`-exporter) capture
   shape. `crates/logit-proto/src/otlp/mod.rs`'s existing hand-built `OTLP_TRACE_REQUEST` literal
@@ -101,9 +103,10 @@ behaves rather than to what its protocol says:
   whole datagram decodes with no diagnostics — never a measured value, a timestamp, or a per-file
   list count.
 
-The follow-on list below is otherwise unchanged: syslog-ng is still not attempted, and
-statsd/DogStatsD, Docker json-file and `logit_in`/`logit_out` cross-version fixtures are still not
-started. One item is now *scheduled* rather than merely unstarted: a collectd `threshold`-plugin
+The follow-on list below is otherwise unchanged: syslog-ng is still not attempted, and Docker
+json-file and `logit_in`/`logit_out` cross-version fixtures are still not started. (statsd/DogStatsD
+was on that list when this amendment was written; it landed on 2026-09-18 — see the amendment at the
+end of this document.) One item is now *scheduled* rather than merely unstarted: a collectd `threshold`-plugin
 capture, exercising the notification parts (`Message` 0x0100 / `Severity` 0x0101), lands with W5 of
 `collectd-binary-relay.md`, which is the workstream that teaches the decoder to read them.
 `testdata/interop/collectd/README.md`'s own "what isn't covered here (yet)" section carries the
@@ -274,9 +277,10 @@ already on `main`) and, once #113 lands, `crates/logit-proto/src/otlp/json/*.rs`
 `main` — see "What this PR ships vs. what's follow-on work" above). HAProxy/nginx access-log
 capture is deliberately **not** a fixture-corpus concern — that's already covered by the existing
 `demo/`/`examples/nginx/` integration test path, and duplicating it here would just be a slower,
-less realistic copy of what `demo/` already proves. statsd/DogStatsD, Docker json-file
-cross-version fixtures, and `logit_in`/`logit_out` cross-version compatibility fixtures are real
-future work, named explicitly above, not silently out of scope.
+less realistic copy of what `demo/` already proves. Docker json-file cross-version fixtures and
+`logit_in`/`logit_out` cross-version compatibility fixtures are real future work, named explicitly
+above, not silently out of scope. statsd/DogStatsD was the third item here until 2026-09-18, when it
+landed — see the amendment at the end of this document.
 
 ## 5. Fuzz seeds — positioned for, not wired up
 
