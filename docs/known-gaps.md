@@ -282,15 +282,16 @@ already built that have a known, accepted rough edge.
   cross-core handoff) and roughly **3× peak RSS**, because nothing paces the reader against the
   decoder any more once they're not sharing a poll budget.
 
-  Shipping it, not attempted here, needs four things designed together, all named in the ADR's
-  "Consequences" section: a join-handle-plus-cancellation story to replace `run_until_shutdown`'s
-  two-arm `select!`, which is load-bearing for shutdown/drain ordering today (read finishing closes
-  the queue, which is what lets decode discover closed-and-empty and flush its accumulator); moving
-  the decoder out of `&mut self` so it can live on a `'static` task (`D: 'static`); a `Fanout`
-  ownership answer, since dropping the decode future — not something a caller does directly once it's
-  on a task — is what closes every downstream inbox today; and `receive.max_bytes`'s default
-  revisited against real measurements, since nothing bounds the reader once it's decoupled from
-  decode's pace. **This overlaps heavily with the `SO_REUSEPORT` entry above**, which needs answers to
+  Shipping it, not attempted here, needs four things designed together — three named in the ADR's
+  "Consequences" section, the fourth from PR #254's own report of the experiment: a
+  join-handle-plus-cancellation story to replace `run_until_shutdown`'s two-arm `select!`, which is
+  load-bearing for shutdown/drain ordering today (read finishing closes the queue, which is what lets
+  decode discover closed-and-empty and flush its accumulator); moving the decoder out of `&mut self`
+  so it can live on a `'static` task (`D: 'static`); a `Fanout` ownership answer, since dropping the
+  decode future — not something a caller does directly once it's on a task — is what closes every
+  downstream inbox today; and `receive.max_bytes`'s default revisited against real measurements,
+  since nothing bounds the reader once it's decoupled from decode's pace. **This overlaps heavily
+  with the `SO_REUSEPORT` entry above**, which needs answers to
   the same shutdown-cascade and `Fanout`-ownership questions for its own, larger reason (N readers
   each with their own `Fanout` clone) — the two should be designed together rather than separately.
 - ~~**A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, on both sides of

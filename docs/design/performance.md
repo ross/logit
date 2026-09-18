@@ -655,16 +655,35 @@ because this dev box's numbers move for reasons that have nothing to do with the
 
 ### Measured numbers
 
-**Everything between the markers below is provisional.** The dev box these numbers were taken on is
-a laptop, on battery, on the `powersave` governor, thermally throttling under sustained load —
-identical code measured minutes apart drifted 3–5% in CPU µs/event, and the control-to-control rows
-in each table are the direct evidence of that drift, not a formality. The lead re-takes every number
-here as interleaved one-sitting pairs on a plugged-in, cooled box (or a cloud VM) before this
-workstream is considered closed for measurement purposes, and that pass replaces the block below
-wholesale rather than amending it in place — nothing in the prose above or below this block should be
-read as depending on today's specific figures.
+**Everything between the markers below is provisional.** This dev box is a laptop whose power/thermal
+state was not controlled across this stack's measurement sessions, and what's actually known about
+that state differs by table, not uniform across all of them:
 
-<!-- udp-intake-numbers:begin PROVISIONAL 2026-09-18 battery/powersave -->
+- **W2 baseline, W3 delta.** `logit-perf run`'s `box_state` capture (governor, energy-performance
+  preference, AC-online) did not exist yet when these were taken — every result file behind these two
+  tables predates the field, so there is no recorded power state for either. PR #252's body asserts
+  "on mains, host otherwise idle" for the W2 baseline; that claim has no recorded evidence behind it
+  in the results JSON, and should be read as an unverified assertion, not a checked fact.
+- **W4 delta, `read_batch` sweep.** `box_state` is recorded for every file behind these two tables.
+  It shows `scaling_governor: "powersave"` and `energy_performance_preference:
+  "balance_performance"` throughout, and `on_ac_power` **false** for every run except the very first
+  control of the W4 session (`20260918T184346Z-…-w3-control-A.json`, `on_ac_power: true`) — so the box
+  was on AC for that one run and on battery for every run after it, including the entire sweep.
+  Separately from anything the harness recorded: the lead checked the host directly during the
+  afternoon these were taken and found it on battery under `powersave`, and the box's owner reports a
+  warm room with fans running hard under load — real, but observed by hand, not by `box_state` (this
+  box has no ACPI `platform_profile` file at all, per `perf/load/README.md`'s "Box state" table, so
+  there is no recorded reading of it to cite either way).
+
+Identical code measured minutes apart drifted 3–5% in CPU µs/event during this stack's sessions, and
+the control-to-control rows in the W3 and W4 tables are the direct evidence of that, not a formality.
+The lead re-takes every number here as interleaved one-sitting pairs on a plugged-in, cooled box (or a
+cloud VM), with `box_state` recorded for every run this time, before this workstream is considered
+closed for measurement purposes — that pass replaces the block below wholesale rather than amending it
+in place, and nothing in the prose above or below this block should be read as depending on today's
+specific figures.
+
+<!-- udp-intake-numbers:begin PROVISIONAL 2026-09-18 laptop, powersave, power/thermal state not controlled -->
 
 #### W2 baseline (PR #252, head `912f5574649d`, branch `udp/w2` measured post-`udp/w1`-merge)
 
@@ -685,7 +704,17 @@ exactly on every repeat. Peak `receive_buffer.utilization` 0.29 / 0.07 / 1.00 �
 Container `net.core.rmem_max` = 4,194,304; `receive_buffer_bytes: 1MiB` is granted as 2 MiB and not
 clamped.
 
-#### W3 delta: `push_many`/`pop_many` (PR #253, head `1b3228c10351`, branch `udp/w3`)
+#### W3 delta: `push_many`/`pop_many` (PR #253, measured at `2038b29`, branch `udp/w3`)
+
+**Measured at `2038b29`** ("merge udp/w2 into udp/w3", `udp/w3`'s first commit after branching), not
+at the PR's final head `1b3228c10351`. The lost-wakeup fix (`c3ac8ae`, "push_many must announce its
+prefix before it waits, not after") and the docs-only commit after it (`1b59760`) both landed on this
+branch after this pair was taken. The fix does not touch this pair's steady-state measurement — under
+the load this pair drives (no batch exceeds the queue's free room, so no `Block` wait is ever
+provoked), the change is one extra `not_empty.notify_one()` call on the path that only runs when a
+`push_many` call has to wait, never a path this pair's numbers exercise — but the pair is re-taken
+regardless at the lead's final pass, on the merged head, rather than trusted on the strength of that
+argument alone.
 
 Run as **A–B–A–B in one sitting** (`udp/w2` control, `udp/w3` branch, `udp/w2` control, `udp/w3`
 branch) because the drop rate here is the difference between two nearly-equal rates and moves with
@@ -735,10 +764,11 @@ udp-statsd-small              +2.4%        -4.9%        +0.0%      -2.13 pts
 
 #### W4 delta: `recvmmsg` (PR #254, head `4a0c252fa530`, branch `udp/w4`)
 
-**Box was on `powersave` with a `balanced` platform profile for this pass** — large effects still
-show through, small ones should not be read (this is the pass the lead's re-take supersedes).
-Interleaved A–B–A–B (`udp/w3` control, `udp/w4` branch, `udp/w3` control, `udp/w4` branch),
-`--pin-sender 0,1 --pin-child 2,3`, `--repeat 5`, medians.
+**Recorded `box_state`: `powersave` governor, `balance_performance` EPP, on battery for every run in
+this pair** (see "Measured numbers" above for the one exception and what's observed vs. recorded) —
+large effects still show through, small ones should not be read; this is the pass the lead's re-take
+supersedes. Interleaved A–B–A–B (`udp/w3` control, `udp/w4` branch, `udp/w3` control, `udp/w4`
+branch), `--pin-sender 0,1 --pin-child 2,3`, `--repeat 5`, medians.
 
 | Scenario | | w3 control A | **w4 A** | w3 control B | **w4 B** |
 |---|---|---|---|---|---|
@@ -793,7 +823,14 @@ fixed costs make up a larger share of the total, and there are fewer syscalls pe
 #### `read_batch` sweep (PR #254, head `4a0c252fa530`, evidence for the default)
 
 `read_batch` ∈ {1, 16, 32, 64, 128, 256}, `--repeat 3`, `--pin-sender 0,1 --pin-child 2,3`, both
-scenarios set at once, everything else held:
+scenarios set at once, everything else held. **Every cell below — including `udp-statsd`'s `max
+rcvbuf` column, which is not in PR #254's own body — is read from the six results files'
+`median.udp` fields** (`cpu_us_per_event`; `received_datagrams / reads` for fill;
+`kernel_dropped / sent_datagrams` for kernel drop %; `kernel_rcvbuf_utilization_max`) under
+`~/lib/logit/tmp/perf/udp/w4/`:
+`20260918T191029Z-unknown-w4-sweep-rb1.json`, `…-191129Z-…-rb16.json`, `…-191229Z-…-rb32.json`,
+`…-191328Z-…-rb64.json`, `…-191428Z-…-rb128.json`, `…-191528Z-…-rb256.json` — checked cell by cell
+against this table while addressing review, not just spot-checked.
 
 | `read_batch` | **`udp-statsd-small`** µs/ev | fill | kernel drop % | max rcvbuf | | **`udp-statsd`** µs/ev | fill | kernel drop % | max rcvbuf |
 |---|---|---|---|---|---|---|---|---|---|

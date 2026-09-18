@@ -750,12 +750,14 @@ read those first. Each bullet is something this record did not, or could not, sa
   generically: the shared `crate::tcp` driver (`syslog_in`, `graphite_in`, TCP `statsd_in`, one call
   site), plus `logit_in`, `otlp_in`, and `prometheus_in`'s remote-write receiver, each of which keeps
   an accept loop of its own and needed its own `AcceptQueueSampler::accept()` call site.
-- **`push_many` notifies `not_empty` immediately before every wait, not only once at the end of the
-  call — found in review, not at design time.** The end-of-call notification alone is a lost wakeup
-  under `Block`: a batch bigger than the queue's total free room admits a prefix and then parks on
-  `not_full`, and a consumer that had already parked on `not_empty` *first* would wait for a permit
-  issued only once the whole call returns — which can only happen once that same consumer frees room,
-  a permanent mutual wait. The fix notifies before every suspend point instead of only after the last
-  one, which also covers cancellation for free (the accepted prefix is already announced by the time
-  a cancelled call's remainder is dropped). `push`'s existing per-item notification was never
-  affected — it takes its item on the same arm that breaks its loop, so it never had this gap.
+- **The `push_many`/`not_empty` lost-wakeup fix this record's "`read_batch` larger than
+  `receive.max_datagrams` is deliberately legal" section already describes was found in review, not
+  at design time** — this ADR's first draft had `push_many` notify `not_empty` once, at the end of
+  the call, and the parked-consumer-before-an-oversized-batch deadlock that shape allows was caught
+  reading the code, not by the exhaustive push/pop-equivalence test (that test's own doc comment
+  names its `Block` exclusion as why). Pinned by three new tests rather than one: a consumer parked
+  first in `pop_many`/`pop`/`peek` against an over-capacity batch on both the item and byte bounds,
+  the same case cancelled mid-wait, and a `Block` equivalence sweep (5 bound shapes × 4 batch
+  sequences × both park orderings) — plus, end to end, W4's `overflow: block` /
+  `max_datagrams: 4` / `read_batch: 64` / `batch_flush_interval: 0s` listener test, which fails
+  against the pre-fix queue and passes against the merged one.

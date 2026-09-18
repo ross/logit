@@ -33,6 +33,13 @@ the ADR's "out of scope" section explains why.
 
 ## Workstreams
 
+**Status: complete and pushed, not merged.** Every row below is `**Landed** (#N)` in the same sense
+[`docs/plans/prometheus-remote-write.md`](prometheus-remote-write.md) uses that word for its own
+stacked, unmerged PRs: the PR is open, its branch carries the finished work, and it targets its
+parent workstream's branch per the linear stack below — "landed" means complete and pushed, **not**
+merged to `main`. Per the "Settled decisions" section above, nothing in this plan merges on its own
+initiative; Ross directs merging.
+
 | # | Scope | Files | Tests | Verification |
 |---|---|---|---|---|
 | W0 | **Landed** (#250). **Docs only.** This ADR and plan. | `docs/adr/udp-intake-batching-and-socket-visibility.md` (+ row atop `docs/adr/README.md`); `docs/plans/udp-intake.md` (this file, + row atop `docs/plans/README.md`) | — | Every relative link resolves; both docs follow `docs/adr/TEMPLATE.md`'s headings exactly; both README indexes gain a row in `created`-order. `script/cibuild` run once per the worker brief even though scope is docs-only. |
