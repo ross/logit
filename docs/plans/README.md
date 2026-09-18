@@ -9,6 +9,7 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-09-18 |
 | [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |
 | [Enabling plan: `docker_in` live container identity and a minimal `inotify` watch set](docker-container-identity.md) | 2026-09-17 | 2026-09-17 |
 | [Enabling plan: `Transform::process` in place — `&mut Event -> bool`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
