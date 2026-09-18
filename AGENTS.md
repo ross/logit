@@ -297,8 +297,10 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
 | `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
 | `script/demo [compose args]` | Run the self-contained demo stack (`demo/`) — the release image, no dev container |
+| `script/vm up\|shell\|status\|down` | Create, use, and destroy a disposable Azure VM for perf measurement (`docs/adr/disposable-azure-perf-vm.md`). `down` deletes the resource group — the only way back to $0 |
 
-All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides. See
+All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides — except `script/vm`,
+which talks to `az` and `ssh` on the host and never to a local Docker daemon. See
 [ADR `containerized-development`](docs/adr/containerized-development.md) and
 [ADR `scripts-to-rule-them-all`](docs/adr/scripts-to-rule-them-all.md).
 
