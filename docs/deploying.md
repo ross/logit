@@ -859,15 +859,27 @@ container recreate.
 
 ### `watch: auto | inotify | poll`
 
-`auto` (the default) uses `inotify` where available (Linux only) for near-immediate discovery of a
-new or rotated file, falling back to polling (`watch_error` diagnosed) if `inotify` setup fails;
-`poll` always uses the `poll_interval` tick (1s default) instead, with no OS-specific dependency —
-the right choice over some network/FUSE mounts, where `inotify` events don't reliably fire; `inotify`
-fails startup outright on setup failure rather than degrading silently. **This only speeds up
-*discovering* a path** (a new file, a rotation, a truncation) — reading more bytes off an
-already-tracked file is never gated by either the watch mode or `poll_interval`, since the driver's
-own read loop runs on every iteration regardless of what woke it, and an already-open file handle
-simply sees new bytes on its next read.
+`auto` (the default) uses `inotify` where available (Linux only), falling back to polling
+(`watch_error` diagnosed) if `inotify` setup fails; `poll` always uses the `poll_interval` tick (1s
+default) instead, with no OS-specific dependency — the right choice over some network/FUSE mounts,
+where `inotify` events don't reliably fire; `inotify` fails startup outright on setup failure
+rather than degrading silently. Reading more bytes off an already-tracked file is never gated by
+`poll_interval` alone: the driver's own read loop runs on every iteration regardless of what woke
+it, so once something wakes it — a content change on a tracked file's own watch, or a poll tick —
+it reads everything currently available.
+
+What `inotify` actually watches is deliberately narrow: one watch on the single directory a
+pattern reaches (`paths:` for `tail_in`, `root` for `docker_in`), plus one watch per file the
+listener currently has open — nothing for a container this listener isn't tailing, and nothing
+that wakes on a write to a file that isn't being tracked. For `docker_in` specifically, that
+directory watch on `root` alone is enough to catch a container's own directory arriving or leaving
+near-instantly (Docker's per-container state directories are direct children of `root`), but *not*
+enough to catch a log file's own first appearance inside an already-existing container directory,
+a rotation, or a `config.v2.json` change — those three ride `poll_interval` regardless of `watch`
+mode. This is a deliberate trade: a design that additionally watched every container's own
+subdirectory would catch all three near-instantly too, but at a cost of O(containers on the host)
+work for every log line written anywhere on the host, selected or not — see [ADR
+`docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
 
 ### What to watch
 
@@ -876,6 +888,10 @@ simply sees new bytes on its next read.
   `paths:` glob matches no files yet — both silent by design (a directory that doesn't exist yet is
   the ordinary "not there yet" case, retried next cycle), so this is the number to alert on if
   "nothing is flowing" needs to be distinguished from "nothing to flow yet."
+- `logit.input.watch.watches` (gauge) — how many `inotify` watches this listener currently holds
+  (the watched directory, plus one per file currently open). Proportional to what's actually being
+  tailed, not to how much any of it writes — the number that makes "the watch set stays minimal"
+  checkable from outside.
 - `logit.input.watch.overflows` (count) — the `inotify` event queue overflowed; the driver responds
   with a full rescan rather than losing track of what changed, but a sustained nonzero rate means
   `poll_interval` is doing more of the real work than the wake source is.
@@ -886,7 +902,14 @@ simply sees new bytes on its next read.
   tool that recreates a log file in place rather than renaming it away first).
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only) — a container's
   `config.v2.json` couldn't be read or parsed; that container's lines still flow, just with a
-  `container.id`-only resource instead of the full identity.
+  `container.id`-only resource instead of the full identity. Retried on every poll tick, not
+  diagnosed again until it either recovers or the stat changes — this fires once per failure, not
+  once per tick for as long as it persists.
+- `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only) — a container's
+  identity (name, image, or a watched label) changed, or a tracked container was renamed out of
+  `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
+  diagnostics name which container and, for a deselection, that it's process-local: a `logit`
+  restart before the container is renamed back loses the retained resume offset.
 
 ## Series retention
 

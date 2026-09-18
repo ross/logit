@@ -408,6 +408,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
         self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
+        // The watched directory (0 or 1 -- `watched_dirs.len()`, not a hardcoded 1: `Watcher::
+        // Poll` reconciles the same set without ever calling `inotify_add_watch`, but the count
+        // here is "what `reconcile_watches` currently wants watched," not "what actually has a
+        // live kernel watch") plus one entry per currently-open file that actually has one
+        // (`None` under `Poll`, or on a failed `inotify_add_watch` -- see `TrackedFile::watch`'s
+        // doc comment) -- this is the number that makes "the watch set stays proportional to
+        // what's tailed, not to what's running on the host" checkable from outside.
+        let file_watches = self.files.values().filter(|f| f.watch.is_some()).count();
+        self.telemetry.gauge(
+            "logit.input.watch.watches",
+            (self.watched_dirs.len() + file_watches) as f64,
+            &[],
+        );
     }
 
     /// Gives the factory a chance to notice this already-tracked file's identity changed
@@ -1330,6 +1343,46 @@ mod tests {
             gauge_value(&registry, "logit.input.files.open"),
             Some(0.0),
             "files.open should drop to 0 once the removed file is reaped"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `logit.input.watch.watches` counts the watched directory plus one entry per currently-open
+    /// file with its own watch -- the number `docs/adr/docker-container-identity-and-minimal-
+    /// watches.md`'s whole design is meant to keep proportional to what's tailed. `WatchMode::
+    /// Inotify` so watches are real, not the `Poll` no-op.
+    #[tokio::test]
+    async fn watch_watches_counts_the_directory_and_each_open_file() {
+        let dir = scratch_dir("watch-count");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"line\n").unwrap();
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("tail_in", "tail_in", "listener");
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.watch = WatchMode::Inotify;
+        let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config)
+            .with_telemetry(telemetry);
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["line"]);
+        assert_eq!(
+            gauge_value(&registry, "logit.input.watch.watches"),
+            Some(2.0),
+            "the watched directory plus the one open file"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(
+            gauge_value(&registry, "logit.input.watch.watches"),
+            Some(1.0),
+            "back down to just the watched directory once the removed file is reaped"
         );
 
         shutdown(shutdown_tx, handle).await;

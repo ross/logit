@@ -1343,12 +1343,25 @@ already built that have a known, accepted rough edge.
   mean this sink reading and interpreting TLS alerts (or application-level acks) it currently
   never looks at — out of scope for either ADR that introduced these sinks.
 
-- **`docker_in` never notices a `docker rename` after a container's log file is first opened.**
-  `container.name` is read once, from `config.v2.json`, at open time, and never re-read for the
-  life of that file handle — a rename after that point is invisible until the container restarts
-  (a new inode, a fresh `open`). Closing this would mean either watching `config.v2.json` itself
-  (a second file per container to track) or moving to the docker socket/API, which reports renames
-  as events. See [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md).
+- **`docker_in`'s identity refresh, and its offset retention across a de-selecting rename, are
+  both bounded by `poll_interval`, and the retention doesn't survive a `logit` restart.** A
+  `config.v2.json` change (a rename, a metadata read recovering from an earlier failure) is
+  picked up on the next poll tick, not instantly — a rename and a rename back within one tick is
+  never observed at all. A container renamed out of `containers:` retains its offset in memory so
+  a rename back resumes rather than replaying, but that retention is process-local: `logit`
+  restarting between the two renames falls back to `read_from` for it, the same as any file this
+  process has never seen before. See [ADR
+  `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
+- **`docker_in` only watches `root` and the files it currently has open, so a log file's own
+  first appearance inside an already-existing container directory, a rotation, and a
+  `config.v2.json` change are all discovered on the next `poll_interval` tick, not instantly.**
+  Only a container's own directory arriving or leaving under `root` is `inotify`-fast — Docker's
+  per-container state directories are direct children of `root`, so that much needs no per-
+  container watch at all. A short `poll_interval` is the only way to tighten the other three; none
+  of the three lose data by being poll-bound, only latency. This deliberately reverses the
+  previous per-container-directory-watch design, which caught all four near-instantly but cost
+  O(containers on the host) work per log line written anywhere on the host. See [ADR
+  `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
 - **`docker_in` only speaks the json-file log driver.** Docker also supports `local`,
   `journald`, `syslog`, and others as the configured logging driver; none of the others write a
   per-container file this driver could tail at all. Genuinely different work per driver, not a
