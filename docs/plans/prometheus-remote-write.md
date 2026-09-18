@@ -34,9 +34,9 @@ nothing is merged by this workstream; Ross directs merging.
 | Exposition `bind:` | Unchanged — no TLS, no auth, known-gaps row as-is |
 | Resource identity | Labels stay labels. `instance`/`job` are ordinary attributes; no `prometheus.target`, no lifting to `Resource`. One `EventBatch` per request, empty `Resource` |
 | Multi-sample series | Decode partitions a request's samples by timestamp, one assembler per distinct timestamp, ascending; encode partitions the batch by `Event::timestamp` and merges identical label sets into one `TimeSeries` with ordered samples |
-| Timestamps | Receiver sets `Event::timestamp` **without** the `prometheus.timestamp` marker; sender always emits one (ms) |
+| Timestamps | Receiver sets `Event::timestamp` **without** the `prometheus.timestamp` marker, via a new `PrometheusDecoder::with_timestamp_marker(bool)` (default `true`) that it passes `false`; sender always emits one (ms) |
 | Stale markers | `Point::Stale` ↔ the stale NaN `0x7ff0000000000002` ↔ `FLAG_NO_RECORDED_VALUE`, for single-series kinds only. `Histogram`/`Summary`/sketch kinds with the flag stay skipped+counted |
-| 2.0 created timestamp | `created_timestamp` ↔ `Series.created` ↔ `MetricRecord::start_timestamp`, the existing `_created` path (which message carries the field is settled against the vendored proto in W1). 1.0 has none |
+| 2.0 start timestamp | `Sample.start_timestamp` (field 3, ms, `0` = unset) and `Histogram.start_timestamp` ↔ `Series.created` ↔ `MetricRecord::start_timestamp`, the existing `_created` path. Per-sample, not per-`TimeSeries`: field 6 on `TimeSeries` (the 2.0 spec prose's `created_timestamp`) is `reserved` in the vendored proto. 1.0 has none |
 | Exemplars | Both ways via the existing `Exemplar` mapping; sender emits on counter and `_bucket` series only, as the text writer does |
 | Body cap | `MAX_REQUEST_BYTES = 4 MiB` constant on the **decompressed** body, matching `otlp_in`; Snappy's `decompress_len` checked before decompressing. Not a config field |
 | Wrong method | `405 + Allow: POST` — a deliberate divergence from `otlp_in`'s `404`, matching `prometheus_out`'s exposition routes; documented in the module doc |
@@ -58,9 +58,9 @@ nothing is merged by this workstream; Ross directs merging.
   both `import "gogoproto/gogo.proto"` and the intra-package `import "types.proto"` must resolve in
   `tools/protogen`. 1.0's `MetricMetadata.type` enum is exactly `FamilyType` (`UNKNOWN` ↔
   `Unknown`).
-- [`tools/protogen/src/main.rs`](../../tools/protogen): today one `DEST` const (`:11`), one
-  OTLP-specific filename rewrite (`strip_prefix("opentelemetry.proto.")`, `:43`), a single include
-  dir `PROTO_ROOT` (`:31`), and no prost-build customizations to mirror. Turn `FILES`/`DEST` into a
+- [`tools/protogen/src/main.rs`](../../tools/protogen): today one `DEST` const (`:10`), one
+  OTLP-specific filename rewrite (`strip_prefix("opentelemetry.proto.")`, `:42`), a single include
+  dir `PROTO_ROOT` (`:9`), and no prost-build customizations to mirror. Turn `FILES`/`DEST` into a
   per-family table `(include_dirs, files, dest_dir, filename_rewrite)`; add the prompb family
   writing to `crates/logit-proto/src/prometheus/generated/{prometheus.rs,
   io.prometheus.write.v2.rs}`; pass both include roots. Hand-write `generated/mod.rs` mirroring
@@ -84,7 +84,7 @@ private to `text.rs`. It moves to `crates/logit-proto/src/prometheus/assemble.rs
 - `declare(base_name, FamilyType, help, unit)`.
 - `push(sample_name, labels, value: f64, timestamp_nanos, exemplar, decoder)`.
 - `push_created(sample_name, labels, created_nanos, decoder)` — the nanos-typed path both
-  `Role::Created` and 2.0's `created_timestamp` need.
+  `Role::Created` and 2.0's `start_timestamp` need.
 - `finish(decoder) -> Vec<MetricFamily>`.
 
 `text::Parser` keeps what is genuinely text syntax and delegates the rest: line parsing, `dialect`,
@@ -107,6 +107,12 @@ and `text.rs`'s own tests pass with no expectation changes.
   `text::write` skips a `Stale` point, counted.
 - `PrometheusEncoder::with_timestamps_always(bool)`, default `false`: fill `Series.timestamp` from
   `Event::timestamp` even without the `prometheus.timestamp` marker.
+- `PrometheusDecoder::with_timestamp_marker(bool)`, default **`true`** — today's behaviour. The
+  receiver passes `false`. Without it the receiver cannot implement the timestamp decision at all:
+  `families_to_events` inserts `prometheus.timestamp: true` whenever `Series.timestamp` is `Some`
+  (`mod.rs:454-459`), and on this transport it always is, so every received event would carry the
+  marker — the ADR's own rejected alternative. With it `Event::timestamp` is still set from the
+  sample and only the marker attribute is omitted.
 - `prometheus_fixed_point.rs`'s `series()` generator (`:416`) stays free of `Stale`, so property 1
   (whole-value `PartialEq` round trip) holds under the default encoder; `Stale` gets a dedicated test
   with the switch on.
@@ -138,7 +144,7 @@ and `text.rs`'s own tests pass with no expectation changes.
   — one bad series does not lose the request. **2.0:** resolve `labels_refs`/`help_ref`/`unit_ref`
   through `symbols`; a bad ref, an odd-length `labels_refs`, or `symbols[0] != ""` is
   `CodecError::Malformed` → `400`, since those are structural, not per-series. `declare` from inline
-  `Metadata` (`UNSPECIFIED` → `Unknown`); `created_timestamp != 0` → `push_created`. The stale NaN
+  `Metadata` (`UNSPECIFIED` → `Unknown`); `Sample.start_timestamp != 0` → `push_created`. The stale NaN
   (`0x7ff0000000000002`) on any sample → `Point::Stale`. `histograms` entries →
   `histograms_skipped`, `skipped{reason="native_histogram"}`. Exemplar labels through the existing
   OpenMetrics exemplar mapping.
@@ -151,8 +157,9 @@ and `text.rs`'s own tests pass with no expectation changes.
   uppercase-initial names precede `_`). Series with identical label sets are merged across groups
   into one `TimeSeries` with samples in timestamp order; timestamp is `Series.timestamp` in ms,
   always `Some` on this path. **1.0:** one `MetricMetadata` per family in `metadata[]`. **2.0:**
-  symbol table with `""` at index 0, inline `Metadata` per series, `created_timestamp` from
-  `Series.created`. Exemplars on `_total`/`_bucket` series only.
+  symbol table with `""` at index 0, inline `Metadata` per series, `Sample.start_timestamp` from
+  `Series.created` (per-sample, so the cross-group merge has no created-timestamp collision to
+  resolve). Exemplars on `_total`/`_bucket` series only.
 
 **Tests.** `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs`, both versions: groups
 → `encode` → `decode` → identical groups (exemplars, created, stale, multi-timestamp series); the
@@ -171,8 +178,9 @@ are at `:234` and `:278`) — pins and doc rows in the same commit, per `AGENTS.
 `scrape_targets` becomes `#[serde(default)]` (empty = unset); new `bind: Option<String>`,
 `path: String` default `/api/v1/write`, `bind_tls: Option<TlsServerConfig>` (`:284`, matching every
 other listener's `Option<TlsServerConfig>` at `:427, 534, 635, 690, 790`), and
-`idle_timeout: Option<Duration>` (`with = "humantime_serde_duration"`, `:2828`, plus the
-`#[schemars(with = "String")]` hint). `tls` → `scrape_tls` in the config, in
+`idle_timeout: Option<Duration>` (`#[serde(default, with = "humantime_serde_duration::option")]`
+plus `#[schemars(with = "Option<String>")]`, as every other listener's `idle_timeout` at
+`:469-471`). `tls` → `scrape_tls` in the config, in
 `crates/logit-cli/src/pipeline.rs`'s `PrometheusIn` arm (`:444-452`), in the input's module doc, and
 in this pair's ADR/plan/known-gaps prose.
 
@@ -181,10 +189,20 @@ in this pair's ADR/plan/known-gaps prose.
 `scrape_targets`/`bind`; a non-default scrape-only field (`interval`, `timeout`, `headers`,
 `scrape_tls`) with `bind:` is an error, and a non-default bind-only field (`path`, `bind_tls`,
 `idle_timeout`) with `scrape_targets` is an error — rule 45's (`:182-186`) and rule 53's
-(`:243-252`) shape. `interval` keeps its default so rule 9's `interval: 0s` rejection (`:531-540`)
-stays satisfied in bind mode. Update the kind role/name tables (`graph.rs:329/388`, `:363/422`) and
-run `script/schema`, committing `schema/logit.schema.json` — `script/cibuild` fails when it is
-stale.
+(`:243-252`) shape. `interval` keeps its default so rule 9's `interval: 0s` rejection (the `bail!`
+at `graph.rs:852-859`; `:531-539` is the `interval()` helper it reads) stays satisfied in bind
+mode. Update the kind role/name tables (`graph.rs:329/388`, `:363/422`) and run `script/schema`,
+committing `schema/logit.schema.json` — `script/cibuild` fails when it is stale.
+
+**Rule 40 becomes scrape-mode-only, and that is the rule that actually blocks bind mode.** Rule 9
+is harmless here; rule 40 (`graph.rs:1815-1890`) is not. It runs over every `PrometheusIn` and
+bails when `scrape_targets` is empty (`:1818-1826`, *"'scrape_targets' must name at least one
+scrape URL"*), so a bind-mode config fails validation before rule 55 is ever consulted. Its
+`timeout.is_zero()` check (`:1835-1840`), its header validation, and its `!tls.is_empty() &&
+!any_https` check (`:1854-1856` — bound to the very field this workstream renames `scrape_tls`) are
+equally scrape-only. So W3 gates rule 40's whole body on `!scrape_targets.is_empty()`, and rule 55
+owns the mode itself: the exactly-one-of check plus the wrong-mode-field checks in both directions.
+Rule 40's existing tests must keep passing unchanged — they all set `scrape_targets`.
 
 **Input** (`crates/logit-inputs/src/prometheus.rs`): `PrometheusInput` becomes a mode enum (or two
 structs behind one `Input`); `tick` is untouched. In receiver mode `Input::bind` opens the
@@ -209,16 +227,23 @@ Routes:
 | Snappy/protobuf failure, 2.0 symbol errors | `400`, `text/plain` reason |
 
 One `EventBatch` per accepted request (empty `Resource`, `received_at` = now), built by
-concatenating `families_to_events` over `Decoded.groups`, sent on the `Fanout` **before** the
+concatenating `families_to_events` over `Decoded.groups` — through a `PrometheusDecoder` built
+`with_timestamp_marker(false)`, per §2, so `Event::timestamp` is set and the
+`prometheus.timestamp` marker is not — sent on the `Fanout` **before** the
 response is built — the ordering `otlp_in` uses (`otlp.rs:904-925`) — so channel backpressure delays
 the `204` and the sender's queue throttles, which is remote-write's own flow-control model.
 Shutdown is per-connection, like `otlp_in`'s.
 
-Counters match `otlp_in`'s request-counter spelling:
-`logit.input.requests{class="ok"|"not_found"|"method"|"unsupported"|"oversize"|"bad_request"}`,
-`logit.input.request.duration`, `logit.input.samples` (reused), plus the decoder's own
-`skipped{reason}`. `warn_throttled("write_rejected", ..)` on `400`/`413`/`415`, with the peer
-address in the message text only, never as a tag.
+Counters take **`prometheus_in`'s own scrape-side spelling**, not `otlp_in`'s — `otlp_in` has no
+request-level counters to match (its only telemetry is `logit.input.connections{,.rejected,.closed}`,
+`crates/logit-inputs/src/otlp.rs:391,413,772`, which `docs/design/internal-telemetry.md:620-624`
+records as deliberate). The sibling to mirror is this component's other mode:
+`logit.input.scrapes{class}` and `logit.input.scrape.duration`
+(`crates/logit-inputs/src/prometheus.rs:73,507-508`). So the receiver emits
+`logit.input.writes{class="ok"|"not_found"|"method"|"unsupported"|"oversize"|"bad_request"}`,
+`logit.input.write.duration`, and `logit.input.samples` (reused as-is, `prometheus.rs:509`), plus
+the decoder's own `skipped{reason}`. `warn_throttled("write_rejected", ..)` on `400`/`413`/`415`,
+with the peer address in the message text only, never as a tag.
 
 **The module doc is the spec**, per house convention: config table, routes table, "no `up` or
 scrape synthetics in bind mode", labels-stay-labels, timestamp handling, and the timestamp-group
@@ -235,10 +260,13 @@ in `otlp_in`'s test shape; rule 55 config cases.
 `Option<String>`; new `endpoint: Option<String>` (an absolute `http(s)` URL including the path,
 typically `/api/v1/write`), `version` (`1 | 2`, default `1`), `timeout: Duration` default 10s,
 `headers: HashMap<String, String>` validated the way rules 22 and 40 already validate header maps
-(rule 40 is at `graph.rs:1815-1887`; note its `tls` check is a *scheme* check, not a mode check)
+(rule 40 is at `graph.rs:1815-1890`; note its `tls` check is a *scheme* check, not a mode check)
 against a `RESERVED_REMOTE_WRITE_HEADERS` list — `content-type`, `content-encoding`,
-`x-prometheus-remote-write-version`, `user-agent`, `content-length` — mirroring
-`RESERVED_PROMETHEUS_HEADERS` (`lib.rs:605`), and `endpoint_tls: TlsClientConfig` (`:246`).
+`x-prometheus-remote-write-version`, `user-agent`, `content-length`, five names — mirroring
+`RESERVED_PROMETHEUS_HEADERS`, which lives in `crates/logit-pipeline/src/graph.rs:611` and is used
+by rule 40 at `:1875`. The new list belongs in the same file for the same reason: the crate whose
+`resolve()` consumes it, not `logit-config`. `endpoint_tls: TlsClientConfig`
+(`crates/logit-config/src/lib.rs:246`).
 
 **Rule 56:** exactly one of `bind`/`endpoint`; a non-default registry-only field (`path`,
 `expire_after`, `max_series`) with `endpoint:` is an error, and a non-default sender-only field
@@ -267,9 +295,17 @@ idempotent overwrite — and `true` is what selects `DeliveryPosture::AtLeastOnc
 (`crates/logit-pipeline/src/output.rs:96-105,159-166`), without which `Fault::Ambiguous` is never
 retried at all.
 
-Counters use `otlp_out`'s spelling:
-`logit.output.requests{class="2xx"|"4xx"|"429"|"5xx"|"network_error"|"timeout"}`,
-`logit.output.request.duration`, `logit.output.samples`, plus the encoder's existing
+Counters use `otlp_out`'s `status_class` vocabulary **exactly**:
+`logit.output.requests{class="1xx"|"2xx"|"3xx"|"4xx"|"5xx"|"other"}` plus the literal
+`class="network_error"` (`crates/logit-outputs/src/otlp.rs:528-536`, `:351`). There is no `429`
+class — a `429` is a `4xx`, and splitting it out would contradict `is_retryable_http_status`, which
+this same paragraph reuses to decide the `Fault` — and no `timeout` class, since a timeout lands in
+`network_error`. `otlp_out` also tags `signal` on every one of these; this sink carries a single
+signal, so it omits that tag rather than hard-coding one value. `logit.output.request.duration`
+follows the sinks that actually emit it — `graphite_out`, `collectd_out`, `syslog_out`,
+`statsd_out`, `influxdb_out`; `otlp_out` does not — and `logit.output.samples` is **new**, with no
+precedent in the tree: it is kept deliberately, mirroring the receiver's `logit.input.samples`, so
+the two ends of a remote-write relay are comparable. Plus the encoder's existing
 `skipped`/`degraded` counters — delta temporality is still skipped and counted, with
 `aggregate { temporality: cumulative }` as the named fix, unchanged from the exposition path.
 
@@ -334,7 +370,7 @@ untyped again; cap eviction.
 |---|---|---|
 | W0 | This plan; ADR [`prometheus-remote-write`](../adr/prometheus-remote-write.md); the "landed" pointer in [`prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)'s forward-compat section and its plan's §5; index rows in both `docs/adr/README.md` and `docs/plans/README.md`. | — |
 | W1 | Vendored prompb + gogoproto protos (README pin), `tools/protogen` per-family table, committed generated code, `snap` dependency. | W0 |
-| W2 | Assembler hoist (own commit); `Point::Stale`, `with_stale_markers`, `with_timestamps_always`; `remote_write.rs` decode/encode for both versions with timestamp groups; fixed-point and bench tests. | W1 |
+| W2 | Assembler hoist (own commit); `Point::Stale`, `with_stale_markers`, `with_timestamps_always`, `with_timestamp_marker`; `remote_write.rs` decode/encode for both versions with timestamp groups; fixed-point and bench tests. | W1 |
 | W3 | `otlp_in` idle-helper hoist (own commit); `prometheus_in` `bind:` receiver, `tls` → `scrape_tls`, `bind_tls`, rule 55, regenerated schema, module-doc spec, tests. | W2 |
 | W4 | `prometheus_out` `endpoint:` sender, `version`/`timeout`/`headers`/`endpoint_tls`, rule 56, regenerated schema, `Fault` mapping, tests. | W2 (developed in parallel with W3, stacked after it) |
 | W5 | Receiver metadata cache. | W3 |
