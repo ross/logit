@@ -342,26 +342,37 @@ impl<T: Queued> BoundedQueue<T> {
     /// "how long did the producer stall", and a call that stalled once for 5 ms should not be
     /// indistinguishable from one that stalled 64 times for 78 µs each.
     ///
-    /// **One `not_empty.notify_one()` per call, deliberately not `notify_waiters()`.**
-    /// `notify_one` stores at most one permit, so N calls before a waiter next polls are
-    /// indistinguishable from one call (the ADR records this so nobody credits the batched call
-    /// with a wakeup win it does not have) -- but the choice between the two primitives is real.
-    /// There is exactly one consumer per queue today (`decode_loop` on the receive side,
-    /// `write_loop`/`drain_inbox` on the sink side), so one permit is one wakeup for the one task
-    /// that wants it. Even with several consumers it stays correct: the woken one re-checks state
-    /// under the lock before it ever parks again (`pop`/`pop_many`'s loop), so it keeps draining
-    /// while items remain, and a consumer cannot be left parked next to a non-empty queue.
-    /// `notify_waiters()` would wake *all* current waiters, but stores **no** permit -- a consumer
-    /// that had already decided the queue was empty and had not yet registered its `Notified` would
-    /// miss the wakeup entirely and park against a queue that just got items. That is the race the
-    /// permit exists to close, so `notify_one` is the primitive, here and in `push`.
+    /// **One `not_empty.notify_one()` per call, plus one immediately before every wait** -- and
+    /// deliberately never `notify_waiters()`.
+    ///
+    /// The end-of-call notification alone would be a lost wakeup under `Block`: a batch bigger than
+    /// the total free room admits a prefix and then parks, so a consumer that parked on `not_empty`
+    /// first would wait for a permit issued only after this call returns, while this call waits for
+    /// that consumer to free room. The pre-wait notification is what makes "a consumer cannot be
+    /// left parked next to a non-empty queue" true for this method -- including when the call is
+    /// cancelled mid-wait, since the permit is issued before the suspend point, never after it.
+    /// See the comment at that notification for why it can never be spurious.
+    ///
+    /// The extra notifications are not extra wakeups: `notify_one` stores at most one permit, so N
+    /// calls before a waiter next polls are indistinguishable from one (the ADR records this so
+    /// nobody credits the batched call with a latency win it does not have). What the permit *does*
+    /// buy is the race `notify_waiters()` loses: that primitive wakes every currently-registered
+    /// waiter but stores nothing, so a consumer that had already decided the queue was empty and
+    /// had not yet registered its `Notified` would miss the wakeup entirely and park against a
+    /// queue that just got items. `notify_one` is therefore the primitive here, in `push`, and in
+    /// `pop_many`'s `not_full` wakeups. (There is exactly one consumer per queue today --
+    /// `decode_loop` on the receive side, `write_loop`/`drain_inbox` on the sink side -- but none
+    /// of the above depends on that: with several, the woken one re-checks state under the lock
+    /// before it ever parks again, so it keeps draining while items remain.)
     ///
     /// **Cancellation: the remainder is dropped uncounted.** The `Peekable<Drain>` is held across
     /// every `.await` in this method, so a caller whose future is dropped mid-call (`read_loop`'s
     /// shutdown race, the same shape `crates/logit-inputs/src/udp.rs`'s single-datagram
-    /// cancellation already has) leaves: everything already accepted still in the queue and fully
-    /// accounted for, the not-yet-reached remainder dropped along with the `Drain` **without being
-    /// counted as a drop**, and the caller's `Vec` empty. This widens the "one datagram in flight at
+    /// cancellation already has) leaves: everything already accepted still in the queue, fully
+    /// accounted for **and already announced to `not_empty`** (the pre-wait notification above, so a
+    /// consumer is never left parked behind an abandoned prefix), the not-yet-reached remainder
+    /// dropped along with the `Drain` **without being counted as a drop**, and the caller's `Vec`
+    /// empty. This widens the "one datagram in flight at
     /// shutdown, uncounted" loss ADR `decoupled-listener-io` already accepted to at most one batch's
     /// worth, still shutdown-path-only -- ordinary operation never cancels a `push_many`. It cannot
     /// be counted: counting a drop needs `Telemetry`, and the only code that runs on cancellation is
@@ -426,6 +437,24 @@ impl<T: Queued> BoundedQueue<T> {
                 if !must_wait {
                     break (len, total_weight);
                 }
+                // **Announce what this call has already admitted, before suspending.** The
+                // end-of-call notification below is not enough on its own: this method can admit a
+                // run of items and *then* park, and a consumer that parked on `not_empty` before
+                // any of it landed would be waiting for a permit that only arrives once this loop
+                // ends -- which only happens once that same consumer frees room. That is a
+                // permanent mutual wait (`max_items: 2`, a batch of 5, `Block`), and it is also why
+                // a `push_many` cancelled mid-wait must not leave its accepted prefix unannounced.
+                // `push` cannot have this problem: it takes its one item only on the arm that
+                // immediately breaks the loop, so "accepted" already implies "notified".
+                //
+                // Never a spurious wakeup: `must_wait` is only true when the queue is provably
+                // non-empty. It implies `would_overflow`, and `!impossible_to_ever_fit` rules out
+                // the degenerate configs, so either `len >= max_items >= 1`, or
+                // `weight() + w > max_weight` with `w <= max_weight`, which needs `weight() > 0`.
+                // A later iteration that admits nothing new re-issues the same permit against the
+                // same non-empty queue, so the woken consumer still finds work, never an empty
+                // queue it has to park against again.
+                self.not_empty.notify_one();
                 if blocked_timer.is_none() {
                     blocked_timer = Some(self.telemetry.timer(self.metrics.push_blocked));
                 }
@@ -566,6 +595,23 @@ impl<T: Queued> BoundedQueue<T> {
     /// empty queue observes the close instead of waiting forever, and `not_full`, so a `push()`
     /// blocked on a full queue under `Block` also wakes rather than hanging against a queue that
     /// will never drain further once its consumer sees it close.
+    ///
+    /// **`notify_waiters()` stores no permit, and does not need to.** The obvious worry is a
+    /// `close()` landing between a waiter's state check and the first poll of its `Notified` -- a
+    /// permit-less broadcast would be missed, and the waiter would park against a queue that will
+    /// never wake it again. It isn't missed, and the reason is worth recording because it is not
+    /// obvious from `notify_waiters`'s own signature: `Notify::notified()` snapshots the
+    /// `notify_waiters` call *counter* when the future is **constructed**, and the first poll
+    /// compares that snapshot against the current value before anything else (tokio 1.53.1,
+    /// `sync/notify.rs`: `notified()` and `poll_notified`'s `State::Init` arm, which even leaves a
+    /// `notify_one` permit alone for another waiter when it takes this path). Every wait loop in
+    /// this type constructs its `Notified` *before* the state check it guards -- `push`'s doc
+    /// comment already names that ordering as the thing that makes it race-free -- so a `close()`
+    /// after construction is seen at the first poll, and a `close()` before construction is seen by
+    /// the state check itself. There is no third window.
+    /// `a_notify_waiters_call_between_constructing_a_notified_and_polling_it_is_never_lost` pins
+    /// the tokio behaviour this depends on, so a future version changing it fails here rather than
+    /// silently hanging a shutdown.
     ///
     /// **Decision on a push racing a concurrent close:** a blocked push that wakes because of
     /// this call re-checks state (per `push`'s loop) and, seeing `closed == true`, falls through
@@ -1562,6 +1608,246 @@ mod tests {
         q.push_many(&mut items).await; // must evict units=1
 
         assert_eq!(drain_units(&q), vec![2, 3], "units=1 should have been evicted");
+    }
+
+    /// The one tokio behaviour every wait loop in this file leans on, pinned directly rather than
+    /// left as a claim in a doc comment: `close()` wakes waiters with `notify_waiters()`, which
+    /// stores **no** permit, and the window that would make that lossy -- a broadcast landing
+    /// between a waiter's state check and the first poll of its `Notified` -- is closed by
+    /// `notified()` snapshotting the `notify_waiters` call counter at *construction* time, which is
+    /// before the state check in every loop here. If a future tokio dropped that guarantee, a
+    /// `close()` racing a `pop`/`peek`/`push` would start parking tasks forever, on the shutdown
+    /// path, intermittently. This test is what turns that into a build failure instead.
+    #[tokio::test]
+    async fn a_notify_waiters_call_between_constructing_a_notified_and_polling_it_is_never_lost() {
+        let notify = Notify::new();
+        // Constructed first, then the broadcast, then the first poll -- exactly the interleaving a
+        // `close()` racing a waiter's state check produces.
+        let notified = notify.notified();
+        notify.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), notified).await.expect(
+            "a notify_waiters() landing after a Notified is constructed but before it is first \
+             polled must still wake it -- BoundedQueue::close's contract depends on this",
+        );
+    }
+
+    // -- The lost wakeup: a consumer parked *before* a blocking `push_many` (review finding). --
+
+    /// Which of the three waiting consumers a test parks. The wakeup this pins is a property of
+    /// `not_empty` itself, so every method that waits on it has to be covered, not just the one
+    /// `decode_loop` happens to call.
+    #[derive(Clone, Copy, Debug)]
+    enum Consumer {
+        PopMany,
+        Pop,
+        Peek,
+    }
+
+    /// Spawns a consumer that collects exactly `want` items' units, in the order it receives them,
+    /// and stops early only if the queue closes.
+    fn spawn_consumer(
+        q: Arc<BoundedQueue<TestItem>>,
+        kind: Consumer,
+        want: usize,
+    ) -> tokio::task::JoinHandle<Vec<u64>> {
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < want {
+                match kind {
+                    Consumer::PopMany => {
+                        let mut out = Vec::new();
+                        if q.pop_many(&mut out, 8).await == 0 {
+                            break;
+                        }
+                        got.extend(out.into_iter().map(|item| item.units));
+                    }
+                    Consumer::Pop => match q.pop().await {
+                        Some(item) => got.push(item.units),
+                        None => break,
+                    },
+                    Consumer::Peek => match q.peek().await {
+                        Some(item) => {
+                            got.push(item.units);
+                            q.commit();
+                        }
+                        None => break,
+                    },
+                }
+            }
+            got
+        })
+    }
+
+    /// **The conjunction every other `Block` test here gets backwards**: the consumer parks on an
+    /// empty queue *first*, and only then does a `push_many` arrive whose batch is larger than the
+    /// queue's entire capacity. Without a notification issued before `push_many` suspends, the
+    /// consumer waits for a permit that only the end of the call would send, and the call waits for
+    /// the consumer to free room -- a permanent mutual wait. Both bounds, because either one can be
+    /// what makes the batch too big; all three waiting consumers, because the permit is `not_empty`'s.
+    #[tokio::test(start_paused = true)]
+    async fn a_consumer_parked_before_a_blocking_push_many_is_woken_by_the_prefix_it_admits() {
+        // (max_items, max_weight, per-item weight): the item bound, then the byte bound, each
+        // leaving room for exactly two of the five items at a time.
+        for (max_items, max_weight, weight) in [(2usize, u64::MAX, 1u64), (1000, 2, 1)] {
+            for kind in [Consumer::PopMany, Consumer::Pop, Consumer::Peek] {
+                let q = Arc::new(test_queue(max_items, max_weight, OverflowPolicy::Block));
+                let consumer = spawn_consumer(Arc::clone(&q), kind, 5);
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(
+                    !consumer.is_finished(),
+                    "{kind:?}: the consumer should be parked on the empty queue before the push"
+                );
+
+                let mut items =
+                    batch_of(&[(weight, 1), (weight, 2), (weight, 3), (weight, 4), (weight, 5)]);
+                tokio::time::timeout(Duration::from_secs(5), q.push_many(&mut items))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{kind:?} (max_items {max_items}, max_weight {max_weight}): push_many \
+                             deadlocked against a consumer that parked before it"
+                        )
+                    });
+                assert!(items.is_empty());
+
+                let got = tokio::time::timeout(Duration::from_secs(5), consumer)
+                    .await
+                    .unwrap_or_else(|_| panic!("{kind:?}: the consumer never woke"))
+                    .expect("the consumer task should not panic");
+                assert_eq!(
+                    got,
+                    vec![1, 2, 3, 4, 5],
+                    "{kind:?}: every item should arrive, in order"
+                );
+            }
+        }
+    }
+
+    /// The cancellation half of the same finding: a `push_many` dropped mid-wait must not leave its
+    /// accepted prefix sitting behind a consumer that is still parked. The notification is issued
+    /// before the suspend point, so a cancelled call has always already announced what it admitted.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_many_cancelled_mid_wait_still_wakes_a_consumer_parked_behind_its_prefix() {
+        let q = Arc::new(test_queue(2, u64::MAX, OverflowPolicy::Block));
+        // Takes two items and then stops consuming, so the push is parked again (on 3 and 4) when
+        // it is cancelled rather than running to completion.
+        let consumer = spawn_consumer(Arc::clone(&q), Consumer::PopMany, 2);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!consumer.is_finished(), "the consumer should be parked on the empty queue");
+
+        let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6)]);
+        {
+            let mut pushing = Box::pin(q.push_many(&mut items));
+            tokio::time::timeout(Duration::from_millis(1), &mut pushing)
+                .await
+                .expect_err("the batch is bigger than the queue and the consumer has stopped");
+            // `pushing` is dropped here, mid-wait.
+        }
+        assert!(items.is_empty(), "the caller's Vec is emptied even by a cancellation");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("the cancelled push_many must still have woken the parked consumer")
+            .expect("the consumer task should not panic");
+        assert_eq!(got, vec![1, 2], "the consumer receives the prefix that was admitted for it");
+        assert_eq!(drain_units(&q), vec![3, 4], "and the rest of the prefix stays queued");
+    }
+
+    /// The `Block` half of the equivalence property the exhaustive model test below leaves out by
+    /// design -- which is exactly how the lost wakeup got through review of that test. `Block` has
+    /// no terminating single-call equivalent without a consumer running *alongside* the producer,
+    /// so this is the same comparison (batched run vs. the same sequence expanded into single
+    /// `push` calls) with one, enumerated rather than exhaustive: two bound shapes crossed with
+    /// three capacities, four batch-size sequences, and both orderings of who parks first.
+    #[tokio::test(start_paused = true)]
+    async fn under_block_with_a_running_consumer_batched_and_single_pushes_agree() {
+        async fn drive(
+            max_items: usize,
+            max_weight: u64,
+            weight: u64,
+            batches: &[usize],
+            consumer_first: bool,
+            batched: bool,
+        ) -> Vec<u64> {
+            let q = Arc::new(test_queue(max_items, max_weight, OverflowPolicy::Block));
+            let total: usize = batches.iter().sum();
+            let spawn_producer = |q: Arc<BoundedQueue<TestItem>>, batches: Vec<usize>| {
+                tokio::spawn(async move {
+                    let mut next = 1u64;
+                    for n in batches {
+                        let mut items: Vec<TestItem> = (0..n)
+                            .map(|_| {
+                                let item = TestItem { weight, units: next };
+                                next += 1;
+                                item
+                            })
+                            .collect();
+                        if batched {
+                            q.push_many(&mut items).await;
+                        } else {
+                            for item in items.drain(..) {
+                                q.push(item).await;
+                            }
+                        }
+                        assert!(items.is_empty());
+                    }
+                })
+            };
+
+            // Whichever side starts first is given a chance to park before the other appears --
+            // that ordering is the whole variable here.
+            let (consumer, producer) = if consumer_first {
+                let consumer = spawn_consumer(Arc::clone(&q), Consumer::PopMany, total);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let producer = spawn_producer(Arc::clone(&q), batches.to_vec());
+                (consumer, producer)
+            } else {
+                let producer = spawn_producer(Arc::clone(&q), batches.to_vec());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let consumer = spawn_consumer(Arc::clone(&q), Consumer::PopMany, total);
+                (consumer, producer)
+            };
+
+            tokio::time::timeout(Duration::from_secs(5), producer)
+                .await
+                .expect("the producer must not deadlock against the consumer")
+                .expect("the producer task should not panic");
+            tokio::time::timeout(Duration::from_secs(5), consumer)
+                .await
+                .expect("the consumer must not be left parked")
+                .expect("the consumer task should not panic")
+        }
+
+        for (max_items, max_weight, weight) in [
+            (1usize, u64::MAX, 1u64),
+            (2, u64::MAX, 1),
+            (3, u64::MAX, 1),
+            (1000, 2, 1),
+            (1000, 6, 2),
+        ] {
+            for batches in [&[5usize][..], &[2, 3][..], &[3, 1, 4][..], &[4, 4][..]] {
+                for consumer_first in [true, false] {
+                    let batched =
+                        drive(max_items, max_weight, weight, batches, consumer_first, true).await;
+                    let single =
+                        drive(max_items, max_weight, weight, batches, consumer_first, false).await;
+                    let expected: Vec<u64> = (1..=batches.iter().sum::<usize>() as u64).collect();
+                    assert_eq!(
+                        batched, expected,
+                        "batched: {batches:?} at (max_items {max_items}, max_weight {max_weight}, \
+                         weight {weight}), consumer_first={consumer_first}"
+                    );
+                    assert_eq!(
+                        batched, single,
+                        "batched and single-call runs must deliver the same stream: {batches:?} at \
+                         (max_items {max_items}, max_weight {max_weight}, weight {weight}), \
+                         consumer_first={consumer_first}"
+                    );
+                }
+            }
+        }
     }
 
     /// The property both methods exist for. It cannot be read back off a drained `Registry` --
