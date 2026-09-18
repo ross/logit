@@ -358,6 +358,54 @@ impl StderrCapture {
     }
 }
 
+/// Reads a child's stderr to its end, announcing the `ready`/`generation complete` lines on
+/// `events` as they go past and keeping the tail for an error message. Returns what was captured
+/// and, in words, **why the stream ended** -- which is what a driven blast's abort message quotes.
+///
+/// **Decoded lossily, never fallibly.** `BufRead::lines` yields `Err(InvalidData)` for a line that
+/// isn't UTF-8, which is indistinguishable at the call site from the stream ending -- so a single
+/// stray byte in the child's stderr (a panic message with a truncated multi-byte character, a
+/// library writing raw bytes) used to stop the reader early and, worse, tell a running blast the
+/// child had exited. Reading delimited bytes and running them through `from_utf8_lossy` means such
+/// a line is captured with replacement characters and the loop carries on; only a real EOF or a
+/// real I/O error ends it, and the two are reported apart.
+///
+/// Split out of `spawn_and_measure` so exactly that can be tested without a child process.
+fn read_child_stderr(stderr: impl io::Read, events: &mpsc::Sender<ChildEvent>) -> (String, String) {
+    let mut reader = io::BufReader::new(stderr);
+    let mut capture = StderrCapture::new();
+    let mut raw = Vec::new();
+    let mut sent_ready = false;
+    let mut sent_complete = false;
+
+    let end = loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(0) => break "the process under test exited mid-blast (its stderr reached EOF)",
+            Ok(_) => {}
+            Err(_) => break "this harness could not read the process under test's stderr",
+        }
+        while raw.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
+            raw.pop();
+        }
+        let line = String::from_utf8_lossy(&raw).into_owned();
+
+        if !sent_ready && is_ready_line(&line) {
+            sent_ready = true;
+            let _ = events.send(ChildEvent::Ready(Instant::now()));
+        }
+        if !sent_complete {
+            if let Some(events_count) = parse_completion_line(&line) {
+                sent_complete = true;
+                let _ =
+                    events.send(ChildEvent::Complete { at: Instant::now(), events: events_count });
+            }
+        }
+        capture.push(line);
+    };
+    (capture.into_string(), end.to_string())
+}
+
 /// Kills and reaps a still-running child, then joins both reader threads -- every error path that
 /// bails before the ordinary settle/SIGTERM/`wait4` sequence has run calls this, so a failed
 /// repeat never leaves a live process, a zombie, or a detached reader thread behind.
@@ -833,34 +881,18 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 
     let stderr = child.stderr.take().expect("stderr was piped");
     let (event_tx, event_rx) = mpsc::channel::<ChildEvent>();
-    // Set once the child's stderr reaches EOF, which happens when the process exits -- `logit`
-    // never closes the stream itself. The cheapest honest liveness signal available here: no extra
-    // thread, no `try_wait` poll, and the stream is already being watched for other reasons. A
-    // driven blast reads it between batches, so a child that dies mid-run stops the sender instead
-    // of letting it finish several seconds of traffic into a socket whose peer is gone. The errno
-    // path cannot do this job -- see `crate::load::MAX_CONSECUTIVE_SEND_ERRORS`.
-    let child_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let child_gone_writer = std::sync::Arc::clone(&child_gone);
+    // Filled in once the child's stderr ends, which for a healthy `logit` means the process exited
+    // -- it never closes the stream itself. The cheapest honest liveness signal available here: no
+    // extra thread, no `try_wait` poll, and the stream is already being watched for other reasons.
+    // A driven blast reads it between batches, so a child that dies mid-run stops the sender
+    // instead of letting it finish several seconds of traffic into a socket whose peer is gone.
+    // The errno path cannot do this job -- see `crate::load::MAX_CONSECUTIVE_SEND_ERRORS`.
+    let child_end = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let child_end_writer = std::sync::Arc::clone(&child_end);
     let stderr_reader = std::thread::spawn(move || -> String {
-        let mut capture = StderrCapture::new();
-        let mut sent_ready = false;
-        let mut sent_complete = false;
-        for line in io::BufReader::new(stderr).lines() {
-            let Ok(line) = line else { break };
-            if !sent_ready && is_ready_line(&line) {
-                sent_ready = true;
-                let _ = event_tx.send(ChildEvent::Ready(Instant::now()));
-            }
-            if !sent_complete {
-                if let Some(events) = parse_completion_line(&line) {
-                    sent_complete = true;
-                    let _ = event_tx.send(ChildEvent::Complete { at: Instant::now(), events });
-                }
-            }
-            capture.push(line);
-        }
-        child_gone_writer.store(true, std::sync::atomic::Ordering::Relaxed);
-        capture.into_string()
+        let (captured, end) = read_child_stderr(stderr, &event_tx);
+        let _ = child_end_writer.set(end);
+        captured
     });
 
     // Wall is measured from `ready`, not from spawn: spawn -> ready is process startup (loading
@@ -942,10 +974,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
                     }
                 }
             }
-            let abort = load::Abort {
-                flag: &child_gone,
-                reason: "the process under test exited mid-blast (its stderr reached EOF)",
-            };
+            let abort = load::Abort { cause: &child_end };
             match load::blast(plan, pin_sender, Some(abort)) {
                 Ok(outcome) => {
                     wall_ends_at = Instant::now();
@@ -1288,8 +1317,12 @@ fn print_udp_table(report: &RunReport) {
     if driven.is_empty() {
         return;
     }
+    // The rate is in the table, not only in the JSON: two runs at different `--rate-scale`s are
+    // different points on the load curve, and reading a drop rate without knowing what pace
+    // produced it is reading half the result. An unscaled run has to print it too, or the only
+    // time the number is visible is the time it was changed.
     println!(
-        "\n{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>8} {:>9}",
+        "\n{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>8} {:>9} {:>11}",
         "scenario",
         "sent dg",
         "recv dg",
@@ -1298,11 +1331,12 @@ fn print_udp_table(report: &RunReport) {
         "queue drop",
         "delivered",
         "drop %",
-        "rcvbuf"
+        "rcvbuf",
+        "rate dg/s"
     );
     for (name, udp) in driven {
         println!(
-            "{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>7.2}% {:>8.2}",
+            "{:<22} {:>11} {:>11} {:>7} {:>11} {:>11} {:>12} {:>7.2}% {:>8.2} {:>11}",
             name,
             udp.sent_datagrams,
             udp.received_datagrams,
@@ -1312,6 +1346,9 @@ fn print_udp_table(report: &RunReport) {
             udp.events_delivered,
             100.0 * udp.drop_rate(),
             udp.kernel_rcvbuf_utilization_max,
+            udp.effective_rate
+                .map(|rate| rate.to_string())
+                .unwrap_or_else(|| "unpaced".to_string()),
         );
     }
 }
@@ -1391,6 +1428,52 @@ mod tests {
         // reasoning as `parse_completion_line`.
         assert!(!is_ready_line(r#"{"message":"getting ready to bind"}"#));
         assert!(!is_ready_line("not json at all"));
+    }
+
+    /// A line that isn't UTF-8 must not look like the child exiting.
+    ///
+    /// `BufRead::lines` returns `Err(InvalidData)` for one, which the old reader could only treat
+    /// as the end of the stream -- so a single stray byte (a panic message cut mid-character, a
+    /// library writing raw bytes) both truncated the capture and told a running blast the child had
+    /// died. The `ready` line *after* the bad one is the part that proves the loop carried on.
+    #[test]
+    fn a_non_utf8_line_is_captured_lossily_and_does_not_end_the_stream() {
+        let (tx, rx) = mpsc::channel::<ChildEvent>();
+        let stderr: &[u8] = b"\xff\xfe not valid utf-8\n{\"message\":\"ready\"}\nafter\n";
+
+        let (captured, end) = read_child_stderr(io::Cursor::new(stderr), &tx);
+
+        assert!(
+            matches!(rx.try_recv(), Ok(ChildEvent::Ready(_))),
+            "the ready line after the bad one must still be announced"
+        );
+        assert!(captured.contains("not valid utf-8"), "kept lossily: {captured:?}");
+        assert!(captured.contains('\u{fffd}'), "with replacement characters: {captured:?}");
+        assert!(captured.ends_with("after"), "and the loop ran to the end: {captured:?}");
+        assert!(end.contains("reached EOF"), "a real EOF, not a read error: {end}");
+    }
+
+    #[test]
+    fn the_end_reason_tells_an_eof_apart_from_a_failed_read() {
+        /// A reader that hands back one good line and then fails, the way a broken pipe would.
+        struct FailAfterFirst(bool);
+        impl io::Read for FailAfterFirst {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 {
+                    return Err(io::Error::other("the pipe broke"));
+                }
+                self.0 = true;
+                let line = b"{\"message\":\"ready\"}\n";
+                buf[..line.len()].copy_from_slice(line);
+                Ok(line.len())
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<ChildEvent>();
+        let (captured, end) = read_child_stderr(FailAfterFirst(false), &tx);
+        assert!(matches!(rx.try_recv(), Ok(ChildEvent::Ready(_))));
+        assert!(captured.contains("ready"), "{captured}");
+        assert!(end.contains("could not read"), "a read error says so, not `exited`: {end}");
     }
 
     #[test]
