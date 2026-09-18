@@ -3340,9 +3340,9 @@ mod tests {
             v1_metadata_only(pb1::metric_metadata::MetricType::Histogram, "A histogram.", "");
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
 
-        // Now a request that says `foo` is a gauge and carries a bare `foo` sample. Under the
-        // cached histogram that sample would have been `skipped{reason="unknown_suffix"}` -- a
-        // histogram has no bare-named sample -- so the family list itself is the assertion.
+        // Now a request that says `foo` is a gauge and carries a bare `foo` sample. The cached
+        // histogram would have typed it `unknown` (a seeded type gives way to a sample it cannot
+        // place rather than rejecting it), so the `gauge` here is the request's own word.
         let retype = pb1::WriteRequest {
             timeseries: vec![v1_sample("foo", None, 3.0)],
             metadata: vec![pb1::MetricMetadata {
@@ -3362,8 +3362,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
         let batch = recv_batch_async(&mut rx).await;
-        // A `MetricKind::Gauge` named `foo`, not the `unknown_suffix` skip a bare `foo` sample
-        // would have drawn under the cached histogram.
+        // A `MetricKind::Gauge` named `foo` -- the request's type, not the remembered one, and
+        // not the `Unknown` the seed would have given way to on its own.
         assert_eq!(gauge_value_of(&batch, "foo"), Some(3.0));
         assert!(histogram_record(&batch).is_none());
 
@@ -3577,6 +3577,68 @@ mod tests {
             seeded_names(&cache.seed(start + Duration::from_secs(620), &telemetry)),
             ["foo"],
             "last_seen moved with the second declaration"
+        );
+    }
+
+    /// The federation case the cache must not make worse: a Prometheus relaying someone else's
+    /// series declares them `UNKNOWN`, which is the metadata enum's "no type given". That must not
+    /// overwrite a remembered `HISTOGRAM` -- if it did, the real sender's `_bucket`/`_sum`/`_count`
+    /// would come apart every time the federating one wrote. `UNKNOWN` is not learned at all
+    /// (`remote_write::decode_v1`), so there is nothing to replace with.
+    #[tokio::test]
+    async fn an_unknown_declaration_cannot_replace_a_cached_type() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver
+            .with_telemetry(telemetry)
+            .with_metadata_cache(10_000, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let declare = v1_metadata_only(
+            pb1::metric_metadata::MetricType::Histogram,
+            "Request duration.",
+            "seconds",
+        );
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
+
+        // The federating sender's write: `foo` UNKNOWN, with a bare `foo` sample of its own.
+        let federated = pb1::WriteRequest {
+            timeseries: vec![v1_sample("foo", None, 1.0)],
+            metadata: vec![pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Unknown as i32,
+                metric_family_name: "foo".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            }],
+        };
+        post_write(
+            &addr,
+            "/api/v1/write",
+            remote_write::Version::V1,
+            &snappy(&federated.encode_to_vec()),
+        )
+        .await;
+        // Its own sample survives -- the remembered histogram gives way rather than rejecting it.
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(gauge_value_of(&batch, "foo"), Some(1.0));
+
+        // And the real sender's next write is still assembled as the histogram it is.
+        let samples = v1_histogram_samples_only();
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
+        let batch = recv_batch_async(&mut rx).await;
+        assert!(histogram_record(&batch).is_some(), "{:#?}", batch.events);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.replaced", ("component", "receive")),
+            None,
+            "an UNKNOWN entry is not learned, so it cannot retype anything"
+        );
+        assert_eq!(
+            counter_in(&events, "logit.input.metrics.degraded", ("reason", "seed_mismatch")),
+            Some(1.0),
+            "the bare `foo` sample is the one the remembered histogram gave way to"
         );
     }
 }

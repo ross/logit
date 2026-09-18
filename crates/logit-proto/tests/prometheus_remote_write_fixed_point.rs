@@ -1567,9 +1567,10 @@ fn a_request_declaration_beats_the_seed() {
 
     let families = &decoded.groups[0];
     assert_eq!(families.len(), 2, "{families:#?}");
-    // `foo`: the request's `GAUGE` wins over the seed's `HISTOGRAM`, help and all. Under the seed's
-    // type a bare `foo` would have been `skipped{reason="unknown_suffix"}` instead -- a histogram
-    // has no bare-named sample -- so this shows in the family list, not only in the `kind`.
+    // `foo`: the request's `GAUGE` wins over the seed's `HISTOGRAM`, help and all -- which shows
+    // in the `help` as well as the `kind`. (Without the request's own entry the sample would still
+    // have been *kept*, as an untyped `foo`: a seeded type gives way rather than rejecting a
+    // sample -- `a_seeded_type_gives_way_to_a_sample_it_would_reject` below.)
     assert_eq!(families[1].name, "foo");
     assert_eq!(families[1].kind, FamilyType::Gauge);
     assert_eq!(families[1].help.as_deref(), Some("Said now."));
@@ -1682,4 +1683,176 @@ fn decoded_declarations_report_version_2_metadata_but_not_unspecified() {
         .find(|family| family.name == "bare")
         .expect("the untyped series is still a family");
     assert_eq!(bare.help.as_deref(), Some("Described, not declared."));
+}
+
+// -------------------------------------------------------------------------------------------------
+// A seeded type is advisory: it may type a sample, never reject one
+// -------------------------------------------------------------------------------------------------
+
+fn decode_v1_with_reasons(
+    request: pb1::WriteRequest,
+    seed: &Declarations,
+) -> (Decoded, Vec<(String, u64)>) {
+    let registry = Registry::new();
+    let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
+        "prometheus",
+        "prometheus_in",
+        "source",
+    ));
+    let decoded = decode_with(&request.encode_to_vec(), Version::V1, &mut decoder, seed)
+        .expect("must decode");
+    let reasons = reasons_from(&registry, "logit.input.metrics.");
+    (decoded, reasons)
+}
+
+fn seed_of(entries: &[(&str, FamilyType)]) -> Declarations {
+    let mut seed = Declarations::default();
+    for (name, kind) in entries {
+        seed.insert(*name, *kind, None, None);
+    }
+    seed
+}
+
+/// The seed is a memory of what some *other* message said; the sample is the message in hand. So a
+/// remembered `histogram` that would make a bare `foo` gauge sample disappear gives way instead --
+/// the sample is kept, exactly as a decode with no seed at all would keep it, and the mismatch is
+/// a degradation rather than a skip. Without this a single sender declaring a common name a
+/// histogram would silently delete every other sender's series of that name for as long as the
+/// caller remembers it.
+#[test]
+fn a_seeded_type_gives_way_to_a_sample_it_would_reject() {
+    let (decoded, reasons) = decode_v1_with_reasons(
+        pb1::WriteRequest {
+            timeseries: vec![v1_series(&[("__name__", "foo")], 3.0)],
+            metadata: Vec::new(),
+        },
+        &seed_of(&[("foo", FamilyType::Histogram)]),
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo");
+    assert_eq!(families[0].kind, FamilyType::Unknown, "the guess was abandoned, not applied");
+    assert_eq!(families[0].series[0].point, Point::Unknown(3.0));
+    assert_eq!(decoded.samples, 1, "and the sample counts as stored, because it was");
+    assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
+}
+
+/// The same rule on the suffix arm: a remembered `counter foo` would claim `foo_sum` and then
+/// refuse it (`_sum` means nothing to a counter). The raw name gets a family of its own instead,
+/// and the seeded `foo` -- which nothing was stored in -- disappears at `finish` rather than
+/// surfacing as an empty family.
+#[test]
+fn a_seeded_base_gives_way_for_a_suffix_it_would_reject() {
+    let (decoded, reasons) = decode_v1_with_reasons(
+        pb1::WriteRequest {
+            timeseries: vec![v1_series(&[("__name__", "foo_sum")], 2.5)],
+            metadata: Vec::new(),
+        },
+        &seed_of(&[("foo", FamilyType::Counter)]),
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo_sum");
+    assert_eq!(families[0].kind, FamilyType::Unknown);
+    assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
+}
+
+/// And on the label the role's value lives in: a `foo_bucket` with no `le` would route into a
+/// remembered histogram and then be thrown away as a malformed line. With no seed it is an ordinary
+/// series called `foo_bucket`, so that is what it stays.
+#[test]
+fn a_seeded_histogram_gives_way_to_a_bucket_with_no_le() {
+    let (decoded, reasons) = decode_v1_with_reasons(
+        pb1::WriteRequest {
+            timeseries: vec![v1_series(&[("__name__", "foo_bucket")], 4.0)],
+            metadata: Vec::new(),
+        },
+        &seed_of(&[("foo", FamilyType::Histogram)]),
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo_bucket");
+    assert_eq!(families[0].series[0].point, Point::Unknown(4.0));
+    assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
+}
+
+/// The give-way stops the moment the request itself corroborates the seed. Once `foo_bucket` has
+/// landed in the remembered histogram, a bare `foo` in the same request contradicts the producer's
+/// own message rather than a stale memory -- and is counted as the skip it always was, with the
+/// histogram left intact.
+#[test]
+fn a_seeded_type_still_applies_once_the_request_corroborates_it() {
+    let (decoded, reasons) = decode_v1_with_reasons(
+        pb1::WriteRequest {
+            timeseries: vec![
+                v1_series(&[("__name__", "foo_bucket"), ("le", "+Inf")], 7.0),
+                v1_series(&[("__name__", "foo_count")], 7.0),
+                v1_series(&[("__name__", "foo")], 3.0),
+            ],
+            metadata: Vec::new(),
+        },
+        &seed_of(&[("foo", FamilyType::Histogram)]),
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].kind, FamilyType::Histogram);
+    assert_eq!(reasons, [("unknown_suffix".to_string(), 1)], "the bare sample, not the seed");
+}
+
+fn v1_unknown_metadata(family: &str) -> pb1::MetricMetadata {
+    pb1::MetricMetadata {
+        r#type: pb1::metric_metadata::MetricType::Unknown as i32,
+        metric_family_name: family.to_string(),
+        help: "Something untyped.".to_string(),
+        unit: "seconds".to_string(),
+    }
+}
+
+/// 1.0's `UNKNOWN` declares nothing -- the enum's zero value means "no type given", which is what
+/// an undeclared family already gets -- so `Decoded::declarations` has nothing for a caller to
+/// learn and later impose on a sender that *does* declare a type. Its `help`/`unit` still land, on
+/// the family a sample of that exact name opened, which is all such an entry can be describing.
+#[test]
+fn version_1_unknown_metadata_is_not_learnable_but_still_describes() {
+    let decoded = decode_v1(pb1::WriteRequest {
+        timeseries: vec![v1_series(&[("__name__", "foo")], 3.0)],
+        metadata: vec![v1_unknown_metadata("foo")],
+    });
+
+    assert!(decoded.declarations.is_empty(), "a type that says nothing is not learnable");
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].kind, FamilyType::Unknown);
+    assert_eq!(families[0].help.as_deref(), Some("Something untyped."));
+    assert_eq!(families[0].unit.as_deref(), Some("seconds"));
+}
+
+/// And the other half of declaring nothing: an `UNKNOWN` entry naming `foo` no longer *claims*
+/// `foo_bucket` by the suffix scan only to refuse it (`_bucket` means nothing to an untyped
+/// family). The sample opens a family of its own, which is what a request carrying no metadata at
+/// all has always done with it.
+#[test]
+fn version_1_unknown_metadata_does_not_claim_a_suffixed_sample() {
+    let (decoded, reasons) = decode_reasons(
+        &pb1::WriteRequest {
+            timeseries: vec![v1_series(&[("__name__", "foo_bucket"), ("le", "1")], 4.0)],
+            metadata: vec![v1_unknown_metadata("foo")],
+        }
+        .encode_to_vec(),
+        Version::V1,
+    );
+
+    let families = &decoded.groups[0];
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(families[0].name, "foo_bucket");
+    // The `le` was not stripped: nothing declared `foo` a histogram, so it is an ordinary label.
+    assert_eq!(families[0].series[0].labels, [("le".to_string(), "1".to_string())]);
+    assert!(reasons.is_empty(), "nothing was dropped: {reasons:?}");
+    // The description named `foo`, and this request has no `foo`, so it described nothing -- the
+    // right answer rather than a lost one.
+    assert_eq!(families[0].help, None);
 }

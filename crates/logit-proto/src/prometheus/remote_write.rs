@@ -54,7 +54,7 @@
 //! | Wire | Model |
 //! |---|---|
 //! | `__name__` | the sample name the assembler routes on; every other label is a series label, verbatim |
-//! | `MetricMetadata` (1.0) / `Metadata` (2.0) | a family declaration -- type, `# HELP`, `# UNIT`. 1.0's `UNKNOWN` and 2.0's `UNSPECIFIED` both mean [`FamilyType::Unknown`], and an empty `help`/`unit` is *absent*, not `Some("")` |
+//! | `MetricMetadata` (1.0) / `Metadata` (2.0) | a family declaration -- type, `# HELP`, `# UNIT`. An empty `help`/`unit` is *absent*, not `Some("")`. 1.0's `UNKNOWN` and 2.0's `UNSPECIFIED` declare **nothing**: that value is "no type given", which is what an undeclared family already gets, and entering it in the table would only let it refuse suffixed samples and displace a real type in a caller's cache (`decode_v1`) |
 //! | `Sample.value`, `Sample.timestamp` (ms) | the point's value, and the group it lands in |
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
@@ -618,19 +618,36 @@ fn decode_v1(
         ));
     }
 
-    // Pass one: the declaration table. 1.0 names the family explicitly, so an `UNKNOWN` type is
-    // still a real statement about a family that exists -- unlike 2.0's `UNSPECIFIED`, which names
-    // no family at all (see `decode_v2`).
+    // Pass one: the declaration table. An `UNKNOWN` entry declares **nothing**, exactly as 2.0's
+    // `UNSPECIFIED` declares nothing (see `decode_v2`), even though 1.0 does name the family it is
+    // talking about. `UNKNOWN` is the metadata enum's zero value and means "no type given", which
+    // is already what an undeclared family gets -- so entering it in the table can only do harm in
+    // two ways, and no good at all. In the request, a declared `Unknown` family named `foo` claims
+    // `foo_bucket` by the suffix scan and then refuses it (`unknown_suffix`), where an undeclared
+    // one would have let it open a family of its own. And out of the request, it is a declaration
+    // a caller can *learn* -- so one sender saying `foo` UNKNOWN would overwrite another sender's
+    // HISTOGRAM in a metadata cache and take the whole family's assembly with it. A type that says
+    // nothing must never displace one that says something.
+    //
+    // Its `help`/`unit` still land, by 2.0's own route: held aside here and applied after the
+    // samples have routed (`Assembler::describe`), to the family a sample of that exact name
+    // opened. An `Unknown` family's only sample is its own name, so that is the whole of what such
+    // an entry can be describing -- and an entry naming a family this request has no samples for
+    // describes nothing, which is the right answer rather than a lost one.
     let mut declarations = Declarations::default();
+    let mut described: HashMap<&str, (Option<String>, Option<String>)> = HashMap::new();
     for metadata in &request.metadata {
-        merge_declaration(
-            &mut declarations,
-            &metadata.metric_family_name,
-            family_type_v1(metadata.r#type),
-            non_empty(&metadata.help),
-            non_empty(&metadata.unit),
-            decoder,
-        );
+        let kind = family_type_v1(metadata.r#type);
+        let help = non_empty(&metadata.help);
+        let unit = non_empty(&metadata.unit);
+        if kind == FamilyType::Unknown {
+            if help.is_some() || unit.is_some() {
+                // First wins, as in `merge_declaration`; a repeat is not a dropped input.
+                described.entry(metadata.metric_family_name.as_str()).or_insert((help, unit));
+            }
+            continue;
+        }
+        merge_declaration(&mut declarations, &metadata.metric_family_name, kind, help, unit, decoder);
     }
 
     let mut groups = Groups::new(&declarations, seed);
@@ -647,7 +664,8 @@ fn decode_v1(
             routed.push(None);
             continue;
         };
-        let track = !series.exemplars.is_empty();
+        let description = described.get(name);
+        let track = !series.exemplars.is_empty() || description.is_some();
         let mut touched = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
@@ -664,6 +682,13 @@ fn decode_v1(
         }
         touched.sort_unstable();
         touched.dedup();
+        if let Some((help, unit)) = description {
+            for timestamp in &touched {
+                if let Some(assembler) = groups.group(*timestamp) {
+                    assembler.describe(name, help.clone(), unit.clone());
+                }
+            }
+        }
         routed.push(Some(Routed { name, labels, groups: touched }));
     }
 
