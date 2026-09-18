@@ -277,12 +277,17 @@ review:
    clone surviving past this task's drop would keep every downstream inbox open and hang the
    shutdown cascade the hard constraint above depends on.
 2. **`queue.close()` is called by the read half, only once it has stopped reading** — the one
-   condition `decode_loop`'s `pop()` needs to discover closed-and-empty and return; no second
+   condition `decode_loop`'s pop needs to discover closed-and-empty and return; no second
    close-detection signal.
 3. **The final accumulator flush happens only after the decode half can no longer receive
    anything** — simpler here than `run_output`'s `finish_and_flush`, since the accumulator is owned
    by (not shared with) `decode_loop`: the flush is the last statement of that loop's own body,
-   after `pop()` returns `None`.
+   after the pop reports closed-and-empty.
+
+   (`decode_loop` takes datagrams a batch at a time now — `BoundedQueue::pop_many`, ADR
+   [`udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md) —
+   so "pop returns `None`" reads "`pop_many` returns `0`" in the code. Same sentinel, same
+   condition, same flush.)
 
 `read_loop` races **both** `recv_from` and `queue.push` against `shutdown` — not just `recv_from` —
 so a graceful shutdown under `overflow: block` doesn't have to wait for downstream decode to make

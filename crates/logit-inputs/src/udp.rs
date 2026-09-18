@@ -703,12 +703,35 @@ impl ReceiveBufferSampler {
     }
 }
 
+/// How many datagrams [`decode_loop`] takes off the [`ReceiveQueue`] per `pop_many` call, and so
+/// how many datagrams one set of queue gauge updates covers on the decode side.
+///
+/// A constant for now, matching the `read_batch` default this listener does not yet have
+/// (`docs/adr/udp-intake-batching-and-socket-visibility.md`): W4 adds `read_batch` to
+/// `ReceiveConfig` for the `recvmmsg` read side and threads it here too, so one setting governs
+/// both halves of the queue and this constant goes away. It is deliberately not a knob of its own
+/// in the meantime -- two independently-tunable batch sizes for the two ends of one queue is
+/// surface nobody has asked for.
+const DECODE_POP_BATCH: usize = 64;
+
 /// Pops datagrams from `queue`, decodes and accumulates them into batches, and sends each
 /// completed batch through `sink` -- entirely independent of how fast `read_loop` is filling
-/// `queue`. Uses [`ReceiveQueue::pop`] (not `peek`/`commit`): a datagram that fails to decode is
-/// diagnosed and dropped, never retried, and `pop` is cancellation-safe
-/// (`logit_pipeline::queue::BoundedQueue::pop`'s own doc comment) -- this whole future can be
+/// `queue`. Uses [`ReceiveQueue::pop_many`] (not `peek`/`commit`): a datagram that fails to decode
+/// is diagnosed and dropped, never retried, and `pop_many` is cancellation-safe
+/// (`logit_pipeline::queue::BoundedQueue::pop_many`'s own doc comment) -- this whole future can be
 /// dropped mid-await by `run_input`'s grace backstop.
+///
+/// **Why `pop_many` rather than `pop`.** Every `pop` refreshes the queue's three depth/bytes/
+/// utilization gauges, each of which locks the component's telemetry buffer, and `read_loop`
+/// (pushing) contends on that same lock from the other side; taking up to [`DECODE_POP_BATCH`]
+/// datagrams per call collapses that to one set of updates per batch. `receive.latency` stays
+/// **per datagram** -- it is the number that says whether event timestamps are trustworthy under
+/// load, and a per-batch figure would lose exactly the resolution it exists to report.
+///
+/// One consequence to name, since it widens an already-accepted loss: this future being dropped
+/// mid-batch (the grace backstop) now discards up to `DECODE_POP_BATCH` popped-but-not-yet-decoded
+/// datagrams instead of the one `pop` held, uncounted, on the shutdown path only -- the decode-side
+/// twin of the `push_many` cancellation the ADR names.
 ///
 /// Owns `sink` (the `Fanout`) -- dropping this future is what closes every downstream inbox, the
 /// shutdown cascade `docs/adr/service-lifecycle-and-output-retry.md` established.
@@ -733,11 +756,22 @@ async fn decode_loop<D: Decoder + Send>(
     // own doc comment explains why this is what actually realizes the allocation win, and why
     // `std::mem::take` anywhere in this loop would silently undo it.
     let mut scratch: Vec<Event> = Vec::new();
+    // Reused across every `pop_many` call for the same reason `scratch` is reused across every
+    // `decode_into` call: drained (not replaced) each time round, so its capacity survives and the
+    // steady state allocates nothing.
+    let mut popped: Vec<Datagram> = Vec::new();
     let has_interval = !batching.flush_interval.is_zero();
     let mut next_flush =
         has_interval.then(|| tokio::time::Instant::now() + batching.flush_interval);
 
     loop {
+        // The interval trigger is checked once per *popped batch* rather than once per datagram
+        // now, which can only ever delay an interval flush by however long it takes to decode and
+        // absorb up to `DECODE_POP_BATCH` datagrams -- tens of microseconds of pure CPU against a
+        // 100 ms default interval, and bounded by the batch size regardless of how deep the backlog
+        // is. The one unbounded term in that span, an `emit` awaiting a full downstream inbox, is
+        // not new: a single datagram's `emit` could already park here for as long as downstream is
+        // stalled, and a stalled downstream delays the interval flush either way.
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
@@ -752,47 +786,57 @@ async fn decode_loop<D: Decoder + Send>(
             }
         }
 
-        let datagram = match next_flush {
-            None => queue.pop().await,
+        popped.clear();
+        let count = match next_flush {
+            None => queue.pop_many(&mut popped, DECODE_POP_BATCH).await,
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(wait, queue.pop()).await {
-                    Ok(datagram) => datagram,
+                match tokio::time::timeout(wait, queue.pop_many(&mut popped, DECODE_POP_BATCH))
+                    .await
+                {
+                    Ok(count) => count,
                     Err(_elapsed) => continue,
                 }
             }
         };
 
-        let Some(datagram) = datagram else {
+        if count == 0 {
             // Closed and empty: `read_loop` has stopped for good (shutdown or a fatal socket
             // error). Flush whatever's left -- nothing more will ever arrive either way.
             if let Some(batch) = accumulator.take() {
                 emit(&sink, &telemetry, batch, FlushReason::Shutdown).await;
             }
             return;
-        };
+        }
 
-        let latency_nanos = (now_nanos() - datagram.received_at).max(0) as u64;
-        telemetry.timing(
-            "logit.component.receive.latency",
-            Duration::from_nanos(latency_nanos),
-            &[],
-        );
+        // Drained, not iterated by reference: each datagram's `Bytes` is handed to `decode_into` by
+        // value, and draining also frees each one as it is consumed rather than at the end of the
+        // batch. In arrival order -- `pop_many` appends in FIFO order and this preserves it.
+        for datagram in popped.drain(..) {
+            let latency_nanos = (now_nanos() - datagram.received_at).max(0) as u64;
+            telemetry.timing(
+                "logit.component.receive.latency",
+                Duration::from_nanos(latency_nanos),
+                &[],
+            );
 
-        scratch.clear();
-        match decoder.decode_into(datagram.bytes, datagram.received_at, &mut scratch) {
-            Ok((resource, scope)) => {
-                // `scope` is whatever `decoder.decode_into` returned -- `None` for every decoder
-                // this loop drives today (statsd/syslog datagrams have no OTLP
-                // instrumentation-scope concept), but threaded through rather than hardcoded so a
-                // future `Decoder` on this same loop that does carry one isn't silently dropped.
-                if let Some((batch, reason)) = accumulator.absorb(resource, scope, &mut scratch) {
-                    emit(&sink, &telemetry, batch, reason).await;
+            scratch.clear();
+            match decoder.decode_into(datagram.bytes, datagram.received_at, &mut scratch) {
+                Ok((resource, scope)) => {
+                    // `scope` is whatever `decoder.decode_into` returned -- `None` for every
+                    // decoder this loop drives today (statsd/syslog datagrams have no OTLP
+                    // instrumentation-scope concept), but threaded through rather than hardcoded so
+                    // a future `Decoder` on this same loop that does carry one isn't silently
+                    // dropped.
+                    if let Some((batch, reason)) = accumulator.absorb(resource, scope, &mut scratch)
+                    {
+                        emit(&sink, &telemetry, batch, reason).await;
+                    }
                 }
-            }
-            Err(err) => {
-                // A malformed datagram from one client shouldn't take the whole listener down.
-                diag.warn_throttled("bad_datagram", err);
+                Err(err) => {
+                    // A malformed datagram from one client shouldn't take the whole listener down.
+                    diag.warn_throttled("bad_datagram", err);
+                }
             }
         }
     }
@@ -1120,6 +1164,59 @@ mod tests {
         }
         payloads.sort();
         assert_eq!(payloads, vec!["msg-0", "msg-1", "msg-2"]);
+    }
+
+    /// The same drain, over a backlog several times deeper than [`DECODE_POP_BATCH`]: `decode_loop`
+    /// takes datagrams off the queue a batch at a time now, so "every queued datagram is decoded"
+    /// has to hold across batch boundaries, and arrival order has to survive both the batched pop
+    /// and the iteration over what it popped. Nothing is sorted here, unlike the test above --
+    /// `Fanout`'s channel is FIFO and `batch_max_events: 1` makes one delivery per datagram, so the
+    /// received sequence is the decode order exactly.
+    #[tokio::test]
+    async fn a_backlog_deeper_than_the_pop_batch_is_fully_decoded_in_arrival_order() {
+        const BACKLOG: usize = DECODE_POP_BATCH * 3 + 7;
+
+        let socket = bind_ephemeral().await;
+        let queue = test_queue(OverflowPolicy::DropOldest, BACKLOG * 2);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (fanout, mut rx) = recording_fanout(BACKLOG * 2);
+        let telemetry = Telemetry::default();
+        let mut decoder = TestDecoder::new();
+
+        for i in 0..BACKLOG {
+            queue
+                .push(Datagram { bytes: Bytes::from(format!("msg-{i}")), received_at: i as i64 })
+                .await;
+        }
+        shutdown_tx.send(true).expect("receiver should still be alive");
+
+        let (read_result, ()) = tokio::join!(
+            read_loop(&socket, Arc::clone(&queue), telemetry.clone(), shutdown_rx),
+            decode_loop(
+                &mut decoder,
+                Arc::clone(&queue),
+                fanout,
+                BatchingConfig {
+                    max_events: 1,
+                    max_bytes: u64::MAX,
+                    flush_interval: Duration::ZERO
+                },
+                telemetry,
+                Diagnostics::default(),
+            )
+        );
+        read_result.expect("should shut down cleanly");
+
+        let mut payloads = Vec::new();
+        while let Ok(delivered) = rx.try_recv() {
+            payloads.push(payload(&unwrap_batch(delivered).events[0]));
+        }
+        let expected: Vec<String> = (0..BACKLOG).map(|i| format!("msg-{i}")).collect();
+        assert_eq!(
+            payloads, expected,
+            "every datagram in a backlog {BACKLOG} deep (pop batch {DECODE_POP_BATCH}) should be \
+             decoded exactly once, in arrival order"
+        );
     }
 
     /// A malformed datagram is diagnosed and skipped -- it must not stop the decode loop from

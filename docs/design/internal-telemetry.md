@@ -454,7 +454,7 @@ point every datagram passes through:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.receive.datagrams` | gauge | datagrams currently queued, sampled on every push/pop |
+| `logit.component.receive.datagrams` | gauge | datagrams currently queued, sampled on every push and once per *popped batch* (`BoundedQueue::pop_many`, ADR `udp-intake-batching-and-socket-visibility`; the push side becomes per-batch too when W4's `recvmmsg` read lands) |
 | `logit.component.receive.bytes` | gauge | undecoded datagram bytes summed over what's queued |
 | `logit.component.receive.utilization` | gauge | `max(datagram ratio, byte ratio)` against the two configured bounds |
 | `logit.component.receive.push.blocked.duration` | timing | only under `overflow: block`, only when a push actually waited |

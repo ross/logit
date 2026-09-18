@@ -375,6 +375,14 @@ uncounted") from exactly one datagram to at most `read_batch` datagrams — stil
 shutdown-path-only (ordinary operation never cancels a `push_many` call mid-flight), and named here
 explicitly rather than left implicit in the widened bound.
 
+**The decode side has the same shape, for the same reason.** `decode_loop` popping a batch means a
+cancelled decode loop (the shutdown-grace backstop dropping that future) discards whatever it had
+popped but not yet decoded — the same widening, from the one datagram `pop` held to at most one
+`pop_many` batch, on the same shutdown-only path, uncounted for the same reason. `pop_many` itself
+loses nothing: it only ever awaits on an iteration that removed nothing at all, so a cancellation
+while it is waiting leaves the queue and the caller's `Vec` exactly as they were. The loss is in
+`decode_loop`'s own iteration over what it already holds, and it is bounded by the same constant.
+
 **Why the remainder can't be counted.** Counting a drop needs a `Telemetry::gauge`/count call, which
 needs the same lock `push_many` already released after its last successful batch — re-acquiring it
 from inside a `Drop` impl (the only code that runs on cancellation) to record a handful of

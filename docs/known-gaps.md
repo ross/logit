@@ -240,21 +240,27 @@ already built that have a known, accepted rough edge.
   because N readers each holding their own `Fanout` clone would need its own answer to the
   cancel-by-drop shutdown cascade ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that
   today assumes exactly one `Fanout` per listener.
-- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, not every batch.**
-  `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` — three
-  `Telemetry::gauge` calls, each locking `ComponentBuffer`'s `Mutex<HashMap>`
-  (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item. On a `SinkQueue`
-  that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it's once per *datagram*,
-  and the same listener's `read_loop` (pushing) and `decode_loop` (popping) run concurrently against
-  the identical lock, so this is genuine cross-task contention on the receive side's two hottest
-  loops, not just added per-call overhead. Deliberately not changed here: `BoundedQueue` is one
-  implementation serving both queues by design ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md),
-  workstream A), and coalescing or sampling the receive side's gauge updates without also touching
-  the sink side would split that implementation's behavior back apart along exactly the seam it was
-  built to erase. If this ever shows up as a measured bottleneck (`script/bench`, the same evidence
-  bar `docs/design/memory.md`'s "Costing internal spans" section sets for a similar hot-path
-  tradeoff), the fix belongs in `BoundedQueue` itself — e.g. gauging on a sampled/coalesced cadence
-  for every caller — not as a receive-only special case.
+- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram *pushed*, not every
+  batch — the pop half is closed.** `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`)
+  call `update_gauges` — three `Telemetry::gauge` calls, each locking `ComponentBuffer`'s
+  `Mutex<HashMap>` (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item.
+  On a `SinkQueue` that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it was
+  once per *datagram* on both sides at once, with the same listener's `read_loop` (pushing) and
+  `decode_loop` (popping) contending on the identical lock.
+
+  **The decode side is now batched.** `BoundedQueue` grew `push_many`/`pop_many`
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)) —
+  in `BoundedQueue` itself, as this entry required, with `push`/`pop` and every sink-side caller
+  untouched — and `decode_loop` pops up to 64 datagrams per call, so the pop side now updates the
+  three gauges once per popped batch instead of once per datagram. Per-item admission, drop counting
+  and `Block` waiting are unchanged; only the bookkeeping around them batches.
+
+  **The push side closes with W4's `recvmmsg` read.** `read_loop` still calls `push` once per
+  datagram, because it still reads one datagram per `recv_from`: batching the push without batching
+  the read would mean calling `push_many` with a one-item `Vec`, which is the same gauge update
+  under another name. When the read path becomes `recvmmsg` with `vlen = read_batch`, the datagrams
+  arrive already batched and `push_many` takes them as one, which is what closes this entry the rest
+  of the way. Until then, the contention is halved, not removed.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
   **closed, both halves** (`docs/adr/relative-gauge-adjustments.md`). Landed as two
   independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no
