@@ -9,7 +9,7 @@ updated: 2026-09-18
 
 Accepted — and built. Every workstream in
 [`docs/plans/prometheus-remote-write.md`](../plans/prometheus-remote-write.md) has landed on its
-stacked branch: **W0 #234, W1 #235, W2 #236, W3 #238, W4 #237, W5 #243, W6 #PRNUM**. Per Ross's
+stacked branch: **W0 #234, W1 #235, W2 #236, W3 #238, W4 #237, W5 #243, W6 #246**. Per Ross's
 direction the stack is not merged to `main` by this workstream, so "landed" means complete and
 pushed; that plan's own status paragraph is the authority. W5 landing is what makes the
 "stateless receiver" section below a record of the sequencing decision rather than of today's
