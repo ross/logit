@@ -163,12 +163,23 @@ anybody runs in. `rate` is therefore set a few percent above what the receiver s
 scenario, which both lengthens the run into the target band and puts the drop rate where it's
 useful.
 
-**The drop rate is the tuning's sensitive number, not its robust one.** Throughput barely moves
-between a quiet box and a mildly contended one; the drop rate, which is the *difference* between two
-nearly-equal rates, moves a lot — a run taken while another build was going on the same machine
-turned `udp-statsd-small`'s 1.4% into 35%, on an unchanged spec. Take a baseline on an idle box, and
-read a drop rate that is wildly different from the one recorded here as a statement about the
-machine before reading it as one about the code.
+**The drop rate is the tuning's sensitive number, not its robust one.** These specs are paced a few
+percent above capacity, so the drop rate is the *difference* between two nearly-equal rates and
+amplifies anything that moves either of them. Two measured examples, same specs, same commit, same
+pins:
+
+- A run taken while another build was going on the same machine turned `udp-statsd-small`'s 1.4%
+  into 35%.
+- After ~90 minutes of continuous benchmarking, the same scenario went from 3.1% to 12.4% and
+  0.45% to 2.2% on `udp-statsd`, with CPU µs/event up ~23% — on a laptop-class part settling into a
+  lower sustained power state. Checked, not assumed: re-running the *earlier* commit right
+  afterwards reproduced the *later* numbers (0.677 vs 0.678 µs/event, 13.2% vs 12.4%), so it is the
+  box that moved, not the code.
+
+Two rules follow. Take a baseline on an idle, rested box; and **take a baseline and the delta it is
+compared against back to back in one sitting** — a delta measured an hour after its baseline is
+measuring the machine as much as the change. `compare` warns on a host/CPU-model mismatch for a
+related reason, but it cannot see this one.
 
 `receive_buffer_bytes: 1MiB` on all three. Linux grants double what is requested, and clamps at
 `net.core.rmem_max` — **4 MiB in this dev container**, so 1 MiB is requested, 2 MiB is granted, and
