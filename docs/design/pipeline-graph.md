@@ -647,7 +647,6 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     field's `normalize:` list is rejected too, the same no-op reasoning once more. An *empty*
     `normalize:` list is legal — it's the default, meaning no normalization at all
     ([ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md)).
-
 55. A `prometheus_in` is in exactly one mode, and every field belongs to the mode it is written
     under ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A non-empty
     `scrape_targets:` is a scrape client; `bind:` is a remote-write receiver accepting 1.0 and 2.0
@@ -668,6 +667,30 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `metadata_cache.ttl` must be greater than `0s`, rule 9's zero-interval reasoning: an entry
     expiring the instant it is written is a cache that does nothing while still sweeping on every
     request, and `metadata_cache: {max_families: 0}` is the spelling that turns it off.
+
+56. A `prometheus_out` has exactly one of `bind:` (serve an exposition) and `endpoint:` (write to
+    a remote-write receiver) — never both, never neither
+    ([ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md)). A **non-default** value
+    of a field belonging to the mode that isn't set is rejected rather than silently ignored:
+    `path`, `expire_after` or `max_series` alongside `endpoint:`; `version`, `timeout`, `headers`
+    or `endpoint_tls` alongside `bind:`. That's rule 45's and rule 53's shape and it exists for
+    their reason — a setting that quietly does nothing is worse than a startup failure naming it
+    — and like rule 45 it compares against `logit_config`'s own default functions rather than
+    mirroring their values, so the default stays legal in both modes. Rule 41's `path`/`max_series`
+    checks are registry-mode-only for the same reason: two rules, one gate each, rather than rule
+    41 silently acquiring a second job. In sender mode the remaining checks are rule 40's, restated
+    against this kind's fields: `endpoint` must be an absolute `http://`/`https://` URL, path
+    included (a remote-write receiver's write path — typically `/api/v1/write` — lives there, not
+    in `path:`); `timeout: 0s` is rejected, the same "0 is impossible" reasoning as rule 9's
+    `interval`; `headers` may not be empty-named, `:`-prefixed (an HTTP/2 pseudo-header), collide
+    with another entry once case is ignored, or name one this output sets itself — `content-type`,
+    `content-encoding`, `content-length`, `x-prometheus-remote-write-version`, `user-agent`, the
+    five in `graph::RESERVED_REMOTE_WRITE_HEADERS`; the `endpoint_tls:` block must be internally
+    consistent (`cert_file`/`key_file` together, no `insecure_skip_verify` alongside `ca_file` —
+    rules 24/34/44/52's two checks, since this is a sink's own TLS block); and a non-default
+    `endpoint_tls:` under a plain `http://` endpoint is rejected — a *scheme* check, exactly rule
+    40's third TLS check, since TLS is selected by the endpoint's own scheme and a block under
+    `http://` could only ever be ignored.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

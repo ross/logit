@@ -34,7 +34,7 @@ use logit_outputs::otlp::{
     OtlpCompression as OtlpOutCompression, OtlpOutput, OtlpTransport as OtlpOutTransport,
     SignalPaths,
 };
-use logit_outputs::prometheus::PrometheusOutput;
+use logit_outputs::prometheus::{ExposeOutput, PrometheusOutput, RemoteWriteOutput};
 use logit_outputs::statsd::{StatsdEncoder, StatsdOutput};
 use logit_outputs::stdio::StreamOutput;
 use logit_outputs::syslog::{SyslogEncoder, SyslogOutput};
@@ -920,16 +920,49 @@ fn build_spec(
             )
         }
 
-        PrometheusOut { bind, path, expire_after, max_series } => {
-            // Nothing is bound here: `PrometheusOutput::bind` opens the listening socket in the
-            // runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what turns an
-            // address already in use into a startup failure that names this component.
-            let output = PrometheusOutput::new(bind.clone())
-                .with_path(path.clone())
-                .with_expire_after(*expire_after)
-                .with_max_series(*max_series)
-                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
-                .with_telemetry(telemetry.clone());
+        PrometheusOut {
+            bind,
+            path,
+            expire_after,
+            max_series,
+            endpoint,
+            version,
+            timeout,
+            headers,
+            endpoint_tls,
+        } => {
+            // Graph rule 56 guarantees exactly one of the two mode fields is set, so this is the
+            // one place the choice is made; `PrometheusOutput` carries it from here as a variant
+            // and nothing downstream branches on it again.
+            let output: PrometheusOutput = match (bind, endpoint) {
+                (Some(bind), _) => {
+                    // Nothing is bound here: `ExposeOutput::bind` opens the listening socket in
+                    // the runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what
+                    // turns an address already in use into a startup failure that names this
+                    // component.
+                    ExposeOutput::new(bind.clone())
+                        .with_path(path.clone())
+                        .with_expire_after(*expire_after)
+                        .with_max_series(*max_series)
+                        .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                        .with_telemetry(telemetry.clone())
+                        .into()
+                }
+                (None, Some(endpoint)) => RemoteWriteOutput::new(endpoint.clone())
+                    .with_version(to_remote_write_version(*version))
+                    .with_timeout(*timeout)
+                    .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                    .with_telemetry(telemetry.clone())
+                    .with_headers(headers)?
+                    .with_tls(&to_tls_client_settings(endpoint_tls), base_dir)?
+                    .into(),
+                // Unreachable behind rule 56, and an error rather than a panic for the same
+                // reason every other `build_spec` arm reports rather than asserts: `build_spec` is
+                // callable without `graph::resolve` having run.
+                (None, None) => anyhow::bail!(
+                    "component '{id}': prometheus_out needs exactly one of 'bind' or 'endpoint'"
+                ),
+            };
             NodeSpec::Output(
                 Box::new(output),
                 queue_config(&component.buffer, base_dir),
@@ -1381,6 +1414,20 @@ fn to_tls_client_settings(
     }
 }
 
+/// `logit_config`'s config-facing `version: 1 | 2` into the codec's own [`remote_write::Version`].
+/// The same translation `otlp_out_transport` does for `protocol:` and for the same reason:
+/// `logit-outputs` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
+/// layout), so `build_spec` is where the two spellings meet.
+fn to_remote_write_version(
+    version: logit_config::RemoteWriteVersion,
+) -> logit_proto::prometheus::remote_write::Version {
+    use logit_proto::prometheus::remote_write::Version;
+    match version {
+        logit_config::RemoteWriteVersion::V1 => Version::V1,
+        logit_config::RemoteWriteVersion::V2 => Version::V2,
+    }
+}
+
 /// The `logit-inputs` mirror of [`to_tls_client_settings`].
 fn to_tls_server_settings(
     tls: &logit_config::TlsServerConfig,
@@ -1800,16 +1847,56 @@ mod tests {
             targets: Vec::new(),
             consumers: vec![],
             kind: ComponentKind::PrometheusOut {
-                bind: "127.0.0.1:0".to_string(),
+                bind: Some("127.0.0.1:0".to_string()),
                 path: "/metrics".to_string(),
                 expire_after: Duration::from_secs(300),
                 max_series: 100_000,
+                endpoint: None,
+                version: logit_config::RemoteWriteVersion::default(),
+                timeout: logit_config::default_prometheus_endpoint_timeout(),
+                headers: HashMap::new(),
+                endpoint_tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(
             build_spec("out", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Output(_, _, _)
         ));
+    }
+
+    /// The other half of the same arm: `endpoint:` builds the remote-write sender, with the
+    /// config-facing integer `version:` translated into the codec's own `Version`. Nothing is
+    /// dialed here -- this sink connects per request.
+    #[test]
+    fn build_spec_builds_a_prometheus_remote_write_sink() {
+        for version in [logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteVersion::V2]
+        {
+            let component = ResolvedComponent {
+                buffer: logit_config::BufferConfig::default(),
+                receive: logit_config::ReceiveConfig::default(),
+                sources: vec!["in".to_string()],
+                targets: Vec::new(),
+                consumers: vec![],
+                kind: ComponentKind::PrometheusOut {
+                    bind: None,
+                    path: logit_config::default_prometheus_path(),
+                    expire_after: logit_config::default_prometheus_expire_after(),
+                    max_series: logit_config::default_prometheus_max_series(),
+                    endpoint: Some("http://mimir:8080/api/v1/push".to_string()),
+                    version,
+                    timeout: Duration::from_secs(30),
+                    headers: HashMap::from([("X-Scope-OrgID".to_string(), "tenant-a".to_string())]),
+                    endpoint_tls: logit_config::TlsClientConfig::default(),
+                },
+            };
+            assert!(
+                matches!(
+                    build_spec("out", &component, Path::new(""), None).unwrap().0,
+                    NodeSpec::Output(_, _, _)
+                ),
+                "version {version:?}"
+            );
+        }
     }
 
     #[test]
