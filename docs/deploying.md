@@ -902,9 +902,11 @@ work for every log line written anywhere on the host, selected or not — see [A
   tool that recreates a log file in place rather than renaming it away first).
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only) — a container's
   `config.v2.json` couldn't be read or parsed; that container's lines still flow, just with a
-  `container.id`-only resource instead of the full identity. Retried on every poll tick, not
-  diagnosed again until it either recovers or the stat changes — this fires once per failure, not
-  once per tick for as long as it persists.
+  `container.id`-only resource instead of the full identity. A file that isn't there at all is
+  retried on every poll tick; one that exists but wouldn't parse is retried when its own stat next
+  changes, since the failed read is cached against that stat exactly as a successful one is (a
+  torn read racing the daemon's own rewrite is therefore picked up as soon as the rewrite lands).
+  Either way this fires once per failure, not once per tick for as long as it persists.
 - `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only) — a container's
   identity (name, image, or a watched label) changed, or a tracked container was renamed out of
   `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`

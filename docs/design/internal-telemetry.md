@@ -664,9 +664,10 @@ Worked examples, one per shipped component:
   identity), `checkpoint_error` (loading or writing the checkpoint file itself), `watch_error`
   (`auto` falling back to polling, or a directory watch that failed), and, `docker_in` only,
   `metadata_error` (`config.v2.json` missing or unparseable — degrades to a `container.id`-only
-  resource rather than refusing to tail; retried on every poll tick via the stat cache, diagnosed
-  again only once it either recovers or the stat changes, not once per tick for as long as it
-  persists), `bad_time` (the envelope's own `time` field didn't parse — falls back to read time),
+  resource rather than refusing to tail; a missing file is retried on every poll tick, one that
+  exists but wouldn't parse on its next stat change, since the stat cache caches a failed read the
+  same way it caches a successful one; diagnosed again only once it either recovers or the stat
+  changes, not once per tick for as long as it persists), `bad_time` (the envelope's own `time` field didn't parse — falls back to read time),
   `container_renamed` (`Diagnostics::info`, not `warn_throttled` — a rename is normal operation:
   the container's identity changed and the decoder's resource was swapped), and
   `container_deselected` (`Diagnostics::info` — a tracked container renamed out of the configured
