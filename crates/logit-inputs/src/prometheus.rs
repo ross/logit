@@ -208,17 +208,42 @@
 //! **Bounds.** `max_families` caps the table; over it, the **least-recently-seen** family is
 //! evicted first (ties broken by name, so it is a function of the data rather than of map order),
 //! the same policy and the same one-pass shape `prometheus_out`'s exposition `max_series:` uses.
-//! `max_families: 0` is not a zero-size cache but no cache at all: nothing is allocated, no lock is
-//! taken, and requests decode through the stateless [`remote_write::decode`] exactly as they did
-//! before this existed. Rule 55 rejects `ttl: 0s`, which would be the pointless version of that.
+//! A family's `# HELP` and `# UNIT` are each cut to [`MAX_METADATA_TEXT_BYTES`] as they are
+//! remembered, counted `logit.input.metadata_cache.truncated` -- the request cap bounds a request,
+//! not a table that keeps things. `max_families: 0` is not a zero-size cache but no cache at all:
+//! nothing is allocated, no lock is taken, and requests decode through the stateless
+//! [`remote_write::decode`] exactly as they did before this existed. Rule 55 rejects `ttl: 0s`,
+//! which would be the pointless version of that.
 //!
-//! **Concurrency.** One `Mutex` guards the table, taken to build the seed and taken again to learn,
-//! **never held across the decode** -- a connection's requests are served concurrently and the
-//! decode is the expensive part. The seed handed to the codec is an `Arc` of the table in the
-//! codec's own shape, rebuilt only when the table actually changes, so the overwhelmingly common
-//! request -- one that carries samples and declares nothing -- costs a lock, a sweep and a refcount
-//! bump rather than a copy of every remembered family. A request that declares nothing does not
-//! take the lock a second time at all.
+//! **Whose table it is.** One per component, not one per sender: every peer that can `POST` to this
+//! listener writes to the same table, is typed from the same table, and is evicted by the same
+//! `last_seen` order. So a peer's declarations are visible to every other peer -- which is the
+//! point, since it is what lets a 2.0 sender type a 1.0 one -- and a peer that declares a great
+//! many families evicts everyone else's, counted `evicted{reason="cardinality"}` but not
+//! attributed. Repeated faster than the victims' own metadata cadence, that keeps well-behaved
+//! senders permanently untyped. The cache does not *drop* their samples -- a remembered type gives
+//! way to a sample it cannot place rather than rejecting it ([`remote_write::decode_with`]) -- but
+//! flat families are what they get. Nothing here authenticates a sender, so this is the
+//! "Security posture" section's rule again rather than a new one: do not point this listener at
+//! untrusted senders. An operator who has to, and would rather have flat families than a table
+//! anyone can churn, sets `max_families: 0` -- which turns the sharing off along with the typing.
+//!
+//! **Concurrency, and what a request actually pays.** One `std::sync::Mutex` guards the table,
+//! taken to build the seed and taken again to learn, **never held across the decode** -- a
+//! connection's requests are served concurrently and the decode is the expensive part. A blocking
+//! mutex parks the Tokio worker thread of anyone waiting on it, so the rule here is that the held
+//! section is `O(1)` unless something really changed:
+//!
+//! - the seed handed to the codec is an `Arc` of the table in the codec's own shape, rebuilt only
+//!   when the table's *contents* change -- re-declaring what is already remembered (which is what
+//!   Prometheus does every `send_interval`, from every shard) touches `last_seen` and nothing else;
+//! - the expiry sweep is *checked* per request, not performed: the table carries the earliest
+//!   instant at which any entry could go, so until then expiry costs one comparison;
+//! - a request that declares nothing -- nearly every 1.0 request -- does not take the lock a second
+//!   time at all.
+//!
+//! So a sample-only request pays a lock, a comparison and a refcount bump, and the passes that
+//! scale with what is remembered happen only when an entry is really added, retyped or expired.
 //!
 //! ## Size, concurrency, and shutdown
 //!
@@ -790,13 +815,32 @@ pub use crate::tls::TlsServerSettings;
 const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
 const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
 const METADATA_CACHE_REPLACED: &str = "logit.input.metadata_cache.replaced";
+const METADATA_CACHE_TRUNCATED: &str = "logit.input.metadata_cache.truncated";
+
+/// The longest `# HELP` or `# UNIT` text this receiver will *remember* for one family. Past it the
+/// text is truncated on a `char` boundary and the cut is counted
+/// `logit.input.metadata_cache.truncated`.
+///
+/// Not a statement about what a description may be -- the decode keeps whatever the request
+/// carried, and this bounds only the copy that outlives the request. Without it the cache's
+/// resident size is `max_families x` the *request* cap: nothing else on the path bounds a
+/// description, so 10 000 individually-legal metadata-only requests, each declaring one family
+/// with a multi-megabyte help (a few KB once Snappy has seen the repeated bytes), would take the
+/// process down while `metadata_cache.size` read a healthy 10 000. 1 KiB is an order of magnitude
+/// past the longest `# HELP` any real exporter writes.
+const MAX_METADATA_TEXT_BYTES: usize = 1024;
 
 /// One remembered family declaration. The family's own name is the map key, not a field here.
+///
+/// `Arc<str>` rather than `String` so that rebuilding the seed -- which happens whenever the table
+/// changes and produces a whole second copy of it for in-flight requests to hold -- shares this
+/// text instead of copying it. The cache and every seed generation alive at once then cost one
+/// description each, not one per generation.
 #[derive(Debug, Clone)]
 struct CachedFamily {
     kind: FamilyType,
-    help: Option<String>,
-    unit: Option<String>,
+    help: Option<Arc<str>>,
+    unit: Option<Arc<str>>,
     /// When a request last *declared* this family -- not when one last carried its samples. The
     /// TTL is a bound on how long a declaration is trusted, and a 1.0 sender re-declares on its own
     /// schedule regardless of how busy the series are.
@@ -814,6 +858,12 @@ struct MetadataCache {
     max_families: usize,
     ttl: Duration,
     state: Mutex<CacheState>,
+    /// Test-only: how many times the expiry sweep has actually walked the table. Not otherwise
+    /// observable -- a sweep that expires nothing leaves behind no counter and no rebuild -- and
+    /// "a sample-only request does not sweep" is the property [`CacheState::next_expiry`] exists
+    /// for.
+    #[cfg(test)]
+    sweeps: std::sync::atomic::AtomicU64,
 }
 
 /// Everything behind the one lock. `families` is authoritative; `seed` is the same content in the
@@ -824,9 +874,37 @@ struct MetadataCache {
 struct CacheState {
     families: HashMap<String, CachedFamily>,
     seed: Arc<remote_write::Declarations>,
+    /// The earliest instant at which *any* entry could have expired, and `None` when the table is
+    /// empty -- what lets a request that declares nothing skip the sweep entirely.
+    ///
+    /// A **lower bound**, never an over-estimate, which is the whole of its correctness: a sweep
+    /// skipped because `now` has not reached this cannot have missed an expiry. Every sweep
+    /// recomputes it exactly; a learn only ever *lowers* it, because an entry whose `last_seen`
+    /// moves forward can only expire later than this said it would. Cap eviction may leave it
+    /// early, which costs one sweep that finds nothing and recomputes.
+    next_expiry: Option<Instant>,
 }
 
 impl CacheState {
+    /// Recomputes [`CacheState::next_expiry`] exactly, from every entry still in the table. One
+    /// pass, and only ever from a sweep -- which has just made one anyway.
+    fn recompute_expiry(&mut self, ttl: Duration) {
+        self.next_expiry =
+            self.families.values().filter_map(|family| family.last_seen.checked_add(ttl)).min();
+    }
+
+    /// Lowers [`CacheState::next_expiry`] to account for an entry that will expire at `now + ttl`.
+    /// Never raises it: a stale-early watermark costs one sweep, a stale-late one loses an expiry.
+    fn note_expiry(&mut self, now: Instant, ttl: Duration) {
+        let Some(expires_at) = now.checked_add(ttl) else { return };
+        self.next_expiry = Some(match self.next_expiry {
+            Some(earliest) => earliest.min(expires_at),
+            None => expires_at,
+        });
+    }
+
+    /// The table in the codec's own shape. The family names are copied (a `Declarations` owns its
+    /// keys); the descriptions, which are the bulk of it, are `Arc` clones.
     fn rebuild_seed(&mut self) {
         let mut seed = remote_write::Declarations::default();
         for (name, family) in &self.families {
@@ -836,19 +914,55 @@ impl CacheState {
     }
 }
 
+/// `text` bounded to [`MAX_METADATA_TEXT_BYTES`], cut on a `char` boundary so the result is still a
+/// string rather than a broken one, and whether it had to cut at all.
+fn bounded_text(text: &Option<Arc<str>>) -> (Option<Arc<str>>, bool) {
+    let Some(text) = text else { return (None, false) };
+    if text.len() <= MAX_METADATA_TEXT_BYTES {
+        // The overwhelmingly common path, and the reason this takes a reference: a description
+        // within the bound is shared with the request that carried it, never copied.
+        return (Some(Arc::clone(text)), false);
+    }
+    let mut end = MAX_METADATA_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Some(Arc::from(&text[..end])), true)
+}
+
 impl MetadataCache {
     fn new(max_families: usize, ttl: Duration) -> Self {
-        MetadataCache { max_families, ttl, state: Mutex::new(CacheState::default()) }
+        MetadataCache {
+            max_families,
+            ttl,
+            state: Mutex::new(CacheState::default()),
+            #[cfg(test)]
+            sweeps: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Expires what the TTL has run out on, then hands back the table to decode this request
     /// against. Counted `logit.input.metadata_cache.evicted{reason="expired"}`.
     ///
-    /// The sweep is per request rather than on a timer of its own: this input has no clock task,
-    /// and a receiver that is not being written to has nothing to spend memory on either way. It is
-    /// one allocation-free pass over a table an operator capped.
+    /// Expiry is checked per request rather than on a timer of its own -- this input has no clock
+    /// task, and a receiver nothing is writing to has nothing to spend memory on either way -- but
+    /// it is *checked*, not performed: [`CacheState::next_expiry`] says when the first entry could
+    /// possibly go, so until then this is one comparison and a refcount bump. A pass over the whole
+    /// table on every request would be a cost that scales with what is remembered rather than with
+    /// the request, which is exactly the shape the seed is an `Arc` to avoid.
     fn seed(&self, now: Instant, telemetry: &Telemetry) -> Arc<remote_write::Declarations> {
         let mut state = self.lock();
+        if state.next_expiry.is_some_and(|earliest| now > earliest) {
+            self.sweep(&mut state, now, telemetry);
+        }
+        Arc::clone(&state.seed)
+    }
+
+    /// One pass, dropping every entry the TTL has run out on and recomputing the watermark from
+    /// what is left. Allocation-free; the rebuild below it happens only if something actually went.
+    fn sweep(&self, state: &mut CacheState, now: Instant, telemetry: &Telemetry) {
+        #[cfg(test)]
+        self.sweeps.fetch_add(1, Ordering::Relaxed);
         let ttl = self.ttl;
         let mut expired = 0u64;
         state.families.retain(|_, family| {
@@ -856,12 +970,12 @@ impl MetadataCache {
             expired += u64::from(stale);
             !stale
         });
+        state.recompute_expiry(ttl);
         if expired > 0 {
             telemetry.count(METADATA_CACHE_EVICTED, expired as f64, &[("reason", "expired")]);
             state.rebuild_seed();
             telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
         }
-        Arc::clone(&state.seed)
     }
 
     /// Folds one request's own declarations in -- the newest statement about a family wins, and a
@@ -882,7 +996,18 @@ impl MetadataCache {
         }
         let mut state = self.lock();
         let mut replaced = 0u64;
+        let mut truncated = 0u64;
+        // Whether the *seed* has to be rebuilt -- which a re-declaration of what is already
+        // remembered does not. Prometheus re-sends a family's metadata every `send_interval` from
+        // every shard, so "identical to what is already there" is the common case, and rebuilding
+        // for it would copy the whole table under the lock once a minute per shard.
+        let mut changed = false;
         for (name, declaration) in declarations.iter() {
+            // Bounded on the way in, not on the way out: what is remembered is what outlives the
+            // request, and the request's own cap does not bound a table that keeps entries.
+            let (help, help_cut) = bounded_text(&declaration.help);
+            let (unit, unit_cut) = bounded_text(&declaration.unit);
+            truncated += u64::from(help_cut) + u64::from(unit_cut);
             match state.families.get_mut(name) {
                 Some(existing) => {
                     if existing.kind != declaration.kind {
@@ -890,31 +1015,41 @@ impl MetadataCache {
                         // mind. Either way the newest statement is the one to keep -- the alternative
                         // is typing a live sender's series from a declaration nothing has repeated.
                         replaced += 1;
+                        changed = true;
+                    } else if existing.help != help || existing.unit != unit {
+                        changed = true;
                     }
                     existing.kind = declaration.kind;
-                    existing.help.clone_from(&declaration.help);
-                    existing.unit.clone_from(&declaration.unit);
+                    existing.help = help;
+                    existing.unit = unit;
+                    // Touched whether or not anything else moved: the TTL measures how long ago a
+                    // sender last said this, and it just said it again.
                     existing.last_seen = now;
                 }
                 None => {
                     state.families.insert(
                         name.to_string(),
-                        CachedFamily {
-                            kind: declaration.kind,
-                            help: declaration.help.clone(),
-                            unit: declaration.unit.clone(),
-                            last_seen: now,
-                        },
+                        CachedFamily { kind: declaration.kind, help, unit, last_seen: now },
                     );
+                    changed = true;
                 }
             }
         }
         if replaced > 0 {
             telemetry.count(METADATA_CACHE_REPLACED, replaced as f64, &[]);
         }
-        self.enforce_cap(&mut state, telemetry);
-        state.rebuild_seed();
-        telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+        if truncated > 0 {
+            telemetry.count(METADATA_CACHE_TRUNCATED, truncated as f64, &[]);
+        }
+        changed |= self.enforce_cap(&mut state, telemetry);
+        // Every entry this touched expires at `now + ttl` at the latest, which can only be later
+        // than whatever the table already held -- unless it was empty, which is the case this is
+        // here for.
+        state.note_expiry(now, self.ttl);
+        if changed {
+            state.rebuild_seed();
+            telemetry.gauge(METADATA_CACHE_SIZE, state.families.len() as f64, &[]);
+        }
     }
 
     /// Evicts least-recently-seen families until at most `max_families` remain, in **one pass over
@@ -926,10 +1061,10 @@ impl MetadataCache {
     /// The tie-break past `last_seen` is the family's own name, so which of two families declared
     /// in one request goes is a function of the data rather than of `Instant` resolution or map
     /// iteration order.
-    fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) {
+    fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) -> bool {
         let total = state.families.len();
         if total <= self.max_families {
-            return;
+            return false;
         }
         let excess = total - self.max_families;
         let mut candidates: Vec<(Instant, &str)> =
@@ -944,6 +1079,9 @@ impl MetadataCache {
             state.families.remove(&name);
         }
         telemetry.count(METADATA_CACHE_EVICTED, excess as f64, &[("reason", "cardinality")]);
+        // The watermark may now point at an entry that is gone -- the oldest are exactly the ones
+        // evicted -- which costs one sweep that finds nothing and recomputes it.
+        true
     }
 
     /// The lock, unpoisoned. Nothing here can panic while it is held -- the body is map operations
@@ -3340,9 +3478,9 @@ mod tests {
             v1_metadata_only(pb1::metric_metadata::MetricType::Histogram, "A histogram.", "");
         post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
 
-        // Now a request that says `foo` is a gauge and carries a bare `foo` sample. Under the
-        // cached histogram that sample would have been `skipped{reason="unknown_suffix"}` -- a
-        // histogram has no bare-named sample -- so the family list itself is the assertion.
+        // Now a request that says `foo` is a gauge and carries a bare `foo` sample. The cached
+        // histogram would have typed it `unknown` (a seeded type gives way to a sample it cannot
+        // place rather than rejecting it), so the `gauge` here is the request's own word.
         let retype = pb1::WriteRequest {
             timeseries: vec![v1_sample("foo", None, 3.0)],
             metadata: vec![pb1::MetricMetadata {
@@ -3362,8 +3500,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
 
         let batch = recv_batch_async(&mut rx).await;
-        // A `MetricKind::Gauge` named `foo`, not the `unknown_suffix` skip a bare `foo` sample
-        // would have drawn under the cached histogram.
+        // A `MetricKind::Gauge` named `foo` -- the request's type, not the remembered one, and
+        // not the `Unknown` the seed would have given way to on its own.
         assert_eq!(gauge_value_of(&batch, "foo"), Some(3.0));
         assert!(histogram_record(&batch).is_none());
 
@@ -3578,5 +3716,172 @@ mod tests {
             ["foo"],
             "last_seen moved with the second declaration"
         );
+    }
+
+    /// The federation case the cache must not make worse: a Prometheus relaying someone else's
+    /// series declares them `UNKNOWN`, which is the metadata enum's "no type given". That must not
+    /// overwrite a remembered `HISTOGRAM` -- if it did, the real sender's `_bucket`/`_sum`/`_count`
+    /// would come apart every time the federating one wrote. `UNKNOWN` is not learned at all
+    /// (`remote_write::decode_v1`), so there is nothing to replace with.
+    #[tokio::test]
+    async fn an_unknown_declaration_cannot_replace_a_cached_type() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver
+            .with_telemetry(telemetry)
+            .with_metadata_cache(10_000, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let declare = v1_metadata_only(
+            pb1::metric_metadata::MetricType::Histogram,
+            "Request duration.",
+            "seconds",
+        );
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
+
+        // The federating sender's write: `foo` UNKNOWN, with a bare `foo` sample of its own.
+        let federated = pb1::WriteRequest {
+            timeseries: vec![v1_sample("foo", None, 1.0)],
+            metadata: vec![pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Unknown as i32,
+                metric_family_name: "foo".to_string(),
+                help: String::new(),
+                unit: String::new(),
+            }],
+        };
+        post_write(
+            &addr,
+            "/api/v1/write",
+            remote_write::Version::V1,
+            &snappy(&federated.encode_to_vec()),
+        )
+        .await;
+        // Its own sample survives -- the remembered histogram gives way rather than rejecting it.
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(gauge_value_of(&batch, "foo"), Some(1.0));
+
+        // And the real sender's next write is still assembled as the histogram it is.
+        let samples = v1_histogram_samples_only();
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
+        let batch = recv_batch_async(&mut rx).await;
+        assert!(histogram_record(&batch).is_some(), "{:#?}", batch.events);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.replaced", ("component", "receive")),
+            None,
+            "an UNKNOWN entry is not learned, so it cannot retype anything"
+        );
+        assert_eq!(
+            counter_in(&events, "logit.input.metrics.degraded", ("reason", "seed_mismatch")),
+            Some(1.0),
+            "the bare `foo` sample is the one the remembered histogram gave way to"
+        );
+    }
+
+    /// What is remembered is what outlives the request, and the 4 MiB request cap does not bound a
+    /// table that keeps entries: without this, 10 000 individually-legal metadata-only requests
+    /// each carrying a multi-megabyte `# HELP` would take the process down while
+    /// `metadata_cache.size` read a healthy 10 000. The description is cut to
+    /// [`MAX_METADATA_TEXT_BYTES`] on a `char` boundary -- so the survivor is still a string -- and
+    /// the cut is counted.
+    #[test]
+    fn a_remembered_description_is_bounded_and_cut_on_a_char_boundary() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let now = Instant::now();
+
+        // A multi-byte char straddling the cut, so a naive slice would panic and a byte-wise one
+        // would produce invalid UTF-8.
+        let help: String = "é".repeat(MAX_METADATA_TEXT_BYTES);
+        let mut declarations = remote_write::Declarations::default();
+        declarations.insert(
+            "foo",
+            FamilyType::Counter,
+            Some(Arc::from(help.as_str())),
+            Some(Arc::from("seconds")),
+        );
+        cache.learn(&declarations, now, &telemetry);
+
+        let seed = cache.seed(now, &telemetry);
+        let (_, remembered) = seed.iter().next().expect("one family");
+        let kept = remembered.help.as_deref().expect("the description survives, shortened");
+        assert!(kept.len() <= MAX_METADATA_TEXT_BYTES, "{} bytes", kept.len());
+        assert!(kept.len() > MAX_METADATA_TEXT_BYTES - 4, "cut at the boundary, not far short");
+        assert!(help.starts_with(kept), "a prefix of what the sender sent");
+        // A short unit alongside it is untouched, and shares the request's own allocation.
+        assert_eq!(remembered.unit.as_deref(), Some("seconds"));
+
+        assert_eq!(
+            counter_in(
+                &registry.drain(0),
+                "logit.input.metadata_cache.truncated",
+                ("component", "receive")
+            ),
+            Some(1.0),
+            "one string cut, not one entry"
+        );
+    }
+
+    /// Prometheus re-sends a family's metadata every `send_interval`, from every shard, so
+    /// "identical to what is already remembered" is the common write. Rebuilding the seed for it
+    /// would copy the whole table under the lock on every one -- so the seed handed out must be the
+    /// *same* `Arc`, which is the only way to observe that no rebuild happened.
+    #[test]
+    fn re_declaring_what_is_already_remembered_does_not_rebuild_the_seed() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+        let declaration = declarations(&[("foo", FamilyType::Counter)]);
+
+        cache.learn(&declaration, start, &telemetry);
+        let first = cache.seed(start, &telemetry);
+
+        cache.learn(&declaration, start + Duration::from_secs(60), &telemetry);
+        let second = cache.seed(start + Duration::from_secs(60), &telemetry);
+        assert!(Arc::ptr_eq(&first, &second), "nothing changed, so nothing was rebuilt");
+
+        // A declaration that really says something new does rebuild.
+        cache.learn(
+            &declarations(&[("foo", FamilyType::Gauge)]),
+            start + Duration::from_secs(120),
+            &telemetry,
+        );
+        let third = cache.seed(start + Duration::from_secs(120), &telemetry);
+        assert!(!Arc::ptr_eq(&second, &third), "a retype is a change");
+    }
+
+    /// The expiry sweep is checked per request, not performed: until the earliest entry could
+    /// possibly have expired there is nothing to find, and walking the table anyway would be a
+    /// per-request cost that scales with what is remembered. Only the sweep's own counter can see
+    /// this -- one that finds nothing leaves no counter and no rebuild behind.
+    #[test]
+    fn a_request_before_the_watermark_does_not_sweep() {
+        use std::sync::atomic::Ordering;
+
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+
+        // An empty table has no earliest expiry at all, so not even the first request sweeps.
+        let _ = cache.seed(start, &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 0);
+
+        cache.learn(&declarations(&[("foo", FamilyType::Counter)]), start, &telemetry);
+        for seconds in [1, 60, 599, 600] {
+            let _ = cache.seed(start + Duration::from_secs(seconds), &telemetry);
+        }
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 0, "nothing could have expired yet");
+
+        // Past it, once -- and the watermark it recomputes is `None`, the table now being empty.
+        let seed = cache.seed(start + Duration::from_secs(601), &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1);
+        assert!(seed.is_empty());
+        let _ = cache.seed(start + Duration::from_secs(3_600), &telemetry);
+        assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1, "an empty table has nothing to sweep");
     }
 }

@@ -54,7 +54,7 @@
 //! | Wire | Model |
 //! |---|---|
 //! | `__name__` | the sample name the assembler routes on; every other label is a series label, verbatim |
-//! | `MetricMetadata` (1.0) / `Metadata` (2.0) | a family declaration -- type, `# HELP`, `# UNIT`. 1.0's `UNKNOWN` and 2.0's `UNSPECIFIED` both mean [`FamilyType::Unknown`], and an empty `help`/`unit` is *absent*, not `Some("")` |
+//! | `MetricMetadata` (1.0) / `Metadata` (2.0) | a family declaration -- type, `# HELP`, `# UNIT`. An empty `help`/`unit` is *absent*, not `Some("")`. 1.0's `UNKNOWN` and 2.0's `UNSPECIFIED` declare **nothing**: that value is "no type given", which is what an undeclared family already gets, and entering it in the table would only let it refuse suffixed samples and displace a real type in a caller's cache (`decode_v1`) |
 //! | `Sample.value`, `Sample.timestamp` (ms) | the point's value, and the group it lands in |
 //! | a sample whose value is the stale NaN ([`super::STALE_NAN_BITS`]) | [`Point::Stale`] for that series in that group |
 //! | `Sample.start_timestamp` (2.0, ms, `0` = unset) | [`Series::created`] |
@@ -181,6 +181,7 @@ use logit_core::Exemplar;
 use prost::Message;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// `X-Prometheus-Remote-Write-Version`, which both versions require on every request.
 pub const HEADER_VERSION: &str = "x-prometheus-remote-write-version";
@@ -409,9 +410,13 @@ pub fn decode_with(
 /// the first hands the rest.
 type ResolvedSeries<'a> = Option<(&'a str, Vec<(String, String)>)>;
 
-/// A help/unit pair a 2.0 series carried without a type, which therefore describes no family until
+/// A `# HELP`/`# UNIT` pair off the wire, either half of it absent. Shared by both versions'
+/// "describes a family but declares no type" path -- see [`UntypedDescription`] and `decode_v1`.
+type Description = (Option<Arc<str>>, Option<Arc<str>>);
+
+/// A [`Description`] a 2.0 series carried without a type, which therefore describes no family until
 /// its samples have routed -- `None` for a series that carried no such pair. See `decode_v2`.
-type UntypedDescription = Option<(Option<String>, Option<String>)>;
+type UntypedDescription = Option<Description>;
 
 /// One series, once its labels have been resolved and validated and its samples have been routed:
 /// the sample name, the series labels, and the groups a sample of it actually landed in (ascending,
@@ -494,8 +499,8 @@ fn merge_declaration(
     declarations: &mut Declarations,
     name: &str,
     kind: FamilyType,
-    help: Option<String>,
-    unit: Option<String>,
+    help: Option<Arc<str>>,
+    unit: Option<Arc<str>>,
     decoder: &mut PrometheusDecoder,
 ) {
     let Some(existing) = declarations.get_mut(name) else {
@@ -510,7 +515,7 @@ fn merge_declaration(
             // A field the first entry left unset is not a conflict, whatever a later one says.
             (None, incoming) => *slot = incoming,
             (Some(_), None) => {}
-            (Some(held), Some(incoming)) if **held == incoming => {}
+            (Some(held), Some(incoming)) if **held == *incoming => {}
             (Some(_), Some(_)) => decoder.skipped("duplicate_metadata"),
         }
     }
@@ -567,11 +572,11 @@ fn ms_to_nanos(ms: i64) -> i64 {
     ms.saturating_mul(1_000_000)
 }
 
-fn non_empty(s: &str) -> Option<String> {
+fn non_empty(s: &str) -> Option<Arc<str>> {
     if s.is_empty() {
         None
     } else {
-        Some(s.to_string())
+        Some(Arc::from(s))
     }
 }
 
@@ -618,17 +623,41 @@ fn decode_v1(
         ));
     }
 
-    // Pass one: the declaration table. 1.0 names the family explicitly, so an `UNKNOWN` type is
-    // still a real statement about a family that exists -- unlike 2.0's `UNSPECIFIED`, which names
-    // no family at all (see `decode_v2`).
+    // Pass one: the declaration table. An `UNKNOWN` entry declares **nothing**, exactly as 2.0's
+    // `UNSPECIFIED` declares nothing (see `decode_v2`), even though 1.0 does name the family it is
+    // talking about. `UNKNOWN` is the metadata enum's zero value and means "no type given", which
+    // is already what an undeclared family gets -- so entering it in the table can only do harm in
+    // two ways, and no good at all. In the request, a declared `Unknown` family named `foo` claims
+    // `foo_bucket` by the suffix scan and then refuses it (`unknown_suffix`), where an undeclared
+    // one would have let it open a family of its own. And out of the request, it is a declaration
+    // a caller can *learn* -- so one sender saying `foo` UNKNOWN would overwrite another sender's
+    // HISTOGRAM in a metadata cache and take the whole family's assembly with it. A type that says
+    // nothing must never displace one that says something.
+    //
+    // Its `help`/`unit` still land, by 2.0's own route: held aside here and applied after the
+    // samples have routed (`Assembler::describe`), to the family a sample of that exact name
+    // opened. An `Unknown` family's only sample is its own name, so that is the whole of what such
+    // an entry can be describing -- and an entry naming a family this request has no samples for
+    // describes nothing, which is the right answer rather than a lost one.
     let mut declarations = Declarations::default();
+    let mut described: HashMap<&str, Description> = HashMap::new();
     for metadata in &request.metadata {
+        let kind = family_type_v1(metadata.r#type);
+        let help = non_empty(&metadata.help);
+        let unit = non_empty(&metadata.unit);
+        if kind == FamilyType::Unknown {
+            if help.is_some() || unit.is_some() {
+                // First wins, as in `merge_declaration`; a repeat is not a dropped input.
+                described.entry(metadata.metric_family_name.as_str()).or_insert((help, unit));
+            }
+            continue;
+        }
         merge_declaration(
             &mut declarations,
             &metadata.metric_family_name,
-            family_type_v1(metadata.r#type),
-            non_empty(&metadata.help),
-            non_empty(&metadata.unit),
+            kind,
+            help,
+            unit,
             decoder,
         );
     }
@@ -647,7 +676,8 @@ fn decode_v1(
             routed.push(None);
             continue;
         };
-        let track = !series.exemplars.is_empty();
+        let description = described.get(name);
+        let track = !series.exemplars.is_empty() || description.is_some();
         let mut touched = Vec::new();
         for sample in &series.samples {
             let timestamp = ms_to_nanos(sample.timestamp);
@@ -664,6 +694,13 @@ fn decode_v1(
         }
         touched.sort_unstable();
         touched.dedup();
+        if let Some((help, unit)) = description {
+            for timestamp in &touched {
+                if let Some(assembler) = groups.group(*timestamp) {
+                    assembler.describe(name, help.as_deref(), unit.as_deref());
+                }
+            }
+        }
         routed.push(Some(Routed { name, labels, groups: touched }));
     }
 
@@ -733,7 +770,7 @@ fn push_sample(
 /// One symbol by reference. `0` is the empty string by construction and means *absent* for an
 /// optional field; any other out-of-range index means the table is being read wrongly, which is a
 /// request-level error rather than one bad series.
-fn symbol(symbols: &[String], reference: u32) -> Result<Option<String>, CodecError> {
+fn symbol(symbols: &[String], reference: u32) -> Result<Option<Arc<str>>, CodecError> {
     if reference == 0 {
         return Ok(None);
     }
@@ -890,7 +927,7 @@ fn decode_v2(
         if let Some((help, unit)) = described {
             for timestamp in &touched {
                 if let Some(assembler) = groups.group(*timestamp) {
-                    assembler.describe(name, help.clone(), unit.clone());
+                    assembler.describe(name, help.as_deref(), unit.as_deref());
                 }
             }
         }

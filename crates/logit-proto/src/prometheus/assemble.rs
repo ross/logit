@@ -50,6 +50,29 @@
 //! bounded by a cap the operator sets -- while everything else on this path is proportional to the
 //! request in hand.
 //!
+//! ## A seeded type is advisory
+//!
+//! A declaration the input carried is a statement by the producer about the samples in front of it.
+//! A declaration from the **seed** is a memory of something a *different* message said, possibly
+//! from a different sender, possibly minutes ago -- a guess. So where a declared type would make
+//! this assembler throw a sample away, a **seeded** one gives way instead:
+//!
+//! | Situation | Declared | Seeded |
+//! |---|---|---|
+//! | bare name under a type that has no bare-named sample (`histogram`, `gaugehistogram`, `info`) | `skipped{reason="unknown_suffix"}` | the family is un-declared and the sample opens it as an implicit one, `degraded{reason="seed_mismatch"}` |
+//! | a suffix the type gives no meaning to (`foo_sum` under a counter `foo`) | `skipped{reason="unknown_suffix"}` | the raw name gets an implicit family of its own, `degraded{reason="seed_mismatch"}` |
+//! | a `_bucket`/quantile sample with no `le`/`quantile` label to read | `skipped{reason="malformed_line"}` | as above, `degraded{reason="seed_mismatch"}` |
+//!
+//! The give-way only applies while the seeded family holds **no series**. Once a sibling sample of
+//! the same input has routed into it, the input itself agrees with the seed about the shape, and a
+//! sample that contradicts it is the producer's own inconsistency rather than a stale memory --
+//! counted as it always was. Un-declaring also clears the seeded mark, so every later decision
+//! about that family reads exactly as it would have with no seed at all.
+//!
+//! Without this, a remembered type is a way to *lose* data that a stateless decode would have kept:
+//! one sender declaring `foo` a histogram would make another sender's plain `foo` gauge disappear
+//! for as long as the caller remembers it. The seed exists to type samples, never to reject them.
+//!
 //! That laziness is a bound, not a micro-optimization. Remote-write decodes into one assembler per
 //! distinct sample timestamp, and both the timestamp count and the declaration count come off the
 //! wire; replaying every declaration into every group would let a small compressed body ask for
@@ -83,6 +106,7 @@ use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
 use logit_core::trace::{parse_span_id, parse_trace_id};
 use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, TraceRef, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Which sample of a family a name carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,8 +191,8 @@ impl Declarations {
         &mut self,
         name: impl Into<String>,
         kind: FamilyType,
-        help: Option<String>,
-        unit: Option<String>,
+        help: Option<Arc<str>>,
+        unit: Option<Arc<str>>,
     ) {
         self.entries.insert(name.into(), Declaration { kind, help, unit });
     }
@@ -197,11 +221,16 @@ impl Declarations {
 }
 
 /// One entry of a [`Declarations`] table.
+///
+/// The description text is `Arc<str>` rather than `String` for the caller's sake, not this
+/// module's: a metadata cache holds the same strings and rebuilds its table whenever it changes, so
+/// sharing them makes that a refcount bump instead of a copy of every remembered description. Here
+/// it is read once per materialized family and costs the same either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
     pub kind: FamilyType,
-    pub help: Option<String>,
-    pub unit: Option<String>,
+    pub help: Option<Arc<str>>,
+    pub unit: Option<Arc<str>>,
 }
 
 /// One flat sample on its way into a family -- what every Prometheus syntax hands the assembler,
@@ -225,6 +254,10 @@ struct FamilyAccum {
     base: String,
     kind: FamilyType,
     typed: bool,
+    /// This family exists only because a [`Assembler::with_seed`] table said it should -- nothing
+    /// in the input being decoded mentioned it. That makes its type a **guess**, and
+    /// [`Assembler::route`] treats it as one: see the module doc's "A seeded type is advisory".
+    from_seed: bool,
     help: Option<String>,
     unit: Option<String>,
     total_suffix: bool,
@@ -381,21 +414,18 @@ impl<'a> Assembler<'a> {
     /// be describing *that* family -- it was describing itself, and which family that turned out to
     /// mean is this assembler's conclusion, not the sender's. Reporting a `duplicate_metadata` the
     /// producer did not commit would be reporting our own inference.
-    pub(super) fn describe(
-        &mut self,
-        sample_name: &str,
-        help: Option<String>,
-        unit: Option<String>,
-    ) {
+    pub(super) fn describe(&mut self, sample_name: &str, help: Option<&str>, unit: Option<&str>) {
         let Some((family, _)) = self.route_existing(sample_name) else { return };
+        // Borrowed, not taken: one description can be offered to every group a series touched, and
+        // is stored by at most one family in each -- so the copy happens where it lands.
         if self.families[family].help.is_none() {
             if let Some(help) = help {
-                self.families[family].help = Some(help);
+                self.families[family].help = Some(help.to_string());
             }
         }
         if self.families[family].unit.is_none() {
             if let Some(unit) = unit {
-                self.families[family].unit = Some(unit);
+                self.families[family].unit = Some(unit.to_string());
             }
         }
     }
@@ -563,7 +593,7 @@ impl<'a> Assembler<'a> {
         mut labels: Vec<(String, String)>,
         decoder: &mut PrometheusDecoder,
     ) -> Option<Slot> {
-        let (family, role, total_suffix) = self.route(name, decoder)?;
+        let (family, role, total_suffix) = self.route(name, &labels, decoder)?;
         // `le`/`quantile` are part of the point, not the series identity: strip them out before the
         // label set becomes the series key.
         let extra = match role {
@@ -608,33 +638,96 @@ impl<'a> Assembler<'a> {
     /// Which family and role a sample name belongs to: an exact family-name match first (so a gauge
     /// genuinely called `foo_sum` beats a histogram called `foo`), then a known suffix over a
     /// declared family, then a fresh implicit family.
+    ///
+    /// `labels` is read, never taken: the two roles whose value is split across the label set
+    /// (`le`, `quantile`) can only be *checked* here, and only for a seeded family -- see
+    /// [`Assembler::abandon_seeded`].
     fn route(
         &mut self,
         name: &str,
+        labels: &[(String, String)],
         decoder: &mut PrometheusDecoder,
     ) -> Option<(usize, Role, bool)> {
         self.materialize(name, decoder);
         if let Some(idx) = self.index.get(name).copied() {
-            return match bare_name_role(self.families[idx].kind) {
-                Some(role) => Some((idx, role, false)),
-                None => {
-                    decoder.skipped("unknown_suffix");
-                    None
+            if let Some(role) = bare_name_role(self.families[idx].kind) {
+                if !self.seed_would_reject(idx, role, labels) {
+                    return Some((idx, role, false));
                 }
-            };
+            }
+            // The bare name has no role under this family's type, or has one it cannot fill. If
+            // the family is the seed's guess and nothing has been stored in it, un-declare it and
+            // let the sample open it as the implicit family it would have opened on its own.
+            if self.abandon_seeded(idx, decoder) {
+                self.reopen_implicit(idx);
+                return Some((idx, Role::Primary, false));
+            }
+            decoder.skipped("unknown_suffix");
+            return None;
         }
         for (suffix, role) in SUFFIXES {
             let Some(base) = name.strip_suffix(suffix) else { continue };
             let Some(idx) = self.index.get(base).copied() else { continue };
             let kind = self.families[idx].kind;
-            if suffix_applies(kind, suffix, role) {
+            if suffix_applies(kind, suffix, role) && !self.seed_would_reject(idx, role, labels) {
                 return Some((idx, role, suffix == "_total"));
+            }
+            if self.abandon_seeded(idx, decoder) {
+                // The *base* was the guess; the raw name is untouched and free to be a family of
+                // its own, so there is nothing to reopen -- the seeded family simply keeps no
+                // series and disappears at `finish`.
+                break;
             }
             decoder.skipped("unknown_suffix");
             return None;
         }
         let idx = self.family_index(name);
         Some((idx, Role::Primary, false))
+    }
+
+    /// Whether a **seeded** family would take this sample's name and then have [`Assembler::slot`]
+    /// throw it away for want of the label its role's value lives in. Always `false` for a family
+    /// the input itself declared: a producer that writes `foo_bucket` with no `le` under its own
+    /// `# TYPE foo histogram` wrote a malformed line, and that is what it is counted as.
+    fn seed_would_reject(&self, idx: usize, role: Role, labels: &[(String, String)]) -> bool {
+        if !self.families[idx].from_seed || !self.families[idx].series.is_empty() {
+            return false;
+        }
+        let needed = match role {
+            Role::Bucket => "le",
+            Role::Quantile => "quantile",
+            _ => return false,
+        };
+        !labels.iter().any(|(key, value)| key == needed && parse_number(value).is_some())
+    }
+
+    /// Whether a rejection about to happen is the *seed's* fault and can therefore be undone:
+    /// the family exists only because a seeded declaration materialized it, and nothing has been
+    /// stored in it, so abandoning it loses nothing the input said. Counts the degradation.
+    ///
+    /// The `series.is_empty()` half is what keeps this from second-guessing a corroborated guess:
+    /// once a sibling sample of this request has routed into the family, the request itself agrees
+    /// with the seed about the shape, and a contradictory sample is the input's own inconsistency.
+    fn abandon_seeded(&mut self, idx: usize, decoder: &mut PrometheusDecoder) -> bool {
+        if !self.families[idx].from_seed || !self.families[idx].series.is_empty() {
+            return false;
+        }
+        decoder.degraded("seed_mismatch");
+        true
+    }
+
+    /// Un-declares a family the seed materialized, leaving the implicit family the raw sample name
+    /// would have opened by itself. Only ever called with no series stored, so nothing is re-homed
+    /// -- and `from_seed` clears with it, because what is left is an ordinary implicit family and
+    /// every later routing decision about it should read exactly as it would with no seed at all.
+    fn reopen_implicit(&mut self, idx: usize) {
+        let implicit = self.implicit;
+        let family = &mut self.families[idx];
+        family.kind = implicit;
+        family.typed = false;
+        family.from_seed = false;
+        family.help = None;
+        family.unit = None;
     }
 
     /// Creates any *declared* family `name` could route to, if a sample has not already brought it
@@ -646,8 +739,8 @@ impl<'a> Assembler<'a> {
             return;
         }
         if !self.index.contains_key(name) {
-            if let Some(declaration) = self.declared(name) {
-                self.declare_from(name, declaration.clone(), decoder);
+            if let Some((declaration, from_seed)) = self.declared(name) {
+                self.declare_from(name, declaration.clone(), from_seed, decoder);
             }
         }
         for (suffix, _) in SUFFIXES {
@@ -655,19 +748,21 @@ impl<'a> Assembler<'a> {
             if self.index.contains_key(base) {
                 continue;
             }
-            if let Some(declaration) = self.declared(base) {
-                self.declare_from(base, declaration.clone(), decoder);
+            if let Some((declaration, from_seed)) = self.declared(base) {
+                self.declare_from(base, declaration.clone(), from_seed, decoder);
             }
         }
     }
 
-    /// What either table says about one family name, the request's own first. Per *name* rather
-    /// than per table: a request that declares `foo` and nothing else still gets the seed's
-    /// `bar`, and its own `foo` still beats the seed's.
-    fn declared(&self, name: &str) -> Option<&'a Declaration> {
-        self.declarations
-            .and_then(|declarations| declarations.get(name))
-            .or_else(|| self.seed.and_then(|seed| seed.get(name)))
+    /// What either table says about one family name, the request's own first, and whether the
+    /// answer came from the seed. Per *name* rather than per table: a request that declares `foo`
+    /// and nothing else still gets the seed's `bar`, and its own `foo` still beats the seed's.
+    fn declared(&self, name: &str) -> Option<(&'a Declaration, bool)> {
+        if let Some(declaration) = self.declarations.and_then(|declarations| declarations.get(name))
+        {
+            return Some((declaration, false));
+        }
+        self.seed.and_then(|seed| seed.get(name)).map(|declaration| (declaration, true))
     }
 
     /// Whether [`Assembler::materialize`] has anything at all to look through -- the common case
@@ -681,11 +776,16 @@ impl<'a> Assembler<'a> {
         &mut self,
         base: &str,
         declaration: Declaration,
+        from_seed: bool,
         decoder: &mut PrometheusDecoder,
     ) {
         let Declaration { kind, help, unit } = declaration;
+        let (help, unit) = (help.map(|h| h.to_string()), unit.map(|u| u.to_string()));
         self.declare_type(base, kind, decoder);
         let idx = self.family_index(base);
+        // Only ever reached for a family this call created -- `materialize` checks the index first
+        // -- so this records where the type came from rather than overwriting an answer.
+        self.families[idx].from_seed = from_seed;
         if help.is_some() {
             self.set_help(idx, help, decoder);
         }
@@ -719,6 +819,7 @@ impl<'a> Assembler<'a> {
             base: name.to_string(),
             kind: self.implicit,
             typed: false,
+            from_seed: false,
             help: None,
             unit: None,
             total_suffix: false,

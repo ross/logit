@@ -1859,8 +1859,18 @@ pub fn default_prometheus_path() -> String {
 /// That table is per-family state on a component that otherwise has none, so it is bounded on both
 /// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
 /// request, and so is any 1.0 sender that attaches metadata to its own writes.
+///
+/// **It is one table per component, shared by every sender that can reach the listener.** That is
+/// what lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer
+/// that declares a great many families evicts other peers' entries, by `last_seen` and with no
+/// attribution -- leaving well-behaved senders untyped (their samples still arrive, as flat
+/// families) until their next metadata write. The receiver authenticates no one, so this is the
+/// same rule `bind_tls:` already carries rather than a new one: do not point it at untrusted
+/// senders (`docs/known-gaps.md`). `max_families: 0` turns the sharing off along with the typing.
+///
 /// See `docs/adr/prometheus-remote-write.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataCacheConfig {
     /// How many families the receiver will remember at once. Over the cap the
     /// **least-recently-seen** entry is evicted first, counted
@@ -1871,8 +1881,15 @@ pub struct MetadataCacheConfig {
     ///
     /// Defaults to `10000`, which is a generous ceiling on the *distinct families* (not series) a
     /// sender writes -- a large Prometheus scrapes tens of thousands of series across low
-    /// thousands of families. Each entry is a family name plus its help and unit text, so the cap
-    /// bounds a few megabytes at the very most.
+    /// thousands of families.
+    ///
+    /// **What it costs.** An entry is a family name plus its `# HELP` and `# UNIT` text, each of
+    /// the two bounded at 1 KiB as it is remembered (past that the text is truncated and counted
+    /// `logit.input.metadata_cache.truncated`), so the resident bound is roughly
+    /// `max_families x (name + 2 KiB)` -- about 20 MiB at the default, and far less in practice,
+    /// since a real `# HELP` is a sentence and most families have no `# UNIT` at all. The family
+    /// *name* is the sender's and is not bounded here; the listener is not built to face a hostile
+    /// one (see "Security posture" in `crates/logit-inputs/src/prometheus.rs`).
     ///
     /// **`0` turns the cache off entirely**: nothing is remembered, nothing is swept, and 1.0
     /// requests decode exactly as a stateless receiver's do. That is the setting for a pure-2.0
@@ -5285,6 +5302,21 @@ mod tests {
             MetadataCacheConfig { max_families: 10_000, ttl: Duration::from_secs(3600) }
         );
         assert_eq!(cache("{}"), MetadataCacheConfig::default());
+    }
+
+    /// Every other all-defaulted sub-block here denies unknown fields, and this one has the sharper
+    /// reason: a misspelled key would otherwise deserialize to the defaults, so the cap an operator
+    /// wrote would be ignored *and* rule 55 would see a defaulted block -- letting the same typo
+    /// resolve under `scrape_targets:`, which is precisely the "a setting silently doing nothing"
+    /// failure rule 55 exists to prevent.
+    #[test]
+    fn prometheus_in_metadata_cache_rejects_a_misspelled_key() {
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "prometheus_in", "bind": "0.0.0.0:9090",
+                "metadata_cache": {"max_familes": 500}}"#,
+        )
+        .expect_err("a misspelled key must not deserialize to the defaults");
+        assert!(err.to_string().contains("max_familes"), "got: {err}");
     }
 
     #[test]

@@ -285,7 +285,8 @@
 //!     that looks configured -- and `metadata_cache.ttl` must be greater than `0s`, rule 9's
 //!     zero-interval reasoning: an entry that expires the instant it is written is a cache that
 //!     does nothing while still sweeping on every request, and `max_families: 0` is the spelling
-//!     for turning it off.
+//!     for turning it off -- which is why that pairing, where the `ttl` governs nothing at all, is
+//!     the one case the zero check lets through.
 //! 56. `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`): exactly one of
 //!     `bind:` (serve an exposition) and `endpoint:` (write to a remote-write receiver), never
 //!     both and never neither. A **non-default** field belonging to the mode that isn't set is an
@@ -2511,7 +2512,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             // expires the instant it is written would have the receiver sweep and lock on every
             // request to keep a table that can never answer -- and `max_families: 0`, which is
             // *not* rejected, is the spelling that turns the cache off for real.
-            if metadata_cache.ttl.is_zero() {
+            if metadata_cache.max_families > 0 && metadata_cache.ttl.is_zero() {
                 anyhow::bail!(
                     "component '{id}': 'metadata_cache.ttl' is 0s, so every remembered metric \
                      type would expire before the next request could use it -- set a positive \
@@ -7644,12 +7645,17 @@ mod tests {
 
     #[test]
     fn a_disabled_metadata_cache_on_a_bind_mode_prometheus_in_resolves_fine() {
-        let mut kind = prometheus_in_bind("0.0.0.0:9090");
-        if let ComponentKind::PrometheusIn { metadata_cache, .. } = &mut kind {
-            metadata_cache.max_families = 0;
+        for ttl in [Duration::from_secs(600), Duration::ZERO] {
+            let mut kind = prometheus_in_bind("0.0.0.0:9090");
+            if let ComponentKind::PrometheusIn { metadata_cache, .. } = &mut kind {
+                metadata_cache.max_families = 0;
+                // With no cache there is nothing for a `ttl` to govern, so even `0s` -- which the
+                // check above rejects on its own -- is not a setting that could do nothing.
+                metadata_cache.ttl = ttl;
+            }
+            resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+                .expect("'max_families: 0' is how an operator turns the cache off");
         }
-        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
-            .expect("'max_families: 0' is how an operator turns the cache off");
     }
 
     // ---- collectd_in (docs/adr/collectd-binary-relay.md) --------------------------------------
