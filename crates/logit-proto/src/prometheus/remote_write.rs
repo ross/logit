@@ -279,6 +279,65 @@ pub struct Decoded {
     pub histograms_skipped: u64,
 }
 
+/// How many wire `Sample`s one [`Series`] accounts for on `version` -- the unit 2.0's
+/// `X-Prometheus-Remote-Write-Samples-Written` header is defined in, and the number a receiver
+/// reports having kept.
+///
+/// This is [`flatten`]'s own spelling, read off the [`Point`] rather than recomputed from a model
+/// record, which is what makes it exact: a `Point` still carries the `Option`s the wire had, so a
+/// summary sent without `_sum`/`_count` counts its quantiles and nothing more, and a gaugehistogram
+/// without a `_gsum` has no `_gcount` either (OpenMetrics' own rule, which both ends already
+/// follow). `kind` is needed for the two cases the point alone cannot answer: a [`Point::Stale`] is
+/// spelled as one sample for a single-series family and as the `_count`/`_sum` pair for a histogram
+/// or summary, and the `_gsum`/`_gcount` rule applies only to a gaugehistogram.
+///
+/// `crates/logit-proto/tests/prometheus_remote_write_fixed_point.rs` pins it against [`encode`]
+/// itself: summed over a generated group set, this equals the number of `Sample`s the encoder
+/// actually writes. The one deliberate difference is the `_created` term -- 1.0 spells a created
+/// timestamp as a `_created` sample of its own, which [`decode`] counts and this counts, while
+/// [`encode`] drops it (1.0 has no field for it; see the permitted-normalization list). 2.0 carries
+/// it as `Sample.start_timestamp`, a field *on* a sample rather than a sample, so it adds nothing
+/// there.
+///
+/// **What "kept" means for a malformed sender.** The count describes the series this receiver now
+/// holds, not the bytes that arrived: where a sender omitted a `+Inf` bucket or a `_count` the
+/// assembler synthesized one, and this counts the synthesized sample, because that is a sample the
+/// receiver really did store and really will re-emit. Both specs require a conforming sender to
+/// send them, so the two readings only ever differ for input that was already wrong.
+pub fn wire_samples(kind: FamilyType, series: &Series, version: Version) -> u64 {
+    let value_samples = match &series.point {
+        Point::Counter(_)
+        | Point::Gauge(_)
+        | Point::Unknown(_)
+        | Point::Info
+        | Point::StateSet(_) => 1,
+        // A stale marker rides the names the decoder can route back to this family: the bare
+        // primary for a single-series type, and the `_count`/`_sum` (`_gcount`/`_gsum`) pair for
+        // the types that have no sample called by the family's own name.
+        Point::Stale => match kind {
+            FamilyType::Histogram | FamilyType::Summary | FamilyType::GaugeHistogram => 2,
+            _ => 1,
+        },
+        Point::Histogram { buckets, sum, .. } => {
+            let gauge_histogram = kind == FamilyType::GaugeHistogram;
+            // One `_bucket` per bucket (`+Inf` included, so the list's own length), the `_sum`
+            // where there is one, and the `_count` -- which a gaugehistogram has only when it has
+            // a `_gsum`.
+            buckets.len() as u64
+                + u64::from(sum.is_some())
+                + u64::from(sum.is_some() || !gauge_histogram)
+        }
+        Point::Summary { quantiles, sum, count } => {
+            quantiles.len() as u64 + u64::from(sum.is_some()) + u64::from(count.is_some())
+        }
+    };
+    let created = match version {
+        Version::V1 => u64::from(series.created.is_some()),
+        Version::V2 => 0,
+    };
+    value_samples + created
+}
+
 // -------------------------------------------------------------------------------------------------
 // Decoding
 // -------------------------------------------------------------------------------------------------
