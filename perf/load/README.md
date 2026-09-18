@@ -253,6 +253,23 @@ Every driven run is checked before its numbers are believed (`crates/logit-perf/
    they ship rather than needing a hand-edited copy of each. A spec with no `rate:` at all is
    rejected rather than asked to be lossless.
 
+### `--verify` and `--rate-scale` together
+
+They are two knobs, and `--verify` only *defaults* one of them:
+
+| Invocation | Pace | Asserts |
+|---|---|---|
+| (neither) | the spec's `rate` | accounting closes, no decode diagnostics |
+| `--rate-scale 0.5` | half the spec's `rate` | the same |
+| `--verify` | a **quarter** of the spec's `rate` | the above, plus zero drops and an exact delivered count |
+| `--verify --rate-scale 1.0` | the spec's own `rate` | the same strict set, at the shipped pace |
+
+An explicit `--rate-scale` replaces `--verify`'s 0.25 derate and **nothing else** — the exactness
+assertion always stays on. So `--verify --rate-scale 1.0` is the way to ask "is this spec's own rate
+loss-free?", and it is *expected to fail* whenever anything drops. That is the question it answers,
+not a misuse of the flag: the shipped rates are tuned to drop a little, so on a healthy box that
+combination should fail, and a run of it that passes means the receiver got faster.
+
 ## Pinning
 
 Not optional here. This dev box has heterogeneous cores (Zen 5 performance vs. Zen 5c efficiency),
