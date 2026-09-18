@@ -66,6 +66,14 @@ pub(crate) enum Refresh {
     /// sees an `Arc` that isn't `ptr_eq` to the one it's accumulating under on the next decoded
     /// line and flushes the old batch itself (`FlushReason::ResourceChange`).
     Identity,
+    /// This file is no longer selected (`docker_in`'s container filter, after a rename moved it
+    /// out of `containers:`). The factory does *not* swap the decoder's resource for this outcome
+    /// -- whatever is flushed on the way out should carry the identity this listener actually
+    /// read the remaining lines under, not the new one it's no longer allowed to follow. The
+    /// driver stops reading the file immediately (`FileState::Deselected`, not `Draining`: the
+    /// container is still running, so there is no EOF to drain to) and retains its offset by
+    /// inode in case it's selected again later.
+    Deselected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +82,13 @@ enum FileState {
     /// No longer matched by any pattern (renamed away, removed) or superseded by a new inode at
     /// the same path (rotated) -- read to EOF, flush, close; never written to `by_path` again.
     Draining,
+    /// Selected away by [`Refresh::Deselected`] -- unlike `Draining`, the file still exists and
+    /// is still being written (the container is still running), so there is no EOF to drain to
+    /// and no more of it should be read. `read_one` returns immediately for a file in this state;
+    /// `reap_drained` still flushes and closes it exactly as a `Draining` file, but retains its
+    /// offset (`Tailer::resume`) rather than letting it go, since the same inode may be selected
+    /// again later.
+    Deselected,
 }
 
 /// What the runtime loop's own `select!` decided happened -- kept as a plain value with no
@@ -121,6 +136,14 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     files: HashMap<FileId, TrackedFile<D>>,
     by_path: HashMap<PathBuf, FileId>,
     checkpoint: Option<CheckpointStore>,
+    /// The offset an inode should resume from when next discovered -- populated at `bind` from
+    /// the checkpoint file (if configured), and by `reap_drained` for a [`FileState::Deselected`]
+    /// file this process itself closed (`docs/adr/docker-container-identity-and-minimal-watches.
+    /// md`). Either way, `open_tracked`'s `None` arm consults this before falling back to
+    /// `read_from`, so a de-selected container renamed back into the selection resumes rather
+    /// than replaying its whole log from byte 0 -- process-local for the de-selection case, since
+    /// nothing in this map survives past the next checkpoint write once its file is gone from
+    /// `self.files`.
     resume: HashMap<FileId, (PathBuf, u64)>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -363,19 +386,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
                 }
                 None => {
-                    let start = self.resume.remove(&id).map_or_else(
-                        || {
-                            if first {
-                                match self.config.read_from {
-                                    super::ReadFrom::Beginning => StartOffset::Beginning,
-                                    super::ReadFrom::End => StartOffset::End,
-                                }
-                            } else {
-                                StartOffset::Beginning
-                            }
+                    // Peeked, not removed: `open_tracked` may still bail out below (a `refresh_
+                    // cache` at `end_scan` aside, `accept` can reject this path -- most
+                    // concretely, a de-selected container that hasn't been re-selected yet). A
+                    // `remove` here would discard the entry on that very first failed attempt,
+                    // permanently losing the retained offset before it's ever actually used;
+                    // `open_tracked` itself removes it, but only once `accept` has already
+                    // succeeded and the offset is genuinely about to be applied.
+                    let start = match self.resume.get(&id) {
+                        Some(&(_, offset)) => StartOffset::Resume(offset),
+                        None if first => match self.config.read_from {
+                            super::ReadFrom::Beginning => StartOffset::Beginning,
+                            super::ReadFrom::End => StartOffset::End,
                         },
-                        |(_path, offset)| StartOffset::Resume(offset),
-                    );
+                        None => StartOffset::Beginning,
+                    };
                     self.open_tracked(path, id, start, watcher).await;
                 }
             }
@@ -395,6 +420,17 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             Refresh::Unchanged => {}
             Refresh::Identity => {
                 self.telemetry.count("logit.input.files.identity_changed", 1.0, &[]);
+            }
+            Refresh::Deselected => {
+                tracked.state = FileState::Deselected;
+                // Load-bearing, not tidiness: the path is still discovered every scan (the
+                // container behind it is still running), so leaving this binding behind would
+                // send the very next scan straight back into this same arm for a file that's
+                // closing. Once `reap_drained` drops it from `self.files`, an orphaned binding
+                // would keep this path out of `scan`'s `None` arm forever -- the container could
+                // never be re-selected even if the rename is reversed.
+                self.by_path.remove(path);
+                self.telemetry.count("logit.input.files.deselected", 1.0, &[]);
             }
         }
     }
@@ -465,6 +501,15 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         watcher: &mut super::watch::Watcher,
     ) {
         if let Some(tracked) = self.files.get_mut(&id) {
+            if tracked.state == FileState::Deselected {
+                // On its way out, but not reaped yet this iteration -- `reap_drained` runs later,
+                // after `drain`, and the path is still discovered every scan since the container
+                // behind it is still running. Must not be revived the way a renamed-but-still-
+                // wanted inode is below: once `reap_drained` removes this entry, this arm is no
+                // longer reached for `id`, and a later scan's own `accept` call re-admits it if
+                // the rename is reversed.
+                return;
+            }
             // Same inode, new name: adopt the existing entry rather than reopening. Reviving a
             // `Draining` entry back to `Active` is correct here -- the inode is once again matched
             // by a configured pattern under a real name, so it should keep being tailed, not
@@ -494,6 +539,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if !self.factory.accept(&path) {
             return;
         }
+        // Committed to actually using `start` now -- safe to discard the resume entry it came
+        // from, if any (a no-op when `start` didn't come from one).
+        self.resume.remove(&id);
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(err) => {
@@ -585,8 +633,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Reads one chunk from the tracked file `id`, decodes every complete line it yields, and
     /// emits any batch that reaches a bound. Returns whether it actually read anything --
-    /// `false` means this file is at EOF for now (nothing more to do until the next wake).
+    /// `false` means this file is at EOF for now (nothing more to do until the next wake), or
+    /// that it's [`FileState::Deselected`] and this driver has stopped reading it regardless of
+    /// how much unread content remains -- either way, `drain`'s caller treats it the same:
+    /// eligible for [`Tailer::reap_drained`] on this pass.
     async fn read_one(&mut self, id: FileId, sink: &Fanout) -> bool {
+        if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
+            return false;
+        }
         let mut chunk = vec![0u8; READ_CHUNK_BYTES];
         let n = match self.files.get_mut(&id) {
             Some(tracked) => match tracked.file.read(&mut chunk).await {
@@ -671,7 +725,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let draining: Vec<FileId> = self
             .files
             .iter()
-            .filter(|(id, f)| f.state == FileState::Draining && at_eof.contains(id))
+            .filter(|(id, f)| {
+                matches!(f.state, FileState::Draining | FileState::Deselected)
+                    && at_eof.contains(id)
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in draining {
@@ -679,9 +736,22 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             if let Some(watch_id) = tracked.watch {
                 watcher.unwatch(watch_id);
             }
+            let deselected = tracked.state == FileState::Deselected;
             close_decoder(&mut tracked, sink, &self.telemetry, &mut self.diag).await;
             if let Some(batch) = tracked.accumulator.take() {
                 emit(sink, &self.telemetry, batch, FlushReason::Closed).await;
+            }
+            if deselected {
+                // Unlike `Draining` (whose inode is gone and could be recycled by Docker for an
+                // unrelated container), this inode is still very much alive -- just no longer
+                // wanted. Retaining its offset here, in the same map a checkpoint resume already
+                // populates, is what lets a rename back into the selection resume instead of
+                // replaying the whole log from byte 0 (`Tailer::open_tracked`'s `None` arm
+                // already consults `resume` first). `tracked.offset`, not minus any pending
+                // partial bytes: `close_decoder` above has already drained the splitter's held
+                // partial through `take_partial`, so every byte counted in `offset` has already
+                // produced an event.
+                self.resume.insert(id, (tracked.path.clone(), tracked.offset));
             }
         }
     }
@@ -846,6 +916,34 @@ mod tests {
         }
     }
 
+    /// A `tail_in`-shaped factory whose selection is driven by a shared flag, standing in for
+    /// `docker_in`'s real container filter -- lets a test flip a file's selection mid-run without
+    /// needing a real `config.v2.json`/`ContainerFilter` round trip. `accept` and `refresh` are
+    /// kept consistent with each other deliberately: a real selection filter answers the same way
+    /// to both, and a de-selected-then-reselected file must be `accept`-able again once the flag
+    /// flips back.
+    struct SelectiveFactory {
+        deselected: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DecoderFactory<LineDecoder> for SelectiveFactory {
+        fn accept(&mut self, _path: &Path) -> bool {
+            !self.deselected.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn open(&mut self, path: &Path) -> anyhow::Result<LineDecoder> {
+            Ok(LineDecoder::new(path, Arc::new(Resource::default())))
+        }
+
+        fn refresh(&mut self, _path: &Path, _decoder: &mut LineDecoder) -> Refresh {
+            if self.deselected.load(std::sync::atomic::Ordering::SeqCst) {
+                Refresh::Deselected
+            } else {
+                Refresh::Unchanged
+            }
+        }
+    }
+
     fn recording_fanout(capacity: usize) -> (Fanout, mpsc::Receiver<Delivered>) {
         let (tx, rx) = mpsc::channel(capacity);
         (Fanout::new(vec![tx]), rx)
@@ -870,8 +968,8 @@ mod tests {
         }
     }
 
-    fn spawn_tailer(
-        mut tailer: Tailer<LineDecoder, LineFactory>,
+    fn spawn_tailer<F: DecoderFactory<LineDecoder> + 'static>(
+        mut tailer: Tailer<LineDecoder, F>,
         sink: Fanout,
     ) -> (watch::Sender<bool>, tokio::task::JoinHandle<anyhow::Result<()>>) {
         let (tx, rx) = watch::channel(false);
@@ -1232,6 +1330,95 @@ mod tests {
             gauge_value(&registry, "logit.input.files.open"),
             Some(0.0),
             "files.open should drop to 0 once the removed file is reaped"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- W3: selection follows the rename (docs/adr/docker-container-identity-and-minimal-
+    // watches.md) --
+
+    /// The regression test for `FileState::Deselected` existing as its own state rather than
+    /// reusing `Draining`: a busy file marked `Draining` keeps draining (and therefore emitting)
+    /// until it reaches EOF, which a still-growing file never does. A de-selected file must stop
+    /// being read immediately instead, even while more is being appended to it.
+    #[tokio::test]
+    async fn a_deselected_file_stops_emitting_immediately_even_while_still_written_to() {
+        let dir = scratch_dir("deselect-stop");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer =
+            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning));
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["one"]);
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A couple of poll ticks' worth of time for the next scan to notice and reap.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"two\nthree\n").unwrap();
+        }
+
+        let nothing = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(
+            nothing.is_err(),
+            "a de-selected file must not emit anything further, even while still being written to"
+        );
+
+        shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A container renamed back into the selection resumes from where it was closed -- not from
+    /// byte 0 -- including lines written while it was away, which are delivered (under the
+    /// identity current at the time they're finally read) once it's selected again. Also the
+    /// regression test for `open_tracked`'s revival guard: without it, the very next scan after
+    /// de-selection would find the still-present `Deselected` entry and silently revive it before
+    /// `reap_drained` ever runs, and this test's first `rx.recv()` after re-selecting would see
+    /// `"one"` replayed instead of nothing followed by `"two"`.
+    #[tokio::test]
+    async fn a_reselected_file_resumes_at_the_retained_offset_rather_than_replaying() {
+        let dir = scratch_dir("deselect-resume");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+
+        let deselected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let factory = SelectiveFactory { deselected: deselected.clone() };
+        let (fanout, mut rx) = recording_fanout(8);
+        let tailer =
+            Tailer::new(vec![PathPattern::new(&path)], factory, fast_config(ReadFrom::Beginning));
+        let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["one"]);
+
+        deselected.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await; // time to reap
+
+        // Written while de-selected -- must not be lost, only deferred.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"two\n").unwrap();
+        }
+        let nothing = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(nothing.is_err(), "still de-selected -- nothing should arrive yet");
+
+        deselected.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let events2 = expect_events(&mut rx, 1).await;
+        assert_eq!(
+            messages(&events2),
+            vec!["two"],
+            "must resume from the retained offset -- \"one\" must never be replayed"
         );
 
         shutdown(shutdown_tx, handle).await;

@@ -476,8 +476,24 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
 
     fn refresh(&mut self, path: &Path, decoder: &mut DockerDecoder) -> Refresh {
         let Some(container_dir) = path.parent() else { return Refresh::Unchanged };
+        let Some(dir_name) = container_dir.file_name().and_then(|n| n.to_str()) else {
+            return Refresh::Unchanged;
+        };
         self.refresh_cache(container_dir);
         let Some(identity) = self.cached(container_dir) else { return Refresh::Unchanged };
+        // Selection before identity, deliberately: a container renamed out of `containers:` is
+        // closing, and the decoder's resource must NOT be swapped for it -- whatever
+        // `close_decoder` flushes on the way out should carry the identity this listener actually
+        // read those lines under, not the new one it's no longer allowed to follow.
+        // `discover: true` can never reach this branch (`ContainerFilter::matches` returns `true`
+        // unconditionally in that mode, before looking at anything).
+        if !self.filter.matches(dir_name, Some(identity.name.as_str())) {
+            self.diag.info(
+                "container_deselected",
+                format!("{}: renamed out of the configured selection", path.display()),
+            );
+            return Refresh::Deselected;
+        }
         if Arc::ptr_eq(&decoder.resource, &identity.resource) {
             return Refresh::Unchanged;
         }
@@ -1266,6 +1282,127 @@ mod tests {
             "a rewrite reproducing the same resource value must keep the existing Arc, not mint \
              a new one -- otherwise every untracked daemon rewrite would flush a batch that never \
              needed to split"
+        );
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- W3: selection follows the rename (docs/adr/docker-container-identity-and-minimal-
+    // watches.md) --
+
+    /// A container renamed out of an explicit `containers:` list stops flowing -- and does so
+    /// without draining the container to EOF first, since it's still running: only the lines
+    /// already read before the rename arrive.
+    #[tokio::test]
+    async fn a_container_renamed_out_of_the_explicit_selection_stops_flowing() {
+        let root = scratch_dir("docker-deselect");
+        let id = "c".repeat(64);
+        let log_path = container(&root, &id, "wanted", "nginx:1.25");
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                r#"{"log":"one\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
+        let (tx, handle) = spawn(input, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["one"]);
+
+        // Renamed out of `containers: ["wanted"]`.
+        std::fs::write(
+            root.join(&id).join("config.v2.json"),
+            r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+        // Give it a couple of poll ticks to notice and close.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}\n",
+                    r#"{"log":"two\n","stream":"stdout","time":"2026-08-17T19:35:47.000000000Z"}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let nothing = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(nothing.is_err(), "a container renamed out of the selection must not keep flowing");
+
+        shutdown(tx, handle).await;
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A container renamed back into the selection resumes rather than replaying its whole log,
+    /// and lines written while it was away are delivered once it's selected again -- under the
+    /// identity current when they're finally read.
+    #[tokio::test]
+    async fn a_container_renamed_back_into_the_selection_resumes_without_replaying() {
+        let root = scratch_dir("docker-reselect");
+        let id = "d".repeat(64);
+        let log_path = container(&root, &id, "wanted", "nginx:1.25");
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n",
+                r#"{"log":"one\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#
+            ),
+        )
+        .unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let filter = ContainerFilter::new(vec!["wanted".to_string()], false);
+        let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
+        let (tx, handle) = spawn(input, fanout);
+
+        let events = expect_events(&mut rx, 1).await;
+        assert_eq!(messages(&events), vec!["one"]);
+
+        // Renamed away, then back -- with a line written while it was away, which must survive.
+        std::fs::write(
+            root.join(&id).join("config.v2.json"),
+            r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}\n",
+                    r#"{"log":"two\n","stream":"stdout","time":"2026-08-17T19:35:47.000000000Z"}"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let nothing = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(nothing.is_err(), "still renamed away -- nothing should arrive yet");
+
+        std::fs::write(
+            root.join(&id).join("config.v2.json"),
+            r#"{"Name":"/wanted","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
+        )
+        .unwrap();
+
+        let events2 = expect_events(&mut rx, 1).await;
+        assert_eq!(
+            messages(&events2),
+            vec!["two"],
+            "must resume from the retained offset -- \"one\" must never be replayed"
         );
 
         shutdown(tx, handle).await;
