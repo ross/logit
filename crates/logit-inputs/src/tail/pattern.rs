@@ -65,32 +65,17 @@ impl PathPattern {
         &self.dir
     }
 
-    /// Every directory that must be watched for this pattern to notice a change to something it
-    /// can match. For a literal or wildcard pattern that's exactly [`PathPattern::dir`] -- the file
-    /// lives directly in it. [`Matcher::DockerContainers`] is the exception its two-level walk
-    /// implies: the log file lives one level below `root`, so `root` alone only reveals a
-    /// container's *directory* appearing, never the log file created inside it a moment later, nor
-    /// that file rotating or being truncated. `root` stays in the set regardless -- that's what
-    /// notices a new container directory at all -- with one entry per container subdirectory that
-    /// currently exists. Recomputed each `scan` (`Tailer::scan`), which is what lets a container's
-    /// directory be unwatched again when it goes away.
-    pub fn watch_dirs(&self) -> Vec<PathBuf> {
-        if self.matcher != Matcher::DockerContainers {
-            return vec![self.dir.clone()];
-        }
-        let mut out = vec![self.dir.clone()];
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            let Ok(is_dir) = entry.file_type().map(|t| t.is_dir()) else { continue };
-            if !is_dir {
-                continue;
-            }
-            out.push(self.dir.join(entry.file_name()));
-        }
-        out
-    }
+    // `watch_dirs()` used to live here, widening to `root` plus every currently-existing
+    // container subdirectory for `Matcher::DockerContainers`. It's gone
+    // (`docs/adr/docker-container-identity-and-minimal-watches.md`): `root` alone already catches
+    // a container directory arriving or leaving (Docker's per-container state directories are
+    // direct children of it), so every matcher now needs exactly `PathPattern::dir` watched --
+    // `Tailer::reconcile_watches` calls that directly rather than through a second method that
+    // would just wrap it in a one-element `Vec`. What the old widening bought beyond `root` --
+    // near-immediate notice of a log file appearing inside an already-existing container
+    // directory, of that file rotating, or of `config.v2.json` changing -- now rides the
+    // `poll_interval` tick instead; a file actually being tailed gets its own watch directly
+    // (`Tailer::open_tracked`, `Watcher::watch_file`).
 
     fn matches_name(&self, name: &str) -> bool {
         match &self.matcher {
@@ -255,35 +240,32 @@ mod tests {
     }
 
     #[test]
-    fn docker_containers_watch_dirs_covers_the_root_and_every_container_directory() {
-        let root = crate::tail::test_support::scratch_dir("pattern-docker-watch-dirs");
+    fn docker_containers_dir_is_just_root_regardless_of_what_it_currently_holds() {
+        // `docs/adr/docker-container-identity-and-minimal-watches.md`: `docker_in` no longer
+        // widens its watch set to every container subdirectory -- `root` alone is watched,
+        // since Docker's per-container state directories are direct children of it. This
+        // fixture (an existing container, a container with no log file yet, a stray plain file)
+        // is what the old `watch_dirs()` used to have to walk to compute that widened set; now
+        // `dir()` doesn't look at any of it.
+        let root = crate::tail::test_support::scratch_dir("pattern-docker-dir");
         let id_a = "aaaa000000000000000000000000000000000000000000000000000000000000";
         let id_b = "bbbb111111111111111111111111111111111111111111111111111111111111";
-        let dir_a = root.join(id_a);
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::write(dir_a.join(format!("{id_a}-json.log")), b"").unwrap();
-        // `id_b` has no log file yet -- this is the load-bearing case: it must still be watched,
-        // since the log file only appears a moment after the directory does.
+        std::fs::create_dir_all(root.join(id_a)).unwrap();
+        std::fs::write(root.join(id_a).join(format!("{id_a}-json.log")), b"").unwrap();
         std::fs::create_dir_all(root.join(id_b)).unwrap();
-        // A stray plain file directly under `root` -- must never be treated as a container
-        // directory.
         std::fs::write(root.join("stray.txt"), b"").unwrap();
 
         let p = PathPattern::docker_containers(&root);
-        let mut watched = p.watch_dirs();
-        watched.sort();
-        let mut expected = vec![root.clone(), dir_a, root.join(id_b)];
-        expected.sort();
-        assert_eq!(watched, expected);
+        assert_eq!(p.dir(), root.as_path());
 
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn a_wildcard_patterns_watch_dirs_is_just_its_own_directory() {
-        let dir = crate::tail::test_support::scratch_dir("pattern-wildcard-watch-dirs");
+    fn a_wildcard_patterns_dir_is_its_own_directory() {
+        let dir = crate::tail::test_support::scratch_dir("pattern-wildcard-dir");
         let p = PathPattern::new(dir.join("*.log"));
-        assert_eq!(p.watch_dirs(), vec![dir.clone()]);
+        assert_eq!(p.dir(), dir.as_path());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
