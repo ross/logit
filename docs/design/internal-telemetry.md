@@ -652,10 +652,13 @@ Worked examples, one per shipped component:
   that find nothing dirty record nothing), `.watch.wakes{source="inotify"|"poll"}` /
   `.watch.overflows` (count — which wake source actually fired, and the `inotify` queue overflowing
   into a full rescan), and `.watch.watches` (gauge, sampled alongside `.files.open` — the watched
-  directory plus one entry per currently-open file that has its own watch; proportional to what's
-  tailed, not to what's running on the host, which is the property the minimal-watch-set design is
-  for). `docker_in`-only: `.files.identity_changed` (count — `config.v2.json`'s own stat changed
-  and the rebuilt resource differs in value, so the decoder's `Arc` was swapped) and `.deselected`
+  directory plus one entry per currently-open file, counting the driver's *intended* watch set
+  rather than live kernel descriptors: under `watch: poll` both halves are no-ops with nothing
+  actually registered, so the count there still reports what would be watched under `inotify`, not
+  zero; proportional to what's tailed, not to what's running on the host, which is the property the
+  minimal-watch-set design is for). `docker_in`-only: `.files.identity_changed` (count —
+  `config.v2.json`'s own stat changed and the rebuilt resource differs in value, so the decoder's
+  `Arc` was swapped) and `.deselected`
   (count — a tracked container renamed out of `containers:`, closed rather than kept flowing).
   `Diagnostics` keys: `bad_line`/`long_line`/`invalid_utf8` (a line that wouldn't decode, exceeded
   `max_line_bytes`, or needed a lossy UTF-8 conversion), `open_error`/`read_error` (a file this
