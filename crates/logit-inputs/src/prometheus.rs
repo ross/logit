@@ -134,6 +134,13 @@
 //! always `0` histograms, since native histograms are skipped and counted rather than stored
 //! (`docs/known-gaps.md`). A 1.0 request gets none: 1.0 defines none.
 //!
+//! *Samples-written is measured on the way out, not on the way in.* The codec's own accepted count
+//! is a statement about what the assembler took, and the model mapping that runs afterwards can
+//! still drop a whole series (an empty histogram, a histogram whose bucket counts decrease). So
+//! the number reported is [`wire_samples`] summed over the events that reached the `Fanout` --
+//! a request whose every series was dropped answers `204` with `Samples-Written: 0` and sends no
+//! batch, which is the honest report of having stored nothing.
+//!
 //! ## What a decoded request becomes
 //!
 //! **One `EventBatch` per request**, with an **empty `Resource`** and `received_at` = now, built
@@ -194,7 +201,11 @@
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
 //! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. `logit.input.write.duration`
 //! -- a timing sample per request, recorded regardless of outcome. `logit.input.samples` --
-//! reused from scrape mode, counting the samples the codec actually stored. The connection
+//! reused from scrape mode, counting the wire samples that actually reached the `Fanout`: the
+//! codec's own accepted total minus every series the model mapping then dropped (an empty
+//! histogram, a histogram whose bucket counts decrease), measured off the events themselves. That
+//! is the same number the `-Written` header reports, deliberately -- a counter and a header
+//! disagreeing about one request would be worse than either being slightly coarse. The connection
 //! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
 //! since this is the same accept loop. A rejected request also reports
 //! `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address in the message text
@@ -1202,14 +1213,46 @@ async fn write_response(
     for group in &decoded.groups {
         events.extend(families_to_events(group, received_at, &mut decoder));
     }
-    telemetry.count("logit.input.samples", decoded.samples as f64, &[]);
+    // Counted off the events that were actually built, **not** `Decoded::samples`:
+    // `families_to_events` runs after the assembler and drops a whole series whose point has no
+    // model kind (an empty histogram, a histogram whose bucket counts decrease), so the
+    // assembler's own total would report samples this receiver went on to discard. The `-Written`
+    // header is the one thing 2.0 defines as a report of what the receiver *kept*, so it has to
+    // be this number -- and `logit.input.samples` is the same number, since a counter and a header
+    // disagreeing about one request would be worse than either being slightly coarse.
+    let written: u64 = events.iter().flat_map(|e| e.metrics.iter()).map(wire_samples).sum();
+    telemetry.count("logit.input.samples", written as f64, &[]);
     if !events.is_empty() {
         // **Before** the response is built, the ordering `otlp_in` uses: channel backpressure
         // delays the `204` and the sender's own queue throttles, which is remote-write's own
         // flow-control model working as designed rather than a stalled receiver.
         sink.send(EventBatch { resource, scope: None, events }).await;
     }
-    ("ok", no_content(seen, &decoded))
+    ("ok", no_content(seen, written, decoded.exemplars))
+}
+
+/// How many remote-write samples one kept [`MetricRecord`] accounts for -- the wire's own unit,
+/// which is what 2.0's `-Written` header is defined in. One series is one sample for every kind
+/// that is one number, and several for the kinds this wire spells as a family of suffixed series:
+/// a classic histogram is one `_bucket` sample per bucket (`+Inf` included, so the bucket list's
+/// own length), plus `_count`, plus `_sum` where there is one; a summary is one sample per
+/// quantile plus `_sum` and `_count`.
+///
+/// Exact for anything a conforming sender produces, which is what makes it the right number to
+/// report back. It can over-count by one where a sender omitted a `_count`/`_sum` the assembler
+/// then synthesized, because [`logit_core::Summary`] has no `Option` to remember the omission by
+/// -- a malformed-input edge, not a mapping choice, and it can only ever err on the side of
+/// claiming a sample the sender did send.
+fn wire_samples(record: &MetricRecord) -> u64 {
+    match &record.kind {
+        MetricKind::Histogram(histogram) => {
+            histogram.buckets.len() as u64 + 1 + u64::from(histogram.sum.is_some())
+        }
+        MetricKind::Summary(summary) => summary.quantiles.len() as u64 + 2,
+        // Every other kind this decode path can produce -- `Sum`, `Gauge`, and the zero-shaped
+        // kinds a stale marker takes -- is one series and one wire sample.
+        _ => 1,
+    }
 }
 
 /// `""` for an absent or non-ASCII header -- both are "this header said nothing this receiver can
@@ -1218,15 +1261,17 @@ fn header_str(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-/// `204 No Content`, plus 2.0's `-Written` report of what this receiver actually stored. Native
-/// histograms are skipped, so the histogram count is always `0` -- an honest report, not a
-/// placeholder.
+/// `204 No Content`, plus 2.0's `-Written` report of what this receiver actually stored --
+/// `samples` is [`wire_samples`] summed over the events that reached the fanout, never the
+/// assembler's own total. Native histograms are skipped, so the histogram count is always `0` --
+/// an honest report, not a placeholder.
 fn no_content(
     version: Option<remote_write::Version>,
-    decoded: &remote_write::Decoded,
+    samples: u64,
+    exemplars: u64,
 ) -> http::Response<Full<Bytes>> {
     let mut builder = http::Response::builder().status(StatusCode::NO_CONTENT);
-    builder = with_written_headers(builder, version, decoded.samples, decoded.exemplars);
+    builder = with_written_headers(builder, version, samples, exemplars);
     builder.body(Full::new(Bytes::new())).expect("a well-formed response always builds")
 }
 
@@ -2215,6 +2260,13 @@ mod tests {
     /// A body that decompresses fine but is not protobuf at all: a truncated varint, which no
     /// message can be. Sent as 2.0 so this also pins the `-Written` report a rejection owes a 2.0
     /// sender -- zeros, on a `4xx`, which is exactly what 2.0 asks for.
+    ///
+    /// A *valid 1.0* body under a 2.0 `Content-Type` is the more realistic mistake, and on this
+    /// branch's base it still answers `204` with nothing stored (proto3 field numbers overlap
+    /// enough for it to decode as an empty 2.0 `Request`). `rw/w2`'s own follow-up
+    /// `fix(proto): bound remote-write decode and place its exemplars honestly` makes that a
+    /// `CodecError`; once the lead syncs this stack onto it, add the case here -- a `V1`
+    /// `request_body` posted with `Version::V2`'s headers, asserting `400`.
     #[tokio::test]
     async fn a_body_that_is_not_the_promised_message_is_400() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2389,6 +2441,149 @@ mod tests {
             .expect("the 204 arrives once the downstream drains");
         assert!(head.starts_with("HTTP/1.1 204"), "got: {head}");
         recv_batch_async(&mut rx).await;
+    }
+
+    /// A histogram whose cumulative bucket counts *decrease* is not a cumulative histogram at all,
+    /// so `families_to_events` drops the whole series after the assembler has already accepted its
+    /// samples. The report has to follow the events, not the assembler: nothing reached the
+    /// `Fanout`, so `Samples-Written` is `0` and `logit.input.samples` counts nothing -- otherwise
+    /// the one header 2.0 defines as "what the receiver kept" would be claiming three samples this
+    /// receiver threw away.
+    #[tokio::test]
+    async fn a_request_whose_only_series_is_dropped_reports_zero_samples_written() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver.with_telemetry(telemetry);
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let mut family = MetricFamily::new("request_seconds", FamilyType::Histogram);
+        family.series.push(Series {
+            labels: vec![("job".to_string(), "api".to_string())],
+            // Cumulative counts must never decrease; `5` after `9` makes this series unmappable.
+            point: Point::Histogram {
+                buckets: vec![(0.5, 9), (f64::INFINITY, 5)],
+                sum: None,
+                count: 5,
+            },
+            timestamp: Some(millis(1_700_000_000_000)),
+            created: None,
+            exemplars: Vec::new(),
+        });
+        let body = request_body(&[vec![family]], remote_write::Version::V2);
+
+        let response = post_write(&addr, "/api/v1/write", remote_write::Version::V2, &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains(&format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN)),
+            "the header reports what was kept, which is nothing -- got: {response}"
+        );
+        assert!(rx.try_recv().is_err(), "a dropped series leaves no events, so no batch is sent");
+
+        let events = registry.drain(0);
+        assert_eq!(counter_in(&events, "logit.input.writes", ("class", "ok")), Some(1.0));
+        assert_eq!(
+            counter_in(&events, "logit.input.samples", ("component", "receive")),
+            Some(0.0),
+            "and the counter agrees with the header"
+        );
+        // The decoder's own skip counter is where the loss is visible, which is the point of it.
+        assert_eq!(
+            counter_in(&events, "logit.input.metrics.skipped", ("reason", "non_monotonic_buckets")),
+            Some(1.0)
+        );
+    }
+
+    /// A well-formed classic histogram, for the other half of the same property: a single series
+    /// that the wire spelled as several samples reports all of them, so the fix above is not
+    /// simply "count events".
+    #[tokio::test]
+    async fn a_kept_histogram_reports_every_wire_sample_it_was_spelled_as() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let mut family = MetricFamily::new("request_seconds", FamilyType::Histogram);
+        family.series.push(Series {
+            labels: vec![("job".to_string(), "api".to_string())],
+            // Two `_bucket` samples, a `_sum` and a `_count`: four on the wire, one event here.
+            point: Point::Histogram {
+                buckets: vec![(0.5, 3), (f64::INFINITY, 7)],
+                sum: Some(1.25),
+                count: 7,
+            },
+            timestamp: Some(millis(1_700_000_000_000)),
+            created: None,
+            exemplars: Vec::new(),
+        });
+        let body = request_body(&[vec![family]], remote_write::Version::V2);
+
+        let response = post_write(&addr, "/api/v1/write", remote_write::Version::V2, &body).await;
+
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains(&format!("{}: 4", remote_write::HEADER_SAMPLES_WRITTEN)),
+            "two buckets plus _sum plus _count -- got: {response}"
+        );
+        let batch = recv_batch_async(&mut rx).await;
+        assert_eq!(batch.events.len(), 1, "four wire samples, one model series");
+    }
+
+    /// The `408` row of the routes table, and the whole reason `collect_with_stall_bound` was
+    /// hoisted: `drive_with_idle` applies no deadline while a request is in flight, so a peer that
+    /// sends a head and then stops mid-body would otherwise hold its connection-limit permit
+    /// forever. `otlp_in`'s own stalled-body test, one listener over.
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_is_408_and_closes_the_connection() {
+        use tokio::io::AsyncWriteExt;
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver
+            .with_telemetry(telemetry)
+            // The per-frame body bound is `idle_timeout` too -- a listener with no idle bound
+            // configured gets no per-frame one either.
+            .with_idle_timeout(Some(Duration::from_millis(100)))
+            // The grace `drive_with_idle` gives hyper to write the 408 out and close.
+            .with_handshake_timeout(Duration::from_millis(200));
+        let mut rx = spawn_receiver(receiver, 4);
+        let body = request_body(
+            &[vec![gauge_family("queue_depth", ("job", "api"), 1.0, millis(1))]],
+            remote_write::Version::V1,
+        );
+
+        // A `Content-Length` promising the whole body, then half of it and silence.
+        let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let head = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{}\r\n",
+            body.len(),
+            write_headers(remote_write::Version::V1)
+        );
+        stalled.write_all(head.as_bytes()).await.unwrap();
+        stalled.write_all(&body[..body.len() / 2]).await.unwrap();
+
+        // `read_to_end` *completing* is the close: `Activity::request_close` ends the connection
+        // once the 408 is out rather than leaving it to the whole-connection deadline, so this
+        // both reads the response and proves the socket went away. `otlp_in`'s own shape.
+        let mut buf = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut buf))
+                .await
+                .expect("a stalled request body should be answered and closed within 5s")
+                .expect("reading the response should not fail outright");
+        }
+        let response = String::from_utf8_lossy(&buf);
+        assert!(response.starts_with("HTTP/1.1 408"), "got: {response}");
+        assert!(response.contains("stalled"), "the message should say what happened: {response}");
+
+        assert!(rx.try_recv().is_err(), "a half-uploaded request produces no batch");
+        let events = registry.drain(0);
+        assert_eq!(counter_in(&events, "logit.input.writes", ("class", "timeout")), Some(1.0));
     }
 
     #[tokio::test]
