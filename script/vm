@@ -1,0 +1,486 @@
+#!/bin/bash
+# Usage: script/vm up
+#        script/vm shell [remote command...]
+#        script/vm status
+#        script/vm down [-y|--yes]
+# Creates, uses, and destroys a disposable Azure VM for perf measurement
+# (docs/adr/disposable-azure-perf-vm.md). The laptop can't give a trustworthy number: its
+# heterogeneous cores make an unpinned `script/perf run` come out bimodal depending on which core
+# type the worker threads land on, and thermal throttling plus whatever else the machine is doing
+# move the answer again. This provisions four homogeneous full physical AMD EPYC cores
+# (Standard_F4as_v6, SMT disabled), measures on them, and deletes the whole thing.
+#
+# `down` DELETES THE RESOURCE GROUP. There is deliberately no stop/deallocate/start path and no
+# snapshot path: zero cost when the machine isn't in use is the requirement, and a stopped VM
+# still bills for its disk while a snapshot bills forever. The price is a cold ~15-20 minute
+# provision-and-build at the start of every session, paid knowingly.
+#
+# The one script/* command that runs on the HOST and needs the Azure CLI rather than the dev
+# container. It sources common.sh for ROOT (so script/vm-cloud-init.yaml resolves regardless of
+# cwd) and for `set -e`, but never uses run/build_image/COMPOSE/DOCKER -- those drive the local
+# Docker daemon and there is nothing local to drive here.
+#
+# SSH is left open to the internet on purpose -- see allow_cidr() below and the ADR's
+# "Networking" section. What actually protects the box is key-only auth, a single authorized
+# key, and a lifetime measured in hours.
+
+set -e
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+usage() {
+    sed -n '2,6p' "${SCRIPT_PATH}/vm" | sed 's/^# //; s/^#//'
+}
+
+# --- configuration: everything account-specific is an env var with a default ---------------
+
+# Empty by default = whatever `az account show` says. This script never runs `az account set`,
+# so it can't disturb the default subscription someone else's work depends on -- every az call
+# below carries --subscription only when this is set, and every subcommand prints the resolved
+# subscription first so it's never a surprise.
+LOGIT_VM_SUBSCRIPTION="${LOGIT_VM_SUBSCRIPTION:-}"
+
+LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-westus2}"
+LOGIT_VM_ZONE="${LOGIT_VM_ZONE:-1}"
+# 4 vCPU = 4 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
+LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F4as_v6}"
+# gen2 only for this series; verified present in westus2 (and eastus, centralus). Pin an
+# explicit version instead of `latest` to compare across sessions -- logit-vm-metadata.txt
+# records whichever version `latest` actually resolved to.
+LOGIT_VM_IMAGE="${LOGIT_VM_IMAGE:-Debian:debian-13:13-gen2:latest}"
+# The image default (30 GiB) doesn't fit rust:1.98.1-bookworm + logit-dev:local + a warm
+# CARGO_HOME + a release target/.
+LOGIT_VM_OS_DISK_GB="${LOGIT_VM_OS_DISK_GB:-128}"
+LOGIT_VM_STORAGE_SKU="${LOGIT_VM_STORAGE_SKU:-Premium_LRS}"
+
+LOGIT_VM_RESOURCE_GROUP="${LOGIT_VM_RESOURCE_GROUP:-logit-perf}"
+LOGIT_VM_NAME="${LOGIT_VM_NAME:-logit-perf-vm}"
+# Not "azureuser"/"admin": Azure rejects a list of reserved usernames, and a name that can't
+# collide with anything an image might already have baked in keeps the uid-1000 assertion in
+# vm-cloud-init.yaml honest.
+LOGIT_VM_ADMIN_USER="${LOGIT_VM_ADMIN_USER:-logit}"
+
+# Distinct from az vm create's own 10.0.0.0/24 default so it can't collide with a 192.168/16 home
+# LAN or Docker's 172.17/172.18 bridges.
+LOGIT_VM_VNET_PREFIX="${LOGIT_VM_VNET_PREFIX:-10.42.0.0/16}"
+LOGIT_VM_SUBNET_PREFIX="${LOGIT_VM_SUBNET_PREFIX:-10.42.0.0/24}"
+
+LOGIT_VM_REPO_URL="${LOGIT_VM_REPO_URL:-https://github.com/ross/logit.git}"
+# A branch or tag -- `git clone --branch` can't take a SHA. To measure a SHA: script/vm shell,
+# then `git checkout <sha>` there.
+LOGIT_VM_REPO_REF="${LOGIT_VM_REPO_REF:-main}"
+
+# Dedicated, never shared, never added to an agent, never in ~/.ssh/authorized_keys, and NEVER
+# deleted by `down` -- so the fingerprint is stable across sessions even though the VM isn't.
+LOGIT_VM_SSH_KEY="${LOGIT_VM_SSH_KEY:-${HOME}/.ssh/logit-perf-vm}"
+LOGIT_VM_KNOWN_HOSTS="${LOGIT_VM_KNOWN_HOSTS:-${HOME}/.ssh/logit-perf-vm.known_hosts}"
+
+# VM + 128GiB Premium SSD + a Standard static public IP, westus2 PAYG Linux -- for status's
+# running-cost line. A rough nag, not a bill.
+LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.305}"
+
+VNET="${LOGIT_VM_RESOURCE_GROUP}-vnet"
+SUBNET="${LOGIT_VM_RESOURCE_GROUP}-subnet"
+NSG="${LOGIT_VM_RESOURCE_GROUP}-nsg"
+NSG_RULE="allow-ssh"
+PIP="${LOGIT_VM_RESOURCE_GROUP}-ip"
+
+AZ=(az)
+[ -n "${LOGIT_VM_SUBSCRIPTION}" ] && AZ+=(--subscription "${LOGIT_VM_SUBSCRIPTION}")
+
+# -F /dev/null: this host's own ~/.ssh/config carries a global `Host *` block (an IdentityAgent
+# pointing at a key agent socket) and a top-level ControlMaster/ControlPath. A disposable VM with
+# a brand-new host key and a brand-new public IP every session is exactly the case where an
+# external key agent and a cached mux socket turn a clear failure into a confusing one, so every
+# option this needs is stated here instead of inherited.
+#
+# StrictHostKeyChecking=accept-new, not "no": first contact records the key in a known_hosts file
+# used by nothing else, and a key that *changes* mid-session is still a hard error. `down` removes
+# that file wholesale, so every session starts from a clean first contact and ~/.ssh/known_hosts
+# is never touched.
+SSH_OPTS=(
+    -F /dev/null
+    -i "${LOGIT_VM_SSH_KEY}"
+    -o IdentitiesOnly=yes
+    -o UserKnownHostsFile="${LOGIT_VM_KNOWN_HOSTS}"
+    -o GlobalKnownHostsFile=/dev/null
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=30
+)
+
+# --- shared helpers --------------------------------------------------------------------------
+
+preflight() {
+    for tool in az ssh ssh-keygen; do
+        command -v "${tool}" >/dev/null 2>&1 || {
+            echo "script/vm needs ${tool} on PATH (this is the one script/* command that runs on" >&2
+            echo "the host, not in the dev container). Azure CLI: https://aka.ms/InstallAzureCLI" >&2
+            exit 1
+        }
+    done
+
+    local account
+    account="$("${AZ[@]}" account show --query '{name:name, id:id}' -o tsv 2>/dev/null)" || {
+        echo "not logged in to Azure -- run 'az login' first." >&2
+        exit 1
+    }
+    echo "subscription:  ${account}"
+}
+
+# Regional and per-family vCPU headroom for the 4 this VM wants.
+#
+# `az vm list-usage` returns currentValue and limit as JSON *strings*, so a JMESPath numeric
+# filter on them crashes the CLI outright -- pulled out as text and compared in the shell instead.
+check_quota() {
+    # `[0].[currentValue, limit]` returns a bare 2-element array, and `-o tsv` prints a bare
+    # array one element per line, not tab-joined -- so a single `read var1 var2 <<<...` only ever
+    # captured the first element, leaving the second empty and the arithmetic below silently
+    # comparing against 0. Shaping the query as a one-row object instead
+    # (`{u:...currentValue, l:...limit}`) is what actually gets both values onto one TSV line.
+    local family_used family_limit core_used core_limit
+    read -r family_used family_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
+        --query "{u:[?name.value=='StandardFasv6Family']|[0].currentValue, l:[?name.value=='StandardFasv6Family']|[0].limit}" -o tsv)"
+    read -r core_used core_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
+        --query "{u:[?name.value=='cores']|[0].currentValue, l:[?name.value=='cores']|[0].limit}" -o tsv)"
+    echo "quota:         Fasv6 ${family_used}/${family_limit} vCPU, regional ${core_used}/${core_limit} vCPU"
+    if [ $((family_limit - family_used)) -lt 4 ] || [ $((core_limit - core_used)) -lt 4 ]; then
+        echo "not enough vCPU quota in ${LOGIT_VM_LOCATION} for a 4-vCPU VM." >&2
+        exit 1
+    fi
+}
+
+ensure_key() {
+    mkdir -p -m 700 "${HOME}/.ssh"
+    if [ -f "${LOGIT_VM_SSH_KEY}" ]; then return; fi
+    # No passphrase: this key grants access to a machine that holds nothing but a clone of a
+    # public repo and exists for hours. A passphrase would mean either an agent (awkward given
+    # the host's own IdentityAgent config above) or a prompt on each of the several ssh calls
+    # `up` makes.
+    echo "creating ${LOGIT_VM_SSH_KEY} (ed25519, no passphrase)"
+    ssh-keygen -q -t ed25519 -N '' -C "logit-perf-vm" -f "${LOGIT_VM_SSH_KEY}"
+}
+
+vm_exists() {
+    "${AZ[@]}" vm show --resource-group "${LOGIT_VM_RESOURCE_GROUP}" \
+        --name "${LOGIT_VM_NAME}" --output none 2>/dev/null
+}
+
+public_ip_or_die() {
+    local ip
+    ip="$("${AZ[@]}" network public-ip show \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${PIP}" \
+        --query ipAddress -o tsv 2>/dev/null)" || true
+    if [ -z "${ip}" ] || [ "${ip}" = "None" ]; then
+        echo "no VM up -- run 'script/vm up' first." >&2
+        exit 1
+    fi
+    echo "${ip}"
+}
+
+# --- subcommands ------------------------------------------------------------------------------
+
+vm_up() {
+    preflight
+    check_quota
+    ensure_key
+
+    local created_group=0 created_vm=0
+    if [ "$("${AZ[@]}" group exists --name "${LOGIT_VM_RESOURCE_GROUP}")" = "false" ]; then
+        created_group=1
+        "${AZ[@]}" group create \
+            --name "${LOGIT_VM_RESOURCE_GROUP}" \
+            --location "${LOGIT_VM_LOCATION}" \
+            --tags project=logit purpose=perf managed-by=script/vm \
+                   "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output none
+    fi
+
+    "${AZ[@]}" network vnet create \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${VNET}" \
+        --location "${LOGIT_VM_LOCATION}" \
+        --address-prefixes "${LOGIT_VM_VNET_PREFIX}" \
+        --subnet-name "${SUBNET}" --subnet-prefixes "${LOGIT_VM_SUBNET_PREFIX}" \
+        --output none
+
+    "${AZ[@]}" network nsg create \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${NSG}" \
+        --location "${LOGIT_VM_LOCATION}" --output none
+
+    # One inbound Allow is all that's needed: the NSG's own default rules already deny
+    # everything else inbound from Internet (DenyAllInBound) and already allow all outbound
+    # (AllowInternetOutBound), which apt, download.docker.com, crates.io and Docker Hub all need.
+    #
+    # Open to the internet, deliberately -- see the header comment and the ADR. What actually
+    # protects the box is key-only auth (asserted in vm-cloud-init.yaml as ssh_pwauth: false),
+    # exactly one authorized key, and a lifetime measured in hours.
+    if "${AZ[@]}" network nsg rule show --resource-group "${LOGIT_VM_RESOURCE_GROUP}" \
+            --nsg-name "${NSG}" --name "${NSG_RULE}" --output none 2>/dev/null; then
+        : # already present from a previous `up`; nothing to reconcile
+    else
+        "${AZ[@]}" network nsg rule create \
+            --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --nsg-name "${NSG}" --name "${NSG_RULE}" \
+            --source-address-prefixes '*' \
+            --destination-port-ranges 22 \
+            --protocol Tcp --access Allow --direction Inbound --priority 300 \
+            --description "SSH; key-only auth, set by script/vm up" \
+            --output none
+    fi
+
+    # No --zone: a Standard SKU IP created without one is zone-redundant, which attaches to a VM
+    # in any zone. A *zonal* IP in a different zone than the VM would be a create failure.
+    "${AZ[@]}" network public-ip create \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${PIP}" \
+        --location "${LOGIT_VM_LOCATION}" \
+        --sku Standard --allocation-method Static --version IPv4 \
+        --output none
+
+    if vm_exists; then
+        local power
+        power="$("${AZ[@]}" vm get-instance-view \
+            --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${LOGIT_VM_NAME}" \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].code|[0]" -o tsv)"
+        if [ "${power}" != "PowerState/running" ]; then
+            # No start/deallocate path here (see the header and the ADR): a stopped VM is an
+            # accident from somewhere else, and `down` then `up` is a defined, cheap recovery.
+            echo "${LOGIT_VM_NAME} exists but is ${power}. Run 'script/vm down' then 'script/vm up'." >&2
+            exit 1
+        fi
+        echo "vm:            ${LOGIT_VM_NAME} already running -- reusing it"
+    else
+        created_vm=1
+        local cloud_init
+        cloud_init="$(mktemp -t logit-vm-cloud-init.XXXXXXXX.yaml)"
+        # shellcheck disable=SC2064 -- expand now, not at trap-fire time
+        trap "rm -f '${cloud_init}'" EXIT
+        sed -e "s|@ADMIN_USER@|${LOGIT_VM_ADMIN_USER}|g" \
+            -e "s|@REPO_URL@|${LOGIT_VM_REPO_URL}|g" \
+            -e "s|@REPO_REF@|${LOGIT_VM_REPO_REF}|g" \
+            "${SCRIPT_PATH}/vm-cloud-init.yaml" > "${cloud_init}"
+
+        echo "vm:            creating ${LOGIT_VM_NAME} (${LOGIT_VM_SIZE}, ${LOGIT_VM_IMAGE})..."
+        "${AZ[@]}" vm create \
+            --resource-group "${LOGIT_VM_RESOURCE_GROUP}" \
+            --name "${LOGIT_VM_NAME}" \
+            --location "${LOGIT_VM_LOCATION}" \
+            --zone "${LOGIT_VM_ZONE}" \
+            --size "${LOGIT_VM_SIZE}" \
+            --image "${LOGIT_VM_IMAGE}" \
+            --security-type TrustedLaunch \
+            --admin-username "${LOGIT_VM_ADMIN_USER}" \
+            --authentication-type ssh \
+            --ssh-key-values "${LOGIT_VM_SSH_KEY}.pub" \
+            --vnet-name "${VNET}" --subnet "${SUBNET}" \
+            --nsg "${NSG}" \
+            --public-ip-address "${PIP}" \
+            --os-disk-name "${LOGIT_VM_NAME}-os" \
+            --os-disk-size-gb "${LOGIT_VM_OS_DISK_GB}" \
+            --storage-sku "${LOGIT_VM_STORAGE_SKU}" \
+            --os-disk-delete-option Delete \
+            --nic-delete-option Delete \
+            --custom-data "${cloud_init}" \
+            --tags project=logit purpose=perf managed-by=script/vm \
+            --output none
+    fi
+
+    local ip
+    ip="$(public_ip_or_die)"
+
+    # Only on the just-created path -- a re-run of `up` against a live VM must NOT wipe
+    # known_hosts, since that's precisely the record that would catch a changed host key.
+    if [ "${created_vm}" -eq 1 ]; then
+        rm -f "${LOGIT_VM_KNOWN_HOSTS}"
+    fi
+
+    printf 'waiting for sshd on %s' "${ip}"
+    local i up_ok=0
+    for i in $(seq 1 90); do
+        if ssh "${SSH_OPTS[@]}" -o LogLevel=QUIET "${LOGIT_VM_ADMIN_USER}@${ip}" true 2>/dev/null; then
+            up_ok=1
+            break
+        fi
+        printf '.'
+        sleep 5
+    done
+    echo
+    if [ "${up_ok}" -ne 1 ]; then
+        echo "sshd never came up on ${ip}. The VM is still running -- 'script/vm down' to clean up." >&2
+        exit 1
+    fi
+
+    # cloud-init exits 0 for done, 2 for "degraded" (a recoverable module error), 1 for a real
+    # failure. Degraded is surfaced as a warning rather than a stop: the machine is usable and
+    # whichever module complained is in the log.
+    echo "waiting for cloud-init (package install, docker, sysctls, clone)..."
+    local rc=0
+    ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@${ip}" 'sudo cloud-init status --wait --long' || rc=$?
+    if [ "${rc}" -eq 1 ]; then
+        echo "cloud-init failed. Last 80 lines of /var/log/cloud-init-output.log:" >&2
+        ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@${ip}" \
+            'sudo tail -n 80 /var/log/cloud-init-output.log' >&2 || true
+        echo "The VM is still up so you can debug it: script/vm shell / script/vm down" >&2
+        exit 1
+    elif [ "${rc}" -eq 2 ]; then
+        echo "warning: cloud-init reports 'degraded' -- see /var/log/cloud-init-output.log on the VM" >&2
+    fi
+
+    # The cache warm runs here, over ssh, rather than inside cloud-init: this is the step that
+    # takes most of the wall clock (the base image pull, Dockerfile.dev's cargo installs, then a
+    # release build of the workspace), and its output belongs in front of whoever is waiting for
+    # it, not buried in a log that's only read after something breaks. Same division script/setup
+    # already makes locally: the image build is a script you watch.
+    #
+    # DOCKER=docker is passed explicitly (as well as being set in the VM's /etc/environment) so
+    # this doesn't depend on the pam_env mechanism that makes an interactive `script/vm shell`
+    # pick it up automatically.
+    echo "warming caches: script/bootstrap..."
+    ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" \
+        'cd ~/logit && DOCKER=docker script/bootstrap'
+    # One real scenario, not just a build: this is what actually produces the release logit-cli
+    # binary the harness spawns, and it proves the whole path -- dev image, cargo, release
+    # build, spawn, wait4, results file -- before anyone starts trusting a number from this box.
+    # perf/results/ is gitignored, so the artifact costs nothing to leave behind.
+    echo "warming caches: script/perf run --scenario passthrough..."
+    ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" \
+        'cd ~/logit && DOCKER=docker script/perf run --scenario passthrough --repeat 1 --label vm-warmup'
+
+    cat <<EOF
+
+logit perf VM is up and warm.
+
+  resource group  ${LOGIT_VM_RESOURCE_GROUP} (${LOGIT_VM_LOCATION}, zone ${LOGIT_VM_ZONE})
+  size            ${LOGIT_VM_SIZE}
+  image           ${LOGIT_VM_IMAGE}
+  public IP       ${ip}  (port 22 open to the internet -- key-only auth, see the ADR)
+  key             ${LOGIT_VM_SSH_KEY}  (kept by 'down')
+  known_hosts     ${LOGIT_VM_KNOWN_HOSTS}  (removed by 'down')
+  cost            ~\$${LOGIT_VM_HOURLY_USD}/hour for as long as this exists
+
+  script/vm shell     a login shell in ~/logit, with DOCKER=docker already set
+  script/vm status    power state, uptime, running cost
+  script/vm down      DELETES the resource group -- the only way back to \$0
+
+Cite ~/logit-vm-metadata.txt on the VM alongside any number you record. It has the CPU model,
+kernel, image version, and the exact sysctl values this run saw.
+EOF
+}
+
+vm_down() {
+    local assume_yes=0
+    case "${1:-}" in
+        -y|--yes) assume_yes=1 ;;
+        "") ;;
+        *) echo "script/vm down: unknown argument '${1}'" >&2; usage >&2; exit 2 ;;
+    esac
+
+    preflight
+    if [ "$("${AZ[@]}" group exists --name "${LOGIT_VM_RESOURCE_GROUP}")" = "false" ]; then
+        echo "${LOGIT_VM_RESOURCE_GROUP} does not exist -- nothing to delete."
+        rm -f "${LOGIT_VM_KNOWN_HOSTS}"
+        return
+    fi
+
+    # This subscription has other, unrelated resource groups -- refuse to delete anything this
+    # script didn't tag as its own, so a mistyped LOGIT_VM_RESOURCE_GROUP can't take one of them
+    # out.
+    local purpose
+    purpose="$("${AZ[@]}" group show --name "${LOGIT_VM_RESOURCE_GROUP}" \
+        --query "tags.purpose" -o tsv 2>/dev/null || true)"
+    if [ "${purpose}" != "perf" ]; then
+        echo "${LOGIT_VM_RESOURCE_GROUP} isn't tagged purpose=perf (managed-by=script/vm)." >&2
+        echo "Refusing to delete a group this script didn't create." >&2
+        exit 1
+    fi
+
+    if [ "${assume_yes}" -eq 0 ]; then
+        # The tty test comes first and is its own error: under `set -e`, a `read` on a closed
+        # stdin returns non-zero and kills the script with no message at all, which is the safe
+        # direction but a baffling one to debug.
+        if [ ! -t 0 ]; then
+            echo "script/vm down: no tty to confirm on. Pass --yes to delete without asking." >&2
+            exit 1
+        fi
+        echo "This DELETES resource group ${LOGIT_VM_RESOURCE_GROUP} and everything in it:"
+        echo "  the VM, its OS disk and every result on it, the vnet, the NSG, and the public IP."
+        echo "There is no stop/start and no snapshot -- the next 'up' is a fresh cold build."
+        printf 'Delete it? [y/N] '
+        local reply=""
+        read -r reply || reply=""
+        case "${reply}" in
+            y|Y|yes|YES) ;;
+            *) echo "aborted."; exit 1 ;;
+        esac
+    fi
+
+    # Blocking, deliberately: no --no-wait. `down` exiting 0 has to mean the resources are
+    # actually gone and billing has actually stopped -- a fire-and-forget delete that silently
+    # failed (a resource lock, a policy) would leave a running VM behind a command that reported
+    # success.
+    echo "deleting ${LOGIT_VM_RESOURCE_GROUP} (a few minutes)..."
+    "${AZ[@]}" group delete --name "${LOGIT_VM_RESOURCE_GROUP}" --yes --output none
+
+    # Every entry in this file named a VM that no longer exists, and only ever this one -- so
+    # removing it whole is simpler and more correct than ssh-keygen -R. ~/.ssh/known_hosts is
+    # never touched either way. The keypair is kept: it isn't a secret worth rotating per
+    # session, and regenerating it each time would churn nothing but noise.
+    rm -f "${LOGIT_VM_KNOWN_HOSTS}"
+    echo "gone. ${LOGIT_VM_SSH_KEY} kept for next time; cost is now zero."
+}
+
+vm_shell() {
+    preflight
+    local ip
+    ip="$(public_ip_or_die)"
+    if [ "$#" -eq 0 ]; then
+        exec ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" 'cd ~/logit && exec bash -l'
+    fi
+    # Pass-through escape hatch: quote the whole remote command yourself, since ssh joins these
+    # with spaces and the remote shell re-parses them, e.g.
+    #   script/vm shell 'DOCKER=docker script/perf run --scenario json-parse --repeat 5'
+    exec ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" "cd ~/logit && $*"
+}
+
+vm_status() {
+    preflight
+    if [ "$("${AZ[@]}" group exists --name "${LOGIT_VM_RESOURCE_GROUP}")" = "false" ]; then
+        echo "not up. 'script/vm up' creates it (~15-20 min)."
+        return
+    fi
+
+    local power ip created hours
+    power="$("${AZ[@]}" vm get-instance-view \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${LOGIT_VM_NAME}" \
+        --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus|[0]" \
+        -o tsv 2>/dev/null || true)"
+    ip="$("${AZ[@]}" network public-ip show \
+        --resource-group "${LOGIT_VM_RESOURCE_GROUP}" --name "${PIP}" \
+        --query ipAddress -o tsv 2>/dev/null || true)"
+    created="$("${AZ[@]}" group show --name "${LOGIT_VM_RESOURCE_GROUP}" \
+        --query "tags.created" -o tsv 2>/dev/null || true)"
+
+    echo "resource group: ${LOGIT_VM_RESOURCE_GROUP} (${LOGIT_VM_LOCATION})"
+    echo "power state:    ${power:-unknown}"
+    echo "public IP:      ${ip:-none}"
+    if [ -n "${created}" ] && [ "${created}" != "None" ]; then
+        hours=$(( ( $(date -u +%s) - $(date -u -d "${created}" +%s) ) / 3600 ))
+        printf 'running for:    ~%dh (since %s), ~\$%s so far\n' \
+            "${hours}" "${created}" "$(awk -v h="${hours}" -v r="${LOGIT_VM_HOURLY_USD}" 'BEGIN{printf "%.2f", h*r}')"
+    fi
+    echo
+    echo "script/vm shell     -- ssh in"
+    echo "script/vm down      -- delete everything, back to \$0"
+}
+
+# --- dispatch -----------------------------------------------------------------------------
+
+COMMAND="${1:-status}"
+[ "$#" -gt 0 ] && shift
+
+case "${COMMAND}" in
+    up)     vm_up "$@" ;;
+    down)   vm_down "$@" ;;
+    shell)  vm_shell "$@" ;;
+    status) vm_status "$@" ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "script/vm: unknown subcommand '${COMMAND}'" >&2; usage >&2; exit 2 ;;
+esac

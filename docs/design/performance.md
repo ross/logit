@@ -88,7 +88,11 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   still sums over the whole run, not a distribution.
 - **Isolation from the rest of the box.** This runs in the same kind of dev-container environment
   every other `script/*` command does, not a dedicated, pinned-core bench host — see the preamble's
-  ~20% caveat.
+  ~20% caveat. `script/vm` (`docs/adr/disposable-azure-perf-vm.md`) provisions a disposable Azure
+  VM with four homogeneous cores and nothing else running for exactly this; a number taken there
+  should be captioned with its `~/logit-vm-metadata.txt` (CPU model, kernel, image version, sysctls)
+  the same way a machine caption works today, and note that the VM has no virtualized PMU, so
+  `flamegraph` there is a `cpu-clock`, not `cycles`, profile.
 
 ## 1. Results: all ten scenarios, median of 3
 
