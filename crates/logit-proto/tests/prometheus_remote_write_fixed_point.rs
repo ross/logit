@@ -47,6 +47,7 @@ use logit_proto::prometheus::{
 };
 use proptest::prelude::*;
 use prost::Message;
+use std::sync::Arc;
 
 /// A whole number of milliseconds, which is the only resolution either version carries.
 const TIMESTAMP: i64 = 1_605_281_325_000_000_000;
@@ -1519,7 +1520,7 @@ fn decode_v1_with(request: pb1::WriteRequest, seed: &Declarations) -> Decoded {
 #[test]
 fn a_seed_types_a_metadata_less_version_1_request() {
     let mut seed = Declarations::default();
-    seed.insert("foo", FamilyType::Histogram, Some("A histogram.".to_string()), None);
+    seed.insert("foo", FamilyType::Histogram, Some(Arc::from("A histogram.")), None);
 
     let decoded = decode_v1_with(untyped_histogram_request(), &seed);
     let families = &decoded.groups[0];
@@ -1546,7 +1547,7 @@ fn a_seed_types_a_metadata_less_version_1_request() {
 #[test]
 fn a_request_declaration_beats_the_seed() {
     let mut seed = Declarations::default();
-    seed.insert("foo", FamilyType::Histogram, Some("Remembered.".to_string()), None);
+    seed.insert("foo", FamilyType::Histogram, Some(Arc::from("Remembered.")), None);
     seed.insert("bar", FamilyType::Counter, None, None);
 
     let decoded = decode_v1_with(

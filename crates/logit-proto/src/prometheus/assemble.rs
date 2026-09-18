@@ -106,6 +106,7 @@ use super::{FamilyType, MetricFamily, Point, PrometheusDecoder, Series};
 use logit_core::trace::{parse_span_id, parse_trace_id};
 use logit_core::{parse_decimal_nanos, AttrMap, Exemplar, TraceRef, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Which sample of a family a name carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +191,8 @@ impl Declarations {
         &mut self,
         name: impl Into<String>,
         kind: FamilyType,
-        help: Option<String>,
-        unit: Option<String>,
+        help: Option<Arc<str>>,
+        unit: Option<Arc<str>>,
     ) {
         self.entries.insert(name.into(), Declaration { kind, help, unit });
     }
@@ -220,11 +221,16 @@ impl Declarations {
 }
 
 /// One entry of a [`Declarations`] table.
+///
+/// The description text is `Arc<str>` rather than `String` for the caller's sake, not this
+/// module's: a metadata cache holds the same strings and rebuilds its table whenever it changes, so
+/// sharing them makes that a refcount bump instead of a copy of every remembered description. Here
+/// it is read once per materialized family and costs the same either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
     pub kind: FamilyType,
-    pub help: Option<String>,
-    pub unit: Option<String>,
+    pub help: Option<Arc<str>>,
+    pub unit: Option<Arc<str>>,
 }
 
 /// One flat sample on its way into a family -- what every Prometheus syntax hands the assembler,
@@ -408,21 +414,18 @@ impl<'a> Assembler<'a> {
     /// be describing *that* family -- it was describing itself, and which family that turned out to
     /// mean is this assembler's conclusion, not the sender's. Reporting a `duplicate_metadata` the
     /// producer did not commit would be reporting our own inference.
-    pub(super) fn describe(
-        &mut self,
-        sample_name: &str,
-        help: Option<String>,
-        unit: Option<String>,
-    ) {
+    pub(super) fn describe(&mut self, sample_name: &str, help: Option<&str>, unit: Option<&str>) {
         let Some((family, _)) = self.route_existing(sample_name) else { return };
+        // Borrowed, not taken: one description can be offered to every group a series touched, and
+        // is stored by at most one family in each -- so the copy happens where it lands.
         if self.families[family].help.is_none() {
             if let Some(help) = help {
-                self.families[family].help = Some(help);
+                self.families[family].help = Some(help.to_string());
             }
         }
         if self.families[family].unit.is_none() {
             if let Some(unit) = unit {
-                self.families[family].unit = Some(unit);
+                self.families[family].unit = Some(unit.to_string());
             }
         }
     }
@@ -777,6 +780,7 @@ impl<'a> Assembler<'a> {
         decoder: &mut PrometheusDecoder,
     ) {
         let Declaration { kind, help, unit } = declaration;
+        let (help, unit) = (help.map(|h| h.to_string()), unit.map(|u| u.to_string()));
         self.declare_type(base, kind, decoder);
         let idx = self.family_index(base);
         // Only ever reached for a family this call created -- `materialize` checks the index first

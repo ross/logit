@@ -1871,8 +1871,15 @@ pub struct MetadataCacheConfig {
     ///
     /// Defaults to `10000`, which is a generous ceiling on the *distinct families* (not series) a
     /// sender writes -- a large Prometheus scrapes tens of thousands of series across low
-    /// thousands of families. Each entry is a family name plus its help and unit text, so the cap
-    /// bounds a few megabytes at the very most.
+    /// thousands of families.
+    ///
+    /// **What it costs.** An entry is a family name plus its `# HELP` and `# UNIT` text, each of
+    /// the two bounded at 1 KiB as it is remembered (past that the text is truncated and counted
+    /// `logit.input.metadata_cache.truncated`), so the resident bound is roughly
+    /// `max_families x (name + 2 KiB)` -- about 20 MiB at the default, and far less in practice,
+    /// since a real `# HELP` is a sentence and most families have no `# UNIT` at all. The family
+    /// *name* is the sender's and is not bounded here; the listener is not built to face a hostile
+    /// one (see "Security posture" in `crates/logit-inputs/src/prometheus.rs`).
     ///
     /// **`0` turns the cache off entirely**: nothing is remembered, nothing is swept, and 1.0
     /// requests decode exactly as a stateless receiver's do. That is the setting for a pure-2.0

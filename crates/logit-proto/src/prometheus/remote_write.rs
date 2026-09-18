@@ -181,6 +181,7 @@ use logit_core::Exemplar;
 use prost::Message;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// `X-Prometheus-Remote-Write-Version`, which both versions require on every request.
 pub const HEADER_VERSION: &str = "x-prometheus-remote-write-version";
@@ -411,7 +412,7 @@ type ResolvedSeries<'a> = Option<(&'a str, Vec<(String, String)>)>;
 
 /// A help/unit pair a 2.0 series carried without a type, which therefore describes no family until
 /// its samples have routed -- `None` for a series that carried no such pair. See `decode_v2`.
-type UntypedDescription = Option<(Option<String>, Option<String>)>;
+type UntypedDescription = Option<(Option<Arc<str>>, Option<Arc<str>>)>;
 
 /// One series, once its labels have been resolved and validated and its samples have been routed:
 /// the sample name, the series labels, and the groups a sample of it actually landed in (ascending,
@@ -494,8 +495,8 @@ fn merge_declaration(
     declarations: &mut Declarations,
     name: &str,
     kind: FamilyType,
-    help: Option<String>,
-    unit: Option<String>,
+    help: Option<Arc<str>>,
+    unit: Option<Arc<str>>,
     decoder: &mut PrometheusDecoder,
 ) {
     let Some(existing) = declarations.get_mut(name) else {
@@ -510,7 +511,7 @@ fn merge_declaration(
             // A field the first entry left unset is not a conflict, whatever a later one says.
             (None, incoming) => *slot = incoming,
             (Some(_), None) => {}
-            (Some(held), Some(incoming)) if **held == incoming => {}
+            (Some(held), Some(incoming)) if **held == *incoming => {}
             (Some(_), Some(_)) => decoder.skipped("duplicate_metadata"),
         }
     }
@@ -567,11 +568,11 @@ fn ms_to_nanos(ms: i64) -> i64 {
     ms.saturating_mul(1_000_000)
 }
 
-fn non_empty(s: &str) -> Option<String> {
+fn non_empty(s: &str) -> Option<Arc<str>> {
     if s.is_empty() {
         None
     } else {
-        Some(s.to_string())
+        Some(Arc::from(s))
     }
 }
 
@@ -635,7 +636,7 @@ fn decode_v1(
     // an entry can be describing -- and an entry naming a family this request has no samples for
     // describes nothing, which is the right answer rather than a lost one.
     let mut declarations = Declarations::default();
-    let mut described: HashMap<&str, (Option<String>, Option<String>)> = HashMap::new();
+    let mut described: HashMap<&str, (Option<Arc<str>>, Option<Arc<str>>)> = HashMap::new();
     for metadata in &request.metadata {
         let kind = family_type_v1(metadata.r#type);
         let help = non_empty(&metadata.help);
@@ -685,7 +686,7 @@ fn decode_v1(
         if let Some((help, unit)) = description {
             for timestamp in &touched {
                 if let Some(assembler) = groups.group(*timestamp) {
-                    assembler.describe(name, help.clone(), unit.clone());
+                    assembler.describe(name, help.as_deref(), unit.as_deref());
                 }
             }
         }
@@ -758,7 +759,7 @@ fn push_sample(
 /// One symbol by reference. `0` is the empty string by construction and means *absent* for an
 /// optional field; any other out-of-range index means the table is being read wrongly, which is a
 /// request-level error rather than one bad series.
-fn symbol(symbols: &[String], reference: u32) -> Result<Option<String>, CodecError> {
+fn symbol(symbols: &[String], reference: u32) -> Result<Option<Arc<str>>, CodecError> {
     if reference == 0 {
         return Ok(None);
     }
@@ -915,7 +916,7 @@ fn decode_v2(
         if let Some((help, unit)) = described {
             for timestamp in &touched {
                 if let Some(assembler) = groups.group(*timestamp) {
-                    assembler.describe(name, help.clone(), unit.clone());
+                    assembler.describe(name, help.as_deref(), unit.as_deref());
                 }
             }
         }

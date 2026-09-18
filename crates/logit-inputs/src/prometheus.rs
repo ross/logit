@@ -790,13 +790,32 @@ pub use crate::tls::TlsServerSettings;
 const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
 const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
 const METADATA_CACHE_REPLACED: &str = "logit.input.metadata_cache.replaced";
+const METADATA_CACHE_TRUNCATED: &str = "logit.input.metadata_cache.truncated";
+
+/// The longest `# HELP` or `# UNIT` text this receiver will *remember* for one family. Past it the
+/// text is truncated on a `char` boundary and the cut is counted
+/// `logit.input.metadata_cache.truncated`.
+///
+/// Not a statement about what a description may be -- the decode keeps whatever the request
+/// carried, and this bounds only the copy that outlives the request. Without it the cache's
+/// resident size is `max_families x` the *request* cap: nothing else on the path bounds a
+/// description, so 10 000 individually-legal metadata-only requests, each declaring one family
+/// with a multi-megabyte help (a few KB once Snappy has seen the repeated bytes), would take the
+/// process down while `metadata_cache.size` read a healthy 10 000. 1 KiB is an order of magnitude
+/// past the longest `# HELP` any real exporter writes.
+const MAX_METADATA_TEXT_BYTES: usize = 1024;
 
 /// One remembered family declaration. The family's own name is the map key, not a field here.
+///
+/// `Arc<str>` rather than `String` so that rebuilding the seed -- which happens whenever the table
+/// changes and produces a whole second copy of it for in-flight requests to hold -- shares this
+/// text instead of copying it. The cache and every seed generation alive at once then cost one
+/// description each, not one per generation.
 #[derive(Debug, Clone)]
 struct CachedFamily {
     kind: FamilyType,
-    help: Option<String>,
-    unit: Option<String>,
+    help: Option<Arc<str>>,
+    unit: Option<Arc<str>>,
     /// When a request last *declared* this family -- not when one last carried its samples. The
     /// TTL is a bound on how long a declaration is trusted, and a 1.0 sender re-declares on its own
     /// schedule regardless of how busy the series are.
@@ -827,6 +846,8 @@ struct CacheState {
 }
 
 impl CacheState {
+    /// The table in the codec's own shape. The family names are copied (a `Declarations` owns its
+    /// keys); the descriptions, which are the bulk of it, are `Arc` clones.
     fn rebuild_seed(&mut self) {
         let mut seed = remote_write::Declarations::default();
         for (name, family) in &self.families {
@@ -834,6 +855,22 @@ impl CacheState {
         }
         self.seed = Arc::new(seed);
     }
+}
+
+/// `text` bounded to [`MAX_METADATA_TEXT_BYTES`], cut on a `char` boundary so the result is still a
+/// string rather than a broken one, and whether it had to cut at all.
+fn bounded_text(text: &Option<Arc<str>>) -> (Option<Arc<str>>, bool) {
+    let Some(text) = text else { return (None, false) };
+    if text.len() <= MAX_METADATA_TEXT_BYTES {
+        // The overwhelmingly common path, and the reason this takes a reference: a description
+        // within the bound is shared with the request that carried it, never copied.
+        return (Some(Arc::clone(text)), false);
+    }
+    let mut end = MAX_METADATA_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Some(Arc::from(&text[..end])), true)
 }
 
 impl MetadataCache {
@@ -882,7 +919,13 @@ impl MetadataCache {
         }
         let mut state = self.lock();
         let mut replaced = 0u64;
+        let mut truncated = 0u64;
         for (name, declaration) in declarations.iter() {
+            // Bounded on the way in, not on the way out: what is remembered is what outlives the
+            // request, and the request's own cap does not bound a table that keeps entries.
+            let (help, help_cut) = bounded_text(&declaration.help);
+            let (unit, unit_cut) = bounded_text(&declaration.unit);
+            truncated += u64::from(help_cut) + u64::from(unit_cut);
             match state.families.get_mut(name) {
                 Some(existing) => {
                     if existing.kind != declaration.kind {
@@ -892,25 +935,23 @@ impl MetadataCache {
                         replaced += 1;
                     }
                     existing.kind = declaration.kind;
-                    existing.help.clone_from(&declaration.help);
-                    existing.unit.clone_from(&declaration.unit);
+                    existing.help = help;
+                    existing.unit = unit;
                     existing.last_seen = now;
                 }
                 None => {
                     state.families.insert(
                         name.to_string(),
-                        CachedFamily {
-                            kind: declaration.kind,
-                            help: declaration.help.clone(),
-                            unit: declaration.unit.clone(),
-                            last_seen: now,
-                        },
+                        CachedFamily { kind: declaration.kind, help, unit, last_seen: now },
                     );
                 }
             }
         }
         if replaced > 0 {
             telemetry.count(METADATA_CACHE_REPLACED, replaced as f64, &[]);
+        }
+        if truncated > 0 {
+            telemetry.count(METADATA_CACHE_TRUNCATED, truncated as f64, &[]);
         }
         self.enforce_cap(&mut state, telemetry);
         state.rebuild_seed();
@@ -3639,6 +3680,51 @@ mod tests {
             counter_in(&events, "logit.input.metrics.degraded", ("reason", "seed_mismatch")),
             Some(1.0),
             "the bare `foo` sample is the one the remembered histogram gave way to"
+        );
+    }
+
+    /// What is remembered is what outlives the request, and the 4 MiB request cap does not bound a
+    /// table that keeps entries: without this, 10 000 individually-legal metadata-only requests
+    /// each carrying a multi-megabyte `# HELP` would take the process down while
+    /// `metadata_cache.size` read a healthy 10 000. The description is cut to
+    /// [`MAX_METADATA_TEXT_BYTES`] on a `char` boundary -- so the survivor is still a string -- and
+    /// the cut is counted.
+    #[test]
+    fn a_remembered_description_is_bounded_and_cut_on_a_char_boundary() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let now = Instant::now();
+
+        // A multi-byte char straddling the cut, so a naive slice would panic and a byte-wise one
+        // would produce invalid UTF-8.
+        let help: String = "é".repeat(MAX_METADATA_TEXT_BYTES);
+        let mut declarations = remote_write::Declarations::default();
+        declarations.insert(
+            "foo",
+            FamilyType::Counter,
+            Some(Arc::from(help.as_str())),
+            Some(Arc::from("seconds")),
+        );
+        cache.learn(&declarations, now, &telemetry);
+
+        let seed = cache.seed(now, &telemetry);
+        let (_, remembered) = seed.iter().next().expect("one family");
+        let kept = remembered.help.as_deref().expect("the description survives, shortened");
+        assert!(kept.len() <= MAX_METADATA_TEXT_BYTES, "{} bytes", kept.len());
+        assert!(kept.len() > MAX_METADATA_TEXT_BYTES - 4, "cut at the boundary, not far short");
+        assert!(help.starts_with(kept), "a prefix of what the sender sent");
+        // A short unit alongside it is untouched, and shares the request's own allocation.
+        assert_eq!(remembered.unit.as_deref(), Some("seconds"));
+
+        assert_eq!(
+            counter_in(
+                &registry.drain(0),
+                "logit.input.metadata_cache.truncated",
+                ("component", "receive")
+            ),
+            Some(1.0),
+            "one string cut, not one entry"
         );
     }
 }
