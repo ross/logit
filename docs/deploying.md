@@ -511,8 +511,9 @@ kernel default before deciding whether to raise it.
 - `logit.input.receive_buffer.utilization` (gauge), with
   `logit.input.receive_buffer.used.bytes` / `.bytes` behind it — how full the kernel's own socket
   buffer is, sampled once a second. This is the leading indicator for the counter above: the
-  kernel drops at exactly 1.0, so a value climbing toward it is the warning, and the drops are the
-  event. **What to do about a high value depends on which way the drops move with it.** If raising
+  kernel drops at 1.0, so a value climbing toward it is the warning, and the drops are the event.
+  (A reading a little over 1.0 is normal at saturation, not a bug — the kernel charges an arriving
+  packet before testing the total against the ceiling, so a sample can catch it mid-drop.) **What to do about a high value depends on which way the drops move with it.** If raising
   `receive.receive_buffer_bytes` (and, if the startup warning names it, `net.core.rmem_max`) makes
   the drops go away, the traffic was bursty and the buffer was too small for the bursts. If it
   doesn't — the buffer simply fills up again at its new size — then nothing is wrong with the
@@ -542,12 +543,13 @@ problem:
   backlog ceiling the kernel enforces, and the first as a fraction of the second. Sampled before
   each accept and once a second while waiting, so an idle listener still reports. `.limit` is
   reported on its own so you can see what `listen(2)` actually got after `net.core.somaxconn`
-  clamped it, without having to back it out of the ratio. A depth that is anything but near-zero means connections are
-  arriving faster than they're being accepted; a utilization approaching 1.0 means the kernel is
-  about to start refusing new connections outright, which a client sees as a connect timeout or a
-  reset with nothing in `logit`'s own logs to explain it. Sustained pressure here is usually
-  connection churn — senders reconnecting per batch rather than holding one connection open — and
-  is worth fixing at the sender before it's worth raising `net.core.somaxconn`.
+  clamped it, without having to back it out of the ratio. A depth that is anything but near-zero
+  means connections are arriving faster than they're being accepted; a utilization approaching 1.0
+  means the kernel is about to start refusing new connections outright, which a client sees as a
+  connect timeout or a reset with nothing in `logit`'s own logs to explain it. Sustained pressure
+  here is usually connection churn — senders reconnecting per batch rather than holding one
+  connection open — and is worth fixing at the sender before it's worth raising
+  `net.core.somaxconn`.
 
 ### `collectd_in`: multicast groups and `types_db`
 

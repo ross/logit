@@ -464,12 +464,12 @@ point every datagram passes through:
 | `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
 | `logit.input.receive_buffer.requested.bytes` | gauge | what `receive.receive_buffer_bytes` asked for, absent when unset — sampled once at bind, and genuinely bind-only: it is config, not a kernel reading |
 | `logit.input.receive_buffer.used.bytes` | gauge | `SO_MEMINFO`'s `SK_MEMINFO_RMEM_ALLOC`: bytes the kernel currently charges this socket's receive queue. **Not** queued payload bytes — each packet is charged its `skb->truesize`, several hundred bytes above its own length |
-| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is exactly where the kernel begins dropping |
+| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is where the kernel begins dropping. Readings a little *above* 1.0 are normal under load: the kernel charges an arriving packet and then tests the total, so a sample can land mid-drop |
 | `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
 
 The last three are Linux-only (`logit_pipeline::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+)
-and are simply absent elsewhere, with one `warn` on the first failed read saying so, after which
-the listener stops sampling -- and stops arming the interval timer -- for the rest of its run. They are sampled
+and are simply absent elsewhere, with one `warn` on the first failed read saying so, after which the
+listener stops sampling — and stops arming the interval timer — for the rest of its run. They are sampled
 once a second for as long as the read loop runs, plus **once more after it stops** — a listener
 usually stops *because* something went wrong, and the drops in the last second before it did are
 the ones most worth having.

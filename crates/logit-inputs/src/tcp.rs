@@ -778,14 +778,29 @@ impl AcceptQueueSampler {
             if !self.enabled {
                 return listener.accept().await;
             }
-            // `biased`: a connection that is ready to be taken always beats a tick that is due.
-            // Taking the accept is the work; the sample only describes it. Nothing is starved by
-            // the ordering -- `listener.accept()` returning `Pending` is what lets the timer arm
-            // be polled at all, and one poll is all a due timer needs.
+            // Timer arm first, matching `crate::udp::sample_while` -- read that function's doc for
+            // the mechanism, because the reason this ordering is *needed* there does not apply
+            // here, and it is worth being clear about which this is.
+            //
+            // There, the work arm is one long-lived `read_loop` future that never returns between
+            // samples, so an arm placed behind it is silenced for the whole duration of an
+            // overload by tokio's cooperative-scheduling budget. Here the loop returns to
+            // `sample_once` on *every* accepted connection, and `sample_once` runs synchronously
+            // at the top of the iteration -- so a backed-up accept queue, which yields a
+            // connection per poll, is sampled per connection whether or not the timer ever fires,
+            // and an idle listener's `accept()` returns a genuine park with budget to spare, so
+            // the timer fires normally. Either ordering is correct for this loop today.
+            //
+            // It is timer-first anyway, for uniformity: one rule ("the timer arm goes first in
+            // both samplers") is one thing for a future edit to preserve, where two orderings with
+            // two different justifications is an invitation to copy the wrong one. The cost is a
+            // due tick being taken ahead of a connection that was ready in the same poll -- one
+            // extra loop iteration, at most once per `ACCEPT_QUEUE_SAMPLE_INTERVAL`, and it cannot
+            // lose the connection: `accept()` takes nothing off the queue unless it returns one.
             tokio::select! {
                 biased;
-                accepted = listener.accept() => return accepted,
                 () = tokio::time::sleep(ACCEPT_QUEUE_SAMPLE_INTERVAL) => {}
+                accepted = listener.accept() => return accepted,
             }
         }
     }

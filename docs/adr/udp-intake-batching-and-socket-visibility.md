@@ -164,8 +164,8 @@ than folded in:
   metrics catalog that already has a convention (`docs/design/internal-telemetry.md`'s "Why this
   exists") of learning what matters by running the thing rather than exposing everything a syscall
   happens to return. Of the remaining five, `SockMeminfo` reads all of `RMEM_ALLOC`/`RCVBUF`/
-  `WMEM_ALLOC`/`SNDBUF`/`DROPS` (`crates/logit-pipeline/src/sockstat.rs`) — but W1 only emits `DROPS`/
-  `RMEM_ALLOC`/`RCVBUF` as metrics. `WMEM_ALLOC`/`SNDBUF` are carried on the struct for a future
+  `WMEM_ALLOC`/`SNDBUF`/`DROPS` (`crates/logit-pipeline/src/sockstat.rs`) — but W1 only emits
+  `DROPS`/`RMEM_ALLOC`/`RCVBUF` as metrics. `WMEM_ALLOC`/`SNDBUF` are carried on the struct for a future
   sink-side consumer rather than read and then discarded; they're not emitted here because that's
   exactly the send-buffer visibility the bullet above rules out building today, on the sink side —
   reading them once, cheaply, alongside the receive-side fields costs nothing and leaves the seam
@@ -199,6 +199,22 @@ reasons:
   silently dropping the very datagram the sampler exists to observe, exactly the loss this ADR
   elsewhere bounds to the shutdown path only (see "Cancellation of `push_many`" below). Sampling has
   to run *alongside* whatever `read_loop` is doing, never race it.
+
+**The sampler's `select!` is `biased` with the timer arm first, and W4 must not undo that.** The
+intuitive ordering is the other one — prefer the work, sample while idle — and it silences the
+sampler for the entire duration of the overload it exists to report. `tokio` gives each task a
+cooperative-scheduling budget of 128 units per poll and every resource operation spends one, so
+under a flood `read_loop` never parks for a real reason: it returns `Pending` only once that budget
+is gone. `Sleep::poll` opens with `coop::poll_proceed` (`tokio/src/time/sleep.rs`), so a timer arm
+polled *after* the read arm sees a budget of zero and returns `Pending` however far past its
+deadline it is; the next wake repeats it, forever. A `Pending` caused by the coop budget is not a
+park, and an arm behind one never runs. Measured on a release build, eight senders flooding one
+listener for 10 s at ~90% kernel loss: read-arm-first carried the drop counter and buffer gauges in
+0 of 10 one-second windows (41–47M drops arriving as a single lump from the final sample after
+SIGTERM); timer-arm-first carried them in 11 of 11, with no measurable throughput difference. This
+is a property of `read_loop` being one long-lived future that does not return between samples, so
+W4's `recvmmsg` rewrite of that loop inherits the constraint unchanged — `crate::udp::sample_while`
+carries the full reasoning, and a regression test that fails with the arms swapped pins it.
 
 A **guaranteed final sample** runs after the read loop exits (shutdown or fatal error), immediately
 before `read_loop_sampled` itself returns — the one thing no `select!`'s arm ordering already

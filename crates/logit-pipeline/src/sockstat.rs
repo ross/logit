@@ -113,6 +113,13 @@ impl SockMeminfo {
     /// getsockopt with a payload numerator, which gets both errors at once. Taking both numbers
     /// from the same `SO_MEMINFO` read is what rules all three out.
     ///
+    /// **It can read slightly above 1.0, and that is not a bug.** The kernel charges an arriving
+    /// packet's `truesize` to `sk_rmem_alloc` and *then* compares the result against `sk_rcvbuf`,
+    /// uncharging it again on the drop path -- so a sample taken between those two steps sees the
+    /// overshoot. Values a little over 1.0 mean "saturated and dropping," which is exactly what
+    /// they look like; a caller must not clamp them, and a test must not assert an upper bound of
+    /// 1.0 against a real socket under load.
+    ///
     /// `None` when `rcvbuf` is 0 -- no kernel reports that for a live socket, but the division is
     /// not this function's to guess at.
     pub fn receive_utilization(&self) -> Option<f64> {
