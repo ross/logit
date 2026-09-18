@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-04
+updated: 2026-09-18
 ---
 
 # `LogRecord` gains a native application trace/span reference
@@ -98,9 +98,10 @@ script copying one onto the other (`event.log.trace_id = trace.trace_id`, stampi
   would ripple into `decode_resource_logs` (`otlp/mod.rs`, currently infallible) for a case the
   spec says shouldn't fail the record at all.
 - **A pipeline-`TraceContext`-stamping mode on `trace_context`** (an opt-in flag that copies
-  `logit`'s own batch trace onto a log, the native equivalent of the Lua pattern above). Deferred,
-  not rejected — out of scope for this change; revisit once a concrete use case needs it (tracked
-  in `docs/known-gaps.md`).
+  `logit`'s own batch trace onto a log, the native equivalent of the Lua pattern above). Declined
+  (2026-09-18): it's a debugging aid for a `logit` config's own flows, not something a pipeline
+  would leave on long-term, and it overwrites whatever application trace the log carried. The
+  one-line Lua script above covers it without a native flag.
 - **Demo-stack wiring** (a second Grafana `derivedFields` entry keyed on Loki's `trace_id`
   structured metadata instead of the existing body regex). Deferred to the demo app's own tracing
   rework, a separate, already-planned piece of work — this ADR only lands the model/codec/Lua/
