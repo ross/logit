@@ -604,7 +604,7 @@ impl<'a> Assembler<'a> {
     /// The family and role a sample name routes to **among the families that already exist** --
     /// the read-only half of [`Assembler::route`], with no implicit family created, no declaration
     /// materialized and nothing counted. What [`Assembler::push_exemplar`] and
-    /// [`Assembler::describe_untyped`] route over.
+    /// [`Assembler::describe`] route over.
     fn route_existing(&self, name: &str) -> Option<(usize, Role)> {
         if let Some(idx) = self.index.get(name).copied() {
             return bare_name_role(self.families[idx].kind).map(|role| (idx, role));

@@ -34,7 +34,7 @@
 //! [ADR `lossless-transit`]: ../../../docs/adr/lossless-transit.md
 
 use logit_core::interner::resolve;
-use logit_core::{AttrMap, Exemplar, Registry, TraceRef, Value};
+use logit_core::{AttrMap, Exemplar, MetricKind, Registry, TraceRef, Value};
 use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
 use logit_proto::prometheus::generated::prometheus as pb1;
 use logit_proto::prometheus::remote_write::{decode, encode, Decoded, Version};
@@ -58,7 +58,7 @@ fn round_trip(groups: &[Vec<MetricFamily>], version: Version) -> Decoded {
 /// reason it recorded. `round_trip` compares families only, which cannot see a decoder that reaches
 /// the right answer while counting input it did not drop -- a counter an operator reads as data
 /// loss.
-fn decode_reasons(body: &[u8], version: Version) -> (Decoded, Vec<String>) {
+fn decode_reasons(body: &[u8], version: Version) -> (Decoded, Vec<(String, u64)>) {
     let registry = Registry::new();
     let mut decoder = PrometheusDecoder::new().with_telemetry(registry.telemetry_for(
         "prometheus",
@@ -66,20 +66,35 @@ fn decode_reasons(body: &[u8], version: Version) -> (Decoded, Vec<String>) {
         "source",
     ));
     let decoded = decode(body, version, &mut decoder).expect("must decode");
-    let reasons = registry
+    let reasons = reasons_from(&registry, "logit.input.metrics.");
+    (decoded, reasons)
+}
+
+/// Every `reason` a drained registry recorded against a counter whose name starts with `prefix`,
+/// **with its value** and sorted by reason, so an assertion pins how much was counted rather than
+/// only that something was. The registry aggregates repeats of one `(metric, reason)` into a single
+/// point, so two dropped exemplars are one entry valued `2`, never two entries.
+fn reasons_from(registry: &Registry, prefix: &str) -> Vec<(String, u64)> {
+    let mut reasons: Vec<(String, u64)> = registry
         .drain(0)
         .iter()
-        .flat_map(|event| {
-            let counted = event.metrics.iter().any(|metric| {
-                let name = resolve(metric.name);
-                name == "logit.input.metrics.skipped" || name == "logit.input.metrics.degraded"
-            });
-            counted
-                .then(|| event.attributes.get("reason").and_then(|v| v.as_str()).map(String::from))
-                .flatten()
+        .filter_map(|event| {
+            let value = event.metrics.iter().find_map(|metric| {
+                if !resolve(metric.name).starts_with(prefix) {
+                    return None;
+                }
+                Some(match &metric.kind {
+                    MetricKind::Sum(sum) => sum.value,
+                    MetricKind::Gauge(value) => *value,
+                    _ => 0.0,
+                })
+            })?;
+            let reason = event.attributes.get("reason").and_then(|value| value.as_str())?;
+            Some((reason.to_string(), value as u64))
         })
         .collect();
-    (decoded, reasons)
+    reasons.sort();
+    reasons
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -560,9 +575,9 @@ fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     );
 }
 
-/// Encodes with telemetry attached and returns every `logit.output.metrics.{skipped,degraded}`
-/// and `logit.output.labels.dropped` reason it recorded, alongside the body.
-fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<String>) {
+/// Encodes with telemetry attached and returns every `logit.output.*` reason it recorded --
+/// `metrics.{skipped,degraded}` and `labels.dropped` alike -- alongside the body.
+fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, Vec<(String, u64)>) {
     let registry = Registry::new();
     let mut encoder = PrometheusEncoder::new().with_telemetry(registry.telemetry_for(
         "prometheus",
@@ -570,19 +585,7 @@ fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, V
         "sink",
     ));
     let body = encode(groups, version, &mut encoder);
-    let reasons = registry
-        .drain(0)
-        .iter()
-        .flat_map(|event| {
-            let counted = event.metrics.iter().any(|metric| {
-                let name = resolve(metric.name);
-                name.starts_with("logit.output.")
-            });
-            counted
-                .then(|| event.attributes.get("reason").and_then(|v| v.as_str()).map(String::from))
-                .flatten()
-        })
-        .collect();
+    let reasons = reasons_from(&registry, "logit.output.");
     (body, reasons)
 }
 
@@ -609,7 +612,7 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
 
     for version in [Version::V1, Version::V2] {
         let (body, reasons) = encode_reasons(&groups, version);
-        assert_eq!(reasons, ["sub_ms_collapsed"], "{version:?}");
+        assert_eq!(reasons, [("sub_ms_collapsed".to_string(), 1)], "{version:?}");
 
         // One `TimeSeries`, and crucially one `Sample` in it: two would be the 400.
         let samples: Vec<(f64, i64)> = match version {
@@ -937,8 +940,11 @@ fn a_conflicting_metadata_entry_is_counted_and_loses() {
     let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
     assert_eq!(decoded.groups[0][0].kind, FamilyType::Gauge, "the first entry wins");
     assert_eq!(decoded.groups[0][0].help.as_deref(), Some("First."));
-    assert!(reasons.contains(&"duplicate_type".to_string()), "{reasons:?}");
-    assert!(reasons.contains(&"duplicate_metadata".to_string()), "{reasons:?}");
+    assert_eq!(
+        reasons,
+        [("duplicate_metadata".to_string(), 1), ("duplicate_type".to_string(), 1)],
+        "one of each, from the one entry that disagreed"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1008,7 +1014,47 @@ fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
     let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
     assert_eq!(decoded.exemplars, 0, "nothing was stored, so nothing is reported as written");
     assert!(decoded.groups.is_empty(), "no samples means no groups and no phantom series");
-    assert_eq!(reasons, ["exemplar_dropped"]);
+    assert_eq!(reasons, [("exemplar_dropped".to_string(), 1)]);
+}
+
+/// An exemplar on a series whose labels were rejected is unwritable too, and is counted as such.
+/// The two counters answer different questions -- how many series went, and how much of what the
+/// sender sent was not stored -- so they are deliberately not additive, and a sender reconciling
+/// its own exemplar count against `X-Prometheus-Remote-Write-Exemplars-Written` can always find the
+/// difference in `exemplar_dropped` alone.
+#[test]
+fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
+    let exemplar = |value: f64| pb1::Exemplar {
+        labels: vec![label("detail", "lost")],
+        value,
+        timestamp: 1_605_281_325_000,
+    };
+    let request = pb1::WriteRequest {
+        timeseries: vec![
+            pb1::TimeSeries {
+                // No `__name__`: the series is skipped as `invalid_labels`, and its two exemplars
+                // go with it.
+                labels: vec![label("code", "200")],
+                samples: vec![pb1::Sample { value: 1.0, timestamp: 1_605_281_325_000 }],
+                exemplars: vec![exemplar(0.1), exemplar(0.2)],
+                ..Default::default()
+            },
+            v1_series(&[("__name__", "good")], 2.0),
+        ],
+        metadata: Vec::new(),
+    };
+    let (decoded, reasons) = decode_reasons(&request.encode_to_vec(), Version::V1);
+
+    assert_eq!(decoded.groups.len(), 1);
+    assert_eq!(decoded.groups[0].len(), 1, "only the good series survives");
+    assert_eq!(decoded.groups[0][0].name, "good");
+    assert_eq!(decoded.samples, 1);
+    assert_eq!(decoded.exemplars, 0, "nothing stored, so nothing reported as written");
+    assert_eq!(
+        reasons,
+        [("exemplar_dropped".to_string(), 2), ("invalid_labels".to_string(), 1)],
+        "one skip for the series, and one degrade per exemplar it took with it"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------

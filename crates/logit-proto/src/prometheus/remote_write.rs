@@ -91,8 +91,11 @@
 //! | `duplicate_type` / `duplicate_metadata` | a second metadata entry naming a *different* type, help or unit for one family. A sender repeating what it already said is not counted, which matters here because 2.0 repeats a family's `Metadata` on every one of its wire series |
 //!
 //! And one *degradation*, `logit.input.metrics.degraded{reason="exemplar_dropped"}`: an exemplar
-//! whose series has no sample anywhere in the request, so there is no reading for it to be an
-//! example of.
+//! with no reading to be an example of -- its series has no sample anywhere in the request, or the
+//! series was itself skipped above. The two counters are not additive: a series with bad labels and
+//! three exemplars raises one `invalid_labels` **and** three `exemplar_dropped`, because they
+//! answer different questions (how many series went, and how much of what the sender sent was not
+//! stored).
 //!
 //! ## Encode: families → protobuf
 //!
@@ -264,10 +267,12 @@ pub struct Decoded {
     /// Samples actually stored -- a sample the assembler stepped over (a duplicate, a bad `le`) is
     /// not counted, because the header is a report of what the receiver kept.
     pub samples: u64,
-    /// Exemplars actually stored. An exemplar whose series carried no sample this codec kept has
-    /// nowhere to go and is not counted here -- it is counted
-    /// `logit.input.metrics.degraded{reason="exemplar_dropped"}` instead, because
-    /// `X-Prometheus-Remote-Write-Exemplars-Written` is a report of what the receiver *stored*.
+    /// Exemplars actually stored. `X-Prometheus-Remote-Write-Exemplars-Written` is a report of
+    /// what the receiver *stored*, so an exemplar this codec could not place is not counted here.
+    /// Every one of those is counted `logit.input.metrics.degraded{reason="exemplar_dropped"}`
+    /// instead -- whether its series carried no sample this codec kept, or the series was skipped
+    /// outright as `invalid_labels` -- so a sender reconciling what it sent against what was
+    /// written can always find the difference in one counter.
     pub exemplars: u64,
     /// Native-histogram entries skipped, each also counted
     /// `logit.input.metrics.skipped{reason="native_histogram"}`.
@@ -550,7 +555,21 @@ fn decode_v1(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
     // Pass three: exemplars, once every series' samples are in their groups -- see
     // `Routed::group_for` for why this cannot be done as the samples go past.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
-        let Some(routed) = routed else { continue };
+        let Some(routed) = routed else {
+            // The series itself was skipped as `invalid_labels`, so its exemplars have no series to
+            // sit on. Counted individually rather than left to the one skip that dropped the
+            // series: the two counters measure different things, and an operator reconciling
+            // "exemplars sent" against `X-Prometheus-Remote-Write-Exemplars-Written` needs every
+            // unwritten one to appear somewhere.
+            //
+            // Their labels are deliberately not resolved on the way past. The series they describe
+            // is already gone, so nothing will read them, and a symbol reference inside one is not
+            // worth failing the whole request over when the request is otherwise fine.
+            for _ in &series.exemplars {
+                decoder.degraded("exemplar_dropped");
+            }
+            continue;
+        };
         for exemplar in &series.exemplars {
             let timestamp = ms_to_nanos(exemplar.timestamp);
             let converted = assemble::exemplar_from_labels(
@@ -759,7 +778,21 @@ fn decode_v2(body: &[u8], decoder: &mut PrometheusDecoder) -> Result<Decoded, Co
 
     // Pass four: exemplars.
     for (series, routed) in request.timeseries.iter().zip(&routed) {
-        let Some(routed) = routed else { continue };
+        let Some(routed) = routed else {
+            // The series itself was skipped as `invalid_labels`, so its exemplars have no series to
+            // sit on. Counted individually rather than left to the one skip that dropped the
+            // series: the two counters measure different things, and an operator reconciling
+            // "exemplars sent" against `X-Prometheus-Remote-Write-Exemplars-Written` needs every
+            // unwritten one to appear somewhere.
+            //
+            // Their labels are deliberately not resolved on the way past. The series they describe
+            // is already gone, so nothing will read them, and a symbol reference inside one is not
+            // worth failing the whole request over when the request is otherwise fine.
+            for _ in &series.exemplars {
+                decoder.degraded("exemplar_dropped");
+            }
+            continue;
+        };
         for exemplar in &series.exemplars {
             let pairs = resolve_refs(&request.symbols, &exemplar.labels_refs)?;
             let timestamp = ms_to_nanos(exemplar.timestamp);
