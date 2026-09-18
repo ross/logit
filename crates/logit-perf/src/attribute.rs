@@ -6,81 +6,37 @@
 //! the received/sent counters, and the sink queues' `buffer.utilization`, each stamped with the
 //! emitting component's `component`/`kind`/`role` (`docs/design/internal-telemetry.md`).
 //!
-//! Getting at them takes a temporary leg through the graph, appended to a **copy** of the
-//! scenario in a temp directory (the shipped file is never touched):
-//!
-//! ```yaml
-//!   __perf_internal: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
-//!   __perf_dump: { type: file_out, sources: [__perf_internal], path: <tmp>/attribute.native,
-//!                  format: native, rotate: { max_bytes: "1024GiB" } }
-//! ```
-//!
-//! Then the dump is decoded with the very codec that wrote it --
-//! [`logit_proto::frame::read_frame`] in a loop over the file, each frame's payload through
-//! [`logit_proto::native::decode_batch`], which is exactly what `format: native` writes per batch
-//! (`logit_outputs::stdio::StreamEncoder::Native` -> `NativeEncoder::encode` ->
-//! `write_frame(CODEC_NATIVE_V1, .., encode_batch(batch))`). `native` is the only format that can
-//! be read back byte-exactly: `human` is a render meant for a person, and there is no `json`
-//! stream format at all (`StreamFormat` is `Human | Native`) -- see
-//! `docs/adr/load-test-harness.md`'s "Per-node attribution" section.
-//!
-//! **The append is textual, never a parse-and-reserialize.** A scenario is round-tripped through
-//! [`logit_config::Config`] nowhere in this crate: that would resolve `!env` (which a scenario
-//! never uses, but which would then have to *exist* to run the harness), normalize every default
-//! into the file, and couple this tool to the config crate for no gain. The YAML is parsed as a
-//! bare [`serde_norway::Value`] only to *check* it -- rule 13 allows at most one `internal` per
-//! config, so a scenario that already has one is refused rather than rewritten into a config the
-//! binary would reject.
-//!
-//! **The rewritten scenario is written next to the original**, as
-//! `perf/scenarios/.<name>.attribute.<pid>.yaml`, and removed on every exit path -- not into the
-//! temp directory the dump goes to. Relative paths in a config resolve against that config file's
-//! own directory, so moving it would silently repoint `lua`'s `script_file`, a sink's
-//! `buffer.disk.path` (`perf/scenarios/buffered.yaml` has one), and any relative file target. See
-//! [`rewritten_config_path`].
+//! Getting at them takes a temporary `internal -> file_out format: native` leg appended to a copy
+//! of the scenario. That machinery lives in [`crate::telemetry_leg`] -- `run` needs the identical
+//! leg for a `Driven` scenario's delivered-event denominator, so it is shared rather than
+//! duplicated. This module is what's left once it's hoisted out: reading the decoded points as a
+//! per-node table, and the verdict drawn from it.
 //!
 //! **The harness's own two nodes are in the table.** `__perf_internal` and `__perf_dump` appear as
 //! ordinary rows -- what attribution costs is worth seeing, not hiding -- but are excluded from
 //! the verdict and the count check, which are about the graph under test.
 //!
-//! **A graph with an `internal` in it never self-exits** -- the drain ticker runs until shutdown
-//! -- so this always takes `run`'s settle-then-SIGTERM path, never the wait-for-exit one. That
-//! SIGTERM is also what makes the numbers whole: `InternalInput::run_until_shutdown` drains once
-//! more on the way out (`docs/design/internal-telemetry.md`, "Shutdown drains once more"), so the
-//! last partial interval -- on a 5-second scenario, a fifth of the run -- lands in the dump
-//! instead of being thrown away.
+//! **Driven scenarios work here too.** A real-socket scenario has no `generate_in` to wait on, so
+//! `attribute` blasts it exactly the way `run` does (`crate::run`'s `Drive::Driven`) and then reads
+//! the same dump. Its count check is necessarily looser: a UDP scenario is *allowed* to lose
+//! datagrams, which is the whole reason it exists, so "every node saw every event" is not a
+//! property to warn about here -- `run` is where the sent/received/dropped accounting is checked.
 
-use crate::run::{self, SpawnConfig};
-use crate::scenario::{self, Scenario};
+use crate::load::{CpuSet, LoadPlan};
+use crate::run::{self, Drive, SpawnConfig};
+use crate::scenario::{self, Scenario, Workload};
+use crate::telemetry_leg::{self, RemoveOnDrop, HARNESS_PREFIX};
 use anyhow::{bail, Context};
-use bytes::Bytes;
 use logit_core::{interner, Event, MetricKind, Value};
-use logit_proto::frame::read_frame;
-use logit_proto::native::{decode_batch, CODEC_NATIVE_V1};
-use logit_proto::CodecError;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::time::Duration;
-
-/// The appended components' ids. Prefixed so they can't collide with a scenario's own ids and are
-/// recognizable in the output as the harness's own machinery rather than part of the graph under
-/// test -- [`HARNESS_PREFIX`] is what the verdict and the count check filter on.
-const INTERNAL_ID: &str = "__perf_internal";
-const DUMP_ID: &str = "__perf_dump";
-const HARNESS_PREFIX: &str = "__perf_";
-
-/// `file_out` must have at least one rotation trigger (graph rule 29 -- neither set would
-/// silently never rotate). One is required here, but rotating *at all* mid-dump would split the
-/// attribution data across `attribute.native` and `attribute.native.1`, so this is set far above
-/// any plausible dump: a scenario's whole self-telemetry stream is kilobytes per drain.
-const ROTATE_MAX_BYTES: &str = "1024GiB";
 
 /// The runtime's uniform per-component metrics this reads (`docs/design/internal-telemetry.md`'s
 /// "Two layers of instrumentation" tables). Named as constants rather than inline literals
 /// because each appears twice -- once in [`fold_metric`], once in a test asserting the fold.
-const EVENTS_RECEIVED: &str = "logit.component.events.received";
+pub(crate) const EVENTS_RECEIVED: &str = "logit.component.events.received";
 const EVENTS_SENT: &str = "logit.component.events.sent";
 const BATCHES_RECEIVED: &str = "logit.component.batches.received";
 const BATCHES_SENT: &str = "logit.component.batches.sent";
@@ -102,6 +58,10 @@ pub struct AttributeArgs {
     pub shutdown_timeout: Duration,
     pub no_build: bool,
     pub profile: String,
+    /// Sender/child CPU pinning, for a driven scenario -- ignored by a generated one, which has no
+    /// sender of its own. See [`crate::load::CpuSet`].
+    pub pin_sender: Option<CpuSet>,
+    pub pin_child: Option<CpuSet>,
 }
 
 pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
@@ -115,7 +75,7 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     crate::spool::clear(root, &scenario)?;
     let logit_bin = run::build_and_locate(root, &args.profile, args.no_build)?;
 
-    let workdir = make_workdir()?;
+    let workdir = telemetry_leg::make_workdir("attribute")?;
     let dump_path = workdir.join("attribute.native");
     // A stale dump from an earlier run at this pid would decode as this run's frames and silently
     // inflate every total. Checked rather than deleted: something already sitting here means an
@@ -142,40 +102,6 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     outcome
 }
 
-/// A path removed when this guard drops -- so every early return (a failed `validate`, a failed
-/// run, an undecodable dump, a panic) takes the rewritten scenario with it. That file sits in
-/// `perf/scenarios/` alongside the real ones (see [`rewritten_config_path`]), which is exactly
-/// where a leftover would do the most harm.
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-/// Where the rewritten scenario is written: **next to the original**, not in the temp directory
-/// with the dump.
-///
-/// Every relative path in a config resolves against that config file's own directory
-/// (`logit_cli::pipeline`'s `base_dir`) -- `lua`'s `script_file`, a sink's `buffer.disk.path`, a
-/// `file_out`/`stdio_out` file target. `perf/scenarios/buffered.yaml`'s
-/// `buffer.disk.path: ../results/spool` is the live example: run from `/tmp`, that config spools
-/// to `/results/spool` instead of `perf/results/spool`, so the scenario under attribution is not
-/// the scenario that ships. Keeping the rewrite in the same directory keeps `base_dir` identical
-/// and every relative path pointing where the author meant.
-///
-/// Dot-prefixed and pid-suffixed: `script/validate`'s `perf/scenarios/*.yaml` glob doesn't match
-/// a leading dot, `scenario::discover` skips dotfiles for the same reason, and two concurrent
-/// runs can't collide.
-fn rewritten_config_path(scenario: &Scenario) -> anyhow::Result<PathBuf> {
-    let dir = scenario
-        .path
-        .parent()
-        .with_context(|| format!("{} has no parent directory", scenario.path.display()))?;
-    Ok(dir.join(format!(".{}.attribute.{}.yaml", scenario.name, std::process::id())))
-}
-
 fn attribute_in(
     logit_bin: &Path,
     scenario: &Scenario,
@@ -184,26 +110,39 @@ fn attribute_in(
 ) -> anyhow::Result<()> {
     let source = fs::read_to_string(&scenario.path)
         .with_context(|| format!("reading {}", scenario.path.display()))?;
-    let rewritten = rewrite_scenario(&source, args.interval, dump_path)
+    let rewritten = telemetry_leg::rewrite_scenario(&source, args.interval, dump_path)
         .with_context(|| format!("rewriting {}", scenario.path.display()))?;
-    let config_path = rewritten_config_path(scenario)?;
+    let config_path = telemetry_leg::rewritten_config_path(scenario, "attribute")?;
     let _cleanup = RemoveOnDrop(config_path.clone());
     fs::write(&config_path, &rewritten)
         .with_context(|| format!("writing {}", config_path.display()))?;
 
-    validate(logit_bin, &config_path)?;
+    telemetry_leg::validate(logit_bin, &config_path)?;
+
+    // A driven scenario's ring is rendered before the child is even spawned, so a broken spec
+    // fails in a second rather than after a full startup.
+    let plan = match &scenario.workload {
+        Workload::Generated { .. } => None,
+        Workload::Driven(_) => Some(LoadPlan::build(&scenario.load_spec_path()?, &source)?),
+    };
+    let drive = match (&plan, &scenario.workload) {
+        (Some(plan), _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
+        (None, Workload::Generated { count }) => Drive::Generated { count: *count },
+        (None, Workload::Driven(_)) => unreachable!("a driven workload always builds a plan"),
+    };
 
     println!(
-        "-- {} (count={}, internal interval={})",
+        "-- {} ({}, internal interval={})",
         scenario.name,
-        scenario.count,
-        format_interval(args.interval)
+        scenario.workload.describe(),
+        telemetry_leg::format_interval(args.interval)
     );
-    let sample = run::spawn_and_measure(SpawnConfig {
+    let measured = run::spawn_and_measure(SpawnConfig {
         logit_bin,
         wrapper: &[],
         config: &config_path,
-        count: scenario.count,
+        drive,
+        pin_child: args.pin_child.as_ref(),
         // Always: the appended `internal` listener's drain loop runs until shutdown, so this
         // graph can never exit on its own the way a plain `generate_in -> null_out` one does.
         needs_sigterm: true,
@@ -211,14 +150,17 @@ fn attribute_in(
         timeout: args.timeout,
         shutdown_timeout: args.shutdown_timeout,
     })?;
-    println!(
-        "   {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS (with the attribution leg attached)",
-        sample.events_per_s,
-        sample.cpu_us_per_event,
-        sample.max_rss_bytes as f64 / (1024.0 * 1024.0),
-    );
+    if let Some(load) = measured.load {
+        println!(
+            "   sent {} datagrams ({} lines, {:.1} MiB) in {:.2}s",
+            load.sent_datagrams,
+            load.sent_lines,
+            load.sent_bytes as f64 / (1024.0 * 1024.0),
+            load.elapsed.as_secs_f64(),
+        );
+    }
 
-    let events = decode_dump(dump_path)?;
+    let events = telemetry_leg::decode_dump(dump_path, false)?;
     let nodes = aggregate(&events);
     if nodes.is_empty() {
         bail!(
@@ -227,168 +169,28 @@ fn attribute_in(
             events.len()
         );
     }
+    // Denominated over what actually reached the deepest node, for both kinds of scenario: for a
+    // generated one that equals `count` unless the graph collapses events, and for a driven one it
+    // is the only honest denominator there is. Reported here rather than folded into a `Sample`:
+    // with the attribution leg attached these numbers describe a graph with two extra nodes in it,
+    // which is not the graph `run` measures.
+    let delivered = peak_received(&nodes);
+    println!(
+        "   {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS (with the attribution leg attached)",
+        delivered as f64 / measured.wall().as_secs_f64(),
+        measured.cpu_us_per_event(delivered),
+        measured.usage.max_rss_bytes as f64 / (1024.0 * 1024.0),
+    );
+
     print_table(&nodes);
     println!();
-    for line in check_counts(&nodes, scenario.count) {
+    for line in check_counts(&nodes, &scenario.workload) {
         println!("{line}");
     }
     for line in verdict(&nodes, &consumer_map(&source)?) {
         println!("{line}");
     }
     Ok(())
-}
-
-/// Runs the built binary's own `logit validate` over the rewritten file before spawning it. The
-/// rewrite is textual, so the first thing that would notice a malformed append is `logit run`
-/// itself, ~10 seconds into a scenario, as a generic startup failure -- this turns that into an
-/// immediate error carrying `validate`'s own message about which component and which rule.
-fn validate(logit_bin: &Path, config: &Path) -> anyhow::Result<()> {
-    let output = Command::new(logit_bin)
-        .arg("validate")
-        .arg(config)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("spawning {} validate", logit_bin.display()))?;
-    if !output.status.success() {
-        bail!(
-            "the rewritten scenario ({}) does not validate:\n{}{}",
-            config.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-    Ok(())
-}
-
-/// A private scratch directory for one `attribute` run's native dump -- and nothing else; the
-/// rewritten scenario deliberately stays next to the original (see [`rewritten_config_path`]).
-/// Named by pid so two concurrent runs can't share one.
-fn make_workdir() -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("logit-perf-attribute-{}", std::process::id()));
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Appends the `internal` + `file_out` dump leg to `yaml`, textually.
-///
-/// Refuses rather than rewrites when the append couldn't produce a valid config: a scenario that
-/// already has an `internal` component (graph rule 13 allows at most one per config -- two would
-/// each drain, and so split, the same process-wide `Registry`), one that already uses either of
-/// the reserved ids, or one with a top-level key other than `components:`. That last check is
-/// what makes appending at the end of the file sound: the two new entries are indented as
-/// `components:` members, which is only where they land if nothing else follows it.
-fn rewrite_scenario(yaml: &str, interval: Duration, dump_path: &Path) -> anyhow::Result<String> {
-    let value: serde_norway::Value = serde_norway::from_str(yaml).context("parsing YAML")?;
-    let top = value.as_mapping().context("no top-level mapping")?;
-    for (key, _) in top {
-        let key = key.as_str().unwrap_or_default();
-        if key != "components" {
-            bail!(
-                "scenario has a top-level `{key}:` key alongside `components:` -- this rewrite \
-                 appends its dump leg at the end of the file, which would land under `{key}:` \
-                 instead"
-            );
-        }
-    }
-    let components = value
-        .get("components")
-        .and_then(serde_norway::Value::as_mapping)
-        .context("no top-level `components` mapping")?;
-    for (id, component) in components {
-        let id = id.as_str().unwrap_or_default();
-        if id == INTERNAL_ID || id == DUMP_ID {
-            bail!("scenario already has a component named `{id}`, which this rewrite reserves");
-        }
-        if component.get("type").and_then(serde_norway::Value::as_str) == Some("internal") {
-            bail!(
-                "scenario already has an `internal` component (`{id}`) -- graph rule 13 allows at \
-                 most one per config, so the harness has nowhere to attach its own. Point that \
-                 component at a `file_out` with `format: native` and read the dump directly, or \
-                 drop it from the scenario."
-            );
-        }
-    }
-
-    let mut out = yaml.to_string();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(
-        "\n  # Appended by `logit-perf attribute` (crates/logit-perf/src/attribute.rs) -- a \
-         temporary\n  # copy of this scenario, never the shipped file.\n",
-    );
-    out.push_str(&format!(
-        "  {INTERNAL_ID}: {{ type: internal, interval: {}, span_sample_rate: 0.0, logs: off }}\n",
-        format_interval(interval)
-    ));
-    out.push_str(&format!(
-        "  {DUMP_ID}: {{ type: file_out, sources: [{INTERNAL_ID}], path: {}, format: native, \
-         rotate: {{ max_bytes: \"{ROTATE_MAX_BYTES}\" }} }}\n",
-        yaml_double_quoted(&dump_path.to_string_lossy())
-    ));
-
-    // The append is two-space-indented text, which is right for every scenario in this repo and
-    // wrong for any other layout: a four-space-indented scenario makes the result a YAML syntax
-    // error (the new keys are less indented than their siblings), and other layouts could nest
-    // them somewhere unintended instead. Re-reading the result and checking both components
-    // actually landed turns either outcome into a harness-worded error naming the harness as the
-    // thing at fault, rather than a `serde_norway` position report or a puzzling `logit validate`
-    // complaint about somebody else's component.
-    check_append_landed(&out).context(
-        "this rewrite indents its two appended components by two spaces, so a scenario laid out \
-         differently needs the harness taught about it \
-         (crates/logit-perf/src/attribute.rs's `rewrite_scenario`)",
-    )?;
-    Ok(out)
-}
-
-/// Re-parses a rewritten scenario and confirms both appended components are where they were meant
-/// to go. Split out from [`rewrite_scenario`] so the one `context` above covers every way this
-/// can fail -- a parse error and a mis-nested key are the same problem wearing two hats.
-fn check_append_landed(rewritten: &str) -> anyhow::Result<()> {
-    let value: serde_norway::Value = serde_norway::from_str(rewritten)
-        .context("the rewritten scenario is not valid YAML any more")?;
-    let components = value
-        .get("components")
-        .and_then(serde_norway::Value::as_mapping)
-        .context("the rewritten scenario has no top-level `components` mapping")?;
-    for id in [INTERNAL_ID, DUMP_ID] {
-        if !components.contains_key(serde_norway::Value::from(id)) {
-            bail!("appending `{id}` did not land under `components:`");
-        }
-    }
-    Ok(())
-}
-
-/// A `humantime` duration literal for the appended `internal`'s `interval:` --
-/// `logit_config`'s own `humantime_serde_duration` is what parses it back. Whole seconds render
-/// as seconds, everything else as whole milliseconds; sub-millisecond intervals are rejected by
-/// the caller, since there is no finer unit this needs and a rounded-to-zero interval would be a
-/// config error rather than a fast one.
-fn format_interval(interval: Duration) -> String {
-    if interval.subsec_nanos() == 0 {
-        format!("{}s", interval.as_secs())
-    } else {
-        format!("{}ms", interval.as_millis())
-    }
-}
-
-/// A YAML double-quoted scalar, so a temp-directory path containing a `:` or a leading `#`
-/// can't be misread as structure. Only `"` and `\` need escaping in a path -- a path holding a
-/// raw control character is rejected outright rather than escaped, since it is far more likely to
-/// be a bug in whatever produced it than a path anyone meant.
-fn yaml_double_quoted(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
-    out.push('"');
-    for c in raw.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Producer id -> the ids of every component that lists it in `sources:`. Read off the *original*
@@ -415,59 +217,6 @@ fn consumer_map(yaml: &str) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
         }
     }
     Ok(map)
-}
-
-/// Reads the whole dump and decodes every frame in it. A file written by `format: native` is a
-/// plain concatenation of independently-decodable frames (`logit_proto::native`'s module doc), so
-/// this is `read_frame` in a loop over one `Bytes` cursor, each frame's payload handed to
-/// `decode_batch` -- the exact inverse of `NativeEncoder::encode`, and the same two calls
-/// `NativeDecoder::decode_into` makes.
-///
-/// A torn *final* frame is a warning, not a failure: the process is SIGTERMed on purpose, and a
-/// write interrupted mid-frame leaves a valid prefix followed by a partial one. Every earlier
-/// frame decoding cleanly is what matters; a corrupt frame anywhere else fails loudly.
-fn decode_dump(path: &Path) -> anyhow::Result<Vec<Event>> {
-    let raw = fs::read(path)
-        .with_context(|| format!("reading the attribution dump {}", path.display()))?;
-    if raw.is_empty() {
-        bail!(
-            "the attribution dump ({}) is empty -- no drain ever reached it. Is --interval longer \
-             than the whole run?",
-            path.display()
-        );
-    }
-    let mut bytes = Bytes::from(raw);
-    let mut events = Vec::new();
-    let mut frames = 0usize;
-    while !bytes.is_empty() {
-        let (codec, mut payload) = match read_frame(&mut bytes) {
-            Ok(frame) => frame,
-            Err(CodecError::Truncated { .. }) => {
-                eprintln!(
-                    "warning: ignoring a torn final frame after {frames} whole ones -- the \
-                     process was signalled mid-write"
-                );
-                break;
-            }
-            Err(err) => {
-                return Err(anyhow::Error::new(err))
-                    .with_context(|| format!("frame {frames} of {}", path.display()))
-            }
-        };
-        if codec != CODEC_NATIVE_V1 {
-            bail!(
-                "frame {frames} of {} declares codec byte {codec}, not native v1 \
-                 ({CODEC_NATIVE_V1})",
-                path.display()
-            );
-        }
-        let batch = decode_batch(&mut payload)
-            .with_context(|| format!("decoding frame {frames} of {}", path.display()))?;
-        events.extend(batch.events);
-        frames += 1;
-    }
-    println!("   decoded {frames} native frames, {} points", events.len());
-    Ok(events)
 }
 
 /// A Σ over a drained `Distribution`: total seconds and how many observations produced them.
@@ -709,27 +458,56 @@ pub fn verdict(
     lines
 }
 
-/// Checks the decoded counters against the scenario's own `count`, since a per-node breakdown
-/// that doesn't add up to the events actually generated is describing something other than this
-/// run. Returns the lines to print -- one statement of what was seen, plus a warning per
-/// mismatch.
+/// The largest `events.received` any node under test recorded -- the deepest point the event
+/// stream actually reached, and the honest denominator for a graph that may have lost events
+/// upstream of it. The harness's own two nodes are excluded: `__perf_dump` receives the
+/// telemetry stream, which has nothing to do with the workload.
+pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
+    nodes
+        .iter()
+        .filter(|(id, _)| !NodeStats::is_harness(id))
+        .map(|(_, node)| node.events_received)
+        .fold(0.0_f64, f64::max) as u64
+}
+
+/// Checks the decoded counters against what the scenario said it would produce, since a per-node
+/// breakdown that doesn't add up is describing something other than this run. Returns the lines to
+/// print -- one statement of what was seen, plus a warning per mismatch.
 ///
-/// The generator's `events.sent` is the strict check: it is the same number the `generation
-/// complete` line already reported, arriving by an entirely different path, so a mismatch means
-/// the dump is missing drains (`internal`'s final drain on shutdown is what normally makes these
-/// agree -- without it the last partial interval never lands). The peak `events.received` is the
-/// looser one: it equals `count` for any graph that neither drops nor collapses events, which is
-/// every scenario except an `aggregate` one, where fewer is correct by construction.
-pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, count: u64) -> Vec<String> {
+/// For a [`Workload::Generated`] scenario the generator's `events.sent` is the strict check: it is
+/// the same number the `generation complete` line already reported, arriving by an entirely
+/// different path, so a mismatch means the dump is missing drains (`internal`'s final drain on
+/// shutdown is what normally makes these agree -- without it the last partial interval never
+/// lands). The peak `events.received` is the looser one: it equals `count` for any graph that
+/// neither drops nor collapses events, which is every scenario except an `aggregate` one, where
+/// fewer is correct by construction.
+///
+/// For a [`Workload::Driven`] scenario neither check applies. There is no generator to compare
+/// against, and a shortfall against the datagrams sent is not a symptom -- kernel and queue drops
+/// are the *point* of a real-socket scenario, and `run` is where that accounting is checked
+/// properly (against `logit.input.kernel.drops`, which this table doesn't carry). Warning here
+/// would report an expected property as a fault.
+pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, workload: &Workload) -> Vec<String> {
     let measured: Vec<(&String, &NodeStats)> =
         nodes.iter().filter(|(id, _)| !NodeStats::is_harness(id)).collect();
+    let peak = peak_received(nodes);
+
+    let count = match workload {
+        Workload::Driven(spec) => {
+            return vec![format!(
+                "events: peak node received {peak}, driven by {} datagrams over a real socket -- \
+                 losses are expected here and are checked by `run`, not by this table",
+                spec.datagrams
+            )]
+        }
+        Workload::Generated { count } => *count,
+    };
+
     let generated: f64 =
         measured.iter().filter(|(_, n)| n.kind == "generate_in").map(|(_, n)| n.events_sent).sum();
-    let peak_received = measured.iter().map(|(_, n)| n.events_received).fold(0.0_f64, f64::max);
 
     let mut lines = vec![format!(
-        "events: generator sent {generated:.0}, peak node received {peak_received:.0}, scenario \
-         count {count}"
+        "events: generator sent {generated:.0}, peak node received {peak}, scenario count {count}"
     )];
     if generated != count as f64 {
         lines.push(format!(
@@ -738,9 +516,9 @@ pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, count: u64) -> Vec<Stri
              undercount"
         ));
     }
-    if peak_received != count as f64 {
+    if peak != count {
         lines.push(format!(
-            "warning: no node received all {count} events (peak {peak_received:.0}) -- expected \
+            "warning: no node received all {count} events (peak {peak}) -- expected \
              for a graph that collapses events (`aggregate`), a missing drain otherwise"
         ));
     }
@@ -750,113 +528,8 @@ pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, count: u64) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logit_core::{AttrMap, DdSketch, EventBatch, MetricRecord, Resource, Sum, Temporality};
-    use logit_proto::frame::{write_frame, Compression};
-    use logit_proto::native::encode_batch;
-    use std::sync::Arc;
-
-    const SCENARIO: &str = "components:\n  gen:\n    type: generate_in\n    count: 100\n  out:\n    type: null_out\n    sources: [gen]\n";
-
-    fn dump_path() -> PathBuf {
-        PathBuf::from("/tmp/logit-perf-attribute-1/attribute.native")
-    }
-
-    #[test]
-    fn rewrite_appends_both_components_under_the_existing_components_mapping() {
-        let out = rewrite_scenario(SCENARIO, Duration::from_secs(1), &dump_path()).unwrap();
-        assert!(out.starts_with(SCENARIO), "the original text is preserved verbatim:\n{out}");
-        assert!(
-            out.contains(
-                "  __perf_internal: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }\n"
-            ),
-            "{out}"
-        );
-        assert!(
-            out.contains(
-                "  __perf_dump: { type: file_out, sources: [__perf_internal], path: \"/tmp/logit-perf-attribute-1/attribute.native\", format: native, rotate: { max_bytes: \"1024GiB\" } }\n"
-            ),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn the_rewritten_scenario_still_parses_as_yaml_with_both_new_components() {
-        let out = rewrite_scenario(SCENARIO, Duration::from_secs(1), &dump_path()).unwrap();
-        let value: serde_norway::Value = serde_norway::from_str(&out).unwrap();
-        let components = value.get("components").and_then(serde_norway::Value::as_mapping).unwrap();
-        assert_eq!(components.len(), 4, "the two original components plus the two appended");
-        for id in [INTERNAL_ID, DUMP_ID] {
-            let component = components.get(serde_norway::Value::from(id)).expect(id);
-            assert!(component.get("type").is_some(), "{id} has no type: {component:?}");
-        }
-    }
-
-    #[test]
-    fn rewrite_refuses_a_scenario_that_already_has_an_internal_component() {
-        let yaml = "components:\n  gen:\n    type: generate_in\n    count: 1\n  self:\n    type: internal\n    interval: 10s\n  out:\n    type: null_out\n    sources: [gen, self]\n";
-        let err = rewrite_scenario(yaml, Duration::from_secs(1), &dump_path())
-            .expect_err("rule 13 allows at most one internal per config");
-        assert!(
-            format!("{err:#}").contains("already has an `internal` component (`self`)"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn rewrite_refuses_a_scenario_using_a_reserved_id() {
-        let yaml = "components:\n  __perf_dump:\n    type: null_out\n  gen:\n    type: generate_in\n    count: 1\n";
-        let err = rewrite_scenario(yaml, Duration::from_secs(1), &dump_path())
-            .expect_err("the appended ids are reserved");
-        assert!(format!("{err:#}").contains("reserves"), "{err:#}");
-    }
-
-    #[test]
-    fn rewrite_refuses_a_scenario_with_another_top_level_key() {
-        let yaml = format!("{SCENARIO}admin:\n  bind: 127.0.0.1:9000\n");
-        let err = rewrite_scenario(&yaml, Duration::from_secs(1), &dump_path())
-            .expect_err("appending at the end would land under the wrong key");
-        assert!(format!("{err:#}").contains("top-level `admin:` key"), "{err:#}");
-    }
-
-    #[test]
-    fn rewrite_refuses_a_layout_its_two_space_indent_does_not_fit() {
-        // Four-space indentation is valid YAML the harness's own append doesn't match -- appending
-        // two-space-indented keys under it isn't even parseable. Reported as the harness's own
-        // limitation, with the file and function to fix, rather than as a bare parser position.
-        let yaml = "components:\n    gen:\n        type: generate_in\n        count: 100\n    out:\n        type: null_out\n        sources: [gen]\n";
-        let err = rewrite_scenario(yaml, Duration::from_secs(1), &dump_path())
-            .expect_err("a four-space-indented scenario doesn't fit this rewrite");
-        let err = format!("{err:#}");
-        assert!(err.contains("appended components by two spaces"), "{err}");
-        assert!(err.contains("not valid YAML any more"), "{err}");
-    }
-
-    #[test]
-    fn check_append_landed_rejects_a_rewrite_that_nested_the_new_keys() {
-        // The other shape of the same problem: parseable, but the two appended components ended
-        // up inside another component instead of beside it.
-        let nested = "components:\n  gen:\n    type: generate_in\n    count: 1\n    __perf_internal: { type: internal, interval: 1s }\n    __perf_dump: { type: null_out }\n";
-        let err = check_append_landed(nested).expect_err("both keys are nested under `gen`");
-        assert!(
-            format!("{err:#}").contains("`__perf_internal` did not land under `components:`"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn interval_renders_as_a_humantime_literal() {
-        assert_eq!(format_interval(Duration::from_secs(1)), "1s");
-        assert_eq!(format_interval(Duration::from_secs(10)), "10s");
-        assert_eq!(format_interval(Duration::from_millis(250)), "250ms");
-        assert_eq!(format_interval(Duration::from_millis(1_500)), "1500ms");
-    }
-
-    #[test]
-    fn a_path_needing_quoting_is_escaped_rather_than_emitted_raw() {
-        assert_eq!(yaml_double_quoted("/tmp/a b/c.native"), "\"/tmp/a b/c.native\"");
-        assert_eq!(yaml_double_quoted("/tmp/\"x\"/c"), "\"/tmp/\\\"x\\\"/c\"");
-        assert_eq!(yaml_double_quoted("/tmp/a\\b"), "\"/tmp/a\\\\b\"");
-    }
+    use crate::load::LoadSpec;
+    use logit_core::{AttrMap, DdSketch, MetricRecord, Sum, Temporality};
 
     #[test]
     fn consumer_map_inverts_the_sources_edges() {
@@ -1093,7 +766,7 @@ mod tests {
             // The harness's own nodes carry their own, unrelated counts.
             ("__perf_dump".to_string(), counted("file_out", 0.0, 7.0)),
         ]);
-        let lines = check_counts(&nodes, 100);
+        let lines = check_counts(&nodes, &Workload::Generated { count: 100 });
         assert_eq!(lines.len(), 1, "no warnings: {lines:?}");
         assert!(lines[0].contains("generator sent 100"), "{}", lines[0]);
         assert!(lines[0].contains("peak node received 100"), "{}", lines[0]);
@@ -1105,81 +778,34 @@ mod tests {
             ("gen".to_string(), counted("generate_in", 80.0, 0.0)),
             ("out".to_string(), counted("null_out", 0.0, 80.0)),
         ]);
-        let lines = check_counts(&nodes, 100);
+        let lines = check_counts(&nodes, &Workload::Generated { count: 100 });
         assert_eq!(lines.len(), 3);
         assert!(lines[1].contains("does not equal the scenario's count"), "{}", lines[1]);
         assert!(lines[2].contains("no node received all 100 events"), "{}", lines[2]);
     }
 
-    /// One frame's worth of bytes, built exactly the way `format: native` builds it:
-    /// `write_frame(CODEC_NATIVE_V1, compression, &encode_batch(batch))`
-    /// (`logit_outputs::stdio::StreamEncoder::Native` -> `NativeEncoder::encode`). Building the
-    /// fixture through the real encoder rather than a hand-written byte string is the point --
-    /// it's what makes this a test of the reader against the writer, not against a transcription
-    /// of the format.
-    fn native_frame(component: &str, events: f64) -> Vec<u8> {
-        let batch = EventBatch {
-            resource: Arc::new(Resource::default()),
-            scope: None,
-            events: vec![point(
-                component,
-                "null_out",
-                "sink",
-                EVENTS_RECEIVED,
-                MetricKind::counter(events),
-            )],
-        };
-        write_frame(CODEC_NATIVE_V1, Compression::None, &encode_batch(&batch)).unwrap().to_vec()
-    }
-
-    /// Writes `bytes` to a uniquely-named file in the temp directory and returns the path. No
-    /// cleanup guard: these are a few hundred bytes each, and a test that fails mid-way leaving
-    /// its fixture behind is easier to debug than one that deletes it.
-    fn temp_dump(name: &str, bytes: &[u8]) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("logit-perf-decode-{}-{name}.native", std::process::id()));
-        fs::write(&path, bytes).unwrap();
-        path
+    #[test]
+    fn check_counts_reports_a_driven_scenario_without_warning_about_its_losses() {
+        let nodes = BTreeMap::from([
+            ("statsd".to_string(), counted("statsd_in", 900.0, 0.0)),
+            ("out".to_string(), counted("null_out", 0.0, 900.0)),
+        ]);
+        let spec: LoadSpec = serde_norway::from_str(
+            "target: statsd\ndatagrams: 1000\nmodel: m.yaml\ndatagram_mix:\n  - { weight: 1, single: true }\n",
+        )
+        .unwrap();
+        let lines = check_counts(&nodes, &Workload::Driven(spec));
+        assert_eq!(lines.len(), 1, "a driven scenario's losses are not a warning here: {lines:?}");
+        assert!(lines[0].contains("peak node received 900"), "{}", lines[0]);
+        assert!(lines[0].contains("1000 datagrams"), "{}", lines[0]);
     }
 
     #[test]
-    fn decode_dump_reads_every_frame_a_native_file_concatenates() {
-        let mut bytes = native_frame("a", 10.0);
-        bytes.extend(native_frame("b", 20.0));
-        let path = temp_dump("whole", &bytes);
-
-        let events = decode_dump(&path).unwrap();
-        let nodes = aggregate(&events);
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes["a"].events_received, 10.0);
-        assert_eq!(nodes["b"].events_received, 20.0);
-        fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn decode_dump_keeps_the_whole_frames_before_a_torn_final_one() {
-        // What a SIGTERM landing mid-write actually leaves: two complete frames, then a prefix of
-        // a third. The prefix is dropped with a warning; neither whole frame is lost.
-        let mut bytes = native_frame("a", 10.0);
-        bytes.extend(native_frame("b", 20.0));
-        let third = native_frame("c", 30.0);
-        bytes.extend(&third[..third.len() / 2]);
-        let path = temp_dump("torn", &bytes);
-
-        let events = decode_dump(&path).unwrap();
-        let nodes = aggregate(&events);
-        assert_eq!(nodes.len(), 2, "the torn frame contributes nothing: {nodes:?}");
-        assert_eq!(nodes["a"].events_received, 10.0);
-        assert_eq!(nodes["b"].events_received, 20.0);
-        assert!(!nodes.contains_key("c"));
-        fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn decode_dump_rejects_an_empty_dump_rather_than_reporting_nothing() {
-        let path = temp_dump("empty", b"");
-        let err = decode_dump(&path).expect_err("an empty dump means no drain ever landed");
-        assert!(format!("{err:#}").contains("is empty"), "{err:#}");
-        fs::remove_file(&path).unwrap();
+    fn peak_received_ignores_the_harness_own_nodes() {
+        let nodes = BTreeMap::from([
+            ("out".to_string(), counted("null_out", 0.0, 42.0)),
+            ("__perf_dump".to_string(), counted("file_out", 0.0, 9_999.0)),
+        ]);
+        assert_eq!(peak_received(&nodes), 42);
     }
 }

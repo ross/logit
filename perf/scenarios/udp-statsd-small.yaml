@@ -1,0 +1,20 @@
+# Real-socket UDP intake, **one metric per datagram** -- the syscall-bound worst case. Same graph
+# as `udp-statsd`, a distinct bind port, and a sidecar load spec (`perf/load/udp-statsd-small.yaml`)
+# whose `datagram_mix:` is all single-line: what an unbuffered client sends.
+#
+#   script/perf run --scenario udp-statsd-small --repeat 5 --pin-sender 1 --pin-child 2
+#
+# This is the regime where per-datagram fixed cost dominates a payload too small to amortize it,
+# so it is where ADR `udp-intake-batching-and-socket-visibility`'s `recvmmsg`/`push_many` work is
+# expected to show the most -- and the one scenario whose baseline is deliberately tuned to a small
+# non-zero kernel drop rate, so a later improvement has somewhere to move it.
+components:
+  statsd:
+    type: statsd_in
+    bind: 127.0.0.1:18126
+    receive:
+      receive_buffer_bytes: 1MiB
+
+  out:
+    type: null_out
+    sources: [statsd]

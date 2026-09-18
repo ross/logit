@@ -1050,6 +1050,7 @@ dependencies = [
  "clap",
  "libc",
  "logit-core",
+ "logit-inputs",
  "logit-proto",
  "serde",
  "serde_json",

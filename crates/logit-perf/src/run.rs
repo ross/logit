@@ -1,19 +1,64 @@
 //! `logit-perf run`: builds the release binary once, then spawns it once per scenario per repeat,
 //! deriving throughput/CPU/RSS from its stderr and `wait4` (docs/adr/load-test-harness.md,
 //! docs/plans/load-test-harness.md's "Harness" section).
+//!
+//! ## Two shapes of run
+//!
+//! A [`Workload::Generated`] scenario generates its own events and announces when it's finished
+//! (`generation complete`), which is what bounds the measurement. A [`Workload::Driven`] one
+//! ([ADR `udp-intake-batching-and-socket-visibility`](../../../docs/adr/udp-intake-batching-and-socket-visibility.md))
+//! has no generator at all: the harness waits for the child's `ready` line, blasts it over a real
+//! UDP socket from `crate::load`, and the blast returning is what bounds the measurement.
+//! [`Drive`] is that fork; everything after it -- settle, SIGTERM, `wait4` -- is the same path
+//! both take.
+//!
+//! **A driven scenario's denominator is events *delivered*, never events sent.** This is the first
+//! scenario family in which those two can honestly differ: a real socket may lose datagrams in the
+//! kernel before `logit` ever sees them, and denominating over sent would silently understate the
+//! per-event cost by exactly the drop rate -- in the very regime the baseline is deliberately tuned
+//! into. The delivered count comes out of the child's own `logit.component.events.received` through
+//! the `crate::telemetry_leg` dump, attached at run time and never shipped in the scenario YAML.
+//!
+//! **Every driven run self-checks before its numbers are believed.** `sent == received + kernel
+//! drops` has to close (on loopback there is nowhere else for a datagram to go), and the decoder
+//! must report no malformed lines -- otherwise the scenario would be quietly benchmarking the
+//! error path. `--verify` adds the stricter form: a paced, zero-drop run must deliver *exactly* the
+//! event count the load spec's ring says it sent.
 
-use crate::result::{GitInfo, RunReport, Sample, ScenarioReport};
-use crate::rusage;
-use crate::scenario::{self, Scenario};
-use crate::spool;
+use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
+use crate::result::{GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
+use crate::rusage::{self, Usage};
+use crate::scenario::{self, Scenario, Workload};
+use crate::telemetry_leg::{self, RemoveOnDrop};
 use anyhow::{bail, Context};
+use logit_core::{interner, MetricKind, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, BufRead};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The shortest settle a driven scenario ever uses, regardless of `--settle`.
+///
+/// A generated scenario's settle only has to cover the in-process drain after the last event is
+/// produced, and `--settle`'s 1 s default has always been ample for that. A driven one has three
+/// slower things to wait for, in order: whatever the kernel still holds in the socket's receive
+/// queue after the blast stops, the listener's **guaranteed final `SO_MEMINFO` sample** (taken once
+/// the read loop exits, so the last interval of `logit.input.kernel.drops` isn't lost), and
+/// `internal`'s own final drain on shutdown, which is what carries both of those into the dump.
+///
+/// The floor is 3 s because the first two of those are bounded by a 1 s sampling interval and the
+/// third by the leg's own `--interval` (1 s by default), so anything at or below 1 s is racing two
+/// timers it has no reason to beat. It is not a tuned number — what makes it *checked* rather than
+/// hoped for is [`self_check`]: if a settle is ever too short, the datagram accounting does not
+/// close and the run fails saying so, rather than quietly reporting a drop rate inflated by
+/// datagrams that were still in the receive queue when the process was signalled.
+///
+/// `--settle` above this is honoured as given.
+const DRIVEN_SETTLE_FLOOR: Duration = Duration::from_secs(3);
 
 pub struct RunArgs {
     /// Empty means every discovered scenario.
@@ -23,12 +68,20 @@ pub struct RunArgs {
     pub settle: Duration,
     pub no_build: bool,
     pub profile: String,
-    /// How long to wait for a scenario's `generation complete` line before giving up on it as
-    /// hung.
+    /// How long to wait for a scenario's `generation complete` line (generated) or `ready` line
+    /// (driven) before giving up on it as hung.
     pub timeout: Duration,
     /// How long to wait for the process to actually exit after `--settle`/SIGTERM (or, for a
     /// self-exiting scenario, after the completion line) before force-killing it.
     pub shutdown_timeout: Duration,
+    /// The run-time telemetry leg's drain cadence, for driven scenarios only.
+    pub interval: Duration,
+    pub pin_sender: Option<CpuSet>,
+    pub pin_child: Option<CpuSet>,
+    /// Hold every driven scenario to the strict expectation: zero drops, and an exactly-equal
+    /// delivered event count. Meant to be run against a paced spec -- an unpaced blast is tuned to
+    /// drop on purpose and will (correctly) fail this.
+    pub verify: bool,
 }
 
 pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
@@ -57,11 +110,45 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
 
     for scenario in &scenarios {
         println!(
-            "-- {} (count={}, {})",
+            "-- {} ({}, {})",
             scenario.name,
-            scenario.count,
+            scenario.workload.describe(),
             if scenario.needs_sigterm { "needs SIGTERM" } else { "self-exits" }
         );
+        // The ring is rendered once per scenario, not once per repeat: it is deterministic from
+        // the spec's seed, so every repeat would render the same bytes, and rendering tens of
+        // thousands of datagrams inside the measured window would be work the measurement isn't
+        // about.
+        let plan = match &scenario.workload {
+            Workload::Generated { .. } => None,
+            Workload::Driven(_) => match driven_plan(scenario, args.verify) {
+                Ok(plan) => Some(plan),
+                Err(err) => {
+                    eprintln!("   FAILED: {err:#}");
+                    any_failed = true;
+                    continue;
+                }
+            },
+        };
+        if let Some(plan) = &plan {
+            let expected = plan.expected();
+            println!(
+                "   {}: {} distinct datagrams pre-rendered, {}",
+                plan.spec_path.display(),
+                plan.ring.len(),
+                plan.ring.shape(),
+            );
+            println!(
+                "   sending {} lines / {} events / {:.1} MiB over {} sockets on {} threads{}",
+                expected.lines,
+                expected.events,
+                expected.bytes as f64 / (1024.0 * 1024.0),
+                plan.spec.sockets,
+                plan.spec.threads,
+                plan.spec.rate.map(|r| format!(", paced at {r} datagrams/s")).unwrap_or_default(),
+            );
+        }
+
         let mut samples = Vec::with_capacity(args.repeat as usize);
         let mut scenario_failed = false;
         for repeat in 1..=args.repeat {
@@ -69,20 +156,25 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
             // comment has the mechanism (`DiskQueue::open`'s O(segment size) startup scan,
             // `docs/known-gaps.md`'s `buffered` entry): left alone, the second repeat already
             // re-validates the first repeat's spool, and it only grows from there.
-            if let Err(err) = spool::clear(root, scenario) {
+            if let Err(err) = crate::spool::clear(root, scenario) {
                 eprintln!("   repeat {repeat}/{}: FAILED: {err:#}", args.repeat);
                 scenario_failed = true;
                 break;
             }
-            match run_one(&logit_bin, scenario, args.settle, args.timeout, args.shutdown_timeout) {
+            let outcome = match &plan {
+                Some(plan) => run_one_driven(&logit_bin, scenario, plan, &args),
+                None => run_one_generated(&logit_bin, scenario, &args),
+            };
+            match outcome {
                 Ok(sample) => {
                     println!(
-                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS, {} startup",
+                        "   repeat {repeat}/{}: {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS, {} startup{}",
                         args.repeat,
                         sample.events_per_s,
                         sample.cpu_us_per_event,
                         sample.max_rss_bytes as f64 / (1024.0 * 1024.0),
                         format_startup(sample.startup_s),
+                        sample.udp.map(format_udp_suffix).unwrap_or_default(),
                     );
                     samples.push(sample);
                 }
@@ -99,10 +191,15 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         }
         let median = crate::result::median_sample(&samples);
         let min = crate::result::min_sample(&samples);
-        reports.insert(
-            scenario.name.clone(),
-            ScenarioReport { count: scenario.count, repeats: samples, median, min },
-        );
+        // The scenario's own denominator, recorded so a results file is self-describing: events
+        // generated for a generated scenario, **lines sent** for a driven one. Lines, not
+        // datagrams: a line is one metric, which is the unit the scenario's event counts are in.
+        let count = match &scenario.workload {
+            Workload::Generated { count } => *count,
+            Workload::Driven(_) => median.udp.map(|udp| udp.sent_lines).unwrap_or_default(),
+        };
+        reports
+            .insert(scenario.name.clone(), ScenarioReport { count, repeats: samples, median, min });
     }
 
     if reports.is_empty() {
@@ -142,6 +239,7 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", path.display()))?;
 
     print_table(&report);
+    print_udp_table(&report);
     println!("\nwrote {}", path.display());
 
     if any_failed {
@@ -150,21 +248,37 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One spawned scenario's completion signal: the instant its `generation complete` line arrived,
-/// the `events` field that line carried (`None` if the line parsed as JSON but that field was
-/// missing or not an unsigned integer -- a format this harness can't trust), and the instant its
-/// own `ready` line arrived, if the reader thread ever saw one.
+/// Reads a driven scenario's sidecar spec and renders its ring, derating its `rate` when this is a
+/// `--verify` run (`LoadPlan::derate_for_verify` has why).
+fn driven_plan(scenario: &Scenario, verify: bool) -> anyhow::Result<LoadPlan> {
+    let source = std::fs::read_to_string(&scenario.path)
+        .with_context(|| format!("reading {}", scenario.path.display()))?;
+    let mut plan = LoadPlan::build(&scenario.load_spec_path()?, &source)?;
+    if verify {
+        let derated = plan.derate_for_verify()?;
+        println!("   --verify: pacing at {derated} datagrams/s, a quarter of the spec's own rate");
+    }
+    Ok(plan)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Child lifecycle
+// ---------------------------------------------------------------------------------------------
+
+/// Something the child announced about itself on stderr, in the order the reader thread saw it.
 ///
-/// `ready_at` rides along on this same message rather than a channel of its own: the reader thread
-/// processes stderr strictly in line order, so by the time it matches the completion line and
-/// sends this struct, it has already updated its local `ready_at` if the `ready` line appeared
-/// earlier in the stream -- which, for any healthy `logit` process, it always does (`ready` is
-/// logged once the bind pass and every node spawn have succeeded,
-/// `crates/logit-pipeline/src/runtime.rs`, long before `generate_in` could possibly finish).
-struct Completion {
-    at: Instant,
-    events: Option<u64>,
-    ready_at: Option<Instant>,
+/// Split out of what used to be one `Completion` message because the two kinds of scenario wait
+/// for different things: a generated one measures `ready` → `generation complete`, a driven one
+/// measures `ready` → *the sender* finishing, and never sees a completion line at all.
+enum ChildEvent {
+    /// `tracing::info!(target: "logit", "ready")` -- logged once the bind pass has opened every
+    /// listener's socket and every node has been spawned (`crates/logit-pipeline/src/runtime.rs`).
+    /// For a driven scenario this is a hard precondition, not a nicety: sending before the socket
+    /// exists would be measured as loss that never happened.
+    Ready(Instant),
+    /// `generate_in`'s own completion line, with the `events` count it carried (`None` if that
+    /// field was missing or not an unsigned integer -- a format this harness can't trust).
+    Complete { at: Instant, events: Option<u64> },
 }
 
 /// `None` if `line` isn't the completion line at all; `Some(events)` if it is -- `generate_in`'s
@@ -181,13 +295,8 @@ fn parse_completion_line(line: &str) -> Option<Option<u64>> {
     Some(json.get("events").and_then(serde_json::Value::as_u64))
 }
 
-/// Whether `line` is the process's own readiness line: `tracing::info!(target: "logit", "ready")`,
-/// logged once the bind pass has opened every listener's socket and every node has been spawned
-/// (`crates/logit-pipeline/src/runtime.rs`) -- the point past which the process is doing real work
-/// rather than starting up. Under `--log-format json` that renders as `{"message":"ready", ...}`
-/// alongside the usual level/target/timestamp fields, so, matching [`parse_completion_line`]'s own
-/// reasoning, this parses the whole line as JSON and requires an *exact* `message` match rather
-/// than a substring one.
+/// Whether `line` is the process's own readiness line, matching [`parse_completion_line`]'s own
+/// reasoning: the whole line parsed as JSON, an *exact* `message` match rather than a substring.
 fn is_ready_line(line: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else { return false };
     json.get("message").and_then(serde_json::Value::as_str) == Some("ready")
@@ -226,9 +335,8 @@ impl StderrCapture {
 }
 
 /// Kills and reaps a still-running child, then joins both reader threads -- every error path that
-/// bails before the ordinary settle/SIGTERM/`wait4` sequence has run (the completion timeout, a
-/// malformed or mismatched `events` count) calls this, so a failed repeat never leaves a live
-/// process, a zombie, or a detached reader thread behind.
+/// bails before the ordinary settle/SIGTERM/`wait4` sequence has run calls this, so a failed
+/// repeat never leaves a live process, a zombie, or a detached reader thread behind.
 fn kill_and_reap(
     child: &mut Child,
     stdout_drain: JoinHandle<()>,
@@ -247,15 +355,22 @@ fn drain_and_join(stdout_drain: JoinHandle<()>, stderr_reader: JoinHandle<String
     stderr_reader.join().unwrap_or_default()
 }
 
-/// One spawn-measure-shutdown cycle's inputs. A struct rather than seven positional parameters
-/// because three callers now share it: [`run_one`] (a scenario as it ships), `crate::attribute`
-/// (the same scenario rewritten into a temp directory with an `internal` dump leg appended), and
+/// What bounds one measurement, and how the load gets there.
+pub(crate) enum Drive<'a> {
+    /// Wait for `generate_in`'s completion line and check it reported exactly `count` events.
+    Generated { count: u64 },
+    /// Wait for `ready`, then blast `plan` from this process and stop when the sender returns.
+    Driven { plan: &'a LoadPlan, pin_sender: Option<&'a CpuSet> },
+}
+
+/// One spawn-measure-shutdown cycle's inputs. A struct rather than a pile of positional
+/// parameters because three callers share it: [`run_one_generated`]/[`run_one_driven`],
+/// `crate::attribute` (the same scenario rewritten with a telemetry leg appended), and
 /// `crate::flamegraph` (the scenario as it ships, under `perf record`).
 pub(crate) struct SpawnConfig<'a> {
     pub logit_bin: &'a Path,
     /// An argv prefix to run `logit` *under*, with the `logit run <config>` command line appended
-    /// to it -- `["perf", "record", .., "--"]` for `flamegraph`. Empty for a plain run, which is
-    /// what `run` and `attribute` both use.
+    /// to it -- `["perf", "record", .., "--"]` for `flamegraph`. Empty for a plain run.
     ///
     /// When it isn't empty the spawned process is the wrapper, not `logit`: the reported rusage
     /// covers both, and a SIGTERM on the settle path goes to the wrapper (which is what `perf
@@ -263,46 +378,305 @@ pub(crate) struct SpawnConfig<'a> {
     pub wrapper: &'a [String],
     /// The config to hand `logit run` -- a scenario file, or a rewritten copy of one.
     pub config: &'a Path,
-    /// The `count` the `generation complete` line must report, so a mis-measured denominator is
-    /// caught rather than silently divided by.
-    pub count: u64,
-    /// Whether this graph will still be running after the generator finishes -- when true the
-    /// completion line is followed by `settle`, then SIGTERM, rather than waiting for the process
-    /// to exit on its own.
+    pub drive: Drive<'a>,
+    /// CPUs to pin the child to, applied **between `fork` and `exec`** so it never runs a single
+    /// instruction unpinned -- see [`spawn_and_measure`].
+    pub pin_child: Option<&'a CpuSet>,
+    /// Whether this graph will still be running after the load stops -- when true the measurement
+    /// is followed by `settle`, then SIGTERM, rather than waiting for the process to exit on its
+    /// own. Always true for a driven scenario, which is a socket listener by construction.
     pub needs_sigterm: bool,
     pub settle: Duration,
     pub timeout: Duration,
     pub shutdown_timeout: Duration,
 }
 
-fn run_one(
+/// The raw result of one spawn-measure-shutdown cycle, before a denominator has been chosen.
+///
+/// Deliberately *not* a [`Sample`]: a driven scenario's denominator isn't known until the child's
+/// own telemetry has been decoded, which happens after this returns. Handing back the pieces keeps
+/// that choice at the one call site that can make it correctly.
+pub(crate) struct Measured {
+    pub startup: Option<Duration>,
+    pub usage: Usage,
+    /// What the sender actually put on the wire -- `None` for a generated scenario, which has no
+    /// sender.
+    pub load: Option<LoadOutcome>,
+}
+
+impl Measured {
+    pub fn cpu_us_per_event(&self, events: u64) -> f64 {
+        let cpu = self.usage.user.as_secs_f64() + self.usage.sys.as_secs_f64();
+        cpu * 1_000_000.0 / events as f64
+    }
+
+    /// `ready` -> the load stopping. Carried on the `wait4` result because that is where it was
+    /// handed in (`rusage::wait4(pid, wall)`), rather than duplicated on this struct.
+    pub fn wall(&self) -> Duration {
+        self.usage.wall
+    }
+
+    pub fn sample(&self, events: u64) -> Sample {
+        Sample::from_usage(
+            events,
+            self.startup,
+            self.usage.wall,
+            self.usage.user,
+            self.usage.sys,
+            self.usage.max_rss_bytes,
+        )
+    }
+}
+
+fn run_one_generated(
     logit_bin: &Path,
     scenario: &Scenario,
-    settle: Duration,
-    timeout: Duration,
-    shutdown_timeout: Duration,
+    args: &RunArgs,
 ) -> anyhow::Result<Sample> {
-    spawn_and_measure(SpawnConfig {
+    let Workload::Generated { count } = scenario.workload else {
+        unreachable!("run_one_generated is only called for a generated workload")
+    };
+    let measured = spawn_and_measure(SpawnConfig {
         logit_bin,
         wrapper: &[],
         config: &scenario.path,
-        count: scenario.count,
+        drive: Drive::Generated { count },
+        pin_child: args.pin_child.as_ref(),
         needs_sigterm: scenario.needs_sigterm,
-        settle,
-        timeout,
-        shutdown_timeout,
-    })
+        settle: args.settle,
+        timeout: args.timeout,
+        shutdown_timeout: args.shutdown_timeout,
+    })?;
+    Ok(measured.sample(count))
 }
 
-/// Spawns one `logit run <config>`, waits for the generator's completion line, shuts the process
-/// down, and reports its `wait4` rusage as a [`Sample`]. The whole spawn/reader-thread/SIGTERM/
-/// `wait4` lifecycle lives here, once, for every subcommand that needs to run a scenario.
-pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample> {
+/// One repeat of a real-socket scenario: attach the telemetry leg, blast, then read the child's
+/// own counters back out of the dump and check they add up before believing any of it.
+fn run_one_driven(
+    logit_bin: &Path,
+    scenario: &Scenario,
+    plan: &LoadPlan,
+    args: &RunArgs,
+) -> anyhow::Result<Sample> {
+    let Workload::Driven(spec) = &scenario.workload else {
+        unreachable!("run_one_driven is only called for a driven workload")
+    };
+    let source = std::fs::read_to_string(&scenario.path)
+        .with_context(|| format!("reading {}", scenario.path.display()))?;
+
+    let workdir = telemetry_leg::make_workdir("run")?;
+    let dump_path = workdir.join(format!("{}.native", scenario.name));
+    // Unlike `attribute`, which refuses a pre-existing dump, `run` expects one: every repeat of
+    // every scenario in one invocation writes here. It's this process's own pid-named directory,
+    // so removing last repeat's file is removing our own, not somebody else's.
+    let _ = std::fs::remove_file(&dump_path);
+
+    let rewritten = telemetry_leg::rewrite_scenario(&source, args.interval, &dump_path)
+        .with_context(|| format!("rewriting {}", scenario.path.display()))?;
+    let config_path = telemetry_leg::rewritten_config_path(scenario, "run")?;
+    let _cleanup = RemoveOnDrop(config_path.clone());
+    std::fs::write(&config_path, &rewritten)
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    telemetry_leg::validate(logit_bin, &config_path)?;
+
+    let measured = spawn_and_measure(SpawnConfig {
+        logit_bin,
+        wrapper: &[],
+        config: &config_path,
+        drive: Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
+        pin_child: args.pin_child.as_ref(),
+        // Always: a driven graph is a socket listener with a telemetry leg attached, so neither
+        // half of it can ever decide on its own that it's finished.
+        needs_sigterm: true,
+        settle: args.settle.max(DRIVEN_SETTLE_FLOOR),
+        timeout: args.timeout,
+        shutdown_timeout: args.shutdown_timeout,
+    })?;
+    let load = measured.load.expect("a driven measurement always carries its sender's outcome");
+
+    let events = telemetry_leg::decode_dump(&dump_path, true)?;
+    let nodes = crate::attribute::aggregate(&events);
+    let delivered = crate::attribute::peak_received(&nodes);
+    let input = input_stats(&events, &spec.target);
+
+    let udp = UdpSample {
+        sent_datagrams: load.sent_datagrams,
+        sent_lines: load.sent_lines,
+        received_datagrams: input.datagrams,
+        kernel_dropped: input.kernel_drops,
+        queue_dropped: input.queue_dropped,
+        events_delivered: delivered,
+        send_errors: load.send_errors,
+        kernel_rcvbuf_utilization_max: input.rcvbuf_utilization_max,
+    };
+    self_check(scenario, plan, &udp, &input, args.verify)?;
+
+    if delivered == 0 {
+        bail!(
+            "no events reached the sink at all -- {} datagrams were sent to {} and {} arrived; \
+             check the scenario's `bind:` matches the load spec's `target:`",
+            udp.sent_datagrams,
+            plan.target,
+            udp.received_datagrams
+        );
+    }
+    let mut sample = measured.sample(delivered);
+    sample.udp = Some(udp);
+    Ok(sample)
+}
+
+/// The listener-side counters a driven run needs, folded out of the decoded telemetry dump for one
+/// component. Kept here rather than in `crate::attribute`'s `NodeStats`: those are the uniform
+/// per-node metrics every component emits, these are `logit.input.*`/UDP-specific and only a
+/// driven scenario has any use for them (`docs/design/internal-telemetry.md`'s listener tables).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct InputStats {
+    /// `logit.input.datagrams` -- every datagram the listener actually received.
+    datagrams: u64,
+    /// `logit.input.kernel.drops` -- what the kernel discarded before `recv_from` could return it.
+    /// A delta per sample, summed here; not emitted at all when zero, so an absent metric is 0.
+    kernel_drops: u64,
+    /// `logit.component.datagrams.dropped{reason=overflow_*}` -- `ReceiveQueue` eviction, i.e.
+    /// loss `logit` chose and counted itself, downstream of the kernel's.
+    queue_dropped: u64,
+    /// The high-water mark of `logit.input.receive_buffer.utilization`. 1.0 is not "nearly full":
+    /// it is exactly where the kernel starts dropping.
+    rcvbuf_utilization_max: f64,
+    /// `logit.component.diagnostics{key=...}` -- every throttled warning the component raised.
+    /// `bad_line` (a statsd line that didn't parse) and `bad_datagram` (a datagram that wasn't
+    /// UTF-8) are the two that would mean the scenario is measuring the error path.
+    diagnostics: BTreeMap<String, u64>,
+}
+
+const INPUT_DATAGRAMS: &str = "logit.input.datagrams";
+const KERNEL_DROPS: &str = "logit.input.kernel.drops";
+const RCVBUF_UTILIZATION: &str = "logit.input.receive_buffer.utilization";
+const DATAGRAMS_DROPPED: &str = "logit.component.datagrams.dropped";
+const DIAGNOSTICS: &str = "logit.component.diagnostics";
+
+fn input_stats(events: &[logit_core::Event], component: &str) -> InputStats {
+    let mut stats = InputStats::default();
+    for event in events {
+        if event.attributes.get("component").and_then(Value::as_str) != Some(component) {
+            continue;
+        }
+        for metric in &event.metrics {
+            let name = interner::resolve(metric.name);
+            match (name, &metric.kind) {
+                (INPUT_DATAGRAMS, MetricKind::Sum(sum)) => stats.datagrams += sum.value as u64,
+                (KERNEL_DROPS, MetricKind::Sum(sum)) => stats.kernel_drops += sum.value as u64,
+                (DATAGRAMS_DROPPED, MetricKind::Sum(sum)) => {
+                    stats.queue_dropped += sum.value as u64
+                }
+                (RCVBUF_UTILIZATION, MetricKind::Gauge(value)) => {
+                    stats.rcvbuf_utilization_max = stats.rcvbuf_utilization_max.max(*value)
+                }
+                (DIAGNOSTICS, MetricKind::Sum(sum)) => {
+                    let key = event
+                        .attributes
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *stats.diagnostics.entry(key).or_default() += sum.value as u64;
+                }
+                _ => {}
+            }
+        }
+    }
+    stats
+}
+
+/// Everything a driven run has to be true for its numbers to mean anything.
+///
+/// 1. **The accounting closes.** On loopback a datagram either arrives or the kernel drops it --
+///    there is no lossy link, no fragmentation, no middlebox. `sent == received + kernel drops` is
+///    therefore an equality, not an inequality, and a mismatch means something this harness
+///    believes about the run is wrong (a settle too short for the receive queue to drain, a final
+///    socket sample that never landed, a datagram sent after the child was signalled) rather than
+///    an interesting measurement.
+/// 2. **Nothing was malformed.** A load spec that renders lines the decoder rejects would benchmark
+///    the error path and look perfectly healthy doing it -- fast, even, since a rejected line never
+///    becomes an event. Any decode diagnostic at all fails the run.
+/// 3. **Under `--verify`, the delivered count is exact.** With a paced spec that drops nothing,
+///    every line the ring sent has to come out the other end as the exact number of events the
+///    ring says it contains -- which is not the same as the number of lines, since a multi-value
+///    counter or gauge line decodes to one event per value.
+fn self_check(
+    scenario: &Scenario,
+    plan: &LoadPlan,
+    udp: &UdpSample,
+    input: &InputStats,
+    verify: bool,
+) -> anyhow::Result<()> {
+    let accounted = udp.received_datagrams + udp.kernel_dropped;
+    if accounted != udp.sent_datagrams {
+        bail!(
+            "{}: datagram accounting does not close -- sent {}, received {}, kernel-dropped {} \
+             (received + kernel = {accounted}, off by {}). On loopback there is nowhere else for a \
+             datagram to go, so this is a harness problem, not a measurement: the usual cause is a \
+             settle shorter than the time the receive queue needs to drain and the listener's final \
+             socket sample to land (--settle, floor {}s for a driven scenario)",
+            scenario.name,
+            udp.sent_datagrams,
+            udp.received_datagrams,
+            udp.kernel_dropped,
+            accounted.abs_diff(udp.sent_datagrams),
+            DRIVEN_SETTLE_FLOOR.as_secs(),
+        );
+    }
+    if !input.diagnostics.is_empty() {
+        let rendered: Vec<String> =
+            input.diagnostics.iter().map(|(key, count)| format!("{key}={count}")).collect();
+        bail!(
+            "{}: the listener reported decode diagnostics ({}) -- the load spec is putting lines \
+             on the wire that `StatsdDecoder` rejects, so this run would be benchmarking the \
+             malformed-line path. Fix perf/load/statsd-app.yaml before trusting any number here",
+            scenario.name,
+            rendered.join(", "),
+        );
+    }
+    if verify {
+        let expected = plan.expected();
+        if udp.kernel_dropped != 0 || udp.queue_dropped != 0 {
+            bail!(
+                "{}: --verify requires a zero-drop run, but the kernel dropped {} datagram(s) and \
+                 the receive queue dropped {}. Lower the load spec's `rate` (or raise the \
+                 scenario's `receive_buffer_bytes`) for a verification run",
+                scenario.name,
+                udp.kernel_dropped,
+                udp.queue_dropped,
+            );
+        }
+        if udp.events_delivered != expected.events {
+            bail!(
+                "{}: --verify expected exactly {} events delivered (the ring's own count over {} \
+                 datagrams / {} lines) but the sink received {}",
+                scenario.name,
+                expected.events,
+                udp.sent_datagrams,
+                expected.lines,
+                udp.events_delivered,
+            );
+        }
+        println!(
+            "   verified: {} datagrams, {} lines, {} events delivered exactly, zero drops",
+            udp.sent_datagrams, expected.lines, udp.events_delivered
+        );
+    }
+    Ok(())
+}
+
+/// Spawns one `logit run <config>`, drives it to completion, shuts the process down, and reports
+/// its `wait4` rusage. The whole spawn/reader-thread/SIGTERM/`wait4` lifecycle lives here, once,
+/// for every subcommand that needs to run a scenario.
+pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measured> {
     let SpawnConfig {
         logit_bin,
         wrapper,
         config,
-        count,
+        drive,
+        pin_child,
         needs_sigterm,
         settle,
         timeout,
@@ -316,11 +690,41 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
         }
         None => Command::new(logit_bin),
     };
-    let mut child = command
+    command
         .args(["--log-format", "json", "--log-level", "info", "run"])
         .arg(config)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(pin) = pin_child {
+        // `pre_exec`, not a `sched_setaffinity` on the returned pid: pinning after spawn leaves a
+        // window in which the child has already started binding sockets and spawning worker
+        // threads on whatever CPU the scheduler picked, and a thread created before the affinity
+        // change keeps the *old* mask -- so a post-spawn pin can silently miss exactly the threads
+        // the measurement is about. Setting it between `fork` and `exec` means every thread the
+        // process ever creates inherits the mask.
+        let mask = pin.to_raw();
+        // SAFETY: `pre_exec` runs in the forked child between `fork` and `exec`, where only
+        // async-signal-safe work is allowed. The closure does exactly one thing --
+        // `sched_setaffinity(2)`, a bare syscall -- and touches no allocator, no lock, and no
+        // memory outside the `cpu_set_t` copied into it by value. `mask` is a plain `cpu_set_t`
+        // living in the closure's own captured state, valid for the duration of the call.
+        unsafe {
+            command.pre_exec(move || {
+                let rc = libc::sched_setaffinity(
+                    0,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &mask as *const _,
+                );
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
         .spawn()
         // Both halves named: which program actually failed to spawn (the wrapper, when there is
         // one) and which binary it was going to run, since "no such file" is equally plausible
@@ -341,20 +745,21 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
     });
 
     let stderr = child.stderr.take().expect("stderr was piped");
-    let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
+    let (event_tx, event_rx) = mpsc::channel::<ChildEvent>();
     let stderr_reader = std::thread::spawn(move || -> String {
         let mut capture = StderrCapture::new();
-        let mut sent = false;
-        let mut ready_at: Option<Instant> = None;
+        let mut sent_ready = false;
+        let mut sent_complete = false;
         for line in io::BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            if ready_at.is_none() && is_ready_line(&line) {
-                ready_at = Some(Instant::now());
+            if !sent_ready && is_ready_line(&line) {
+                sent_ready = true;
+                let _ = event_tx.send(ChildEvent::Ready(Instant::now()));
             }
-            if !sent {
+            if !sent_complete {
                 if let Some(events) = parse_completion_line(&line) {
-                    sent = true;
-                    let _ = completion_tx.send(Completion { at: Instant::now(), events, ready_at });
+                    sent_complete = true;
+                    let _ = event_tx.send(ChildEvent::Complete { at: Instant::now(), events });
                 }
             }
             capture.push(line);
@@ -362,51 +767,104 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
         capture.into_string()
     });
 
-    let completion = match completion_rx.recv_timeout(timeout) {
-        Ok(completion) => completion,
-        Err(_) => {
-            let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
-            bail!(
-                "no `generation complete` line within {}s; stderr:\n{stderr_text}",
-                timeout.as_secs()
-            );
-        }
-    };
     // Wall is measured from `ready`, not from spawn: spawn -> ready is process startup (loading
     // the binary, opening every listener's socket in the bind pass, spawning every node), which
-    // `generate_in` doesn't even begin sending into until it's done -- folding it into `wall`
-    // would count it as part of the graph's own per-event cost. `ready` missing at all (a binary
-    // built without the log line, or a race this harness doesn't expect) falls back to the old
-    // spawn -> completion measurement, loudly, rather than silently reporting a startup-inflated
-    // number.
-    let (startup, wall) = match completion.ready_at {
-        Some(ready_at) => (Some(ready_at.duration_since(spawned_at)), completion.at - ready_at),
-        None => {
-            eprintln!(
-                "warning: no `ready` line observed before the completion line -- wall_s falls \
-                 back to spawn -> completion, and startup_s is not recorded for this repeat"
-            );
-            (None, completion.at - spawned_at)
-        }
-    };
+    // no load even begins arriving at until it's done -- folding it into `wall` would count it as
+    // part of the graph's own per-event cost.
+    let deadline = Instant::now() + timeout;
+    let mut ready_at: Option<Instant> = None;
+    let mut load = None;
+    let wall_ends_at;
 
-    let events = match completion.events {
-        Some(events) => events,
-        None => {
-            let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
-            bail!(
-                "`generation complete` line has no numeric `events` field; stderr:\n{stderr_text}"
-            );
+    match drive {
+        Drive::Generated { count } => {
+            let completion = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match event_rx.recv_timeout(remaining) {
+                    Ok(ChildEvent::Ready(at)) => ready_at = Some(at),
+                    Ok(ChildEvent::Complete { at, events }) => break Some((at, events)),
+                    Err(_) => break None,
+                }
+            };
+            let Some((at, events)) = completion else {
+                let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                bail!(
+                    "no `generation complete` line within {}s; stderr:\n{stderr_text}",
+                    timeout.as_secs()
+                );
+            };
+            if ready_at.is_none() {
+                // `ready` missing at all (a binary built without the log line, or a race this
+                // harness doesn't expect) falls back to the old spawn -> completion measurement,
+                // loudly, rather than silently reporting a startup-inflated number.
+                eprintln!(
+                    "warning: no `ready` line observed before the completion line -- wall_s falls \
+                     back to spawn -> completion, and startup_s is not recorded for this repeat"
+                );
+            }
+            let events = match events {
+                Some(events) => events,
+                None => {
+                    let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                    bail!(
+                        "`generation complete` line has no numeric `events` field; stderr:\n{stderr_text}"
+                    );
+                }
+            };
+            if events != count {
+                let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                bail!(
+                    "generate_in reported {events} events but the scenario's `count` is {count} -- \
+                     events/s and CPU us/event would be measured against the wrong denominator; \
+                     stderr:\n{stderr_text}"
+                );
+            }
+            wall_ends_at = at;
         }
-    };
-    if events != count {
-        let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
-        bail!(
-            "generate_in reported {events} events but the scenario's `count` is {count} -- \
-             events/s and CPU us/event would be measured against the wrong denominator; \
-             stderr:\n{stderr_text}"
-        );
+        Drive::Driven { plan, pin_sender } => {
+            // Hard-required, not best-effort: a driven scenario has no completion line to fall
+            // back on, and sending before the listener's socket exists would be recorded as loss
+            // that never happened (or, on a connected socket, as a burst of `ECONNREFUSED`).
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match event_rx.recv_timeout(remaining) {
+                    Ok(ChildEvent::Ready(at)) => {
+                        ready_at = Some(at);
+                        break;
+                    }
+                    // A driven scenario has no generator, so this can't happen -- but ignoring it
+                    // rather than matching exhaustively-by-panic keeps a surprise in the child's
+                    // logging from taking down the harness.
+                    Ok(ChildEvent::Complete { .. }) => continue,
+                    Err(_) => {
+                        let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                        bail!(
+                            "no `ready` line within {}s -- a driven scenario cannot start sending \
+                             until the listener's socket is bound; stderr:\n{stderr_text}",
+                            timeout.as_secs()
+                        );
+                    }
+                }
+            }
+            match load::blast(plan, pin_sender) {
+                Ok(outcome) => {
+                    wall_ends_at = Instant::now();
+                    load = Some(outcome);
+                }
+                Err(err) => {
+                    let stderr_text = kill_and_reap(&mut child, stdout_drain, stderr_reader);
+                    return Err(err).with_context(|| {
+                        format!("blasting {} ; child stderr:\n{stderr_text}", plan.target)
+                    });
+                }
+            }
+        }
     }
+
+    let (startup, wall) = match ready_at {
+        Some(ready_at) => (Some(ready_at.duration_since(spawned_at)), wall_ends_at - ready_at),
+        None => (None, wall_ends_at - spawned_at),
+    };
 
     if needs_sigterm {
         std::thread::sleep(settle);
@@ -462,7 +920,7 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Sample
         None => bail!("terminated by signal (raw status {}); stderr:\n{stderr_text}", usage.status),
     }
 
-    Ok(Sample::from_usage(count, startup, usage.wall, usage.user, usage.sys, usage.max_rss_bytes))
+    Ok(Measured { startup, usage, load })
 }
 
 /// Builds `logit` under `profile` (unless `no_build`) and returns the path to the binary,
@@ -682,6 +1140,55 @@ fn print_table(report: &RunReport) {
     }
 }
 
+/// The socket-side half of a driven scenario's story, printed only when there is one. A separate
+/// table rather than more columns on the first: seven of these nine numbers are `null` for every
+/// generated scenario, and a table two-thirds empty reads worse than two tables.
+fn print_udp_table(report: &RunReport) {
+    let driven: Vec<(&String, &UdpSample)> = report
+        .scenarios
+        .iter()
+        .filter_map(|(name, scenario)| scenario.median.udp.as_ref().map(|udp| (name, udp)))
+        .collect();
+    if driven.is_empty() {
+        return;
+    }
+    println!(
+        "\n{:<22} {:>11} {:>11} {:>11} {:>11} {:>12} {:>8} {:>9}",
+        "scenario",
+        "sent dg",
+        "recv dg",
+        "kern drop",
+        "queue drop",
+        "delivered",
+        "drop %",
+        "rcvbuf"
+    );
+    for (name, udp) in driven {
+        println!(
+            "{:<22} {:>11} {:>11} {:>11} {:>11} {:>12} {:>7.2}% {:>8.2}",
+            name,
+            udp.sent_datagrams,
+            udp.received_datagrams,
+            udp.kernel_dropped,
+            udp.queue_dropped,
+            udp.events_delivered,
+            100.0 * udp.drop_rate(),
+            udp.kernel_rcvbuf_utilization_max,
+        );
+    }
+}
+
+/// The per-repeat line's UDP tail: only the two numbers worth reading at a glance while a run is
+/// still going, with the full picture left to [`print_udp_table`].
+fn format_udp_suffix(udp: UdpSample) -> String {
+    format!(
+        ", {} sent / {} delivered ({:.2}% dropped)",
+        udp.sent_datagrams,
+        udp.events_delivered,
+        100.0 * udp.drop_rate()
+    )
+}
+
 /// Renders an optional startup time the way every "unknown" numeric field in this crate's output
 /// reads -- never a bare Rust `None`. Shared by the per-repeat line and the summary table.
 fn format_startup(startup_s: Option<f64>) -> String {
@@ -691,6 +1198,7 @@ fn format_startup(startup_s: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logit_core::{AttrMap, Event, MetricRecord};
 
     #[test]
     fn logit_binary_path_maps_the_dev_profile_to_the_debug_directory() {
@@ -784,5 +1292,174 @@ mod tests {
         assert_eq!(sanitize_label("baseline v2"), "baseline_v2");
         assert_eq!(sanitize_label("a/b:c"), "a_b_c");
         assert_eq!(sanitize_label("fine-name_1"), "fine-name_1");
+    }
+
+    /// One point as an `internal` drain would emit it, under the identity attributes
+    /// `ComponentBuffer::drain` stamps on every one of them.
+    fn point(component: &str, metric: &str, kind: MetricKind) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("component", component);
+        Event::metric(0, attrs, MetricRecord::new(interner::intern(metric), kind))
+    }
+
+    fn keyed_point(component: &str, metric: &str, key: &str, kind: MetricKind) -> Event {
+        let mut attrs = AttrMap::new();
+        attrs.insert("component", component);
+        attrs.insert("key", key);
+        Event::metric(0, attrs, MetricRecord::new(interner::intern(metric), kind))
+    }
+
+    #[test]
+    fn input_stats_sums_counters_and_takes_the_high_water_mark_of_the_gauge() {
+        let events = vec![
+            point("statsd", INPUT_DATAGRAMS, MetricKind::counter(600.0)),
+            point("statsd", INPUT_DATAGRAMS, MetricKind::counter(400.0)),
+            point("statsd", KERNEL_DROPS, MetricKind::counter(7.0)),
+            point("statsd", KERNEL_DROPS, MetricKind::counter(3.0)),
+            point("statsd", DATAGRAMS_DROPPED, MetricKind::counter(5.0)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.25)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.91)),
+            point("statsd", RCVBUF_UTILIZATION, MetricKind::Gauge(0.10)),
+            // Another component's numbers must not be folded in.
+            point("out", INPUT_DATAGRAMS, MetricKind::counter(999.0)),
+        ];
+        let stats = input_stats(&events, "statsd");
+        assert_eq!(stats.datagrams, 1_000);
+        assert_eq!(stats.kernel_drops, 10);
+        assert_eq!(stats.queue_dropped, 5);
+        assert!((stats.rcvbuf_utilization_max - 0.91).abs() < 1e-9);
+        assert!(stats.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn input_stats_keeps_diagnostics_apart_by_key() {
+        let events = vec![
+            keyed_point("statsd", DIAGNOSTICS, "bad_line", MetricKind::counter(3.0)),
+            keyed_point("statsd", DIAGNOSTICS, "bad_line", MetricKind::counter(4.0)),
+            keyed_point("statsd", DIAGNOSTICS, "bad_datagram", MetricKind::counter(1.0)),
+        ];
+        let stats = input_stats(&events, "statsd");
+        assert_eq!(stats.diagnostics.get("bad_line"), Some(&7));
+        assert_eq!(stats.diagnostics.get("bad_datagram"), Some(&1));
+    }
+
+    #[test]
+    fn a_kernel_drops_metric_that_never_appeared_reads_as_zero() {
+        // `logit.input.kernel.drops` is not emitted when its delta is zero, so "absent" has to
+        // mean "none", not "unknown".
+        let stats =
+            input_stats(&[point("statsd", INPUT_DATAGRAMS, MetricKind::counter(5.0))], "statsd");
+        assert_eq!(stats.kernel_drops, 0);
+    }
+
+    fn driven_scenario() -> Scenario {
+        let spec: load::LoadSpec = serde_norway::from_str(
+            "target: statsd\ndatagrams: 100\nmodel: m.yaml\ndatagram_mix:\n  - { weight: 1, single: true }\n",
+        )
+        .unwrap();
+        Scenario {
+            name: "udp-statsd".to_string(),
+            path: PathBuf::from("/repo/perf/scenarios/udp-statsd.yaml"),
+            workload: Workload::Driven(spec),
+            needs_sigterm: true,
+            disk_spool_paths: Vec::new(),
+        }
+    }
+
+    fn plan_for(datagrams: u64) -> LoadPlan {
+        let spec: load::LoadSpec = serde_norway::from_str(&format!(
+            "target: statsd\ndatagrams: {datagrams}\nring_datagrams: 8\nmodel: m.yaml\ndatagram_mix:\n  - {{ weight: 1, single: true }}\n"
+        ))
+        .unwrap();
+        let model: load::LineModel =
+            serde_norway::from_str("lines:\n  - { weight: 1, template: \"a.{seq%3}:1|c\" }\n")
+                .unwrap();
+        let ring = load::Ring::render(&spec, &model).unwrap();
+        LoadPlan {
+            spec,
+            spec_path: PathBuf::from("/repo/perf/load/udp-statsd.yaml"),
+            ring,
+            target: "127.0.0.1:18125".parse().unwrap(),
+        }
+    }
+
+    fn udp_sample(sent: u64, received: u64, kernel: u64, delivered: u64) -> UdpSample {
+        UdpSample {
+            sent_datagrams: sent,
+            sent_lines: sent,
+            received_datagrams: received,
+            kernel_dropped: kernel,
+            queue_dropped: 0,
+            events_delivered: delivered,
+            send_errors: 0,
+            kernel_rcvbuf_utilization_max: 0.5,
+        }
+    }
+
+    #[test]
+    fn self_check_accepts_a_run_whose_accounting_closes() {
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        let udp = udp_sample(100, 90, 10, 90);
+        self_check(&scenario, &plan, &udp, &InputStats::default(), false).unwrap();
+    }
+
+    #[test]
+    fn self_check_rejects_a_run_whose_accounting_does_not_close() {
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        let udp = udp_sample(100, 90, 5, 90);
+        let err = self_check(&scenario, &plan, &udp, &InputStats::default(), false)
+            .expect_err("95 accounted for out of 100 sent");
+        let err = format!("{err:#}");
+        assert!(err.contains("does not close"), "{err}");
+        assert!(err.contains("off by 5"), "{err}");
+    }
+
+    #[test]
+    fn self_check_rejects_any_decode_diagnostic() {
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        let udp = udp_sample(100, 100, 0, 100);
+        let mut input = InputStats::default();
+        input.diagnostics.insert("bad_line".to_string(), 12);
+        let err = self_check(&scenario, &plan, &udp, &input, false)
+            .expect_err("a malformed line means the wrong path is being measured");
+        assert!(format!("{err:#}").contains("bad_line=12"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_requires_zero_drops_and_an_exact_delivered_count() {
+        let scenario = driven_scenario();
+        let plan = plan_for(100);
+        // The ring is one single-value counter line per datagram, so 100 datagrams is 100 events.
+        assert_eq!(plan.expected().events, 100);
+
+        self_check(&scenario, &plan, &udp_sample(100, 100, 0, 100), &InputStats::default(), true)
+            .expect("an exact, lossless run verifies");
+
+        let dropped =
+            self_check(&scenario, &plan, &udp_sample(100, 99, 1, 99), &InputStats::default(), true)
+                .expect_err("--verify requires a zero-drop run");
+        assert!(format!("{dropped:#}").contains("zero-drop"), "{dropped:#}");
+
+        let short = self_check(
+            &scenario,
+            &plan,
+            &udp_sample(100, 100, 0, 97),
+            &InputStats::default(),
+            true,
+        )
+        .expect_err("--verify requires an exact delivered count");
+        assert!(format!("{short:#}").contains("exactly 100 events"), "{short:#}");
+    }
+
+    #[test]
+    fn a_driven_scenario_never_settles_for_less_than_the_floor() {
+        // Not a test of `run_one_driven` (which needs a child process) but of the one line in it
+        // that matters for the accounting check: whatever `--settle` says, a driven scenario waits
+        // at least `DRIVEN_SETTLE_FLOOR`.
+        assert_eq!(Duration::from_millis(1).max(DRIVEN_SETTLE_FLOOR), DRIVEN_SETTLE_FLOOR);
+        assert_eq!(Duration::from_secs(10).max(DRIVEN_SETTLE_FLOOR), Duration::from_secs(10));
     }
 }

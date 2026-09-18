@@ -1,0 +1,29 @@
+# Real-socket UDP intake, mixed datagram packing -- the headline scenario of ADR
+# `udp-intake-batching-and-socket-visibility`. Unlike every other scenario here there is **no
+# `generate_in`**: the load arrives over a real loopback UDP socket, sent by `logit-perf` itself
+# from the sidecar load spec `perf/load/udp-statsd.yaml`.
+#
+#   script/perf run --scenario udp-statsd --repeat 5 --pin-sender 1 --pin-child 2
+#
+# Pins are not optional here (see docs/design/performance.md's "Driven scenarios" note): this dev
+# box has heterogeneous cores, and an unpinned UDP run is bimodal by roughly 2x.
+#
+# Still an ordinary `logit` config, run the same way an operator would
+# (`logit run perf/scenarios/udp-statsd.yaml`) -- it just sits there listening until something
+# sends to it, which is exactly what `script/validate` and the shipped-config test need it to be.
+#
+# `receive_buffer_bytes` is deliberately small relative to the offered load: the point of this
+# scenario family is the regime where the kernel is *close to* dropping, so `logit.input.kernel.drops`
+# and `receive_buffer.utilization` have something to say. See perf/load/README.md for the tuning.
+components:
+  statsd:
+    type: statsd_in
+    bind: 127.0.0.1:18125
+    receive:
+      # 1 MiB requested; Linux grants double and clamps at net.core.rmem_max (4 MiB in this
+      # container). perf/load/README.md records what was actually granted.
+      receive_buffer_bytes: 1MiB
+
+  out:
+    type: null_out
+    sources: [statsd]
