@@ -291,11 +291,15 @@ portable across targets), and is documented as ignored.
 rsyslog's `imudp` both default their own batch-equivalent knob in the same rough range (rsyslog's
 reference high-throughput config sets `batchSize: 128`; gostatsd's `--receive-batch-size` defaults to
 50), and 64 sat between them as a starting point. The sweep says it is past the knee for both shapes
-of traffic this family models, and that where the knee is has almost nothing to do with 64 itself.
+of traffic this family models, and that where the knee is has almost nothing to do with 64 itself. A
+second sweep on an isolated Azure VM (`docs/design/performance.md` §7) confirms the same plateau
+shape and the choice of 64 — that part is no longer a laptop-only claim.
 
 `read_batch` ∈ {1, 16, 32, 64, 128, 256}, `--repeat 3`, pinned `--pin-sender 0,1 --pin-child 2,3`,
 each value set on both scenarios at once, everything else held (see "Pinned runs only" and the
-`powersave` caveat below — these are provisional numbers, not final ones):
+`powersave` caveat below — the absolute µs/event figures in this table are still this laptop
+session's own, not re-taken on the VM, but the plateau shape and the choice of 64 are now confirmed
+independently, see above):
 
 | `read_batch` | **`udp-statsd-small`** µs/ev | fill | kernel drop % | max rcvbuf | | **`udp-statsd`** µs/ev | fill | kernel drop % | max rcvbuf |
 |---|---|---|---|---|---|---|---|---|---|
@@ -327,12 +331,17 @@ rather than the 16 MiB/64 MiB a higher default would ask every listener to reser
 knob still earns its place: a deployment whose fill sits pinned at 64 is telling its operator that
 its arrival bursts are larger than this default, and `docs/deploying.md` says so in those terms.
 
-**The slab is not resident, and the sweep is the proof.** `udp-statsd-small`'s peak RSS is
-**21.7 MiB at every one of `read_batch` 16, 32, 64, 128 and 256** — a sixteenfold change in the
-nominal size of the read slab (1 MiB to 16 MiB) with no movement in resident memory at all, because
-`vec![0u8; n]` under this codebase's jemalloc is a fresh zeroed mapping and a small datagram touches
-one 4 KiB page of each 65,507-byte slot. `docs/design/memory.md` §5 carries the direct probe
-alongside it.
+**The slab is not resident, and the sweep is the proof — on this box.** `udp-statsd-small`'s peak
+RSS is **21.7 MiB at every one of `read_batch` 16, 32, 64, 128 and 256** — a sixteenfold change in
+the nominal size of the read slab (1 MiB to 16 MiB) with no movement in resident memory at all,
+because `vec![0u8; n]` under this codebase's jemalloc is a fresh zeroed mapping and a small
+datagram touches one 4 KiB page of each 65,507-byte slot. `docs/design/memory.md` §5 carries the
+direct probe alongside it. **This does not hold everywhere:** the same sweep repeated on an Azure
+VM with transparent huge pages set to `always` (`docs/design/performance.md` §7) found peak RSS
+rising noticeably at `read_batch` 128/256, likely (not yet confirmed) because touching one 4 KiB
+page per slot under `THP=always` faults in the whole enclosing 2 MiB huge page, making most of the
+slab resident rather than just the touched pages. "The slab is not resident" is a claim about this
+dev container's THP setting (`madvise`/`never`), not a universal one.
 
 **Ceiling 1024 = `UIO_MAXIOV`.** `recvmmsg` takes an array of `mmsghdr`, each wrapping an `iovec`;
 `UIO_MAXIOV` (1024 on Linux) is the kernel's hard limit on how many `iovec`s a single vectored I/O

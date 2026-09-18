@@ -1210,6 +1210,18 @@ a ~4 MiB one. `docs/deploying.md`'s "Listener intake" section is where an operat
 `logit.input.datagrams / logit.input.reads` ratio that says whether raising it would buy anything at
 all.
 
+**Caveat, likely but not confirmed:** the figures above were measured in the dev container, where
+transparent huge pages are `madvise`/`never` and the "untouched pages are never faulted in" argument
+holds cleanly. A `read_batch` sweep on an Azure VM with THP set to `always`
+(`docs/design/performance.md` §7) instead found peak RSS *rising* with `read_batch` at 128/256 — an
+arithmetic fit against `read_batch × 65,507` bytes (4/8/16 MiB at 64/128/256) suggests that under
+`THP=always`, touching one 4 KiB page per slot faults in the whole enclosing 2 MiB huge page, making
+the entire slab resident rather than just the touched pages. This is the likely explanation, not a
+confirmed one — it wants a same-box run with THP forced to `madvise`/`never` to isolate it — but the
+practical consequence is real either way: this section's "the slab is not resident" claim holds
+where THP is `madvise`/`never` (this dev container), and does not hold under `THP=always`, where the
+shipped default `read_batch: 64` can cost up to ~4 MiB of real resident memory per UDP listener.
+
 ## 6. The allocator
 
 `logit` runs a multi-threaded tokio runtime plus one OS thread per Lua component, allocating and

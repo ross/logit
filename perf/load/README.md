@@ -284,3 +284,20 @@ so neither is ever competing with the other for a core and neither lands on an e
 `--pin-child` is applied between `fork` and `exec`, so every thread the child ever creates inherits
 the mask — pinning after spawn would leave the threads created during startup on whatever CPU the
 scheduler picked.
+
+## Portability notes from the Azure perf-VM session
+
+- **Rates are hardware-specific and must be recalibrated per box.** The shipped specs' rates are
+  tuned against this dev laptop; an `Standard_F4as_v6` Azure VM's cores needed `--rate-scale`
+  0.49–0.83 (roughly half, and non-uniformly across scenarios) to reach the same 1–5% calibration
+  target this README's "Tuning" section describes. Don't assume a rate that's calibrated on one box
+  carries over to another — retune whenever the receiver's own speed changes, and that includes a
+  change of *box*, not just a change of code.
+- **Give each ref its own `CARGO_TARGET_DIR` when building several for one comparison.** Building
+  multiple refs' binaries under one shared target directory (even across separate source trees
+  extracted at nearly the same wall-clock time) let cargo's mtime-based fingerprinting falsely match
+  a later ref's freshly-extracted files against an earlier ref's build record, silently reusing the
+  earlier binary under the later ref's label — caught only by comparing sha256 checksums, not by
+  build output (the reused build reported `0.11s` and zero `Compiling` lines, which is itself a
+  tell). Use a distinct `CARGO_TARGET_DIR` per ref, and verify each binary's checksum before every
+  run, not just once at the start of a session.

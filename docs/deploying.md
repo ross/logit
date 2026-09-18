@@ -530,8 +530,11 @@ here has always been sized to), allocated once at startup. At the default that i
 *address space* and, in practice, a few hundred KiB of real memory — only the pages a datagram is
 actually written into are ever faulted in, so a listener seeing ordinary small statsd or syslog
 datagrams touches one 4 KiB page per slot and no more (`docs/design/memory.md` §5 has the measured
-figures). The ceiling of 1024 is a ~4 MiB resident decision on that traffic, not a 64 MiB one — but
-it is still 64 MiB of address space per listener, and there is rarely a reason to go near it.
+figures) — but this holds only where transparent huge pages are `madvise`/`never`; under
+`THP=always` a touched page can fault in its whole enclosing 2 MiB huge page, making a much larger
+share of the slab resident (`docs/design/performance.md` §7). The ceiling of 1024 is a ~4 MiB
+resident decision on that traffic, not a 64 MiB one — but it is still 64 MiB of address space per
+listener, and there is rarely a reason to go near it.
 
 **One thing it widens.** A shutdown landing while the reader is handing a batch to a full queue
 drops whatever it was still holding, uncounted — up to `read_batch` datagrams now, rather than

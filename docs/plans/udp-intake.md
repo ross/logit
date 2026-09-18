@@ -223,13 +223,26 @@ several times over, and `udp-statsd`/`udp-statsd-packed` staying inside drift at
 itself the finding (the decode-bound scenarios have little of this family's cost left to save), not
 an absence of one. `docs/design/performance.md` §7 is where that read-out lives.
 
+**Measurement is now done**, per this section's own premise: the numbers in `docs/design/performance.md`
+§7 were re-taken on a dedicated, isolated Azure VM (`script/vm`) as interleaved one-sitting pairs at
+two calibrated operating points, superseding the throttling-laptop numbers this plan's tables
+originally carried (those remain only in PRs #252-#254's descriptions). The VM session settled the
+peak-RSS question this plan left open: RSS *falls* w3→w4 at the knee (the laptop's provisional rise
+does not reproduce), closing that item outright.
+
 **Residual debt**, tracked in `docs/known-gaps.md` unless noted otherwise:
 
-- **`docs/design/performance.md` §7's "Open after this workstream" list**: the +7–32% peak-RSS rise
-  on `udp-statsd`/`udp-statsd-packed` at W4 has no settled attribution yet (the slab is ruled out; a
-  1 s probe's queue-depth reading argues against the working "more bytes in flight" guess as much as
-  for it); and every number in this plan's tables is provisional, taken on a throttling laptop on
-  battery, pending the lead's re-take on a stable box.
+- **A per-binary capacity metric.** The VM session calibrated its offered-load knee on `udp/w2`
+  only and ran w3/w4 at that same load; bisecting the highest loss-free offered rate separately for
+  each binary is the honest headline for syscall-bound traffic and was not done.
+- **Confirm the THP explanation for the `read_batch`-sweep RSS rise.** The VM (THP `always`) showed
+  peak RSS rising at `read_batch` 128/256, fitting a "whole huge page faulted in" hypothesis
+  (`docs/design/performance.md` §7); this wants a repeat with THP forced to `madvise`/`never` on the
+  same box to confirm.
+- **The wakeup-cost hypothesis for small datagrams on VMs.** `udp-statsd-small`'s higher per-event
+  CPU at half scale than at the knee is consistent with a fixed per-wakeup cost a virtualized guest
+  pays disproportionately for at low arrival rates, but this is a hypothesis, not a measurement of
+  wakeup cost directly.
 - **"A UDP listener's read and decode loops share one task"** (`docs/known-gaps.md`, new this
   workstream) — W4's report-only, unshipped experiment found real headroom in splitting them
   (`udp-statsd-small` CPU/event −12%, `udp-statsd` kernel drops to zero) at a real cost (+5.6%
@@ -244,8 +257,3 @@ an absence of one. `docs/design/performance.md` §7 is where that read-out lives
 - **UDP sink send-error counting by errno** (`statsd_out`/`syslog_out`/`graphite_out`/`collectd_out`)
   is named and not built — `SockMeminfo`'s send-side fields are read but not emitted as metrics,
   since a UDP send-buffer gauge is ~always zero and the errno at the call site is the real signal.
-- **A cloud-VM (or otherwise plugged-in, cooled, dedicated) perf rig is under consideration** for
-  this family specifically, not just as general harness hygiene — `udp-statsd*`'s drop rate is
-  deliberately the difference between two nearly-equal rates, which is exactly the kind of number a
-  laptop on battery under thermal throttle cannot hold still long enough to trust without the
-  interleaved-pair discipline this plan had to invent to work around it.
