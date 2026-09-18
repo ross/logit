@@ -1,13 +1,15 @@
 # Recorded interop fixtures
 
 Real wire traffic captured once from real third-party producers (syslog senders, collectd, OTel
-SDKs) and committed here, so `logit`'s decoders (`crates/logit-inputs/src/syslog.rs`,
-`crates/logit-proto/src/collectd/`, `crates/logit-proto/src/otlp/`) get checked against what those
-producers actually put on the wire -- not only against this team's own reading of RFC 3164/5424,
-collectd's `network.c` or the OTLP spec, and not only against `logit`'s own encoder, which will
-happily agree with itself even if both sides share the same misunderstanding. See
+SDKs, carbon senders, Prometheus) and committed here, so `logit`'s decoders
+(`crates/logit-inputs/src/syslog.rs`, `crates/logit-proto/src/collectd/`,
+`crates/logit-proto/src/otlp/`, `crates/logit-proto/src/graphite/`,
+`crates/logit-proto/src/prometheus/remote_write.rs`) get checked against what those producers
+actually put on the wire -- not only against this team's own reading of RFC 3164/5424, collectd's
+`network.c`, the OTLP spec or the remote-write spec, and not only against `logit`'s own encoder,
+which will happily agree with itself even if both sides share the same misunderstanding. See
 [`docs/plans/recorded-interop-fixtures.md`](../../docs/plans/recorded-interop-fixtures.md)
-for the full design and rationale; this file and the three below it are the provenance record
+for the full design and rationale; this file and the ones below it are the provenance record
 [ADR `committed-pregenerated-otlp-protobuf`](../../docs/adr/committed-pregenerated-otlp-protobuf.md)
 and `testdata/tls/README.md` both establish for committed, regeneratable test artifacts.
 
@@ -18,21 +20,30 @@ code, same as `testdata/tls/`.
 
 ```
 testdata/interop/
-  syslog/README.md    -- provenance table for syslog/*.raw
-  syslog/*.raw        -- raw captured UDP datagrams, exactly as received, one file per message
-  collectd/README.md  -- provenance table for collectd/*.raw
-  collectd/*.raw      -- raw captured UDP datagrams from collectd's own binary `network` plugin,
-                         one file per datagram (each one packs many value lists)
-  otlp/README.md      -- provenance table for otlp/*.json
-  otlp/*.json         -- OTLP/JSON as re-emitted by the Collector's own `file` exporter
-  graphite/README.md  -- provenance table for graphite/*.raw
-  graphite/*.raw      -- raw captured TCP connection streams: real carbon plaintext (collectd's
-                         `write_graphite` plugin) and real carbon pickle frames (a stdlib Python
-                         producer), one file per accepted connection
+  syslog/README.md     -- provenance table for syslog/*.raw
+  syslog/*.raw         -- raw captured UDP datagrams, exactly as received, one file per message
+  collectd/README.md   -- provenance table for collectd/*.raw
+  collectd/*.raw       -- raw captured UDP datagrams from collectd's own binary `network` plugin,
+                          one file per datagram (each one packs many value lists)
+  otlp/README.md       -- provenance table for otlp/*.json
+  otlp/*.json          -- OTLP/JSON as re-emitted by the Collector's own `file` exporter
+  graphite/README.md   -- provenance table for graphite/*.raw
+  graphite/*.raw       -- raw captured TCP connection streams: real carbon plaintext (collectd's
+                          `write_graphite` plugin) and real carbon pickle frames (a stdlib Python
+                          producer), one file per accepted connection
+  prometheus/README.md -- provenance table for prometheus/*.bin
+  prometheus/*.bin     -- Snappy-compressed protobuf remote-write request bodies, exactly as a real
+                          Prometheus POSTed them, one file per request
+  prometheus/*.headers -- one sidecar per body, holding that request's method, path and request
+                          headers -- which is what carries the `Content-Type` and
+                          `X-Prometheus-Remote-Write-Version` the wire version is read from
 ```
 
-`syslog/*.raw`/`collectd/*.raw`/`graphite/*.raw` and `otlp/*.json` are captured differently on
-purpose, not inconsistently -- see each subdirectory's own README for why.
+`syslog/*.raw`/`collectd/*.raw`/`graphite/*.raw`, `otlp/*.json` and `prometheus/*.bin` are captured
+differently on purpose, not inconsistently -- an HTTP exchange needs a response before the sender
+will send anything more, so the Prometheus corpus comes from `raw_capture.py --proto http`, which
+answers `204`, rather than from the read-only UDP/TCP sinks the `*.raw` corpora use. See each
+subdirectory's own README for the rest.
 
 ## Regenerating
 
