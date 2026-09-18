@@ -1723,6 +1723,25 @@ mod tests {
         })
     }
 
+    /// [`counter_in`] for a gauge -- `Telemetry::gauge` records a `MetricKind::Gauge`, which that
+    /// helper deliberately does not match (a counter read as a gauge would hide a spelling bug).
+    fn gauge_in(events: &[Event], metric: &str, tag: (&str, &str)) -> Option<f64> {
+        events.iter().find_map(|e| {
+            if e.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1) {
+                return None;
+            }
+            e.metrics.iter().find_map(|m| {
+                if logit_core::interner::resolve(m.name) != metric {
+                    return None;
+                }
+                match m.kind {
+                    MetricKind::Gauge(value) => Some(value),
+                    _ => None,
+                }
+            })
+        })
+    }
+
     #[tokio::test]
     async fn a_successful_text_scrape_decodes_series_and_reports_up_one() {
         let (addr, _captured) = canned_server(CannedResponse::Body {
@@ -2623,9 +2642,10 @@ mod tests {
         );
     }
 
-    /// The stateless receiver's known limitation, pinned: Prometheus's own 1.0 sender ships
-    /// `MetricMetadata` in *separate* requests, so a request carrying only samples decodes as
-    /// `Unknown` families until the metadata cache (W5) lands. The samples themselves are exact.
+    /// What a receiver with **no** metadata cache does with Prometheus's own 1.0 sender, which
+    /// ships `MetricMetadata` in *separate* requests: a request carrying only samples decodes as
+    /// `Unknown` families. The samples themselves are exact. `metadata_cache:` is what closes
+    /// this -- see the cache's own tests below, which are this test with a table behind it.
     #[tokio::test]
     async fn a_1_0_request_without_metadata_decodes_as_unknown_families() {
         use logit_proto::prometheus::generated::prometheus as pb1;
@@ -3044,5 +3064,416 @@ mod tests {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    // ---- bind mode: the metadata cache --------------------------------------------------------
+    //
+    // The 1.0 shape these are all about: one request declares a family and carries no samples,
+    // later requests carry its samples and declare nothing. `remote_write::encode` never produces
+    // either half on its own -- it writes a `metadata[]` entry for every family it has series for
+    // -- so the wire messages here are hand-built, exactly as `a_1_0_request_without_metadata_…`
+    // builds its own.
+
+    use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
+    use logit_proto::prometheus::generated::prometheus as pb1;
+    use prost::Message as _;
+
+    /// A 1.0 request that declares `foo` and carries nothing else -- what Prometheus's sender
+    /// writes on its `metadata_config` schedule.
+    fn v1_metadata_only(kind: pb1::metric_metadata::MetricType, help: &str, unit: &str) -> Vec<u8> {
+        let request = pb1::WriteRequest {
+            timeseries: Vec::new(),
+            metadata: vec![pb1::MetricMetadata {
+                r#type: kind as i32,
+                metric_family_name: "foo".to_string(),
+                help: help.to_string(),
+                unit: unit.to_string(),
+            }],
+        };
+        snappy(&request.encode_to_vec())
+    }
+
+    fn v1_sample(name: &str, extra: Option<(&str, &str)>, value: f64) -> pb1::TimeSeries {
+        // Labels sorted by byte order, as both specs require of a sender: `__name__` first here
+        // because `_` (0x5f) sorts below every lowercase letter.
+        let mut labels = vec![pb1::Label { name: "__name__".to_string(), value: name.to_string() }];
+        if let Some((key, value)) = extra {
+            labels.push(pb1::Label { name: key.to_string(), value: value.to_string() });
+        }
+        pb1::TimeSeries {
+            labels,
+            samples: vec![pb1::Sample { value, timestamp: 1_700_000_000_000 }],
+            exemplars: Vec::new(),
+            histograms: Vec::new(),
+        }
+    }
+
+    /// The three flat series one classic histogram is spelled as, with no metadata at all.
+    fn v1_histogram_samples_only() -> Vec<u8> {
+        let request = pb1::WriteRequest {
+            timeseries: vec![
+                v1_sample("foo_bucket", Some(("le", "+Inf")), 7.0),
+                v1_sample("foo_count", None, 7.0),
+                v1_sample("foo_sum", None, 2.5),
+            ],
+            metadata: Vec::new(),
+        };
+        snappy(&request.encode_to_vec())
+    }
+
+    /// The one histogram record a decoded `foo` family becomes, or `None` if the request decoded
+    /// to something flatter.
+    fn histogram_record(batch: &EventBatch) -> Option<&MetricRecord> {
+        batch.events.iter().flat_map(|e| e.metrics.iter()).find(|m| {
+            logit_core::interner::resolve(m.name) == "foo"
+                && matches!(m.kind, MetricKind::Histogram(_))
+        })
+    }
+
+    /// The whole point of the feature, end to end over a socket: a metadata-only request teaches
+    /// the receiver what `foo` is, and the samples-only request that follows -- carrying no
+    /// metadata whatsoever, which is every request a real 1.0 sender writes -- decodes as one
+    /// typed `Histogram` with its help and unit, instead of three unrelated `unknown` series.
+    #[tokio::test]
+    async fn a_metadata_only_request_types_the_samples_only_request_that_follows() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver
+            .with_telemetry(telemetry)
+            .with_metadata_cache(10_000, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let declare = v1_metadata_only(
+            pb1::metric_metadata::MetricType::Histogram,
+            "Request duration.",
+            "seconds",
+        );
+        let response =
+            post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        assert!(rx.try_recv().is_err(), "a metadata-only request carries no samples to send");
+
+        let samples = v1_histogram_samples_only();
+        let response =
+            post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+
+        let batch = recv_batch_async(&mut rx).await;
+        let record = histogram_record(&batch).expect("the cached type assembles one histogram");
+        assert_eq!(
+            record.description.map(logit_core::interner::resolve),
+            Some("Request duration."),
+            "help is remembered too, not just the type"
+        );
+        assert_eq!(record.unit.map(logit_core::interner::resolve), Some("seconds"));
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "three wire series, one model record: {:#?}",
+            batch.events
+        );
+        // No `prometheus.type` marker: `MetricKind::Histogram` *is* the type, and the marker
+        // exists only for the family types the model has no kind of its own for.
+        assert_eq!(batch.events[0].attributes.get(ATTR_TYPE), None);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            gauge_in(&events, "logit.input.metadata_cache.size", ("component", "receive")),
+            Some(1.0)
+        );
+    }
+
+    /// `max_families: 0` is not a zero-size cache but no cache: the receiver stays on the
+    /// stateless decode path, so the same pair of requests decodes exactly as it did before this
+    /// feature existed -- and nothing is counted, since there is nothing there to count.
+    #[tokio::test]
+    async fn a_disabled_metadata_cache_leaves_the_stateless_decode_path_alone() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver =
+            receiver.with_telemetry(telemetry).with_metadata_cache(0, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let declare = v1_metadata_only(
+            pb1::metric_metadata::MetricType::Histogram,
+            "Request duration.",
+            "seconds",
+        );
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
+        let samples = v1_histogram_samples_only();
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
+
+        let batch = recv_batch_async(&mut rx).await;
+        assert!(histogram_record(&batch).is_none(), "nothing was remembered, so nothing assembled");
+        assert_eq!(batch.events.len(), 3, "three unrelated flat series: {:#?}", batch.events);
+        for event in &batch.events {
+            assert_eq!(event.attributes.get(ATTR_TYPE).and_then(|v| v.as_str()), Some("unknown"));
+        }
+
+        let events = registry.drain(0);
+        assert_eq!(
+            gauge_in(&events, "logit.input.metadata_cache.size", ("component", "receive")),
+            None,
+            "a cache that does not exist reports nothing"
+        );
+    }
+
+    /// A request's own metadata beats the remembered entry, per family name: the sender said `foo`
+    /// is a gauge *now*, however long the receiver has been treating it as a histogram -- and the
+    /// retype is counted, since a steady stream of them is two senders disagreeing about one name.
+    #[tokio::test]
+    async fn a_request_declaration_overrides_a_cached_one() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let receiver = receiver
+            .with_telemetry(telemetry)
+            .with_metadata_cache(10_000, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let declare =
+            v1_metadata_only(pb1::metric_metadata::MetricType::Histogram, "A histogram.", "");
+        post_write(&addr, "/api/v1/write", remote_write::Version::V1, &declare).await;
+
+        // Now a request that says `foo` is a gauge and carries a bare `foo` sample. Under the
+        // cached histogram that sample would have been `skipped{reason="unknown_suffix"}` -- a
+        // histogram has no bare-named sample -- so the family list itself is the assertion.
+        let retype = pb1::WriteRequest {
+            timeseries: vec![v1_sample("foo", None, 3.0)],
+            metadata: vec![pb1::MetricMetadata {
+                r#type: pb1::metric_metadata::MetricType::Gauge as i32,
+                metric_family_name: "foo".to_string(),
+                help: "A gauge, actually.".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let response = post_write(
+            &addr,
+            "/api/v1/write",
+            remote_write::Version::V1,
+            &snappy(&retype.encode_to_vec()),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+
+        let batch = recv_batch_async(&mut rx).await;
+        // A `MetricKind::Gauge` named `foo`, not the `unknown_suffix` skip a bare `foo` sample
+        // would have drawn under the cached histogram.
+        assert_eq!(gauge_value_of(&batch, "foo"), Some(3.0));
+        assert!(histogram_record(&batch).is_none());
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.replaced", ("component", "receive")),
+            Some(1.0),
+            "the retype is counted once"
+        );
+    }
+
+    /// 2.0's inline `Metadata` fills the same table, so a fleet migrating version by version gets
+    /// its 1.0 senders typed by its 2.0 ones -- the family a 2.0 series declares is the base its
+    /// type implies (`foo_bucket` under `HISTOGRAM` declares `foo`), which is exactly the key a
+    /// 1.0 `metadata[]` entry uses.
+    #[tokio::test]
+    async fn a_2_0_request_fills_the_cache_for_a_later_1_0_sender() {
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver = receiver.with_metadata_cache(10_000, Duration::from_secs(600));
+        let mut rx = spawn_receiver(receiver, 4);
+
+        let v2 = pb2::Request {
+            symbols: vec![
+                String::new(),
+                "__name__".to_string(),
+                "foo_bucket".to_string(),
+                "le".to_string(),
+                "+Inf".to_string(),
+                "Request duration.".to_string(),
+                "seconds".to_string(),
+            ],
+            timeseries: vec![pb2::TimeSeries {
+                labels_refs: vec![1, 2, 3, 4],
+                samples: vec![pb2::Sample {
+                    value: 1.0,
+                    timestamp: 1_700_000_000_000,
+                    start_timestamp: 0,
+                }],
+                metadata: Some(pb2::Metadata {
+                    r#type: pb2::metadata::MetricType::Histogram as i32,
+                    help_ref: 5,
+                    unit_ref: 6,
+                }),
+                ..Default::default()
+            }],
+        };
+        let response = post_write(
+            &addr,
+            "/api/v1/write",
+            remote_write::Version::V2,
+            &snappy(&v2.encode_to_vec()),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+        let _ = recv_batch_async(&mut rx).await; // the 2.0 request's own (bucket-only) family
+
+        // Now a 1.0 sender's samples-only write of the same family.
+        let samples = v1_histogram_samples_only();
+        let response =
+            post_write(&addr, "/api/v1/write", remote_write::Version::V1, &samples).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "got: {response}");
+
+        let batch = recv_batch_async(&mut rx).await;
+        let record = histogram_record(&batch).expect("the 2.0 declaration typed the 1.0 request");
+        assert_eq!(
+            record.description.map(logit_core::interner::resolve),
+            Some("Request duration.")
+        );
+        assert_eq!(record.unit.map(logit_core::interner::resolve), Some("seconds"));
+    }
+
+    // ---- the table itself, against a clock a test owns ----------------------------------------
+    //
+    // `Instant` is a parameter of `seed`/`learn` rather than read inside them, so the expiry and
+    // eviction rules are testable without sleeping through a real TTL -- `prometheus_out`'s
+    // exposition registry takes the same shape for the same reason.
+
+    fn declarations(entries: &[(&str, FamilyType)]) -> remote_write::Declarations {
+        let mut declarations = remote_write::Declarations::default();
+        for (name, kind) in entries {
+            declarations.insert(*name, *kind, None, None);
+        }
+        declarations
+    }
+
+    fn seeded_names(seed: &remote_write::Declarations) -> Vec<&str> {
+        let mut names: Vec<&str> = seed.iter().map(|(name, _)| name).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// A family nothing has re-declared within the TTL stops being typed -- its next samples come
+    /// back `unknown` -- and the drop is counted. That is the bound working: a remembered type
+    /// nothing has reasserted is a guess about a series that may no longer exist.
+    #[test]
+    fn a_cached_family_expires_once_its_ttl_has_run_out() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+
+        cache.learn(&declarations(&[("foo", FamilyType::Histogram)]), start, &telemetry);
+        assert_eq!(seeded_names(&cache.seed(start, &telemetry)), ["foo"]);
+
+        // One second inside the window, then one past it.
+        assert_eq!(
+            seeded_names(&cache.seed(start + Duration::from_secs(599), &telemetry)),
+            ["foo"]
+        );
+        let seed = cache.seed(start + Duration::from_secs(601), &telemetry);
+        assert!(seed.is_empty(), "the declaration is no longer trusted");
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.evicted", ("reason", "expired")),
+            Some(1.0)
+        );
+        assert_eq!(
+            gauge_in(&events, "logit.input.metadata_cache.size", ("component", "receive")),
+            Some(0.0)
+        );
+    }
+
+    /// Over the cap the **least-recently-seen** family goes, and "seen" means last declared: a
+    /// family re-declared by a later request outlives one that was inserted after it but never
+    /// mentioned again.
+    #[test]
+    fn the_cardinality_cap_evicts_the_least_recently_seen_family() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(2, Duration::from_secs(600));
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+
+        cache.learn(&declarations(&[("a", FamilyType::Counter)]), at(0), &telemetry);
+        cache.learn(&declarations(&[("b", FamilyType::Counter)]), at(1), &telemetry);
+        // `a` is refreshed, so `b` is now the oldest thing in the table.
+        cache.learn(&declarations(&[("a", FamilyType::Counter)]), at(2), &telemetry);
+        cache.learn(&declarations(&[("c", FamilyType::Counter)]), at(3), &telemetry);
+
+        assert_eq!(seeded_names(&cache.seed(at(3), &telemetry)), ["a", "c"]);
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.evicted", ("reason", "cardinality")),
+            Some(1.0)
+        );
+        assert_eq!(
+            gauge_in(&events, "logit.input.metadata_cache.size", ("component", "receive")),
+            Some(2.0)
+        );
+    }
+
+    /// One request declaring several families over the cap evicts them all in one pass, and the
+    /// tie-break past `last_seen` is the family's own name -- so which of two families declared in
+    /// the same request survives is a function of the data, not of hash order.
+    #[test]
+    fn one_over_cap_request_evicts_in_a_single_pass_and_ties_break_by_name() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(2, Duration::from_secs(600));
+        let now = Instant::now();
+
+        cache.learn(
+            &declarations(&[
+                ("a", FamilyType::Counter),
+                ("b", FamilyType::Counter),
+                ("c", FamilyType::Counter),
+                ("d", FamilyType::Counter),
+            ]),
+            now,
+            &telemetry,
+        );
+
+        assert_eq!(seeded_names(&cache.seed(now, &telemetry)), ["c", "d"]);
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_in(&events, "logit.input.metadata_cache.evicted", ("reason", "cardinality")),
+            Some(2.0),
+            "two evictions, counted once"
+        );
+    }
+
+    /// Re-declaring a family the same way is not a retype: `replaced` is the counter an operator
+    /// watches when model kinds look wrong, and a 1.0 sender repeating itself once a minute
+    /// forever must not move it.
+    #[test]
+    fn relearning_the_same_declaration_is_not_counted_as_a_replacement() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+        let cache = MetadataCache::new(10, Duration::from_secs(600));
+        let start = Instant::now();
+
+        cache.learn(&declarations(&[("foo", FamilyType::Counter)]), start, &telemetry);
+        cache.learn(
+            &declarations(&[("foo", FamilyType::Counter)]),
+            start + Duration::from_secs(60),
+            &telemetry,
+        );
+        assert_eq!(
+            counter_in(
+                &registry.drain(0),
+                "logit.input.metadata_cache.replaced",
+                ("component", "receive")
+            ),
+            None,
+            "a sender repeating itself is not a retype"
+        );
+
+        // And the repeat *did* refresh the entry: it survives a TTL measured from the first.
+        assert_eq!(
+            seeded_names(&cache.seed(start + Duration::from_secs(620), &telemetry)),
+            ["foo"],
+            "last_seen moved with the second declaration"
+        );
     }
 }
