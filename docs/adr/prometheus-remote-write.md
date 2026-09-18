@@ -1,13 +1,19 @@
 ---
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-18
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
 
 ## Status
 
-Accepted
+Accepted — and built. Every workstream in
+[`docs/plans/prometheus-remote-write.md`](../plans/prometheus-remote-write.md) has landed on its
+stacked branch: **W0 #234, W1 #235, W2 #236, W3 #238, W4 #237, W5 #243, W6 #PRNUM**. Per Ross's
+direction the stack is not merged to `main` by this workstream, so "landed" means complete and
+pushed; that plan's own status paragraph is the authority. W5 landing is what makes the
+"stateless receiver" section below a record of the sequencing decision rather than of today's
+behaviour — the bounded metadata cache exists, and `prometheus_in`'s module doc is its spec.
 
 ## Context
 
@@ -90,15 +96,15 @@ the same reason: a setting silently doing nothing is worse than a startup failur
 `interval` keeps its default in bind mode so rule 9's `interval: 0s` rejection stays satisfied
 without a mode-specific carve-out.
 
-**Rule 40's body becomes scrape-mode-only.** It is the rule that today makes bind mode
-unreachable, not rule 9: it runs over every `PrometheusIn` and bails when `scrape_targets` is empty
-(`crates/logit-pipeline/src/graph.rs:1818-1826`, *"'scrape_targets' must name at least one scrape
-URL"*), and its `timeout: 0s` check, its header validation, and its "TLS settings with no `https`
-target" check (`:1854-1856`, bound to the very field this ADR renames `scrape_tls`) are all
-statements about a scrape that bind mode never performs. So rule 40 runs only when
-`scrape_targets` is non-empty, and rule 55 owns everything about the mode itself: the
-exactly-one-of check, and the wrong-mode-field checks in both directions. Two rules, one gate
-each — rather than rule 40 silently acquiring a second job.
+**Rule 40's body becomes scrape-mode-only.** Rule 40, not rule 9, is what made bind mode
+unreachable: it ran over every `PrometheusIn` and bailed when `scrape_targets` was empty
+(*"'scrape_targets' must name at least one scrape URL"*), and its `timeout: 0s` check, its header
+validation, and its "TLS settings with no `https` target" check (now at
+`crates/logit-pipeline/src/graph.rs:1927-1933`, bound to the very field this ADR renames
+`scrape_tls`) are all statements about a scrape that bind mode never performs — so rule 40's whole
+body is gated on a non-empty `scrape_targets`, the empty-list bail now a plain `continue`
+(`graph.rs:1895-1897`), and rule 55 owns everything about the mode itself: the exactly-one-of check, and the wrong-mode-field checks
+in both directions. Two rules, one gate each — rather than rule 40 silently acquiring a second job.
 
 **`prometheus_in`'s `tls:` is renamed `scrape_tls:`.** One kind now has two TLS-shaped roles —
 client TLS for outbound scrapes, server TLS for the inbound receiver — and a bare `tls:` next to a
@@ -139,7 +145,8 @@ and their labels are exact, and a relay back out to remote-write is still a fixe
 model kinds are flatter than the producer's.
 
 The fix is a **bounded metadata cache** keyed by family name, fed by every `metadata[]` and inline
-`Metadata` the receiver sees and consulted for series whose own request carried none — and it is
+`Metadata` the receiver sees **that names a type** (a 1.0 `UNKNOWN` or a 2.0 `UNSPECIFIED` entry
+declares nothing, so it is not learned) and consulted for series whose own request carried none — and it is
 deliberately **its own workstream** (W5) rather than part of the first receiver PR. It introduces
 per-family state on a component that otherwise has none, which means a cardinality cap, a TTL, an
 eviction policy and eviction counters: a second design with its own failure modes, none of which
@@ -150,7 +157,7 @@ receiver is correct and useful on its own — 2.0 is fully typed with no cache a
 ### Decode and encode work in timestamp groups
 
 A remote-write `TimeSeries` carries one label set and **N `Sample`s**. `Series`
-(`crates/logit-proto/src/prometheus/mod.rs:282`) holds exactly one `Point` and one `timestamp`, and
+(`crates/logit-proto/src/prometheus/mod.rs:329`) holds exactly one `Point` and one `timestamp`, and
 the assembler's `replace_once` counts a second value for one label set within a family as
 `duplicate_series`. The two shapes do not line up, and forcing them to would mean either inventing a
 multi-point `Series` — changing the type every mapping table in the older ADR is written against —
@@ -207,7 +214,7 @@ have produced.
 
 Suppressing the marker takes a decoder-side switch, because the marker is not the receiver's to
 omit today: `families_to_events` inserts `prometheus.timestamp: true` whenever `Series.timestamp`
-is `Some` (`crates/logit-proto/src/prometheus/mod.rs:454-459`), and on this transport it always is.
+is `Some` (`crates/logit-proto/src/prometheus/mod.rs:572-579`), and on this transport it always is.
 `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly today's
 behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still set from
 the sample, only the marker attribute is omitted.
@@ -227,12 +234,14 @@ and no struct literal in the existing tests changes.
 
 **Decode:** a stale NaN on any sample makes that label set's series `Point::Stale`, and
 `families_to_events` maps it to the family type's zero-shaped kind with `FLAG_NO_RECORDED_VALUE`
-set, replacing today's hardcoded `flags: 0` (`mod.rs:467`).
+set, replacing the hardcoded `flags: 0` it used to build: `point_to_kind` (`mod.rs:604-610`) returns
+`(kind, flags)` now, and a `Point::Stale` is the one arm of it that returns a non-zero one.
 
 **Encode:** with `PrometheusEncoder::with_stale_markers(true)`, a flagged `Gauge`, `Sum`, or
 marker-untyped record becomes a `Point::Stale` series, bypassing the early
-`is_no_recorded_value()` skip at `mod.rs:560`. A flagged `Histogram`, `Summary` or sketch kind stays
-**skipped and counted**, as it is today: those kinds expand to several derived series
+`is_no_recorded_value()` skip at the top of `events_to_families` (`mod.rs:731-735`). A flagged
+`Histogram`, `Summary` or sketch kind stays **skipped and counted**, as it is today: those kinds
+expand to several derived series
 (`_bucket{le}`, `_sum`, `_count`), and a single flag carries no information about which of them
 existed, so there is nothing to reconstruct the stale set from. That is a known-gaps row, not a
 silent omission.
@@ -269,7 +278,7 @@ mapping and this transport has no reason to widen it.
 *decompressed* size: Snappy's `decompress_len` is read from the block header and compared before a
 byte is decompressed, so a compression bomb is rejected without being expanded. This is the same
 number and the same hardcoded-not-configurable posture as `otlp_in`
-(`crates/logit-inputs/src/otlp.rs:197`), which already bounds a decompressed request the same way
+(`crates/logit-inputs/src/otlp.rs:203`), which already bounds a decompressed request the same way
 and explains the reasoning in its own module doc. Prometheus's default `max_samples_per_send` is
 2000, so a real request is orders of magnitude under the cap; an operator who hits it has a
 misconfigured sender, not a tuning problem.
@@ -281,8 +290,9 @@ misconfigured sender, not a tuning problem.
 | `POST path`, `Content-Encoding: snappy`, recognised `Content-Type` | decode, then `204` (plus `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` when the request was 2.0) |
 | other path | `404` |
 | other method on `path` | `405` + `Allow: POST` |
-| missing or other `Content-Encoding`, unrecognised `Content-Type` | `415` |
+| missing or other `Content-Encoding`, missing or unrecognised `Content-Type` | `415` |
 | compressed body, or Snappy `decompress_len`, over `MAX_REQUEST_BYTES` | `413` |
+| a body that stops arriving mid-upload | `408`, and the connection closes |
 | Snappy or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
 
 `204` is what the spec recommends for a successful write, and the batch is handed to the `Fanout`
@@ -291,15 +301,31 @@ delays the `204` and the sender's own queue throttles. That is remote-write's fl
 working as designed, not a stalled receiver.
 
 **`405 + Allow: POST` is a deliberate divergence from `otlp_in`**, which answers `404` for a
-non-`POST` (`crates/logit-inputs/src/otlp.rs:838`). `prometheus_out`'s exposition server already
+non-`POST` (`crates/logit-inputs/src/otlp.rs:607-609`). `prometheus_out`'s exposition server already
 answers `405` for a wrong method on `/metrics`, and this receiver lives on the same kind pair, so it
 matches its sibling rather than the unrelated input it copied its accept loop from. The receiver's
 module doc says so explicitly, so the next reader diffing the two inputs finds the reason instead of
 a bug.
 
-The 2.0 `-Written` headers are set from `Decoded`'s own counts (`samples`, `exemplars`,
-`histograms_skipped`) on both 2xx and 4xx, as 2.0 requires. They are the receiver's honest report of
-what it stored, which for histograms today is zero.
+A **missing `Content-Type` is a `415`, not a default**, where `otlp_in` treats an absent type as
+protobuf: `otlp_in` has a history of clients predating its JSON support, and remote-write has none —
+both specs require the header, so guessing 1.0 would turn a 2.0 sender's misconfiguration into a
+wall of protobuf decode errors instead of the one status the spec has for exactly this. And a body
+that *stalls* mid-upload gets `408` rather than being left to the whole-connection idle deadline,
+which would otherwise let a half-uploaded request hold its connection-limit permit indefinitely.
+
+The 2.0 `-Written` headers are set on both 2xx and 4xx, as 2.0 requires — zeros on a rejection, a
+1.0 request getting none at all since 1.0 defines none. They are the receiver's report of what it
+*stored*, and that is deliberately not `Decoded`'s own `samples` count: that number is what the
+assembler accepted, and the model mapping that runs afterwards can still drop a whole series (an
+empty histogram, a histogram whose bucket counts decrease). So `Samples-Written` is every decoded
+series' wire samples minus the ones belonging to a series that mapping dropped, both measured by
+`remote_write::wire_samples`, which reads the `Point` and so still sees the `Option`s the wire had
+(a summary sent as quantiles alone is two samples, not four). `Exemplars-Written` is
+`Decoded::exemplars`. `Histograms-Written` is a literal `0` rather than a count of anything: native
+histograms are skipped, so a receiver that stored none is the honest report. `logit.input.samples`
+reports the same number `Samples-Written` does, deliberately — a counter and a header disagreeing
+about one request would be a puzzle with no right answer.
 
 ### Sender behaviour: one request per batch, no retry in the sink
 
@@ -319,18 +345,29 @@ only contribution is classifying the outcome into a `Fault`, exactly as `otlp_ou
 
 - 2xx → `Ok`.
 - 429 and 5xx → **`Fault::Ambiguous`**, via `is_retryable_http_status`
-  (`crates/logit-outputs/src/otlp.rs:541`). Ambiguous, not `Clean`: the request reached the server
-  and may have been partially applied.
-- Transport errors → `classify_reqwest_error` (`otlp.rs:548`); only a connect failure is
+  (`crates/logit-outputs/src/http.rs:125` — that whole table hoisted out of `otlp_out` into a shared
+  module when this sender landed, rather than being copied). Ambiguous, not `Clean`: the request
+  reached the server and may have been partially applied.
+- Transport errors → `classify_reqwest_error` (`http.rs:133`); only a connect failure is
   `Fault::Clean`.
-- Any other 4xx → permanent, with a throttled warning carrying the first ~256 bytes of the response
+- Any 3xx → permanent. `build_client` (`http.rs:46-56`) turns `reqwest`'s own `limited(10)` redirect
+  policy off, which is what puts a status class nobody would otherwise see onto this table.
+  Remote-write defines no redirect, and following one would break the table's premise that one
+  request went to the configured URL: a `301`/`302`/`303` is replayed as a body-less `GET`, so a
+  batch nothing wrote would be acked by whatever answered it, and a `307`/`308` would carry the
+  operator's `headers:` — a tenant header, an `Authorization` on a same-host scheme downgrade — to
+  the `Location` host, past rule 56's `https://` check. `otlp_out` inherits the same row from the
+  same client, and its own module-doc fault table says so.
+- Any other 4xx → permanent, with a throttled warning carrying the first 256 bytes of the response
   body, because Prometheus's own 400 text names the offending series and is the only useful thing in
-  the exchange.
+  the exchange. Read bounded rather than read whole and then trimmed
+  (`http::read_body_prefix` against `ERROR_BODY_SNIPPET_BYTES`), so a receiver answering with an
+  endless body costs a snippet rather than a connection's worth of allocation on every retry.
 
 `duplicate_safe()` stays **`true`**, and this is load-bearing rather than incidental. A sample's
 identity on a remote-write receiver is `(label set, timestamp)`, so replaying an identical request
 is an idempotent overwrite, never a double count — which is what makes `true` honest. And `true` is
-what selects `DeliveryPosture::AtLeastOnce` (`crates/logit-pipeline/src/output.rs:96-105,159-166`),
+what selects `DeliveryPosture::AtLeastOnce` (`crates/logit-pipeline/src/output.rs:82-88,158-169`),
 which is the *only* posture under which a `Fault::Ambiguous` is retried at all. Setting it `false`
 would not make delivery safer; it would silently turn every 5xx into a dropped batch.
 
@@ -440,19 +477,34 @@ hand-written `generated/mod.rs` mirrors OTLP's `#[path]`/`#[rustfmt::skip]` nest
   `assemble.rs` owns family assembly for both syntaxes, and a third one would reuse it as-is.
 - **`logit-proto` grows a second vendored proto family and a second generated tree**, and
   `tools/protogen` is now table-driven. `snap` is a new workspace dependency.
-- **Known-gaps rows W6 adds:** the remote-write receiver has no authentication (`bind_tls` gives
-  transport security, not identity — the same gap `admin:` and the exposition `bind:` already
-  carry); 1.0 requests without inline metadata decode as `Unknown` families until the metadata cache
-  lands; stale markers are emitted for single-series kinds only, with histogram and summary records
-  carrying `FLAG_NO_RECORDED_VALUE` skipped and counted; the sender does no out-of-order handling,
-  so a fan-in topology writing one series can draw `400`s from a receiver without an out-of-order
-  window; native histograms are skipped in both directions.
+- **Known-gaps rows W6 added.** The four this ADR anticipated, all present: the receiver has TLS but
+  no authentication (`bind_tls` gives transport security, not identity — the same gap `admin:` and
+  the exposition `bind:` already carry); 1.0 typing depends on the metadata cache, which is bounded
+  and therefore lapses, so an expiry puts a family back to decoding untyped until the sender's next
+  metadata request re-declares it (the row W5 turned from "until the cache lands" into a statement
+  about the cache's own bounds); a `FLAG_NO_RECORDED_VALUE` record whose kind expands to several
+  derived series is skipped and counted (`skipped{reason="no_recorded_value"}`) rather than written
+  as a stale marker; and the sender does no cross-batch reordering, so a fan-in topology writing one
+  series can draw `400`s from a receiver with no out-of-order window. Five more the build surfaced
+  that this ADR had not: same-millisecond samples collapse to the later reading
+  (`degraded{reason="sub_ms_collapsed"}`) — the one permitted normalization that loses a *reading*
+  rather than a rendering; a closed fanout during shutdown still answers `204`, which is
+  `docs/design/pipeline-graph.md`'s own closed-downstream open question reaching a transport with a
+  wire acknowledgement to be wrong about; `tls:` written under `prometheus_in` is silently ignored,
+  since no `ComponentKind` variant denies unknown fields, which makes this rename the one most
+  likely to be hit that way; `influxdb_out` and `prometheus_in`'s scrape client still follow HTTP
+  redirects, where `otlp_out` and this sender share a client that does not; and
+  `logit.input.samples` counts wire samples in bind mode against series in scrape mode, one
+  counter name with two units on one kind. The native-histogram gap is the reworded row below
+  rather than a new one.
 - **The existing `ExponentialHistogram` known-gaps row is reworded**: it no longer reads as "the
   text format has no syntax for this" but as "native histograms are deferred to a follow-up plan,"
   which is now true of both transports and names where the work is tracked.
-- **`docs/known-gaps.md`'s "Prometheus remote-write is not built" row is deleted** when W6 closes
-  out, and `docs/design/telemetry-landscape.md`'s existing `Prom. remote-write` matrix column has
-  its cells updated rather than a column added.
+- **`docs/known-gaps.md`'s "Prometheus remote-write is not built" row is deleted** at W6, and
+  `docs/design/telemetry-landscape.md`'s existing `Prom. remote-write` matrix column has its cells
+  updated rather than a column added — including two that were simply wrong about the *protocol*
+  (remote-write carries a classic explicit-bucket histogram as flat `_bucket{le}`/`_sum`/`_count`
+  series exactly as exposition does, not "via native").
 - **`tools/record-fixtures/raw_capture.py` gains a `capture_http` mode** — bind, accept N POSTs,
   answer `204`, write each body verbatim — because its existing `--proto udp|tcp` modes cannot
   record an exchange that needs a response, and a real Prometheus will not send a second request to

@@ -1071,7 +1071,9 @@ already built that have a known, accepted rough edge.
   | encode/decode | `Exemplar`'s trace context (`TraceRef.flags`) → dropped on encode, hardcoded `0` on decode | none (documented) | OTLP's `Exemplar` message has no trace-flags field at all — a real, permanent lossy mapping, not a decode shortcut (`crates/logit-proto/src/otlp/metrics.rs`'s `encode_exemplar`/`decode_exemplar`). |
   | sinks with no no-value wire form / `aggregate` | A `MetricRecord` flagged `NO_RECORDED_VALUE` → skipped at `influxdb_out`/`statsd_out`, rendered as `no_recorded_value` at `stdio_out` (never dropped — a debug sink must show it), passed through unmerged at `aggregate` | `logit.output.messages.dropped{reason="no_recorded_value"}` (statsd) / throttled diagnostic key `no_recorded_value` (influxdb) / `logit.transform.metrics.passed_through{reason="no_recorded_value"}` (aggregate) | `otlp_out` keeps a flagged point on the wire and re-encodes it unchanged — that's the fixed point `docs/adr/lossless-transit.md` requires for `otlp_in -> otlp_out` — and `collectd_out` is the one other wire with a concept of its own for this: a flagged `Gauge` is written as a GAUGE `NaN`, collectd's own "no reading this interval," and decodes back flagged (`crates/logit-proto/src/collectd/mod.rs`'s module doc); every *other* kind flagged at `collectd_out` is still skipped and counted. No remaining sink or transform has a wire/model concept of "no value here," so treating the flag's default numeric payload as a genuine reading would fabricate a sample the producer never sent (`crates/logit-core/src/metric.rs`'s `flags` doc). |
   | encode (Prometheus) | A delta `Sum`/`Histogram` → **skipped** | `logit.output.metrics.skipped{metric_kind="delta_sum"\|"delta_histogram"}`, throttled diagnostic key `delta_temporality_unresolved` | Prometheus exposition has no delta temporality at all: every counter and histogram on the wire is a running total since a start time. Resolving one in the sink would mean the sink keeping per-series state and inventing a window, which is exactly what [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md) makes an explicit, named stage — so `prometheus_out` skips and the diagnostic names the fix (`aggregate` with `temporality: cumulative`). |
-  | encode (Prometheus) | `MetricKind::ExponentialHistogram` → **skipped** | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` | Neither Prometheus text 0.0.4 nor OpenMetrics 1.0 has native-histogram syntax — sparse exponential buckets exist only in Prometheus's protobuf exposition and remote-write 2.0 (`docs/design/telemetry-landscape.md`). Materializing explicit buckets from one would be the lossy conversion `MetricKind::ExponentialHistogram` exists to avoid; the gap closes with remote-write, not with a bucket-fabricating shim. |
+  | encode/decode (Prometheus) | Native histograms are **skipped in both directions** — `MetricKind::ExponentialHistogram` on the way out of either `prometheus_out` mode, a `TimeSeries.histograms[]` entry on the way into `prometheus_in(bind)` | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` on send; `logit.input.metrics.skipped{reason="native_histogram"}` on receive (also reported per request as `Decoded::histograms_skipped`, which is why a 2.0 response's `X-Prometheus-Remote-Write-Histograms-Written` is always `0`) | Deferred to a follow-up plan, not rejected — [ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "Native histograms now" alternative has the scope: a `Point::NativeHistogram` carrying the sparse shape, a mapping between Prometheus's `schema` field and OTLP's `scale` (they agree on base-2 exponential bucketing but not on sign or on the zero-bucket treatment), the positive/negative span-and-delta encoding, and a decision about the gauge-vs-counter `reset_hint`. Remote-write 2.0 *does* carry them, so this is no longer "the text format has no syntax for it" (text 0.0.4 and OpenMetrics 1.0 genuinely don't — sparse buckets live only in Prometheus's protobuf exposition and in remote-write, `docs/design/telemetry-landscape.md`): the wire is there now and the mapping is what isn't. Materializing explicit buckets from one would still be the lossy conversion `MetricKind::ExponentialHistogram` exists to avoid. |
+  | encode (Prometheus remote-write) | A record flagged `FLAG_NO_RECORDED_VALUE` whose kind expands to several derived series — `Histogram`, `Summary`, `Distribution`/`Samples` (a sketch) — → **skipped**, where a flagged `Gauge`/`Sum`/marker-untyped record is written as Prometheus's own stale marker (the NaN bit pattern `0x7ff0000000000002`) | `logit.output.metrics.skipped{reason="no_recorded_value"}` | One flag says a series stopped reporting; it says nothing about *which* of `_bucket{le}`/`_sum`/`_count` existed while it did, and a stale marker has to name a series by its full label set to mean anything. There is nothing to reconstruct the stale set from, and writing a marker on the bare family name would mark a series that never existed (`crates/logit-proto/src/prometheus/mod.rs`'s `stale_point`). Distinct from the exposition path, where `with_stale_markers` is off and *every* flagged record is skipped under the same counter. |
+  | encode (Prometheus remote-write) | Two readings of one series whose nanosecond timestamps truncate to the same millisecond → the **later** reading wins, the earlier is dropped | `logit.output.metrics.degraded{reason="sub_ms_collapsed"}`, once per dropped reading | The wire carries milliseconds and the model carries nanoseconds, and one label set may not carry two samples at one timestamp: Prometheus and Mimir answer `400 duplicate sample for timestamp`, which this sink classifies `Fault::Permanent`, so emitting both would cost the whole request rather than the one reading. Real data loss rather than a rendering difference — the one entry on `remote_write.rs`'s permitted-normalization list that loses a *reading* — and the only fix is a sub-millisecond wire, which remote-write does not have. Reachable in practice only from a source with sub-millisecond resolution writing one series more than once per millisecond. |
   | encode (Prometheus) | `MetricKind::Distribution`/`Samples` → a `summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) with a `_count` and **no `_sum`** | `logit.output.metrics.degraded{metric_kind="distribution"\|"samples"}` | Same shape as the OTLP `Distribution` row above, and the same shared `DISTRIBUTION_QUANTILES` constant, so one metric describes itself identically at `otlp_out` and `prometheus_out`. The missing `_sum` is honest rather than lossy: a `DDSketch` has no sum to report, and OpenMetrics permits omitting it. |
   | encode (Prometheus) | `MetricKind::Set`/`SetMembers` → a `gauge` of `estimate()` / of the distinct member count | `logit.output.metrics.degraded{metric_kind="set"\|"set_members"}` | Prometheus has no cardinality-estimate type, but unlike OTLP (which skips) it does have a plain gauge, and a cardinality *number* is a perfectly good gauge reading — the estimate is the whole point of a `Set`. What's lost is mergeability: two relays' gauges can't be combined the way their `HyperLogLog`s could. |
   | encode (Prometheus) | `Sum{Cumulative, !monotonic}` → `gauge` | `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"}` | Prometheus has no non-monotonic counter: a `counter` is monotonic by definition, and exposing a decreasing one would make every `rate()` over it wrong. A gauge carries the value correctly and loses only the "this is a sum" fact, which no exposition type can express. |
@@ -1414,18 +1416,128 @@ already built that have a known, accepted rough edge.
   and front it with something that has both. Real server-side TLS would reuse `logit-inputs`'
   existing builder (`otlp_in`'s `tls:`); auth has no in-tree precedent on any listener yet, so it
   needs a decision about what kind (bearer, mTLS) before it needs code.
-- **Prometheus remote-write is not built** — `prometheus_in`/`prometheus_out` cover scrape and
-  exposition only (ADR `prometheus-scrape-and-exposition`'s "Transports" section). The seam is
-  already there for it: the wire↔model mapping lives behind `MetricFamily`
-  (`logit_proto::prometheus::mod`), independent of `text.rs`'s syntax, so a `remote_write.rs`
-  mapping prompb messages to and from that same type adds no change to the "Model mapping" tables
-  above; `prometheus_in` would gain an optional `bind:` (a receiver) and `prometheus_out` an
-  optional `endpoint:` (a sender), each mutually exclusive with today's field by a graph rule —
-  additive, not a breaking change to a config already shipped. Deferred because every existing
-  Prometheus deployment already scrapes/exposes text, and remote-write needs vendored protobuf
-  types (`crates/logit-proto/proto/prometheus/`, regenerated by `tools/protogen` per ADR
-  `committed-pregenerated-otlp-protobuf`) plus Snappy framing (`snap`, already allowed in
-  `deny.toml`) before anything at all can round-trip.
+- **The remote-write receiver has TLS but no authentication** ([ADR
+  `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "Security posture", and
+  `crates/logit-inputs/src/prometheus.rs`'s own module doc) — `prometheus_in`'s `bind_tls:` gives
+  the receiver real server TLS, and that is transport security, not identity: there is no bearer
+  token, no basic auth, and no mutual-TLS identity check beyond `rustls` accepting whatever chain a
+  client presents when `client_ca_file` is set. Anything that can reach the socket can write series
+  into the pipeline. Exactly the gap the two rows above already carry for `admin:` and
+  `prometheus_out`'s exposition `bind:`, and it stays one for the same reason: auth has no in-tree
+  precedent on any listener yet, so it needs a decision about what kind (bearer, mTLS subject
+  matching) before it needs code. Until then the posture is the shipped example's — bind loopback or
+  pod-local and front it with something that authenticates
+  ([`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml),
+  and `docs/deploying.md`'s "Prometheus remote-write" section).
+- **1.0 remote-write typing depends on the metadata cache, which is bounded and therefore lapses**
+  ([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "The receiver is stateless"
+  section, and `prometheus_in`'s "Metadata cache" module-doc section). Remote-write 1.0 carries a
+  family's type, `# HELP` and `# UNIT` in `WriteRequest.metadata[]`, and Prometheus's own 1.0 sender
+  ships those in **separate requests** on its own schedule (`metadata_config`, once a minute by
+  default) rather than attached to the samples they describe — so without a cache every family in
+  nearly every 1.0 request decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/
+  `_count` arrive as three unrelated series instead of one histogram. `metadata_cache:` closes that
+  (`max_families: 10000`, `ttl: 10m`; `max_families: 0` turns it off entirely, which is the setting
+  for a pure-2.0 fleet), least-recently-seen evicted first over the cap. What remains a gap is what
+  the bound *means*: **an expiry puts a family back to decoding untyped** — its next samples are
+  `unknown` and its derived series come apart again — until the sender's next metadata request
+  re-declares it. The default TTL is an order of magnitude over Prometheus's own metadata cadence,
+  so a live sender has to miss ten refreshes running to lapse, but a sender with a longer
+  `metadata_config` interval, or one that has gone quiet and come back, will. Watch
+  `logit.input.metadata_cache.size` (gauge), `.evicted{reason="expired"|"cardinality"}` and
+  `.replaced`; a steady `expired` stream against a live sender means the `ttl` is under that
+  sender's cadence. 2.0 needs none of this — it is fully typed on every request. Two smaller
+  bounds sit inside the same row. A remembered `# HELP`/`# UNIT` is **cut to a fixed byte cap**
+  (`MAX_METADATA_TEXT_BYTES`, counted `logit.input.metadata_cache.truncated`), because what is
+  remembered outlives the request that carried it and the request's own size cap does not bound a
+  table that keeps entries — the *type* is remembered exactly, so only the description text is
+  affected. And a remembered type is **advisory, never authoritative**: where a declaration the
+  request itself carried would make the assembler throw a sample away, a remembered one gives way
+  instead and the sample opens an implicit family of its own, counted
+  `logit.input.metrics.degraded{reason="seed_mismatch"}`
+  (`crates/logit-proto/src/prometheus/assemble.rs`'s "A seeded type is advisory" table). So a stale
+  or wrong memory costs typing, never data — but a steady `seed_mismatch` stream means the table
+  and the senders disagree about a family's shape, which is worth chasing rather than tuning.
+- **The remote-write receiver's metadata table is shared by every sender that can reach it, and
+  peers can evict each other's entries.** There is one table per `prometheus_in(bind)` component,
+  not one per peer, and eviction is strictly by `last_seen`
+  (`crates/logit-inputs/src/prometheus.rs`'s "Metadata cache" module-doc section). That sharing is
+  the point — it is what lets a 2.0 sender's inline declarations type a 1.0 sender's series — but
+  it cuts both ways: a peer that declares a great many families pushes other peers' entries out of
+  `max_families`, counted `.evicted{reason="cardinality"}` with **no attribution** to who caused
+  it. Repeated faster than the victims' own `metadata_config` cadence, that keeps well-behaved
+  senders permanently untyped. Their samples still arrive — the remembered type is advisory, see
+  the row above — as flat families. Nothing on this listener authenticates a sender, so the
+  conclusion is the no-auth row's rather than a new one: do not point a `bind:` at senders you do
+  not control, and `max_families: 0` turns the sharing off along with the typing. The default is
+  on, so every existing `bind:` config acquires this on upgrade.
+- **The remote-write sender does no cross-batch reordering, so a fan-in topology can draw
+  out-of-order `400`s.** `prometheus_out(endpoint)` sends samples in batch order and nothing in the
+  sink reorders across batches ([ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s
+  "Sender behaviour", and the sink's own module doc). Both specs require a sender to write one
+  series' samples in timestamp order, so two upstream branches that both write the same series into
+  one `prometheus_out` can present a receiver with an older sample after a newer one — which a
+  receiver with no out-of-order window (a stock Prometheus, Mimir without
+  `out_of_order_time_window`) answers `400`, classified `Fault::Permanent` and dropped. This is a
+  property of the pipeline that was built, not a bug in the sink: a single chain into one
+  `prometheus_out` cannot have it, and the fix is a topology that doesn't split one series across
+  branches, or a receiver configured with an out-of-order window. Not something the sink can buffer
+  its way out of without inventing a reorder window of its own, which is the `aggregate`-shaped
+  state a sink deliberately doesn't hold.
+- **`prometheus_in`'s `tls:` key is gone, and writing it is silently ignored rather than rejected.**
+  The kind has two TLS-shaped roles now, so every TLS key is prefixed by the mode it serves:
+  `scrape_tls:` (client TLS for outbound scrapes) and `bind_tls:` (server TLS for the remote-write
+  receiver) — [ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)'s "mode-prefixed TLS
+  keys". Pre-release, so the rename ships with no alias and no deprecation window. The residual gap
+  is that **no `ComponentKind` variant carries `#[serde(deny_unknown_fields)]`** — `TailOptions`'
+  own doc comment in `crates/logit-config/src/lib.rs` states the general rule, and the reason it
+  can't have one there (serde refuses the attribute alongside `#[serde(flatten)]`) is narrower than
+  the rule it names. So an operator who writes the old `tls:` under a `prometheus_in` gets no error
+  at all: the block is dropped at parse time, the
+  component starts with default TLS settings, and a scrape that should have presented a client
+  certificate quietly doesn't. The same silence covers any misspelled key on any `ComponentKind`
+  variant; this row names the one rename that makes it likely to be hit in practice. `logit
+  validate` cannot catch it either, for the same reason.
+- **`influxdb_out` and `prometheus_in`'s scrape client still follow HTTP redirects.** Both build
+  their own `reqwest::Client` without a redirect policy (`crates/logit-outputs/src/influxdb.rs`'s
+  `build_client`, `crates/logit-inputs/src/prometheus.rs`'s scrape client), so they inherit
+  `reqwest`'s `limited(10)` default. `otlp_out` and `prometheus_out`'s remote-write sender do not:
+  they share `crates/logit-outputs/src/http.rs`'s `build_client`, which turns the policy off, and
+  that helper's own doc comment is where the reasoning lives — a `301`/`302`/`303` is replayed as a
+  body-less `GET`, so whatever answers it becomes the sink's verdict on a batch that was never
+  written, and a `307`/`308` replays the body *and* the operator's `headers:` at the `Location`
+  host, past a config-time `https://` check that has no say at runtime. `reqwest` strips only
+  `Authorization`/`Cookie`, and only on a host or port change, so a tenant header always travels.
+  The same argument applies to `influxdb_out`'s token and to a scrape URL's basic-auth credential;
+  `crates/logit-outputs/src/http.rs`'s module doc names the influxdb half explicitly as a gap worth
+  closing separately rather than in passing. Not closed here because `influxdb_out` keeps its own
+  `status_class`/`classify_transport_error` pair on purpose (its module doc argues that sink's
+  classification is its own to evolve), and moving it onto the shared client is that change, not a
+  one-line policy flip.
+- **`logit.input.samples` means two different things depending on `prometheus_in`'s mode.** In
+  scrape mode it counts the *series* a scrape decoded (`events.len()` — one event per series,
+  `crates/logit-inputs/src/prometheus.rs`'s `tick`); in bind mode it counts the **wire samples**
+  that reached the `Fanout`, which for a classic histogram is one per `_bucket` plus `_sum` plus
+  `_count` rather than one per record. One counter name, two units, on one `ComponentKind`. It is
+  deliberate on both sides — the bind-mode number is the same one the 2.0
+  `X-Prometheus-Remote-Write-Samples-Written` header reports, and a counter and a header disagreeing
+  about one request would be a puzzle with no right answer — but it means summing
+  `logit.input.samples` across a deployment running both modes adds series to samples. A
+  mode-distinguishing tag was considered and not added: the two modes are already distinguishable by
+  which of `logit.input.scrapes`/`logit.input.writes` the same component reports.
+- **A `prometheus_in(bind)` whose downstream is already closed still answers `204`.** `Fanout::send`
+  silently skips a closed consumer (counted `logit.component.events.dropped{reason=
+  "closed_consumer"}`, `crates/logit-pipeline/src/fanout.rs`), and the receiver hands its batch to
+  the `Fanout` *before* building the response — the ordering `otlp_in` already uses, and the one
+  that makes channel backpressure throttle the sender's own queue. So during a shutdown that has
+  already torn the downstream half of the graph down, a sender is told `204` (and, on 2.0, a
+  non-zero `Samples-Written`) for a batch nothing kept. Inherited, not introduced here: this is
+  [`docs/design/pipeline-graph.md`](design/pipeline-graph.md)'s own named open question — *"today's
+  `send_batch` silently drops a send on a closed downstream; under a DAG that closure should really
+  propagate as a shutdown signal rather than vanish"* — reaching a transport that has a wire
+  acknowledgement to be wrong about. The no-end-to-end-acknowledgement entry above is the general
+  statement of the same limit. Narrow in practice (shutdown is per-connection and the window is the
+  drain), and it closes when that open question does, not before.
 - **Readiness is per-process, not per-sink.** A single sink stuck retrying (`degraded`, in the
   self-logging sense) does not flip `/readyz` to unready — that's what a sink's own `buffer:`
   block (retry budget, queue depth) exists to absorb. `/readyz`'s `degraded` phase is reserved for

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-09-17
+updated: 2026-09-18
 ---
 
 # Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`
@@ -368,19 +368,27 @@ untyped again; cap eviction.
 
 | # | PR | Depends on |
 |---|---|---|
-| W0 | This plan; ADR [`prometheus-remote-write`](../adr/prometheus-remote-write.md); the "landed" pointer in [`prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)'s forward-compat section and its plan's §5; index rows in both `docs/adr/README.md` and `docs/plans/README.md`. | — |
-| W1 | Vendored prompb + gogoproto protos (README pin), `tools/protogen` per-family table, committed generated code, `snap` dependency. | W0 |
-| W2 | Assembler hoist (own commit); `Point::Stale`, `with_stale_markers`, `with_timestamps_always`, `with_timestamp_marker`; `remote_write.rs` decode/encode for both versions with timestamp groups; fixed-point and bench tests. | W1 |
-| W3 | `otlp_in` idle-helper hoist (own commit); `prometheus_in` `bind:` receiver, `tls` → `scrape_tls`, `bind_tls`, rule 55, regenerated schema, module-doc spec, tests. | W2 |
-| W4 | `prometheus_out` `endpoint:` sender, `version`/`timeout`/`headers`/`endpoint_tls`, rule 56, regenerated schema, `Fault` mapping, tests. | W2 (developed in parallel with W3, stacked after it) |
-| W5 | Receiver metadata cache. | W3 |
-| W6 | Round-trip test, `capture_http` plus recorded Prometheus fixtures, real-store check, examples, docs closeout. | W3, W4, W5 |
+| W0 | **Landed** (#234). This plan; ADR [`prometheus-remote-write`](../adr/prometheus-remote-write.md); the "landed" pointer in [`prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)'s forward-compat section and its plan's §5; index rows in both `docs/adr/README.md` and `docs/plans/README.md`. | — |
+| W1 | **Landed** (#235). Vendored prompb + gogoproto protos (README pin), `tools/protogen` per-family table, committed generated code, `snap` dependency. | W0 |
+| W2 | **Landed** (#236). Assembler hoist (own commit); `Point::Stale`, `with_stale_markers`, `with_timestamps_always`, `with_timestamp_marker`; `remote_write.rs` decode/encode for both versions with timestamp groups; fixed-point and bench tests. | W1 |
+| W3 | **Landed** (#238). `otlp_in` idle-helper hoist (own commit); `prometheus_in` `bind:` receiver, `tls` → `scrape_tls`, `bind_tls`, rule 55, regenerated schema, module-doc spec, tests. | W2 |
+| W4 | **Landed** (#237). `prometheus_out` `endpoint:` sender, `version`/`timeout`/`headers`/`endpoint_tls`, rule 56, regenerated schema, `Fault` mapping, tests. | W2 (developed in parallel with W3, stacked after it) |
+| W5 | **Landed** (#243). Receiver metadata cache. | W3 |
+| W6 | **Landed** (#PRNUM). Round-trip test, `capture_http` plus recorded Prometheus fixtures, real-store check, examples, docs closeout. | W3, W4, W5 |
 
 Landing order: **W0 → W1 → W2 → W3 → W4 → W5 → W6**, strictly linear, each PR based on and
 targeting its parent's branch and brought up to date with `git merge origin/main` (never rebase).
 W4 touches no file W3 owns except `ComponentKind` and the regenerated schema, so it can be built
 while W3 is in review, but it stacks after W3 rather than branching beside it so the schema
 regeneration has one owner per PR.
+
+**Status (2026-09-18): W0–W6 landed on their stacked branches** (W0 #234, W1 #235, W2 #236, W3
+#238, W4 #237, W5 #243, W6 #PRNUM — #237 and #238 were opened in the other order than they stack,
+so the numbers run backwards there and the branches do not), **but the stack is not yet merged to
+`main`** — per Ross's direction, every PR targets its parent's branch and retargets to `main` only
+once that parent merges, so "landed" here means "complete and pushed," not "in `main`." The same
+convention [`docs/plans/graphite-carbon-relay.md`](graphite-carbon-relay.md) records for its own
+stack.
 
 ## Verification
 

@@ -1025,6 +1025,115 @@ exporter — one pointed at `otlp_in` directly, on a different origin than the p
 at all; put a reverse proxy in front that shares the page's origin instead of trying to open
 `otlp_in` up to arbitrary browser origins (`docs/known-gaps.md`).
 
+## Prometheus remote-write: receiving, sending, and picking a version
+
+`prometheus_in` and `prometheus_out` are each two components in one, with the mode chosen by which
+field is set and a config error — not a silently ignored setting — if a field of the *other* mode
+comes along with it (graph rules 55 and 56). `prometheus_in` scrapes `scrape_targets:` or binds a
+remote-write **receiver** on `bind:`; `prometheus_out` exposes a registry on `bind:` or **sends**
+remote-write to an `endpoint:`. See [ADR `prometheus-remote-write`](adr/prometheus-remote-write.md)
+for the design and
+[`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml)/
+[`examples/prometheus-remote-write-send.yaml`](../examples/prometheus-remote-write-send.yaml) for
+runnable configs.
+
+**The receiver's bind posture is the exposition server's, not the scrape client's.** `bind_tls:`
+gives it real server TLS, and that is transport security and nothing else: there is no bearer token,
+no basic auth, and no mutual-TLS identity check beyond `rustls` accepting whatever chain a client
+presents when `client_ca_file` is set. Anything that can reach the socket can write series into the
+pipeline. So bind loopback or pod-local — `127.0.0.1:9201`, as
+[`examples/prometheus-remote-write-receive.yaml`](../examples/prometheus-remote-write-receive.yaml)
+does — and front it with something that authenticates (an ingress, a service mesh, an
+authenticating reverse proxy), exactly the posture `admin:` and `prometheus_out`'s exposition
+`bind:` already take. An operator who
+needs it reachable from off-host is making that choice deliberately rather than inheriting it from
+an example. Tracked in `docs/known-gaps.md`.
+
+```yaml
+components:
+  rw_in:
+    type: prometheus_in
+    bind: 127.0.0.1:9201
+    path: /api/v1/write      # default; the route POSTs are accepted on
+    metadata_cache:          # what 1.0 metric types are remembered between requests
+      max_families: 10000    #   0 turns the cache off entirely
+      ttl: 10m
+```
+
+A Prometheus writing into that needs a `remote_write:` block of its own and nothing else — it is the
+sender, so no server-side flag is involved:
+
+```yaml
+remote_write:
+  - url: http://logit:9201/api/v1/write
+    # protobuf_message: io.prometheus.write.v2.Request   # omit for 1.0
+```
+
+**Keep `metadata_cache:` on for a 1.0 fleet.** Prometheus's own 1.0 sender ships a family's type,
+`# HELP` and `# UNIT` in *separate* requests on its own schedule (`metadata_config`, once a minute
+by default) rather than attached to the samples they describe, so a receiver that remembers nothing
+decodes nearly every 1.0 request as untyped `unknown` families — and a histogram arrives as three
+unrelated `_bucket`/`_sum`/`_count` series instead of one record. The cache is what fixes that;
+`max_families: 0` turns it off, which is the right setting only for a pure-2.0 fleet. Watch
+`logit.input.metadata_cache.evicted{reason="expired"}` against a live sender: a steady stream there
+means `ttl` is shorter than that sender's metadata cadence, and families are lapsing back to untyped
+between refreshes.
+
+**`--web.enable-remote-write-receiver` is the *other* direction's flag.** It belongs on the
+Prometheus side when `logit` is the **sender** — a stock Prometheus does not accept remote-write at
+all until it is started with it:
+
+```yaml
+components:
+  rw_out:
+    type: prometheus_out
+    sources: [enrich]
+    endpoint: http://prometheus:9090/api/v1/write   # absolute URL, write path included
+    version: 1                                      # default
+    timeout: 10s
+    headers:
+      X-Scope-OrgID: tenant-a                       # e.g. a Mimir tenant; !env works on a value
+```
+
+`endpoint:` is the receiver's full write URL with its path, not a host and a separate `path:` —
+`path:` belongs to the *other* mode of this kind and setting it here is rule 56. TLS is selected by
+the scheme, and `endpoint_tls:` tunes it (a private CA, a client certificate, or the deliberately
+awkward `insecure_skip_verify`, which logs a startup warning). The four protocol headers
+(`Content-Type`, `Content-Encoding`, `X-Prometheus-Remote-Write-Version`, `User-Agent`) plus
+`Content-Length` are reserved: rule 56 rejects them in `headers:` at config time rather than letting
+the sink silently override what config asked for.
+
+**Choosing `version: 1` or `2`.** There is no negotiation and no fallback — the operator picks the
+one their receiver speaks, exactly as they already pick an exposition dialect — so the choice is
+about the destination, not about `logit`:
+
+- **`version: 1`** (`prometheus.WriteRequest`) is the default, and is what every remote-write
+  receiver deployed today accepts. Pick it unless you know the far end speaks 2.0. Its one real cost
+  is that 1.0 has no field for a counter's start time, so `Series::created` (an OpenMetrics
+  `_created` series, an OTLP `start_time_unix_nano`) is dropped on the way out.
+- **`version: 2`** (`io.prometheus.write.v2.Request`) is worth setting when the receiver is a recent
+  Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a Prometheus 3.x started with
+  `--web.enable-remote-write-receiver`. It interns every label and metadata string in a request-wide
+  symbol table (smaller bodies for the same series), carries `Metadata` inline on each series rather
+  than in separate requests, carries the created timestamp per sample, and answers with
+  `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` so a sender learns what was
+  actually stored. A receiver that does not speak it answers `415`, which this sink classifies
+  permanent — a misconfiguration reported immediately rather than retried.
+
+Native histograms are skipped and counted on both wires regardless of version
+(`docs/known-gaps.md`), so nothing about this choice affects them.
+
+**What to watch.** Receiver: `logit.input.writes{class}` (`ok` against `bad_request`/`unsupported`/
+`oversize` — a non-zero `unsupported` is usually a sender whose `Content-Type` or
+`Content-Encoding` doesn't match what it is actually sending), `logit.input.write.duration`,
+`logit.input.samples`, and the `metadata_cache` trio above. Sender: `logit.output.requests{class}`
+(a `4xx` is permanent and the batch is dropped — the throttled `remote_write_rejected` diagnostic
+quotes the receiver's own message, which for Prometheus and Mimir names the offending series; a
+`3xx` means the endpoint is redirecting and this client deliberately does not follow it),
+`logit.output.request.duration`, `logit.output.samples`. A sender feeding one series from two
+upstream branches can draw out-of-order `400`s from a receiver with no out-of-order window: that is
+the topology, not the sink, and `docs/known-gaps.md` has the row.
+
 ## TLS
 
 `otlp_out` (both `protocol: http` and `protocol: grpc`) and `otlp_in` (both transports) can speak

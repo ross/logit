@@ -28,8 +28,15 @@
 //! | Connect refused, DNS failure (the request never reached anything) | `Clean` |
 //! | Request timeout | `Ambiguous` |
 //! | HTTP 429 or any 5xx; gRPC `UNAVAILABLE`/`RESOURCE_EXHAUSTED`/`DEADLINE_EXCEEDED`/`ABORTED`/`INTERNAL` | `Ambiguous` |
+//! | Any HTTP 3xx | `Permanent` -- [`crate::http::build_client`] turns `reqwest`'s own `limited(10)` redirect policy off, so a redirect is reported against the URL the operator configured rather than followed. OTLP defines no redirect, and following one would break this table's premise that one request went to the configured endpoint: a `301`/`302`/`303` is replayed as a body-less `GET`, so whatever answers it becomes the verdict on a batch that was never written, and a `307`/`308` carries the operator's `headers:` to the `Location` host past rule 22's `https://` check |
 //! | Any other HTTP 4xx; gRPC `INVALID_ARGUMENT`/`UNAUTHENTICATED`/`PERMISSION_DENIED`/`UNIMPLEMENTED` | `Permanent` |
 //! | Any other gRPC status | `Permanent` (never retry a code this sink doesn't positively recognize) |
+//!
+//! A non-2xx HTTP response's body is quoted in the error message, bounded to
+//! [`crate::http::ERROR_BODY_SNIPPET_BYTES`] (256) bytes plus a character's slack -- and read
+//! bounded rather than read whole and then trimmed ([`crate::http::read_body_prefix`]), so a
+//! collector answering an error with an endless body costs a snippet rather than a connection's
+//! worth of allocation on every retry.
 //!
 //! **Partial success.** A 2xx/`OK` response can still say "I only accepted part of this" via OTLP's
 //! own `Export*ServiceResponse.partial_success` field (`rejected_<signal>` + `error_message`) --

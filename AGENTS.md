@@ -189,7 +189,25 @@ its first PR rather than retrofitted: `prometheus_in` scrapes `/metrics` targets
 negotiated on `Accept`/`Content-Type`, so `prometheus_in -> prometheus_out` is a fixed point modulo
 a short, named list of normalizations
 ([ADR `prometheus-scrape-and-exposition`](docs/adr/prometheus-scrape-and-exposition.md),
-[examples/prometheus-relay.yaml](examples/prometheus-relay.yaml)). `aggregate` gained a
+[examples/prometheus-relay.yaml](examples/prometheus-relay.yaml)); both components are **two-mode**
+now, each mode chosen by which config field is set and enforced by graph rules 55 and 56 rather than
+by a new kind, so an existing scrape or exposition config keeps working with no edit
+([ADR `prometheus-remote-write`](docs/adr/prometheus-remote-write.md)) -- `prometheus_in` either
+scrapes `scrape_targets:` or binds a remote-write **receiver** on `bind:`, accepting 1.0 and 2.0 on
+one listener chosen per request from its own `Content-Type`, with `bind_tls:` for server TLS and a
+bounded `metadata_cache:` (`max_families`/`ttl`) that is what makes 1.0 typed at all, since
+Prometheus's own 1.0 sender ships `metadata[]` in separate requests from the samples it describes;
+and `prometheus_out` either exposes a registry on `bind:` or **sends** remote-write to an
+`endpoint:` under an explicit `version: 1 | 2` (no negotiation and no fallback -- the operator picks
+the one their receiver speaks, as they already pick an exposition dialect), one `POST` per batch
+with no retry in the sink, `duplicate_safe()` `true` because a sample's identity at a receiver is
+`(label set, timestamp)`. Both TLS keys on `prometheus_in` are prefixed by the mode they serve now
+(`scrape_tls:` for the client, `bind_tls:` for the server; the old bare `tls:` is gone, pre-release,
+with no alias), and native histograms are skipped and counted in both directions pending their own
+follow-up
+([examples/prometheus-remote-write-receive.yaml](examples/prometheus-remote-write-receive.yaml),
+[examples/prometheus-remote-write-send.yaml](examples/prometheus-remote-write-send.yaml)).
+`aggregate` gained a
 `temporality: cumulative` mode alongside them: a delta `Sum`/`Histogram` accumulator survives each
 flush and keeps summing instead of resetting, which is what lets `statsd_in -> aggregate ->
 prometheus_out` and `internal -> aggregate -> prometheus_out` expose real running counters

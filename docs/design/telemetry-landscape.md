@@ -112,7 +112,13 @@ convert rather than reinterpret.
 ### Prometheus remote-write
 
 References: <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
-<https://prometheus.io/docs/specs/remote_write_spec_2_0/> (2.0).
+<https://prometheus.io/docs/specs/remote_write_spec_2_0/> (2.0). Both versions are **supported** —
+`prometheus_in`'s `bind:` receives them on one listener and `prometheus_out`'s `endpoint:` sends
+either under an explicit `version:` — over the same `MetricFamily` seam the exposition codec uses;
+see [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md) for `logit`'s model mapping,
+its timestamp-group decomposition, and its permitted normalizations. **Native histograms are the
+one part of the format `logit` does not map**: skipped and counted in both directions, deferred to
+a follow-up (`docs/known-gaps.md`).
 
 1.0: `WriteRequest{timeseries: []TimeSeries{labels, samples: []{value, timestamp_ms}, exemplars,
 histograms}, metadata}`. 2.0 replaces this with `io.prometheus.write.v2.Request`, whose headline
@@ -220,18 +226,18 @@ same tag grammar given above regardless of which protocol carries the tagged pat
 | Counter/monotonic sum | `c` | `c` | `Sum{monotonic:true}` | `counter` | via `Sum` type | untyped field | `COUNTER`, `DERIVE` | untyped → `Gauge` (temporality/monotonicity dropped, `docs/adr/graphite-carbon-relay.md`) |
 | Gauge | `g` (absolute) | `g` | `Gauge` | `gauge` | via type | untyped field | `GAUGE` | untyped → `Gauge` |
 | Relative gauge delta | `+`/`-` on `g` | `+`/`-` on `g` | — | — | — | — | — | — |
-| Temporality (delta/cumulative) | — (implicit delta) | — | explicit field | cumulative only (`_bucket`) | via native histogram | — | — | — |
+| Temporality (delta/cumulative) | — (implicit delta) | — | explicit field | cumulative only (`_bucket`) | cumulative only, same as exposition (a native histogram's `reset_hint` is the one exception) | — | — | — |
 | Timer/raw samples | `ms` (server-summarized) | `ms` | — | — | — | — | — | — |
-| Distribution (sketch) | — | `d` | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram | — | — | none natively; `multi_value: expand` → `.count`/`.sum`/`.q0_5`…`.q0_99` sub-paths, else dropped |
+| Distribution (sketch) | — | `d` | `Summary` (fixed quantiles) or native histogram | native histogram | native histogram (in `logit`: a `summary` of 5 fixed quantiles, as on exposition -- native histograms are skipped) | — | — | none natively; `multi_value: expand` → `.count`/`.sum`/`.q0_5`…`.q0_99` sub-paths, else dropped |
 | Set/cardinality | `s` | `s` | — | — | — | — | — | none natively; `expand` → `.count`, else dropped |
-| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | `Histogram` | `histogram` | via native | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped |
+| Histogram (explicit buckets) | `h` (~alias of `ms`) | `h` | `Histogram` | `histogram` | `_bucket{le}`/`_sum`/`_count` flat series, exactly as on exposition (supported, 1.0 and 2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.bucket_<b>`, else dropped |
 | Histogram sum/count/min/max | — | — | yes | `_sum`/`_count` (no min/max) | yes | — | — | `expand` only (see row above) |
-| Exponential/native histogram | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped |
+| Exponential/native histogram | — | — | `ExponentialHistogram` | native histogram ext. | yes (2.0) -- **skipped by `logit` in both directions**, counted, deferred to a follow-up (`docs/known-gaps.md`) | — | — | none natively; `expand` → `.count`/`.sum`/`.min`/`.max`/`.zero_count`, no buckets, else dropped |
 | Summary (pre-computed quantiles) | — | — | `Summary` | `summary` | — | — | — | none natively; `expand` → `.count`/`.sum`/`.q<q>`, else dropped |
-| Exemplars | — | — | yes | OpenMetrics only | yes (2.0) | — | — | — |
-| Unit | — | — | `Metric.unit` | `# UNIT` (OM) | via metadata (2.0) | — | — | — |
-| Description | — | — | `Metric.description` | `# HELP` | via metadata (2.0) | — | — | — |
-| Start time | — | — | `start_time_unix_nano` | — (`_created`, OM) | `created_timestamp` (2.0) | — | — | — |
+| Exemplars | — | — | yes | OpenMetrics only | yes, both versions (`TimeSeries.exemplars`) | — | — | — |
+| Unit | — | — | `Metric.unit` | `# UNIT` (OM) | via metadata, both versions (1.0 `MetricMetadata.unit`, 2.0 inline `Metadata`) | — | — | — |
+| Description | — | — | `Metric.description` | `# HELP` | via metadata, both versions (1.0 `MetricMetadata.help`, 2.0 inline `Metadata`) | — | — | — |
+| Start time | — | — | `start_time_unix_nano` | — (`_created`, OM) | `Sample.start_timestamp` (2.0 only; `TimeSeries` field 6 is `reserved`, and 1.0 has no field at all) | — | — | — |
 | Point timestamp | — | `\|T` (c/g only) | `time_unix_nano` (ns) | ms | ms | configurable, ns default | s or 2⁻³⁰s | s |
 | Collection interval | — | — | — | — | — | — | `Interval`/`IntervalHR` per value list | — |
 | Sample rate | `@rate` | `@rate` (not g/s) | — | — | — | — | — | — |
