@@ -1796,40 +1796,68 @@
           }
         },
         {
-          "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant (a remote-write receiver) is planned as an additive, non-breaking change -- \"exactly one of `scrape_targets`/`bind`\" would become a graph rule once it lands, not a new kind.\n\nNamed `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/ target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]` can't have two fields answer to the same key.",
+          "description": "Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response declares via its own `Content-Type`. Always synthesizes `up`, `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See `docs/adr/prometheus-scrape-and-exposition.md`.\n\n**Two modes, one kind.** `scrape_targets:` is the scrape client above; `bind:` is a remote-write *receiver* (`docs/adr/prometheus-remote-write.md`), accepting 1.0 and 2.0 requests on one listener. Exactly one of the two is set (rule 55), and a field belonging to the other mode is a config error rather than a silently ignored setting -- also rule 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape.\n\nNamed `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/ target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]` can't have two fields answer to the same key.",
           "type": "object",
           "required": [
-            "scrape_targets",
             "type"
           ],
           "properties": {
+            "bind": {
+              "description": "Receiver mode: `host:port` to accept Prometheus remote-write requests on. Set selects bind mode (rule 55). Both wire versions are accepted on the one listener, chosen per request from its own `Content-Type` -- there is nothing to configure.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "bind_tls": {
+              "description": "Server-side TLS for the receiver's listener -- see [`TlsServerConfig`]. Its mere presence turns TLS on. Bind-mode-only (rule 55).\n\nTransport security only: the receiver has no authentication of any kind, so a listener reachable from an untrusted network belongs behind something that does (`docs/known-gaps.md`).",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsServerConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "headers": {
-              "description": "Extra headers sent on every scrape request. A name this input sets itself (`accept`, `user-agent`, and the other protocol-owned names -- rule 40) is rejected at config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).",
+              "description": "Extra headers sent on every scrape request. A name this input sets itself (`accept`, `user-agent`, and the other protocol-owned names -- rule 40) is rejected at config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22). Scrape-mode-only (rule 55).",
               "default": {},
               "type": "object",
               "additionalProperties": {
                 "type": "string"
               }
             },
+            "idle_timeout": {
+              "description": "How long a receiver connection may sit with no request in flight before it is closed and its connection-limit permit handed back. Omitted -- the default -- means no idle timeout at all. Rule 53 rejects `0s`; rule 55 rejects it alongside `scrape_targets:`. See `docs/adr/idle-connection-timeout.md`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "interval": {
-              "description": "Scrape cadence. Rule 9 rejects `0s`.",
+              "description": "Scrape cadence. Rule 9 rejects `0s`. Scrape-mode-only: a non-default value alongside `bind:` is rejected by rule 55.",
               "default": "15s",
               "type": "string"
             },
+            "path": {
+              "description": "The path the receiver answers `POST`s on; anything else is a `404`. Defaults to `/api/v1/write`, which is where every remote-write sender points by convention. Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.",
+              "default": "/api/v1/write",
+              "type": "string"
+            },
             "scrape_targets": {
-              "description": "Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).",
+              "description": "Scrape mode: absolute `http://`/`https://` scrape URLs. Non-empty selects scrape mode (rule 55), and every entry is checked by rule 40.",
+              "default": [],
               "type": "array",
               "items": {
                 "type": "string"
               }
             },
-            "timeout": {
-              "description": "Per-request timeout. Rule 40 rejects `0s`.",
-              "default": "10s",
-              "type": "string"
-            },
-            "tls": {
-              "description": "Client-side TLS tuning for any `https://` target -- see [`TlsClientConfig`]. A non-default value with no `https://` target is a config error (rule 40), not silently ignored.",
+            "scrape_tls": {
+              "description": "Client-side TLS tuning for any `https://` *scrape* target -- see [`TlsClientConfig`]. A non-default value with no `https://` target is a config error (rule 40), not silently ignored. Scrape-mode-only (rule 55).\n\nNamed `scrape_tls`, not `tls`: this kind has two TLS-shaped roles -- client TLS for outbound scrapes, server TLS for the inbound receiver -- and a bare `tls:` next to a `bind_tls:` would be a coin flip for a reader. Every TLS key here is prefixed by the socket it governs (`docs/adr/prometheus-remote-write.md`).",
               "default": {
                 "ca_file": null,
                 "cert_file": null,
@@ -1841,6 +1869,11 @@
                   "$ref": "#/definitions/TlsClientConfig"
                 }
               ]
+            },
+            "timeout": {
+              "description": "Per-request timeout. Rule 40 rejects `0s`. Scrape-mode-only (rule 55).",
+              "default": "10s",
+              "type": "string"
             },
             "type": {
               "type": "string",

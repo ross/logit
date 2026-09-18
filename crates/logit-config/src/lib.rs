@@ -1550,34 +1550,72 @@ pub enum ComponentKind {
     /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
     /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
     /// `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See
-    /// `docs/adr/prometheus-scrape-and-exposition.md`. A future `bind:` field on this same variant
-    /// (a remote-write receiver) is planned as an additive, non-breaking change -- "exactly one of
-    /// `scrape_targets`/`bind`" would become a graph rule once it lands, not a new kind.
+    /// `docs/adr/prometheus-scrape-and-exposition.md`.
+    ///
+    /// **Two modes, one kind.** `scrape_targets:` is the scrape client above; `bind:` is a
+    /// remote-write *receiver* (`docs/adr/prometheus-remote-write.md`), accepting 1.0 and 2.0
+    /// requests on one listener. Exactly one of the two is set (rule 55), and a field belonging
+    /// to the other mode is a config error rather than a silently ignored setting -- also rule
+    /// 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape.
     ///
     /// Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
     /// target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]`
     /// can't have two fields answer to the same key.
     PrometheusIn {
-        /// Absolute `http://`/`https://` scrape URLs. Required, non-empty (rule 40).
+        /// Scrape mode: absolute `http://`/`https://` scrape URLs. Non-empty selects scrape mode
+        /// (rule 55), and every entry is checked by rule 40.
+        #[serde(default)]
         scrape_targets: Vec<String>,
-        /// Scrape cadence. Rule 9 rejects `0s`.
+        /// Scrape cadence. Rule 9 rejects `0s`. Scrape-mode-only: a non-default value alongside
+        /// `bind:` is rejected by rule 55.
         #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// Per-request timeout. Rule 40 rejects `0s`.
+        /// Per-request timeout. Rule 40 rejects `0s`. Scrape-mode-only (rule 55).
         #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         timeout: Duration,
         /// Extra headers sent on every scrape request. A name this input sets itself (`accept`,
         /// `user-agent`, and the other protocol-owned names -- rule 40) is rejected at
         /// config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).
+        /// Scrape-mode-only (rule 55).
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Client-side TLS tuning for any `https://` target -- see [`TlsClientConfig`]. A
+        /// Client-side TLS tuning for any `https://` *scrape* target -- see [`TlsClientConfig`]. A
         /// non-default value with no `https://` target is a config error (rule 40), not silently
-        /// ignored.
+        /// ignored. Scrape-mode-only (rule 55).
+        ///
+        /// Named `scrape_tls`, not `tls`: this kind has two TLS-shaped roles -- client TLS for
+        /// outbound scrapes, server TLS for the inbound receiver -- and a bare `tls:` next to a
+        /// `bind_tls:` would be a coin flip for a reader. Every TLS key here is prefixed by the
+        /// socket it governs (`docs/adr/prometheus-remote-write.md`).
         #[serde(default)]
-        tls: TlsClientConfig,
+        scrape_tls: TlsClientConfig,
+        /// Receiver mode: `host:port` to accept Prometheus remote-write requests on. Set selects
+        /// bind mode (rule 55). Both wire versions are accepted on the one listener, chosen per
+        /// request from its own `Content-Type` -- there is nothing to configure.
+        #[serde(default)]
+        bind: Option<String>,
+        /// The path the receiver answers `POST`s on; anything else is a `404`. Defaults to
+        /// `/api/v1/write`, which is where every remote-write sender points by convention.
+        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        #[serde(default = "default_prometheus_write_path")]
+        path: String,
+        /// Server-side TLS for the receiver's listener -- see [`TlsServerConfig`]. Its mere
+        /// presence turns TLS on. Bind-mode-only (rule 55).
+        ///
+        /// Transport security only: the receiver has no authentication of any kind, so a listener
+        /// reachable from an untrusted network belongs behind something that does
+        /// (`docs/known-gaps.md`).
+        #[serde(default)]
+        bind_tls: Option<TlsServerConfig>,
+        /// How long a receiver connection may sit with no request in flight before it is closed
+        /// and its connection-limit permit handed back. Omitted -- the default -- means no idle
+        /// timeout at all. Rule 53 rejects `0s`; rule 55 rejects it alongside `scrape_targets:`.
+        /// See `docs/adr/idle-connection-timeout.md`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
     },
     /// A synthetic event source for load testing -- the listener end of the perf harness
     /// (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative
@@ -1791,6 +1829,15 @@ impl From<RemoteWriteVersion> for u8 {
 /// the default beats hand-mirroring it in another crate.
 pub fn default_prometheus_path() -> String {
     "/metrics".to_string()
+}
+
+/// `PrometheusIn::path`'s default -- the remote-write receiver's route. Prometheus's own
+/// `remote_write.url` examples, the 1.0 and 2.0 specs' examples, and every receiver in the
+/// ecosystem use `/api/v1/write`, so a sender configured against a stock deployment needs no
+/// `path:` here at all.
+/// `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+pub fn default_prometheus_write_path() -> String {
+    "/api/v1/write".to_string()
 }
 
 fn default_generate_batch() -> usize {
@@ -2109,13 +2156,17 @@ fn default_graphite_connect_timeout() -> Duration {
 
 /// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
 /// interval.
-fn default_prometheus_scrape_interval() -> Duration {
+/// `pub`, like [`default_handshake_timeout`]: graph rule 55 has to tell a *set* `interval` from a
+/// defaulted one when deciding whether a scrape-only field was written under `bind:`, and
+/// `logit-pipeline` already depends on this crate, so it imports this rather than mirroring the
+/// number by hand.
+pub fn default_prometheus_scrape_interval() -> Duration {
     Duration::from_secs(15)
 }
 
 /// `PrometheusIn::timeout`'s default -- matches `OtlpOutput`'s/`OtlpInput`'s own 10s default
-/// request timeout.
-fn default_prometheus_scrape_timeout() -> Duration {
+/// request timeout. `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+pub fn default_prometheus_scrape_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
@@ -5086,32 +5137,48 @@ mod tests {
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { scrape_targets, interval, timeout, headers, tls } => {
+            ComponentKind::PrometheusIn {
+                scrape_targets,
+                interval,
+                timeout,
+                headers,
+                scrape_tls,
+                bind,
+                path,
+                bind_tls,
+                idle_timeout,
+            } => {
                 assert_eq!(scrape_targets, vec!["http://node-exporter:9100/metrics".to_string()]);
                 assert_eq!(interval, Duration::from_secs(15));
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
-                assert_eq!(tls, TlsClientConfig::default());
+                assert_eq!(scrape_tls, TlsClientConfig::default());
+                // The receiver half all defaults away, so a scrape config is untouched by its
+                // existence -- and graph rule 55 reads exactly these defaults.
+                assert_eq!(bind, None);
+                assert_eq!(path, "/api/v1/write");
+                assert_eq!(bind_tls, None);
+                assert_eq!(idle_timeout, None);
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
     }
 
     #[test]
-    fn prometheus_in_interval_timeout_headers_and_tls_can_all_be_set() {
+    fn prometheus_in_interval_timeout_headers_and_scrape_tls_can_all_be_set() {
         let component: Component = serde_json::from_str(
             r#"{"type": "prometheus_in", "scrape_targets": ["https://node-exporter:9100/metrics"],
                 "interval": "30s", "timeout": "5s",
                 "headers": {"X-Scope-OrgID": "tenant-a"},
-                "tls": {"ca_file": "ca.pem"}}"#,
+                "scrape_tls": {"ca_file": "ca.pem"}}"#,
         )
         .unwrap();
         match component.kind {
-            ComponentKind::PrometheusIn { interval, timeout, headers, tls, .. } => {
+            ComponentKind::PrometheusIn { interval, timeout, headers, scrape_tls, .. } => {
                 assert_eq!(interval, Duration::from_secs(30));
                 assert_eq!(timeout, Duration::from_secs(5));
                 assert_eq!(headers.get("X-Scope-OrgID"), Some(&"tenant-a".to_string()));
-                assert_eq!(tls.ca_file, Some("ca.pem".to_string()));
+                assert_eq!(scrape_tls.ca_file, Some("ca.pem".to_string()));
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }

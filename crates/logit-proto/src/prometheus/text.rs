@@ -74,7 +74,7 @@
 //! | `malformed_line` | a sample line this grammar rejects: a bad name, an unterminated label set, an unparsable value or timestamp, non-UTF-8 bytes, or Prometheus 3's quoted UTF-8 name syntax (`{"my.dotted.metric"} 1`), which this codec does not implement (`docs/known-gaps.md`) |
 //! | `malformed_metadata` | a `# HELP`/`# TYPE`/`# UNIT` line with a bad name, a missing field (a bare `# TYPE` included), or an unrecognized type keyword -- the family stays untyped rather than the body failing. Fields are separated by a run of spaces or tabs, either way |
 //! | `duplicate_type` | a second, conflicting `# TYPE` for one family; the first wins |
-//! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family; the first wins |
+//! | `duplicate_metadata` | a second `# HELP`/`# UNIT` for one family *disagreeing with the first*; the first wins. A producer repeating itself verbatim is neither counted nor an error, the same rule `duplicate_type` has always had |
 //! | `duplicate_series` | one sample repeated: the same label set twice for a family's primary/`_sum`/`_count`/`_created` sample, or the same `le`/`quantile` twice. Both formats require "a unique combination of a metric name and labels"; the first wins |
 //! | `duplicate_label` | one line naming the same label twice -- an invalid label set, so the whole sample goes |
 //! | `unknown_suffix` | a sample whose name is a declared family's name plus a suffix that type has no meaning for (`foo_sum` under `# TYPE foo counter`) |
@@ -206,7 +206,10 @@ pub fn parse_with(
 /// doc for the table.
 struct Parser {
     dialect: Dialect,
-    assembler: Assembler,
+    /// `'static` rather than borrowed: the exposition grammar declares families from its own
+    /// `# TYPE`/`# HELP`/`# UNIT` lines as it goes, so there is no up-front declaration table to
+    /// share -- that is remote-write's shape ([`Assembler::with_declarations`]).
+    assembler: Assembler<'static>,
     saw_eof: bool,
 }
 

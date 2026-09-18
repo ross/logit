@@ -39,6 +39,11 @@ tokio-rustls.workspace = true
 # dependency of `logit-outputs` at this exact version (its `otlp_out`/`influxdb_out` HTTP clients),
 # so promoting it here too adds no new crate version to `Cargo.lock`.
 reqwest.workspace = true
+# `prometheus_in`'s remote-write receiver (docs/adr/prometheus-remote-write.md): Snappy *block*
+# decompression of every request body, the only `Content-Encoding` either wire version defines.
+# Already a direct dependency of `logit-proto` at this exact version (the codec itself), so
+# promoting it here adds no new crate version to `Cargo.lock`.
+snap.workspace = true
 # `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Every other
 # self-diagnostic in this crate goes through `logit_core::Diagnostics`, which is where `tracing`
 # normally lives -- this one can't: the perf harness reads `events`/`batches`/`elapsed` as
@@ -53,6 +58,11 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Test-only: `prometheus_in`'s receiver tests hand-build one remote-write 1.0 request that carries
+# no `metadata[]` at all -- the shape a real Prometheus sends, and the one `remote_write::encode`
+# deliberately never produces. Already in the tree at this exact version (`logit-proto`'s own
+# generated prompb types).
+prost.workspace = true
 # Test-only: the end-to-end statsd -> aggregate integration test
 # (tests/statsd_to_aggregate.rs) needs a real `Aggregator` to prove a decoded `GaugeDelta`
 # actually resolves, not just that it decodes correctly in isolation. Not a production

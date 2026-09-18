@@ -125,11 +125,14 @@
 //!     wrong for the consumer that mode exists for. `series_retention: 0` stays legal under the
 //!     default `temporality: delta` (`docs/adr/aggregation-window-semantics.md`'s cumulative
 //!     amendment).
-//! 40. A `prometheus_in` `scrape_targets` must be non-empty, and every entry must parse as an
-//!     absolute `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
+//! 40. A **scrape-mode** `prometheus_in`'s scrape settings. Every check here is a statement about
+//!     an outbound scrape, so the whole rule is gated on a non-empty `scrape_targets` and says
+//!     nothing at all about a `bind:` receiver; rule 55 owns the mode itself, including the case
+//!     where neither mode is configured. Each `scrape_targets` entry must parse as an absolute
+//!     `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
 //!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
-//!     small hand-rolled scheme/authority check, not a real URL parse. A `tls:` block must be
-//!     internally consistent -- `cert_file`/`key_file` set together, no `insecure_skip_verify`
+//!     small hand-rolled scheme/authority check, not a real URL parse. A `scrape_tls:` block must
+//!     be internally consistent -- `cert_file`/`key_file` set together, no `insecure_skip_verify`
 //!     alongside `ca_file` -- the same two checks rule 24 makes for `otlp_out`'s own `tls:` block
 //!     (and rule 34 for `logit_out`'s) -- and is rejected outright unless at least one target is
 //!     `https://` (the same "would have no effect" reasoning as rule 24's third check).
@@ -239,8 +242,11 @@
 //!     internals.
 //! 53. A TCP listener's `idle_timeout`, where set, must be greater than `0s`, and must not be set
 //!     at all on a UDP `syslog_in`, `graphite_in` or `statsd_in`, which have no connection to time
-//!     out (`docs/adr/idle-connection-timeout.md`). One rule over all five kinds that carry the
-//!     field -- `syslog_in`, `graphite_in`, `statsd_in`, `logit_in` and `otlp_in` -- rule 43's
+//!     out (`docs/adr/idle-connection-timeout.md`). One rule over all six kinds that carry the
+//!     field -- `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` and
+//!     `prometheus_in` (whose `bind:` receiver is the field's sixth listener; a *scrape*-mode
+//!     `prometheus_in` has no connection either, but that is rule 55's wrong-mode check rather
+//!     than this rule's wrong-transport one) -- rule 43's
 //!     one-rule-for-every-listener shape rather than one number per kind; every kind's arm landed
 //!     in the same PR that made that listener honour the field, so no landed state ever accepted a
 //!     set-but-ignored `idle_timeout`. `0s` is rules 9/15/18/28/45's
@@ -258,6 +264,22 @@
 //!     the literal, since it could never match anything that step could produce; and a duplicate
 //!     step within one field's `normalize:` list is rejected, the same no-op reasoning again. An
 //!     empty `normalize:` list is not rejected -- it's the default, meaning no normalization.
+//! 55. A `prometheus_in` is in exactly one mode, and every field belongs to the mode it is written
+//!     under ([ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md)).
+//!     `scrape_targets:` (non-empty) is a scrape client; `bind:` is a remote-write receiver.
+//!     Both together is two components' worth of config in one, and neither is a listener that
+//!     could never produce an event -- rules 7/12's "can only ever be a no-op" instinct, answered
+//!     with a message instead of a process that starts up listening on nothing. Then: a
+//!     non-default `interval`, `timeout`, `headers` or `scrape_tls` alongside `bind:` is rejected
+//!     (a receiver performs no scrape), and a non-default `path`, `bind_tls` or `idle_timeout`
+//!     alongside `scrape_targets:` is rejected (a scrape client binds nothing) -- rule 45's and
+//!     rule 53's shape one kind over, for their reason: a setting silently doing nothing is worse
+//!     than a startup failure naming it. Only *non-default* values are rejected, which is also
+//!     what lets `interval` keep its default in bind mode and so keeps rule 9's `interval: 0s`
+//!     rejection satisfied there with no mode-specific carve-out. In bind mode the `path` itself
+//!     must also start with `/` -- rule 41's check for `prometheus_out`, for its reason: a request
+//!     URI's path is always absolute, so a relative or empty one could never match and every write
+//!     would `404` against a listener that looks configured.
 //! 56. `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`): exactly one of
 //!     `bind:` (serve an exposition) and `endpoint:` (write to a remote-write receiver), never
 //!     both and never neither. A **non-default** field belonging to the mode that isn't set is an
@@ -286,9 +308,10 @@
 //! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
 
 use logit_config::{
-    default_handshake_timeout, BufferConfig, Component, ComponentKind, Compression, Config,
-    GraphiteProtocol, GraphiteTransport, ReceiveConfig, StatsdTransport, StreamFormat,
-    SyslogTransport,
+    default_handshake_timeout, default_prometheus_scrape_interval,
+    default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
+    ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, ReceiveConfig,
+    StatsdTransport, StreamFormat, SyslogTransport,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -1848,17 +1871,23 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: `prometheus_in`'s `scrape_targets`/`timeout`/`tls`/`headers` -- see this module's
-    // own doc comment for the full rule text.
+    // Rule 40: a *scrape-mode* `prometheus_in`'s `scrape_targets`/`timeout`/`scrape_tls`/`headers`
+    // -- see this module's own doc comment for the full rule text. Every check below is a
+    // statement about a scrape, so the whole body is gated on this component actually being in
+    // scrape mode; rule 55 owns the mode itself (exactly-one-of, and the wrong-mode fields in both
+    // directions), including the "neither mode is set" case this rule's empty-list bail used to
+    // catch by accident.
     for (id, component) in &components {
-        if let ComponentKind::PrometheusIn { scrape_targets, timeout, headers, tls, .. } =
-            &component.kind
+        if let ComponentKind::PrometheusIn {
+            scrape_targets,
+            timeout,
+            headers,
+            scrape_tls: tls,
+            ..
+        } = &component.kind
         {
             if scrape_targets.is_empty() {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_targets' must name at least one scrape URL -- an \
-                     empty list would never scrape anything"
-                );
+                continue; // bind mode, or no mode at all -- rule 55's, either way
             }
             for target in scrape_targets {
                 if !is_absolute_http_url(target) {
@@ -1876,24 +1905,24 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             if tls.cert_file.is_some() != tls.key_file.is_some() {
                 anyhow::bail!(
-                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
-                     mutual TLS, or both omitted -- one alone can't be used"
+                    "component '{id}': 'scrape_tls.cert_file' and 'scrape_tls.key_file' must \
+                     both be set for mutual TLS, or both omitted -- one alone can't be used"
                 );
             }
             if tls.insecure_skip_verify && tls.ca_file.is_some() {
                 anyhow::bail!(
-                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
-                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
-                     specific trusted CA meaningless"
+                    "component '{id}': 'scrape_tls.insecure_skip_verify' and \
+                     'scrape_tls.ca_file' can't both be set -- 'insecure_skip_verify' trusts any \
+                     certificate, which makes a specific trusted CA meaningless"
                 );
             }
             let any_https =
                 scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
             if !tls.is_empty() && !any_https {
                 anyhow::bail!(
-                    "component '{id}': 'tls' is set, but no 'scrape_targets' entry is 'https://' \
-                     -- TLS is selected per-target by its own scheme, so a 'tls:' block here \
-                     would have no effect"
+                    "component '{id}': 'scrape_tls' is set, but no 'scrape_targets' entry is \
+                     'https://' -- TLS is selected per-target by its own scheme, so a \
+                     'scrape_tls:' block here would have no effect"
                 );
             }
             let mut seen_lowercase = BTreeSet::new();
@@ -2197,10 +2226,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // One loop over every kind that carries the field, rule 43's one-rule-for-every-listener
     // shape: the check, the message and the reasoning are identical on all of them and only the
     // `transport` spelling differs -- and on a kind with no datagram transport at all there is
-    // nothing to spell, which is why `logit_in`'s and `otlp_in`'s arms report `false` rather than
-    // reading a field: `logit_in` has no `transport:` at all (it is TCP by construction), and
-    // `otlp_in`'s `protocol` picks HTTP or gRPC over TCP, not a datagram alternative. Only the
-    // zero check can ever fire on either.
+    // nothing to spell, which is why `logit_in`'s, `otlp_in`'s and `prometheus_in`'s arms report
+    // `false` rather than reading a field: `logit_in` has no `transport:` at all (it is TCP by
+    // construction), `otlp_in`'s `protocol` picks HTTP or gRPC over TCP, not a datagram
+    // alternative, and `prometheus_in`'s receiver is HTTP over TCP with no datagram spelling
+    // either. Only the zero check can ever fire on any of the three. A `prometheus_in` in *scrape*
+    // mode has no connection of its own to time out -- but that is a wrong-mode field rather than
+    // a wrong-transport one, so rule 55 rejects it rather than this rule growing a second axis.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -2214,6 +2246,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
             ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
+            ComponentKind::PrometheusIn { idle_timeout, .. } => {
+                ("prometheus_in", *idle_timeout, false)
+            }
             _ => continue,
         };
         let Some(idle_timeout) = idle_timeout else { continue };
@@ -2390,6 +2425,96 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Rule 55: a `prometheus_in` is in exactly one mode, and every field belongs to the mode it
+    // is written under (`docs/adr/prometheus-remote-write.md`). `scrape_targets:` is a scrape
+    // client, `bind:` is a remote-write receiver; both together is two components' worth of config
+    // in one, and neither is a component that does nothing at all -- rules 7/12's "can only ever
+    // be a no-op" instinct, with an explicit message instead of a silent start-up that listens on
+    // nothing.
+    //
+    // The wrong-mode checks are rule 45's and rule 53's shape (`handshake_timeout`/`idle_timeout`
+    // on a UDP listener), and they exist for the same reason: a setting that silently does nothing
+    // is worse than a startup failure naming it. Only a *non-default* value is rejected, so a
+    // config that never mentions the other mode's fields is fine in either mode -- which is also
+    // what keeps `interval:` at its default in bind mode, so rule 9's `interval: 0s` rejection
+    // stays satisfied without a mode-specific carve-out there.
+    for (id, component) in &components {
+        let ComponentKind::PrometheusIn {
+            scrape_targets,
+            interval,
+            timeout,
+            headers,
+            scrape_tls,
+            bind,
+            path,
+            bind_tls,
+            idle_timeout,
+        } = &component.kind
+        else {
+            continue;
+        };
+        match (scrape_targets.is_empty(), bind.is_some()) {
+            (false, true) => anyhow::bail!(
+                "component '{id}': 'scrape_targets' and 'bind' are the two modes of a \
+                 prometheus_in -- a scrape client and a remote-write receiver -- so exactly one \
+                 of them belongs on a component, not both"
+            ),
+            (true, false) => anyhow::bail!(
+                "component '{id}': a prometheus_in needs either 'scrape_targets' (scrape targets \
+                 on an interval) or 'bind' (a remote-write receiver) -- with neither it would \
+                 never produce an event"
+            ),
+            _ => {}
+        }
+        if bind.is_some() {
+            // Rule 41's check for `prometheus_out`, verbatim in reasoning and nearly so in wording
+            // -- a receiver's `path` is compared against a request URI's own path, which is always
+            // absolute, so a relative or empty one could never match and every write would `404`
+            // against a listener that looks configured.
+            if !path.starts_with('/') {
+                anyhow::bail!(
+                    "component '{id}': prometheus_in path '{path}' must start with '/' -- a \
+                     request URI's path always does, so this one could never be written to"
+                );
+            }
+            let wrong = if *interval != default_prometheus_scrape_interval() {
+                Some("interval")
+            } else if *timeout != default_prometheus_scrape_timeout() {
+                Some("timeout")
+            } else if !headers.is_empty() {
+                Some("headers")
+            } else if !scrape_tls.is_empty() {
+                Some("scrape_tls")
+            } else {
+                None
+            };
+            if let Some(wrong) = wrong {
+                anyhow::bail!(
+                    "component '{id}': '{wrong}' configures an outbound scrape, and this \
+                     prometheus_in has 'bind' set -- a receiver performs no scrape, so the value \
+                     could never take effect"
+                );
+            }
+        } else {
+            let wrong = if *path != default_prometheus_write_path() {
+                Some("path")
+            } else if bind_tls.is_some() {
+                Some("bind_tls")
+            } else if idle_timeout.is_some() {
+                Some("idle_timeout")
+            } else {
+                None
+            };
+            if let Some(wrong) = wrong {
+                anyhow::bail!(
+                    "component '{id}': '{wrong}' configures the remote-write receiver's own \
+                     listener, and this prometheus_in has 'scrape_targets' set -- a scrape client \
+                     binds nothing, so the value could never take effect"
+                );
             }
         }
     }
@@ -3056,37 +3181,53 @@ mod tests {
         }
     }
 
+    /// A scrape-mode `prometheus_in` with every other field at its default -- the shape rules 40
+    /// and 55 both read. `prometheus_in_bind` below is its receiver-mode twin.
     fn prometheus_in(targets: Vec<&str>) -> ComponentKind {
         ComponentKind::PrometheusIn {
             scrape_targets: targets.into_iter().map(String::from).collect(),
-            interval: Duration::from_secs(15),
-            timeout: Duration::from_secs(10),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
             headers: Map::new(),
-            tls: logit_config::TlsClientConfig::default(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+            bind: None,
+            path: default_prometheus_write_path(),
+            bind_tls: None,
+            idle_timeout: None,
+        }
+    }
+
+    fn prometheus_in_bind(bind: &str) -> ComponentKind {
+        ComponentKind::PrometheusIn {
+            scrape_targets: Vec::new(),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
+            headers: Map::new(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+            bind: Some(bind.to_string()),
+            path: default_prometheus_write_path(),
+            bind_tls: None,
+            idle_timeout: None,
         }
     }
 
     fn prometheus_in_with_headers(targets: Vec<&str>, headers: Vec<(&str, &str)>) -> ComponentKind {
-        ComponentKind::PrometheusIn {
-            scrape_targets: targets.into_iter().map(String::from).collect(),
-            interval: Duration::from_secs(15),
-            timeout: Duration::from_secs(10),
-            headers: headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            tls: logit_config::TlsClientConfig::default(),
+        let mut kind = prometheus_in(targets);
+        if let ComponentKind::PrometheusIn { headers: slot, .. } = &mut kind {
+            *slot = headers.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         }
+        kind
     }
 
     fn prometheus_in_with_tls(
         targets: Vec<&str>,
         tls: logit_config::TlsClientConfig,
     ) -> ComponentKind {
-        ComponentKind::PrometheusIn {
-            scrape_targets: targets.into_iter().map(String::from).collect(),
-            interval: Duration::from_secs(15),
-            timeout: Duration::from_secs(10),
-            headers: Map::new(),
-            tls,
+        let mut kind = prometheus_in(targets);
+        if let ComponentKind::PrometheusIn { scrape_tls, .. } = &mut kind {
+            *scrape_tls = tls;
         }
+        kind
     }
 
     fn file_out(rotate: logit_config::RotateConfig) -> ComponentKind {
@@ -7029,13 +7170,17 @@ mod tests {
             .expect("a well-formed prometheus_in should resolve fine");
     }
 
+    /// Rule 40's body is gated on scrape mode now, so "no targets at all" is rule 55's
+    /// neither-mode case rather than rule 40's empty-list bail -- the config is still rejected,
+    /// and the message still names the field an operator forgot.
     #[test]
-    fn a_prometheus_in_with_empty_scrape_targets_is_rejected() {
+    fn a_prometheus_in_with_neither_scrape_targets_nor_bind_is_rejected() {
         let err = expect_err(cfg(vec![
             ("in", vec![], prometheus_in(vec![])),
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("'in'") && err.contains("'scrape_targets'"), "got: {err}");
+        assert!(err.contains("'bind'"), "got: {err}");
     }
 
     #[test]
@@ -7237,6 +7382,203 @@ mod tests {
             err.contains("'receive' is only meaningful on a datagram, stream or tail listener"),
             "got: {err}"
         );
+    }
+
+    // ---- rule 55: prometheus_in's two modes (docs/adr/prometheus-remote-write.md) --------------
+
+    #[test]
+    fn a_bind_mode_prometheus_in_resolves_fine() {
+        let kind = prometheus_in_bind("0.0.0.0:9090");
+        assert_eq!(kind_name(&kind), "prometheus_in");
+        assert_eq!(role(&kind), Role::Listener);
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a bind-mode prometheus_in should resolve fine");
+    }
+
+    /// The regression test for rule 40's gating: before it, rule 40's empty-`scrape_targets` bail
+    /// ran over *every* `prometheus_in` and failed a bind-mode config before rule 55 was ever
+    /// consulted -- which is what made bind mode unreachable rather than merely unvalidated.
+    #[test]
+    fn rule_40_does_not_fire_on_a_bind_mode_prometheus_in() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        // Rule 40's `timeout: 0s` and `scrape_tls`-without-https checks are scrape statements;
+        // neither may fire here. The defaults are what rule 55 requires in bind mode anyway, so
+        // this asserts the gate, not a carve-out.
+        if let ComponentKind::PrometheusIn { path, .. } = &mut kind {
+            *path = "/write".to_string();
+        }
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("rule 40 must not run over a bind-mode prometheus_in");
+    }
+
+    #[test]
+    fn a_prometheus_in_with_both_scrape_targets_and_bind_is_rejected() {
+        let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+        if let ComponentKind::PrometheusIn { bind, .. } = &mut kind {
+            *bind = Some("0.0.0.0:9090".to_string());
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("exactly one of them"), "got: {err}");
+    }
+
+    /// Rule 41's `prometheus_out` check, one kind over: a `path` that a request URI's own path
+    /// could never equal would `404` every write forever, against a listener that looks perfectly
+    /// configured and reports no error at all.
+    #[test]
+    fn a_bind_mode_prometheus_in_with_a_relative_path_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { path, .. } = &mut kind {
+            *path = "api/v1/write".to_string();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("must start with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bind_mode_prometheus_in_with_an_empty_path_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { path, .. } = &mut kind {
+            *path = String::new();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("must start with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_scrape_only_field_alongside_bind_is_rejected() {
+        for (field, mutate) in scrape_only_mutations() {
+            let mut kind = prometheus_in_bind("0.0.0.0:9090");
+            mutate(&mut kind);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(&format!("'{field}'")), "for {field}, got: {err}");
+            assert!(err.contains("a receiver performs no scrape"), "for {field}, got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bind_only_field_alongside_scrape_targets_is_rejected() {
+        for (field, mutate) in bind_only_mutations() {
+            let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
+            mutate(&mut kind);
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(&format!("'{field}'")), "for {field}, got: {err}");
+            assert!(err.contains("a scrape client binds nothing"), "for {field}, got: {err}");
+        }
+    }
+
+    /// `interval` keeps its default in bind mode rather than being carved out of rule 9 -- so
+    /// rule 9's `interval: 0s` rejection stays satisfied there with nothing mode-specific about
+    /// it, and rule 55 sees a defaulted value rather than a set one.
+    #[test]
+    fn bind_mode_leaves_interval_at_its_default_and_rule_9_stays_satisfied() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        // Rule 9's generic flush-interval check, reached before rule 55's wrong-mode one -- which
+        // is the point: nothing about bind mode is carved out of it.
+        assert!(err.contains("a flush interval of 0s"), "got: {err}");
+    }
+
+    /// Rule 53's sixth arm. A bind-mode `prometheus_in` is the field's newest listener, so its
+    /// zero check has to reach it -- and rule 55, not rule 53, is what rejects the field in
+    /// scrape mode (covered by `a_bind_only_field_alongside_scrape_targets_is_rejected`).
+    #[test]
+    fn a_zero_idle_timeout_on_a_bind_mode_prometheus_in_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::ZERO);
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
+    #[test]
+    fn a_positive_idle_timeout_on_a_bind_mode_prometheus_in_resolves_fine() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::from_secs(60));
+        }
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+            .expect("a bind-mode prometheus_in may carry an idle_timeout");
+    }
+
+    /// One non-default value per scrape-only field, named as rule 55's message spells it.
+    #[allow(clippy::type_complexity)]
+    fn scrape_only_mutations() -> Vec<(&'static str, Box<dyn Fn(&mut ComponentKind)>)> {
+        vec![
+            (
+                "interval",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { interval, .. } = kind {
+                        *interval = Duration::from_secs(30);
+                    }
+                }) as Box<dyn Fn(&mut ComponentKind)>,
+            ),
+            (
+                "timeout",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { timeout, .. } = kind {
+                        *timeout = Duration::from_secs(30);
+                    }
+                }),
+            ),
+            (
+                "headers",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { headers, .. } = kind {
+                        headers.insert("X-Scope-OrgID".to_string(), "tenant-a".to_string());
+                    }
+                }),
+            ),
+            (
+                "scrape_tls",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { scrape_tls, .. } = kind {
+                        scrape_tls.ca_file = Some("ca.pem".to_string());
+                    }
+                }),
+            ),
+        ]
+    }
+
+    /// The same, one field over.
+    #[allow(clippy::type_complexity)]
+    fn bind_only_mutations() -> Vec<(&'static str, Box<dyn Fn(&mut ComponentKind)>)> {
+        vec![
+            (
+                "path",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { path, .. } = kind {
+                        *path = "/write".to_string();
+                    }
+                }) as Box<dyn Fn(&mut ComponentKind)>,
+            ),
+            (
+                "bind_tls",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { bind_tls, .. } = kind {
+                        *bind_tls = Some(logit_config::TlsServerConfig {
+                            cert_file: "server.pem".to_string(),
+                            key_file: "server.key".to_string(),
+                            client_ca_file: None,
+                        });
+                    }
+                }),
+            ),
+            (
+                "idle_timeout",
+                Box::new(|kind: &mut ComponentKind| {
+                    if let ComponentKind::PrometheusIn { idle_timeout, .. } = kind {
+                        *idle_timeout = Some(Duration::from_secs(60));
+                    }
+                }),
+            ),
+        ]
     }
 
     // ---- collectd_in (docs/adr/collectd-binary-relay.md) --------------------------------------
