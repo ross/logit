@@ -491,9 +491,25 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// (`Tailer::run_until_shutdown`) -- this is what keeps the cost of one write to one tracked
     /// file O(1) rather than the O(containers) a directory-level wake used to cost
     /// (`docs/adr/docker-container-identity-and-minimal-watches.md`).
+    ///
+    /// The `id`/`len` pair handed to `reconcile_truncation` has to come from the *same* inode, so
+    /// the freshly-stat'd identity is checked against the tracked one before anything else --
+    /// `scan` gets this for free (it derives both from one `metadata` call, and only reconciles
+    /// under its own `existing_id == id` arm), but here `id` comes from `by_path`, which only
+    /// `scan` refreshes. Across an ordinary rotation -- rename the old file away, create a new
+    /// one at the same name, exactly what logrotate and Docker's json-file driver do -- a
+    /// `Wake::Data` queued for the old inode can be handled before any `scan` has noticed, and
+    /// under this ADR's watch set a rotation *inside* a container directory produces no
+    /// `Wake::Discover` at all, so the stale mapping stands until the next `poll_interval` tick.
+    /// Pairing the old inode's offset with the new file's near-empty length would read as a
+    /// truncation for virtually every rotation -- seeking the rotated-away handle back to `0` and
+    /// re-emitting everything it had already read, as duplicates.
     async fn on_data_wake(&mut self, path: &Path) {
         let Some(&id) = self.by_path.get(path) else { return }; // no longer tracked; ignore
         let Ok(meta) = std::fs::metadata(path) else { return }; // raced with removal; `scan` will notice
+        if FileId::from_metadata(&meta) != id {
+            return; // a different inode answers to this name now; `scan` reconciles the rotation
+        }
         self.reconcile_truncation(id, meta.len()).await;
     }
 
@@ -1926,6 +1942,72 @@ mod tests {
         assert_eq!(messages(&second), vec!["short"]);
 
         shutdown(shutdown_tx, handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// White-box regression for the other half of that pair: `on_data_wake` takes `id` from
+    /// `by_path` -- refreshed only by `scan` -- but `len` from its own fresh `metadata(path)`
+    /// call, so the two can describe different inodes. An ordinary rotation (rename the old file
+    /// away, create a new one at the same name -- logrotate's default, and Docker's json-file
+    /// driver) leaves that mapping stale until the next `scan`, and under this ADR's watch set a
+    /// rotation inside a container directory produces no `Wake::Discover` to shorten the window.
+    /// Pairing the rotated-away inode's offset with the replacement's near-empty length reads as
+    /// a truncation for virtually every rotation: the old handle is seeked back to `0` and the
+    /// drain that follows every wake re-emits every line it had already read. Driven directly
+    /// rather than through `run_until_shutdown`, for the same reason the rebind test below is:
+    /// the next `scan` reconciles the rotation either way, so only this one interleaving -- a
+    /// data wake handled *before* the scan that follows it -- tells the bug from the fix.
+    #[tokio::test]
+    async fn a_data_wake_for_a_path_a_new_inode_now_owns_is_not_a_truncation() {
+        let dir = scratch_dir("data-wake-rotation");
+        let path = dir.join("app.log");
+        // Deliberately longer than the replacement written below, so a stale-`id` reconcile would
+        // classify it as a truncation (`len < offset`) rather than passing as a harmless no-op.
+        std::fs::write(&path, b"a-longer-first-line\n").unwrap();
+
+        let (fanout, mut rx) = recording_fanout(8);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        tailer.scan(true, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+        tailer.flush_all(&fanout, FlushReason::Interval).await;
+        assert_eq!(messages(&expect_events(&mut rx, 1).await), vec!["a-longer-first-line"]);
+
+        let old = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+        let read_offset = tailer.files.get(&old).unwrap().offset;
+        assert_eq!(read_offset, 20, "the whole first line should already have been read");
+
+        // The rotation itself, with no `scan` in between -- exactly the window a `Wake::Data`
+        // queued for the old inode lands in.
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, b"new\n").unwrap();
+        assert_ne!(
+            FileId::from_metadata(&std::fs::metadata(&path).unwrap()),
+            old,
+            "test is vacuous if the filesystem reused the rotated-away file's inode"
+        );
+
+        tailer.on_data_wake(&path).await;
+        assert_eq!(
+            tailer.files.get(&old).unwrap().offset,
+            read_offset,
+            "a data wake naming a path another inode now owns must not rewind the tracked file"
+        );
+
+        // The observable half: the unconditional drain that follows every wake finds nothing to
+        // re-read, so nothing is emitted twice.
+        let _ = tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+        tailer.flush_all(&fanout, FlushReason::Interval).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the rotated-away file's already-read content must not be re-emitted"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
