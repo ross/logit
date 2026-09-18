@@ -62,7 +62,10 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 // Shared with `prometheus_out`'s remote-write sender, which reuses this transport's `Fault` table
 // by name (`docs/adr/prometheus-remote-write.md`) -- see `crate::http`.
-use crate::http::{build_client, classify_reqwest_error, is_retryable_http_status, status_class};
+use crate::http::{
+    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
+    status_class, ERROR_BODY_SNIPPET_BYTES,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -336,7 +339,15 @@ impl OtlpOutput {
                     1.0,
                     &[("signal", signal.as_str()), ("class", status_class(status))],
                 );
-                let text = resp.text().await.unwrap_or_default();
+                // A bounded read, not `text()`: a collector answering an error with an
+                // arbitrarily long body would otherwise cost this sink that much allocation per
+                // attempt, and an erroring sink is the one that keeps retrying. The message keeps
+                // as much of it as is useful, ellipsised past that -- see
+                // `crate::http::read_body_prefix`.
+                let text = body_snippet(
+                    &read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await,
+                    ERROR_BODY_SNIPPET_BYTES,
+                );
                 let fault = if is_retryable_http_status(status) {
                     Fault::Ambiguous
                 } else {

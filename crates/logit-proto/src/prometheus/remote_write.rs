@@ -684,13 +684,16 @@ pub fn encode_counted(
             }
         }
     }
-    let mut samples = 0u64;
     for out in built.values_mut() {
         // Both versions require a series' samples to be in timestamp order. Stable, so two samples
         // that truncate to the same millisecond keep the order the groups gave them.
         out.samples.sort_by_key(|sample| sample.timestamp_ms);
-        samples += out.samples.len() as u64;
     }
+    // Counted in its own pass, deliberately *after* everything that can still add to or remove
+    // from `built` -- what a caller reports as `logit.output.samples` has to be what the body
+    // ends up carrying, not what the merge loop above happened to have accumulated at some point
+    // on the way there.
+    let samples = built.values().map(|out| out.samples.len() as u64).sum();
     let body = match version {
         Version::V1 => encode_v1(built),
         Version::V2 => encode_v2(built),

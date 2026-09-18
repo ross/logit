@@ -142,9 +142,23 @@
 //! |---|---|
 //! | 2xx | `Ok` |
 //! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied |
-//! | any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange |
+//! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange |
 //! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
+//!
+//! **Redirects are not followed** ([`crate::http::build_client`] turns `reqwest`'s own
+//! `limited(10)` default off), which is what puts `3xx` on that table at all. Remote-write defines
+//! no redirect, and following one would break the table's premise that one request went to the
+//! configured URL: a `301`/`302`/`303` is replayed as a body-less `GET`, so a batch nothing wrote
+//! would be acked by whatever answered that, and a `307`/`308` would carry the operator's
+//! `headers:` -- a tenant header, an `Authorization` on a same-host scheme downgrade -- to the
+//! `Location` host, past rule 56's `https://` check. So a redirect is reported against the URL the
+//! operator actually configured, which is where the misconfiguration is.
+//!
+//! **The rejection body is read bounded, not read whole and then trimmed.** At most 256 bytes
+//! (plus a character's slack) leave the socket into this sink's memory, so a receiver answering
+//! `500` with an endless body costs a snippet rather than a connection's worth of allocation on
+//! every retry -- see [`crate::http::read_body_prefix`].
 //!
 //! [`RemoteWriteOutput::duplicate_safe`] is **`true`**, and load-bearing rather than incidental. A
 //! sample's identity at a remote-write receiver is `(label set, timestamp)`, so replaying an
@@ -221,7 +235,10 @@
 //! `insecure_skip_verify`, which logs a startup warning. The receiver getting TLS does not
 //! retroactively give the exposition server any.
 
-use crate::http::{build_client, classify_reqwest_error, is_retryable_http_status, status_class};
+use crate::http::{
+    body_snippet, build_client, classify_reqwest_error, is_retryable_http_status, read_body_prefix,
+    status_class, ERROR_BODY_SNIPPET_BYTES,
+};
 /// The sender's `endpoint_tls:`, re-exported at this path the way `otlp_out`, `logit_out`,
 /// `syslog_out` and `statsd_out` each re-export the one shared type.
 pub use crate::tls::TlsClientSettings;
@@ -303,11 +320,6 @@ pub const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// operator can't replace it: a receiver's own logs are frequently the only place a misbehaving
 /// sender is identified from, and this is the identification.
 const USER_AGENT: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
-
-/// How much of a rejection body is worth carrying into an error message and a diagnostic. Enough
-/// for Prometheus's own `400` text -- which names the offending series and why -- and short enough
-/// that a receiver answering with an HTML error page doesn't fill a log line.
-const ERROR_BODY_SNIPPET_BYTES: usize = 256;
 
 const SCRAPES: &str = "logit.output.scrapes";
 /// Response body bytes as *rendered* (post-gzip when the client asked for it), counted when the
@@ -1051,9 +1063,9 @@ impl Output for RemoteWriteOutput {
                 // The body, not just the status: a Prometheus-style `400` names the offending
                 // series (`out of order sample`, `duplicate sample for timestamp`, a label that
                 // failed validation), and that is the only actionable thing in the exchange.
-                // Truncated, because a receiver under load can answer with a great deal of it.
-                let body = response.text().await.unwrap_or_default();
-                let snippet = body_snippet(&body);
+                // Read truncated, not read whole and then truncated -- see `read_body_prefix`.
+                let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
+                let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
                 self.diag.warn_throttled(
                     "remote_write_rejected",
                     format_args!("remote-write to {} failed ({status}): {snippet}", self.endpoint),
@@ -1084,21 +1096,6 @@ impl Output for RemoteWriteOutput {
     fn duplicate_safe(&self) -> bool {
         true
     }
-}
-
-/// The first [`ERROR_BODY_SNIPPET_BYTES`] of a rejection body, on a character boundary so the
-/// result is always printable, with an ellipsis when anything was cut. A `String` is UTF-8 by
-/// construction, so `floor_char_boundary`'s work is all this needs.
-fn body_snippet(body: &str) -> String {
-    let trimmed = body.trim();
-    if trimmed.len() <= ERROR_BODY_SNIPPET_BYTES {
-        return trimmed.to_string();
-    }
-    let mut end = ERROR_BODY_SNIPPET_BYTES;
-    while end > 0 && !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &trimmed[..end])
 }
 
 /// Poisoning cannot lose data here -- a panic while holding this lock would have to come from
@@ -2036,14 +2033,74 @@ mod tests {
         }
     }
 
-    /// A real HTTP/1.1 receiver answering `status` with `body` and recording every request it
-    /// saw. A real server rather than a raw-socket canned response (`otlp.rs`'s pattern) because
-    /// these assertions are about the *request*: the headers, the path, and a body this test then
+    /// What a canned receiver answers with.
+    #[derive(Clone, Copy)]
+    enum Canned {
+        /// A status, a fixed body, and an optional `Location` header.
+        Fixed(StatusCode, &'static str, Option<&'static str>),
+        /// A status whose body never ends -- what a *bounded* error-body read has to survive and
+        /// an unbounded one would sit on until the request deadline fired.
+        Endless(StatusCode),
+    }
+
+    type CannedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+    const ENDLESS_CHUNK: &[u8] = &[b'x'; 1024];
+
+    /// A body that never ends: `poll_frame` always has another kilobyte. A client that has read
+    /// enough simply drops the connection, which is precisely what a bounded read does -- so this
+    /// needs no cooperation from the reader and no length to agree on.
+    struct EndlessBody;
+
+    impl hyper::body::Body for EndlessBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(
+                ENDLESS_CHUNK,
+            )))))
+        }
+    }
+
+    /// A real HTTP/1.1 receiver answering `canned` and recording every request it saw. A real
+    /// server rather than a raw-socket canned response (`otlp.rs`'s pattern) because these
+    /// assertions are about the *request*: the headers, the path, and a body this test then
     /// decompresses and prost-decodes.
     async fn canned_receiver(
         status: StatusCode,
         body: &'static str,
     ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_canned(Canned::Fixed(status, body, None)).await
+    }
+
+    /// A receiver that answers `status` with a `Location` -- and a body naming it, the way a real
+    /// ingress's redirect page does, since `Location` itself is a header and the sink quotes the
+    /// body. `location` is deliberately *relative*: `reqwest` resolves it against the request URL,
+    /// so a client that follows redirects comes straight back here and this receiver's own request
+    /// count is the evidence.
+    async fn canned_redirect_receiver(
+        status: StatusCode,
+        location: &'static str,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_canned(Canned::Fixed(
+            status,
+            "redirecting to somewhere this batch was never written",
+            Some(location),
+        ))
+        .await
+    }
+
+    async fn canned_endless_receiver(
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        serve_canned(Canned::Endless(status)).await
+    }
+
+    async fn serve_canned(canned: Canned) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -2060,7 +2117,7 @@ mod tests {
                                 let seen = Arc::clone(&seen_conn);
                                 async move {
                                     Ok::<_, std::convert::Infallible>(
-                                        record(req, seen, status, body).await,
+                                        record(req, seen, canned).await,
                                     )
                                 }
                             }),
@@ -2097,7 +2154,8 @@ mod tests {
                                 let seen = Arc::clone(&seen_conn);
                                 async move {
                                     Ok::<_, std::convert::Infallible>(
-                                        record(req, seen, StatusCode::OK, "").await,
+                                        record(req, seen, Canned::Fixed(StatusCode::OK, "", None))
+                                            .await,
                                     )
                                 }
                             }),
@@ -2112,9 +2170,8 @@ mod tests {
     async fn record(
         req: http::Request<hyper::body::Incoming>,
         seen: Arc<Mutex<Vec<CapturedRequest>>>,
-        status: StatusCode,
-        body: &'static str,
-    ) -> http::Response<Full<Bytes>> {
+        canned: Canned,
+    ) -> http::Response<CannedBody> {
         use http_body_util::BodyExt as _;
         let (parts, incoming) = req.into_parts();
         let collected = incoming.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
@@ -2124,10 +2181,17 @@ mod tests {
             headers: parts.headers,
             body: collected.to_vec(),
         });
-        http::Response::builder()
-            .status(status)
-            .body(Full::new(Bytes::from_static(body.as_bytes())))
-            .expect("a well-formed response always builds")
+        let (status, body, location): (_, CannedBody, _) = match canned {
+            Canned::Fixed(status, body, location) => {
+                (status, Full::new(Bytes::from_static(body.as_bytes())).boxed(), location)
+            }
+            Canned::Endless(status) => (status, CannedBody::new(EndlessBody), None),
+        };
+        let mut builder = http::Response::builder().status(status);
+        if let Some(location) = location {
+            builder = builder.header(http::header::LOCATION, location);
+        }
+        builder.body(body).expect("a well-formed response always builds")
     }
 
     /// `otlp.rs`'s own test-only server config, with ALPN narrowed to HTTP/1.1.
@@ -2472,15 +2536,75 @@ mod tests {
         assert!(message.contains("out of order sample"), "got: {message}");
     }
 
-    /// The snippet is bounded: a receiver answering with a page of HTML must not become a log
-    /// line of one.
-    #[test]
-    fn a_long_rejection_body_is_truncated_on_a_character_boundary() {
-        let long = "é".repeat(400);
-        let snippet = body_snippet(&long);
-        assert!(snippet.len() <= ERROR_BODY_SNIPPET_BYTES + 3, "got {} bytes", snippet.len());
-        assert!(snippet.ends_with("..."));
-        assert_eq!(body_snippet("  short  "), "short", "trimmed, and not truncated");
+    /// The bounded read, end to end: a receiver answering `500` with a body that never ends must
+    /// cost this sink a snippet, not a connection's worth of allocation, and must not turn a
+    /// classifiable `5xx` into a timeout. `crate::http`'s own tests cover the cutting rules; this
+    /// one covers that the *read* stops, which `Response::text()` would not have.
+    #[tokio::test]
+    async fn an_endless_rejection_body_is_read_only_as_far_as_the_snippet_needs() {
+        let (url, _seen) = canned_endless_receiver(StatusCode::INTERNAL_SERVER_ERROR).await;
+        // Well under the time an unbounded read of an endless body would take to hit any
+        // deadline, so a regression fails as a timeout rather than hanging this test.
+        let mut sink = sender(&url).with_timeout(Duration::from_secs(30));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            sink.send(&counter_batch(1_000_000_000, 1.0)),
+        )
+        .await
+        .expect("the read is bounded by bytes, so it returns without waiting for the body to end");
+
+        let err = outcome.expect_err("a 500 is an error");
+        assert_eq!(
+            logit_pipeline::classify(&err),
+            Fault::Ambiguous,
+            "a bounded read must not turn a 5xx into a transport timeout"
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("500"), "got: {message}");
+        assert!(message.contains("..."), "the snippet is ellipsised: {message}");
+        assert!(
+            message.len() < ERROR_BODY_SNIPPET_BYTES * 2,
+            "the whole message stays log-line sized, got {} bytes",
+            message.len()
+        );
+    }
+
+    /// Redirects are off (`crate::http::build_client`): a `3xx` is a non-2xx like any other, not
+    /// a second request to wherever `Location` pointed. Without the policy the sink would replay
+    /// this as a body-less `GET`, and whatever answered *that* would become its verdict on a batch
+    /// nothing ever wrote -- so the request count at this receiver is the assertion that matters.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_is_a_permanent_fault() {
+        let (url, seen) = canned_redirect_receiver(StatusCode::FOUND, "/api/v1/write").await;
+        let registry = logit_core::Registry::new();
+        let mut sink =
+            sender(&url).with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
+        let err = sink
+            .send(&counter_batch(1_000_000_000, 1.0))
+            .await
+            .expect_err("a 3xx is not a delivery");
+
+        assert_eq!(seen.lock().unwrap().len(), 1, "the redirect must not be followed");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert!(logit_pipeline::is_explicitly_permanent(&err), "never retried under any posture");
+        let message = format!("{err:#}");
+        assert!(message.contains("302"), "got: {message}");
+        assert!(
+            message.contains("redirecting to"),
+            "the operator sees what the receiver said: {message}"
+        );
+
+        let events = registry.drain(0);
+        assert_eq!(tagged(&events, "logit.output.requests", "class", "3xx"), 1.0);
+        assert_eq!(
+            events
+                .iter()
+                .flat_map(|e| &e.metrics)
+                .filter(|m| logit_core::interner::resolve(m.name) == "logit.output.samples")
+                .count(),
+            0,
+            "nothing was written, so nothing is counted as written"
+        );
     }
 
     #[tokio::test]
