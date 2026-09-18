@@ -19,7 +19,9 @@
 // files themselves -- is what keeps `script/format`/`script/format --check` off this generated
 // code: rustfmt honors `#[rustfmt::skip]` on a module *declaration* by skipping the file it names
 // entirely, and the outer form is stable (the inner `#![rustfmt::skip]` form each generated file
-// would otherwise want at its own top is nightly-only, rust-lang/rust#54726).
+// would otherwise want at its own top is nightly-only, rust-lang/rust#54726 -- unlike the
+// `#![allow(...)]` lines the generator does write into each file's top, which are stable: `allow`
+// is a builtin attribute, just given a tool-lint-path argument).
 // Without help, an inline module's file-module children resolve against a *virtual* nested
 // directory that accumulates one path segment per enclosing inline `mod` (e.g. `common`'s child
 // `v1` would default to looking in `generated/opentelemetry/proto/common/`, not `generated/` --
