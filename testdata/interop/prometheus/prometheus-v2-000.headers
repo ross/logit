@@ -1,0 +1,8 @@
+method: POST
+path: /api/v1/write
+host: capture:9091
+user-agent: Prometheus/3.14.0
+content-length: 771
+content-encoding: snappy
+content-type: application/x-protobuf;proto=io.prometheus.write.v2.Request
+x-prometheus-remote-write-version: 2.0.0
