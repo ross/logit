@@ -1,0 +1,225 @@
+#cloud-config
+# user-data for the disposable Azure perf VM script/vm creates
+# (docs/adr/disposable-azure-perf-vm.md). Not standalone: script/vm substitutes the @NAME@
+# placeholders below into a temp copy and hands that to `az vm create --custom-data`. The two
+# files are edited together and neither is useful alone -- the same relationship script/common.sh
+# has to the rest of script/*, which is why this lives beside it rather than under deploy/
+# (deploy/ holds assets for *running* logit; this is an argument to a script/* command).
+#
+# Machine setup only -- everything that has to be true before a login shell is worth anything.
+# The cache warm (script/bootstrap, then one release scenario run) is deliberately NOT here:
+# script/vm up does it over ssh so its several minutes of output stream to whoever is waiting on
+# it, instead of landing in a log nobody reads until something breaks.
+
+# Indexes refreshed; nothing upgraded. The image URN already pins the kernel; an in-place upgrade
+# on every `up` would make the kernel version depend on which day the VM happened to be created,
+# which is exactly the nondeterminism this machine exists to remove, and would also want a reboot.
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - git       # script/perf computes the git SHA on the *host* side before entering the
+              # container (see its own comment); git has to exist out here for that
+  - gnupg     # to verify Docker's apt signing key by fingerprint below
+  - linux-perf # so `perf stat -e cycles true` can answer "does this guest have a hardware PMU"
+              # in one command, without building crates/logit-perf/Dockerfile first -- see the
+              # ADR's "no virtualized PMU" limitation
+
+# bootcmd runs in cloud-init's `init` stage -- before `packages:` installs anything and long
+# before runcmd. That ordering matters: Debian's apt-daily / unattended-upgrades units fire on a
+# randomized timer seconds into first boot and take /var/lib/dpkg/lock, and masking them from
+# runcmd would be too late to stop them racing the Docker install below.
+#
+# `mask`, not `disable`: a masked unit can't be pulled back in by another unit's Wants=/Requires=,
+# and masking succeeds even for a unit this image doesn't ship, so the whole list can be named at
+# once. Each of these is a real mid-measurement perturbation risk on a machine that lives for one
+# session:
+#   unattended-upgrades, apt-daily(-upgrade)  unprompted package installs / index refresh
+#   man-db.timer                              a full mandb rebuild -- minutes of CPU and disk
+#   fstrim.timer                              weekly discard across the whole filesystem
+#   e2scrub_all.timer / e2scrub_reap          online fsck of every ext4 volume
+#   dpkg-db-backup.timer                      daily tarball of /var/lib/dpkg
+#   logrotate.timer                           log compression -- cheap, but it's disk I/O mid-run
+#   systemd-tmpfiles-clean.timer              walks /tmp and /var/tmp
+#
+# Deliberately left running: `walinuxagent` (reports provisioning success and serves every
+# `az vm` operation script/vm makes; idle in between) and `systemd-timesyncd` (the harness's
+# events/s is wall-clock derived, so a drifting clock corrupts a measurement rather than
+# protecting one -- and Azure's own /dev/ptp_hyperv source is more accurate than NTP, not less).
+bootcmd:
+  - systemctl mask unattended-upgrades.service apt-daily.timer apt-daily.service
+      apt-daily-upgrade.timer apt-daily-upgrade.service man-db.timer fstrim.timer
+      e2scrub_all.timer e2scrub_reap.service dpkg-db-backup.timer logrotate.timer
+      systemd-tmpfiles-clean.timer
+  - systemctl stop unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+      man-db.timer fstrim.timer || true
+
+write_files:
+  # Applied by `sysctl --system` in runcmd; persistent afterward via /etc/sysctl.d, so this
+  # survives the reboot this machine is never expected to take.
+  - path: /etc/sysctl.d/99-logit-perf.conf
+    permissions: "0644"
+    content: |
+      # Written by script/vm-cloud-init.yaml (docs/adr/disposable-azure-perf-vm.md). Every value
+      # here is recorded verbatim in ~/logit-vm-metadata.txt, because a measurement whose kernel
+      # settings are unknown is not a trustworthy measurement.
+
+      # Ceilings on what an explicit SO_RCVBUF/SO_SNDBUF setsockopt may ask for. Raising a
+      # ceiling reserves nothing -- it costs zero memory until a socket actually asks. 16 MiB is
+      # 2x the largest `receive_buffer_bytes:` any shipped config suggests (8 MiB, in
+      # examples/statsd-to-influxdb.yaml and friends); Linux stores 2x the *requested* value for
+      # its own bookkeeping, so an 8 MiB request needs rmem_max >= 8 MiB, not >= 16 MiB.
+      #
+      # Honest scope note: no scenario under perf/scenarios/ uses UDP today (they're all
+      # generate_in, plus native-relay's loopback TCP pair), and net.core.rmem_max doesn't affect
+      # TCP autotuning at all -- that's net.ipv4.tcp_rmem, left at its default. This exists so the
+      # first UDP scenario measures the socket it asked for instead of a silently clamped one
+      # (crates/logit-inputs/src/udp.rs warns exactly when granted < 2x requested), not because
+      # anything is clamped right now.
+      net.core.rmem_max = 16777216
+      net.core.wmem_max = 16777216
+
+      # Pinned at the stock kernel value, deliberately NOT raised. rmem_default is what a socket
+      # gets when nothing asks for a size -- raising it would change every socket in every
+      # scenario, make VM numbers incomparable to laptop numbers, and mask a config that forgot
+      # its own `receive_buffer_bytes:`. Written explicitly so a future Debian default change
+      # shows up as a diff to this file rather than an unexplained shift in a results table.
+      net.core.rmem_default = 212992
+      net.core.wmem_default = 212992
+
+      # Debian's kernels are built with CONFIG_SECURITY_PERF_EVENTS_RESTRICT, so the stock
+      # default here is 3 (perf_event_open refused outright without CAP_PERFMON/CAP_SYS_ADMIN),
+      # not upstream's 2. crates/logit-perf/Dockerfile's flamegraph container already runs with
+      # --cap-add SYS_ADMIN and would pass at 3, but 1 is what makes a plain `perf stat`/
+      # `perf record` work directly as the admin user -- the first thing anyone reaches for when
+      # a flamegraph looks wrong.
+      kernel.perf_event_paranoid = 1
+      # So kernel frames in a capture resolve to names instead of hex. Paired with the line
+      # above: paranoid <= 1 permits kernel-address samples, kptr_restrict = 0 permits reading
+      # /proc/kallsyms to symbolize them -- either alone leaves an unattributed [unknown] block.
+      kernel.kptr_restrict = 0
+
+  # common.sh defaults DOCKER to `sudo docker`, which is right for the dev box and wrong here:
+  # the admin user is added to the `docker` group in runcmd below, so `docker` works directly.
+  #
+  # /etc/environment, not just a profile.d drop-in: `ssh host 'command'` runs a non-login,
+  # non-interactive shell that never sources /etc/profile, so a profile.d file alone would leave
+  # every `script/vm shell '<cmd>'` invocation falling back to `sudo docker`. What actually sets
+  # this for an ssh session is pam_env, via the `auth required pam_env.so` line in Debian's
+  # /etc/pam.d/sshd, reading /etc/environment. The profile.d file is written too, so an
+  # interactive login shell's `env | grep DOCKER` reads the way someone expects.
+  # script/vm up also passes DOCKER=docker explicitly on its own ssh calls, so its own build
+  # steps don't depend on either mechanism working.
+  - path: /etc/environment
+    append: true
+    content: |
+      DOCKER=docker
+  - path: /etc/profile.d/logit-perf.sh
+    permissions: "0644"
+    content: |
+      export DOCKER=docker
+
+  # Every machine fact a recorded number has to be read against. Written as a re-runnable script,
+  # not a one-shot inline command, so it can be re-run by hand after any change and so
+  # `script/vm shell logit-vm-metadata` works on demand.
+  - path: /usr/local/bin/logit-vm-metadata
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # cloud-init runs this once into ~@ADMIN_USER@/logit-vm-metadata.txt; re-run any time.
+      #
+      # Deliberately NOT written inside the ~/logit clone: script/perf computes
+      # LOGIT_PERF_GIT_DIRTY from `git status --porcelain` on the host side, and an untracked
+      # file in the checkout would stamp every results file this VM ever writes as dirty.
+      set -u
+      p() { printf '%-16s %s\n' "$1" "$2"; }
+      p "captured:"    "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      p "cpu model:"   "$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)"
+      p "cpus:"        "$(nproc) online; $(lscpu | sed -n 's/^Thread(s) per core:[[:space:]]*/threads-per-core /p')"
+      p "microcode:"   "$(sed -n 's/^microcode[[:space:]]*: //p' /proc/cpuinfo | head -1)"
+      p "kernel:"      "$(uname -srmo)"
+      p "os:"          "$(. /etc/os-release && echo "${PRETTY_NAME}")"
+      p "docker:"      "$(docker --version 2>&1)"
+      p "compose:"     "$(docker compose version 2>&1 | head -1)"
+      for k in net.core.rmem_max net.core.wmem_max net.core.rmem_default \
+               net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+               kernel.perf_event_paranoid kernel.kptr_restrict; do
+        p "sysctl:" "${k} = $(sysctl -n "${k}" 2>&1 | tr -s '[:space:]' ' ')"
+      done
+      # jemalloc is the global allocator (docs/adr/jemalloc-global-allocator.md) and its RSS
+      # behavior depends on this, so it's recorded here rather than changed -- the dev box also
+      # reads `always [madvise] never`, and making them differ would add a variable, not remove
+      # one.
+      p "THP:"         "$(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+      # Expected to be empty: this size has no local temp disk (MaxResourceVolumeMB is 0), so
+      # there's no resource disk for waagent to put a swapfile on. A non-empty answer here
+      # invalidates every peak-RSS number this VM produces.
+      p "swap:"        "$(swapon --show=NAME,SIZE --noheadings | paste -sd' ' || true)"
+      # The one measurement the guest can't make for itself: whether a hardware PMU exists.
+      # Expect "not supported" on Azure -- see the ADR's limitations and its effect on
+      # `script/perf flamegraph`.
+      p "perf cycles:" "$(perf stat -e cycles true 2>&1 | tr '\n' ' ')"
+      # format=text on IMDS leaf nodes needs no JSON parsing. `version` is the single most
+      # valuable field here: it's whatever `:latest` actually resolved to, the only way to tell
+      # two sessions' images apart after the fact. Azure exposes no physical host identity, so
+      # "was this the same host as last time" stays unanswerable -- see the ADR.
+      for f in vmId vmSize location zone platformFaultDomain platformUpdateDomain \
+               publisher offer sku version; do
+        p "azure ${f}:" "$(curl -s -H Metadata:true --max-time 5 \
+          "http://169.254.169.254/metadata/instance/compute/${f}?api-version=2023-07-01&format=text")"
+      done
+      p "masked units:" "$(systemctl list-unit-files --state=masked --no-legend | awk '{print $1}' | paste -sd' ')"
+      p "admin uid:"   "$(id -u) (compose.yaml pins user \"1000:1000\" -- this must read 1000)"
+
+ssh_pwauth: false
+disable_root: true
+
+runcmd:
+  # Applied now; already persistent via /etc/sysctl.d above.
+  - [ sysctl, --system ]
+
+  # compose.yaml hard-codes `user: "1000:1000"` and Dockerfile.dev bakes a matching dev user, so
+  # an admin account that isn't uid 1000 would write bind-mounted files as the wrong owner. A
+  # fresh Debian Azure image creates exactly one non-system user, so this should always hold --
+  # which is exactly why it's asserted rather than assumed. Failing here makes `cloud-init status`
+  # report an error, which script/vm up surfaces with the log tail.
+  - |
+    uid="$(id -u '@ADMIN_USER@')"
+    if [ "${uid}" != "1000" ]; then
+      echo "FATAL: @ADMIN_USER@ has uid ${uid}, not 1000; compose.yaml pins user 1000:1000" >&2
+      exit 1
+    fi
+
+  # Docker CE from download.docker.com rather than Debian trixie's own packaging (docker.io,
+  # docker-buildx, docker-compose): version parity with the dev box's Docker CE
+  # (ADR containerized-development), and Dockerfile.dev's `# syntax=docker/dockerfile:1` plus its
+  # `RUN --mount=type=cache` lines are BuildKit features that need docker-buildx-plugin, not
+  # Debian's separately-versioned docker-buildx. common.sh also invokes `${DOCKER} compose` as a
+  # CLI plugin, and Debian trixie ships no `docker-compose-v2` plugin package at all.
+  #
+  # The key is fetched over https and pinned by fingerprint, so a redirected or tampered download
+  # fails the install instead of quietly configuring a different repo.
+  # 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 is "Docker Release (CE deb) <docker@docker.com>".
+  - [ install, -m, "0755", -d, /etc/apt/keyrings ]
+  - curl -fsSL --retry 3 --max-time 60 https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - bash -c "gpg --show-keys --with-fingerprint --with-colons /etc/apt/keyrings/docker.asc | grep -q '^fpr:*9DC858229FC7DD38854AE2D88D81803C0EBFCD88:'"
+  # trixie is Debian 13's suite name; verified present under download.docker.com/linux/debian.
+  - bash -c "echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian trixie stable' > /etc/apt/sources.list.d/docker.list"
+  - [ apt-get, update ]
+  - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin" ]
+
+  # So DOCKER=docker (set in /etc/environment above) works without sudo. Group membership is
+  # picked up at login; nothing has logged in yet, so every ssh session after this has it.
+  - [ usermod, -aG, docker, "@ADMIN_USER@" ]
+
+  # A full clone, not --depth 1: the whole .git is ~27 MiB, and a measurement session routinely
+  # wants a second ref (`git checkout <branch>`, or two SHAs for `script/perf compare`), neither
+  # of which a shallow clone gives without another fetch. Cloned as the admin user so the checkout
+  # is owned by uid 1000 and no `safe.directory` config is needed.
+  - [ runuser, -u, "@ADMIN_USER@", --, git, clone, --branch, "@REPO_REF@", "@REPO_URL@", "/home/@ADMIN_USER@/logit" ]
+
+  - [ bash, -c, "/usr/local/bin/logit-vm-metadata > /home/@ADMIN_USER@/logit-vm-metadata.txt 2>&1" ]
+  - [ chown, "@ADMIN_USER@:@ADMIN_USER@", "/home/@ADMIN_USER@/logit-vm-metadata.txt" ]
