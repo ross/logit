@@ -108,13 +108,30 @@ pub fn rewritten_config_path(scenario: &Scenario, purpose: &str) -> anyhow::Resu
     Ok(dir.join(format!(".{}.{purpose}.{}.yaml", scenario.name, std::process::id())))
 }
 
+/// Where [`make_workdir`] puts a given purpose's scratch directory. Pure, so a caller that only
+/// wants to *clean up* afterwards doesn't have to create the directory to learn its name.
+pub fn workdir_path(purpose: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("logit-perf-{purpose}-{}", std::process::id()))
+}
+
 /// A private scratch directory for one run's native dump -- and nothing else; the rewritten
 /// scenario deliberately stays next to the original (see [`rewritten_config_path`]). Named by
 /// purpose and pid so two concurrent runs can't share one.
 pub fn make_workdir(purpose: &str) -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("logit-perf-{purpose}-{}", std::process::id()));
+    let dir = workdir_path(purpose);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Removes a workdir left by [`make_workdir`] **only if it is empty**.
+///
+/// Non-recursive on purpose: every dump inside it was either removed by the repeat that wrote it
+/// (because that repeat succeeded) or deliberately kept (because it didn't). An empty directory is
+/// therefore exactly "nothing failed", and a `remove_dir_all` here would throw away the evidence
+/// the failure path just went out of its way to preserve. Silent either way -- a leftover scratch
+/// directory is not worth a message.
+pub fn remove_workdir_if_empty(purpose: &str) {
+    let _ = fs::remove_dir(workdir_path(purpose));
 }
 
 /// Runs the built binary's own `logit validate` over the rewritten file before spawning it. The

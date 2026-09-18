@@ -37,7 +37,65 @@ pub struct RunReport {
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// What the box's power/thermal policy was while this ran. Absent in every results file
+    /// written before it existed, and any field of it may be absent on a machine or container
+    /// that doesn't expose it -- see [`BoxState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_state: Option<BoxState>,
     pub scenarios: BTreeMap<String, ScenarioReport>,
+}
+
+/// The CPU frequency policy and power source a run was taken under, read best-effort from sysfs.
+///
+/// Recorded because it is the single largest source of unexplained movement in these numbers, and
+/// a results file that doesn't carry it can't be told apart from one that does: a `powersave`
+/// governor or a run on battery can move CPU µs/event by tens of percent with nothing in the code
+/// having changed (`perf/load/README.md`'s "Tuning", and `docs/design/performance.md`). Every
+/// field is `Option` and read with a plain file read that is allowed to fail -- a container or a
+/// non-Linux host that exposes none of this records `null`s rather than refusing to run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxState {
+    /// `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` -- `performance` or `powersave` on
+    /// an `amd_pstate`/`intel_pstate` box. Visible inside this repo's dev container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling_governor: Option<String>,
+    /// `…/cpu0/cpufreq/energy_performance_preference` -- the finer knob underneath the governor
+    /// (`performance`, `balance_performance`, `balance_power`, `power`). Also visible in the
+    /// container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_performance_preference: Option<String>,
+    /// `/sys/firmware/acpi/platform_profile` -- the firmware-level profile, where a machine has
+    /// one. Verified **absent** on this repo's own dev box, hence very much optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_profile: Option<String>,
+    /// Whether a mains supply is online, from the first `/sys/class/power_supply/*` whose `type`
+    /// is `Mains`. Found by scanning rather than by name: it is `ACAD` on this box, `AC` or
+    /// `ADP1` on others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac_power: Option<bool>,
+}
+
+impl BoxState {
+    /// The reasons this run's numbers should be read with suspicion, in words -- empty when the
+    /// box looks like somewhere a measurement can be taken.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.scaling_governor.as_deref() == Some("powersave") {
+            warnings.push(
+                "the CPU governor is `powersave` -- CPU µs/event is not comparable with a run \
+                 taken under `performance`, and a driven scenario's drop rate least of all"
+                    .to_string(),
+            );
+        }
+        if self.on_ac_power == Some(false) {
+            warnings.push(
+                "this box is on battery -- expect every absolute number to be depressed, and the \
+                 amount to drift as the run goes on"
+                    .to_string(),
+            );
+        }
+        warnings
+    }
 }
 
 /// One scenario's results across every `--repeat`.
@@ -116,6 +174,14 @@ pub struct UdpSample {
     /// "nearly full": it is exactly the point at which the kernel begins dropping, so a baseline
     /// sitting just under it is the regime this scenario family is tuned for.
     pub kernel_rcvbuf_utilization_max: f64,
+    /// Datagrams/s the blast was actually paced at, after `--rate-scale`/`--verify` -- not the
+    /// spec's own `rate:`, which is what it would have been unscaled. `None` for an unpaced spec,
+    /// and for any results file written before the flag existed.
+    ///
+    /// Recorded because two runs of the same scenario at different scales are not comparable, and
+    /// nothing else in the file would say so: `compare` warns when these differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_rate: Option<u64>,
 }
 
 impl UdpSample {
@@ -273,6 +339,14 @@ fn reduce_udp(
         kernel_rcvbuf_utilization_max: reduce_f64(
             &udp.iter().map(|u| u.kernel_rcvbuf_utilization_max).collect::<Vec<_>>(),
         ),
+        // Config, not a measurement: every repeat of one scenario ran at the same pace, so there
+        // is nothing to reduce. Carried through only when they all agree, so a hand-merged file
+        // reporting two different paces as one number is impossible.
+        effective_rate: udp
+            .iter()
+            .all(|u| u.effective_rate == udp[0].effective_rate)
+            .then(|| udp[0].effective_rate)
+            .flatten(),
     })
 }
 
@@ -303,6 +377,7 @@ mod tests {
             events_delivered: delivered,
             send_errors: 0,
             kernel_rcvbuf_utilization_max: utilization,
+            effective_rate: Some(100_000),
         }
     }
 
@@ -433,6 +508,7 @@ mod tests {
             rustc: "rustc 1.98.1".to_string(),
             profile: "release".to_string(),
             label: Some("baseline".to_string()),
+            box_state: None,
             scenarios,
         };
 
@@ -484,6 +560,35 @@ mod tests {
     }
 
     #[test]
+    fn the_effective_rate_survives_a_summary_only_when_every_repeat_agrees() {
+        let mut a = sample(1.0, 10.0, 100);
+        a.udp = Some(udp(1_000, 10, 990, 0.8));
+        let mut b = sample(2.0, 20.0, 200);
+        b.udp = Some(udp(1_000, 10, 990, 0.8));
+        assert_eq!(median_sample(&[a, b]).udp.unwrap().effective_rate, Some(100_000));
+
+        // A hand-merged file mixing two paces must not report either of them as if it were both.
+        let mut c = sample(3.0, 30.0, 300);
+        let mut mixed = udp(1_000, 10, 990, 0.8);
+        mixed.effective_rate = Some(25_000);
+        c.udp = Some(mixed);
+        assert_eq!(median_sample(&[a, c]).udp.unwrap().effective_rate, None);
+    }
+
+    #[test]
+    fn a_udp_sample_written_before_the_rate_scale_flag_existed_still_loads() {
+        // Exactly the `udp` block this harness wrote before `--rate-scale`: no `effective_rate`.
+        let json = r#"{
+            "sent_datagrams": 100, "sent_lines": 100, "received_datagrams": 99,
+            "kernel_dropped": 1, "queue_dropped": 0, "events_delivered": 99,
+            "send_errors": 0, "kernel_rcvbuf_utilization_max": 0.5
+        }"#;
+        let udp: UdpSample = serde_json::from_str(json).expect("an older udp block must load");
+        assert_eq!(udp.effective_rate, None);
+        assert_eq!(udp.events_delivered, 99);
+    }
+
+    #[test]
     fn a_results_file_written_before_udp_samples_existed_still_loads() {
         // Exactly the JSON the pre-ADR harness wrote for one repeat: no `udp` key anywhere.
         let json = r#"{
@@ -512,6 +617,7 @@ mod tests {
             rustc: "rustc 1.98.1".to_string(),
             profile: "release".to_string(),
             label: None,
+            box_state: None,
             scenarios: BTreeMap::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
