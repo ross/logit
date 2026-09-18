@@ -21,6 +21,7 @@
 //! `Registry` drain, nothing queue-shaped. Don't generalize this module toward it.
 
 use bytes::Bytes;
+use logit_core::sockstat;
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
 use logit_pipeline::{BatchAccumulator, FlushReason, Input};
 use logit_pipeline::{BoundedQueue, Fanout, OverflowPolicy, QueueConfig, QueueMetrics, Queued};
@@ -267,8 +268,13 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
             self.telemetry.clone(),
         ));
 
-        let mut read =
-            Box::pin(read_loop(&socket, Arc::clone(&queue), self.telemetry.clone(), shutdown));
+        let mut read = Box::pin(read_loop_sampled(
+            &socket,
+            Arc::clone(&queue),
+            self.telemetry.clone(),
+            self.diag.clone(),
+            shutdown,
+        ));
         let mut decode = Box::pin(decode_loop(
             &mut self.decoder,
             Arc::clone(&queue),
@@ -280,7 +286,9 @@ impl<D: Decoder + Send> Input for UdpListener<D> {
 
         // `read` is the only side that can finish on its own initiative -- a fatal socket error,
         // or `shutdown` firing -- and whichever way it finishes, it always closes `queue` first
-        // (see `read_loop`'s own doc comment), which is what lets `decode`'s `pop()` discover
+        // (see `read_loop`'s own doc comment; `read_loop_sampled` only wraps it, adding the
+        // kernel-counter sampler and forwarding its result unchanged), which is what lets
+        // `decode`'s `pop()` discover
         // "closed and empty" and return on its own. `decode` therefore never needs to be raced
         // away from early the way `run_output`'s `write`/`drain` dance does: once `read` is done,
         // simply drive `decode` to completion so it drains whatever `read` already queued and
@@ -438,7 +446,11 @@ fn finish_bind(
 ) -> anyhow::Result<tokio::net::UdpSocket> {
     use anyhow::Context;
 
-    // Sampled once at bind, not per datagram -- SO_RCVBUF doesn't change after bind.
+    // Read once at bind, not per datagram -- SO_RCVBUF doesn't change after bind. The gauge
+    // itself is re-emitted every second by `ReceiveBufferSampler::sample_once` (from
+    // `SO_MEMINFO`'s `SK_MEMINFO_RCVBUF`, the same `sk_rcvbuf` this getsockopt returns), because a
+    // point written once here would survive exactly one `internal` drain window. This emission
+    // still earns its keep: it is the only one a process that fails during startup ever makes.
     let granted = socket.recv_buffer_size().unwrap_or(0) as f64;
     telemetry.gauge("logit.input.receive_buffer.bytes", granted, &[]);
     if let Some(requested) = receive_buffer_bytes {
@@ -507,6 +519,132 @@ async fn read_loop(
     };
     queue.close();
     result
+}
+
+/// How often [`read_loop_sampled`] reads the socket's kernel counters. One `getsockopt` a second
+/// per UDP listener -- small enough not to need a config knob, frequent enough that
+/// `logit.input.receive_buffer.utilization` is a usable gauge rather than a coarse average, and
+/// deliberately the same cadence whether or not traffic is arriving (see the wrapper's doc).
+const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// [`read_loop`], plus a sampler that reads the kernel's own per-socket counters on a fixed
+/// interval for as long as the read loop is running, and once more after it stops.
+///
+/// **Why the sampler cannot live inside `read_loop`.** The moments worth sampling are exactly the
+/// moments `read_loop` is not going round: under `overflow: block` it parks in `queue.push` until
+/// downstream makes room, and the kernel's receive buffer -- which cannot wait -- is filling and
+/// then dropping the whole time. A sample taken at the top of each read iteration would therefore
+/// go quiet precisely when the numbers start mattering. Pinning `read_loop` as one arm of a
+/// `select!` against a timer solves that without a task, a channel or a `'static` bound: the loop
+/// below re-polls the *same* `read_loop` future each time the timer wins, so a blocked `push`
+/// resumes exactly where it was and nothing is cancelled. (Cancelling and restarting `read_loop`
+/// here would drop a datagram per tick; it is never dropped and re-created.)
+///
+/// **The final sample is guaranteed.** Drops in the last fraction of a second before a fatal
+/// socket error or a shutdown are as real as any other, and with a one-second interval they are
+/// the likeliest ones to exist at all -- a listener usually stops *because* something went wrong.
+/// So the sampler runs once more after `read_loop` has returned, before this function forwards
+/// that result. The socket is still open at that point (it is owned by `run_until_shutdown`, which
+/// outlives this future), so the counters are still readable.
+///
+/// Sampling is synchronous and inline -- one `getsockopt` on an fd this process owns, which is a
+/// bounded read of kernel memory with no I/O wait, so `spawn_blocking` would cost more than the
+/// call it wrapped.
+async fn read_loop_sampled(
+    socket: &tokio::net::UdpSocket,
+    queue: Arc<ReceiveQueue>,
+    telemetry: Telemetry,
+    diag: Diagnostics,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut sampler = ReceiveBufferSampler::new(socket, telemetry.clone(), diag);
+    let mut read = std::pin::pin!(read_loop(socket, queue, telemetry, shutdown));
+    let result = loop {
+        sampler.sample_once();
+        tokio::select! {
+            result = &mut read => break result,
+            () = tokio::time::sleep(KERNEL_SAMPLE_INTERVAL) => {}
+        }
+    };
+    sampler.sample_once();
+    result
+}
+
+/// Reads one UDP socket's kernel-side receive counters into telemetry -- the drop counter and the
+/// receive buffer's fill level, both of which are invisible to `recv_from` itself.
+///
+/// Disables itself for good on the first failed read: `SO_MEMINFO` either exists for a socket or
+/// it never will (an older kernel, a non-Linux build), so retrying it every second would be a
+/// syscall per second forever in exchange for nothing. One `warn` says so, once.
+struct ReceiveBufferSampler {
+    /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
+    /// descriptors at all, where [`logit_core::sockstat`] reports nothing anyway. Safe to hold as
+    /// a bare fd rather than a borrow: this sampler is created and dropped inside
+    /// [`read_loop_sampled`], whose `socket` argument outlives it.
+    fd: Option<sockstat::RawFd>,
+    drops: sockstat::DropCounter,
+    telemetry: Telemetry,
+    diag: Diagnostics,
+    enabled: bool,
+}
+
+impl ReceiveBufferSampler {
+    fn new(socket: &tokio::net::UdpSocket, telemetry: Telemetry, diag: Diagnostics) -> Self {
+        Self {
+            fd: sockstat::fd_of(socket),
+            drops: sockstat::DropCounter::new(),
+            telemetry,
+            diag,
+            enabled: true,
+        }
+    }
+
+    /// One `getsockopt`, and the three metrics it feeds.
+    ///
+    /// `logit.input.kernel.drops` is reported only when the delta is nonzero, matching how every
+    /// other loss counter here behaves (`logit.component.datagrams.dropped` does not emit a zero
+    /// either) -- the two gauges alongside it are what tell an operator the sampler is alive.
+    ///
+    /// `logit.input.receive_buffer.bytes` is re-emitted on every sample even though the value
+    /// never changes after bind. `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s
+    /// its point map, so a gauge written once at bind time appears in exactly one `internal` drain
+    /// window and then vanishes from the series forever -- which would leave the utilization gauge
+    /// below with no visible denominator a minute into the process's life. `finish_bind` still
+    /// emits it (and still warns about an `rmem_max` clamp) so the value is there before this loop
+    /// ever runs, and for a `logit` that fails during startup.
+    fn sample_once(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let info = self.fd.and_then(sockstat::meminfo);
+        let Some(info) = info else {
+            self.enabled = false;
+            self.diag.warn(format_args!(
+                "the kernel's per-socket receive counters are not available for this listener -- \
+                 SO_MEMINFO needs Linux 4.12 or newer; logit.input.kernel.drops, \
+                 logit.input.receive_buffer.used.bytes and .utilization will not be reported"
+            ));
+            return;
+        };
+        let dropped = self.drops.delta(info.drops);
+        if dropped > 0 {
+            self.telemetry.count("logit.input.kernel.drops", dropped as f64, &[]);
+        }
+        self.telemetry.gauge("logit.input.receive_buffer.bytes", f64::from(info.rcvbuf), &[]);
+        self.telemetry.gauge(
+            "logit.input.receive_buffer.used.bytes",
+            f64::from(info.rmem_alloc),
+            &[],
+        );
+        // Both terms come from this one `SO_MEMINFO` read, deliberately: they are the kernel's own
+        // comparable pair, and mixing either with a number from anywhere else (the operator's
+        // requested `receive_buffer_bytes`, the queued payload bytes) gets the ratio wrong in a
+        // way that still looks plausible. `SockMeminfo::receive_utilization`'s doc has the three
+        // wrong pairings spelt out.
+        if let Some(utilization) = info.receive_utilization() {
+            self.telemetry.gauge("logit.input.receive_buffer.utilization", utilization, &[]);
+        }
+    }
 }
 
 /// Pops datagrams from `queue`, decodes and accumulates them into batches, and sends each
@@ -1093,6 +1231,198 @@ mod tests {
         err.chain()
             .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
             .any(|io| io.raw_os_error().is_some_and(|code| SKIP_ERRNOS.contains(&code)))
+    }
+
+    // -- per-socket kernel visibility (`ReceiveBufferSampler`, `read_loop_sampled`) --------------
+
+    /// How many datagrams a kernel-overrun test blasts at a deliberately tiny receive buffer. At
+    /// `receive_buffer_bytes: 8 KiB` Linux grants 16 KiB (it doubles the request) and charges each
+    /// of these datagrams several hundred bytes of `skb->truesize`, so a couple of dozen fit and
+    /// the rest have nowhere to go -- a margin of nearly two orders of magnitude, which is what
+    /// keeps the assertion "more than zero" rather than a number that could flake.
+    #[cfg(target_os = "linux")]
+    const OVERRUN_DATAGRAMS: usize = 2_000;
+
+    /// Deliberately tiny, and deliberately *requested* rather than assumed: Linux doubles it and
+    /// `net.core.rmem_max` may clamp it, and nothing below depends on the exact granted figure.
+    #[cfg(target_os = "linux")]
+    const TINY_RECEIVE_BUFFER: u64 = 8 * 1024;
+
+    /// Every `logit.input.kernel.drops` delta in `events`, summed -- the counter is a delta `Sum`
+    /// per drain, so a total is what an operator's backend would show.
+    #[cfg(target_os = "linux")]
+    fn kernel_drops(events: &[Event]) -> f64 {
+        events
+            .iter()
+            .flat_map(|event| &event.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.input.kernel.drops")
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value,
+                other => panic!("kernel.drops must be a counter, got {other:?}"),
+            })
+            .sum()
+    }
+
+    /// The single value of gauge `name` in `events`, or `None` if it was never recorded. A gauge
+    /// is last-write-wins per drain, so there is at most one point per name here.
+    #[cfg(target_os = "linux")]
+    fn gauge(events: &[Event], name: &str) -> Option<f64> {
+        events
+            .iter()
+            .flat_map(|event| &event.metrics)
+            .filter(|m| logit_core::interner::resolve(m.name) == name)
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Gauge(v) => *v,
+                other => panic!("{name} must be a gauge, got {other:?}"),
+            })
+            .next()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn blast(target: std::net::SocketAddr, datagrams: usize) {
+        let sender = bind_ephemeral().await;
+        for _ in 0..datagrams {
+            // Errors ignored on purpose: a loopback send into a full receive buffer still
+            // *succeeds* (the packet is discarded later, in softirq, and charged to the receiving
+            // socket's `sk_drops`), and any send that did fail simply isn't part of the overrun.
+            let _ = sender.send_to(b"overrun", target).await;
+        }
+    }
+
+    /// The gap `docs/known-gaps.md` used to record: a datagram the kernel discards before
+    /// `recv_from` can return it is now counted and attributable, and the receive buffer's fill
+    /// level is visible alongside it.
+    ///
+    /// **No sleeps, and no dependence on how fast the reader runs.** The overrun happens *before*
+    /// anything reads the socket -- the listener is bound (so the socket, and its tiny buffer,
+    /// exist) but not yet running -- and `shutdown` is already signalled when the run starts. The
+    /// sampler's first read happens at the top of `read_loop_sampled`, before `read_loop` is
+    /// polled even once, so both the drop counter and the still-full buffer are observed at a
+    /// point in time this test fully controls.
+    ///
+    /// It is also the case `DropCounter`'s first-sample-is-absolute rule exists for: every one of
+    /// these drops happened before the first sample, and a counter that treated that sample as a
+    /// mere baseline would report zero here -- which is the answer `logit` gave before this work.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_kernels_own_drops_and_receive_buffer_fill_are_reported() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut listener = UdpListener::new(
+            "127.0.0.1:0",
+            TestDecoder::new(),
+            UdpListenerConfig {
+                receive_buffer_bytes: Some(TINY_RECEIVE_BUFFER),
+                ..UdpListenerConfig::default()
+            },
+        )
+        .with_telemetry(telemetry);
+        listener.bind().await.expect("binding an ephemeral port should succeed");
+        let addr = listener.local_addr().expect("bind() leaves a real address behind");
+
+        blast(addr, OVERRUN_DATAGRAMS).await;
+
+        // Already signalled: `read_loop` stops almost immediately, but not before
+        // `read_loop_sampled` has taken its first sample of a socket that is still full.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let (fanout, _rx) = recording_fanout(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            listener.run_until_shutdown(fanout, shutdown_rx),
+        )
+        .await
+        .expect("shutdown was already signalled, so this must return promptly")
+        .expect("should shut down without error");
+
+        let events = registry.drain(0);
+        assert!(
+            kernel_drops(&events) > 0.0,
+            "{OVERRUN_DATAGRAMS} datagrams into a {TINY_RECEIVE_BUFFER}-byte buffer nothing was \
+             reading must leave the kernel's own drop counter nonzero"
+        );
+        let used = gauge(&events, "logit.input.receive_buffer.used.bytes")
+            .expect("the receive-buffer fill gauge should have been sampled");
+        let granted = gauge(&events, "logit.input.receive_buffer.bytes").expect(
+            "the granted-buffer gauge should be re-emitted by the sampler, not only at bind",
+        );
+        let utilization = gauge(&events, "logit.input.receive_buffer.utilization")
+            .expect("the utilization gauge should have been sampled");
+        assert!(used > 0.0, "the buffer was full when it was sampled, got {used} bytes");
+        assert!(granted > 0.0, "a live socket always has a receive-buffer ceiling");
+        assert!(
+            utilization > 0.0 && utilization <= 1.0,
+            "utilization is rmem_alloc/rcvbuf, so it lives in (0, 1] on a socket this full, got \
+             {utilization}"
+        );
+        // The pairing the metric's whole meaning depends on: both terms come from the same
+        // `SO_MEMINFO` read, so the ratio is exactly the one the kernel itself tests.
+        assert!(
+            (utilization - used / granted).abs() < 1e-9,
+            "utilization must be `used.bytes / receive_buffer.bytes`, not a ratio against the \
+             requested size or against queued payload bytes"
+        );
+    }
+
+    /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
+    /// last fraction of a second before the reader stops are still reported.
+    ///
+    /// Constructed so that the interval sampler provably cannot be the one that sees them. The
+    /// future is polled exactly once up front -- which takes the first sample (of a socket nothing
+    /// has sent to yet: zero drops) and parks `read_loop` -- and then is not polled again at all
+    /// while the overrun happens, because it is a plain local future, not a spawned task. The one
+    /// remaining sample is the final one, taken after `read_loop` has returned.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_final_sample_reports_drops_that_happened_just_before_shutdown() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut diag = Diagnostics::default();
+        let (socket, _group) =
+            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
+                .await
+                .expect("binding an ephemeral port should succeed");
+        let addr = socket.local_addr().expect("a bound socket has an address");
+        // Depth 1 under `block`, with nothing popping: the reader takes one datagram and then
+        // parks in `queue.push` for good -- the state this whole wrapper exists to keep sampling
+        // through.
+        let queue = test_queue(OverflowPolicy::Block, 1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let sampled = read_loop_sampled(
+            &socket,
+            Arc::clone(&queue),
+            telemetry.clone(),
+            Diagnostics::default(),
+            shutdown_rx,
+        );
+        tokio::pin!(sampled);
+
+        // One poll: `select!` polls every arm on its first pass, so the wrapper's first
+        // `sample_once` has definitely run by the time `yield_now` resolves.
+        tokio::select! {
+            _ = &mut sampled => panic!("the read loop must not finish before shutdown"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(
+            kernel_drops(&registry.drain(0)),
+            0.0,
+            "the premise: nothing has been sent yet, so the first sample saw no drops at all"
+        );
+
+        // Nothing polls `sampled` between here and the `await` below, so the reader is frozen and
+        // every one of these datagrams arrives at a buffer that is not being drained.
+        blast(addr, OVERRUN_DATAGRAMS).await;
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        tokio::time::timeout(Duration::from_secs(5), sampled)
+            .await
+            .expect("shutdown should stop the read loop promptly")
+            .expect("should shut down without error");
+
+        assert!(
+            kernel_drops(&registry.drain(0)) > 0.0,
+            "drops taken after the last interval sample must still be reported -- that is what \
+             the guaranteed final sample is for"
+        );
     }
 
     #[tokio::test]

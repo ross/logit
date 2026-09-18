@@ -455,9 +455,10 @@ is an in-process drain that can afford to wait. `receive:`'s default is `drop_ol
 deliberately the opposite call, for a reason worth understanding rather than just remembering: the
 producer behind a UDP listener is the kernel's socket receive buffer, which *cannot* wait. Setting
 `receive.overflow: block` doesn't prevent loss under sustained overload, it just relocates it from a
-place `logit` can count and report (`logit.component.datagrams.dropped`) to a place it can't see at
-all (the kernel silently discarding into a counter this process never reads). Every mature UDP
-listener in the field — syslog-ng, rsyslog, Telegraf, gostatsd — treats this the same way. Leave
+place `logit` can do something about (`logit.component.datagrams.dropped`, a queue you can size) to
+one it can only report on (`logit.input.kernel.drops`, the kernel discarding datagrams before
+`recv_from` ever sees them). Every mature UDP listener in the field — syslog-ng, rsyslog, Telegraf,
+gostatsd — treats this the same way, and most of them can't even tell you the second number. Leave
 `overflow` at its default unless you have a specific reason to want backpressure to propagate all
 the way back to the sender instead.
 
@@ -497,14 +498,54 @@ kernel default before deciding whether to raise it.
   socket; under `block`, that's also back-pressuring the sender (or, for a local process, the OS).
 - `logit.component.datagrams.dropped` / `.bytes.dropped` (count, tagged `reason`:
   `overflow_oldest`/`overflow_newest`) — every datagram this listener itself decided to drop. This
-  is *better* news than it sounds: it's the visible, attributable counterpart to a kernel drop you'd
-  otherwise never see at all. A sustained nonzero rate here means the listener is genuinely
-  overloaded relative to how fast downstream is decoding/consuming, and is worth sizing `receive:`
-  or the downstream chain against.
+  is *better* news than it sounds: it's the drop you can size your way out of, by raising
+  `receive.max_datagrams`/`max_bytes` or speeding up what's downstream. A sustained nonzero rate
+  here means the listener is genuinely overloaded relative to how fast downstream is
+  decoding/consuming, and is worth sizing `receive:` or the downstream chain against.
+- `logit.input.kernel.drops` (count) — datagrams the *kernel* threw away before `recv_from` could
+  return them, read from the listening socket itself (Linux only). This is the loss nothing else
+  in the field reports in-process: it's the same number `/proc/net/udp`'s `drops` column shows for
+  this socket, and it is not covered by the queue counter above — the two are separate losses that
+  add up. Any sustained nonzero rate means datagrams are arriving faster than this process takes
+  them off the socket.
+- `logit.input.receive_buffer.utilization` (gauge), with
+  `logit.input.receive_buffer.used.bytes` / `.bytes` behind it — how full the kernel's own socket
+  buffer is, sampled once a second. This is the leading indicator for the counter above: the
+  kernel drops at exactly 1.0, so a value climbing toward it is the warning, and the drops are the
+  event. **What to do about a high value depends on which way the drops move with it.** If raising
+  `receive.receive_buffer_bytes` (and, if the startup warning names it, `net.core.rmem_max`) makes
+  the drops go away, the traffic was bursty and the buffer was too small for the bursts. If it
+  doesn't — the buffer simply fills up again at its new size — then nothing is wrong with the
+  buffer and the reader is the bottleneck: check `logit.component.receive.utilization` and
+  `receive.latency` below, which say whether decode is what's behind, and size the downstream
+  chain rather than the socket. A bigger buffer absorbs a burst; it cannot absorb a sustained
+  arrival rate faster than this process can read.
+
+  Two footnotes on the numbers, so they aren't misread. The `used.bytes` figure is what the kernel
+  *charges* this socket, not the payload bytes queued: each datagram costs several hundred bytes of
+  packet-structure overhead on top of its own length, so a queue of small statsd datagrams charges
+  far more than their combined size — which is the right accounting, because it's the one the
+  kernel drops against. And `receive_buffer.bytes` is the doubled value Linux reports for a
+  `SO_RCVBUF` request, not what you asked for; the ratio is computed from the kernel's own pair, so
+  it's directly comparable across listeners regardless of what any of them requested.
 - `logit.component.receive.latency` (timing) — arrival-to-dequeue per datagram. Since decode now
   runs on its own loop, this is the number that says whether event timestamps (always receipt time,
   stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
   this small; a climbing value under sustained load means decode is genuinely falling behind.
+
+On a **TCP** listener there is no receive queue and no kernel receive buffer to size (TCP's own
+flow control is the backpressure), but there is an accept queue, and it has the same shape of
+problem:
+
+- `logit.input.accept_queue.depth` / `.utilization` (gauges, Linux only) — connections that have
+  completed their TCP handshake and are waiting for this listener to accept them, against the
+  backlog ceiling the kernel enforces. Sampled before each accept and once a second while waiting,
+  so an idle listener still reports. A depth that is anything but near-zero means connections are
+  arriving faster than they're being accepted; a utilization approaching 1.0 means the kernel is
+  about to start refusing new connections outright, which a client sees as a connect timeout or a
+  reset with nothing in `logit`'s own logs to explain it. Sustained pressure here is usually
+  connection churn — senders reconnecting per batch rather than holding one connection open — and
+  is worth fixing at the sender before it's worth raising `net.core.somaxconn`.
 
 ### `collectd_in`: multicast groups and `types_db`
 

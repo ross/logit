@@ -168,20 +168,63 @@ already built that have a known, accepted rough edge.
     is still only "the immediate destination accepted the write," never more. The receive-side loss
     this entry used to also name (a UDP listener losing datagrams before anything reaches a
     buffer) narrowed with ADR `decoupled-listener-io`: a listener now counts every datagram it
-    drops itself (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own
-    drop, before `logit` ever sees the datagram — see the kernel-drop-visibility entry below.
+    drops itself (`logit.component.datagrams.dropped`). It narrowed the rest of the way with the
+    per-socket kernel counters below — the kernel's own drop, before `logit` ever sees the
+    datagram, is counted too now (`logit.input.kernel.drops`). Every receive-side loss path on a
+    UDP listener is therefore attributable to a component; what this entry still names is the
+    *delivery* side, past the first hop.
   - **No out-of-order/credit-based acknowledgement** — see the native wire protocol entry above's
     "Credit-based flow control" bullet; `SinkQueue` is deliberately in-order and single-in-flight
     (one queue, one writer, `peek`-then-`commit`-the-head only) until that lands.
-- **No visibility into the kernel's own UDP receive-buffer drops.** A listener's `ReceiveQueue`
-  ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md), directly above) counts every datagram *it* drops,
-  but a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
-  entirely. Linux exposes this per-socket in `/proc/net/udp[6]`'s `drops` column; sampling it (on a
-  timer, keyed by the listener's own bound address) as `logit.input.kernel.drops` would close the
-  last uncounted loss path, and is Linux-only with no new dependency. Worth noting almost nothing in
-  the field does this in-process — syslog-ng, rsyslog, Telegraf, and gostatsd all tell operators to
-  run `netstat -su`/`ss -u` themselves — so building it would put `logit` ahead of the field, not
-  merely at parity.
+- ~~**No visibility into the kernel's own UDP receive-buffer drops.**~~ — **closed** (ADR
+  [`udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
+  A listener's `ReceiveQueue` ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md),
+  directly above) always counted every datagram *it* dropped; a datagram the kernel discarded
+  before `recv_from` could return it was invisible to `logit` entirely, which left the one loss
+  path nothing could attribute to a component. `logit_core::sockstat` now reads the kernel's own
+  per-socket counters straight off the listener's fd, once a second and once more after the read
+  loop stops, and reports `logit.input.kernel.drops` (a count) alongside
+  `logit.input.receive_buffer.used.bytes` / `.utilization` (gauges) — the fill level that says
+  whether more drops are coming.
+
+  Two things about how it landed are worth keeping. **`getsockopt(SO_MEMINFO)`, not procfs**,
+  which is what this entry originally proposed: the drop counter it returns is byte-for-byte
+  `/proc/net/udp[6]`'s `drops` column, but reading it needs no parse of a netns-wide table and no
+  matching of *our* socket in it by address or inode — a match `SO_REUSEADDR` and multicast binds
+  make genuinely ambiguous — and it returns the receive buffer's fill in the same call. **And the
+  same helper covers TCP listeners**: `getsockopt(TCP_INFO)` on a socket in `LISTEN` aliases
+  `tcpi_unacked`/`tcpi_sacked` onto the accept queue's depth and its backlog ceiling, reported as
+  `logit.input.accept_queue.depth` / `.utilization` by every stream input (`syslog_in`,
+  `graphite_in`, TCP `statsd_in`, `logit_in`, `otlp_in`, `prometheus_in`'s remote-write receiver).
+  The note this entry ended on still holds: almost nothing in the field does either in-process —
+  syslog-ng, rsyslog, Telegraf and gostatsd all tell operators to run `netstat -su`/`ss -u`
+  themselves — so this is ahead of the field rather than at parity with it.
+- **A UDP sink's send failures are not counted by cause.** The receive side's kernel counters
+  (directly above) have no useful send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 when
+  sampled on a UDP socket, because a datagram is charged and uncharged inside one `sendmsg`, so a
+  send-buffer gauge would be a flat zero dressed up as a signal — it was deliberately not built,
+  and `SockMeminfo` carries the field only because the option returns it anyway. What *would* be
+  worth having is the thing the call site can see and nothing else can: the errno. `statsd_out`,
+  `syslog_out`, `graphite_out` and `collectd_out` all send datagrams and all treat a failed send
+  the same way regardless of why it failed, so an operator cannot today tell `ENOBUFS` (local
+  socket-buffer pressure, a tuning problem) from `EMSGSIZE` (a datagram past the path MTU, a
+  configuration problem) from `ECONNREFUSED` (an ICMP port-unreachable from a receiver that isn't
+  there, a deployment problem) — three different faults with three different fixes, currently one
+  undifferentiated failure. A `logit.output.send.errors{errno="..."}` count at those four send
+  sites would separate them, with the errno set bounded by the handful a UDP `sendmsg` can
+  actually return.
+- **Netns-wide UDP counters (`/proc/net/snmp`, `netstat -su`) are deliberately not collected.**
+  `Udp: InErrors` / `RcvbufErrors` / `NoPorts` and the `UdpLite` block alongside them answer real
+  questions the per-socket counters cannot — most usefully `NoPorts`, datagrams that arrived for a
+  port nothing was listening on, which is what a misconfigured sender looks like from the
+  receiver's side. They are not collected because they are not attributable: they are totals for
+  the whole network namespace, covering every process and every socket in it, and `logit`'s
+  telemetry model is per component (`docs/design/internal-telemetry.md` — every point carries the
+  `component`/`kind`/`role` identity of the thing that recorded it). Publishing a namespace-wide
+  number under one listener's identity would be actively misleading in exactly the deployments
+  where it matters, a host agent sharing a netns with everything else on the box. If these are
+  ever wanted, they belong to a process-level scope — alongside `logit.process.*`, which `internal`
+  already samples for itself — and not to any listener.
 - **A UDP listener reads one datagram per syscall.** `read_loop` (`logit-inputs::udp`,
   [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
   amortizes that across a batch — rsyslog's own high-throughput reference config sets `batchSize`

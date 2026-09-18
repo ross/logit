@@ -6,6 +6,10 @@
 pub mod diag;
 pub mod interner;
 pub mod provenance;
+/// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd -- see the module's own
+/// doc comment. Namespaced rather than re-exported flat: `sockstat::meminfo` reads better at a
+/// call site than a bare `meminfo`, and the same goes for `SockMeminfo`'s companions.
+pub mod sockstat;
 pub mod telemetry;
 /// `{name}` placeholder templates -- see the module's own doc comment. Deliberately left as a
 /// namespaced module with no flattened re-exports here: `Template`/`Segment`/`Compiled` are

@@ -461,7 +461,17 @@ point every datagram passes through:
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction) |
 | `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. Distinct from `shutdown`, the whole component stopping. An ordinary client disconnect shows up here as `closed`, never as `shutdown`. |
-| `logit.input.receive_buffer.bytes` / `.requested.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp, and what was actually requested (absent when unset) — sampled once at bind |
+| `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
+| `logit.input.receive_buffer.requested.bytes` | gauge | what `receive.receive_buffer_bytes` asked for, absent when unset — sampled once at bind, and genuinely bind-only: it is config, not a kernel reading |
+| `logit.input.receive_buffer.used.bytes` | gauge | `SO_MEMINFO`'s `SK_MEMINFO_RMEM_ALLOC`: bytes the kernel currently charges this socket's receive queue. **Not** queued payload bytes — each packet is charged its `skb->truesize`, several hundred bytes above its own length |
+| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is exactly where the kernel begins dropping |
+| `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
+
+The last three are Linux-only (`logit_core::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+) and
+are simply absent elsewhere, with one `warn` on the first failed read saying so. They are sampled
+once a second for as long as the read loop runs, plus **once more after it stops** — a listener
+usually stops *because* something went wrong, and the drops in the last second before it did are
+the ones most worth having.
 
 Three naming choices worth calling out, since the obvious names collide with existing ones: drops
 are `logit.component.*`, not `logit.input.*` — they're emitted by the same generic `BoundedQueue`
@@ -473,6 +483,43 @@ genuinely impl-known); accumulator emissions are `receive.flushed`, not an unqua
 stateful transform's window flush," and a bare `batches.flushed` next to those would read as the
 same concept. `overflow: block` (never the receive-queue default — see the ADR) is the one
 configuration under which `push.blocked.duration` records anything at all.
+
+Every **TCP** listener (`logit-inputs::tcp`, and the three inputs with accept loops of their own —
+`logit_in`, `otlp_in`, `prometheus_in`'s remote-write receiver) gets the stream-side counterpart,
+also Linux-only, from `getsockopt(TCP_INFO)` on the listening socket:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.accept_queue.depth` | gauge | connections that have completed their handshake and are waiting to be accepted (`tcpi_unacked`, which the kernel aliases onto `sk_ack_backlog` for a socket in `LISTEN`) |
+| `logit.input.accept_queue.utilization` | gauge | that depth against the backlog ceiling (`tcpi_sacked`, aliased onto `sk_max_ack_backlog`) — 1.0 is where the kernel starts refusing connections outright |
+
+Sampled before each `accept()` *and* on the same one-second interval: the per-accept sample is the
+depth at the instant that matters, and the interval one is what keeps a listener that is blocked in
+`accept()` — or starved of runtime with a growing queue — from reporting nothing at all.
+
+**Why a constant is re-emitted.** `logit.input.receive_buffer.bytes` does not change after bind,
+and yet the sampler writes it every second. `ComponentBuffer::drain`
+(`crates/logit-core/src/telemetry.rs`) `mem::take`s its point map, so a point written once at bind
+appears in exactly one `internal` drain window and then vanishes from the series for the life of
+the process — which would leave `receive_buffer.utilization` with no visible denominator a minute
+in. The bind-time emission is kept regardless: it is the only one a process that fails during
+startup ever makes. `.requested.bytes` is deliberately *not* re-emitted — it is what the operator
+asked for, which the config already says, not a reading of anything.
+
+**Where `kernel` appears in a name, and where it doesn't.** Only on the drops counter. The
+distinction the name is carrying is *whose loss this was*: `logit.component.datagrams.dropped` is a
+drop `logit` chose and can be sized out of, `logit.input.kernel.drops` is one the kernel took
+before `logit` had any say, and an operator reading a dashboard needs to tell those apart at a
+glance because the remedies are different (see `docs/deploying.md`'s "What to watch"). The gauges
+need no such qualifier: `used.bytes` and `utilization` extend the `logit.input.receive_buffer.*`
+family that `receive_buffer.bytes`/`.requested.bytes` already established, where "the receive
+buffer" has only ever meant the kernel's, so `receive_buffer.kernel.used.bytes` would be saying it
+twice. `utilization` is also deliberately the same last segment as
+`logit.component.receive.utilization` and `logit.component.buffer.utilization`: three different
+buffers, one convention — a 0-to-1 fill ratio against whatever bound that buffer actually has — so
+an operator who learns to read one reads all three. `accept_queue.*` follows the same rule for the
+same reason: no `kernel` segment, because a listener has no accept queue of its own to confuse it
+with.
 
 **Layer 3: a component adds only what only it knows**, via the same `with_telemetry` builder
 idiom `with_diagnostics`/`with_timeout`/`with_retry` already established
@@ -491,7 +538,9 @@ Worked examples, one per shipped component:
   above actually gets recorded — free for both, no per-listener code. Under `transport: tcp` it
   runs on `logit-inputs::tcp::TcpListener` instead, exactly as a TCP `syslog_in`/`graphite_in`
   does, and records that driver's stream set in place of the datagram pair — nothing statsd-
-  specific, and nothing this component writes itself: `logit.input.connections` (gauge) and
+  specific, and nothing this component writes itself: `logit.input.accept_queue.depth` /
+  `.utilization` (gauges, the kernel's own accept queue — see the TCP table above),
+  `logit.input.connections` (gauge) and
   `logit.input.connections.rejected{reason="limit"}` (count), `logit.input.connections.closed
   {reason="idle"}` (count — an operator-configured `idle_timeout:` closed the connection; policy,
   not a fault, and only ever counted when the field is set), `logit.input.frames` /

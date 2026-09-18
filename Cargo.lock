@@ -972,6 +972,7 @@ dependencies = [
  "bytes",
  "cardinality-estimator",
  "lasso",
+ "libc",
  "serde",
  "sketches-ddsketch",
  "smallvec",
