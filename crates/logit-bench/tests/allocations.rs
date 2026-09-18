@@ -688,6 +688,46 @@ fn receive_queue_push_then_pop_costs_nothing() {
     expect_allocs("receive queue: push then pop, warm", stats, 0);
 }
 
+/// The batched twin of the row above (ADR `udp-intake-batching-and-socket-visibility`): a whole
+/// batch through `push_many` and back out through `pop_many` must cost the same nothing per
+/// datagram that the single-item pair does. Both `Vec`s are the caller's own, reused across calls
+/// and drained rather than replaced -- `push_many`'s `Drain` empties the input while keeping its
+/// capacity, `pop_many` appends into an output the caller clears -- so the only way this row could
+/// be nonzero is if one of them had been rebuilt instead of reused, which is exactly the mistake
+/// `decode_loop`'s own reused `Vec<Datagram>` exists to avoid.
+#[test]
+fn receive_queue_push_many_then_pop_many_costs_nothing() {
+    use logit_inputs::udp::{Datagram, RECEIVE_QUEUE_METRICS};
+    use logit_pipeline::{BoundedQueue, OverflowPolicy, QueueConfig};
+
+    const BATCH: usize = 8;
+
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let queue = BoundedQueue::with_metrics(
+        QueueConfig { max_items: 16, max_weight: u64::MAX, overflow: OverflowPolicy::DropOldest },
+        &RECEIVE_QUEUE_METRICS,
+        Telemetry::default(),
+    );
+    let payload = fixtures::statsd_datagram(1);
+    let datagram = || Datagram { bytes: payload.clone(), received_at: 0 };
+    // Both buffers are filled and drained once outside the measured region, exactly as
+    // `decode_loop` reuses its own -- so what's measured below is a steady-state batch, not the
+    // first one that has to grow two `Vec`s and the underlying `VecDeque`.
+    let mut inbound: Vec<Datagram> = Vec::new();
+    let mut outbound: Vec<Datagram> = Vec::new();
+    let round = |inbound: &mut Vec<Datagram>, outbound: &mut Vec<Datagram>| {
+        inbound.extend((0..BATCH).map(|_| datagram()));
+        outbound.clear();
+        rt.block_on(queue.push_many(inbound));
+        rt.block_on(queue.pop_many(outbound, BATCH))
+    };
+    round(&mut inbound, &mut outbound);
+
+    let (popped, stats) = measure(|| round(&mut inbound, &mut outbound));
+    assert_eq!(popped, BATCH);
+    expect_allocs("receive queue: push_many then pop_many, warm", stats, 0);
+}
+
 /// `BatchAccumulator::absorb`'s own doc comment names this as the whole point of taking `&mut
 /// Vec<Event>` rather than an owned `EventBatch`: `Vec::append` drains the caller's buffer while
 /// leaving its capacity intact, so a second `absorb` call against the same (now-empty-but-still-
