@@ -276,7 +276,10 @@
 //!     rule 53's shape one kind over, for their reason: a setting silently doing nothing is worse
 //!     than a startup failure naming it. Only *non-default* values are rejected, which is also
 //!     what lets `interval` keep its default in bind mode and so keeps rule 9's `interval: 0s`
-//!     rejection satisfied there with no mode-specific carve-out.
+//!     rejection satisfied there with no mode-specific carve-out. In bind mode the `path` itself
+//!     must also start with `/` -- rule 41's check for `prometheus_out`, for its reason: a request
+//!     URI's path is always absolute, so a relative or empty one could never match and every write
+//!     would `404` against a listener that looks configured.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -2426,6 +2429,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             _ => {}
         }
         if bind.is_some() {
+            // Rule 41's check for `prometheus_out`, verbatim in reasoning and nearly so in wording
+            // -- a receiver's `path` is compared against a request URI's own path, which is always
+            // absolute, so a relative or empty one could never match and every write would `404`
+            // against a listener that looks configured.
+            if !path.starts_with('/') {
+                anyhow::bail!(
+                    "component '{id}': prometheus_in path '{path}' must start with '/' -- a \
+                     request URI's path always does, so this one could never be written to"
+                );
+            }
             let wrong = if *interval != default_prometheus_scrape_interval() {
                 Some("interval")
             } else if *timeout != default_prometheus_scrape_timeout() {
@@ -7202,6 +7215,31 @@ mod tests {
         let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
         assert!(err.contains("'in'"), "got: {err}");
         assert!(err.contains("exactly one of them"), "got: {err}");
+    }
+
+    /// Rule 41's `prometheus_out` check, one kind over: a `path` that a request URI's own path
+    /// could never equal would `404` every write forever, against a listener that looks perfectly
+    /// configured and reports no error at all.
+    #[test]
+    fn a_bind_mode_prometheus_in_with_a_relative_path_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { path, .. } = &mut kind {
+            *path = "api/v1/write".to_string();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("must start with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bind_mode_prometheus_in_with_an_empty_path_is_rejected() {
+        let mut kind = prometheus_in_bind("0.0.0.0:9090");
+        if let ComponentKind::PrometheusIn { path, .. } = &mut kind {
+            *path = String::new();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("must start with '/'"), "got: {err}");
     }
 
     #[test]
