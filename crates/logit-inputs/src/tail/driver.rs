@@ -38,6 +38,34 @@ pub(crate) trait DecoderFactory<D: TailDecoder>: Send {
     /// here is diagnosed (`open_error`) and the path is simply not tailed this cycle -- retried
     /// on the next `scan` rather than treated as fatal to the whole listener.
     fn open(&mut self, path: &Path) -> anyhow::Result<D>;
+
+    /// Re-checks an already-tracked file's identity and selection -- called once per tracked file
+    /// per `scan`, the only place a factory gets a say about a file after [`DecoderFactory::open`]
+    /// already built its decoder. Given the decoder itself (not asked to hand back a value) so a
+    /// factory that rebuilds a resource installs it directly, keeping the swapped value private to
+    /// the module that defines the decoder -- `docker_in`'s own use, see `docker.rs`. Default:
+    /// nothing this factory tracks can change (`tail_in`'s own factory never overrides this).
+    fn refresh(&mut self, _path: &Path, _decoder: &mut D) -> Refresh {
+        Refresh::Unchanged
+    }
+
+    /// End of one `scan`: every currently-discovered path has had exactly one `accept` or
+    /// `refresh` call since the previous `end_scan`. A caching factory uses this to evict entries
+    /// for paths no longer discovered. Default: nothing cached, nothing to evict.
+    fn end_scan(&mut self) {}
+}
+
+/// What one [`DecoderFactory::refresh`] call decided about a file the [`Tailer`] already tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refresh {
+    /// Nothing changed, or nothing this factory tracks can change -- the default, and the only
+    /// outcome `tail_in`'s own factory ever produces.
+    Unchanged,
+    /// The factory re-read this file's identity and has already installed a new resource on the
+    /// decoder it was handed. Nothing further for the driver to do: `BatchAccumulator::absorb`
+    /// sees an `Arc` that isn't `ptr_eq` to the one it's accumulating under on the next decoded
+    /// line and flushes the old batch itself (`FlushReason::ResourceChange`).
+    Identity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +352,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             match self.by_path.get(&path).copied() {
                 Some(existing_id) if existing_id == id => {
                     self.reconcile_truncation(id, meta.len()).await;
+                    self.refresh_identity(id, &path);
                 }
                 Some(existing_id) => {
                     if let Some(tracked) = self.files.get_mut(&existing_id) {
@@ -352,7 +381,22 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
 
+        self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
+    }
+
+    /// Gives the factory a chance to notice this already-tracked file's identity changed
+    /// (`docker_in`'s `config.v2.json`) -- called for every discovered path already in
+    /// `self.files`, once per `scan`. `tail_in`'s own factory never returns anything but
+    /// `Refresh::Unchanged`, so this is a no-op for it beyond the trait call itself.
+    fn refresh_identity(&mut self, id: FileId, path: &Path) {
+        let Some(tracked) = self.files.get_mut(&id) else { return };
+        match self.factory.refresh(path, &mut tracked.decoder) {
+            Refresh::Unchanged => {}
+            Refresh::Identity => {
+                self.telemetry.count("logit.input.files.identity_changed", 1.0, &[]);
+            }
+        }
     }
 
     /// Shared by `scan` (checked for every already-tracked path it discovers) and
