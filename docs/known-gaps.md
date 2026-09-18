@@ -256,8 +256,43 @@ already built that have a known, accepted rough edge.
   clone would need its own answer to the cancel-by-drop shutdown cascade
   ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that today
   assumes exactly one `Fanout` per listener. A related, smaller question that same work would have
-  to settle: the read and decode halves currently share **one** task, so they interleave but never
-  run on two cores at once.
+  to settle is its own entry, directly below: the read and decode halves currently share one task.
+- **A UDP listener's read and decode loops share one task.** `read_loop` and `decode_loop`
+  (`crates/logit-inputs/src/udp.rs`) are driven by `run_until_shutdown`'s one two-arm `select!`, so
+  the two interleave — cooperatively yielding to each other on the coop budget — but never run on two
+  cores at once. W4's coop-budget analysis found nothing currently costing anything measurable from
+  that sharing (`docs/design/performance.md` §7), but a report-only experiment run alongside it, not
+  shipped, found real headroom if it were split: spawning `decode_loop` onto its own task, pinned to
+  cores 2, 3, 14, 15 (two fast physical cores plus their SMT siblings), against the same branch and
+  pins otherwise — **provisional, same laptop/battery/powersave caveat as every other number in this
+  entry**:
+
+  | | single task | decode spawned |
+  |---|---|---|
+  | `udp-statsd-small` CPU µs/event | 1.229 | 1.082 (−12%) |
+  | `udp-statsd-small` peak RSS | 22.0 MiB | 38.0 MiB |
+  | `udp-statsd` CPU µs/event | 0.659 | 0.696 (+5.6%) |
+  | `udp-statsd` kernel drop % | 0.69 | 0.00 |
+  | `udp-statsd` mean fill | 22.8 | 2.6 |
+  | `udp-statsd` peak RSS | 86.4 MiB | 264.8 MiB |
+
+  Splitting the two took `udp-statsd`'s kernel drops to zero and its mean fill from ~23 to ~2.6 (the
+  reader stops waiting behind decode at all and keeps the socket continuously drained), and cut
+  `udp-statsd-small`'s CPU/event ~12% — at a cost of +5.6% CPU/event on `udp-statsd` itself (the
+  cross-core handoff) and roughly **3× peak RSS**, because nothing paces the reader against the
+  decoder any more once they're not sharing a poll budget.
+
+  Shipping it, not attempted here, needs four things designed together, all named in the ADR's
+  "Consequences" section: a join-handle-plus-cancellation story to replace `run_until_shutdown`'s
+  two-arm `select!`, which is load-bearing for shutdown/drain ordering today (read finishing closes
+  the queue, which is what lets decode discover closed-and-empty and flush its accumulator); moving
+  the decoder out of `&mut self` so it can live on a `'static` task (`D: 'static`); a `Fanout`
+  ownership answer, since dropping the decode future — not something a caller does directly once it's
+  on a task — is what closes every downstream inbox today; and `receive.max_bytes`'s default
+  revisited against real measurements, since nothing bounds the reader once it's decoupled from
+  decode's pace. **This overlaps heavily with the `SO_REUSEPORT` entry above**, which needs answers to
+  the same shutdown-cascade and `Fanout`-ownership questions for its own, larger reason (N readers
+  each with their own `Fanout` clone) — the two should be designed together rather than separately.
 - ~~**A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, on both sides of
   the queue**~~ — **closed, both halves.** `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`)
   call `update_gauges` — three `Telemetry::gauge` calls, each locking `ComponentBuffer`'s

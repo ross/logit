@@ -585,6 +585,283 @@ the largest Σ process time, then calls out every node whose blocked time is not
 downstream-constraint reading spelled out — see §2's two worked examples above for what that looks
 like in practice.
 
+## 7. UDP intake: recvmmsg and batched queue operations
+
+[ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)
+closes two of the costs §0's "Driven scenarios" section named as still open when the `udp-statsd*`
+family was added: `BoundedQueue::push_many`/`pop_many` (W3) stop `read_loop` and `decode_loop`
+contending on the same per-datagram gauge-lock, and Linux `recvmmsg(2)` batched reads (W4) stop
+`read_loop` paying one syscall per datagram. This section is the write-up of what moved; the ADR is
+the design record of why.
+
+### Why three driven scenarios, not one
+
+`udp-statsd`, `udp-statsd-small`, and `udp-statsd-packed` share one traffic model
+([`perf/load/README.md`](../../perf/load/README.md)) and differ only in `datagram_mix:` — the axis
+that decides which half of the receive path a number is actually about:
+
+- **`udp-statsd-small`** packs every line into its own datagram (an unbuffered client, ~40–120 B) —
+  the **syscall-bound worst case**. Per-datagram fixed cost dominates a payload this small, so this
+  is where both W3's gauge-lock batching and W4's `recvmmsg` should show the most: neither change
+  touches decode cost, and decode cost is nearly all there is to amortize against here.
+- **`udp-statsd-packed`** packs every datagram to ≤1432 B (DogStatsD's own UDP default, ~13.5
+  metrics/datagram) — the **decode-bound** end. Far fewer syscalls and gauge updates per event, so
+  whatever the decoder and `BatchAccumulator` cost dominates instead, and there's little left for
+  either change to save.
+- **`udp-statsd`** mixes both packing targets plus a ≤8192 B local-agent-style share (45% single /
+  40% ≤1432 B / 15% ≤8192 B, ~17.9 lines/datagram on average) — the **headline** number, closest to
+  what a real mixed-client deployment looks like.
+
+A number from only one of the three would mislead about which half of the pipeline a change actually
+helps — see the ADR's "Representative traffic, calibrated against a recorded real-client capture"
+section for the full reasoning.
+
+### Measurement protocol
+
+Every table in this section follows the protocol `docs/plans/udp-intake.md`'s "Baseline/delta
+recording protocol" and `perf/load/README.md`'s "Box state"/"Pinning" sections settle on, established
+because this dev box's numbers move for reasons that have nothing to do with the code:
+
+- **A delta is a parent/branch pair taken in one sitting, interleaved** — parent, branch, parent,
+  branch — never a branch diffed against a results file from another day. Two unbroken blocks would
+  put one side on the cool half of a session and the other on the warm half, which is exactly the
+  artifact this guards against.
+- **Pinned to distinct fast physical cores.** `--pin-sender`/`--pin-child` (`sched_setaffinity`,
+  applied between `fork` and `exec` so every thread a process spawns inherits the mask). This box's
+  heterogeneous cores — Zen 5 physical cores at 5,158 MHz (CPUs 0–3) vs. Zen 5c ones at 3,289 MHz
+  (4–11, 16–23), per `lscpu -e`'s `MAXMHZ` column — make an unpinned run bimodal by roughly 2×. Every
+  table below states its pins (`--pin-sender 0,1 --pin-child 2,3` throughout).
+- **Control-to-control drift is reported alongside every delta, not assumed away.** Each delta table
+  below is read next to a same-session, same-code control-vs-control comparison — the two runs that
+  differ only in *when* they happened, not in what they ran. A delta smaller than that drift is
+  reported as "no signal," not as an improvement.
+- **A box-state checklist gates whether a number is worth writing down at all** —
+  `perf/load/README.md`'s "Box state" table: AC power (not battery), `performance` governor (not
+  `powersave`), a non-power-saving energy-performance preference, thermal headroom (a rested box,
+  gaps between repeats), and nothing else building. `logit-perf run` records what it can of this into
+  the results file's `box_state` and warns before the first scenario on `powersave` or battery.
+- **The denominator is events *delivered* to `null_out`, never events sent.** `udp-statsd*` is the
+  first scenario family where those two can honestly differ — a real socket can drop a datagram in
+  the kernel before `logit` ever sees it, and the baseline is deliberately tuned into a regime where
+  a small fraction does (§0's "Driven scenarios" section above has the self-check machinery that
+  keeps this honest).
+- **The telemetry leg that makes the delivered count visible runs inside the measured process.** The
+  same `internal → file_out format: native` leg `attribute` uses is attached to every driven run, so
+  the child's own `wait4` rusage includes two of the harness's own nodes on top of the graph under
+  test. **A driven scenario's absolute CPU µs/event is therefore comparable only to its own
+  history** — never to a `generate_in` scenario's number (§0/§1 above), and not even to a raw
+  syscall-count argument, since the leg's own cost is baked into every number in this section
+  identically.
+
+### Measured numbers
+
+**Everything between the markers below is provisional.** The dev box these numbers were taken on is
+a laptop, on battery, on the `powersave` governor, thermally throttling under sustained load —
+identical code measured minutes apart drifted 3–5% in CPU µs/event, and the control-to-control rows
+in each table are the direct evidence of that drift, not a formality. The lead re-takes every number
+here as interleaved one-sitting pairs on a plugged-in, cooled box (or a cloud VM) before this
+workstream is considered closed for measurement purposes, and that pass replaces the block below
+wholesale rather than amending it in place — nothing in the prose above or below this block should be
+read as depending on today's specific figures.
+
+<!-- udp-intake-numbers:begin PROVISIONAL 2026-09-18 battery/powersave -->
+
+#### W2 baseline (PR #252, head `912f5574649d`, branch `udp/w2` measured post-`udp/w1`-merge)
+
+`--pin-sender 0,1 --pin-child 2,3`, `--repeat 5`, release, 2026-09-18T15:55:46Z. `events/s` and `CPU
+µs/event` denominated over events delivered.
+
+| Scenario | Lines sent | Delivered | events/s | events/s min–max | CPU µs/event | Peak RSS | Wall | Kernel drop % (per repeat) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `udp-statsd` | 11,074,692 | 10,826,863 | 1,571,498 | 1,563,474 – 1,606,869 | 0.678 | 47.4 MiB | 6.89 s | 2.15 (0.03 / 2.35 / 2.14 / 2.62 / 2.15) |
+| `udp-statsd-packed` | 10,788,160 | 10,550,475 | 1,529,623 | 1,527,002 – 1,532,959 | 0.700 | 45.4 MiB | 6.90 s | 2.20 (1.99 / 2.24 / 2.37 / 2.04 / 2.20) |
+| `udp-statsd-small` | 5,000,000 | 4,378,147 | 665,299 | 664,096 – 667,049 | 1.978 | 22.9 MiB | 6.58 s | 12.44 (12.21 / 12.61 / 12.29 / 12.49 / 12.44) |
+
+Datagram medians: `udp-statsd` 620,000 sent / 606,677 received / 13,323 kernel-dropped;
+`udp-statsd-packed` 800,000 / 782,394 / 17,606; `udp-statsd-small` 5,000,000 / 4,378,147 / 621,853.
+Zero receive-queue drops and zero send errors throughout; `sent == received + kernel-dropped` closed
+exactly on every repeat. Peak `receive_buffer.utilization` 0.29 / 0.07 / 1.00 —
+`udp-statsd-small` sits exactly at the kernel's drop threshold, which is where it was tuned to sit.
+Container `net.core.rmem_max` = 4,194,304; `receive_buffer_bytes: 1MiB` is granted as 2 MiB and not
+clamped.
+
+#### W3 delta: `push_many`/`pop_many` (PR #253, head `1b3228c10351`, branch `udp/w3`)
+
+Run as **A–B–A–B in one sitting** (`udp/w2` control, `udp/w3` branch, `udp/w2` control, `udp/w3`
+branch) because the drop rate here is the difference between two nearly-equal rates and moves with
+the box. `--pin-sender 0,1 --pin-child 2,3`, `--repeat 5`, medians.
+
+| Scenario | | w2 control A | **w3 run A** | w2 control B | **w3 run B** |
+|---|---|---|---|---|---|
+| `udp-statsd` | CPU µs/event | 0.683 | **0.661** | 0.664 | **0.646** |
+| | delivered events/s | 1,573,830 | **1,573,002** | 1,599,504 | **1,601,659** |
+| | kernel drop % | 2.03 | **2.04** | 0.48 | **0.32** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 0.95 | **0.45** | 0.93 | **0.48** |
+| `udp-statsd-packed` | CPU µs/event | 0.702 | **0.685** | 0.679 | **0.662** |
+| | delivered events/s | 1,528,994 | **1,533,565** | 1,558,181 | **1,561,107** |
+| | kernel drop % | 2.25 | **1.95** | 0.38 | **0.19** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 1.00 | **1.00** | 0.42 | **0.71** |
+| `udp-statsd-small` | CPU µs/event | 1.965 | **1.696** | 1.868 | **1.461** |
+| | delivered events/s | 660,845 | **743,956** | 676,996 | **757,295** |
+| | kernel drop % | 13.04 | **2.08** | 10.91 | **0.35** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 1.00 | **0.81** | 1.00 | **0.44** |
+
+`logit-perf compare`, each control against the run that followed it:
+
+```
+control A -> w3 A          events/s     us/event     peak RSS      drop rate
+udp-statsd                    -0.1%        -3.1%        +1.7%      +0.02 pts
+udp-statsd-packed             +0.3%        -2.5%        -2.5%      -0.29 pts
+udp-statsd-small             +12.6%       -13.7%        +0.0%     -10.96 pts
+
+control B -> w3 B          events/s     us/event     peak RSS      drop rate
+udp-statsd                    +0.1%        -2.7%        -2.1%      -0.16 pts
+udp-statsd-packed             +0.2%        -2.5%        -0.8%      -0.18 pts
+udp-statsd-small             +11.9%       -21.8%        +0.0%     -10.56 pts
+```
+
+Control-to-control drift, same code, ~8 minutes apart — the yardstick the two deltas above are read
+against:
+
+```
+control A -> control B     events/s     us/event     peak RSS      drop rate
+udp-statsd                    +1.6%        -2.7%        -0.5%      -1.55 pts
+udp-statsd-packed             +1.9%        -3.2%        -7.9%      -1.87 pts
+udp-statsd-small              +2.4%        -4.9%        +0.0%      -2.13 pts
+```
+
+#### W4 delta: `recvmmsg` (PR #254, head `4a0c252fa530`, branch `udp/w4`)
+
+**Box was on `powersave` with a `balanced` platform profile for this pass** — large effects still
+show through, small ones should not be read (this is the pass the lead's re-take supersedes).
+Interleaved A–B–A–B (`udp/w3` control, `udp/w4` branch, `udp/w3` control, `udp/w4` branch),
+`--pin-sender 0,1 --pin-child 2,3`, `--repeat 5`, medians.
+
+| Scenario | | w3 control A | **w4 A** | w3 control B | **w4 B** |
+|---|---|---|---|---|---|
+| `udp-statsd-small` | CPU µs/event | 1.405 | **1.127** | 1.338 | **1.218** |
+| | delivered ev/s | 753,218 | **759,906** | 756,619 | **759,908** |
+| | kernel drop % | 0.87 | **0.00** | 0.43 | **0.00** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 0.51 | **0.01** | 0.40 | **0.02** |
+| | mean fill (dg/read) | 1.0 | **3.1** | 1.0 | **3.1** |
+| | peak RSS | 22.6 MiB | **22.6 MiB** | 22.8 MiB | **23.0 MiB** |
+| `udp-statsd` | CPU µs/event | 0.653 | **0.674** | 0.662 | **0.668** |
+| | delivered ev/s | 1,597,416 | **1,595,451** | 1,598,690 | **1,596,983** |
+| | kernel drop % | 0.60 | **0.71** | 0.50 | **0.62** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 0.45 | **0.35** | 0.33 | **0.26** |
+| | mean fill (dg/read) | 1.0 | **24.2** | 1.0 | **24.2** |
+| | peak RSS | 49.1 MiB | **52.4 MiB** | 46.4 MiB | **56.8 MiB** |
+| `udp-statsd-packed` | CPU µs/event | 0.639 | **0.635** | 0.635 | **0.619** |
+| | delivered ev/s | 1,558,385 | **1,559,598** | 1,558,601 | **1,556,111** |
+| | kernel drop % | 0.37 | **0.29** | 0.35 | **0.51** |
+| | queue drop % | 0 | **0** | 0 | **0** |
+| | max rcvbuf utilization | 0.07 | **0.14** | 0.28 | **0.14** |
+| | mean fill (dg/read) | 1.0 | **14.2** | 1.0 | **14.2** |
+| | peak RSS | 45.3 MiB | **58.7 MiB** | 46.8 MiB | **61.8 MiB** |
+
+(The control's `fill` is 1.0 by construction — `udp/w3` has no `logit.input.reads` counter, so it's
+one datagram per `recv_from`.)
+
+```
+control A -> w4 A          events/s     us/event     peak RSS      drop rate
+udp-statsd                    -0.1%        +3.1%        +6.9%      +0.11 pts
+udp-statsd-packed             +0.1%        -0.6%       +29.5%      -0.08 pts
+udp-statsd-small              +0.9%       -19.8%        +0.2%      -0.87 pts
+
+control B -> w4 B          events/s     us/event     peak RSS      drop rate
+udp-statsd                    -0.1%        +0.8%       +22.3%      +0.12 pts
+udp-statsd-packed             -0.2%        -2.7%       +32.1%      +0.16 pts
+udp-statsd-small              +0.4%        -9.0%        +1.1%      -0.43 pts
+
+control A -> control B     events/s     us/event     peak RSS      drop rate   (drift, same code)
+udp-statsd                    +0.1%        +1.4%        -5.4%      -0.10 pts
+udp-statsd-packed             +0.0%        -0.5%        +3.2%      -0.01 pts
+udp-statsd-small              +0.5%        -4.8%        +0.8%      -0.45 pts
+```
+
+**Below the knee, `--rate-scale 0.5` (zero drops on both sides, so this isolates pure CPU cost from
+any drop-rate interaction):** `udp-statsd` −3.1%, `udp-statsd-packed` −4.5%, `udp-statsd-small`
+−4.4% µs/event. Smaller than the at-rate deltas above, as expected — at half the rate the per-wakeup
+fixed costs make up a larger share of the total, and there are fewer syscalls per unit time for
+`recvmmsg` to be saving in the first place.
+
+#### `read_batch` sweep (PR #254, head `4a0c252fa530`, evidence for the default)
+
+`read_batch` ∈ {1, 16, 32, 64, 128, 256}, `--repeat 3`, `--pin-sender 0,1 --pin-child 2,3`, both
+scenarios set at once, everything else held:
+
+| `read_batch` | **`udp-statsd-small`** µs/ev | fill | kernel drop % | max rcvbuf | | **`udp-statsd`** µs/ev | fill | kernel drop % | max rcvbuf |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | **1.718** | 1.0 | **3.65%** | **0.98** | | 0.663 | 1.0 | 0.44% | 0.39 |
+| 16 | 1.107 | 3.2 | 0.00% | 0.05 | | 0.660 | 11.9 | 0.74% | 0.39 |
+| 32 | 0.979 | 3.6 | 0.00% | 0.01 | | 0.652 | 18.5 | 0.34% | 0.47 |
+| **64** | **1.128** | **3.1** | **0.00%** | **0.03** | | **0.648** | **24.2** | **0.44%** | **0.26** |
+| 128 | 1.117 | 3.0 | 0.00% | 0.06 | | 0.660 | 26.8 | 0.35% | 0.26 |
+| 256 | 1.112 | 3.7 | 0.00% | 0.04 | | 0.654 | 24.3 | 0.63% | 0.25 |
+
+**Peak RSS across the sweep** (`udp-statsd-small`, the slab-size probe): **21.7 MiB at every one of
+`read_batch` 16, 32, 64, 128 and 256** — a sixteenfold change in the slab's nominal size (1 MiB → 16
+MiB) with no movement in resident memory (not separately measured at `read_batch: 1`). A direct
+allocation probe agrees: `vec![0u8; 64 × 65,507]` under this repo's jemalloc adds +52 KiB RSS on
+allocation (not 4 MiB), +308 KiB once every slot has held a 100-byte datagram, and +4.1 MiB only if
+every byte of every slot is touched (`docs/design/memory.md` §5 carries both figures as a fixed
+per-listener row).
+
+<!-- udp-intake-numbers:end -->
+
+### Reading the numbers
+
+**Small datagrams are where both changes land, and that is not a coincidence.** `udp-statsd-small`
+is the one scenario where W3's delta clears the control-to-control drift (−13.7%/−21.8% µs/event,
+against a same-code drift of −2.7% to −4.9%) and where W4's delta clears it too (−19.8%/−9.0%
+µs/event, against a same-code drift of −0.5% to −4.8%), with the kernel drop rate collapsing to
+near-zero in both passes. That is exactly the prediction: `push_many`/`pop_many` removed one of the
+two per-datagram gauge-lock acquisitions that `read_loop` and `decode_loop` used to contend on, and
+`recvmmsg` removed the per-datagram `recv_from` syscall itself — both costs are fixed per datagram,
+so both save the most where the payload is too small to amortize them against anything else.
+
+**`udp-statsd` and `udp-statsd-packed` stay within drift at both W3 and W4.** Their few-percent
+movements are the same size as (or smaller than) the control-to-control drift measured in the same
+session, so they're reported as "no signal," not claimed as wins — the expected shape given how few
+syscalls and gauge updates a decode-bound datagram pays per event (~13.5 metrics/datagram on
+`udp-statsd-packed` alone).
+
+**The mean-fill column is why any `read_batch` above the arrival burst is equivalent.** `fill` is
+`logit.input.datagrams / logit.input.reads` — the number of datagrams one `recvmmsg` call actually
+returned. It plateaus around **~3 on `udp-statsd-small`** and **~24 on `udp-statsd`** (and ~14 on
+`udp-statsd-packed`) for every `read_batch` from 16 upward: the reader is never more than a few
+datagrams behind the arrival rate, so raising the ceiling past that plateau has nothing left to buy.
+64 was chosen as the smallest power of two comfortably above both plateaus.
+
+**The read slab is not resident**, which is the other side of that same plateau: a sixteenfold change
+in the slab's nominal size (`read_batch` 16 → 256, 1 MiB → 16 MiB of address space) moved peak RSS by
+nothing on `udp-statsd-small`. `vec![0u8; n]` under this codebase's jemalloc is a fresh zeroed
+mapping, and a small datagram only ever touches the one 4 KiB page of each 65,507-byte slot it
+actually writes into — the slab's cost is address space, not memory.
+
+### Open after this workstream
+
+- **Peak RSS rose +7–32% on `udp-statsd`/`udp-statsd-packed` at W4, and the attribution is open.**
+  The slab is ruled out (the sweep above holds RSS flat across a sixteenfold slab-size change); the
+  working guess is more datagram bytes in flight per turn of the read loop, at roughly 1.4 KB per
+  datagram. That is an inference, not a measurement — a 1 s-interval probe during W4 saw the receive
+  queue only 8–64 datagrams deep, which is evidence *against* that guess, not for it. The final runs
+  should settle this by comparing the receive queue's own byte high-water mark
+  (`logit.component.receive.bytes`, sampled more tightly than once a second) against jemalloc's
+  `stats.resident`/`stats.retained` — if the queue gauge rises in step with RSS the guess holds; if
+  it stays flat while RSS still moves, the allocator's dirty-page retention under a burstier
+  allocation pattern is the better explanation and wants its own reading.
+- **All numbers in this section are provisional** and taken on a laptop, on battery, on the
+  `powersave` governor, thermally throttling — identical code drifted 3–5% in CPU µs/event within
+  minutes of itself, which is what the control-to-control rows above are for. The lead re-takes every
+  table in the delimited block above as interleaved one-sitting pairs on a plugged-in, cooled box (or
+  a cloud VM) and that pass replaces the block wholesale.
+
 ## Open questions
 
 - **When and how this harness runs in the ongoing development process is still deliberately

@@ -6,7 +6,12 @@ updated: 2026-09-18
 # UDP intake batching and socket visibility
 
 ## Status
-Accepted
+
+Accepted — and built. Every workstream in [`docs/plans/udp-intake.md`](../plans/udp-intake.md) has
+landed on its stacked branch: **W0 #250, W1 #251, W2 #252, W3 #253, W4 #254, W5 (this closeout)**.
+Per Ross's direction the stack is not merged to `main` by this workstream, so "landed" means complete
+and pushed, not merged; that plan's own status paragraph is the authority. See "As built" below for
+where the implementation sharpened or corrected this record as it went.
 
 ## Context
 
@@ -719,3 +724,38 @@ ahead of evidence this same plan is about to produce.
   is a separate question, and one that overlaps with `SO_REUSEPORT`'s own redesign of
   `run_until_shutdown`'s two-arm select, the `&mut self.decoder` borrow and `Fanout` ownership.
   Recorded in `docs/known-gaps.md` next to the `SO_REUSEPORT` entry rather than designed here.
+
+## As built
+
+What follows is new information the implementation surfaced, not restated from the sections above —
+read those first. Each bullet is something this record did not, or could not, say at design time.
+
+- **`sockstat` landed exactly where "`sockstat` lives in `logit-pipeline`" above decided**, at
+  `crates/logit-pipeline/src/sockstat.rs` — not `logit-core`, despite an early W1 PR description
+  that named the wrong crate in passing. The code and the decision agree; only the prose of one PR
+  body briefly didn't.
+- **`DropCounter`'s first sample reports its absolute value**, not a zero baseline. `logit` opens
+  every socket it samples itself, so a fresh socket's counter is genuinely zero at birth, and the
+  drops accumulating between `Input::bind` and the run loop's first sample — while the process is
+  still binding other listeners, with traffic already arriving at a socket nothing is reading yet —
+  are real and would otherwise be silently absorbed into the first interval's baseline instead of
+  counted.
+- **`SockMeminfo::receive_utilization` can read slightly above 1.0, and that is not a bug.**
+  `__udp_enqueue_schedule_skb` charges an arriving packet's `truesize` to `sk_rmem_alloc` and *then*
+  compares the result against `sk_rcvbuf`, uncharging it again on the drop path — so a sample taken
+  between those two steps sees the overshoot. A caller must not clamp it, and a test must not assert
+  an upper bound of 1.0 against a real socket under load; values a little over 1.0 mean "saturated
+  and dropping," which is exactly what they look like.
+- **The accept-queue sampler is wired into all four accept loops that exist**, not described
+  generically: the shared `crate::tcp` driver (`syslog_in`, `graphite_in`, TCP `statsd_in`, one call
+  site), plus `logit_in`, `otlp_in`, and `prometheus_in`'s remote-write receiver, each of which keeps
+  an accept loop of its own and needed its own `AcceptQueueSampler::accept()` call site.
+- **`push_many` notifies `not_empty` immediately before every wait, not only once at the end of the
+  call — found in review, not at design time.** The end-of-call notification alone is a lost wakeup
+  under `Block`: a batch bigger than the queue's total free room admits a prefix and then parks on
+  `not_full`, and a consumer that had already parked on `not_empty` *first* would wait for a permit
+  issued only once the whole call returns — which can only happen once that same consumer frees room,
+  a permanent mutual wait. The fix notifies before every suspend point instead of only after the last
+  one, which also covers cancellation for free (the accepted prefix is already announced by the time
+  a cancelled call's remainder is dropped). `push`'s existing per-item notification was never
+  affected — it takes its item on the same arm that breaks its loop, so it never had this gap.

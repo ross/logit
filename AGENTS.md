@@ -144,7 +144,16 @@ real Tempo, exactly the way `log_out` proves `syslog_out` against a real Loki. `
 read and its decode/batch-assembly loop run decoupled through a `ReceiveQueue`, the listener-side
 mirror of `SinkQueue`'s sink-side decoupling, so a stalled downstream no longer stops the socket
 being read; see [ADR `decoupled-listener-io`](docs/adr/decoupled-listener-io.md) and the `receive:`
-config block it introduces. `syslog_in`, `graphite_in` and `statsd_in` can each instead run
+config block it introduces. On Linux, that same driver reads in batches: `read_loop` takes up to
+`receive.read_batch` datagrams (default 64) per `recvmmsg(2)` call and hands the batch to
+`BoundedQueue::push_many`/`pop_many`, which update the queue's telemetry gauges once per batch
+instead of once per datagram on both the push and pop side; `logit_pipeline::sockstat` reads the
+kernel's own per-socket counters straight off a listener's fd (`getsockopt(SO_MEMINFO)` for a UDP
+socket's drops/receive-buffer fill, `TCP_INFO` for a `LISTEN` socket's accept-queue depth/backlog),
+once a second and once more after the read loop stops, so `logit.input.kernel.drops` and the
+`receive_buffer.*`/`accept_queue.*` gauges attribute a loss no other layer could ever see to a
+component — see [ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md).
+`syslog_in`, `graphite_in` and `statsd_in` can each instead run
 `transport: tcp` on a second, generic stream driver, `logit-inputs::tcp::TcpListener` — an accept
 loop, a connection cap, per-listener framing (RFC 6587's auto-detecting pair for `syslog_in`,
 LF-delimited lines for `statsd_in` and carbon plaintext, carbon's 4-byte length prefix for pickle),
@@ -282,7 +291,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
 | `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
-| `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, and is denominated over events *delivered* ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
+| `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, is denominated over events *delivered*, and takes `--verify` (a strict zero-drop self-check) / `--rate-scale` (moves the operating point without editing a spec) ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -438,7 +447,7 @@ crates/
   logit-config      YAML config types + generated JSON Schema
   logit-script      LuaJIT embedding (mlua), the Event proxy
   logit-proto       codec traits, native wire format, output buffering
-  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime
+  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
   logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, route (implements logit-pipeline::Router)
