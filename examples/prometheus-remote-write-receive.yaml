@@ -1,0 +1,66 @@
+# Receive Prometheus remote-write and re-expose it for something else to scrape: `prometheus_in`'s
+# `bind:` mode is a remote-write **receiver**, `prometheus_out`'s `bind:` serves the exposition
+# (docs/adr/prometheus-remote-write.md). This is the half of the pair scrape cannot do at all -- a
+# Prometheus server's own /metrics exposes its internal telemetry, not its TSDB, so remote-write is
+# the only supported way to get the series a Prometheus has *ingested* into logit.
+#
+# Point a real Prometheus at this with:
+#
+#   remote_write:
+#     - url: http://<this-host>:9201/api/v1/write
+#       protobuf_message: prometheus.WriteRequest      # or io.prometheus.write.v2.Request
+#
+# Both wire versions are accepted on the one listener, selected per request from its own
+# Content-Type -- there is nothing to configure, and nothing to keep in step with the sender.
+#
+# `instance` and `job` arrive as ordinary labels and stay ordinary event attributes, verbatim: a
+# receiver observed a TCP connection from a sender that may be relaying for thousands of targets,
+# so unlike scrape mode (which genuinely connected to the target it names) it stamps no resource
+# identity of its own. Add a `set` component if this deployment wants one; that decision belongs in
+# config, not in the decoder.
+components:
+  remote_write_in:
+    type: prometheus_in
+    # 127.0.0.1, not 0.0.0.0: `bind_tls:` below gives this listener transport security, not
+    # identity -- there is no authentication on it (docs/known-gaps.md). Bind loopback or pod-local
+    # and front it with something that authenticates, exactly as the exposition endpoint below.
+    bind: 127.0.0.1:9201
+    # path: /api/v1/write         # the one path POSTs are accepted on; any other path is a 404,
+    #                             # any other method on this path a 405 + Allow: POST
+    # bind_tls:                   # presence turns server TLS on for this listener
+    #   cert_file: server.pem     # resolved against this config file's directory
+    #   key_file: server.key
+    #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
+    # idle_timeout: 5m            # off by default -- bounds the quiet gap between requests on a
+    #                             # kept-alive connection (docs/adr/idle-connection-timeout.md)
+    #
+    # WHY THE CACHE IS NOT OPTIONAL FOR A 1.0 SENDER. Prometheus's own remote-write 1.0 sender
+    # ships metric metadata in requests of its *own*, on its own schedule (`metadata_config`, once
+    # a minute by default), not attached to the samples it describes. A receiver holding no state
+    # therefore sees, for nearly every request, a bag of flat series with no `# TYPE` equivalent
+    # anywhere in the message -- so `http_requests_total`, `..._bucket` and `..._sum`/`_count`
+    # arrive as unrelated untyped series instead of one counter and one histogram. Nothing is lost
+    # (samples and labels are exact, and a relay straight back out to remote-write is still a fixed
+    # point), but the model kinds are flatter than the producer's. This bounded, per-family cache
+    # is what closes that: every `metadata[]` entry and every 2.0 inline `Metadata` feeds it, and a
+    # series whose own request carried none is typed from it. 2.0 is fully typed with no cache at
+    # all, so a 2.0-only deployment can turn it off.
+    #
+    # Both fields below are the defaults -- shown rather than omitted because this is the one
+    # bind-mode setting whose value an operator should think about rather than inherit.
+    metadata_cache:
+      max_families: 10000 # hard cap on remembered families; over it the least-recently-declared is
+      #                     evicted, counted logit.input.metadata_cache.evicted{reason="cardinality"}.
+      #                     0 turns the cache off entirely, leaving the stateless decode path
+      ttl: 10m # a family not re-declared within this window is forgotten (counted
+      #          reason="expired") and its samples go back to decoding untyped until the sender's
+      #          next metadata request re-declares it. Keep it comfortably above the sender's own
+      #          `metadata_config.send_interval`
+
+  metrics:
+    type: prometheus_out
+    sources: [remote_write_in]
+    # Registry mode: the received series are held and rendered on demand, in whichever dialect the
+    # scraping client's `Accept` asks for. 127.0.0.1 for the same reason as above -- no TLS and no
+    # auth on this endpoint (docs/adr/prometheus-scrape-and-exposition.md's "Security posture").
+    bind: 127.0.0.1:9464

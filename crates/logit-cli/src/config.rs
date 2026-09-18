@@ -244,6 +244,12 @@ mod tests {
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
+                // `examples/prometheus-remote-write-send.yaml`'s `headers:` map -- the whole
+                // header value, `Bearer ` prefix included, since `!env` substitutes a field
+                // rather than interpolating into one.
+                "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {
+                    Some("Bearer logit-test-token".to_string())
+                }
                 _ => None,
             })
             .unwrap_or_else(|err| panic!("{} did not load: {err:#}", path.display()));
