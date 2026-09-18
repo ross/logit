@@ -359,13 +359,6 @@ already built that have a known, accepted rough edge.
   `logit` never attributes a flush to any of the batches that fed it (no accumulator to inspect,
   unlike `Transform::flush`'s linking below), so a script that wants that relationship tracks
   contributing contexts itself inside `process()`.
-- **No native way to stamp `logit`'s own pipeline trace context onto a log's `LogRecord.trace`** —
-  a script can already do this by hand (`event.log.trace_id = trace.trace_id`,
-  [ADR `log-record-trace-context`](adr/log-record-trace-context.md)), but the `trace_context`
-  native transform has no equivalent opt-in mode, only attribute-lifting. Deliberately deferred,
-  not designed around yet: it stamps *logit's* identity onto *application* data, which must stay
-  strictly opt-in (never a default, same posture as everything else on this page), and no concrete
-  consumer has needed it yet. Revisit once one does.
 - ~~**Lua has no span API at all**~~ — ~~**narrowed to span writes/minting from Lua.**~~ —
   **narrowed again (2026-09-15) to in-place span mutation from Lua.** `event.span`
   (`docs/design/lua-api.md`'s "Reading `event.span`") is a real, read-only proxy — a script can
@@ -378,18 +371,6 @@ already built that have a known, accepted rough edge.
   field by field; the documented way is `Event.new(event:to_table())` with the table edited. An
   in-place write path shares this constructor's parsers and is a small follow-up, not designed
   yet — the same posture in-place `event.log.message`/`severity`/`body_format` writes take.
-- **A haproxy/nginx access line derives only its own server span, not the CLIENT-side child span
-  for the hop to its upstream** — `trace_context`'s `span:` block mints one `SpanRecord` per
-  event, and `Transform::process` is one-in-one-out, so there's nowhere to put a second span for
-  the same line. The math is fully available on the wire already: for haproxy (`docs/adr/
-  trace-context-span-lifting.md`'s "Producer timing model"), a CLIENT span to the upstream would
-  be `start = request_date + TR + Tw`, `duration = Tc + Tr + Td` (`%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td`,
-  logged as plain `haproxy.timer.*` attributes for exactly this reason); for nginx, the
-  `$upstream_connect_time`/`$upstream_header_time`/`$upstream_response_time` triple gives the
-  equivalent breakdown. Building this needs either a `Transform` that can emit more than one event
-  per input (a trait change) or a second, explicitly upstream-flavored lift mode — not designed,
-  since no config needs it yet and the attributes needed to build it later are already on the
-  event.
 - ~~**A benchmark of the event proxy against plain table conversion is still outstanding**~~ —
   **closed.** Measured in `crates/logit-bench/benches/pipeline.rs` (`lua::proxy` vs
   `lua::to_table`): the proxy is faster, widening in its favour for scripts that read few
@@ -1246,19 +1227,6 @@ already built that have a known, accepted rough edge.
   signals that are succeeding remains a separate, unfiled possible improvement to `otlp_out`
   itself. `demo/logit.yaml`'s `trace_only`/`tempo_out` components carry this same explanation
   inline.
-
-- **No mechanism exists anywhere in `logit` to attach a static attribute to a batch's resource** —
-  found in the same investigation
-  ([docs/plans/otlp-logs-and-resource-identity.md](plans/otlp-logs-and-resource-identity.md),
-  workstream A). Not config (no `attributes`/`labels`/`tags`/`resource` field on any input), not any
-  transform (`keep`/`json`/`kv_metrics`/`aggregate` only filter or derive), and Lua can mutate only
-  *event* attributes (`crates/logit-script/src/proxy.rs`'s `AttrsProxy`), never a resource. This is
-  what blocks giving `syslog_in`/`statsd_in` traffic a real `service.name` for OTLP-native backends
-  (Loki's index labels among them) without the just-landed rule that `logit`'s own code must not
-  invent one. The plan's workstream A sketches the fix — an operator-declared `resource:` config
-  field, landing on a new ADR distinguishing "code invents an identity" (still forbidden) from "an
-  operator configuring the pipeline declares one" (fine, same category as `syslog_out`'s existing
-  `hostname`/`app_name` fields) — plus the demo-stack workstreams (B, C, D) it would unblock.
 
 - **Every TLS-capable component's certificates are loaded once at startup; rotation needs a
   restart.** `otlp_in`/`otlp_out`, `logit_in`/`logit_out`, `syslog_in`/`syslog_out`, and

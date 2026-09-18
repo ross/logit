@@ -142,10 +142,10 @@ without writing Lua; `event.log.trace_id`/`span_id`/`trace_flags` are read+write
 OTLP log sink — Loki included — can now get native trace correlation from `logit`, wherever the
 trace context comes from (the wire, an attribute, or a script).
 
-**What's still open, deliberately:** no mode stamps `logit`'s *own* pipeline trace context onto a
-log automatically — a script can do it by hand
-(`event.log.trace_id = trace.trace_id`), but that's an application-identity decision an operator
-must opt into, never a default (`docs/known-gaps.md`). And the demo-stack half of this workstream
+**Declined, not open:** no mode stamps `logit`'s *own* pipeline trace context onto a log
+automatically — a script can do it by hand (`event.log.trace_id = trace.trace_id`), and that's
+the supported answer ([ADR `log-record-trace-context`](../adr/log-record-trace-context.md)'s
+alternatives, declined 2026-09-18). **What's still open:** the demo-stack half of this workstream
 — wiring the demo's log leg to actually carry a trace context, and the Grafana-side upgrade this
 paragraph originally described (a second `derivedFields` entry keyed on Loki's `trace_id`
 structured metadata instead of the existing body regex) — is explicitly deferred to the demo app's

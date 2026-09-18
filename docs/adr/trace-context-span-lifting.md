@@ -1,6 +1,6 @@
 ---
 created: 2026-09-04
-updated: 2026-09-15
+updated: 2026-09-18
 ---
 
 # `trace_context` grows a `span:` block, and a native `traceparent` parser
@@ -196,10 +196,11 @@ breakdown haproxy's finer timers do, for the same not-built-here reason.
   deferred — see the Decision section; this would fork traces silently rather than report a real
   gap in propagation.
 - **Deriving a second, CLIENT-side span for the upstream hop from the same timers this ADR reads
-  anyway (haproxy's `%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td`, nginx's `$upstream_*`).** Deferred, not
-  designed: `Transform::process` is one-in-one-out, so a second span per line needs either a trait
-  change or a second, upstream-flavored lift mode, and no concrete config needs it yet. Filed in
-  `docs/known-gaps.md` with the exact derivation so it isn't re-discovered from scratch.
+  anyway (haproxy's `%TR`/`%Tw`/`%Tc`/`%Tr`/`%Td`, nginx's `$upstream_*`).** Declined
+  (2026-09-18), not just deferred: the timing math is all there, but a proxy minting a span on its
+  upstream's behalf is backwards. The upstream is what knows what the hop actually did, and a span
+  built proxy-side could never carry anything beyond the timers the proxy already logs as
+  attributes. The upstream's own instrumentation should emit that span.
 
 ## Consequences
 
