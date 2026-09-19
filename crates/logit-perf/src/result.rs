@@ -24,6 +24,10 @@ pub struct GitInfo {
 /// One `logit-perf run` invocation: the environment it ran in, plus every scenario it measured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunReport {
+    /// The checkout the harness itself and `perf/scenarios/`/`perf/load/` came from -- distinct
+    /// from [`RunReport::binary`], which is what was actually spawned. The two agree for an
+    /// ordinary in-tree build; a `--logit-bin`-driven multi-source session (`script/vm build`) is
+    /// exactly the case where they don't, and each answers a different question.
     pub git: GitInfo,
     /// RFC 3339, always UTC (a trailing `Z`), second precision.
     pub timestamp: String,
@@ -33,7 +37,9 @@ pub struct RunReport {
     pub nproc: usize,
     /// `rustc -V`'s output, verbatim (trimmed).
     pub rustc: String,
-    /// The `--profile` the binary under test was built with (`release` by default).
+    /// The `--profile` the binary under test was built with (`release` by default). Meaningless
+    /// under `--logit-bin` (nothing was built this invocation) but left as given, since a stashed
+    /// binary's own sidecar (`binary.built_profile`) is what actually answers the question then.
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -42,7 +48,39 @@ pub struct RunReport {
     /// that doesn't expose it -- see [`BoxState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_state: Option<BoxState>,
+    /// The binary that was actually spawned -- always populated, `--logit-bin` or not, so a
+    /// results file never leaves "what did this measure" to be inferred from `git`/`profile`
+    /// alone. Absent only in a results file written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<BinaryInfo>,
     pub scenarios: BTreeMap<String, ScenarioReport>,
+}
+
+/// Identity of the `logit` binary a run actually spawned, independent of the checkout's own
+/// [`GitInfo`] -- the two can differ under `--logit-bin` (`docs/adr/disposable-azure-perf-vm.md`'s
+/// multi-source `script/vm build`), and a results file has to say which binary produced its
+/// numbers even when the checkout it ran alongside is ambiguous or shared across several.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BinaryInfo {
+    /// The path handed to (or resolved for) the spawned process, as given on the command line --
+    /// relative paths are resolved against the repo root before this is recorded, so the field
+    /// means the same thing whether `logit-perf` ran on the host or inside the dev container.
+    pub path: String,
+    /// `sha256sum` of the binary's bytes at the moment it was located -- the one piece of
+    /// provenance that's always obtainable, commit or no commit, clean tree or not.
+    pub sha256: String,
+    /// From a `<bin>.json` sidecar next to the binary (`script/vm build`'s output), when one
+    /// exists and parses. A malformed sidecar is ignored with a warning rather than failing the
+    /// run -- provenance is a nicety a bad file must not be able to block a measurement over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// The commit the sidecar's build was taken from, when it names one -- a bare directory or
+    /// tarball source with no `.git` of its own leaves this `None` even with a sidecar present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha: Option<String>,
+    /// When the sidecar's build ran, RFC 3339 UTC, verbatim from the sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
 }
 
 /// The CPU frequency policy and power source a run was taken under, read best-effort from sysfs.
@@ -529,6 +567,13 @@ mod tests {
             profile: "release".to_string(),
             label: Some("baseline".to_string()),
             box_state: None,
+            binary: Some(BinaryInfo {
+                path: "/repo/target/release/logit".to_string(),
+                sha256: "d".repeat(64),
+                source_ref: Some("udp/w3".to_string()),
+                source_sha: Some("abc123".to_string()),
+                built_at: Some("2026-09-18T00:00:00Z".to_string()),
+            }),
             scenarios,
         };
 
@@ -638,9 +683,11 @@ mod tests {
             profile: "release".to_string(),
             label: None,
             box_state: None,
+            binary: None,
             scenarios: BTreeMap::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("label"), "{json}");
+        assert!(!json.contains("\"binary\""), "{json}");
     }
 }

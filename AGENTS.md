@@ -297,7 +297,7 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
 | `script/image [tag]` | Build the production runtime image (`Dockerfile`, not `Dockerfile.dev`) |
 | `script/demo [compose args]` | Run the self-contained demo stack (`demo/`) — the release image, no dev container |
-| `script/vm up\|shell\|status\|down` | Create, use, and destroy a disposable Azure VM for perf measurement (`docs/adr/disposable-azure-perf-vm.md`). `down` deletes the resource group — the only way back to $0 |
+| `script/vm up\|shell\|status\|down\|build\|push\|pull` | Create, use, and destroy a disposable Azure VM for perf measurement (`docs/adr/disposable-azure-perf-vm.md`). `down` deletes the resource group — the only way back to $0. **The operator runs `up` and `down`**; an agent does the measuring in between — `build <ref\|dir\|tarball>...` stashes another binary to measure (`perf/bins/<slug>/logit`, fed to `logit-perf run --logit-bin`), `push`/`pull` `scp` files to/from it |
 
 All default to `sudo docker`; `DOCKER=docker` or `DOCKER=podman` overrides — except `script/vm`,
 which talks to `az` and `ssh` on the host and never to a local Docker daemon. See

@@ -26,7 +26,7 @@
 //! event count the load spec's ring says it sent.
 
 use crate::load::{self, CpuSet, LoadOutcome, LoadPlan};
-use crate::result::{BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
+use crate::result::{BinaryInfo, BoxState, GitInfo, RunReport, Sample, ScenarioReport, UdpSample};
 use crate::rusage::{self, Usage};
 use crate::scenario::{self, Scenario, Workload};
 use crate::telemetry_leg::{self, RemoveOnDrop};
@@ -68,6 +68,13 @@ pub struct RunArgs {
     pub settle: Duration,
     pub no_build: bool,
     pub profile: String,
+    /// Measure this binary instead of building one. Implies `--no-build`; a relative path is
+    /// resolved against the repo root, not the process's cwd, so it means the same thing typed on
+    /// the host or inside the dev container. The enabling change for a multi-source VM session
+    /// (`docs/adr/disposable-azure-perf-vm.md`'s `script/vm build`): each source gets its own
+    /// stashed binary under `perf/bins/<slug>/logit`, and this is what points a run at one of
+    /// them without the `docker cp`-into-the-target-volume choreography that used to require.
+    pub logit_bin: Option<PathBuf>,
     /// How long to wait for a scenario's `generation complete` line (generated) or `ready` line
     /// (driven) before giving up on it as hung.
     pub timeout: Duration,
@@ -116,7 +123,19 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         eprintln!("warning: {warning}");
     }
 
-    let logit_bin = build_and_locate(root, &args.profile, args.no_build)?;
+    let logit_bin =
+        build_and_locate(root, &args.profile, args.no_build, args.logit_bin.as_deref())?;
+    let binary = binary_info(&logit_bin);
+    println!(
+        "binary:        {} (sha256 {}{})",
+        binary.path,
+        short12(&binary.sha256),
+        match (&binary.source_ref, &binary.source_sha) {
+            (Some(source), Some(sha)) => format!(", {source} @ {}", short12(sha)),
+            (Some(source), None) => format!(", {source}"),
+            (None, _) => String::new(),
+        }
+    );
 
     let mut reports: BTreeMap<String, ScenarioReport> = BTreeMap::new();
     let mut any_failed = false;
@@ -230,25 +249,14 @@ pub fn run(root: &Path, args: RunArgs) -> anyhow::Result<()> {
         profile: args.profile.clone(),
         label: args.label.clone(),
         box_state: Some(state),
+        binary: Some(binary),
         scenarios: reports,
     };
 
     let results_dir = root.join("perf/results");
     std::fs::create_dir_all(&results_dir)
         .with_context(|| format!("creating {}", results_dir.display()))?;
-    let short_sha: String = report
-        .git
-        .sha
-        .as_deref()
-        .map(|sha| sha.chars().take(12).collect())
-        .unwrap_or_else(|| "unknown".to_string());
-    let label_suffix = report
-        .label
-        .as_deref()
-        .map(|label| format!("-{}", sanitize_label(label)))
-        .unwrap_or_default();
-    let filename = format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now));
-    let path = results_dir.join(filename);
+    let path = results_dir.join(result_filename(&report, now, args.logit_bin.is_some()));
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", path.display()))?;
 
@@ -1055,11 +1063,26 @@ pub(crate) fn spawn_and_measure(spawn: SpawnConfig<'_>) -> anyhow::Result<Measur
 /// Builds `logit` under `profile` (unless `no_build`) and returns the path to the binary,
 /// failing loudly if it isn't there afterwards. Shared by `run`, `attribute`, and `flamegraph` --
 /// all three measure the *same* binary and must agree on which one that is.
+///
+/// `logit_bin_override` is `--logit-bin`, honoured by `run`/`attribute` only (`flamegraph` always
+/// passes `None`: it measures the `profiling` profile for its symbols, and a stashed release
+/// binary would produce a useless capture). It **implies skipping the build** regardless of
+/// `no_build` -- there is nothing to build toward, the binary is already named -- and a relative
+/// path is resolved against `root`, not the process's cwd, so `--logit-bin perf/bins/foo/logit`
+/// means the same thing typed on the host or inside the dev container.
 pub(crate) fn build_and_locate(
     root: &Path,
     profile: &str,
     no_build: bool,
+    logit_bin_override: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
+    if let Some(path) = logit_bin_override {
+        let resolved = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+        if !resolved.exists() {
+            bail!("{} does not exist (--logit-bin)", resolved.display());
+        }
+        return Ok(resolved);
+    }
     if !no_build {
         build(root, profile)?;
     }
@@ -1072,6 +1095,122 @@ pub(crate) fn build_and_locate(
         );
     }
     Ok(logit_bin)
+}
+
+/// What `<bin>.json` records next to a binary `script/vm build` produced
+/// (`docs/adr/disposable-azure-perf-vm.md`) -- the source string the operator/agent gave `build`
+/// (a git ref, or a directory/tarball path for work that was never pushed), the commit it
+/// resolved to when there was one, and when it was built. Parsed with serde's default
+/// unknown-field tolerance, not `deny_unknown_fields`: the sidecar is free to carry more than
+/// this crate reads (`script/vm build`'s own `sha256`/`profile`, say) without breaking this side.
+#[derive(serde::Deserialize)]
+struct BinarySidecar {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    built_at: Option<String>,
+}
+
+/// Reads `<logit_bin>.json` if it exists and parses -- absence is silent (an ordinary in-tree
+/// build never has one), but a file that exists and doesn't parse warns and is otherwise ignored:
+/// bad provenance metadata must never be able to fail a measurement over it.
+fn read_binary_sidecar(logit_bin: &Path) -> Option<BinarySidecar> {
+    let sidecar_path = logit_bin.with_extension("json");
+    let contents = std::fs::read_to_string(&sidecar_path).ok()?;
+    match serde_json::from_str(&contents) {
+        Ok(sidecar) => Some(sidecar),
+        Err(err) => {
+            eprintln!(
+                "warning: {} exists but did not parse as binary provenance ({err}) -- ignoring it",
+                sidecar_path.display()
+            );
+            None
+        }
+    }
+}
+
+/// `sha256sum`'s own algorithm output for `path` -- shelled out to rather than pulling in a hash
+/// crate, the same "no new dependency for W5" reasoning `format_rfc3339_utc_seconds` already
+/// documents, and `sha256sum` is already on every image this runs in (coreutils).
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .with_context(|| format!("running sha256sum {}", path.display()))?;
+    if !output.status.success() {
+        bail!("sha256sum {} failed", path.display());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .context("sha256sum produced no output")
+}
+
+/// The identity recorded for the binary a run actually spawns -- always populated, `--logit-bin`
+/// or not, so a results file never leaves "what did this measure" to be inferred from `git`/
+/// `profile` alone (`result::BinaryInfo`'s own doc has why the two can differ).
+fn binary_info(logit_bin: &Path) -> BinaryInfo {
+    let sha256 = sha256_file(logit_bin).unwrap_or_else(|err| {
+        eprintln!("warning: could not sha256 {}: {err:#}", logit_bin.display());
+        "unknown".to_string()
+    });
+    let sidecar = read_binary_sidecar(logit_bin);
+    BinaryInfo {
+        path: logit_bin.to_string_lossy().into_owned(),
+        sha256,
+        source_ref: sidecar.as_ref().and_then(|s| s.source.clone()),
+        source_sha: sidecar.as_ref().and_then(|s| s.sha.clone()),
+        built_at: sidecar.and_then(|s| s.built_at),
+    }
+}
+
+/// The first 12 characters of a hex sha (git or sha256) -- the one truncation convention this
+/// crate uses everywhere a full hash would be unreadable clutter.
+fn short12(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
+/// The short-sha component of a results filename.
+///
+/// **`logit_bin_overridden` is what actually decides this, not merely whether `binary` carries a
+/// `source_sha`.** For an ordinary build (`--logit-bin` not given) the checkout's own `git.sha` is
+/// exactly what was measured, and naming the file after it is the existing, stable convention --
+/// changing it to `binary.sha256` instead would rename every ordinary run's results after a hash
+/// that isn't even guaranteed to reproduce across two builds of the *same* commit, breaking
+/// filename-based correlation for no benefit. `--logit-bin` is the one case `git.sha` can honestly
+/// diverge from what was measured (a stashed binary from a different ref, or no ref at all), which
+/// is exactly when the binary's own identity has to win: its sidecar's resolved commit
+/// (`source_sha`) when the source was a git ref, else its `sha256` (a tarball or dirty-tree source
+/// has no commit, but it is still its own identity).
+fn short_provenance_sha(report: &RunReport, logit_bin_overridden: bool) -> String {
+    if logit_bin_overridden {
+        if let Some(binary) = &report.binary {
+            if let Some(sha) = &binary.source_sha {
+                return short12(sha);
+            }
+            return short12(&binary.sha256);
+        }
+    }
+    report.git.sha.as_deref().map(short12).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `perf/results/<compact-utc-timestamp>-<short-sha>[-<label>].json` -- see
+/// [`short_provenance_sha`] for which sha wins, and `run`'s own doc for the label suffix.
+fn result_filename(
+    report: &RunReport,
+    now_unix_seconds: i64,
+    logit_bin_overridden: bool,
+) -> String {
+    let short_sha = short_provenance_sha(report, logit_bin_overridden);
+    let label_suffix = report
+        .label
+        .as_deref()
+        .map(|label| format!("-{}", sanitize_label(label)))
+        .unwrap_or_default();
+    format!("{}-{short_sha}{label_suffix}.json", compact_utc_now(now_unix_seconds))
 }
 
 fn build(root: &Path, profile: &str) -> anyhow::Result<()> {
@@ -1704,6 +1843,205 @@ mod tests {
         let short = self_check(&scenario, &plan, &udp_sample(100, 100, 0, 97), &sampled(), true)
             .expect_err("--verify requires an exact delivered count");
         assert!(format!("{short:#}").contains("exactly 100 events"), "{short:#}");
+    }
+
+    #[test]
+    fn build_and_locate_rejects_a_missing_logit_bin_override() {
+        let root = Path::new("/repo");
+        let err = build_and_locate(root, "release", false, Some(Path::new("no/such/logit")))
+            .expect_err("a --logit-bin path that doesn't exist must fail");
+        assert!(format!("{err:#}").contains("--logit-bin"), "{err:#}");
+    }
+
+    #[test]
+    fn build_and_locate_resolves_a_relative_logit_bin_override_against_root() {
+        let dir = tempfile_dir();
+        let bin_path = dir.join("stashed-logit");
+        std::fs::write(&bin_path, b"not a real binary, just bytes to hash").unwrap();
+
+        let resolved =
+            build_and_locate(&dir, "release", false, Some(Path::new("stashed-logit"))).unwrap();
+        assert_eq!(resolved, bin_path);
+    }
+
+    #[test]
+    fn build_and_locate_accepts_an_absolute_logit_bin_override() {
+        let dir = tempfile_dir();
+        let bin_path = dir.join("stashed-logit");
+        std::fs::write(&bin_path, b"bytes").unwrap();
+
+        let resolved =
+            build_and_locate(Path::new("/unrelated"), "release", false, Some(&bin_path)).unwrap();
+        assert_eq!(resolved, bin_path);
+    }
+
+    /// A directory unique to this test process and this call, cleaned up on drop -- these tests
+    /// touch the real filesystem (a real `sha256sum` invocation, a real sidecar file) rather than
+    /// mocking either, since both are cheap and the point is proving the real plumbing works.
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "logit-perf-run-tests-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn unique_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn sha256_file_matches_a_known_vector() {
+        let dir = tempfile_dir();
+        let path = dir.join("hello.txt");
+        std::fs::write(&path, b"hello world\n").unwrap();
+        // sha256("hello world\n"), a standard test vector.
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    #[test]
+    fn read_binary_sidecar_returns_none_when_no_sidecar_exists() {
+        let dir = tempfile_dir();
+        let bin_path = dir.join("logit");
+        assert!(read_binary_sidecar(&bin_path).is_none());
+    }
+
+    #[test]
+    fn read_binary_sidecar_parses_a_valid_sidecar() {
+        let dir = tempfile_dir();
+        let bin_path = dir.join("logit");
+        std::fs::write(
+            dir.join("logit.json"),
+            r#"{"source": "udp/w3", "sha": "abc123", "sha256": "ignored", "built_at": "2026-09-18T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let sidecar = read_binary_sidecar(&bin_path).expect("a valid sidecar must parse");
+        assert_eq!(sidecar.source.as_deref(), Some("udp/w3"));
+        assert_eq!(sidecar.sha.as_deref(), Some("abc123"));
+        assert_eq!(sidecar.built_at.as_deref(), Some("2026-09-18T00:00:00Z"));
+    }
+
+    #[test]
+    fn read_binary_sidecar_ignores_a_malformed_sidecar_rather_than_failing() {
+        let dir = tempfile_dir();
+        let bin_path = dir.join("logit");
+        std::fs::write(dir.join("logit.json"), "not json at all").unwrap();
+        assert!(read_binary_sidecar(&bin_path).is_none());
+    }
+
+    fn report_with_binary(git_sha: Option<&str>, binary: Option<BinaryInfo>) -> RunReport {
+        RunReport {
+            git: GitInfo { sha: git_sha.map(str::to_string), dirty: Some(false) },
+            timestamp: "2026-09-18T00:00:00Z".to_string(),
+            hostname: "devbox".to_string(),
+            cpu_model: "cpu".to_string(),
+            nproc: 4,
+            rustc: "rustc 1.98.1".to_string(),
+            profile: "release".to_string(),
+            label: None,
+            box_state: None,
+            binary,
+            scenarios: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn short_provenance_sha_ignores_binary_info_when_logit_bin_was_not_used() {
+        // The ordinary, overwhelmingly common case: no --logit-bin, so the checkout's own git.sha
+        // is exactly what was measured, and the filename convention every existing doc/tool
+        // expects must not change. `binary` is populated here too (it always is), but it must
+        // not win -- and specifically must not be read at all, since even its *presence* used to
+        // be enough to change the answer before this test existed.
+        let report = report_with_binary(
+            Some("checkoutsha1234"),
+            Some(BinaryInfo {
+                path: "/x/logit".to_string(),
+                sha256: "f".repeat(64),
+                source_ref: None,
+                source_sha: None,
+                built_at: None,
+            }),
+        );
+        assert_eq!(short_provenance_sha(&report, false), "checkoutsha1");
+    }
+
+    #[test]
+    fn short_provenance_sha_prefers_the_binarys_own_source_sha_under_logit_bin() {
+        let report = report_with_binary(
+            Some("checkoutsha1234"),
+            Some(BinaryInfo {
+                path: "/x/logit".to_string(),
+                sha256: "f".repeat(64),
+                source_ref: Some("udp/w3".to_string()),
+                source_sha: Some("binarycommitsha5678".to_string()),
+                built_at: None,
+            }),
+        );
+        assert_eq!(short_provenance_sha(&report, true), "binarycommit");
+    }
+
+    #[test]
+    fn short_provenance_sha_falls_back_to_the_binarys_sha256_with_no_commit() {
+        // The tarball/dirty-tree case under --logit-bin: a binary with no resolvable commit is
+        // still its own identity, and a results file named `unknown` for it would be exactly the
+        // gap this exists to close.
+        let report = report_with_binary(
+            Some("checkoutsha1234"),
+            Some(BinaryInfo {
+                path: "/x/logit".to_string(),
+                sha256: "abcdef0123456789".to_string(),
+                source_ref: Some("dir".to_string()),
+                source_sha: None,
+                built_at: None,
+            }),
+        );
+        assert_eq!(short_provenance_sha(&report, true), "abcdef012345");
+    }
+
+    #[test]
+    fn short_provenance_sha_falls_back_to_git_sha_when_logit_bin_carries_no_binary_info() {
+        // Defensive: --logit-bin was used, but for some reason `binary` itself is absent (a
+        // results file this function is asked to name outside `run`'s own path). Falling back to
+        // git.sha here is better than a bare "unknown" when there's a real sha available.
+        let report = report_with_binary(Some("checkoutsha1234"), None);
+        assert_eq!(short_provenance_sha(&report, true), "checkoutsha1");
+    }
+
+    #[test]
+    fn short_provenance_sha_is_unknown_with_nothing_to_go_on() {
+        let report = report_with_binary(None, None);
+        assert_eq!(short_provenance_sha(&report, false), "unknown");
+    }
+
+    #[test]
+    fn result_filename_appends_the_label_suffix_when_present() {
+        let mut report = report_with_binary(Some("checkoutsha1234"), None);
+        report.label = Some("baseline v2".to_string());
+        let filename = result_filename(&report, 0, false);
+        assert!(filename.ends_with("-checkoutsha1-baseline_v2.json"), "{filename}");
+    }
+
+    #[test]
+    fn result_filename_names_the_binary_not_the_checkout_under_logit_bin() {
+        let report = report_with_binary(
+            Some("checkoutsha1234"),
+            Some(BinaryInfo {
+                path: "/x/logit".to_string(),
+                sha256: "f".repeat(64),
+                source_ref: Some("udp/w3".to_string()),
+                source_sha: Some("binarycommitsha5678".to_string()),
+                built_at: None,
+            }),
+        );
+        let filename = result_filename(&report, 0, true);
+        assert!(filename.starts_with("19700101T000000Z-binarycommit"), "{filename}");
     }
 
     #[test]

@@ -19,6 +19,13 @@ Everything here is reproducible:
 | What's discoverable | `script/perf list` |
 | A real-socket UDP scenario | `script/perf run --scenario udp-statsd --repeat 5 --pin-sender 0,1 --pin-child 2,3` |
 | Its zero-drop self-check | `script/perf run --scenario udp-statsd --verify --pin-sender 0,1 --pin-child 2,3` |
+| A stashed binary, not a build | `script/perf run --scenario passthrough --logit-bin perf/bins/<slug>/logit` |
+
+A multi-ref session on the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`) measures
+several sources this way: `script/vm build <ref\|dir\|tarball>...` stashes one binary per source
+under `perf/bins/<slug>/logit`, and `--logit-bin` is what points a run at one of them without
+building anything. The results file then names itself after the *binary's* identity rather than
+the checkout's — see the ADR's "Multiple sources, one VM" section.
 
 > Numbers below were taken on a Fedora Linux 44 (Workstation Edition) host, kernel
 > `7.2.4-200.fc44.x86_64`, x86-64, AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 logical CPUs), inside
