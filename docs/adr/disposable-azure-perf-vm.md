@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-19
 ---
 
 # A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot
@@ -38,6 +38,66 @@ harness by hand, and this change supplies a better *machine* for that, not a sch
 `up` provisions a VM and warms it to the point of having already run one scenario; `shell` opens a
 session on it; `status` reports what's running and its cost so far; `down` deletes every billable
 resource. There is no fifth verb.
+
+**Amended 2026-09-19** to add three more: `build`, `push`, `pull` -- see "Who runs what" and
+"Multiple sources, one VM" below. The four original verbs, and the cost/lifecycle model around
+them, are unchanged.
+
+### Who runs what
+
+The **operator runs `up` and `down`**; an agent runs everything else (`build`, `push`, `pull`,
+`shell`, `status`) in the session between them. Two reasons, one of them a hard constraint: an
+auto-mode permission classifier denies an agent's `script/vm up`/`down` outright ("Modify Shared
+Resources"), and separately, the billable begin/end of a session is exactly the kind of decision
+that should sit under a human's own prompt rather than an agent's judgment about when it's "done
+enough" to justify the next cold ~15-20 minute provision or to stop paying for an idle box. In
+practice: the operator runs `LOGIT_VM_REPO_REF=... [LOGIT_VM_REPO_REFS=...] script/vm up`, hands
+the agent the running VM, and the agent does the measuring -- building extra sources, pushing
+uncommitted work, pulling results, comparing them -- reporting back when it's done so the operator
+can run `script/vm down -y`. `vm_up`'s own closing banner and `AGENTS.md`'s `script/vm` row both
+say this, so it's the documented workflow rather than something rediscovered per session.
+
+### Multiple sources, one VM
+
+The single biggest cost the first real session on this box paid was choreography, not compute:
+every perf question this repo asks is "ref A vs ref B, interleaved, in one sitting"
+(`docs/plans/udp-intake.md`'s baseline/delta protocol), but the tooling gave a session no way to
+build a second binary without inventing one by hand -- build each ref, stash the binary, `docker
+cp` the chosen one into the target volume before each run, checksum to prove the right one landed.
+That choreography nearly produced a wrong number: three source trees extracted around the same
+wall-clock time against one *shared* `CARGO_TARGET_DIR` let cargo's own mtime fingerprinting treat
+the second ref's sources as unchanged, handing back a byte-identical binary under a different
+label -- caught only because the agent compared sha256s by hand.
+
+`script/vm build <source>...` closes this. A **source** is a git ref/SHA (built in the one clone
+`up` already made, checked out in turn -- never several checkouts at once, which is what keeps
+cargo's mtime fingerprinting honest: `git checkout` stamps every file it touches with the current
+time, so a later ref's fingerprint is always newer than an earlier one's build), a directory
+already on the VM's disk, or a tarball (extracted with `tar -xm`, so cargo sees fresh mtimes rather
+than `git archive`'s own commit-time ones). The directory/tarball forms exist because "build the
+ref under review" and "build what's on GitHub" are not the same requirement -- WIP work that was
+never committed or pushed needs measuring too, and `script/vm push` is how it gets onto the VM
+without going through GitHub at all. A directory/tarball source always gets its own
+`CARGO_TARGET_DIR` (never the clone's), since nothing about it is git-driven the way a ref checkout
+is; `LOGIT_VM_TARGET_PER_REF` opts a *ref* build into the same full isolation, at the cost of a
+rebuild per ref, for anyone who wants belt-and-braces over the sequential-checkout argument above.
+Every build lands at `~/logit/perf/bins/<slug>/logit` with a `<slug>/logit.json` sidecar recording
+where it came from, and refuses (unless `--allow-identical`) to finish two sources that hashed to
+the identical binary -- the exact mistake described above, caught automatically instead of by hand.
+`LOGIT_VM_REPO_REFS` lets `up` build extra refs during the operator's own provisioning wait, rather
+than leaving every build for the first `shell` after the hand-off.
+
+`logit-perf run --logit-bin <path>` is the other half: it measures a named binary instead of
+building one, and records that binary's own sha256 (and, from a sidecar, its source ref/commit) in
+the results file -- so a filename no longer reads `unknown` for want of a resolvable commit, and
+`compare` warns outright when two results measured the identical binary. An ordinary run with no
+`--logit-bin` is completely unaffected: the checkout's own `git.sha` still names the file, exactly
+as before this existed.
+
+`script/vm push`/`pull` are thin `scp` wrappers over the same dedicated key and known_hosts file
+every other subcommand uses -- files and tarballs in either direction, `pull` defaulting to
+`perf/results/` landing under `tmp/perf/vm/<timestamp>/` on the host, following the repo's existing
+"perf artifacts never enter the repo" rule.
 
 ### The size, and why 4 vCPUs is 4 cores
 
@@ -292,4 +352,6 @@ set, and every subcommand prints the resolved subscription first.
   regions once fixed. There is no `--no-check-quota` escape hatch, since the bug is what needed
   fixing, not the check itself.
 - **Cost**: ~$0.305/hour running in `westus2` (VM $0.273 + 128 GiB Premium SSD ~$0.027 + the
-  static IP ~$0.005), $0 once `down` completes.
+  static IP ~$0.005), $0 once `down` completes. The first real session (three refs, interleaved
+  pairs, a `read_batch` sweep) ran ~2h08m end to end -- well under a dollar -- which is the answer
+  to "is it worth spinning up" at a glance.

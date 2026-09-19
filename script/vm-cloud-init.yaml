@@ -136,6 +136,10 @@ write_files:
       set -u
       p() { printf '%-16s %s\n' "$1" "$2"; }
       p "captured:"    "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # `@REPO_REF@` as given (a branch, a tag, or a SHA) alongside what it actually resolved to --
+      # read live off the clone rather than stashed at clone time, so re-running this after a
+      # `script/vm build`/manual `git checkout` in ~/logit always reports the truth.
+      p "repo ref:"    "@REPO_REF@ (resolved $(git -C /home/@ADMIN_USER@/logit rev-parse HEAD 2>&1))"
       p "cpu model:"   "$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)"
       p "cpus:"        "$(nproc) online; $(lscpu | sed -n 's/^Thread(s) per core:[[:space:]]*/threads-per-core /p')"
       p "microcode:"   "$(sed -n 's/^microcode[[:space:]]*: //p' /proc/cpuinfo | head -1)"
@@ -215,11 +219,30 @@ runcmd:
   # picked up at login; nothing has logged in yet, so every ssh session after this has it.
   - [ usermod, -aG, docker, "@ADMIN_USER@" ]
 
-  # A full clone, not --depth 1: the whole .git is ~27 MiB, and a measurement session routinely
-  # wants a second ref (`git checkout <branch>`, or two SHAs for `script/perf compare`), neither
-  # of which a shallow clone gives without another fetch. Cloned as the admin user so the checkout
-  # is owned by uid 1000 and no `safe.directory` config is needed.
-  - [ runuser, -u, "@ADMIN_USER@", --, git, clone, --branch, "@REPO_REF@", "@REPO_URL@", "/home/@ADMIN_USER@/logit" ]
+  # A full clone, not --depth 1 and not `--branch`: the whole .git is ~27 MiB, and a measurement
+  # session routinely wants a second ref (`script/vm build`'s own multi-source model, or two SHAs
+  # for `script/perf compare`), neither of which a shallow or single-branch clone gives without
+  # another fetch. Cloned as the admin user so the checkout is owned by uid 1000 and no
+  # `safe.directory` config is needed.
+  - [ runuser, -u, "@ADMIN_USER@", --, git, clone, "@REPO_URL@", "/home/@ADMIN_USER@/logit" ]
+
+  # `@REPO_REF@` is a branch, a tag, or a SHA -- `git clone --branch` (the previous approach) can
+  # only take the first two. Resolved to a concrete commit before checkout for two reasons: a bare
+  # branch name usually has no *local* ref yet (a full, non-`--branch` clone only creates one local
+  # branch -- whichever the remote's HEAD points at -- and leaves every other branch as a
+  # remote-tracking ref under `refs/remotes/origin/`, unreachable by its bare name), and modern git
+  # refuses `checkout --detach <name>` outright when resolving that name would otherwise imply
+  # creating a new tracking branch ("'--detach' cannot be used with '-b/-B/--orphan'") -- verified
+  # against git 2.55. Checking out the resolved SHA directly sidesteps both: `script/vm
+  # build`/`script/vm-build-refs` resolves the same way, for the same reason.
+  - |
+    runuser -u @ADMIN_USER@ -- bash -c '
+      set -e
+      cd /home/@ADMIN_USER@/logit
+      sha="$(git rev-parse --verify "@REPO_REF@^{commit}" 2>/dev/null \
+          || git rev-parse --verify "origin/@REPO_REF@^{commit}")"
+      git checkout --detach --quiet "${sha}"
+    '
 
   - [ bash, -c, "/usr/local/bin/logit-vm-metadata > /home/@ADMIN_USER@/logit-vm-metadata.txt 2>&1" ]
   - [ chown, "@ADMIN_USER@:@ADMIN_USER@", "/home/@ADMIN_USER@/logit-vm-metadata.txt" ]
