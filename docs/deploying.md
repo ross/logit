@@ -455,9 +455,10 @@ is an in-process drain that can afford to wait. `receive:`'s default is `drop_ol
 deliberately the opposite call, for a reason worth understanding rather than just remembering: the
 producer behind a UDP listener is the kernel's socket receive buffer, which *cannot* wait. Setting
 `receive.overflow: block` doesn't prevent loss under sustained overload, it just relocates it from a
-place `logit` can count and report (`logit.component.datagrams.dropped`) to a place it can't see at
-all (the kernel silently discarding into a counter this process never reads). Every mature UDP
-listener in the field — syslog-ng, rsyslog, Telegraf, gostatsd — treats this the same way. Leave
+place `logit` can do something about (`logit.component.datagrams.dropped`, a queue you can size) to
+one it can only report on (`logit.input.kernel.drops`, the kernel discarding datagrams before
+`recv_from` ever sees them). Every mature UDP listener in the field — syslog-ng, rsyslog, Telegraf,
+gostatsd — treats this the same way, and most of them can't even tell you the second number. Leave
 `overflow` at its default unless you have a specific reason to want backpressure to propagate all
 the way back to the sender instead.
 
@@ -490,21 +491,128 @@ the full requested size. The granted value is always gauged
 (`logit.input.receive_buffer.bytes`), even when you never set an override, so you can see the
 kernel default before deciding whether to raise it.
 
+### `read_batch`: how many datagrams one syscall takes
+
+`receive.read_batch` (64 by default) is how many datagrams one `recvmmsg(2)` call may return, and —
+the same number, deliberately — how many the decode half takes off the receive queue at a time. One
+knob, both ends of one queue. `read_batch: 1` is one datagram per syscall, which is what every UDP
+listener here did before
+[ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md).
+
+```yaml
+components:
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+    receive:
+      read_batch: 64             # the default
+```
+
+**Linux only, in effect.** `recvmmsg` is a Linux syscall; on any other target the read loop still
+takes one datagram per `recv_from` and this field is parsed, validated and then ignored, so one
+config file stays portable. (The decode-side batch it also sets applies everywhere.) `logit validate`
+rejects `0` and anything above `1024` — the kernel's own `UIO_MAXIOV` ceiling on a vectored I/O call.
+
+**When raising it is worth anything: watch the mean fill.** Divide `logit.input.datagrams` by
+`logit.input.reads` and you get how many datagrams an average syscall actually returned.
+
+- A fill sitting at (or near) `read_batch` means every read is coming back full — the batch size is
+  the limit, and raising it will take more datagrams per syscall. This is the regime a busy
+  listener fed by many unbuffered clients lands in.
+- A fill near 1 means datagrams are arriving one at a time and there is simply never more than one
+  waiting when the reader asks. Raising `read_batch` cannot help, because the value was never the
+  constraint; lowering it costs nothing either. A listener at a low rate, or one fed by a single
+  buffered client sending large packed datagrams, looks like this.
+
+**What it costs.** The read half holds one buffer per message the syscall may return: a slab of
+`read_batch` × 65,507 bytes per listener (IPv4's largest payload, and what every UDP read buffer
+here has always been sized to), allocated once at startup. At the default that is 4 MiB of
+*address space* and, in practice, a few hundred KiB of real memory — only the pages a datagram is
+actually written into are ever faulted in, so a listener seeing ordinary small statsd or syslog
+datagrams touches one 4 KiB page per slot and no more (`docs/design/memory.md` §5 has the measured
+figures) — but this holds only where transparent huge pages are `madvise`/`never`; under
+`THP=always` a touched page can fault in its whole enclosing 2 MiB huge page, making a much larger
+share of the slab resident (`docs/design/performance.md` §7). The ceiling of 1024 is a ~4 MiB
+resident decision on that traffic, not a 64 MiB one — but it is still 64 MiB of address space per
+listener, and there is rarely a reason to go near it.
+
+**One thing it widens.** A shutdown landing while the reader is handing a batch to a full queue
+drops whatever it was still holding, uncounted — up to `read_batch` datagrams now, rather than
+exactly one. Bounded, and only on the shutdown path.
+
+A `read_batch` larger than `receive.max_datagrams` is legal and behaves the way you would expect: a
+batch that cannot fit is admitted item by item under the configured `overflow` policy, exactly as a
+sequence of single pushes would have been.
+
 ### What to watch
 
+- `logit.input.datagrams` / `logit.input.reads` (counts) — datagrams read off the socket, and the
+  read syscalls that returned them. Their ratio is the mean fill described under `read_batch` above,
+  and it is the only number that says whether that knob is doing anything for this listener.
+- `logit.input.datagrams.truncated` (count, Linux only) — datagrams that arrived longer than the
+  65,507-byte read slot and were delivered only as far as it holds. This can only happen on an
+  **IPv6** listener: 65,507 is IPv4's maximum payload and IPv6 permits 65,527, so the last 20 bytes
+  of a maximum-size IPv6 datagram have nowhere to go. It is not new behaviour — the pre-`recvmmsg`
+  read loop truncated the same datagrams with the same buffer size — only newly *visible*, because
+  `recvmmsg` reports it and `recv_from` never could. Anything but zero here means a sender is
+  emitting datagrams larger than any IPv4 path could carry; fix it at the sender.
 - `logit.component.receive.utilization` (gauge) — the fill ratio of whichever of `max_datagrams`/
   `max_bytes` is closer to tripping. Sustained values near 1.0 mean decode is falling behind the
   socket; under `block`, that's also back-pressuring the sender (or, for a local process, the OS).
 - `logit.component.datagrams.dropped` / `.bytes.dropped` (count, tagged `reason`:
   `overflow_oldest`/`overflow_newest`) — every datagram this listener itself decided to drop. This
-  is *better* news than it sounds: it's the visible, attributable counterpart to a kernel drop you'd
-  otherwise never see at all. A sustained nonzero rate here means the listener is genuinely
-  overloaded relative to how fast downstream is decoding/consuming, and is worth sizing `receive:`
-  or the downstream chain against.
+  is *better* news than it sounds: it's the drop you can size your way out of, by raising
+  `receive.max_datagrams`/`max_bytes` or speeding up what's downstream. A sustained nonzero rate
+  here means the listener is genuinely overloaded relative to how fast downstream is
+  decoding/consuming, and is worth sizing `receive:` or the downstream chain against.
+- `logit.input.kernel.drops` (count) — datagrams the *kernel* threw away before `recv_from` could
+  return them, read from the listening socket itself (Linux only). This is the loss nothing else
+  in the field reports in-process: it's the same number `/proc/net/udp`'s `drops` column shows for
+  this socket, and it is not covered by the queue counter above — the two are separate losses that
+  add up. Any sustained nonzero rate means datagrams are arriving faster than this process takes
+  them off the socket.
+- `logit.input.receive_buffer.utilization` (gauge), with
+  `logit.input.receive_buffer.used.bytes` / `.bytes` behind it — how full the kernel's own socket
+  buffer is, sampled once a second. This is the leading indicator for the counter above: the
+  kernel drops at 1.0, so a value climbing toward it is the warning, and the drops are the event.
+  (A reading a little over 1.0 is normal at saturation, not a bug — the kernel charges an arriving
+  packet before testing the total against the ceiling, so a sample can catch it mid-drop.) **What to do about a high value depends on which way the drops move with it.** If raising
+  `receive.receive_buffer_bytes` (and, if the startup warning names it, `net.core.rmem_max`) makes
+  the drops go away, the traffic was bursty and the buffer was too small for the bursts. If it
+  doesn't — the buffer simply fills up again at its new size — then nothing is wrong with the
+  buffer and the reader is the bottleneck: check `logit.component.receive.utilization` and
+  `receive.latency` below, which say whether decode is what's behind, and size the downstream
+  chain rather than the socket. A bigger buffer absorbs a burst; it cannot absorb a sustained
+  arrival rate faster than this process can read.
+
+  Two footnotes on the numbers, so they aren't misread. The `used.bytes` figure is what the kernel
+  *charges* this socket, not the payload bytes queued: each datagram costs several hundred bytes of
+  packet-structure overhead on top of its own length, so a queue of small statsd datagrams charges
+  far more than their combined size — which is the right accounting, because it's the one the
+  kernel drops against. And `receive_buffer.bytes` is the doubled value Linux reports for a
+  `SO_RCVBUF` request, not what you asked for; the ratio is computed from the kernel's own pair, so
+  it's directly comparable across listeners regardless of what any of them requested.
 - `logit.component.receive.latency` (timing) — arrival-to-dequeue per datagram. Since decode now
   runs on its own loop, this is the number that says whether event timestamps (always receipt time,
   stamped at arrival, never decode time) are still trustworthy under load — a healthy listener keeps
   this small; a climbing value under sustained load means decode is genuinely falling behind.
+
+On a **TCP** listener there is no receive queue and no kernel receive buffer to size (TCP's own
+flow control is the backpressure), but there is an accept queue, and it has the same shape of
+problem:
+
+- `logit.input.accept_queue.depth` / `.limit` / `.utilization` (gauges, Linux only) — connections
+  that have completed their TCP handshake and are waiting for this listener to accept them, the
+  backlog ceiling the kernel enforces, and the first as a fraction of the second. Sampled before
+  each accept and once a second while waiting, so an idle listener still reports. `.limit` is
+  reported on its own so you can see what `listen(2)` actually got after `net.core.somaxconn`
+  clamped it, without having to back it out of the ratio. A depth that is anything but near-zero
+  means connections are arriving faster than they're being accepted; a utilization approaching 1.0
+  means the kernel is about to start refusing new connections outright, which a client sees as a
+  connect timeout or a reset with nothing in `logit`'s own logs to explain it. Sustained pressure
+  here is usually connection churn — senders reconnecting per batch rather than holding one
+  connection open — and is worth fixing at the sender before it's worth raising
+  `net.core.somaxconn`.
 
 ### `collectd_in`: multicast groups and `types_db`
 
@@ -579,7 +687,7 @@ cross-protocol one, `statsd_in` through an `aggregate` window into `graphite_out
   and the queue exists (ADR `decoupled-listener-io`) for a UDP socket's *silent* drops, which a
   stream cannot have — so only `batch_max_events`, `batch_max_bytes`, `batch_flush_interval` and
   `shutdown_grace` apply to it. A queue-bounding field (`max_datagrams`, `max_bytes`, `overflow`,
-  `receive_buffer_bytes`) on a TCP `graphite_in` is a `logit validate` error naming the field, not
+  `receive_buffer_bytes`, `read_batch`) on a TCP `graphite_in` is a `logit validate` error naming the field, not
   a setting that is silently ignored. A stalled TCP `graphite_in` therefore shows up as
   backpressure at the *sender*, which is what you want, rather than as a drop counter here.
 - **`protocol: pickle` requires `transport: tcp`.** Carbon's pickle batch protocol (port 2004) is a
@@ -666,8 +774,8 @@ components:
 - **`receive:` means different halves on the two transports**, exactly as for `graphite_in` above:
   a UDP `statsd_in` takes the whole block; a TCP one has no receive queue at all, so only
   `batch_max_events`, `batch_max_bytes`, `batch_flush_interval` and `shutdown_grace` apply to it
-  (scoped per connection), and a queue-bounding field on one is a `logit validate` error naming the
-  field rather than a silently ignored setting.
+  (scoped per connection), and a queue-bounding field on one — including `read_batch` — is a
+  `logit validate` error naming the field rather than a silently ignored setting.
 - **What to watch.** Under `transport: udp`, the `logit.input.datagrams`/`.datagram.bytes` pair and
   the receive-queue gauges above. Under `transport: tcp`, `logit.input.connections` (a gauge —
   should match the number of senders actually connected),

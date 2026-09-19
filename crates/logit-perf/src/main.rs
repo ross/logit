@@ -11,11 +11,13 @@
 mod attribute;
 mod compare;
 mod flamegraph;
+mod load;
 mod result;
 mod run;
 mod rusage;
 mod scenario;
 mod spool;
+mod telemetry_leg;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -66,6 +68,45 @@ enum Command {
         /// mapping to `target/debug` as cargo itself does).
         #[arg(long, default_value = "release")]
         profile: String,
+        /// The run-time telemetry leg's drain cadence, for real-socket scenarios. Shorter captures
+        /// more of the run before the final drain, at the cost of more work inside the process
+        /// being measured -- the same trade `attribute --interval` makes.
+        #[arg(long, default_value = "1s", value_parser = parse_duration)]
+        interval: Duration,
+        /// Pin the load sender's threads to these CPUs (`3`, `2,4`, `2-5`). Real-socket scenarios
+        /// only. Not optional in practice on a box with heterogeneous cores -- see
+        /// docs/design/performance.md's "Driven scenarios" note.
+        #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
+        pin_sender: Option<load::CpuSet>,
+        /// Pin the spawned `logit` process to these CPUs, applied between `fork` and `exec` so
+        /// every thread it creates inherits the mask. Pick CPUs disjoint from `--pin-sender`.
+        #[arg(long = "pin-child", value_parser = parse_cpu_list)]
+        pin_child: Option<load::CpuSet>,
+        /// Hold every real-socket scenario to the strict expectation -- zero drops, and an
+        /// exactly-equal delivered event count -- instead of only checking that the datagram
+        /// accounting closes. A spec with no `rate` at all is rejected rather than asked to be
+        /// lossless.
+        ///
+        /// Implies `--rate-scale 0.25`, since a shipped spec is paced deliberately *above* what
+        /// the receiver sustains. An explicit `--rate-scale` overrides **that derate only**, never
+        /// the exactness assertion -- so `--verify --rate-scale 1.0` asks "is this spec's own rate
+        /// loss-free?" and is expected to fail whenever anything drops. That is the point of it,
+        /// not a misuse.
+        #[arg(long)]
+        verify: bool,
+        /// Multiply every real-socket spec's `rate` by this factor. The shipped rates sit just
+        /// above the drop knee, which is what a baseline wants and what reading a stable CPU
+        /// µs/event does not -- `--rate-scale 0.5` moves the operating point without editing any
+        /// spec. Recorded in the results file, and `compare` warns when two runs used different
+        /// ones, because they are different points on the load curve rather than a before and
+        /// after.
+        ///
+        /// Given alongside `--verify` it replaces that flag's own 0.25 derate but leaves its
+        /// exact-delivery assertion in place, which is how one asks whether a particular rate is
+        /// loss-free: `--verify --rate-scale 1.0` holds the spec's shipped rate to zero drops, and
+        /// fails if it drops anything.
+        #[arg(long = "rate-scale")]
+        rate_scale: Option<f64>,
     },
     /// Diff two results files' medians and exit non-zero on a regression past `--threshold`.
     Compare {
@@ -79,7 +120,8 @@ enum Command {
         #[arg(long = "rss-threshold")]
         rss_threshold: Option<f64>,
     },
-    /// List discovered scenarios with their `count` and whether they need SIGTERM to stop.
+    /// List discovered scenarios: how each one is loaded (an in-process `generate_in` or a real
+    /// socket), the size of that load, and whether it needs SIGTERM to stop.
     List,
     /// Run one scenario with a temporary `internal` telemetry leg attached, then decode the dump
     /// into a per-node breakdown of where its time went.
@@ -104,6 +146,13 @@ enum Command {
         no_build: bool,
         #[arg(long, default_value = "release")]
         profile: String,
+        /// Pin the load sender's threads to these CPUs -- real-socket scenarios only, ignored by a
+        /// generator-driven one, which has no sender of its own.
+        #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
+        pin_sender: Option<load::CpuSet>,
+        /// Pin the spawned `logit` process to these CPUs.
+        #[arg(long = "pin-child", value_parser = parse_cpu_list)]
+        pin_child: Option<load::CpuSet>,
     },
     /// Profile one scenario with `perf record` and render the capture as a flamegraph SVG. Needs
     /// the profiling image (`script/perf flamegraph ...`), which is where `perf`/`inferno` live.
@@ -125,6 +174,12 @@ enum Command {
         /// Skip the `cargo build --profile profiling` step -- use an already-built binary as is.
         #[arg(long)]
         no_build: bool,
+        /// Pin the load sender's threads to these CPUs -- real-socket scenarios only.
+        #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
+        pin_sender: Option<load::CpuSet>,
+        /// Pin the profiled process to these CPUs.
+        #[arg(long = "pin-child", value_parser = parse_cpu_list)]
+        pin_child: Option<load::CpuSet>,
     },
 }
 
@@ -141,6 +196,11 @@ fn main() {
             shutdown_timeout,
             no_build,
             profile,
+            interval,
+            pin_sender,
+            pin_child,
+            verify,
+            rate_scale,
         } => run::run(
             &repo_root(),
             run::RunArgs {
@@ -152,6 +212,11 @@ fn main() {
                 shutdown_timeout,
                 no_build,
                 profile,
+                interval,
+                pin_sender,
+                pin_child,
+                verify,
+                rate_scale,
             },
         ),
         Command::Compare { before, after, threshold, rss_threshold } => {
@@ -166,6 +231,8 @@ fn main() {
             shutdown_timeout,
             no_build,
             profile,
+            pin_sender,
+            pin_child,
         } => attribute::attribute(
             &repo_root(),
             attribute::AttributeArgs {
@@ -176,6 +243,8 @@ fn main() {
                 shutdown_timeout,
                 no_build,
                 profile,
+                pin_sender,
+                pin_child,
             },
         ),
         Command::Flamegraph {
@@ -186,6 +255,8 @@ fn main() {
             timeout,
             shutdown_timeout,
             no_build,
+            pin_sender,
+            pin_child,
         } => flamegraph::flamegraph(
             &repo_root(),
             flamegraph::FlamegraphArgs {
@@ -196,6 +267,8 @@ fn main() {
                 timeout,
                 shutdown_timeout,
                 no_build,
+                pin_sender,
+                pin_child,
             },
         ),
     };
@@ -212,16 +285,25 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
         println!("no scenarios found under perf/scenarios/");
         return Ok(());
     }
-    println!("{:<22} {:>12} {:>14}", "scenario", "count", "shutdown");
+    println!("{:<22} {:<12} {:>22} {:>14}", "scenario", "load", "workload", "shutdown");
     for scenario in &scenarios {
         println!(
-            "{:<22} {:>12} {:>14}",
+            "{:<22} {:<12} {:>22} {:>14}",
             scenario.name,
-            scenario.count,
+            if scenario.workload.is_driven() { "real socket" } else { "generate_in" },
+            scenario.workload.describe(),
             if scenario.needs_sigterm { "SIGTERM" } else { "self-exits" },
         );
     }
     Ok(())
+}
+
+/// `--pin-sender`/`--pin-child`'s parser. `clap`'s `value_parser` wants a `String` error, while
+/// [`load::CpuSet::parse`] reports an `anyhow::Error` like everything else in this crate --
+/// rendered here with `{:#}` so the whole chain (which part of the list, and why) reaches the user
+/// rather than only its outermost sentence.
+fn parse_cpu_list(list: &str) -> Result<load::CpuSet, String> {
+    load::CpuSet::parse(list).map_err(|err| format!("{err:#}"))
 }
 
 fn read_report(path: &Path) -> anyhow::Result<result::RunReport> {
@@ -265,17 +347,25 @@ fn run_compare(
         eprintln!("warning: {warning}");
     }
 
-    println!("\n{:<22} {:>12} {:>12} {:>12}", "scenario", "events/s", "us/event", "peak RSS");
+    println!(
+        "\n{:<22} {:>12} {:>12} {:>12} {:>14}",
+        "scenario", "events/s", "us/event", "peak RSS", "drop rate"
+    );
     for scenario in &report.scenarios {
         match &scenario.deltas {
             Some(deltas) => {
                 let regressed = deltas.is_regression(threshold, rss_threshold);
                 println!(
-                    "{:<22} {:>+11.1}% {:>+11.1}% {:>+11.1}%{}",
+                    "{:<22} {:>+11.1}% {:>+11.1}% {:>+11.1}% {:>14}{}",
                     scenario.name,
                     deltas.events_per_s_pct,
                     deltas.cpu_us_per_event_pct,
                     deltas.max_rss_bytes_pct,
+                    // Percentage *points*, and never gated -- `Deltas::drop_rate_points` has why.
+                    deltas
+                        .drop_rate_points
+                        .map(|points| format!("{points:+.2} pts"))
+                        .unwrap_or_else(|| "-".to_string()),
                     if regressed { "  REGRESSED" } else { "" },
                 );
                 // Warned, never gated (`Deltas::startup_regressed`'s own doc has why): startup is

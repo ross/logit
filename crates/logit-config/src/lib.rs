@@ -2840,6 +2840,33 @@ pub struct ReceiveConfig {
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
+    /// Datagrams one `recvmmsg(2)` call may return, and -- the same number, deliberately -- how
+    /// many the decode half takes off the receive queue per `pop_many`. One knob for both ends of
+    /// one queue (`docs/adr/udp-intake-batching-and-socket-visibility.md`); `1` is one datagram
+    /// per syscall, the behaviour before that ADR.
+    ///
+    /// **Linux only, in effect.** `recvmmsg` is a Linux syscall; every other target keeps the
+    /// one-`recv_from`-per-datagram read loop and ignores this field, which still parses and
+    /// validates everywhere so one config file stays portable across targets. The decode-side pop
+    /// batch it also sets is not platform-specific and applies everywhere.
+    ///
+    /// **What it costs.** The read half owns one slab of `read_batch` x 65,507-byte slots (IPv4's
+    /// largest payload, and the size every UDP read buffer in this codebase has always been) per
+    /// listener -- 4 MiB of *address space* at the default 64,
+    /// 64 MiB at the 1024 ceiling. Only the pages a datagram is actually written into are ever
+    /// faulted in, so the resident cost tracks the traffic's real datagram sizes rather than the
+    /// slab's virtual size (`docs/design/memory.md` has the measured figures).
+    ///
+    /// **What it widens.** A shutdown landing mid-push drops whatever the read half was holding,
+    /// uncounted -- up to `read_batch` datagrams now rather than exactly one. Bounded, and on the
+    /// shutdown path only.
+    ///
+    /// `0` is rejected (graph rule 18 -- no datagram could ever be read); above `1024` is rejected
+    /// (graph rule 57 -- `UIO_MAXIOV`, the kernel's own ceiling on how many `iovec`s one vectored
+    /// I/O call may carry). A `read_batch` **larger than `max_datagrams`** is deliberately legal
+    /// and needs no rule: a batch that cannot fit in the whole queue is admitted item by item under
+    /// the configured `overflow` policy, exactly as a sequence of single pushes would have been.
+    pub read_batch: usize,
 }
 
 /// Defaults, justified against established UDP listeners' own tuning figures -- see
@@ -2856,9 +2883,33 @@ impl Default for ReceiveConfig {
             batch_flush_interval: Duration::from_millis(100),
             receive_buffer_bytes: None,
             shutdown_grace: Duration::from_secs(5),
+            read_batch: default_read_batch(),
         }
     }
 }
+
+/// `receive.read_batch`'s default, as a function so graph rule 57 compares against the same value
+/// this struct is built from rather than a second copy of the number -- the shape rule 45 already
+/// uses for `default_handshake_timeout`.
+///
+/// **64.** Telegraf's UDP reader, rsyslog's `imudp` (`batchSize: 128` in its own high-throughput
+/// reference config) and gostatsd (`--receive-batch-size`, default 50) all default their
+/// batch-equivalent knob in this range, and `docs/adr/udp-intake-batching-and-socket-visibility.md`
+/// carries the sweep that measured it against this codebase's own decode and queue costs.
+pub const fn default_read_batch() -> usize {
+    64
+}
+
+/// The ceiling graph rule 57 enforces on `receive.read_batch`: `UIO_MAXIOV`, the kernel's own hard
+/// limit on how many `iovec`s a single vectored I/O call may carry, and so on `recvmmsg`'s `vlen`.
+/// A larger value would be clamped or refused by the kernel depending on call path; rejecting it at
+/// validation time turns that into a config error with a name attached.
+///
+/// `pub` for the same reason [`default_handshake_timeout`] is: `logit_pipeline::graph` needs the
+/// number and already depends on this crate, so it imports it rather than keeping a second copy.
+/// (`logit_inputs::udp::MAX_READ_BATCH` *is* a second copy, unavoidably -- `logit-inputs` does not
+/// depend on `logit-config` by design.)
+pub const MAX_READ_BATCH: usize = 1024;
 
 /// A human-readable byte-size codec (`134217728`, `64MiB`, `128KiB`, `1GiB`) for `BufferConfig::
 /// max_bytes`, mirroring `humantime_serde_duration`'s shape below -- hand-rolled rather than a new

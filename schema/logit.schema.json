@@ -2099,6 +2099,7 @@
             "max_bytes": "33554432",
             "max_datagrams": 10000,
             "overflow": "drop_oldest",
+            "read_batch": 64,
             "receive_buffer_bytes": null,
             "shutdown_grace": "5s"
           },
@@ -2536,6 +2537,13 @@
               "$ref": "#/definitions/OverflowPolicy"
             }
           ]
+        },
+        "read_batch": {
+          "description": "Datagrams one `recvmmsg(2)` call may return, and -- the same number, deliberately -- how many the decode half takes off the receive queue per `pop_many`. One knob for both ends of one queue (`docs/adr/udp-intake-batching-and-socket-visibility.md`); `1` is one datagram per syscall, the behaviour before that ADR.\n\n**Linux only, in effect.** `recvmmsg` is a Linux syscall; every other target keeps the one-`recv_from`-per-datagram read loop and ignores this field, which still parses and validates everywhere so one config file stays portable across targets. The decode-side pop batch it also sets is not platform-specific and applies everywhere.\n\n**What it costs.** The read half owns one slab of `read_batch` x 65,507-byte slots (IPv4's largest payload, and the size every UDP read buffer in this codebase has always been) per listener -- 4 MiB of *address space* at the default 64, 64 MiB at the 1024 ceiling. Only the pages a datagram is actually written into are ever faulted in, so the resident cost tracks the traffic's real datagram sizes rather than the slab's virtual size (`docs/design/memory.md` has the measured figures).\n\n**What it widens.** A shutdown landing mid-push drops whatever the read half was holding, uncounted -- up to `read_batch` datagrams now rather than exactly one. Bounded, and on the shutdown path only.\n\n`0` is rejected (graph rule 18 -- no datagram could ever be read); above `1024` is rejected (graph rule 57 -- `UIO_MAXIOV`, the kernel's own ceiling on how many `iovec`s one vectored I/O call may carry). A `read_batch` **larger than `max_datagrams`** is deliberately legal and needs no rule: a batch that cannot fit in the whole queue is admitted item by item under the configured `overflow` policy, exactly as a sequence of single pushes would have been.",
+          "default": 64,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
         },
         "receive_buffer_bytes": {
           "description": "`SO_RCVBUF`, requested at bind. `None` -- the default -- leaves the kernel default alone: a nonzero default here would exceed most stock kernels' `net.core.rmem_max` (212992 B) and warn on every first run, training operators to ignore the one warning that matters.",

@@ -96,6 +96,7 @@
 use crate::Input;
 use bytes::{Bytes, BytesMut};
 use logit_core::{Diagnostics, Event, EventBatch, Telemetry};
+use logit_pipeline::sockstat;
 use logit_pipeline::{BatchAccumulator, Fanout, FlushReason};
 use logit_proto::Decoder;
 use std::path::Path;
@@ -708,6 +709,142 @@ fn strip_cr(line: Bytes) -> Bytes {
     }
 }
 
+// ---- the kernel's accept queue -----------------------------------------------------------------
+
+/// How often [`AcceptQueueSampler::accept`] re-reads the accept queue while waiting for a
+/// connection. The same one-second cadence [`crate::udp`]'s receive-buffer sampler uses, and for
+/// the same reason: frequent enough to be a usable gauge, cheap enough (one `getsockopt` per
+/// listener per second) not to need a config knob.
+const ACCEPT_QUEUE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Gauges the kernel's accept queue for one listening socket -- how many completed connections are
+/// waiting for an `accept()` right now, against the backlog ceiling at which the kernel starts
+/// refusing them.
+///
+/// **Why an accept loop cannot see this for itself.** A listener that is keeping up accepts each
+/// connection the moment it appears, so nothing it can observe from inside the loop distinguishes
+/// "no traffic" from "so far behind that the kernel is dropping SYNs." The queue depth is the only
+/// number that does, and it lives solely in the kernel
+/// ([`logit_pipeline::sockstat::listen_queue`]).
+///
+/// **Sampled before each accept *and* on a fixed interval.** Before each accept, because that is
+/// the instant that matters -- the depth just before this loop takes one off the queue is what a
+/// backlog is actually made of. On an interval as well, because a listener blocked in `accept()`
+/// with a growing queue would otherwise report nothing at all: the accept-time sample only fires
+/// when a connection is *taken*, which is exactly what is not happening when the loop is starved
+/// of runtime or stuck. So [`Self::accept`] does both, in one place, and every caller gets both by
+/// calling it instead of `listener.accept()`.
+///
+/// Like `crate::udp`'s receive-buffer sampler, this disables itself for good after one failed read
+/// and says so once: `TCP_INFO`'s listener aliasing either works on a socket or never will.
+pub(crate) struct AcceptQueueSampler {
+    /// The listening socket's descriptor, captured once. `None` only on a platform with no raw
+    /// descriptors. Held as a bare fd rather than a borrow because every caller passes the same
+    /// listener back into [`Self::accept`] anyway, and that listener outlives this sampler.
+    fd: Option<sockstat::RawFd>,
+    telemetry: Telemetry,
+    diag: Diagnostics,
+    enabled: bool,
+}
+
+impl AcceptQueueSampler {
+    pub(crate) fn new(
+        listener: &TokioTcpListener,
+        telemetry: Telemetry,
+        diag: Diagnostics,
+    ) -> Self {
+        Self { fd: sockstat::fd_of(listener), telemetry, diag, enabled: true }
+    }
+
+    /// Accepts the next connection on `listener`, gauging the accept queue before the attempt and
+    /// once per [`ACCEPT_QUEUE_SAMPLE_INTERVAL`] for as long as the wait lasts.
+    ///
+    /// **Once the sampler has disabled itself, no timer is armed at all** and this is exactly
+    /// `listener.accept()`. That is the other half of "report once and stop asking": a listener on
+    /// a non-Linux build (or a kernel without the counters) would otherwise wake once a second,
+    /// forever, to call a function that returns immediately -- a cost this PR would have added to
+    /// every idle listener on those platforms in exchange for nothing.
+    ///
+    /// **Cancellation-safe**, which two of the four call sites depend on: `TcpListener::accept` is
+    /// itself cancellation-safe (it takes nothing off the queue unless it returns a connection)
+    /// and `sleep` holds no state worth keeping, so dropping this future -- which is what happens
+    /// every time a caller's `select!` loses this arm to `shutdown` -- loses at most one sample.
+    pub(crate) async fn accept(
+        &mut self,
+        listener: &TokioTcpListener,
+    ) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+        loop {
+            self.sample_once();
+            if !self.enabled {
+                return listener.accept().await;
+            }
+            // Timer arm first, matching `crate::udp::sample_while` -- read that function's doc for
+            // the mechanism, because the reason this ordering is *needed* there does not apply
+            // here, and it is worth being clear about which this is.
+            //
+            // There, the work arm is one long-lived `read_loop` future that never returns between
+            // samples, so an arm placed behind it is silenced for the whole duration of an
+            // overload by tokio's cooperative-scheduling budget. Here the loop returns to
+            // `sample_once` on *every* accepted connection, and `sample_once` runs synchronously
+            // at the top of the iteration -- so a backed-up accept queue, which yields a
+            // connection per poll, is sampled per connection whether or not the timer ever fires,
+            // and an idle listener's `accept()` returns a genuine park with budget to spare, so
+            // the timer fires normally. Either ordering is correct for this loop today.
+            //
+            // It is timer-first anyway, for uniformity: one rule ("the timer arm goes first in
+            // both samplers") is one thing for a future edit to preserve, where two orderings with
+            // two different justifications is an invitation to copy the wrong one. The cost is a
+            // due tick being taken ahead of a connection that was ready in the same poll -- one
+            // extra loop iteration, at most once per `ACCEPT_QUEUE_SAMPLE_INTERVAL`, and it cannot
+            // lose the connection: `accept()` takes nothing off the queue unless it returns one.
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep(ACCEPT_QUEUE_SAMPLE_INTERVAL) => {}
+                accepted = listener.accept() => return accepted,
+            }
+        }
+    }
+
+    /// One `getsockopt`, and the three gauges it feeds.
+    ///
+    /// `logit.input.accept_queue.limit` is re-emitted on every sample although the backlog does not
+    /// change after `listen(2)`, for the same reason `crate::udp`'s sampler re-emits
+    /// `receive_buffer.bytes`: `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s its
+    /// point map, so a value written once would appear in one `internal` drain window and then
+    /// vanish. It is reported as its own gauge rather than left implicit in the ratio because an
+    /// operator deciding whether to raise `net.core.somaxconn` (or the listener's own backlog)
+    /// needs the ceiling itself, and backing it out of `depth / utilization` is both arithmetic
+    /// nobody should have to do and undefined at the depth of 0 an idle listener always reports.
+    ///
+    /// `logit.input.accept_queue.utilization` is skipped when the kernel reports a backlog of 0
+    /// (nothing does for a real listener, but the division is not this function's to guess at), so
+    /// the gauge's presence is itself the evidence that a ceiling was read.
+    fn sample_once(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let queue = self.fd.and_then(sockstat::listen_queue);
+        let Some((depth, backlog)) = queue else {
+            self.enabled = false;
+            self.diag.warn(format_args!(
+                "the kernel's accept-queue depth is not available for this listener -- \
+                 TCP_INFO's listener fields are Linux-only; logit.input.accept_queue.depth, \
+                 .limit and .utilization will not be reported"
+            ));
+            return;
+        };
+        self.telemetry.gauge("logit.input.accept_queue.depth", f64::from(depth), &[]);
+        self.telemetry.gauge("logit.input.accept_queue.limit", f64::from(backlog), &[]);
+        if backlog > 0 {
+            self.telemetry.gauge(
+                "logit.input.accept_queue.utilization",
+                f64::from(depth) / f64::from(backlog),
+                &[],
+            );
+        }
+    }
+}
+
 // ---- the listener ----------------------------------------------------------------------------
 
 /// [`TcpListener`]'s runtime knobs -- [`crate::udp::UdpListenerConfig`] minus every queue field
@@ -957,9 +1094,16 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         // All three of this listener's diagnostic keys (`connection_error`, `framing_error`,
         // `bad_frame`) throttle listener-wide through the per-connection `Diagnostics` clone
         // below: a clone shares its original's counts -- see `logit_core::Diagnostics`' type doc.
+        //
+        // `accept_queue.accept(&listener)` in place of a bare `listener.accept()`: same future,
+        // same cancellation safety against the `shutdown` arm below, plus the kernel accept-queue
+        // gauges -- see `AcceptQueueSampler`'s own doc for why this loop cannot observe them
+        // itself and why an interval sample is needed alongside the per-accept one.
+        let mut accept_queue =
+            AcceptQueueSampler::new(&listener, self.telemetry.clone(), self.diag.clone());
         loop {
             let (stream, _peer) = tokio::select! {
-                accepted = listener.accept() => accepted?,
+                accepted = accept_queue.accept(&listener) => accepted?,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
             };
 
@@ -2047,6 +2191,17 @@ mod tests {
         })
     }
 
+    /// The single value of gauge `name`, or `None` if it was never recorded -- a gauge is
+    /// last-write-wins per drain, so there is at most one point per name.
+    fn gauge_of(events: &[Event], name: &str) -> Option<f64> {
+        events.iter().find_map(|e| {
+            e.metrics.iter().find_map(|m| match m.kind {
+                MetricKind::Gauge(v) if logit_core::interner::resolve(m.name) == name => Some(v),
+                _ => None,
+            })
+        })
+    }
+
     fn testdata_dir() -> std::path::PathBuf {
         // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
         // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`,
@@ -3086,5 +3241,101 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    // ---- the kernel's accept queue (`AcceptQueueSampler`) --------------------------------------
+
+    /// The accept-queue gauges show up for an ordinary running listener, with no configuration and
+    /// nothing protocol-specific -- which is what makes them free for every stream input sharing
+    /// this driver.
+    ///
+    /// Synchronized on a delivered frame rather than on a sleep: the sampler reads the queue
+    /// *before* each accept, so a connection whose first frame has come all the way through
+    /// proves the accept before it happened, and therefore that the sample before *that* has
+    /// already been recorded.
+    ///
+    /// `.utilization` being present is itself the assertion that the kernel reported a nonzero
+    /// backlog -- [`AcceptQueueSampler::sample_once`] skips the gauge when the ceiling is 0, so
+    /// there is no way for it to appear off a listener with no backlog.
+    /// `logit_pipeline::sockstat`'s own tests pin the underlying `(depth, backlog)` pair directly.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_kernel_accept_queue_gauges_are_reported_for_a_running_listener() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let mut listener = listener.with_telemetry(telemetry);
+        let (sink, mut rx) = fanout_into_channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut client = connect(&addr).await;
+        client.write_all(b"<13>hello\n").await.unwrap();
+        assert_eq!(payloads(&recv_batch(&mut rx).await), vec!["<13>hello"]);
+
+        let events = registry.drain(0);
+        let depth = gauge_of(&events, "logit.input.accept_queue.depth")
+            .expect("the accept-queue depth should be gauged before each accept");
+        let limit = gauge_of(&events, "logit.input.accept_queue.limit")
+            .expect("the backlog ceiling should be gauged in its own right, not left implicit");
+        let utilization = gauge_of(&events, "logit.input.accept_queue.utilization")
+            .expect("the utilization gauge's presence means the kernel reported a real backlog");
+        assert!(depth >= 0.0, "a queue depth is never negative, got {depth}");
+        assert!(limit > 0.0, "a listening socket always has a backlog ceiling, got {limit}");
+        assert!(
+            (0.0..=1.0).contains(&utilization),
+            "utilization is depth/backlog, so it lives in [0, 1], got {utilization}"
+        );
+        assert!(
+            (utilization - depth / limit).abs() < 1e-9,
+            "the three must be consistent: utilization is exactly depth/limit"
+        );
+
+        handle.abort();
+    }
+
+    /// A sampler with nothing to read latches itself off on its very first call -- the state
+    /// [`AcceptQueueSampler::accept`] checks before arming its interval timer, and the reason a
+    /// listener on a platform without `TCP_INFO`'s listener fields goes back to parking in
+    /// `accept()` instead of waking once a second forever.
+    #[tokio::test]
+    async fn an_accept_queue_sampler_that_cannot_read_the_queue_disables_itself() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
+        let mut sampler =
+            AcceptQueueSampler::new(&listener, Telemetry::default(), Diagnostics::default());
+        // The non-Linux shape: `sockstat::fd_of` has no descriptor to hand back.
+        sampler.fd = None;
+
+        assert!(sampler.enabled, "a fresh sampler always tries once");
+        sampler.sample_once();
+        assert!(!sampler.enabled, "one failed read is enough -- these fields never appear later");
+        sampler.sample_once(); // still a harmless no-op
+        assert!(!sampler.enabled);
+    }
+
+    /// The disabled path end to end: with no timer armed at all, `accept()` is exactly
+    /// `listener.accept()`, and must still hand back the connection and record nothing -- the shape
+    /// every non-Linux build runs, and one no Linux CI run would otherwise exercise.
+    #[tokio::test]
+    async fn a_disabled_accept_queue_sampler_still_accepts_and_records_nothing() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
+        let addr = listener.local_addr().expect("a bound listener has an address");
+        let mut sampler = AcceptQueueSampler::new(&listener, telemetry, Diagnostics::default());
+        sampler.fd = None;
+
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (_accepted, _peer) = sampler
+            .accept(&listener)
+            .await
+            .expect("a disabled sampler must still accept exactly as a bare accept() would");
+        client.await.expect("the connect task should not panic").expect("connect should succeed");
+
+        let events = registry.drain(0);
+        assert_eq!(gauge_of(&events, "logit.input.accept_queue.depth"), None);
+        assert_eq!(gauge_of(&events, "logit.input.accept_queue.limit"), None);
+        assert_eq!(gauge_of(&events, "logit.input.accept_queue.utilization"), None);
     }
 }

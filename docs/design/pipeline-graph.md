@@ -308,15 +308,20 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     failure rule 14 guards against on the sink side. A tail listener has no receive *queue* at all (the tailed
     file is its own durable buffer) — only `receive.batch_max_events`, `batch_max_bytes`,
     `batch_flush_interval`, and `shutdown_grace` are meaningful on one; a queue-bounding field
-    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name. A
+    (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`), or `read_batch` — which
+    sizes one `recvmmsg(2)` read and the matching `pop_many` off that same queue
+    ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md))
+    — is rejected by name. A
     stream listener has no receive queue either, for a different reason — the TCP connection's own
     flow control *is* the backpressure, so a blocked `Fanout::send` just stops the socket being
-    read and the peer's window closes — so the same four queue fields are rejected by name on one,
+    read and the peer's window closes — so the same five queue fields are rejected by name on one,
     with a message that says so, and the same four batch/shutdown fields apply, scoped **per
     connection** rather than per listener (N live connections can hold up to N ×
     `batch_max_events` in flight).
-18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, or `receive.batch_max_events`
-    of `0` is rejected — the twin of rule 15. `receive.batch_flush_interval: 0s` is **not**
+18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes`, `receive.read_batch`, or
+    `receive.batch_max_events`
+    of `0` is rejected — the twin of rule 15. (`read_batch: 0` is `recvmmsg`'s `vlen` of zero, which
+    reads nothing, forever; rule 57 owns its upper end.) `receive.batch_flush_interval: 0s` is **not**
     rejected — it means "no flush timer," a meaningful setting, unlike the count bounds. A tail or
     stream listener's `receive.batch_max_events`/`batch_max_bytes` of `0` is rejected the same way
     (the queue-only bounds don't apply to either at all — see rule 17).
@@ -693,6 +698,18 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `endpoint_tls:` under a plain `http://` endpoint is rejected — a *scheme* check, exactly rule
     40's third TLS check, since TLS is selected by the endpoint's own scheme and a block under
     `http://` could only ever be ignored.
+57. A datagram listener's `receive.read_batch` above `1024` is rejected
+    ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
+    `read_batch` is `recvmmsg(2)`'s `vlen`, and `1024` is `UIO_MAXIOV`, the kernel's own hard
+    ceiling on how many `iovec`s any one vectored I/O call may carry — above it the kernel clamps
+    or refuses depending on call path, which is a runtime surprise whose cause is nowhere near the
+    config that set it. Rule 18 owns the `0` end, the same split those two rules already have for
+    `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
+    **legal**: `push_many` has a defined answer for a batch bigger than the whole queue (evict or
+    block per policy, per item, exactly as a sequence of single `push` calls would have), so a rule
+    against it would only refuse a configuration that works. Datagram listeners only — rule 17 has
+    already rejected a non-default `read_batch` on every other kind, so anything reaching this
+    check carries the default and cannot fail it.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
@@ -1045,6 +1062,15 @@ unremarkable; only `logit-pipeline` itself is barred from depending on the impl 
   that *uses* them (`logit-inputs::udp::UdpListener`) stay in `logit-inputs`, following the same
   "traits and generic machinery here, concrete protocol impls there" split the crate already
   applies everywhere else.
+- Owns `sockstat` (`docs/adr/udp-intake-batching-and-socket-visibility.md`) on the same line: a
+  `getsockopt`-level *reading* of a file descriptor the caller already holds — the kernel's
+  per-socket drop counter and receive-buffer fill (`SO_MEMINFO`), a listening socket's accept-queue
+  depth (`TCP_INFO`) — with no notion of a listener, a datagram or a node. It is here rather than in
+  `logit-inputs` because `logit-outputs` is the foreseeable second consumer and must not depend on
+  an input crate, and rather than in `logit-core` because that crate's "no I/O" boundary (two
+  bullets up) is exactly what a raw syscall and a `libc` dependency would have broken; this crate
+  already does real I/O (`disk_queue.rs`) without claiming otherwise. Everything that *operates* a
+  socket — binding it, sizing it, reading from it — still stays in `logit-inputs`.
 
 `graph.rs` (resolution + the validation rules + topo-sort) is a **pure function over
 `Config`** — no channels, no threads, no tokio — mirroring how `apply_transforms` in today's

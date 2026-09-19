@@ -1,0 +1,17 @@
+# Load spec for `perf/scenarios/udp-statsd-packed.yaml` -- **every datagram packed to <=1432 B**,
+# DogStatsD's own UDP default and the decode-bound end of the packing axis. Same `model:` as the
+# other two specs; only `datagram_mix:` differs.
+target: statsd
+datagrams: 800000
+sockets: 8
+threads: 2
+seed: 20260918
+ring_datagrams: 8191
+model: statsd-app.yaml
+
+# ~13.5 lines per datagram, so 116,000 datagrams/s is ~1.6M metrics/s offered -- the same
+# small-overload regime the other two specs sit in, reached with far fewer, far larger datagrams.
+rate: 116000
+
+datagram_mix:
+  - { weight: 1, max_bytes: 1432 }

@@ -1,0 +1,24 @@
+# Load spec for `perf/scenarios/udp-statsd-small.yaml` -- **one line per datagram**, the
+# syscall-bound worst case. Same `model:` as the other two specs; only `datagram_mix:` differs.
+#
+# `ring_datagrams` is four times the other specs' because a single-line ring holds one line per
+# datagram rather than a dozen: 8191 would give the lowest-weighted template only ~80 renders,
+# too few for its `{seq%N}` moduli to come round. 32749 (prime, so it never falls into step with
+# `sockets`, `threads` or the 64-datagram send batch) gives every template enough turns for the
+# model's cardinality to actually be realised.
+target: statsd
+datagrams: 5000000
+sockets: 8
+threads: 2
+seed: 20260918
+ring_datagrams: 32749
+model: statsd-app.yaml
+
+# One line per datagram, so this is the metrics/s figure too -- and less than half what either
+# packed spec manages, which is exactly this scenario's point: the per-datagram fixed cost dominates
+# a payload this small. Paced a few percent above what the receiver sustains, for a small non-zero
+# kernel drop rate at baseline (perf/load/README.md's "Tuning").
+rate: 760000
+
+datagram_mix:
+  - { weight: 1, single: true }

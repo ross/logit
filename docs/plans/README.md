@@ -9,6 +9,7 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-09-18 |
 | [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |
 | [Enabling plan: `docker_in` live container identity and a minimal `inotify` watch set](docker-container-identity.md) | 2026-09-17 | 2026-09-17 |
 | [Enabling plan: `Transform::process` in place — `&mut Event -> bool`](in-place-transform-process.md) | 2026-09-17 | 2026-09-17 |
@@ -17,11 +18,11 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 | [Enabling plan: TLS and TCP ingress for `syslog_in`/`syslog_out`](syslog-tls.md) | 2026-09-13 | 2026-09-14 |
 | [Enabling plan: `target` components and routers](target-components.md) | 2026-09-13 | 2026-09-13 |
 | [Enabling plan: `graphite_in`/`graphite_out` — a lossless Graphite/Carbon relay](graphite-carbon-relay.md) | 2026-09-13 | 2026-09-13 |
-| [Enabling plan: a load-test harness for the real `logit` binary](load-test-harness.md) | 2026-09-12 | 2026-09-13 |
+| [Enabling plan: a load-test harness for the real `logit` binary](load-test-harness.md) | 2026-09-12 | 2026-09-18 |
 | [Enabling plan: `collectd_in`/`collectd_out` — a lossless collectd binary-protocol relay](collectd-binary-relay.md) | 2026-09-12 | 2026-09-12 |
 | [Enabling plan: Prometheus scrape ingestion and exposition](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-09-12 |
 | [Closing plan: lossless like-protocol transit](lossless-transit.md) | 2026-09-10 | 2026-09-12 |
-| [Recorded interop fixtures: real producers, captured once, replayed as tests forever](recorded-interop-fixtures.md) | 2026-09-10 | 2026-09-12 |
+| [Recorded interop fixtures: real producers, captured once, replayed as tests forever](recorded-interop-fixtures.md) | 2026-09-10 | 2026-09-18 |
 | [Enabling plan: `logit_out`/`logit_in` — the native transport](native-transport.md) | 2026-09-09 | 2026-09-09 |
 | [Closing plan: durable, disk-backed sink buffering](durable-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
 | [Enabling plan: operator surface — readiness/liveness, leveled structured self-logging, internal logs](operator-surface.md) | 2026-09-09 | 2026-09-09 |

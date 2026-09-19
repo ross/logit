@@ -271,10 +271,18 @@ impl Input for LogitInput {
         let max_frame_bytes = self.max_frame_bytes;
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
+        // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented -- same future,
+        // same cancellation safety against the `shutdown` arm below (see `AcceptQueueSampler::
+        // accept`'s own doc), plus `logit.input.accept_queue.depth`/`.utilization`.
+        let mut accept_queue = crate::tcp::AcceptQueueSampler::new(
+            &listener,
+            self.telemetry.clone(),
+            self.diag.clone(),
+        );
 
         loop {
             let (stream, _peer) = tokio::select! {
-                accepted = listener.accept() => accepted?,
+                accepted = accept_queue.accept(&listener) => accepted?,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
             };
 

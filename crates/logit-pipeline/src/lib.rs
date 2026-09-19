@@ -18,6 +18,10 @@ pub mod queue;
 pub mod readiness;
 pub mod router;
 pub mod runtime;
+/// Per-socket kernel counters (`SO_MEMINFO`, `TCP_INFO`) read off a raw fd -- see the module's own
+/// doc comment. Namespaced rather than re-exported flat: `sockstat::meminfo` reads better at a
+/// call site than a bare `meminfo`, and the same goes for `SockMeminfo`'s companions.
+pub mod sockstat;
 pub mod transform;
 
 pub use accumulator::{BatchAccumulator, FlushReason};

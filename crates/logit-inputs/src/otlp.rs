@@ -385,8 +385,16 @@ impl Input for OtlpInput {
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
+        // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented: the same
+        // `accept()` this loop already awaited, plus `logit.input.accept_queue.depth`/
+        // `.utilization` sampled before each accept and once a second while waiting for one.
+        let mut accept_queue = crate::tcp::AcceptQueueSampler::new(
+            &listener,
+            self.telemetry.clone(),
+            self.diag.clone(),
+        );
         loop {
-            let (stream, _peer) = listener.accept().await?;
+            let (stream, _peer) = accept_queue.accept(&listener).await?;
 
             // Non-blocking (`try_acquire_owned`, not `acquire_owned`): at capacity the connection
             // is closed immediately rather than queued behind a permit that may never come. And

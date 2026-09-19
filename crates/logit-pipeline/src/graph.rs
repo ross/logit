@@ -41,17 +41,18 @@
 //!     buffer) nor a stream listener (the connection's own flow control is the backpressure, ADRs
 //!     `syslog-tcp-ingress-and-tls` and `graphite-carbon-relay`) has such a queue, so either may
 //!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
-//!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`) is rejected by name on
-//!     one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
+//!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`), or `read_batch` (which
+//!     sizes one `recvmmsg(2)` read and the matching `pop_many` off that same queue), is rejected
+//!     by name on one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
 //!     are listeners by role but have no socket, no queue, and no decoder, so `receive:` on
 //!     either would be a silently-ignored setting -- exactly what this rule exists to catch on
 //!     the sink side (rule 14). A future listener kind rejects `receive:` until it is actually
 //!     wired to one of these three drivers.
-//! 18. A datagram listener's `receive.max_datagrams` or `receive.max_bytes` of `0` is rejected;
-//!     a datagram, stream or tail listener's `receive.batch_max_events` or
+//! 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes` or `receive.read_batch`
+//!     of `0` is rejected; a datagram, stream or tail listener's `receive.batch_max_events` or
 //!     `receive.batch_max_bytes` of `0` is rejected -- each an impossible bound, the twin of rule
 //!     15. `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
-//!     meaningful setting, unlike the count bounds.
+//!     meaningful setting, unlike the count bounds. Rule 57 owns `read_batch`'s upper end.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name is rejected
 //!     -- it could never name a real attribute, so that lookup can only ever be a no-op, the same
 //!     reasoning rules 10-12 already apply to `kv_metrics`/`set` (`null`, not `""`, is how an
@@ -305,6 +306,14 @@
 //!     block), and a non-default `endpoint_tls:` under a plain `http://` endpoint is rejected --
 //!     a *scheme* check, exactly rule 40's third TLS check, since TLS is selected by the
 //!     endpoint's own scheme and a block under `http://` could only ever be ignored.
+//! 57. A datagram listener's `receive.read_batch` above `1024` is rejected
+//!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
+//!     `vlen`, and `1024` is `UIO_MAXIOV`, the kernel's own hard ceiling on how many `iovec`s any
+//!     one vectored I/O call may carry -- above it the kernel clamps or refuses depending on call
+//!     path, a runtime surprise whose cause is nowhere near the config that set it. Rule 18 owns
+//!     the `0` end. A `read_batch` *larger than* `max_datagrams` is deliberately legal: `push_many`
+//!     has a defined answer for a batch bigger than the whole queue, so a rule against it would
+//!     only refuse a configuration that works.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -318,7 +327,7 @@ use logit_config::{
     default_handshake_timeout, default_prometheus_scrape_interval,
     default_prometheus_scrape_timeout, default_prometheus_write_path, BufferConfig, Component,
     ComponentKind, Compression, Config, GraphiteProtocol, GraphiteTransport, MetadataCacheConfig,
-    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport,
+    ReceiveConfig, StatsdTransport, StreamFormat, SyslogTransport, MAX_READ_BATCH,
 };
 use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -1049,10 +1058,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // listener (the tailed file is its own durable buffer) nor a stream listener (the TCP
     // connection's own flow control is the backpressure) has a receive *queue*, so either may
     // only set the batch-assembly/shutdown-grace fields `receive:` also carries -- the
-    // queue-bounding fields (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) stay
-    // datagram-only and are named individually here, not just rejected as "any non-default
-    // field", so the error points at exactly what doesn't apply rather than making an operator
-    // guess.
+    // queue-bounding fields (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) and
+    // `read_batch` (which sizes one `recvmmsg` read and the matching `pop_many` off that same
+    // queue) stay datagram-only and are named individually here, not just rejected as "any
+    // non-default field", so the error points at exactly what doesn't apply rather than making an
+    // operator guess.
     for (id, component) in &components {
         if component.receive == ReceiveConfig::default() {
             continue;
@@ -1070,6 +1080,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 Some("overflow")
             } else if component.receive.receive_buffer_bytes != default.receive_buffer_bytes {
                 Some("receive_buffer_bytes")
+            } else if component.receive.read_batch != default.read_batch {
+                Some("read_batch")
             } else {
                 None
             };
@@ -1123,6 +1135,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'receive.max_bytes' must be at least 1 -- 0 means no \
                      datagram can ever be queued"
+                );
+            }
+            if component.receive.read_batch == 0 {
+                anyhow::bail!(
+                    "component '{id}': 'receive.read_batch' must be at least 1 -- 0 means no \
+                     datagram could ever be read off the socket"
                 );
             }
         }
@@ -2702,6 +2720,32 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     );
                 }
             }
+        }
+    }
+
+    // Rule 57: a datagram listener's `receive.read_batch` may not exceed `UIO_MAXIOV`
+    // (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
+    // `vlen`, and `UIO_MAXIOV` (1024) is the kernel's hard ceiling on how many `iovec`s any one
+    // vectored I/O call may carry -- a larger value is clamped or refused by the kernel depending
+    // on call path, which is a runtime surprise whose cause is nowhere near the config that set
+    // it. Rejected here instead, with the kernel's own name for the limit in the message.
+    //
+    // Rule 18 owns the other end (`read_batch: 0`), the same split the two rules already have for
+    // `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
+    // **not** an error: `push_many` has a defined answer for a batch bigger than the whole queue
+    // (evict or block per policy, per item, exactly as `push` would), so a rule against it would
+    // only refuse a configuration that works.
+    //
+    // Datagram listeners only -- rule 17 has already rejected a non-default `read_batch` on every
+    // other kind, so a stream or tail listener reaching here carries the default and can't fail.
+    for (id, component) in &components {
+        if is_datagram_listener(&component.kind) && component.receive.read_batch > MAX_READ_BATCH {
+            anyhow::bail!(
+                "component '{id}': 'receive.read_batch' is {} -- at most {MAX_READ_BATCH} \
+                 (UIO_MAXIOV, the kernel's own ceiling on how many messages one recvmmsg(2) call \
+                 may carry)",
+                component.receive.read_batch
+            );
         }
     }
 
@@ -5670,6 +5714,100 @@ mod tests {
         ]));
         assert!(err.contains("'in'"), "got: {err}");
         assert!(err.contains("batch_max_bytes"), "got: {err}");
+    }
+
+    /// Rule 18's `read_batch` arm: `0` means `recvmmsg`'s `vlen` is zero, which reads nothing,
+    /// forever -- the same impossible bound the four above are.
+    #[test]
+    fn a_listeners_receive_with_zero_read_batch_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            ("in", vec![], listener(), ReceiveConfig { read_batch: 0, ..ReceiveConfig::default() }),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("read_batch"), "got: {err}");
+    }
+
+    /// Rule 57: above `UIO_MAXIOV` the kernel clamps or refuses depending on call path, so the
+    /// config is rejected with the kernel's own name for the limit in the message.
+    #[test]
+    fn a_listeners_read_batch_above_uio_maxiov_is_rejected() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { read_batch: MAX_READ_BATCH + 1, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("read_batch"), "got: {err}");
+        assert!(err.contains("UIO_MAXIOV"), "got: {err}");
+    }
+
+    /// The boundary itself is legal -- `UIO_MAXIOV` is the largest `vlen` the kernel accepts, not
+    /// the first one it rejects.
+    #[test]
+    fn a_listeners_read_batch_of_exactly_uio_maxiov_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { read_batch: MAX_READ_BATCH, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("1024 is the ceiling, not the first rejected value");
+        assert_eq!(graph.components["in"].receive.read_batch, MAX_READ_BATCH);
+    }
+
+    /// Deliberately legal, and pinned so it stays that way: `push_many` has a defined answer for a
+    /// batch larger than the whole queue (evict or block per policy, per item), so a rule against
+    /// this combination would only refuse a configuration that works -- see rule 57's own comment.
+    #[test]
+    fn a_read_batch_larger_than_max_datagrams_validates_fine() {
+        let graph = resolve(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                listener(),
+                ReceiveConfig { read_batch: 64, max_datagrams: 4, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("a read batch bigger than the queue is legal -- push_many handles it per item");
+        assert_eq!(graph.components["in"].receive.read_batch, 64);
+        assert_eq!(graph.components["in"].receive.max_datagrams, 4);
+    }
+
+    /// Rule 17's queue-only list has to include `read_batch`: it sizes one `recvmmsg` read and
+    /// the matching `pop_many` off a receive queue a stream listener does not have.
+    #[test]
+    fn a_read_batch_on_a_tcp_syslog_in_is_rejected_naming_the_field() {
+        let err = expect_err(cfg_with_receive(vec![
+            (
+                "in",
+                vec![],
+                syslog_in(SyslogTransport::Tcp, false),
+                ReceiveConfig { read_batch: 16, ..ReceiveConfig::default() },
+            ),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'receive.read_batch'"), "got: {err}");
+        assert!(err.contains("a stream listener has no receive queue"), "got: {err}");
+    }
+
+    /// The default is 64, and it is the same 64 `UdpListenerConfig::default` carries -- the two
+    /// live in different crates (`logit-inputs` deliberately does not depend on `logit-config`),
+    /// so nothing but a test can hold them together.
+    #[test]
+    fn the_default_read_batch_is_sixty_four() {
+        assert_eq!(ReceiveConfig::default().read_batch, 64);
+        assert_eq!(logit_config::default_read_batch(), 64);
+        assert_eq!(MAX_READ_BATCH, 1024);
     }
 
     /// Unlike the four count/byte bounds above, `batch_flush_interval: 0s` is a meaningful

@@ -37,7 +37,65 @@ pub struct RunReport {
     pub profile: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// What the box's power/thermal policy was while this ran. Absent in every results file
+    /// written before it existed, and any field of it may be absent on a machine or container
+    /// that doesn't expose it -- see [`BoxState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_state: Option<BoxState>,
     pub scenarios: BTreeMap<String, ScenarioReport>,
+}
+
+/// The CPU frequency policy and power source a run was taken under, read best-effort from sysfs.
+///
+/// Recorded because it is the single largest source of unexplained movement in these numbers, and
+/// a results file that doesn't carry it can't be told apart from one that does: a `powersave`
+/// governor or a run on battery can move CPU µs/event by tens of percent with nothing in the code
+/// having changed (`perf/load/README.md`'s "Tuning", and `docs/design/performance.md`). Every
+/// field is `Option` and read with a plain file read that is allowed to fail -- a container or a
+/// non-Linux host that exposes none of this records `null`s rather than refusing to run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoxState {
+    /// `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` -- `performance` or `powersave` on
+    /// an `amd_pstate`/`intel_pstate` box. Visible inside this repo's dev container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling_governor: Option<String>,
+    /// `…/cpu0/cpufreq/energy_performance_preference` -- the finer knob underneath the governor
+    /// (`performance`, `balance_performance`, `balance_power`, `power`). Also visible in the
+    /// container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_performance_preference: Option<String>,
+    /// `/sys/firmware/acpi/platform_profile` -- the firmware-level profile, where a machine has
+    /// one. Verified **absent** on this repo's own dev box, hence very much optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_profile: Option<String>,
+    /// Whether a mains supply is online, from the first `/sys/class/power_supply/*` whose `type`
+    /// is `Mains`. Found by scanning rather than by name: it is `ACAD` on this box, `AC` or
+    /// `ADP1` on others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac_power: Option<bool>,
+}
+
+impl BoxState {
+    /// The reasons this run's numbers should be read with suspicion, in words -- empty when the
+    /// box looks like somewhere a measurement can be taken.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.scaling_governor.as_deref() == Some("powersave") {
+            warnings.push(
+                "the CPU governor is `powersave` -- CPU µs/event is not comparable with a run \
+                 taken under `performance`, and a driven scenario's drop rate least of all"
+                    .to_string(),
+            );
+        }
+        if self.on_ac_power == Some(false) {
+            warnings.push(
+                "this box is on battery -- expect every absolute number to be depressed, and the \
+                 amount to drift as the run goes on"
+                    .to_string(),
+            );
+        }
+        warnings
+    }
 }
 
 /// One scenario's results across every `--repeat`.
@@ -74,6 +132,87 @@ pub struct Sample {
     /// (docs/adr/load-test-harness.md): far less noisy than wall time on a shared box, since it
     /// doesn't care how many other processes were competing for the CPU during the run.
     pub cpu_us_per_event: f64,
+    /// The socket-side half of a real-socket (`Workload::Driven`) repeat -- absent for every
+    /// generator-driven scenario, and absent from every results file written before ADR
+    /// `udp-intake-batching-and-socket-visibility` existed. `#[serde(default)]` plus
+    /// `skip_serializing_if` is the same optional-field shape [`Sample::startup_s`] already
+    /// established, and is what keeps an old results file loadable by a new `compare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp: Option<UdpSample>,
+}
+
+/// What a real-socket repeat's datagrams actually did: how many were sent, how many the listener
+/// saw, and where the difference went.
+///
+/// Every field here exists because a UDP scenario is the first one in this codebase where "events
+/// produced" and "events measured" can honestly differ. `events_delivered` is the denominator
+/// [`Sample::events_per_s`] and [`Sample::cpu_us_per_event`] are computed over -- never
+/// `sent_datagrams` or `sent_lines`, which would understate the true per-event cost by exactly the
+/// drop rate, in precisely the regime this scenario family's baseline is tuned into.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UdpSample {
+    /// Datagrams `crate::load`'s sender got the kernel to accept.
+    pub sent_datagrams: u64,
+    /// statsd lines inside those datagrams -- the load spec's own count, not a decode.
+    pub sent_lines: u64,
+    /// `logit.input.datagrams`: what the listener actually read off the socket.
+    pub received_datagrams: u64,
+    /// `logit.input.reads`: read syscalls the listener made. `received_datagrams / reads` is the
+    /// **mean fill** of one `recvmmsg(2)` batch -- the number that says whether `receive.read_batch`
+    /// is the constraint or an irrelevance (`docs/deploying.md`'s "Listener intake").
+    ///
+    /// `#[serde(default)]` because a results file written before `logit.input.reads` existed has
+    /// no such key, and a `compare` against one must still load -- the same optional-field shape
+    /// [`Sample::startup_s`] established. `0` there means "not recorded", which is also what a
+    /// non-UDP run would report, and [`UdpSample::mean_fill`] returns `None` for it rather than
+    /// dividing by it.
+    #[serde(default)]
+    pub reads: u64,
+    /// `logit.input.kernel.drops`: discarded by the kernel before `recv_from` could return them.
+    /// On loopback `sent == received + this`, which `crate::run`'s self-check asserts.
+    pub kernel_dropped: u64,
+    /// `logit.component.datagrams.dropped{reason=overflow_*}`: `ReceiveQueue` eviction -- loss
+    /// `logit` chose and counted itself, downstream of the kernel's.
+    pub queue_dropped: u64,
+    /// `logit.component.events.received` at the deepest node -- the denominator.
+    pub events_delivered: u64,
+    /// Retryable `sendmmsg` failures the sender absorbed (`ENOBUFS`, a stale `ECONNREFUSED`).
+    /// Non-zero here doesn't mean a datagram was lost -- each one was retried -- but a large
+    /// number means the sender was fighting the local send path rather than measuring the
+    /// receiver.
+    pub send_errors: u64,
+    /// The high-water mark of `logit.input.receive_buffer.utilization` across the run. 1.0 is not
+    /// "nearly full": it is exactly the point at which the kernel begins dropping, so a baseline
+    /// sitting just under it is the regime this scenario family is tuned for.
+    pub kernel_rcvbuf_utilization_max: f64,
+    /// Datagrams/s the blast was actually paced at, after `--rate-scale`/`--verify` -- not the
+    /// spec's own `rate:`, which is what it would have been unscaled. `None` for an unpaced spec,
+    /// and for any results file written before the flag existed.
+    ///
+    /// Recorded because two runs of the same scenario at different scales are not comparable, and
+    /// nothing else in the file would say so: `compare` warns when these differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_rate: Option<u64>,
+}
+
+impl UdpSample {
+    /// Datagrams per read syscall, or `None` when the read counter was not recorded (a results
+    /// file from before it existed). Not a rate and not comparable across scenarios with different
+    /// datagram sizes -- it is only ever read against the `read_batch` that produced it.
+    pub fn mean_fill(&self) -> Option<f64> {
+        (self.reads > 0).then(|| self.received_datagrams as f64 / self.reads as f64)
+    }
+
+    /// Datagrams lost anywhere, as a fraction of those sent -- kernel and receive-queue drops
+    /// together, since someone watching data loss cares that it happened, not which side of the
+    /// socket boundary it happened on. `0.0` for a run that sent nothing, rather than a `NaN` that
+    /// would poison every median it lands in.
+    pub fn drop_rate(&self) -> f64 {
+        if self.sent_datagrams == 0 {
+            return 0.0;
+        }
+        (self.kernel_dropped + self.queue_dropped) as f64 / self.sent_datagrams as f64
+    }
 }
 
 impl Sample {
@@ -96,6 +235,7 @@ impl Sample {
             max_rss_bytes,
             events_per_s: count_f / wall_s,
             cpu_us_per_event: cpu_s * 1_000_000.0 / count_f,
+            udp: None,
         }
     }
 }
@@ -169,6 +309,7 @@ pub fn median_sample(samples: &[Sample]) -> Sample {
         cpu_us_per_event: median_f64(
             &samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>(),
         ),
+        udp: reduce_udp(samples, median_u64, median_f64),
     }
 }
 
@@ -183,7 +324,49 @@ pub fn min_sample(samples: &[Sample]) -> Sample {
         max_rss_bytes: min_u64(&samples.iter().map(|s| s.max_rss_bytes).collect::<Vec<_>>()),
         events_per_s: min_f64(&samples.iter().map(|s| s.events_per_s).collect::<Vec<_>>()),
         cpu_us_per_event: min_f64(&samples.iter().map(|s| s.cpu_us_per_event).collect::<Vec<_>>()),
+        udp: reduce_udp(samples, min_u64, min_f64),
     }
+}
+
+/// Reduces every [`UdpSample`] field independently with the caller's own reducers -- the same
+/// field-wise treatment the rest of [`Sample`] gets, and for the same reason: the summary is a
+/// per-metric picture, not any one repeat.
+///
+/// `None` unless *every* repeat carried a `UdpSample`. A mixed set can only come from a results
+/// file somebody has edited or merged by hand, and summarizing a subset of repeats as if it were
+/// all of them would quietly report a drop rate computed over the wrong denominator.
+fn reduce_udp(
+    samples: &[Sample],
+    reduce_u64: fn(&[u64]) -> u64,
+    reduce_f64: fn(&[f64]) -> f64,
+) -> Option<UdpSample> {
+    let udp: Vec<UdpSample> = samples.iter().filter_map(|sample| sample.udp).collect();
+    if udp.is_empty() || udp.len() != samples.len() {
+        return None;
+    }
+    let field_u64 =
+        |get: fn(&UdpSample) -> u64| reduce_u64(&udp.iter().map(get).collect::<Vec<_>>());
+    Some(UdpSample {
+        sent_datagrams: field_u64(|u| u.sent_datagrams),
+        sent_lines: field_u64(|u| u.sent_lines),
+        received_datagrams: field_u64(|u| u.received_datagrams),
+        reads: field_u64(|u| u.reads),
+        kernel_dropped: field_u64(|u| u.kernel_dropped),
+        queue_dropped: field_u64(|u| u.queue_dropped),
+        events_delivered: field_u64(|u| u.events_delivered),
+        send_errors: field_u64(|u| u.send_errors),
+        kernel_rcvbuf_utilization_max: reduce_f64(
+            &udp.iter().map(|u| u.kernel_rcvbuf_utilization_max).collect::<Vec<_>>(),
+        ),
+        // Config, not a measurement: every repeat of one scenario ran at the same pace, so there
+        // is nothing to reduce. Carried through only when they all agree, so a hand-merged file
+        // reporting two different paces as one number is impossible.
+        effective_rate: udp
+            .iter()
+            .all(|u| u.effective_rate == udp[0].effective_rate)
+            .then(|| udp[0].effective_rate)
+            .flatten(),
+    })
 }
 
 #[cfg(test)]
@@ -199,6 +382,22 @@ mod tests {
             max_rss_bytes,
             events_per_s: 1.0 / wall_s,
             cpu_us_per_event,
+            udp: None,
+        }
+    }
+
+    fn udp(sent: u64, kernel_dropped: u64, delivered: u64, utilization: f64) -> UdpSample {
+        UdpSample {
+            sent_datagrams: sent,
+            sent_lines: sent,
+            received_datagrams: sent - kernel_dropped,
+            reads: sent - kernel_dropped,
+            kernel_dropped,
+            queue_dropped: 0,
+            events_delivered: delivered,
+            send_errors: 0,
+            kernel_rcvbuf_utilization_max: utilization,
+            effective_rate: Some(100_000),
         }
     }
 
@@ -329,12 +528,102 @@ mod tests {
             rustc: "rustc 1.98.1".to_string(),
             profile: "release".to_string(),
             label: Some("baseline".to_string()),
+            box_state: None,
             scenarios,
         };
 
         let json = serde_json::to_string(&report).unwrap();
         let round_tripped: RunReport = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped, report);
+    }
+
+    #[test]
+    fn udp_fields_are_reduced_independently_like_every_other_field() {
+        let mut a = sample(1.0, 10.0, 100);
+        a.udp = Some(udp(1_000, 10, 990, 0.80));
+        let mut b = sample(2.0, 20.0, 200);
+        b.udp = Some(udp(1_000, 30, 970, 0.95));
+        let mut c = sample(3.0, 30.0, 300);
+        c.udp = Some(udp(1_000, 20, 980, 0.60));
+
+        let median = median_sample(&[a, b, c]).udp.expect("every repeat carried one");
+        assert_eq!(median.kernel_dropped, 20);
+        assert_eq!(median.events_delivered, 980);
+        assert!((median.kernel_rcvbuf_utilization_max - 0.80).abs() < 1e-9);
+
+        let min = min_sample(&[a, b, c]).udp.expect("every repeat carried one");
+        assert_eq!(min.kernel_dropped, 10);
+        assert_eq!(min.events_delivered, 970);
+    }
+
+    #[test]
+    fn a_generated_scenarios_samples_summarize_with_no_udp_block_at_all() {
+        let samples = vec![sample(1.0, 10.0, 100), sample(2.0, 20.0, 200)];
+        assert_eq!(median_sample(&samples).udp, None);
+        assert_eq!(min_sample(&samples).udp, None);
+    }
+
+    #[test]
+    fn a_partial_set_of_udp_samples_summarizes_to_none_rather_than_a_subset() {
+        let mut a = sample(1.0, 10.0, 100);
+        a.udp = Some(udp(1_000, 10, 990, 0.8));
+        let b = sample(2.0, 20.0, 200); // no udp block
+        assert_eq!(median_sample(&[a, b]).udp, None);
+    }
+
+    #[test]
+    fn drop_rate_counts_both_kinds_of_loss_and_never_divides_by_zero() {
+        let mut both = udp(1_000, 10, 980, 0.9);
+        both.queue_dropped = 10;
+        assert!((both.drop_rate() - 0.02).abs() < 1e-12);
+        assert_eq!(udp(0, 0, 0, 0.0).drop_rate(), 0.0);
+    }
+
+    #[test]
+    fn the_effective_rate_survives_a_summary_only_when_every_repeat_agrees() {
+        let mut a = sample(1.0, 10.0, 100);
+        a.udp = Some(udp(1_000, 10, 990, 0.8));
+        let mut b = sample(2.0, 20.0, 200);
+        b.udp = Some(udp(1_000, 10, 990, 0.8));
+        assert_eq!(median_sample(&[a, b]).udp.unwrap().effective_rate, Some(100_000));
+
+        // A hand-merged file mixing two paces must not report either of them as if it were both.
+        let mut c = sample(3.0, 30.0, 300);
+        let mut mixed = udp(1_000, 10, 990, 0.8);
+        mixed.effective_rate = Some(25_000);
+        c.udp = Some(mixed);
+        assert_eq!(median_sample(&[a, c]).udp.unwrap().effective_rate, None);
+    }
+
+    #[test]
+    fn a_udp_sample_written_before_the_rate_scale_flag_existed_still_loads() {
+        // Exactly the `udp` block this harness wrote before `--rate-scale`: no `effective_rate`.
+        let json = r#"{
+            "sent_datagrams": 100, "sent_lines": 100, "received_datagrams": 99,
+            "kernel_dropped": 1, "queue_dropped": 0, "events_delivered": 99,
+            "send_errors": 0, "kernel_rcvbuf_utilization_max": 0.5
+        }"#;
+        let udp: UdpSample = serde_json::from_str(json).expect("an older udp block must load");
+        assert_eq!(udp.effective_rate, None);
+        assert_eq!(udp.events_delivered, 99);
+    }
+
+    #[test]
+    fn a_results_file_written_before_udp_samples_existed_still_loads() {
+        // Exactly the JSON the pre-ADR harness wrote for one repeat: no `udp` key anywhere.
+        let json = r#"{
+            "wall_s": 2.0, "startup_s": 0.2, "user_s": 1.0, "sys_s": 1.0,
+            "max_rss_bytes": 1024, "events_per_s": 500.0, "cpu_us_per_event": 4.0
+        }"#;
+        let sample: Sample = serde_json::from_str(json).expect("an old sample must still load");
+        assert_eq!(sample.udp, None);
+        assert_eq!(sample.cpu_us_per_event, 4.0);
+    }
+
+    #[test]
+    fn a_sample_with_no_udp_block_omits_the_key_entirely() {
+        let json = serde_json::to_string(&sample(1.0, 2.0, 3)).unwrap();
+        assert!(!json.contains("udp"), "{json}");
     }
 
     #[test]
@@ -348,6 +637,7 @@ mod tests {
             rustc: "rustc 1.98.1".to_string(),
             profile: "release".to_string(),
             label: None,
+            box_state: None,
             scenarios: BTreeMap::new(),
         };
         let json = serde_json::to_string(&report).unwrap();

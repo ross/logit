@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-12
+updated: 2026-09-18
 ---
 
 # Decoupled listener I/O
@@ -277,12 +277,17 @@ review:
    clone surviving past this task's drop would keep every downstream inbox open and hang the
    shutdown cascade the hard constraint above depends on.
 2. **`queue.close()` is called by the read half, only once it has stopped reading** — the one
-   condition `decode_loop`'s `pop()` needs to discover closed-and-empty and return; no second
+   condition `decode_loop`'s pop needs to discover closed-and-empty and return; no second
    close-detection signal.
 3. **The final accumulator flush happens only after the decode half can no longer receive
    anything** — simpler here than `run_output`'s `finish_and_flush`, since the accumulator is owned
    by (not shared with) `decode_loop`: the flush is the last statement of that loop's own body,
-   after `pop()` returns `None`.
+   after the pop reports closed-and-empty.
+
+   (`decode_loop` takes datagrams a batch at a time now — `BoundedQueue::pop_many`, ADR
+   [`udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md) —
+   so "pop returns `None`" reads "`pop_many` returns `0`" in the code. Same sentinel, same
+   condition, same flush.)
 
 `read_loop` races **both** `recv_from` and `queue.push` against `shutdown` — not just `recv_from` —
 so a graceful shutdown under `overflow: block` doesn't have to wait for downstream decode to make
@@ -350,6 +355,15 @@ to ignore the one warning that matters.
   Genuinely valuable — almost no tool in the field does this in-process, they all tell operators to
   run `netstat -su` — but Linux-only and a separate, self-contained addition; recorded as a new
   `docs/known-gaps.md` entry rather than folded in here.
+
+> **Revised by [ADR `udp-intake-batching-and-socket-visibility`](udp-intake-batching-and-socket-visibility.md).**
+> Both bullets above are now designed and scheduled rather than merely deferred: `recvmmsg` batched
+> reads land unconditionally on Linux (`SO_REUSEPORT` fan-in stays out of scope, deferred again
+> pending that work's own measurements), and kernel-side drop visibility is built on
+> `getsockopt(SO_MEMINFO)` against the socket's own fd, not the `/proc/net/udp[6]` scrape named
+> here — that ADR's `SO_MEMINFO` section explains why the procfs approach was superseded before
+> being built. This section's account of what was known and out of scope when written is otherwise
+> unaffected.
 
 ## Consequences
 

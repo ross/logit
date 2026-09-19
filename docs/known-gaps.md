@@ -168,50 +168,153 @@ already built that have a known, accepted rough edge.
     is still only "the immediate destination accepted the write," never more. The receive-side loss
     this entry used to also name (a UDP listener losing datagrams before anything reaches a
     buffer) narrowed with ADR `decoupled-listener-io`: a listener now counts every datagram it
-    drops itself (`logit.component.datagrams.dropped`); what remains uncounted is the kernel's own
-    drop, before `logit` ever sees the datagram — see the kernel-drop-visibility entry below.
+    drops itself (`logit.component.datagrams.dropped`). It narrowed the rest of the way with the
+    per-socket kernel counters below — the kernel's own drop, before `logit` ever sees the
+    datagram, is counted too now (`logit.input.kernel.drops`). Every receive-side loss path on a
+    UDP listener is therefore attributable to a component; what this entry still names is the
+    *delivery* side, past the first hop.
   - **No out-of-order/credit-based acknowledgement** — see the native wire protocol entry above's
     "Credit-based flow control" bullet; `SinkQueue` is deliberately in-order and single-in-flight
     (one queue, one writer, `peek`-then-`commit`-the-head only) until that lands.
-- **No visibility into the kernel's own UDP receive-buffer drops.** A listener's `ReceiveQueue`
-  ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md), directly above) counts every datagram *it* drops,
-  but a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
-  entirely. Linux exposes this per-socket in `/proc/net/udp[6]`'s `drops` column; sampling it (on a
-  timer, keyed by the listener's own bound address) as `logit.input.kernel.drops` would close the
-  last uncounted loss path, and is Linux-only with no new dependency. Worth noting almost nothing in
-  the field does this in-process — syslog-ng, rsyslog, Telegraf, and gostatsd all tell operators to
-  run `netstat -su`/`ss -u` themselves — so building it would put `logit` ahead of the field, not
-  merely at parity.
-- **A UDP listener reads one datagram per syscall.** `read_loop` (`logit-inputs::udp`,
-  [ADR `decoupled-listener-io`](adr/decoupled-listener-io.md)) calls `recv_from` once per datagram. `recvmmsg(2)`
-  amortizes that across a batch — rsyslog's own high-throughput reference config sets `batchSize`
-  to 128, gostatsd's `--receive-batch-size` defaults to 50 — and syscall overhead is the read half's
-  dominant remaining cost now that a stalled downstream no longer stops it running. Not built:
-  `tokio::net::UdpSocket` doesn't expose `recvmmsg`, so this needs raw-fd work via `try_io` plus a
-  `libc` binding.
-- **One reader per UDP listener.** A single `recv_from` loop is one core's worth of read capacity.
+- ~~**No visibility into the kernel's own UDP receive-buffer drops.**~~ — **closed** (ADR
+  [`udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
+  A listener's `ReceiveQueue` ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md),
+  directly above) always counted every datagram *it* dropped; a datagram the kernel discarded
+  before `recv_from` could return it was invisible to `logit` entirely, which left the one loss
+  path nothing could attribute to a component. `logit_pipeline::sockstat` now reads the kernel's own
+  per-socket counters straight off the listener's fd, once a second and once more after the read
+  loop stops, and reports `logit.input.kernel.drops` (a count) alongside
+  `logit.input.receive_buffer.used.bytes` / `.utilization` (gauges) — the fill level that says
+  whether more drops are coming.
+
+  Two things about how it landed are worth keeping. **`getsockopt(SO_MEMINFO)`, not procfs**,
+  which is what this entry originally proposed: the drop counter it returns is byte-for-byte
+  `/proc/net/udp[6]`'s `drops` column, but reading it needs no parse of a netns-wide table and no
+  matching of *our* socket in it by address or inode — a match `SO_REUSEADDR` and multicast binds
+  make genuinely ambiguous — and it returns the receive buffer's fill in the same call. **And the
+  same helper covers TCP listeners**: `getsockopt(TCP_INFO)` on a socket in `LISTEN` aliases
+  `tcpi_unacked`/`tcpi_sacked` onto the accept queue's depth and its backlog ceiling, reported as
+  `logit.input.accept_queue.depth` / `.limit` / `.utilization` by every stream input (`syslog_in`,
+  `graphite_in`, TCP `statsd_in`, `logit_in`, `otlp_in`, `prometheus_in`'s remote-write receiver).
+  The note this entry ended on still holds: almost nothing in the field does either in-process —
+  syslog-ng, rsyslog, Telegraf and gostatsd all tell operators to run `netstat -su`/`ss -u`
+  themselves — so this is ahead of the field rather than at parity with it.
+- **A UDP sink's send failures are not counted by cause.** The receive side's kernel counters
+  (directly above) have no useful send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 when
+  sampled on a UDP socket, because a datagram is charged and uncharged inside one `sendmsg`, so a
+  send-buffer gauge would be a flat zero dressed up as a signal — it was deliberately not built,
+  and `SockMeminfo` carries the field only because the option returns it anyway. What *would* be
+  worth having is the thing the call site can see and nothing else can: the errno. `statsd_out`,
+  `syslog_out`, `graphite_out` and `collectd_out` all send datagrams and all treat a failed send
+  the same way regardless of why it failed, so an operator cannot today tell `ENOBUFS` (local
+  socket-buffer pressure, a tuning problem) from `EMSGSIZE` (a datagram past the path MTU, a
+  configuration problem) from `ECONNREFUSED` (an ICMP port-unreachable from a receiver that isn't
+  there, a deployment problem) — three different faults with three different fixes, currently one
+  undifferentiated failure. A `logit.output.send.errors{errno="..."}` count at those four send
+  sites would separate them, with the errno set bounded by the handful a UDP `sendmsg` can
+  actually return.
+- **Netns-wide UDP counters (`/proc/net/snmp`, `netstat -su`) are deliberately not collected.**
+  `Udp: InErrors` / `RcvbufErrors` / `NoPorts` and the `UdpLite` block alongside them answer real
+  questions the per-socket counters cannot — most usefully `NoPorts`, datagrams that arrived for a
+  port nothing was listening on, which is what a misconfigured sender looks like from the
+  receiver's side. They are not collected because they are not attributable: they are totals for
+  the whole network namespace, covering every process and every socket in it, and `logit`'s
+  telemetry model is per component (`docs/design/internal-telemetry.md` — every point carries the
+  `component`/`kind`/`role` identity of the thing that recorded it). Publishing a namespace-wide
+  number under one listener's identity would be actively misleading in exactly the deployments
+  where it matters, a host agent sharing a netns with everything else on the box. If these are
+  ever wanted, they belong to a process-level scope — alongside `logit.process.*`, which `internal`
+  already samples for itself — and not to any listener.
+- ~~**A UDP listener reads one datagram per syscall**~~ — **closed** on Linux
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
+  `read_loop` (`logit-inputs::udp`) now takes up to `receive.read_batch` datagrams per `recvmmsg(2)`
+  call (default 64, ceiling `UIO_MAXIOV`), through `tokio::net::UdpSocket::async_io` — which is the
+  raw-fd seam this entry said the work would need, and the same one
+  `crates/logit-inputs/src/tail/watch.rs`'s `inotify` backend already uses. The `mmsghdr`/`iovec`
+  arrays are rebuilt inside the readiness closure on every call over `Vec<u64>` backing storage, so
+  no raw pointer is ever held across an `.await` and the read future stays ordinarily `Send` with no
+  `unsafe impl` behind it.
+
+  `read_batch` also sizes the decode half's `pop_many`, so one knob governs both ends of the receive
+  queue, and `logit.input.reads` alongside `logit.input.datagrams` makes the mean fill of a syscall
+  batch — the number that says whether the knob is doing anything — directly observable.
+
+  **Linux only, and that is the whole of it.** `recvmmsg` is a Linux syscall with no portable
+  equivalent worth a second implementation; every other target keeps the one-`recv_from`-per-datagram
+  loop behind the same interface, and `read_batch` is documented as parsed-and-ignored there.
+- **One reader per UDP listener.** A single read loop is one core's worth of read capacity.
   `SO_REUSEPORT` lets multiple sockets share one port with the kernel load-balancing datagrams
   across them — gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener
-  thread count (capped at 32). Not built, partly because it interacts with the previous entry (a
-  batched read raises the single-reader ceiling before more readers are worth adding) and partly
-  because N readers each holding their own `Fanout` clone would need its own answer to the
-  cancel-by-drop shutdown cascade ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that
-  today assumes exactly one `Fanout` per listener.
-- **A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, not every batch.**
-  `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` — three
-  `Telemetry::gauge` calls, each locking `ComponentBuffer`'s `Mutex<HashMap>`
-  (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item. On a `SinkQueue`
-  that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it's once per *datagram*,
-  and the same listener's `read_loop` (pushing) and `decode_loop` (popping) run concurrently against
-  the identical lock, so this is genuine cross-task contention on the receive side's two hottest
-  loops, not just added per-call overhead. Deliberately not changed here: `BoundedQueue` is one
-  implementation serving both queues by design ([ADR `decoupled-listener-io`](adr/decoupled-listener-io.md),
-  workstream A), and coalescing or sampling the receive side's gauge updates without also touching
-  the sink side would split that implementation's behavior back apart along exactly the seam it was
-  built to erase. If this ever shows up as a measured bottleneck (`script/bench`, the same evidence
-  bar `docs/design/memory.md`'s "Costing internal spans" section sets for a similar hot-path
-  tradeoff), the fix belongs in `BoundedQueue` itself — e.g. gauging on a sampled/coalesced cadence
-  for every caller — not as a receive-only special case.
+  thread count (capped at 32). Still not built, and the reasoning has moved on rather than
+  disappeared. **The prerequisite is done**: the entry above used to say a batched read should raise
+  the single-reader ceiling before more readers are worth adding, and it has —
+  `recvmmsg(2)` with `read_batch: 64` cut the CPU cost per event on the single-datagram-per-packet
+  workload substantially, so the question "is one reader still the bottleneck?" now has measurements
+  behind it rather than an assumption
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)'s
+  sweep). What has not changed is the cost of building it: N readers each holding their own `Fanout`
+  clone would need its own answer to the cancel-by-drop shutdown cascade
+  ([ADR `service-lifecycle-and-output-retry`](adr/service-lifecycle-and-output-retry.md)) that today
+  assumes exactly one `Fanout` per listener. A related, smaller question that same work would have
+  to settle is its own entry, directly below: the read and decode halves currently share one task.
+- **A UDP listener's read and decode loops share one task.** `read_loop` and `decode_loop`
+  (`crates/logit-inputs/src/udp.rs`) are driven by `run_until_shutdown`'s one two-arm `select!`, so
+  the two interleave — cooperatively yielding to each other on the coop budget — but never run on two
+  cores at once. W4's coop-budget analysis found nothing currently costing anything measurable from
+  that sharing (`docs/design/performance.md` §7), but a report-only experiment run alongside it, not
+  shipped, found real headroom if it were split: spawning `decode_loop` onto its own task, pinned to
+  cores 2, 3, 14, 15 (two fast physical cores plus their SMT siblings), against the same branch and
+  pins otherwise — **provisional, same laptop/battery/powersave caveat as every other number in this
+  entry**:
+
+  | | single task | decode spawned |
+  |---|---|---|
+  | `udp-statsd-small` CPU µs/event | 1.229 | 1.082 (−12%) |
+  | `udp-statsd-small` peak RSS | 22.0 MiB | 38.0 MiB |
+  | `udp-statsd` CPU µs/event | 0.659 | 0.696 (+5.6%) |
+  | `udp-statsd` kernel drop % | 0.69 | 0.00 |
+  | `udp-statsd` mean fill | 22.8 | 2.6 |
+  | `udp-statsd` peak RSS | 86.4 MiB | 264.8 MiB |
+
+  Splitting the two took `udp-statsd`'s kernel drops to zero and its mean fill from ~23 to ~2.6 (the
+  reader stops waiting behind decode at all and keeps the socket continuously drained), and cut
+  `udp-statsd-small`'s CPU/event ~12% — at a cost of +5.6% CPU/event on `udp-statsd` itself (the
+  cross-core handoff) and roughly **3× peak RSS**, because nothing paces the reader against the
+  decoder any more once they're not sharing a poll budget.
+
+  Shipping it, not attempted here, needs four things designed together — three named in the ADR's
+  "Consequences" section, the fourth from PR #254's own report of the experiment: a
+  join-handle-plus-cancellation story to replace `run_until_shutdown`'s two-arm `select!`, which is
+  load-bearing for shutdown/drain ordering today (read finishing closes the queue, which is what lets
+  decode discover closed-and-empty and flush its accumulator); moving the decoder out of `&mut self`
+  so it can live on a `'static` task (`D: 'static`); a `Fanout` ownership answer, since dropping the
+  decode future — not something a caller does directly once it's on a task — is what closes every
+  downstream inbox today; and `receive.max_bytes`'s default revisited against real measurements,
+  since nothing bounds the reader once it's decoupled from decode's pace. **This overlaps heavily
+  with the `SO_REUSEPORT` entry above**, which needs answers to
+  the same shutdown-cascade and `Fanout`-ownership questions for its own, larger reason (N readers
+  each with their own `Fanout` clone) — the two should be designed together rather than separately.
+- ~~**A `ReceiveQueue`'s depth/bytes/utilization gauges update on every datagram, on both sides of
+  the queue**~~ — **closed, both halves.** `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs`)
+  call `update_gauges` — three `Telemetry::gauge` calls, each locking `ComponentBuffer`'s
+  `Mutex<HashMap>` (`crates/logit-core/src/telemetry.rs`) — unconditionally on every accepted item.
+  On a `SinkQueue` that's once per *batch*, an already-accepted cost; on a `ReceiveQueue` it was
+  once per *datagram* on both sides at once, with the same listener's `read_loop` (pushing) and
+  `decode_loop` (popping) contending on the identical lock.
+
+  **The decode side is now batched.** `BoundedQueue` grew `push_many`/`pop_many`
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)) —
+  in `BoundedQueue` itself, as this entry required, with `push`/`pop` and every sink-side caller
+  untouched — and `decode_loop` pops up to 64 datagrams per call, so the pop side now updates the
+  three gauges once per popped batch instead of once per datagram. Per-item admission, drop counting
+  and `Block` waiting are unchanged; only the bookkeeping around them batches.
+
+  **And the push side closed with the `recvmmsg` read.** The condition this entry set was that
+  batching the push without batching the read would just be the same gauge update with a one-item
+  `Vec` around it. The read path is now `recvmmsg` with `vlen = read_batch` (the entry above), so
+  the datagrams arrive already batched and `read_loop` hands the whole batch to `push_many` in one
+  call. Both of the two loops that used to contend on the component's telemetry mutex once per
+  datagram now touch it once per batch, which is what this entry asked for.
 - ~~**Relative gauge adjustment (`+`/`-`) and sample-rate extrapolation for distributions**~~ —
   **closed, both halves** (`docs/adr/relative-gauge-adjustments.md`). Landed as two
   independently-reviewed branches — relative gauge adjustment and sample-rate extrapolation had no

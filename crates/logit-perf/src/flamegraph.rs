@@ -33,8 +33,9 @@
 //! (`docs/adr/load-test-harness.md`'s "Profiling" section). Running this outside that image is a
 //! clear error naming `script/perf flamegraph`, not a confusing failure three steps in.
 
-use crate::run::{self, SpawnConfig};
-use crate::scenario::{self, Scenario};
+use crate::load::{CpuSet, LoadPlan};
+use crate::run::{self, Drive, SpawnConfig};
+use crate::scenario::{self, Scenario, Workload};
 use anyhow::{bail, Context};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,9 @@ pub struct FlamegraphArgs {
     pub timeout: Duration,
     pub shutdown_timeout: Duration,
     pub no_build: bool,
+    /// Sender/child CPU pinning, for a real-socket scenario -- ignored by a generator-driven one.
+    pub pin_sender: Option<CpuSet>,
+    pub pin_child: Option<CpuSet>,
 }
 
 pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
@@ -116,18 +120,37 @@ fn record_and_render(
     out: &Path,
 ) -> anyhow::Result<()> {
     println!(
-        "-- {} (count={}, {} Hz, {})",
+        "-- {} ({}, {} Hz, {})",
         scenario.name,
-        scenario.count,
+        scenario.workload.describe(),
         args.freq,
         if scenario.needs_sigterm { "needs SIGTERM" } else { "self-exits" }
     );
+    // A real-socket scenario is profiled under exactly the load `run` gives it -- the sender runs
+    // in this process, outside the `perf record` wrapper, so what's captured is the receive side
+    // and nothing else. No telemetry leg is attached here: a flamegraph wants the shipped graph,
+    // not the graph plus two of the harness's own nodes.
+    let plan = match &scenario.workload {
+        Workload::Generated { .. } => None,
+        Workload::Driven(_) => {
+            let source = fs::read_to_string(&scenario.path)
+                .with_context(|| format!("reading {}", scenario.path.display()))?;
+            Some(LoadPlan::build(&scenario.load_spec_path()?, &source)?)
+        }
+    };
+    let drive = match (&plan, &scenario.workload) {
+        (Some(plan), _) => Drive::Driven { plan, pin_sender: args.pin_sender.as_ref() },
+        (None, Workload::Generated { count }) => Drive::Generated { count: *count },
+        (None, Workload::Driven(_)) => unreachable!("a driven workload always builds a plan"),
+    };
+
     let wrapper = record_argv(args.freq, perf_data);
-    let sample = run::spawn_and_measure(SpawnConfig {
+    let measured = run::spawn_and_measure(SpawnConfig {
         logit_bin,
         wrapper: &wrapper,
         config: &scenario.path,
-        count: scenario.count,
+        drive,
+        pin_child: args.pin_child.as_ref(),
         needs_sigterm: scenario.needs_sigterm,
         settle: args.settle,
         timeout: args.timeout,
@@ -136,11 +159,11 @@ fn record_and_render(
     .context("perf record")?;
     // `perf record` starts capturing at spawn, not at `ready` -- unlike `run`'s events/s (which
     // deliberately excludes startup from the graph's own per-event cost), this line describes how
-    // much of `perf.data` was actually written, so it's `startup_s + wall_s` (spawn ->
-    // completion/shutdown) rather than `sample.wall_s` alone.
+    // much of `perf.data` was actually written, so it's `startup + wall` (spawn ->
+    // completion/shutdown) rather than the measured wall alone.
     println!(
         "   captured {:.1}s of wall time ({:.1} MiB of samples)",
-        sample.startup_s.unwrap_or(0.0) + sample.wall_s,
+        measured.startup.unwrap_or_default().as_secs_f64() + measured.wall().as_secs_f64(),
         fs::metadata(perf_data).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0),
     );
 
