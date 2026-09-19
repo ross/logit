@@ -3,6 +3,9 @@
 #        script/vm shell [remote command...]
 #        script/vm status
 #        script/vm down [-y|--yes]
+#        script/vm build <ref|dir|tarball>... [--allow-identical]
+#        script/vm push <local-path>... [--to <remote-dir>]
+#        script/vm pull [<remote-path>...] [--to <local-dir>]
 # Creates, uses, and destroys a disposable Azure VM for perf measurement
 # (docs/adr/disposable-azure-perf-vm.md). The laptop can't give a trustworthy number: its
 # heterogeneous cores make an unpinned `script/perf run` come out bimodal depending on which core
@@ -23,13 +26,18 @@
 # SSH is left open to the internet on purpose -- see allow_cidr() below and the ADR's
 # "Networking" section. What actually protects the box is key-only auth, a single authorized
 # key, and a lifetime measured in hours.
+#
+# Who runs what: the OPERATOR runs `up` and `down` -- the billable begin/end of a session belongs
+# under a human's own prompt, and (separately) an auto-mode permission classifier denies an
+# agent's `script/vm up`/`down` outright ("Modify Shared Resources"). An agent does everything in
+# between: `build`, `push`, `pull`, `shell`, `status`. See the ADR's "Who runs what" section.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 usage() {
-    sed -n '2,6p' "${SCRIPT_PATH}/vm" | sed 's/^# //; s/^#//'
+    sed -n '2,9p' "${SCRIPT_PATH}/vm" | sed 's/^# //; s/^#//'
 }
 
 # --- configuration: everything account-specific is an env var with a default ---------------
@@ -66,9 +74,22 @@ LOGIT_VM_VNET_PREFIX="${LOGIT_VM_VNET_PREFIX:-10.42.0.0/16}"
 LOGIT_VM_SUBNET_PREFIX="${LOGIT_VM_SUBNET_PREFIX:-10.42.0.0/24}"
 
 LOGIT_VM_REPO_URL="${LOGIT_VM_REPO_URL:-https://github.com/ross/logit.git}"
-# A branch or tag -- `git clone --branch` can't take a SHA. To measure a SHA: script/vm shell,
-# then `git checkout <sha>` there.
+# A branch, a tag, or a SHA -- vm-cloud-init.yaml clones plainly and resolves/checks this out
+# afterward (see its own comment for why a plain `git checkout <name>` can't always do it).
 LOGIT_VM_REPO_REF="${LOGIT_VM_REPO_REF:-main}"
+# Comma-separated extra refs/SHAs to build, alongside `up`'s own cache-warming build of
+# LOGIT_VM_REPO_REF -- so a multi-ref session's builds happen inside the operator's provisioning
+# wait rather than after the first `shell`. Empty by default: most sessions measure one ref at a
+# time, added later with `script/vm build`. Each is built exactly the way `script/vm build` builds
+# it (`script/vm-build-refs`) -- this is a convenience over calling that afterward, not a
+# different mechanism.
+LOGIT_VM_REPO_REFS="${LOGIT_VM_REPO_REFS:-}"
+# Passed through to `script/vm build`'s remote side (`script/vm-build-refs`): give every git-ref
+# source its own `CARGO_TARGET_DIR` instead of sharing the clone's, at the cost of a full rebuild
+# per ref. Off by default because sequential `git checkout`s in one clone already keep cargo's own
+# mtime fingerprinting honest (see vm-build-refs's header comment) -- this is belt-and-braces
+# isolation for anyone who wants it anyway.
+LOGIT_VM_TARGET_PER_REF="${LOGIT_VM_TARGET_PER_REF:-}"
 
 # Dedicated, never shared, never added to an agent, never in ~/.ssh/authorized_keys, and NEVER
 # deleted by `down` -- so the fingerprint is stable across sessions even though the VM isn't.
@@ -181,6 +202,23 @@ public_ip_or_die() {
 # --- subcommands ------------------------------------------------------------------------------
 
 vm_up() {
+    # Templated, and the checkout it came from printed, before any `az` call or other
+    # precondition check -- so a moved/edited source tree fails in under a second, not after
+    # network scaffolding is already billing. The first `up` this tooling saw run failed exactly
+    # this way: the operator switched branches in the same worktree while `up` ran in the
+    # background, and vm-cloud-init.yaml vanished out from under the `sed` templating step below
+    # after the vnet/NSG/IP had already been created -- a wasted provisioning cycle and a
+    # permission round-trip to clean up, for something this ordering makes impossible.
+    echo "checkout:      ${ROOT} ($(cd "${ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo "not a git checkout"))"
+    local cloud_init
+    cloud_init="$(mktemp -t logit-vm-cloud-init.XXXXXXXX.yaml)"
+    # shellcheck disable=SC2064 -- expand now, not at trap-fire time
+    trap "rm -f '${cloud_init}'" EXIT
+    sed -e "s|@ADMIN_USER@|${LOGIT_VM_ADMIN_USER}|g" \
+        -e "s|@REPO_URL@|${LOGIT_VM_REPO_URL}|g" \
+        -e "s|@REPO_REF@|${LOGIT_VM_REPO_REF}|g" \
+        "${SCRIPT_PATH}/vm-cloud-init.yaml" > "${cloud_init}"
+
     preflight
     check_quota
     ensure_key
@@ -249,15 +287,6 @@ vm_up() {
         echo "vm:            ${LOGIT_VM_NAME} already running -- reusing it"
     else
         created_vm=1
-        local cloud_init
-        cloud_init="$(mktemp -t logit-vm-cloud-init.XXXXXXXX.yaml)"
-        # shellcheck disable=SC2064 -- expand now, not at trap-fire time
-        trap "rm -f '${cloud_init}'" EXIT
-        sed -e "s|@ADMIN_USER@|${LOGIT_VM_ADMIN_USER}|g" \
-            -e "s|@REPO_URL@|${LOGIT_VM_REPO_URL}|g" \
-            -e "s|@REPO_REF@|${LOGIT_VM_REPO_REF}|g" \
-            "${SCRIPT_PATH}/vm-cloud-init.yaml" > "${cloud_init}"
-
         echo "vm:            creating ${LOGIT_VM_NAME} (${LOGIT_VM_SIZE}, ${LOGIT_VM_IMAGE})..."
         "${AZ[@]}" vm create \
             --resource-group "${LOGIT_VM_RESOURCE_GROUP}" \
@@ -344,6 +373,15 @@ vm_up() {
     ssh "${SSH_OPTS[@]}" -t "${LOGIT_VM_ADMIN_USER}@${ip}" \
         'cd ~/logit && DOCKER=docker script/perf run --scenario passthrough --repeat 1 --label vm-warmup'
 
+    # Built here, inside the operator's own provisioning wait, rather than left for the first
+    # `script/vm build` after handing the session off -- the whole point of naming refs up front.
+    if [ -n "${LOGIT_VM_REPO_REFS}" ]; then
+        echo "building extra refs: ${LOGIT_VM_REPO_REFS}"
+        local -a extra_refs=()
+        IFS=',' read -ra extra_refs <<< "${LOGIT_VM_REPO_REFS}"
+        vm_build_remote "${ip}" "${extra_refs[@]}"
+    fi
+
     cat <<EOF
 
 logit perf VM is up and warm.
@@ -356,9 +394,15 @@ logit perf VM is up and warm.
   known_hosts     ${LOGIT_VM_KNOWN_HOSTS}  (removed by 'down')
   cost            ~\$${LOGIT_VM_HOURLY_USD}/hour for as long as this exists
 
-  script/vm shell     a login shell in ~/logit, with DOCKER=docker already set
-  script/vm status    power state, uptime, running cost
-  script/vm down      DELETES the resource group -- the only way back to \$0
+  script/vm build <ref|dir|tarball>...   build another binary to measure (perf/bins/<slug>/logit)
+  script/vm push / pull                  copy files to/from the VM (uncommitted work, results)
+  script/vm shell                        a login shell in ~/logit, with DOCKER=docker already set
+  script/vm status                       power state, uptime, running cost
+  script/vm down                         DELETES the resource group -- the only way back to \$0
+
+This session created the VM, so this session's prompt is the one that should end it: run
+'script/vm down' yourself once whoever is measuring on it is done -- see the ADR's "Who runs
+what" section for why an agent won't run this or 'up' for you.
 
 Cite ~/logit-vm-metadata.txt on the VM alongside any number you record. It has the CPU model,
 kernel, image version, and the exact sysctl values this run saw.
@@ -427,6 +471,109 @@ vm_down() {
     echo "gone. ${LOGIT_VM_SSH_KEY} kept for next time; cost is now zero."
 }
 
+# Runs `script/vm-build-refs` against an already-up VM at `ip`, fed on stdin so it can never be
+# stale against the checkout that invoked it (the same relationship this script has to
+# vm-cloud-init.yaml). Shared by `vm_build` and `vm_up`'s own optional LOGIT_VM_REPO_REFS build,
+# so the two ways of triggering a build stay identical rather than drifting apart.
+#
+# `LOGIT_VM_TARGET_PER_REF` is passed as a leading `VAR=value` on the remote command line, not
+# through ssh's `SendEnv`/`AcceptEnv` (usually disabled server-side, and not asserted here) --
+# every other env var this tooling needs on the far side (`DOCKER=docker`) already reaches it the
+# same way. Each source is quoted with `%q` before being appended to that command line, since
+# unlike `vm_shell`'s pass-through (which documents that the *caller* must quote its own remote
+# command), a source name here is an ordinary positional argument no caller should have to
+# shell-escape by hand.
+vm_build_remote() {
+    local ip="$1"
+    shift
+    local remote_cmd="LOGIT_VM_TARGET_PER_REF=${LOGIT_VM_TARGET_PER_REF} bash -s --"
+    local arg
+    for arg in "$@"; do
+        remote_cmd+=" $(printf '%q' "${arg}")"
+    done
+    ssh "${SSH_OPTS[@]}" "${LOGIT_VM_ADMIN_USER}@${ip}" "${remote_cmd}" < "${SCRIPT_PATH}/vm-build-refs"
+}
+
+vm_build() {
+    preflight
+    local ip
+    ip="$(public_ip_or_die)"
+    local -a sources=() flags=()
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --allow-identical) flags+=(--allow-identical) ;;
+            *) sources+=("${arg}") ;;
+        esac
+    done
+    if [ "${#sources[@]}" -eq 0 ]; then
+        echo "script/vm build: at least one <ref|dir|tarball> is required" >&2
+        usage >&2
+        exit 2
+    fi
+    vm_build_remote "${ip}" "${sources[@]}" "${flags[@]}"
+}
+
+# scp, not a hand-rolled transfer: `SSH_OPTS` is nothing but ordinary OpenSSH client options
+# (`-F`/`-i`/`-o`), which scp accepts identically to ssh, so the same dedicated key and
+# known_hosts file protect this the same way every other subcommand is protected. `-r -p`
+# throughout -- a single file, a directory, or a tarball all just work, and timestamps survive the
+# copy (relevant for a tarball `script/vm build` will later `tar -xm` anyway, but harmless either
+# way).
+vm_push() {
+    preflight
+    local ip
+    ip="$(public_ip_or_die)"
+    local remote_dir=""
+    local -a paths=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --to) remote_dir="$2"; shift 2 ;;
+            *) paths+=("$1"); shift ;;
+        esac
+    done
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "script/vm push: at least one local path is required" >&2
+        usage >&2
+        exit 2
+    fi
+    # A bare "user@host:" (no path) is scp's own way of naming the home directory -- the default,
+    # matching `script/vm build`'s own directory/tarball sources, which are read relative to it.
+    local dest="${LOGIT_VM_ADMIN_USER}@${ip}:"
+    [ -n "${remote_dir}" ] && dest="${dest}${remote_dir}/"
+    echo "pushing to ${dest}"
+    scp "${SSH_OPTS[@]}" -r -p "${paths[@]}" "${dest}"
+}
+
+vm_pull() {
+    preflight
+    local ip
+    ip="$(public_ip_or_die)"
+    local local_dir=""
+    local -a remote_paths=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --to) local_dir="$2"; shift 2 ;;
+            *) remote_paths+=("$1"); shift ;;
+        esac
+    done
+    # The common case needs no arguments at all: bring perf/results/ back, following the repo's
+    # own "perf artifacts never enter the repo" convention (docs/plans/udp-intake.md) by landing
+    # it under tmp/, timestamped so a second pull in the same session doesn't overwrite the first.
+    if [ "${#remote_paths[@]}" -eq 0 ]; then
+        remote_paths=("logit/perf/results")
+    fi
+    if [ -z "${local_dir}" ]; then
+        local_dir="${ROOT}/tmp/perf/vm/$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+    mkdir -p "${local_dir}"
+    echo "pulling into ${local_dir}/"
+    local remote_path
+    for remote_path in "${remote_paths[@]}"; do
+        scp "${SSH_OPTS[@]}" -r -p "${LOGIT_VM_ADMIN_USER}@${ip}:${remote_path}" "${local_dir}/"
+    done
+}
+
 vm_shell() {
     preflight
     local ip
@@ -467,6 +614,8 @@ vm_status() {
             "${hours}" "${created}" "$(awk -v h="${hours}" -v r="${LOGIT_VM_HOURLY_USD}" 'BEGIN{printf "%.2f", h*r}')"
     fi
     echo
+    echo "script/vm build     -- build another binary to measure"
+    echo "script/vm push/pull -- copy files to/from the VM"
     echo "script/vm shell     -- ssh in"
     echo "script/vm down      -- delete everything, back to \$0"
 }
@@ -479,6 +628,9 @@ COMMAND="${1:-status}"
 case "${COMMAND}" in
     up)     vm_up "$@" ;;
     down)   vm_down "$@" ;;
+    build)  vm_build "$@" ;;
+    push)   vm_push "$@" ;;
+    pull)   vm_pull "$@" ;;
     shell)  vm_shell "$@" ;;
     status) vm_status "$@" ;;
     -h|--help|help) usage; exit 0 ;;

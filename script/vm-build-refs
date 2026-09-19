@@ -1,0 +1,313 @@
+#!/bin/bash
+# Fed to the perf VM on stdin by `script/vm build <source>...`
+# (`ssh ... 'bash -s -- <source>...' < script/vm-build-refs`) -- never installed on the VM, so it
+# can never be stale against the checkout that invoked it, the same "two files edited together"
+# relationship script/vm has to script/vm-cloud-init.yaml.
+#
+# Builds one release `logit` binary per source and stashes each one at
+# ~/logit/perf/bins/<slug>/logit, with a `<slug>/logit.json` sidecar next to it that
+# `logit-perf run --logit-bin`'s own sidecar reader (`crates/logit-perf/src/run.rs`) picks up for
+# provenance. A source is one of three things (docs/adr/disposable-azure-perf-vm.md):
+#
+#   a git ref/SHA   built in ~/logit, the one clone `up` already made -- checked out in turn,
+#                   never several checkouts at once, which is what makes cargo's own mtime
+#                   fingerprinting trustworthy (see "why sequential" below).
+#   a directory     already unpacked on the VM's disk -- built in place, with its own isolated
+#                   CARGO_TARGET_DIR (never the clone's).
+#   a tarball       extracted to ~/src/<slug>/ first (tar -xm, so cargo sees fresh mtimes, never
+#                   the archive's own commit-time ones), then built the same way a directory is.
+#
+# The directory/tarball forms exist so work that was never committed or pushed can still be
+# measured -- `script/vm push` is how it gets onto the VM in the first place; a host-side
+# `git archive`/`tar` one-liner for building the archive is documented in the ADR.
+#
+# Why sequential, one clone: the session this tooling grew out of hit a real hazard by hand --
+# three source trees extracted around the same wall-clock time against one *shared*
+# CARGO_TARGET_DIR let cargo's mtime fingerprinting treat the second ref's sources as unchanged,
+# producing a byte-identical binary under a different label. `git checkout` in one clone stamps
+# every file it touches with the current time, which is what makes a later ref's fingerprint
+# always newer than an earlier one's build; a directory/tarball source has no git driving its
+# mtimes forward at all, so it always gets its own target dir (never the clone's, and never
+# shared with another path source) rather than relying on timing.
+
+set -e -o pipefail
+
+LOGIT_HOME="${HOME}/logit"
+BINS_DIR="${LOGIT_HOME}/perf/bins"
+SRCS_DIR="${HOME}/src"
+# Matches script/vm up's own reasoning for passing this explicitly on every ssh call: a non-login,
+# non-interactive shell (which `ssh host 'bash -s -- ...'` is) never sources /etc/profile, and this
+# must not depend on pam_env having done its job either.
+export DOCKER=docker
+
+# Asserted rather than assumed: a relative directory source (`script/vm build wip`, matching
+# `push`'s own default remote directory) is read relative to this, so it has to be right rather
+# than whatever ssh happened to start the shell in.
+cd "${HOME}"
+
+ALLOW_IDENTICAL=0
+SOURCES=()
+for arg in "$@"; do
+    case "${arg}" in
+        --allow-identical) ALLOW_IDENTICAL=1 ;;
+        --) ;;
+        *) SOURCES+=("${arg}") ;;
+    esac
+done
+if [ "${#SOURCES[@]}" -eq 0 ]; then
+    echo "usage: script/vm build <ref|dir|tarball>... [--allow-identical]" >&2
+    exit 2
+fi
+if [ ! -d "${LOGIT_HOME}/.git" ]; then
+    echo "FATAL: ${LOGIT_HOME} is not a git clone -- run 'script/vm up' first." >&2
+    exit 1
+fi
+
+mkdir -p "${BINS_DIR}" "${SRCS_DIR}"
+
+# --- classification ----------------------------------------------------------------------------
+
+# A source is a path if it names something that already exists on the VM, or looks enough like a
+# path/archive to be unambiguous even before it exists (an absolute path, one starting `./`/`~/`,
+# or an archive extension) -- everything else is read as a git ref. `--ref`/`--src` are not
+# implemented as a forcing override here: no shipped ref name collides with a path shape, and
+# adding the flag before anything has needed it would be speculative.
+is_path_source() {
+    # `\~/*`, not `~/*`: an *unescaped* tilde in a case pattern is itself tilde-expanded (to this
+    # process's own $HOME) before matching, which would silently fail to match the literal string
+    # "~/..." a caller typed -- the usual bash gotcha. The backslash keeps it literal.
+    case "$1" in
+        /*|./*|\~/*|*.tar|*.tar.gz|*.tgz) return 0 ;;
+    esac
+    [ -e "$1" ]
+}
+
+# A ref keeps its whole name, since a branch's own `/` is meaningful (`udp/w3` -> `udp-w3`) --
+# everything outside `[A-Za-z0-9_-]` maps to `-`, and a bare 7-40 hex string (a SHA) shortens to
+# its first 12 characters instead.
+slug_for_ref() {
+    local raw="$1"
+    if [[ "${raw}" =~ ^[0-9a-f]{7,40}$ ]]; then
+        echo "${raw:0:12}"
+    else
+        printf '%s' "${raw}" | tr -c 'A-Za-z0-9_-' '-'
+    fi
+}
+
+# A path or tarball slugs from its own basename, with any archive suffix stripped first --
+# `~/w3.tar.gz` -> `w3`, `~/src/wip` -> `wip`. The directory it lives under isn't part of the
+# source's identity the way a ref's namespace is.
+slug_for_path() {
+    local raw="$1" base
+    base="$(basename -- "${raw}")"
+    case "${base}" in
+        *.tar.gz) base="${base%.tar.gz}" ;;
+        *.tgz) base="${base%.tgz}" ;;
+        *.tar) base="${base%.tar}" ;;
+    esac
+    printf '%s' "${base}" | tr -c 'A-Za-z0-9_-' '-'
+}
+
+# --- one container invocation, target dir chosen by the caller ---------------------------------
+
+# compose.yaml gives `logit_cargo_home`/`logit_target_cache` fixed global `name:`s, so every
+# checkout on this box -- the clone, or any unpacked source tree -- shares the same warm cargo
+# registry/git cache regardless of which directory's compose.yaml launched the container; only
+# CARGO_TARGET_DIR ever needs overriding per source, which `common.sh`'s own `run()` helper has no
+# way to do (it takes no extra `-e`), so this calls compose directly instead of going through it.
+container_build_and_stash() {
+    local tree_dir="$1" target_dir="$2" slug="$3"
+    (
+        cd "${tree_dir}"
+        source "${tree_dir}/script/common.sh" >/dev/null
+        build_image
+        ${COMPOSE} run --rm -e LOGIT_DEV_CONTAINER=1 -e "CARGO_TARGET_DIR=${target_dir}" dev \
+            bash -c "set -e; mkdir -p '/work/perf/bins/${slug}' && \
+                cargo build --profile release -p logit-cli && \
+                cp '${target_dir}/release/logit' '/work/perf/bins/${slug}/logit'"
+    )
+}
+
+# Backslash and double-quote only -- the two characters that would otherwise break the JSON
+# `printf` builds below. A directory/tarball path or ref name is operator-supplied, not
+# attacker-supplied, but this costs nothing and means a stray `"` never produces invalid JSON.
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Writes `<slug>/logit.json`, the sidecar `logit-perf run --logit-bin`'s own reader
+# (`crates/logit-perf/src/run.rs::read_binary_sidecar`) looks for next to the binary. Built with
+# `printf`, deliberately not a heredoc: an unquoted heredoc runs command substitution over its own
+# body, so a source string containing a backtick or `$(...)` would otherwise execute rather than
+# just being recorded.
+write_sidecar() {
+    local slug="$1" source_desc sha sha256 sha_json
+    source_desc="$(json_escape "$2")"
+    sha256="$(json_escape "$4")"
+    sha_json="null"
+    if [ -n "$3" ]; then
+        sha_json="\"$(json_escape "$3")\""
+    fi
+    printf '{"source": "%s", "sha": %s, "sha256": "%s", "built_at": "%s", "profile": "release"}\n' \
+        "${source_desc}" "${sha_json}" "${sha256}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "${BINS_DIR}/${slug}/logit.json"
+}
+
+# --- per-source builds ---------------------------------------------------------------------------
+
+declare -a RESULT_SLUGS=() RESULT_SOURCES=() RESULT_SHAS=() RESULT_SHA256S=()
+LAST_REF_SEEN=""
+
+build_ref() {
+    local ref="$1" slug
+    slug="$(slug_for_ref "${ref}")"
+    echo "== ${ref} (git ref) -> perf/bins/${slug}/logit"
+
+    ( cd "${LOGIT_HOME}" && git fetch --tags --prune origin ) >/dev/null
+
+    local sha
+    if sha="$(cd "${LOGIT_HOME}" && git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+        :
+    elif sha="$(cd "${LOGIT_HOME}" && git rev-parse --verify "origin/${ref}^{commit}" 2>/dev/null)"; then
+        :
+    else
+        echo "   FAILED: '${ref}' does not resolve to a commit (checked as given, and as origin/${ref})" >&2
+        return 1
+    fi
+    ( cd "${LOGIT_HOME}" && git checkout --detach "${sha}" --quiet )
+    LAST_REF_SEEN="${ref}"
+
+    # Every ref build shares the clone's own target dir by default, since `git checkout` between
+    # builds is what keeps cargo's fingerprinting honest here (see the header comment) --
+    # LOGIT_VM_TARGET_PER_REF opts into full isolation instead, at the cost of a full rebuild per
+    # ref.
+    local target_dir="/work/target"
+    if [ -n "${LOGIT_VM_TARGET_PER_REF:-}" ]; then
+        target_dir="/work/target/refs/${slug}"
+    fi
+    container_build_and_stash "${LOGIT_HOME}" "${target_dir}" "${slug}"
+
+    local sha256
+    sha256="$(sha256sum "${BINS_DIR}/${slug}/logit" | cut -d' ' -f1)"
+    write_sidecar "${slug}" "${ref}" "${sha}" "${sha256}"
+
+    RESULT_SLUGS+=("${slug}")
+    RESULT_SOURCES+=("${ref} (${sha:0:12})")
+    RESULT_SHAS+=("${sha}")
+    RESULT_SHA256S+=("${sha256}")
+}
+
+build_path() {
+    local given="$1" slug tree_dir kind
+    slug="$(slug_for_path "${given}")"
+
+    case "${given}" in
+        *.tar|*.tar.gz|*.tgz)
+            kind="tar"
+            tree_dir="${SRCS_DIR}/${slug}"
+            echo "== ${given} (tarball) -> perf/bins/${slug}/logit"
+            [ -f "${given}" ] || { echo "   FAILED: no such file: ${given}" >&2; return 1; }
+            rm -rf "${tree_dir}"
+            mkdir -p "${tree_dir}"
+            # A single top-level directory in the archive is stripped, so `git archive
+            # --prefix=logit/ ...` and a bare `tar czf ... .` both land the repo's own files
+            # directly under tree_dir rather than one level down.
+            local top_entries strip_args=()
+            top_entries="$(tar -tf "${given}" | sed -e 's#/.*##' -e '/^$/d' | sort -u)"
+            if [ "$(printf '%s\n' "${top_entries}" | wc -l)" -eq 1 ]; then
+                strip_args=(--strip-components=1)
+            fi
+            # -m: stamp every extracted file with the current time. `git archive` sets each
+            # file's mtime to its *commit* time, and without -m tar would restore that,
+            # handing cargo a tree that looks older than a fingerprint it already recorded --
+            # exactly the hazard the header comment describes, just for one tree instead of
+            # three.
+            tar -xm "${strip_args[@]}" -f "${given}" -C "${tree_dir}"
+            ;;
+        *)
+            kind="dir"
+            tree_dir="${given/#\~/${HOME}}"
+            echo "== ${given} (directory) -> perf/bins/${slug}/logit"
+            [ -d "${tree_dir}" ] || { echo "   FAILED: no such directory: ${tree_dir}" >&2; return 1; }
+            ;;
+    esac
+
+    for required in Cargo.toml script/common.sh compose.yaml; do
+        if [ ! -e "${tree_dir}/${required}" ]; then
+            echo "   FAILED: ${tree_dir} has no ${required} -- not a logit checkout" >&2
+            return 1
+        fi
+    done
+
+    # Isolated unconditionally, unlike a ref build: nothing here is git-driven, so nothing
+    # guarantees this tree's mtimes are newer than whatever last built in the clone's shared
+    # target dir.
+    local target_dir="/work/target/srcs/${slug}"
+    mkdir -p "${BINS_DIR}/${slug}"
+    container_build_and_stash "${tree_dir}" "${target_dir}" "${slug}"
+    # container_build_and_stash writes into <tree_dir>/perf/bins/<slug>/logit (its own bind
+    # mount); copy that into the clone's own perf/bins/, which is what `--logit-bin` and every
+    # other `script/vm` subcommand actually looks under.
+    if [ "${tree_dir}" != "${LOGIT_HOME}" ]; then
+        cp "${tree_dir}/perf/bins/${slug}/logit" "${BINS_DIR}/${slug}/logit"
+    fi
+
+    local sha=""
+    if [ -d "${tree_dir}/.git" ]; then
+        sha="$(cd "${tree_dir}" && git rev-parse HEAD 2>/dev/null || true)"
+    fi
+    local sha256
+    sha256="$(sha256sum "${BINS_DIR}/${slug}/logit" | cut -d' ' -f1)"
+    write_sidecar "${slug}" "${given}" "${sha}" "${sha256}"
+
+    RESULT_SLUGS+=("${slug}")
+    if [ -n "${sha}" ]; then
+        RESULT_SOURCES+=("${given} (${kind}, ${sha:0:12})")
+    else
+        RESULT_SOURCES+=("${given} (${kind})")
+    fi
+    RESULT_SHAS+=("${sha}")
+    RESULT_SHA256S+=("${sha256}")
+}
+
+FAILED=0
+for source in "${SOURCES[@]}"; do
+    if is_path_source "${source}"; then
+        build_path "${source}" || FAILED=1
+    else
+        build_ref "${source}" || FAILED=1
+    fi
+done
+
+# --- duplicate-binary guard (docs/adr/disposable-azure-perf-vm.md) ------------------------------
+
+if [ "${ALLOW_IDENTICAL}" -eq 0 ]; then
+    for ((i = 0; i < ${#RESULT_SLUGS[@]}; i++)); do
+        for ((j = i + 1; j < ${#RESULT_SLUGS[@]}; j++)); do
+            if [ "${RESULT_SHA256S[i]}" = "${RESULT_SHA256S[j]}" ]; then
+                echo
+                echo "FATAL: '${RESULT_SOURCES[i]}' and '${RESULT_SOURCES[j]}' built to the" >&2
+                echo "identical binary (sha256 ${RESULT_SHA256S[i]:0:12}...) -- this is the" >&2
+                echo "shared-target-dir mtime hazard this script exists to prevent, unless the" >&2
+                echo "two sources really are identical (pass --allow-identical to accept that)." >&2
+                FAILED=1
+            fi
+        done
+    done
+fi
+
+echo
+printf '%-14s %-50s %s\n' "slug" "source" "sha256"
+for ((i = 0; i < ${#RESULT_SLUGS[@]}; i++)); do
+    printf '%-14s %-50s %s\n' "${RESULT_SLUGS[i]}" "${RESULT_SOURCES[i]}" "${RESULT_SHA256S[i]:0:12}"
+done
+echo
+if [ -n "${LAST_REF_SEEN}" ]; then
+    echo "clone left checked out at the last ref built: ${LAST_REF_SEEN}"
+fi
+echo "run each with, e.g.:"
+for slug in "${RESULT_SLUGS[@]}"; do
+    echo "  script/perf run --logit-bin perf/bins/${slug}/logit --scenario <name> --repeat 5 ..."
+done
+
+exit "${FAILED}"

@@ -58,6 +58,9 @@ pub struct AttributeArgs {
     pub shutdown_timeout: Duration,
     pub no_build: bool,
     pub profile: String,
+    /// Measure this binary instead of building one -- see `run::RunArgs::logit_bin`'s doc, same
+    /// semantics (implies skipping the build; a relative path resolves against the repo root).
+    pub logit_bin: Option<std::path::PathBuf>,
     /// Sender/child CPU pinning, for a driven scenario -- ignored by a generated one, which has no
     /// sender of its own. See [`crate::load::CpuSet`].
     pub pin_sender: Option<CpuSet>,
@@ -73,7 +76,8 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     // Fresh spool before this leg's own spawn -- same reasoning as `run`'s per-repeat clear
     // (`crate::spool`'s module doc).
     crate::spool::clear(root, &scenario)?;
-    let logit_bin = run::build_and_locate(root, &args.profile, args.no_build)?;
+    let logit_bin =
+        run::build_and_locate(root, &args.profile, args.no_build, args.logit_bin.as_deref())?;
 
     let workdir = telemetry_leg::make_workdir("attribute")?;
     let dump_path = workdir.join("attribute.native");

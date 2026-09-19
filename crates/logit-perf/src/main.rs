@@ -68,6 +68,14 @@ enum Command {
         /// mapping to `target/debug` as cargo itself does).
         #[arg(long, default_value = "release")]
         profile: String,
+        /// Measure this binary instead of building one; implies `--no-build`. A relative path
+        /// resolves against the repo root, not the current directory. The results file records
+        /// its sha256 and, when a `<path>.json` sidecar sits beside it (`script/vm build`'s own
+        /// output, `docs/adr/disposable-azure-perf-vm.md`), the source ref/commit it was built
+        /// from -- this is what a multi-source VM session drives instead of the `docker
+        /// cp`-into-the-target-volume choreography an earlier session had to invent by hand.
+        #[arg(long = "logit-bin")]
+        logit_bin: Option<PathBuf>,
         /// The run-time telemetry leg's drain cadence, for real-socket scenarios. Shorter captures
         /// more of the run before the final drain, at the cost of more work inside the process
         /// being measured -- the same trade `attribute --interval` makes.
@@ -146,6 +154,10 @@ enum Command {
         no_build: bool,
         #[arg(long, default_value = "release")]
         profile: String,
+        /// Measure this binary instead of building one -- see `run --logit-bin`'s doc, same
+        /// semantics.
+        #[arg(long = "logit-bin")]
+        logit_bin: Option<PathBuf>,
         /// Pin the load sender's threads to these CPUs -- real-socket scenarios only, ignored by a
         /// generator-driven one, which has no sender of its own.
         #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
@@ -196,6 +208,7 @@ fn main() {
             shutdown_timeout,
             no_build,
             profile,
+            logit_bin,
             interval,
             pin_sender,
             pin_child,
@@ -212,6 +225,7 @@ fn main() {
                 shutdown_timeout,
                 no_build,
                 profile,
+                logit_bin,
                 interval,
                 pin_sender,
                 pin_child,
@@ -231,6 +245,7 @@ fn main() {
             shutdown_timeout,
             no_build,
             profile,
+            logit_bin,
             pin_sender,
             pin_child,
         } => attribute::attribute(
@@ -243,6 +258,7 @@ fn main() {
                 shutdown_timeout,
                 no_build,
                 profile,
+                logit_bin,
                 pin_sender,
                 pin_child,
             },
@@ -318,6 +334,23 @@ fn display_optional<T: std::fmt::Display>(value: &Option<T>) -> String {
     value.as_ref().map(T::to_string).unwrap_or_else(|| "unknown".to_string())
 }
 
+/// `, binary sha256 <short>[ <source>[ @ <short sha>]]` -- appended to `compare`'s header lines,
+/// empty when the results file predates `RunReport::binary`. `git.sha` above already names the
+/// checkout; this names the binary that was actually spawned, which a `--logit-bin` run can leave
+/// pointing at a different source entirely (`result::BinaryInfo`'s own doc).
+fn format_binary_provenance(binary: &Option<result::BinaryInfo>) -> String {
+    let Some(binary) = binary else { return String::new() };
+    let short_sha256: String = binary.sha256.chars().take(12).collect();
+    match (&binary.source_ref, &binary.source_sha) {
+        (Some(source), Some(sha)) => {
+            let short_sha: String = sha.chars().take(12).collect();
+            format!(", binary sha256 {short_sha256} ({source} @ {short_sha})")
+        }
+        (Some(source), None) => format!(", binary sha256 {short_sha256} ({source})"),
+        (None, _) => format!(", binary sha256 {short_sha256}"),
+    }
+}
+
 fn run_compare(
     before: &Path,
     after: &Path,
@@ -328,18 +361,20 @@ fn run_compare(
     let b = read_report(after)?;
 
     println!(
-        "before: {} (sha {}, {}, {})",
+        "before: {} (sha {}, {}, {}{})",
         before.display(),
         display_optional(&a.git.sha),
         a.profile,
-        a.rustc
+        a.rustc,
+        format_binary_provenance(&a.binary)
     );
     println!(
-        "after:  {} (sha {}, {}, {})",
+        "after:  {} (sha {}, {}, {}{})",
         after.display(),
         display_optional(&b.git.sha),
         b.profile,
-        b.rustc
+        b.rustc,
+        format_binary_provenance(&b.binary)
     );
 
     let report = compare::compare(&a, &b);

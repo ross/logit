@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-18
+updated: 2026-09-19
 ---
 
 # A load-test harness: the real binary, a declarative event template, and CPU per event as the signal
@@ -125,6 +125,26 @@ worth much on its own. `perf/results/` is gitignored for the same reason `/targe
 per-run/per-machine output, not source — while `docs/design/performance.md`'s tables stay the
 durable, hand-curated record of what a measured run showed and when, following that same
 established convention rather than inventing a second one.
+
+### `--logit-bin`: measuring a stashed binary instead of building one
+
+**Amended 2026-09-19.** `run`/`attribute` gained `--logit-bin <path>` (implying `--no-build`),
+recording the measured binary's own `sha256` and, from a `<path>.json` sidecar next to it, its
+source ref/commit and when it was built, in a `binary` block on `RunReport`. This is what a
+multi-source Azure VM session (`docs/adr/disposable-azure-perf-vm.md`) drives instead of the
+`docker cp`-into-the-target-volume choreography an earlier session had to invent by hand: each
+source builds once, via `script/vm build`, into its own `perf/bins/<slug>/logit`, and `run
+--logit-bin` points a measurement at one of them directly. `flamegraph` deliberately doesn't get
+this flag — it always measures the `profiling` profile for its symbols, and a stashed release
+binary would produce a useless capture.
+
+The results filename's short-sha component still prefers the *checkout's* `git.sha` when
+`--logit-bin` wasn't used — an ordinary run's filename is completely unchanged by this feature's
+existence. Only under `--logit-bin` does the binary's own identity (its sidecar's resolved commit,
+else its `sha256`) take over, since that is exactly the case where the checkout and the measured
+binary can honestly differ. `compare` warns when both sides of a comparison carry the identical
+binary `sha256` — the exact "byte-identical binary under two labels" hazard a shared
+`CARGO_TARGET_DIR` produced by hand in that session, now caught automatically.
 
 ### Per-node attribution via `internal → file_out format: native`, decoded by the harness
 

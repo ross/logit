@@ -1,9 +1,13 @@
 #!/bin/bash
-# Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release]
+# Usage: script/perf run [--scenario NAME]... [--repeat N] [--label TEXT] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH]
 #        script/perf compare <a.json> <b.json> [--threshold 5.0] [--rss-threshold PCT]
-#        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release]
+#        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH]
 #        script/perf flamegraph --scenario NAME [--out perf/results/NAME.svg] [--freq 999] [--no-build]
 #        script/perf list
+# `--logit-bin PATH` measures that binary instead of building one (implies --no-build) -- a
+# relative path resolves against the repo root. Its sha256, and, next to a `script/vm build`-style
+# `<path>.json` sidecar, its source ref/commit, are recorded in the results file
+# (docs/adr/disposable-azure-perf-vm.md's multi-source model).
 # Out-of-CI load-test harness (crates/logit-perf, docs/adr/load-test-harness.md): spawns the real
 # release `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and
 # peak RSS. `attribute` adds a temporary `internal` telemetry leg and decodes its native dump into

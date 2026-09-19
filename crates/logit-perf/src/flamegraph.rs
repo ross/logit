@@ -83,7 +83,7 @@ pub fn flamegraph(root: &Path, args: FlamegraphArgs) -> anyhow::Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let logit_bin = run::build_and_locate(root, PROFILE, args.no_build)?;
+    let logit_bin = run::build_and_locate(root, PROFILE, args.no_build, None)?;
 
     let workdir =
         std::env::temp_dir().join(format!("logit-perf-flamegraph-{}", std::process::id()));

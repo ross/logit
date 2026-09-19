@@ -165,6 +165,20 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
         warnings
             .push(format!("comparing different rustc versions: `{}` vs `{}`", a.rustc, b.rustc));
     }
+    // Caught the exact hazard a multi-source VM session ran into by hand (`docs/adr/disposable-
+    // azure-perf-vm.md`): two source trees extracted around the same time against one shared
+    // `CARGO_TARGET_DIR` let cargo's mtime fingerprinting treat the second as unchanged, so a
+    // "delta" would have been measured against a byte-identical binary under a different label. A
+    // warning, not a refusal -- a docs-only diff between two refs legitimately produces this too.
+    if let (Some(a_bin), Some(b_bin)) = (&a.binary, &b.binary) {
+        if a_bin.sha256 == b_bin.sha256 {
+            let short: String = a_bin.sha256.chars().take(12).collect();
+            warnings.push(format!(
+                "both sides measured the identical binary (sha256 {short}…) -- a delta between \
+                 these two results measures nothing"
+            ));
+        }
+    }
 
     let names: BTreeSet<&String> = a.scenarios.keys().chain(b.scenarios.keys()).collect();
     let scenarios = names
@@ -302,6 +316,7 @@ mod tests {
             profile: "release".to_string(),
             label: None,
             box_state: None,
+            binary: None,
             scenarios,
         }
     }
@@ -558,6 +573,51 @@ mod tests {
             "{:?}",
             cmp.warnings
         );
+    }
+
+    fn binary(sha256: &str) -> crate::result::BinaryInfo {
+        crate::result::BinaryInfo {
+            path: "/repo/target/release/logit".to_string(),
+            sha256: sha256.to_string(),
+            source_ref: None,
+            source_sha: None,
+            built_at: None,
+        }
+    }
+
+    #[test]
+    fn identical_binary_sha256_on_both_sides_warns() {
+        let scenarios = BTreeMap::new();
+        let mut a = report("box-a", "cpu-a", scenarios.clone());
+        a.binary = Some(binary(&"a".repeat(64)));
+        let mut b = report("box-a", "cpu-a", scenarios);
+        b.binary = Some(binary(&"a".repeat(64)));
+
+        let cmp = compare(&a, &b);
+        assert!(cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
+    }
+
+    #[test]
+    fn different_binary_sha256s_do_not_warn() {
+        let scenarios = BTreeMap::new();
+        let mut a = report("box-a", "cpu-a", scenarios.clone());
+        a.binary = Some(binary(&"a".repeat(64)));
+        let mut b = report("box-a", "cpu-a", scenarios);
+        b.binary = Some(binary(&"b".repeat(64)));
+
+        let cmp = compare(&a, &b);
+        assert!(!cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
+    }
+
+    #[test]
+    fn missing_binary_info_on_either_side_does_not_warn() {
+        let scenarios = BTreeMap::new();
+        let mut a = report("box-a", "cpu-a", scenarios.clone());
+        a.binary = Some(binary(&"a".repeat(64)));
+        let b = report("box-a", "cpu-a", scenarios); // no binary block -- an old results file
+
+        let cmp = compare(&a, &b);
+        assert!(!cmp.warnings.iter().any(|w| w.contains("identical binary")), "{:?}", cmp.warnings);
     }
 
     #[test]
