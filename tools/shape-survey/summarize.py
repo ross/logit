@@ -90,12 +90,84 @@ def parse_quoted(text: str, i: int) -> tuple[str, int]:
     raise ValueError(f"unterminated quoted string in {text!r}")
 
 
+def skip_container(text: str, i: int) -> int:
+    """Returns the index just past the `[...]`/`{...}` that starts at `text[i]`.
+
+    `render_value` renders a `Value::Array` as `[a, b]` and a `Value::Map` as `{k=v, k=v}`, both
+    recursively -- so a container can hold containers, and either can hold a quoted string that
+    itself contains a bracket, a brace, a comma or a space. The only way to find a container's end
+    is to walk it, counting nesting and stepping over quoted strings whole (which is what
+    `parse_quoted` is for: a `\\"` inside one must not be mistaken for its terminator).
+    """
+    closers = {"[": "]", "{": "}"}
+    stack = [closers[text[i]]]
+    i += 1
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            _, i = parse_quoted(text, i)
+            continue
+        if c in closers:
+            stack.append(closers[c])
+            i += 1
+            continue
+        if c == stack[-1]:
+            stack.pop()
+            i += 1
+            if not stack:
+                return i
+            continue
+        i += 1
+    raise ValueError(f"unterminated container in {text!r}")
+
+
+def parse_value(text: str, i: int) -> tuple[str, int]:
+    """Reads one rendered `Value` starting at `text[i]` (`crates/logit-outputs/src/stdio.rs`).
+
+    Every variant `render_value` can emit, and how each one ends:
+
+    | rendered                | variant                     | ends at                     |
+    |-------------------------|-----------------------------|-----------------------------|
+    | `"..."`                 | `Str`                       | the closing quote           |
+    | `[a, b]` / `{k=v}`      | `Array` / `Map`             | the matching bracket/brace  |
+    | `<12 bytes>`            | `Bytes`                     | the `>`                     |
+    | `null`/`true`/`-1`/`.5` | `Null`/`Bool`/ints/floats   | the next space              |
+    | `2026-09-20T…Z`         | `Timestamp`                 | the next space              |
+
+    A string is returned decoded; a container is returned as its raw rendered text, which is all
+    this summary ever needs of one (nothing under `TAG_KEYS` is a container). The three
+    space-bearing forms -- a quoted string, a container, and `Bytes`'s `<N bytes>` -- are exactly
+    why an `attrs` line cannot be split on whitespace, and why this is a scanner rather than a
+    `str.split`.
+    """
+    c = text[i]
+    if c == '"':
+        return parse_quoted(text, i)
+    if c in "[{":
+        end = skip_container(text, i)
+        return text[i:end], end
+    if c == "<":
+        # `Value::Bytes` -> `<12 bytes>`: bare, and it contains a space.
+        end = text.find(">", i)
+        if end < 0:
+            raise ValueError(f"unterminated <N bytes> in {text!r}")
+        return text[i : end + 1], end + 1
+    end = text.find(" ", i)
+    end = len(text) if end < 0 else end
+    return text[i:end], end
+
+
 def parse_attrs(text: str) -> dict[str, str]:
     """Parses one `attrs` line's space-separated `key=value` pairs.
 
-    Values that are strings are always quoted by the renderer (`render_value` -> quoted), so the
-    quoting is what makes a value containing a space unambiguous; numeric and boolean values are
-    bare. Keys are bare unless they need quoting.
+    `render_attrs`/`render_merged_attrs` write `key=value` pairs separated by a single space, the
+    key through `render_key` (bare when identifier-shaped, quoted and escaped otherwise) and the
+    value through `render_value`. Both sides can therefore contain spaces, `=`, commas, brackets
+    and quotes, so both are read by a scanner that knows the grammar -- see `parse_value`.
+
+    Values are returned as text: decoded for a string, raw rendered text for an array or a map.
+    Only `TAG_KEYS` are ever read back out, and `shape`'s own tags are all plain strings; the rest
+    are parsed to find where the next pair starts, not for their content.
     """
     attrs: dict[str, str] = {}
     i = 0
@@ -106,17 +178,16 @@ def parse_attrs(text: str) -> dict[str, str]:
         if text[i] == '"':
             key, i = parse_quoted(text, i)
         else:
-            end = text.index("=", i)
+            end = text.find("=", i)
+            if end < 0:
+                raise ValueError(f"no = after key at {i} in {text!r}")
             key, i = text[i:end], end
-        assert text[i] == "=", f"expected = at {i} in {text!r}"
+        if i >= len(text) or text[i] != "=":
+            raise ValueError(f"expected = at {i} in {text!r}")
         i += 1
-        if i < len(text) and text[i] == '"':
-            value, i = parse_quoted(text, i)
-        else:
-            end = text.find(" ", i)
-            end = len(text) if end < 0 else end
-            value, i = text[i:end], end
-        attrs[key] = value
+        if i >= len(text):
+            raise ValueError(f"key {key!r} has no value in {text!r}")
+        attrs[key], i = parse_value(text, i)
     return attrs
 
 
@@ -427,6 +498,40 @@ SELF_TEST_RENDER = """2026-09-20T15:56:20.153724900Z
 """
 
 
+#: A second excerpt, structurally verbatim from a real `resource: keep` capture (the `oteldemo`
+#: producer's second, opt-in run, whose tap forwards the observed `Resource` so every resource
+#: attribute the OTel SDKs' `resource_detection` stamped lands on each record's `attrs` line).
+#: **The structure is the capture's; the values are not** -- hostnames, container ids, paths,
+#: pids, command lines and kernel strings are replaced with neutral placeholders, because
+#: `shape`'s whole contract is that a survey output can leave an environment the traffic could
+#: not, and that holds for a test fixture quoting one.
+#:
+#: Everything here is a real shape `parse_attrs` has to survive: an array of strings holding
+#: commas, spaces and an `=` (`process.command_args`, on the resource of every OTel SDK that
+#: detects a process -- which is what made a `resource: keep` capture unparseable), a bare integer
+#: beside it, empty quoted strings, and a quoted string carrying spaces, `=` and `:`.
+SELF_TEST_RESOURCE_KEEP = """2026-09-20T20:43:57.818255215Z
+  attrs   signal="log" source="otlp_gateway" tap="tap_input" process.pid=1 process.executable.path="/opt/app/bin/node" process.command_args=["/opt/app/bin/node", "--require=./Instrumentation.js", "/app/server.js"] process.command_line="/opt/jdk/bin/java -javaagent:/app/agent.jar -Xmx200m example.Service" host.name="host-placeholder" container.id="0000000000000000000000000000000000000000000000000000000000000000" service.name="frontend" os.description="Linux host-placeholder 0.0.0-0 #1 SMP PLACEHOLDER x86_64" host.cpu.cache.l2.size=1024 zone_name="" cluster_name=""
+  metric  logit.shape.attributes samples=[11,9] rate=1
+  metric  logit.shape.events sum=2 temporality=delta monotonic=true
+
+2026-09-20T20:43:57.818255215Z
+  attrs   signal="log" source="otlp_gateway" tap="tap_input" process.command_args=["./shipping"] service.name="shipping"
+  metric  logit.shape.attributes samples=[7] rate=1
+"""
+
+#: The remaining `Value` variants `render_value` can put on an `attrs` line, which no capture in
+#: hand happens to contain but any one of them could: a nested array, a `Value::Map` (what a
+#: `syslog_in` structured-data element becomes) including a nested one, a `Value::Bytes` (rendered
+#: `<N bytes>` -- bare, *with a space in it*), a quoted key needing quotes, and a string value
+#: carrying the delimiters `[`, `]`, `{`, `}`, `,`, `=`, a space and an escaped quote. Synthetic,
+#: and labelled as such: it is a grammar test, not a measurement.
+SELF_TEST_EXOTIC_VALUES = """2026-09-20T20:43:57.818255215Z
+  attrs   signal="metric" nested=[1, [2, 3], {a=1, b=[4, 5]}] sd={origin={ip="10.0.0.1", port=514}, note="a=b, c=d"} blob=<12 bytes> "odd key"="[{x=1}], \\"quoted\\"" source="syslog_in" tap="tap_input" trailing=true
+  metric  logit.shape.attributes samples=[6] rate=1
+"""
+
+
 def self_test() -> None:
     series = parse(SELF_TEST_RENDER)
 
@@ -486,7 +591,73 @@ def self_test() -> None:
     else:
         raise AssertionError("a sketched logit.shape.* series must fail the summary")
 
+    self_test_attrs_grammar()
     print("summarize: self-test passed")
+
+
+def self_test_attrs_grammar() -> None:
+    """The `attrs`-line grammar, over every `Value` variant `render_value` can emit.
+
+    This half exists because the parser used to split an `attrs` line as if a value never
+    contained a space unless it was quoted. An **array** value breaks that: it is rendered bare,
+    `[a, b]`, with spaces and commas inside, and its elements can be quoted strings carrying an
+    `=`. The old parser walked into the middle of one looking for the next key's `=`, found the
+    one inside `--require=./Instrumentation.js`, and asserted -- which made every `resource: keep`
+    capture unsummarizable, since `process.command_args` rides on the resource of every OTel SDK
+    that detects a process. `Value::Map` and `Value::Bytes` (`<12 bytes>`) have the same property.
+    """
+    keep = parse(SELF_TEST_RESOURCE_KEEP)
+
+    # The whole line parses, the pairs after the array are still found, and the array's own text
+    # comes back intact rather than as three garbled fragments.
+    line = SELF_TEST_RESOURCE_KEEP.splitlines()[1].strip()[len("attrs ") :].strip()
+    attrs = parse_attrs(line)
+    assert attrs["process.command_args"] == (
+        '["/opt/app/bin/node", "--require=./Instrumentation.js", "/app/server.js"]'
+    ), attrs["process.command_args"]
+    assert attrs["process.pid"] == "1", attrs["process.pid"]
+    assert attrs["service.name"] == "frontend", attrs["service.name"]
+    assert attrs["zone_name"] == "" and attrs["cluster_name"] == "", attrs
+    assert attrs["process.command_line"].startswith("/opt/jdk/bin/java -javaagent:"), attrs
+    assert attrs["host.cpu.cache.l2.size"] == "1024", attrs["host.cpu.cache.l2.size"]
+    # And `shape`'s own three tags -- the only ones the series key is built from -- survive
+    # having a dozen resource attributes, one of them an array, interleaved around them.
+    assert (attrs["signal"], attrs["source"], attrs["tap"]) == ("log", "otlp_gateway", "tap_input")
+
+    # Two blocks, same series key (the resource is not part of it, by design), so the samples
+    # concatenate exactly as they do for a `resource: drop` capture.
+    kept = keep[("logit.shape.attributes", "log", "otlp_gateway", "tap_input")]
+    assert kept.samples == [11.0, 9.0, 7.0], kept.samples
+    assert keep[("logit.shape.events", "log", "otlp_gateway", "tap_input")].total == 2.0
+    assert summarize(keep)["attribute_widths"], "a resource: keep capture must still summarize"
+
+    # Nested containers, a map, a `<N bytes>`, a quoted key, and a string value full of the
+    # delimiters. Every one of these ends where the renderer ended it, not at the next space.
+    exotic = SELF_TEST_EXOTIC_VALUES.splitlines()[1].strip()[len("attrs ") :].strip()
+    values = parse_attrs(exotic)
+    assert values["nested"] == "[1, [2, 3], {a=1, b=[4, 5]}]", values["nested"]
+    assert values["sd"] == '{origin={ip="10.0.0.1", port=514}, note="a=b, c=d"}', values["sd"]
+    assert values["blob"] == "<12 bytes>", values["blob"]
+    assert values["odd key"] == '[{x=1}], "quoted"', values["odd key"]
+    assert values["trailing"] == "true", values["trailing"]
+    assert (values["signal"], values["source"], values["tap"]) == (
+        "metric",
+        "syslog_in",
+        "tap_input",
+    ), values
+    assert len(values) == 8, sorted(values)
+    assert parse(SELF_TEST_EXOTIC_VALUES)[
+        ("logit.shape.attributes", "metric", "syslog_in", "tap_input")
+    ].samples == [6.0]
+
+    # A truncated container is a parse error, not a silently short attribute set: a half-written
+    # final line (a capture cut off mid-flush) must not read as a valid, narrower event.
+    for broken in ('a=[1, 2 b="x"', "a={k=1 b=2", "a=<12 bytes", "a="):
+        try:
+            parse_attrs(broken)
+        except ValueError:
+            continue
+        raise AssertionError(f"a malformed attrs line must raise, got a parse of {broken!r}")
 
 
 # ---- entry point ---------------------------------------------------------------------------------

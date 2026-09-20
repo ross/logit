@@ -560,27 +560,17 @@ PYEOF
 # how long it lasts when it happens.
 SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT=180
 
-# Per-service medians, which `summarize.py` cannot produce -- for two separate reasons, and the
-# second one is why this script parses `shape.log` with a regex rather than importing
-# summarize.py's own `parse_attrs`:
+# Per-service medians, which `summarize.py` cannot produce: its series key is the metric name plus
+# `shape`'s own `signal`/`source`/`tap` tags, so two services' samples collapse into one series
+# however many resource attributes rode along. This walks `shape.log` itself, reusing
+# summarize.py's own `parse_attrs` (its render parser is the thing under self-test; a second hand-
+# rolled one would be a second thing to get wrong) and grouping on `service.name` instead.
 #
-#   1. Its series key is the metric name plus `shape`'s own `signal`/`source`/`tap` tags, so two
-#      services' samples collapse into one series however many resource attributes rode along.
-#   2. **It cannot parse a `resource: keep` capture at all.** `parse_attrs` reads an `attrs` line
-#      as space-separated `key=value` pairs where a string value is quoted and anything else is
-#      bare -- and an *array* value is rendered bare, with spaces and commas inside it:
-#
-#        process.command_args=["/nodejs/bin/node", "--require=./Instrumentation.js", "/app/server.js"]
-#
-#      which makes the parser walk into the middle of the array looking for a `=` and assert. That
-#      is not exotic: `process.command_args` is on the resource of every OTel SDK that detects a
-#      process, so it is on nearly every batch here. With `resource: drop` (the main capture) no
-#      resource attribute reaches the render at all and the parser never sees one, which is why
-#      this only ever bites the keep run.
-#
-# So this script takes the two fields it actually needs -- `signal` and `service.name` -- off the
-# `attrs` line by regex, and ignores everything else on it. That is both narrower than a general
-# parser and immune to whatever else a resource happens to carry.
+# `parse_attrs` handles a `resource: keep` line's array values -- `process.command_args`, on the
+# resource of every OTel SDK that detects a process, renders bare with spaces, commas and an `=`
+# inside it. It did not always: that was a real parser bug, and fixing it is what let this run go
+# back through `survey_summarize` at all. summarize.py's own `--self-test` now carries a
+# structurally-verbatim `resource: keep` line (with neutral values) so it cannot regress.
 survey_oteldemo_keep_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
@@ -588,36 +578,33 @@ survey_oteldemo_keep_section_py() {
 
 Reads /out/shape.log directly, which the main run's section script deliberately does not: with
 `resource: keep`, `service.name` is on each record's `attrs` line but is not one of summarize.py's
-series-key tags, so summary.json would have pooled every service together even if it could be
-written -- and it cannot, for the array-value reason in this script's caller.
+series-key tags, so summary.json has already pooled every service together by the time it is
+written. The parsing itself is summarize.py's (`parse_attrs`), imported rather than re-implemented
+-- its render parser is the thing under `--self-test`, including a `resource: keep` line's array
+values; a second hand-rolled one here would be a second thing to get wrong.
 
 Its output NAMES SERVICES and stays in this run directory.
 """
 
+import importlib.util
 import pathlib
-import re
 import statistics
 from collections import defaultdict
 
-#: Just the two fields this needs, off the `attrs` line. Both are `shape`-side string values and
-#: so always quoted by the renderer; nothing else on the line is looked at.
-SIGNAL = re.compile(r'(?:^|\s)signal="([^"]*)"')
-SERVICE = re.compile(r'(?:^|\s)service\.name="([^"]*)"')
+spec = importlib.util.spec_from_file_location("summarize", "/tools/summarize.py")
+summarize = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(summarize)
 
 # (metric, signal, service) -> samples
 buckets: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
-signal = service = ""
+tags: dict[str, str] = {}
 for raw in pathlib.Path("/out/shape.log").read_text().splitlines():
     if not raw or not raw.startswith(" "):
-        signal = service = ""
+        tags = {}
         continue
     line = raw.strip()
     if line.startswith("attrs "):
-        body = line[len("attrs ") :]
-        found = SIGNAL.search(body)
-        signal = found.group(1) if found else ""
-        found = SERVICE.search(body)
-        service = found.group(1) if found else "(no service.name)"
+        tags = summarize.parse_attrs(line[len("attrs ") :].strip())
         continue
     if not line.startswith("metric "):
         continue
@@ -627,7 +614,8 @@ for raw in pathlib.Path("/out/shape.log").read_text().splitlines():
     values = rendered[len("samples=[") : rendered.index("]")]
     if not values:
         continue
-    buckets[(name, signal, service)].extend(float(v) for v in values.split(","))
+    key = (name, tags.get("signal", ""), tags.get("service.name", "(no service.name)"))
+    buckets[key].extend(float(v) for v in values.split(","))
 
 
 def rows(metric):
@@ -691,13 +679,11 @@ survey_oteldemo_keep_run() {
     survey_capture_for "${duration}"
     stop_logit
 
-    # **No `survey_summarize` here, deliberately.** `summarize.py` cannot parse a `resource: keep`
-    # capture: the resource attributes now on every record's `attrs` line include array values
-    # (`process.command_args`, on the resource of every OTel SDK that detects a process), which its
-    # `parse_attrs` walks into and asserts on. It is not this producer's file to change, and this
-    # run does not need it -- the cross-producer numbers all come from the main capture one level
-    # up, and the one thing this run exists for is the per-service table below, which
-    # `summarize.py` could not have produced anyway (its series key has no room for a resource).
+    # The ordinary path, like every other capture here: summary.json/summary.md for this run's own
+    # pooled numbers (the series key has no room for a resource, so they are pooled across
+    # services exactly as the main capture's are), and then the per-service table below, which is
+    # the one thing only a `resource: keep` capture can produce.
+    survey_summarize >/dev/null
     survey_oteldemo_keep_section_py >"${keep_dir}/per-service.py"
     survey_python keep-section -- python3 /out/per-service.py
 
