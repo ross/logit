@@ -1124,6 +1124,66 @@ even with `series_retention` set — retention exists specifically for a gauge's
 semantics, which nothing about a raw sample or set member shares (see
 [ADR `aggregation-window-semantics`](adr/aggregation-window-semantics.md)'s amendment).
 
+## Measuring a flow's shape with `shape`
+
+`shape` answers "what do the events on this leg actually look like?" — how many attributes they
+carry, how long their keys and values are, how deeply their values nest, how many metric records
+ride on each one, how many distinct key-sets a source produces, and how many events arrive per
+batch. It is a transform, so it goes on its own branch of an ordinary fan-out; it rewrites each
+event it sees into a measurement of that event and drops the original payload, so it must never sit
+in the flow you care about. [`examples/shape-tap.yaml`](../examples/shape-tap.yaml) is the runnable
+shape:
+
+```
+statsd ─┬─> rollup ─> metrics          (the real pipeline, unchanged)
+        └─> tap ─> shape_rollup ─> shape_out
+```
+
+**It emits counts and lengths only** — never an attribute key, an attribute value, a log body, or a
+metric name, in a metric, a tag, a diagnostic or a telemetry point
+([ADR `shape-observer-component`](adr/shape-observer-component.md)). That is the property to rely
+on if you want to send the result somewhere the traffic itself could never go: what leaves the tap
+describes the traffic's shape, not a sample of it. Two things to know about the edges:
+
+- `resource: drop` (the default) replaces the batch's `Resource` with an empty one, so no resource
+  attribute value flows out. `resource: keep` forwards it unchanged — set it only when a
+  per-service breakdown downstream is worth that identity travelling with the measurements.
+- The batch's `Scope` passes through either way. A scope names an instrumentation library rather
+  than carrying payload, and a transform has no hook to substitute one.
+
+**Put an `aggregate` after it.** Every distribution-shaped quantity goes out raw (one
+`MetricKind::Samples` value per key, per value, per nested map, per batch), because summarization is
+an explicit, operator-chosen stage in `logit` — see "Raw samples and set members" above. The default
+`distributions: sketch` gives you percentiles; `distributions: samples` keeps the exact values if
+you are collecting a survey rather than watching a dashboard.
+
+**Two taps measure how much an event widens.** Put one straight off the listener and one after your
+transform chain; each tags its output with its own component name (`tap`), so the two stay distinct
+series through a shared `aggregate`. Measurements are also tagged `source` (the batch's origin
+component) and, per event, `signal` — `log`, `metric`, `span`, or a `+`-joined combination — so
+signal co-occurrence falls out as an ordinary tag value.
+
+**A tap is not free, and you should remove it when you're done.** Adding one turns a
+single-consumer edge — which costs nothing at all — into a fan-out with a *mutating* branch. What
+that costs depends on what the other branch is: against a sink it is racy (one `Arc`, plus a whole-
+batch clone only when the timing goes the wrong way), against another transform or a Lua stage one
+of the two always clones. `docs/design/memory.md` §3 has the shape-by-shape account. The tap's own
+per-event cost is pinned in `crates/logit-bench/tests/allocations.rs`.
+
+**What to watch:** `logit.shape.tracking_overflow` (gauge, 0/1) — one of the two cumulative tables
+hit its cap (`max_tracked_keys`/`max_tracked_keysets`, both 4096 by default), after which new keys
+and key-sets are counted rather than tracked; `logit.shape.distinct_keys` and `.distinct_keysets`
+become lower bounds, and `.keyset_share.top1`/`.top5` under-report. Raise the cap or, better, put a
+`keep` in front of the tap so it measures the key-set you actually intend to carry.
+`logit.transform.keys.untracked`/`.keysets.untracked` (count) are the matching drop counters, and
+`logit.transform.batches.dropped` fires when more than 4096 batches arrive in one flush window —
+shorten `interval`, or accept that the per-batch distribution is a sample of the window rather than
+all of it. All three counters name nothing observed; they are counts, like everything else here.
+
+Note that `shape`'s idea of "a batch" is whatever its upstream delivered: a listener's accumulator
+flush by default, the wire's own grouping when that listener runs `receive.batch_max_events: 1`, and
+always the wire's grouping for `otlp_in` and `prometheus_in`, which have no accumulator.
+
 ## `otlp_in`: put `keep` in front of it
 
 `otlp_in`'s attribute *keys* are arbitrary peer-supplied strings, not something `logit`'s own

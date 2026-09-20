@@ -1739,3 +1739,34 @@ already built that have a known, accepted rough edge.
   nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
   cadence entirely is real future work this effort didn't answer, not an oversight — the harness is
   built and runnable by hand, and nothing wires it into CI, a pre-merge gate, or a schedule yet.
+
+- **`shape`'s cumulative gauges are since process start, not windowed.**
+  `logit.shape.distinct_keys`, `.distinct_keysets`, `.keyset_share.top1`/`.top5` and
+  `.tracking_overflow` (`crates/logit-transforms/src/shape.rs`,
+  [ADR `shape-observer-component`](adr/shape-observer-component.md)) accumulate from startup and
+  are re-reported unchanged on every flush; they never reset. For the survey this instrument was
+  built for that is what's wanted — a capture's whole key-set population, not the last ten seconds'
+  — but it means a long-lived tap's distinct-key count only ever rises, so it cannot show that a
+  producer *stopped* emitting a key, and `tracking_overflow` latches at `1` for the life of the
+  process once either cap is hit. A windowed variant (a second set of gauges reset per flush, or a
+  decaying table) is real future work; restarting the process is the only reset today.
+
+- **`shape` tracks top-level attribute keys only.** A nested `Value::Map`'s keys are counted in
+  that map's width (`logit.shape.nested_map_width`) and its values in the per-type counters, but
+  they never enter the distinct-key set or the key-set hash. Two events whose top-level keys match
+  and whose nested maps differ entirely are one key-set as far as `logit.shape.distinct_keysets` is
+  concerned. This is deliberate — the key-set identity is what `AttrMap`'s own sorted `Symbol`
+  sequence gives for free, and the sizing questions the survey feeds
+  (`docs/design/memory.md` §8) are about the top-level map — but it means a shop whose width lives
+  under a `k8s`/`labels` map reads as narrow on the distinct-key gauges and wide only on the nested
+  ones. Read the two together.
+
+- **A batch's `Scope` passes through `shape` untouched, unlike its `Resource`.** `resource: drop`
+  substitutes an empty `Resource` so no resource attribute value leaves the tap, but there is no
+  equivalent for `Scope`: `Transform` has no scope-substitution hook, and adding one every
+  implementer would have to carry, for this one component, wasn't judged worth it
+  ([ADR `shape-observer-component`](adr/shape-observer-component.md)). A scope names an
+  instrumentation library rather than carrying payload, so this is a narrow exception to the
+  counts-only property rather than a hole in it — but an `otlp_in` whose senders put identifying
+  information in `Scope.attributes` should know that it rides through. `shape`'s *flush* output
+  carries no scope at all (a window spans many batches, so there is no single one to keep).

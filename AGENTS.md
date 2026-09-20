@@ -274,7 +274,20 @@ that field's `other` (or is removed) rather than an unbounded new series, with a
 `normalize:` step (today just ASCII-lowercasing) applied and written back before the allow test
 ([ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md)).
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) now runs one, clamping `$host`
-ahead of `aggregate`.
+ahead of `aggregate`. `shape` is the newest real, implemented `ComponentKind`, and the odd one out
+among the transforms: it is an *observer*, tapped off a flow by ordinary fan-out and never placed
+in it, rewriting every event it sees into a measurement of that event's own shape -- attribute and
+nested-map counts, key/value byte lengths, a per-type value count, metric and span widths, tagged
+`signal`/`source`/`tap` -- plus, on its `interval`, per-batch measurements (events, resource/scope
+attribute counts, distinct key-sets per batch) and cumulative gauges (distinct keys, distinct
+key-sets, top-1/top-5 key-set share, an overflow flag). It emits **counts and lengths only**, never
+an observed key, value, body or metric name, in a metric, tag, diagnostic or telemetry point --
+that property is the point, and it is what a reviewer should check first on any change to it. Raw
+`Samples` out, never a sketch: an `aggregate` downstream summarizes, per `lossless-transit`
+([ADR `shape-observer-component`](docs/adr/shape-observer-component.md),
+[examples/shape-tap.yaml](examples/shape-tap.yaml),
+[docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md) -- W1 of the survey this
+instrument exists to collect).
 
 ## Environment
 
@@ -452,7 +465,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

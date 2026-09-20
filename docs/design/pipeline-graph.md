@@ -113,6 +113,11 @@ pub enum ComponentKind {
     // Matches a pattern against a log message (or a named attribute), turning named capture
     // groups into attributes (docs/adr/regex-transform.md).
     Regex { pattern: String, field: Option<String> },
+    // Rewrites each event into a measurement of its own shape -- counts and lengths only, never a
+    // key or a value -- with per-batch and cumulative measurements on `interval`. Belongs on its
+    // own fan-out branch, never in the flow it measures (docs/adr/shape-observer-component.md).
+    Shape { interval: Duration, resource: ShapeResource, max_tracked_keys: usize,
+            max_tracked_keysets: usize },
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
@@ -145,7 +150,7 @@ UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well afte
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`,
-and any future native transform — take no suffix; there's only ever one direction for a transform
+`shape`, and any future native transform — take no suffix; there's only ever one direction for a transform
 to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
@@ -191,7 +196,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -710,6 +715,14 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     against it would only refuse a configuration that works. Datagram listeners only — rule 17 has
     already rejected a non-default `read_batch` on every other kind, so anything reaching this
     check carries the default and cannot fail it.
+58. A `shape`'s `max_tracked_keys` or `max_tracked_keysets` of `0` is rejected
+    ([ADR `shape-observer-component`](../adr/shape-observer-component.md)) — rules 9/15/18/28/45's
+    impossible-bound shape again. A cap of `0` tracks nothing at all, so `logit.shape.distinct_keys`
+    and `.distinct_keysets` would read `0` and `logit.shape.tracking_overflow` `1` forever, from a
+    component that looks configured. There is deliberately no "turn the table off" spelling: the
+    cumulative gauges are half of what `shape` is for, so an operator who doesn't want them removes
+    the component. `shape`'s `interval` needs no rule of its own — it joins `aggregate`'s and
+    `internal`'s in rule 9's `interval()` table.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
