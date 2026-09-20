@@ -69,18 +69,19 @@ throughput pressure.** The cost of the Lua route, measured (`docs/design/memory.
 | | Lua node | Native `Transform` node |
 |---|---|---|
 | Allocations/event | **9** (`memory.md`'s `run_lua: set_resource + process + take_resource` row) | **1** (`memory.md`'s `process_batch` through `keep` row — `process_batch`'s own `Vec`) |
-| Throughput | **1.07 µs/event** (`memory.md`'s `lua (proxy)` bench) | **360 ns/event** (`memory.md`'s `process_batch through keep` bench) |
+| Throughput | **1.61 µs/event** (`memory.md`'s `lua (proxy)` bench) | **525 ns/event** (`memory.md`'s `process_batch through keep` bench) |
 | Concurrency | one dedicated OS thread **and** one LuaJIT VM *per node* — `crates/logit-pipeline/src/runtime.rs`'s `run_with_telemetry` spawns each Lua component via `std::thread::Builder::new().name(format!("logit-{id}")).spawn(move \|\| run_lua(...))` | an ordinary tokio task in the shared runtime (`crates/logit-pipeline/src/transform.rs`'s own module doc: a native transform "runs as an ordinary tokio task in the node runtime, unlike a Lua component, which needs its own OS thread") |
 
 **The honest scale reading, so the trigger has teeth rather than being decorative:** at
 sidecar/host-agent volume — thousands of events/sec, the deployment shape this project expects for
-most users (`docs/OVERVIEW.md`) — the ~0.7 µs delta per event per filter is roughly 0.5% of one
+most users (`docs/OVERVIEW.md`) — the ~1.1 µs delta per event per filter is roughly 0.5% of one
 core, and a handful of extra OS threads is noise. It becomes real specifically in the
 central-aggregator role: at roughly 500k events/sec, a three-way routing diamond spends on the
-order of a full core answering boolean questions that a native transform would answer for a third
-of that. Per-node throughput is single-threaded either way in both routes — only the constant
-differs, by roughly 3×. If and when that pressure is actually measured against a real config (not
-assumed), this decision is the one to revisit, and the alternative below is where to resume.
+order of one and a half to two cores answering boolean questions that a native transform would
+answer for a third of that. Per-node throughput is single-threaded either way in both routes —
+only the constant differs, by roughly 3×. If and when that pressure is actually measured against a
+real config (not assumed), this decision is the one to revisit, and the alternative below is where
+to resume.
 
 ## Alternatives considered
 
