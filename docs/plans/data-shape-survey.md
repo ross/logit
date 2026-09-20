@@ -177,6 +177,23 @@ As built, it reproduces exactly — events per datagram `[1×48, 7×1, 8×3, 10�
 attributes per event `[0×38, 1×17, 5×4, 6×9, 7×20, 8×32]` over the corpus's 56 datagrams and 120
 lines.
 
+**The `exporters` producer** is the first captured-from-scratch one: official exporter images
+(node_exporter, postgres_exporter, redis_exporter, nginx-prometheus-exporter, blackbox_exporter's
+`/probe` and its own `client_golang` registry) in **default** configuration, one `prometheus_in`
+per target so `source` separates them, at a 5s interval for ≥10 scrapes each. At a scrape-mode tap
+`logit.shape.attributes` *is* labels per series and `logit.shape.batch.events` *is* series per
+scrape; `instance`/`prometheus.target` ride on the resource (dropped at the tap), so a count is the
+wire's own labels plus `prometheus.type` on an untyped family. cAdvisor is **not** captured: it
+needs more than read-only `/`, `/sys` and `/var/lib/docker` on this daemon (`inotify_add_watch
+/sys/fs/cgroup: permission denied` without `--privileged`), and the run records that rather than
+measuring a privileged configuration nobody would call default. Series counts from idle
+single-instance services are a floor; the label *structure* is not.
+
+**`combine.py`** folds N run directories into one cross-producer report — one table per dimension,
+one row per producer × source × tap × signal, each row carrying its run's representativeness line.
+That is what W3's tables get written from, and it recomputes the >4/>8/>12/>16 spill fractions from
+`summary.json`'s exact value→count tables rather than re-reading any capture.
+
 **Every producer states its representativeness in one line**, written into the run's
 `provenance.txt` and printed by `summarize.py` as the banner at the top of `summary.md`, above any
 number. That is structural rather than a footnote because these tables get quoted: the `demo`
