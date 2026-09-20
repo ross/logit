@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Fold a `shape.log` capture into `summary.json` + `summary.md`, for `script/shape-survey`.
+
+Parses `stdio_out`/`file_out`'s human render (`crates/logit-outputs/src/stdio.rs`) -- the only
+text output in `logit` that emits **raw metric values** rather than re-sketched quantiles, which
+is why a survey writes its capture through `file_out` and reads it back here rather than through
+`influxdb_out` or `prometheus_out`.
+
+What it does with each `logit.shape.*` record, per series (a series being the metric name plus the
+`signal`/`source`/`tap` tags `shape` stamps):
+
+  samples=[...]  concatenated across every flush window in the capture -- these are raw
+                 observations, one per event (or per batch), and a survey wants the whole
+                 population, not a per-window summary of it
+  sum=           summed (a counter, delta temporality from `aggregate`)
+  gauge=         last value wins (cumulative-since-start gauges: distinct keys, key-set shares)
+
+**A sketched `logit.shape.*` series is a hard failure.** `aggregate` falls back from raw retention
+to a `DdSketch` past `max_samples_per_series`, which renders as `distribution count=N p50=...`;
+every distribution in this output would then be a silently truncated, silently approximated
+answer to the question the survey is asking. Rather than summarize that, this exits non-zero and
+names the series, so the config's `max_samples_per_series` gets raised instead.
+
+Percentiles are **nearest-rank** (the smallest value at or above the p-th position of the sorted
+sample), stated as such in the output. A p99 is refused below 100 values and a p90 below 10 --
+printed `n/a`, never a number computed from too few observations to mean one -- and every table
+carries its own value count beside it.
+
+Stdlib only, so it runs in a bare `python:3.12-slim` with no `pip install` step, the same
+constraint `tools/record-fixtures/raw_capture.py` has.
+
+Usage:
+    summarize.py --shape-log /out/shape.log --out-dir /out
+    summarize.py --self-test        # parse an embedded sample of the real render, check the numbers
+"""
+
+import argparse
+import json
+import math
+import pathlib
+import sys
+from collections import Counter, OrderedDict
+
+#: The tags `shape` stamps on everything it emits (docs/adr/shape-observer-component.md). A series
+#: is identified by its metric name plus these, in this order.
+TAG_KEYS = ("signal", "source", "tap")
+
+#: The attribute-count thresholds the survey exists to answer (`AttrMap`'s inline capacity is 8
+#: today; docs/design/memory.md §8). Reported as "fraction of events wider than this".
+WIDTH_THRESHOLDS = (4, 8, 12, 16)
+
+#: Below this many values a p99 is not printed at all, and below `MIN_FOR_P90` a p90 is not.
+MIN_FOR_P99 = 100
+MIN_FOR_P90 = 10
+
+
+# ---- parsing -------------------------------------------------------------------------------------
+
+
+def parse_quoted(text: str, i: int) -> tuple[str, int]:
+    """Reads one `"..."` token starting at `text[i]`, undoing `render_quoted_str`'s escapes."""
+    assert text[i] == '"'
+    out: list[str] = []
+    i += 1
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            return "".join(out), i + 1
+        if c == "\\":
+            nxt = text[i + 1]
+            if nxt == "x":
+                out.append(chr(int(text[i + 2 : i + 4], 16)))
+                i += 4
+                continue
+            out.append({"n": "\n", "r": "\r", "t": "\t"}.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    raise ValueError(f"unterminated quoted string in {text!r}")
+
+
+def parse_attrs(text: str) -> dict[str, str]:
+    """Parses one `attrs` line's space-separated `key=value` pairs.
+
+    Values that are strings are always quoted by the renderer (`render_value` -> quoted), so the
+    quoting is what makes a value containing a space unambiguous; numeric and boolean values are
+    bare. Keys are bare unless they need quoting.
+    """
+    attrs: dict[str, str] = {}
+    i = 0
+    while i < len(text):
+        if text[i] == " ":
+            i += 1
+            continue
+        if text[i] == '"':
+            key, i = parse_quoted(text, i)
+        else:
+            end = text.index("=", i)
+            key, i = text[i:end], end
+        assert text[i] == "=", f"expected = at {i} in {text!r}"
+        i += 1
+        if i < len(text) and text[i] == '"':
+            value, i = parse_quoted(text, i)
+        else:
+            end = text.find(" ", i)
+            end = len(text) if end < 0 else end
+            value, i = text[i:end], end
+        attrs[key] = value
+    return attrs
+
+
+class Series:
+    """One metric name + tag set, and everything the capture said about it."""
+
+    def __init__(self, name: str, tags: dict[str, str]) -> None:
+        self.name = name
+        self.tags = tags
+        self.samples: list[float] = []
+        self.total: float | None = None
+        self.gauge: float | None = None
+
+    def key(self) -> tuple:
+        return (self.name, *(self.tags.get(k, "") for k in TAG_KEYS))
+
+
+def parse(text: str) -> "OrderedDict[tuple, Series]":
+    """Parses a whole `shape.log` into series.
+
+    A block starts at any line with no leading whitespace (`render_event_block` writes the
+    timestamp flush left and indents everything else). `attrs` carries the block's tags; every
+    `metric` line in the block belongs to them.
+    """
+    series: OrderedDict[tuple, Series] = OrderedDict()
+    tags: dict[str, str] = {}
+    sketched: list[str] = []
+
+    for raw in text.splitlines():
+        if not raw or not raw.startswith(" "):
+            tags = {}
+            continue
+        line = raw.strip()
+        if line.startswith("attrs "):
+            tags = parse_attrs(line[len("attrs ") :].strip())
+            continue
+        if not line.startswith("metric "):
+            continue
+        body = line[len("metric ") :].strip()
+        name, _, rendered = body.partition(" ")
+        if not name.startswith("logit.shape."):
+            # Anything else sharing the sink (a pipeline's own `internal` leg, say) is not this
+            # survey's subject. Skipped rather than an error: a producer is free to point other
+            # traffic at the same file_out.
+            continue
+        entry = series.setdefault((name, *(tags.get(k, "") for k in TAG_KEYS)), Series(name, tags))
+
+        if rendered.startswith("samples=["):
+            values = rendered[len("samples=[") : rendered.index("]")]
+            if values:
+                entry.samples.extend(float(v) for v in values.split(","))
+        elif rendered.startswith("sum="):
+            entry.total = (entry.total or 0.0) + float(rendered[len("sum=") :].split(" ")[0])
+        elif rendered.startswith("gauge="):
+            entry.gauge = float(rendered[len("gauge=") :].split(" ")[0])
+        elif rendered.startswith("distribution "):
+            sketched.append(f"{name}{sorted(tags.items())}")
+        else:
+            raise ValueError(f"unrecognized metric render: {body!r}")
+
+    if sketched:
+        raise SystemExit(
+            "summarize: a logit.shape.* series was rendered as a DdSketch, not raw samples:\n  "
+            + "\n  ".join(sorted(set(sketched)))
+            + "\nThat means `aggregate` fell back past `max_samples_per_series` and the values"
+            " behind it are gone. Raise that limit in the config; do not summarize this capture."
+        )
+    return series
+
+
+# ---- statistics ----------------------------------------------------------------------------------
+
+
+def nearest_rank(sorted_values: list[float], q: float) -> float:
+    """Nearest-rank percentile: the value at ceil(q * n) in a 1-based sorted sample."""
+    rank = max(1, math.ceil(q * len(sorted_values)))
+    return sorted_values[rank - 1]
+
+
+def describe(values: list[float]) -> dict:
+    """Count/min/max/mean/percentiles, with percentiles withheld below their own minimums."""
+    ordered = sorted(values)
+    n = len(ordered)
+    stats: dict = {
+        "count": n,
+        "min": ordered[0],
+        "max": ordered[-1],
+        "mean": sum(ordered) / n,
+        "p50": nearest_rank(ordered, 0.50),
+        "p90": nearest_rank(ordered, 0.90) if n >= MIN_FOR_P90 else None,
+        "p99": nearest_rank(ordered, 0.99) if n >= MIN_FOR_P99 else None,
+    }
+    if all(float(v).is_integer() for v in ordered):
+        # An exact value->count table, which for a count-shaped series (attributes per event,
+        # events per batch) is strictly more informative than any percentile -- the survey's
+        # whole question is "what fraction sits at or above N", and this answers it for every N.
+        stats["histogram"] = {str(int(v)): c for v, c in sorted(Counter(ordered).items())}
+    return stats
+
+
+def width_fractions(values: list[float]) -> dict[str, float]:
+    n = len(values)
+    return {f">{t}": sum(1 for v in values if v > t) / n for t in WIDTH_THRESHOLDS}
+
+
+def fmt(value) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, float):
+        return f"{value:.0f}" if float(value).is_integer() else f"{value:.2f}"
+    return str(value)
+
+
+# ---- rendering -----------------------------------------------------------------------------------
+
+
+def render_markdown(summary: dict) -> str:
+    out: list[str] = []
+    out.append("# Event-shape survey")
+    out.append("")
+    out.append(
+        "Percentiles are **nearest-rank** over the whole capture (every flush window's raw"
+        f" samples concatenated). A p99 is `n/a` below {MIN_FOR_P99} values and a p90 below"
+        f" {MIN_FOR_P90}: too few observations to mean one. Every table carries its own value"
+        " count."
+    )
+    out.append("")
+
+    dists = summary["distributions"]
+    if dists:
+        out.append("## Per-event and per-batch distributions")
+        out.append("")
+        out.append("| metric | signal | source | tap | n | min | p50 | p90 | p99 | max | mean |")
+        out.append("|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|")
+        for row in dists:
+            s = row["stats"]
+            out.append(
+                f"| `{row['metric']}` | {row['signal'] or '-'} | {row['source'] or '-'} |"
+                f" {row['tap'] or '-'} | {s['count']} | {fmt(s['min'])} | {fmt(s['p50'])} |"
+                f" {fmt(s['p90'])} | {fmt(s['p99'])} | {fmt(s['max'])} | {fmt(s['mean'])} |"
+            )
+        out.append("")
+
+    widths = summary["attribute_widths"]
+    if widths:
+        out.append("## Attribute width per event")
+        out.append("")
+        out.append(
+            "The fraction of events carrying **more than** N top-level attributes --"
+            " `AttrMap`'s inline capacity is 8 today (docs/design/memory.md §8), so `>8` is the"
+            " spill fraction at the current constant."
+        )
+        out.append("")
+        out.append("| signal | source | tap | events | p50 | p90 | p99 | max | >4 | >8 | >12 | >16 |")
+        out.append("|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+        for row in widths:
+            s, f = row["stats"], row["fractions"]
+            out.append(
+                f"| {row['signal'] or '-'} | {row['source'] or '-'} | {row['tap'] or '-'} |"
+                f" {s['count']} | {fmt(s['p50'])} | {fmt(s['p90'])} | {fmt(s['p99'])} |"
+                f" {fmt(s['max'])} | {f['>4']:.1%} | {f['>8']:.1%} | {f['>12']:.1%} |"
+                f" {f['>16']:.1%} |"
+            )
+        out.append("")
+
+    counters = summary["counters"]
+    if counters:
+        out.append("## Counters")
+        out.append("")
+        out.append("| metric | signal | source | tap | total |")
+        out.append("|---|---|---|---|--:|")
+        for row in counters:
+            out.append(
+                f"| `{row['metric']}` | {row['signal'] or '-'} | {row['source'] or '-'} |"
+                f" {row['tap'] or '-'} | {fmt(row['total'])} |"
+            )
+        out.append("")
+
+    gauges = summary["gauges"]
+    if gauges:
+        out.append("## Cumulative gauges (last value in the capture)")
+        out.append("")
+        out.append(
+            "Cumulative since process start, not windowed, and over top-level keys only"
+            " (docs/known-gaps.md). `keyset_share.top1`/`top5` are the share of all events"
+            " carried by the most common one and five key-sets."
+        )
+        out.append("")
+        out.append("| metric | source | tap | value |")
+        out.append("|---|---|---|--:|")
+        for row in gauges:
+            out.append(
+                f"| `{row['metric']}` | {row['source'] or '-'} | {row['tap'] or '-'} |"
+                f" {fmt(row['value'])} |"
+            )
+        out.append("")
+
+    return "\n".join(out) + "\n"
+
+
+def summarize(series: "OrderedDict[tuple, Series]") -> dict:
+    summary: dict = {
+        "percentile_method": "nearest-rank",
+        "min_values_for_p90": MIN_FOR_P90,
+        "min_values_for_p99": MIN_FOR_P99,
+        "distributions": [],
+        "attribute_widths": [],
+        "counters": [],
+        "gauges": [],
+    }
+    for entry in series.values():
+        tags = {k: entry.tags.get(k, "") for k in TAG_KEYS}
+        if entry.samples:
+            stats = describe(entry.samples)
+            summary["distributions"].append({"metric": entry.name, **tags, "stats": stats})
+            if entry.name == "logit.shape.attributes":
+                summary["attribute_widths"].append(
+                    {**tags, "stats": stats, "fractions": width_fractions(entry.samples)}
+                )
+        if entry.total is not None:
+            summary["counters"].append({"metric": entry.name, **tags, "total": entry.total})
+        if entry.gauge is not None:
+            summary["gauges"].append({"metric": entry.name, **tags, "value": entry.gauge})
+
+    for section in ("distributions", "attribute_widths", "counters", "gauges"):
+        summary[section].sort(key=lambda row: (row.get("metric", ""), row["source"], row["tap"], row["signal"]))
+    return summary
+
+
+# ---- self-test -----------------------------------------------------------------------------------
+
+#: A verbatim excerpt of a real `shape.log` (the interop producer's own first run), kept here so a
+#: change to `stdio_out`'s human render fails this test rather than silently producing an empty
+#: summary from a capture that took real traffic to collect. `script/shape-survey` runs
+#: `--self-test` before every survey for exactly that reason.
+SELF_TEST_RENDER = """2026-09-20T15:56:20.153724900Z
+  attrs   signal="metric" source="statsd_in" tap="tap_input"
+  metric  logit.shape.events sum=3 temporality=delta monotonic=true
+  metric  logit.shape.attributes samples=[7,7,0] rate=1
+  metric  logit.shape.value_depth samples=[0,0,0] rate=1
+  metric  logit.shape.key_bytes samples=[3,11,4,8,6,20,9] rate=1
+  metric  logit.shape.values.string sum=14 temporality=delta monotonic=true
+
+2026-09-20T15:56:20.153724900Z
+  attrs   source="statsd_in" tap="tap_input"
+  metric  logit.shape.batch.events samples=[1,1,2] rate=1
+
+2026-09-20T15:56:20.153724900Z
+  attrs   tap="tap_input"
+  metric  logit.shape.distinct_keys gauge=9
+  metric  logit.shape.keyset_share.top1 gauge=0.5
+  metric  logit.shape.tracking_overflow gauge=0
+"""
+
+
+def self_test() -> None:
+    series = parse(SELF_TEST_RENDER)
+
+    attrs = series[("logit.shape.attributes", "metric", "statsd_in", "tap_input")]
+    assert attrs.samples == [7.0, 7.0, 0.0], attrs.samples
+    stats = describe(attrs.samples)
+    assert stats["count"] == 3 and stats["min"] == 0.0 and stats["max"] == 7.0, stats
+    # Nearest-rank p50 of [0,7,7] is the 2nd of 3 values.
+    assert stats["p50"] == 7.0, stats
+    assert stats["p90"] is None and stats["p99"] is None, "too few values to quote either"
+    assert stats["histogram"] == {"0": 1, "7": 2}, stats["histogram"]
+    fractions = width_fractions(attrs.samples)
+    assert fractions[">4"] == 2 / 3 and fractions[">8"] == 0.0, fractions
+
+    events = series[("logit.shape.events", "metric", "statsd_in", "tap_input")]
+    assert events.total == 3.0, events.total
+
+    keys = series[("logit.shape.key_bytes", "metric", "statsd_in", "tap_input")]
+    assert len(keys.samples) == 7 and max(keys.samples) == 20.0, keys.samples
+
+    batch = series[("logit.shape.batch.events", "", "statsd_in", "tap_input")]
+    assert batch.samples == [1.0, 1.0, 2.0], batch.samples
+
+    gauge = series[("logit.shape.distinct_keys", "", "", "tap_input")]
+    assert gauge.gauge == 9.0, gauge.gauge
+    share = series[("logit.shape.keyset_share.top1", "", "", "tap_input")]
+    assert share.gauge == 0.5, share.gauge
+
+    summary = summarize(series)
+    assert len(summary["attribute_widths"]) == 1, summary["attribute_widths"]
+    assert "Attribute width per event" in render_markdown(summary)
+
+    # And the guard itself: a sketched shape series must stop the run, not be summarized.
+    sketched = (
+        "2026-09-20T15:56:20.153724900Z\n"
+        '  attrs   signal="metric" source="statsd_in" tap="tap_input"\n'
+        "  metric  logit.shape.attributes distribution count=4096 p50=6 p90=9 p99=12\n"
+    )
+    try:
+        parse(sketched)
+    except SystemExit as err:
+        assert "DdSketch" in str(err), err
+    else:
+        raise AssertionError("a sketched logit.shape.* series must fail the summary")
+
+    print("summarize: self-test passed")
+
+
+# ---- entry point ---------------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--shape-log", help="the file_out capture to parse")
+    ap.add_argument("--out-dir", help="where summary.json / summary.md are written")
+    ap.add_argument("--self-test", action="store_true", help="check the parser against a real render")
+    args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
+    if not args.shape_log or not args.out_dir:
+        ap.error("--shape-log and --out-dir are required unless --self-test is given")
+
+    text = pathlib.Path(args.shape_log).read_text()
+    series = parse(text)
+    if not series:
+        print(f"summarize: no logit.shape.* records in {args.shape_log}", file=sys.stderr)
+        sys.exit(1)
+    summary = summarize(series)
+
+    out_dir = pathlib.Path(args.out_dir)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=False) + "\n")
+    markdown = render_markdown(summary)
+    (out_dir / "summary.md").write_text(markdown)
+    print(markdown)
+
+
+if __name__ == "__main__":
+    main()
