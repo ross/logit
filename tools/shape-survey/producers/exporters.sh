@@ -180,8 +180,10 @@ out.append(
     " per scrape** (one exporter's whole `/metrics` response is one batch). `instance` and"
     " `prometheus.target` are on the *resource*, which this tap drops, so a row's attribute count"
     " is the exposition line's own labels plus `prometheus.type` where the family's wire type has"
-    " no distinct model kind (`unknown`/`info`/`stateset`/`gaugehistogram`) -- read it as **wire"
-    " labels + 0 or 1**."
+    " no distinct model kind (`untyped`/`unknown`, `info`, `stateset`, `gaugehistogram`) -- read it"
+    " as **wire labels + 0 or 1**. That second case is real rather than hypothetical:"
+    " node_exporter answers in text 0.0.4 and leaves its whole `node_netstat_*`/`node_vmstat_*`"
+    " surface untyped, so about 2% of its series here carry that one extra attribute."
 )
 out.append("")
 out.append("| exporter | what it watches | scrapes | series/scrape min | median | max |")

@@ -22,7 +22,10 @@
 # attributes are the exposition line's own labels plus at most:
 #
 #   * `prometheus.type`      on a family whose wire type the model has no distinct kind for
-#                            (`unknown`, `info`, `stateset`, `gaugehistogram`), and
+#                            (`untyped`/`unknown`, `info`, `stateset`, `gaugehistogram`) -- which
+#                            is not hypothetical here: node_exporter answers in text 0.0.4 and
+#                            emits its whole `node_netstat_*`/`node_vmstat_*` surface untyped, so
+#                            ~2% of its series carry this one extra attribute, and
 #   * `prometheus.timestamp` when the exposition line carried its own timestamp (exporters here
 #                            do not, so this should not appear at all).
 #
