@@ -205,17 +205,50 @@ producer therefore also labels each tier with whether its format is the software
 (HAProxy's `option httplog`, Postgres's `jsonlog`, Redis's log line, Docker's json-file envelope)
 or one of ours, and `summarize.py` renders that table above the distributions.
 
-| Capture | Signals | Box |
-|---|---|---|
-| `demo/` as it stands (nginx, haproxy, postgres, redis, Django, Celery) | logs | 15 min under `traffic` |
-| `demo/` with an OpenTelemetry auto-instrumentation overlay on Django and Celery → `otlp_in` (an overlay; `demo/` itself unchanged) | all three | 15 min; also yields the static-to-runtime correction factor |
-| OpenTelemetry Demo → `otlp_in` | all three | one 30-minute run — the most expensive item for one archetype, so boxed hardest |
-| node_exporter, cAdvisor, postgres and redis exporters → `prometheus_in` | metrics | 10 scrapes; kube-state-metrics Counted from published output unless a `kind` cluster is trivial |
-| Telegraf and collectd default plugin sets → `statsd_in`/`collectd_in`/`graphite_in` | metrics | 10 min |
-| Real JSON loggers (pino, structlog, zap, lograge) in minimal apps → `syslog_in`/`tail_in` + `json` | logs | replaces `fixtures.rs`'s "no live pino process was captured" caveat |
-| Loghub samples → `tail_in` | logs | body length only |
+### What was actually built and run
+
+Six producers, all captured. The window is each producer's default, overridable per run.
+
+| Producer | What it captures | Signals | Window |
+|---|---|---|---|
+| `interop` | every recorded corpus under `testdata/interop/` replayed at the listener that decoded it — statsd, syslog (UDP and a real RFC 6587 TCP stream), collectd, carbon plaintext and pickle, Prometheus remote-write, OTLP/JSON. Also the instrument's acceptance test | all three | corpus-driven |
+| `exporters` | node, postgres, redis, nginx, blackbox and Go-runtime exporters, official images in default configuration, one `prometheus_in` per target at 5 s | metrics | 70 s (≥10 scrapes each) |
+| `applogs` | eight log streams from five tiny HTTP apps — structlog, python-json-logger (both its documented and its bare-default config), pino-http, bare pino, Go `log/slog`, zap, semantic_logger — each through `tail_in` + `json`; plus one Django app under `opentelemetry-instrument` straight into `otlp_in` with no Collector | all three | 300 s |
+| `oteldemo` | the OpenTelemetry Demo at a pinned tag, cloned at run time, under its own Locust generator, through the demo's own Collector into `otlp_in` | all three | 1200 s, plus an opt-in 180 s `resource: keep` run |
+| `hostagents` | collectd and Telegraf in default configuration over five wires at once: collectd binary, carbon plaintext from each agent, a scraped Telegraf Prometheus endpoint, Telegraf OTLP/gRPC | metrics | 600 s, then a 180 s wire-grouped second run |
+| `demo` | this repo's own `demo/` stack, config generated from `demo/logit.yaml` at run time through a compose overlay; `demo/` itself untouched | logs, spans | 900 s |
 
 Raw captures never enter the repo.
+
+### Deviations from the planned capture list, and why
+
+The table above replaced the one this plan opened with. Four planned items were not captured, and
+one was replaced; none of it is a gap somebody forgot.
+
+- **kube-state-metrics was not captured.** It needs a real cluster (`kind` or otherwise) to have
+  any objects to report on, and an empty one reports an empty shape. Nothing was counted from
+  published output in its place either, so there is no kube-state-metrics row at all.
+- **cAdvisor was not captured.** It cannot start without `--privileged` on this daemon
+  (`inotify_add_watch /sys/fs/cgroup: permission denied` with read-only `/`, `/sys` and
+  `/var/lib/docker`), and a survey does not run a privileged container to measure a label set.
+  `exporters`' `provenance.txt` records the attempt and the error.
+- **Loghub samples were not replayed.** The item was body-length-only from the start, and every
+  other producer now measures body length from live software; a corpus of anonymized 2010s log
+  files would have added a row whose provenance nobody could state in one line.
+- **Rails/lograge was not captured.** lograge is a Rails railtie with no supported use outside
+  Rails, and a `gem install rails` + `rails new` inside an image build is minutes of build for four
+  routes. The brief's own fallback, **semantic_logger**'s `formatter: :json`, was taken instead —
+  so `applogs`' Ruby row is a semantic_logger row, not a Rails row, and its provenance says so.
+- **Postgres-backed Django was not captured.** `applogs`' Django leg runs on **sqlite**. The dbapi
+  span comes from the same `opentelemetry-instrumentation-dbapi` either way, but sqlite's carries
+  no network peer, so that span's attribute count sits at the low end of the desk range rather than
+  the middle.
+- **The `demo/` OpenTelemetry overlay was replaced.** Rather than bolt auto-instrumentation onto
+  `demo/`'s Django and Celery tiers, `applogs` runs a **standalone** auto-instrumented Django app —
+  at the owner's request, because `demo/` numbers carry little weight (the stack exists to
+  demonstrate `logit`, and several of the formats it measures were authored here). The
+  static-to-runtime correction factor the overlay was meant to yield is produced there instead, and
+  `applogs`' own summary section prints the desk count beside the measured one per span kind.
 
 ## W3 — synthesis
 

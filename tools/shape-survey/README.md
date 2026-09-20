@@ -19,6 +19,88 @@ SHAPE_SURVEY_SKIP_IMAGE=1 script/shape-survey interop  # reuse the already-built
 SHAPE_SURVEY_OUT=/tmp/x script/shape-survey interop    # write runs somewhere else
 ```
 
+## Producers
+
+Six, discovered by glob from `producers/*.sh`. Each row's **representativeness** is the line that
+producer passes to `survey_provenance`, verbatim — it is what `summarize.py` prints as
+`summary.md`'s banner and what `combine.py` puts on every row it contributes, so it is the thing
+to read before any number below it.
+
+| producer | what it runs, and how it reaches `logit` | signals | taps | default window |
+|---|---|---|---|---|
+| `interop` | **No live software.** `replay.py` re-sends every recorded corpus under `testdata/interop/` at the listener that decoded it — statsd (UDP), syslog (UDP *and* a real RFC 6587 TCP stream), collectd (UDP), carbon plaintext and pickle (TCP), Prometheus remote-write (HTTP), OTLP/JSON logs+metrics+traces (HTTP) | log, metric, span | `tap_input` on every leg; `tap_landed` on the two syslog legs (the only ones with a real chain) | corpus-driven (no window) |
+| `exporters` | Six official Prometheus exporter images in default configuration — node, postgres, redis, nginx, blackbox, and the Go runtime — against idle single-instance Postgres/Redis/nginx, scraped by `prometheus_in` at 5 s | metric | one per exporter (`tap_<exporter>`); no second tap — a scrape arrives finished | 70 s |
+| `applogs` | Eight log streams from five tiny HTTP apps (structlog, python-json-logger ×2, pino-http, pino, Go `log/slog`, zap, semantic_logger), each writing JSON lines a `tail_in` follows, plus one Django app under `opentelemetry-instrument` exporting OTLP/gRPC straight to `otlp_in` with no Collector | log, metric, span | shared `tap_input` (raw line) **and** one `tap_<stream>` after `json`; `tap_django` (one tap, all three signals) | 300 s |
+| `oteldemo` | The **OpenTelemetry Demo** at a pinned tag, shallow-cloned at run time, under its own Locust load generator, exporting through the demo's **own** Collector into `otlp_in` | log, metric, span | `tap_input` only — the events arrive finished from a real collector | 1200 s (+ an opt-in 180 s `resource: keep` second capture) |
+| `hostagents` | collectd and Telegraf, each from its own official distribution in **default** configuration, over five wires at once: collectd binary (UDP), carbon plaintext from each agent (TCP), a Telegraf Prometheus endpoint scraped, and Telegraf OTLP/gRPC | metric | one per wire (`tap_<leg>`); no second tap — agent output arrives finished | 600 s, then a second 180 s run |
+| `demo` | This repository's **own** `demo/` stack (nginx, HAProxy, Postgres, Redis, a Django app, a Celery worker, a traffic generator), config generated from `demo/logit.yaml` at run time through a compose overlay | log, span | `tap_input` and `tap_landed` per tier | 900 s |
+
+| producer | representativeness (verbatim) |
+|---|---|
+| `interop` | *recorded real producers running synthetic workloads -- grammar/packing evidence, not traffic mix* |
+| `exporters` | *official exporter images in default configuration against idle single-instance services -- label/series structure per exporter; series counts scale with real object counts and are a floor* |
+| `applogs` | *real logging libraries at pinned versions in their documented production configuration, in minimal apps under a synthetic request mix -- library record structure; no application-specific fields an operator would add, so widths are a floor. Django leg: SDK defaults with auto-instrumentation, no collector enrichment* |
+| `oteldemo` | *OpenTelemetry Demo &lt;tag&gt;: real SDK auto-instrumentation in ~10 languages under a synthetic load generator, via the demo's own collector -- a demo app: every instrumentation enabled at once, no operator-added context, no production enrichment* |
+| `hostagents` | *collectd and Telegraf with their distro/default plugin sets inside containers on an idle host -- agent packing and identity structure; device/filesystem counts, and so series counts, are a floor* (each run then names its own variant: default batching, or wire grouping) |
+| `demo` | *own demo stack -- harness exercise; not evidence of production shape* |
+
+### Caveats each author recorded
+
+Every one of these is in the producer's own header or its `provenance.txt`; they are collected here
+so a reader comparing two rows of `combine.py`'s output does not have to open six files.
+
+- **`exporters`** — **cAdvisor is not captured.** It was tried and could not start without
+  `--privileged` (`inotify_add_watch /sys/fs/cgroup: permission denied`), and a survey does not run
+  a privileged container to measure a label set. Series counts are a floor everywhere: one idle
+  container has fewer block devices, filesystems and interfaces than a real host, and
+  `node_exporter`'s row scales with those. The *label structure* is not a floor — it is the
+  exporter's own.
+- **`oteldemo`** — the demo's **`docker_stats` receiver is dropped**, the one deviation from its
+  own pipelines: it cannot reach `/var/run/docker.sock` on an SELinux-enforcing host, and it
+  measures the daemon rather than application SDK output. The clone is **relabelled** (`chcon -R -t
+  container_file_t`) on such a host, on this run's own freshly-cloned copy and nothing else. Only
+  the demo's **core `compose.yaml`** layer is run (its own "core/minimal" set), and even that
+  **peaks around 20 GB of RAM** — budget for it before starting a second survey beside it.
+- **`applogs`** — **Rails and lograge were dropped.** lograge is a Rails railtie with no supported
+  use outside Rails, and a `rails new` inside an image build costs minutes to measure four routes;
+  the brief's own fallback, **semantic_logger**'s JSON formatter, was taken instead, so the Ruby row
+  is not a Rails row. The Django leg runs on **sqlite, not Postgres** — the dbapi span comes from
+  the same instrumentation either way, but sqlite's carries no network peer, so its attribute count
+  sits at the low end.
+- **`hostagents`** — **both graphite legs carry zero attributes** in the default configuration:
+  carbon's wire is one dotted name and one number, and neither agent is configured to emit tags, so
+  `logit.shape.attributes` is flat `0` there by construction rather than by accident. Telegraf's
+  **first** graphite connection is closed once by `graphite_in`'s 5 s `handshake_timeout` (Telegraf
+  connects before it has anything to write); it reconnects and the capture is unaffected, but the
+  `logit.log` line is expected, not a fault.
+- **`demo`** — the weakest evidence in the harness and the best exercise of it; see
+  "Representativeness is structural" below, and `source-labels.json` for which tiers' formats this
+  repository authored.
+
+### `resource: keep` captures
+
+`oteldemo`'s optional second run (`SHAPE_SURVEY_OTELDEMO_KEEP=1`) forwards the observed `Resource`
+instead of dropping it, so `aggregate` keys its series per resource and a **per-service** breakdown
+becomes possible — the one question a pooled capture structurally cannot answer when nine SDKs are
+feeding one gateway.
+
+**That capture is identity-bearing and stays in its run directory.** Keeping the resource means
+`service.name`, `host.name`, `container.id` and everything else `resource_detection` stamped reach
+`shape.log`, which is exactly what `resource: drop` exists to deny. It writes to its own
+`resource-keep/` subdirectory with its own provenance saying so; `perf/results/` is gitignored, and
+nothing derived from it belongs in a shared summary or in this repository.
+
+It summarizes through the ordinary `summarize.py` path like any other capture. It did not always:
+`parse_attrs` used to split an `attrs` line as if a value never contained a space unless it was
+quoted, which an *array* value does — `process.command_args` rides on the resource of every OTel SDK
+that detects a process, rendered bare as `["/usr/bin/node", "--require=…", …]` — so the parser
+walked into the array and asserted. The parser now knows the whole `render_value` grammar (arrays,
+maps, nested ones, `<N bytes>`, and strings carrying the delimiters), and `--self-test` carries a
+structurally-verbatim keep-capture line, with neutral values, so it cannot regress. Note that
+`summarize.py`'s series key is still the metric name plus `signal`/`source`/`tap` — it has no room
+for a resource, so its tables stay **pooled** across services. The per-service split is the
+producer's own `per-service.md`, and that file names services.
+
 ## Two surveys at once
 
 **Two `script/shape-survey <producer>` invocations may run at the same time on one docker daemon**
