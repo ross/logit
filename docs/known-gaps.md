@@ -1770,3 +1770,18 @@ already built that have a known, accepted rough edge.
   counts-only property rather than a hole in it — but an `otlp_in` whose senders put identifying
   information in `Scope.attributes` should know that it rides through. `shape`'s *flush* output
   carries no scope at all (a window spans many batches, so there is no single one to keep).
+
+- **Nothing bounds a single `shape` measurement event.** `logit.shape.key_bytes` and
+  `.value_bytes` carry one value per top-level key and per string leaf, so an event with ten
+  thousand attributes produces a ten-thousand-value `Samples` — the only bound is whatever bounded
+  the event that produced it. Every *table* in the component is capped and counted
+  (`max_tracked_keys`, `max_tracked_keysets`, the per-window batch cap); the per-event vectors are
+  the one place that discipline isn't applied, on the reasoning that truncating a measurement of
+  width at exactly the widths worth knowing about defeats the instrument. A per-event value cap
+  with a drop counter is the obvious fix if a tap ever meets a genuinely pathological producer.
+
+- **`shape` measures `Resource`/`Scope` width as a count only.** `logit.shape.batch.resource_attributes`
+  and `.scope_attributes` are attribute counts per batch; there is no resource-side equivalent of
+  `key_bytes`/`value_bytes`/`nested_maps`. The per-batch cost `docs/design/memory.md` cares about
+  is therefore only half visible — a 20-attribute resource of short enums and one of long ARNs and
+  a nested label map read the same.
