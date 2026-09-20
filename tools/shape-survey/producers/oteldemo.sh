@@ -549,13 +549,38 @@ PYEOF
 # Mechanically it retargets `SURVEY_RUN_DIR` for the duration -- lib.sh's `start_logit`/
 # `stop_logit`/`survey_summarize` all read that one variable, so a second capture into a second
 # directory needs no change there and no second copy of any of them.
-SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT=300
+#
+# **It holds the whole 20-container stack up for its own window**, on top of whatever else shares
+# the daemon, so it is deliberately short. On one observed run its `survey_capture_for 300` took
+# 54 minutes of wall clock to spend 300 seconds of `sleep` -- three surveys and ~50 containers
+# were live on the workstation at the time, and `logit` itself logged `otlp_in` handshake timeouts
+# ("no first byte received within 5s") through the same stretch, so the host was genuinely starved
+# rather than this loop being wrong; the identical `survey_capture_for` had run 1200s in 20m54s an
+# hour earlier in the same invocation. Nothing here can prevent that, but a short window bounds
+# how long it lasts when it happens.
+SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT=180
 
-# Per-service medians, which `summarize.py` cannot produce: its series key is the metric name plus
-# `shape`'s own `signal`/`source`/`tap` tags, so two services' samples collapse into one series
-# however many resource attributes rode along. This walks `shape.log` itself, reusing
-# summarize.py's own `parse_attrs` (its render parser is the thing under self-test; a second hand-
-# rolled one would be a second thing to get wrong) and grouping on `service.name` instead.
+# Per-service medians, which `summarize.py` cannot produce -- for two separate reasons, and the
+# second one is why this script parses `shape.log` with a regex rather than importing
+# summarize.py's own `parse_attrs`:
+#
+#   1. Its series key is the metric name plus `shape`'s own `signal`/`source`/`tap` tags, so two
+#      services' samples collapse into one series however many resource attributes rode along.
+#   2. **It cannot parse a `resource: keep` capture at all.** `parse_attrs` reads an `attrs` line
+#      as space-separated `key=value` pairs where a string value is quoted and anything else is
+#      bare -- and an *array* value is rendered bare, with spaces and commas inside it:
+#
+#        process.command_args=["/nodejs/bin/node", "--require=./Instrumentation.js", "/app/server.js"]
+#
+#      which makes the parser walk into the middle of the array looking for a `=` and assert. That
+#      is not exotic: `process.command_args` is on the resource of every OTel SDK that detects a
+#      process, so it is on nearly every batch here. With `resource: drop` (the main capture) no
+#      resource attribute reaches the render at all and the parser never sees one, which is why
+#      this only ever bites the keep run.
+#
+# So this script takes the two fields it actually needs -- `signal` and `service.name` -- off the
+# `attrs` line by regex, and ignores everything else on it. That is both narrower than a general
+# parser and immune to whatever else a resource happens to carry.
 survey_oteldemo_keep_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
@@ -563,31 +588,36 @@ survey_oteldemo_keep_section_py() {
 
 Reads /out/shape.log directly, which the main run's section script deliberately does not: with
 `resource: keep`, `service.name` is on each record's `attrs` line but is not one of summarize.py's
-series-key tags, so summary.json has already pooled every service together by the time it is
-written. The parsing itself is summarize.py's (`parse_attrs`), imported rather than re-implemented.
+series-key tags, so summary.json would have pooled every service together even if it could be
+written -- and it cannot, for the array-value reason in this script's caller.
 
 Its output NAMES SERVICES and stays in this run directory.
 """
 
-import importlib.util
 import pathlib
+import re
 import statistics
 from collections import defaultdict
 
-spec = importlib.util.spec_from_file_location("summarize", "/tools/summarize.py")
-summarize = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(summarize)
+#: Just the two fields this needs, off the `attrs` line. Both are `shape`-side string values and
+#: so always quoted by the renderer; nothing else on the line is looked at.
+SIGNAL = re.compile(r'(?:^|\s)signal="([^"]*)"')
+SERVICE = re.compile(r'(?:^|\s)service\.name="([^"]*)"')
 
 # (metric, signal, service) -> samples
 buckets: defaultdict[tuple[str, str, str], list[float]] = defaultdict(list)
-tags: dict[str, str] = {}
+signal = service = ""
 for raw in pathlib.Path("/out/shape.log").read_text().splitlines():
     if not raw or not raw.startswith(" "):
-        tags = {}
+        signal = service = ""
         continue
     line = raw.strip()
     if line.startswith("attrs "):
-        tags = summarize.parse_attrs(line[len("attrs ") :].strip())
+        body = line[len("attrs ") :]
+        found = SIGNAL.search(body)
+        signal = found.group(1) if found else ""
+        found = SERVICE.search(body)
+        service = found.group(1) if found else "(no service.name)"
         continue
     if not line.startswith("metric "):
         continue
@@ -597,8 +627,7 @@ for raw in pathlib.Path("/out/shape.log").read_text().splitlines():
     values = rendered[len("samples=[") : rendered.index("]")]
     if not values:
         continue
-    key = (name, tags.get("signal", ""), tags.get("service.name", "(no service.name)"))
-    buckets[key].extend(float(v) for v in values.split(","))
+    buckets[(name, signal, service)].extend(float(v) for v in values.split(","))
 
 
 def rows(metric):
@@ -662,7 +691,13 @@ survey_oteldemo_keep_run() {
     survey_capture_for "${duration}"
     stop_logit
 
-    survey_summarize >/dev/null
+    # **No `survey_summarize` here, deliberately.** `summarize.py` cannot parse a `resource: keep`
+    # capture: the resource attributes now on every record's `attrs` line include array values
+    # (`process.command_args`, on the resource of every OTel SDK that detects a process), which its
+    # `parse_attrs` walks into and asserts on. It is not this producer's file to change, and this
+    # run does not need it -- the cross-producer numbers all come from the main capture one level
+    # up, and the one thing this run exists for is the per-service table below, which
+    # `summarize.py` could not have produced anyway (its series key has no room for a resource).
     survey_oteldemo_keep_section_py >"${keep_dir}/per-service.py"
     survey_python keep-section -- python3 /out/per-service.py
 
@@ -762,9 +797,22 @@ survey_oteldemo() {
     survey_python section -- python3 /out/section.py
     survey_summarize --append section.md
 
-    # Opt-in, and after the main capture is fully summarized, so a failure here cannot cost the
-    # run its own result. The stack is still up (`survey_compose`'s teardown runs at cleanup).
+    # Opt-in, and after the main capture is fully summarized, so nothing here can cost the run its
+    # own result. The stack is still up (`survey_compose`'s teardown runs at cleanup).
+    #
+    # `|| { ...; true; }` rather than a bare call: this is a supplementary capture, the main
+    # summary is already on disk, and the survey's own rule is that a run fails loudly *about the
+    # thing it was measuring*. A failure in the identity-bearing extra should be a loud warning
+    # that leaves `${run_dir}` intact, not a non-zero exit that makes a completed 20-minute
+    # capture look like a failed one. `SURVEY_RUN_DIR` is restored here too, because the keep run
+    # retargets it and an early exit would otherwise leave it pointing at the subdirectory.
     if [ -n "${SHAPE_SURVEY_OTELDEMO_KEEP:-}" ]; then
-        survey_oteldemo_keep_run
+        survey_oteldemo_keep_run || {
+            SURVEY_RUN_DIR="${run_dir}"
+            echo "shape-survey: WARNING -- the resource: keep second capture failed." \
+                "The main capture in ${run_dir} is complete and unaffected; see" \
+                "${run_dir}/resource-keep/ for how far the second one got." >&2
+            true
+        }
     fi
 }
