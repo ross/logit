@@ -159,7 +159,13 @@ survey_cleanup() {
     done
     SURVEY_CONTAINERS=()
     SURVEY_COMPOSE_PROJECTS=()
-    [ -n "${SURVEY_NET}" ] && ${DOCKER} network rm "${SURVEY_NET}" >/dev/null 2>&1
+    # `|| true`, and not as an `&&` tail: cleanup runs twice on a normal run (once per producer in
+    # the dispatcher's loop, once more from the EXIT trap), so the second `network rm` always fails
+    # -- and a failing *last* command of an AND-OR list is exactly what `set -e` exits on, which
+    # would make a wholly successful survey exit 1 from inside its own trap.
+    if [ -n "${SURVEY_NET}" ]; then
+        ${DOCKER} network rm "${SURVEY_NET}" >/dev/null 2>&1 || true
+    fi
     return 0
 }
 
