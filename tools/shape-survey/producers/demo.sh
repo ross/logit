@@ -198,10 +198,15 @@ survey_demo() {
 
     # `logit`'s own healthcheck is `logit ready` against demo/logit.yaml's `admin:` block, so
     # compose's health state is the readiness signal here -- no blind sleep, same as start_logit.
-    local i state
+    # Compose names the container after the project, so it is asked for the id rather than
+    # guessed at: `docker inspect` on a name that does not exist prints an empty *stdout* line
+    # before failing, which quietly turned a later "healthy" into "\nhealthy" and never matched.
+    local i cid state=""
     for i in $(seq 1 180); do
-        state="$(${DOCKER} inspect --format '{{.State.Health.Status}}' logit-demo-logit 2>/dev/null ||
-            ${DOCKER} compose -f "${ROOT}/demo/compose.yaml" ps --format '{{.Health}}' logit 2>/dev/null)"
+        cid="$(survey_demo_compose ps -q logit 2>/dev/null || true)"
+        if [ -n "${cid}" ]; then
+            state="$(${DOCKER} inspect --format '{{.State.Health.Status}}' "${cid}" 2>/dev/null || true)"
+        fi
         [ "${state}" = "healthy" ] && break
         sleep 1
     done
