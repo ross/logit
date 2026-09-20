@@ -121,15 +121,26 @@ survey_out_dir() {
     echo "${SURVEY_RUN_DIR}"
 }
 
-# survey_provenance <producer>: writes the common half of provenance.txt -- date, this repo's git
-# SHA and dirty state, the docker and image identities. A producer appends its own software
-# versions to the same file (that is the half only it knows), e.g.
+# survey_provenance <producer> <representativeness>: writes the common half of provenance.txt --
+# date, this repo's git SHA and dirty state, the docker and image identities. A producer appends
+# its own software versions to the same file (that is the half only it knows), e.g.
 #   { echo "producer software:"; echo "  python: $(...)"; } >>"${SURVEY_RUN_DIR}/provenance.txt"
+#
+# **`<representativeness>` is required, and it is not decoration.** It is one line saying what kind
+# of traffic this producer's numbers are -- what docs/plans/data-shape-survey.md's grading calls
+# the representativeness axis (Demo / Default / Configured / Production). summarize.py reads it
+# straight out of provenance.txt and prints it as a banner at the top of summary.md, so a run's
+# numbers cannot be read, quoted or pasted without the caveat attached: a measurement of a stack
+# this project built to demonstrate itself is a harness exercise, not evidence about production
+# shape, and the difference has to travel with the number.
 survey_provenance() {
-    local producer="$1" file="${SURVEY_RUN_DIR}/provenance.txt"
+    local producer="$1" representativeness="$2" file="${SURVEY_RUN_DIR}/provenance.txt"
+    [ -n "${representativeness}" ] ||
+        survey_fail "survey_provenance: ${producer} passed no representativeness line"
     {
         echo "shape-survey provenance"
         echo "producer: ${producer}"
+        echo "representativeness: ${representativeness}"
         echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "host: $(uname -srm)"
         echo "repo: $(git -C "${ROOT}" rev-parse HEAD)"
@@ -241,8 +252,18 @@ survey_self_test() {
 
 # survey_summarize: parses SURVEY_RUN_DIR/shape.log into summary.json + summary.md, and prints the
 # markdown. Fails if the parser saw a sketched `logit.shape.*` series (see summarize.py).
+#
+# provenance.txt is always passed, for the representativeness banner. `source-labels.json` is
+# optional and producer-written: a `{"<source component>": {"tier": ..., "format": ...}}` map that
+# adds a per-source column to the summary, for a producer whose sources differ in where their
+# *format* came from (see producers/demo.sh, where some tiers log in their own software's default
+# shape and others in a format this repo authored -- measuring the latter is partly circular, and
+# the summary has to say which is which rather than leave it to a reader's memory).
 survey_summarize() {
     echo "shape-survey: summarizing ${SURVEY_RUN_DIR}/shape.log"
+    local labels=()
+    [ -f "${SURVEY_RUN_DIR}/source-labels.json" ] && labels=(--source-labels /out/source-labels.json)
     survey_python summarize -- \
-        python3 /tools/summarize.py --shape-log /out/shape.log --out-dir /out
+        python3 /tools/summarize.py --shape-log /out/shape.log --out-dir /out \
+        --provenance /out/provenance.txt "${labels[@]}"
 }

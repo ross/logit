@@ -29,8 +29,18 @@ carries its own value count beside it.
 Stdlib only, so it runs in a bare `python:3.12-slim` with no `pip install` step, the same
 constraint `tools/record-fixtures/raw_capture.py` has.
 
+Every summary opens with its run's **representativeness banner**, read from `provenance.txt`'s
+`representativeness:` line (which `lib.sh` requires every producer to supply). That is deliberate
+placement rather than a footnote: these numbers get quoted and pasted, and a measurement of a
+stack this project built to demonstrate itself says something very different from a measurement of
+a third-party producer. The banner travels with the table, so the two cannot be confused later.
+
+`--source-labels` optionally adds a per-source column saying where each source's *format* came
+from -- a tier logging in its own software's default shape is evidence about that software, and a
+tier logging in a format this repo authored is partly a measurement of our own choices.
+
 Usage:
-    summarize.py --shape-log /out/shape.log --out-dir /out
+    summarize.py --shape-log /out/shape.log --out-dir /out --provenance /out/provenance.txt
     summarize.py --self-test        # parse an embedded sample of the real render, check the numbers
 """
 
@@ -227,6 +237,36 @@ def render_markdown(summary: dict) -> str:
     out: list[str] = []
     out.append("# Event-shape survey")
     out.append("")
+    # The banner, before any number -- see this module's docstring. A run with no
+    # representativeness line at all says so loudly rather than opening with a bare table.
+    banner = summary.get("representativeness")
+    out.append(f"> **Representativeness:** {banner}" if banner else
+               "> **Representativeness: not stated** -- this run's provenance.txt carried no"
+               " `representativeness:` line, so nothing here should be quoted until it does.")
+    if summary.get("producer"):
+        out.append(f">")
+        out.append(f"> Producer: `{summary['producer']}`. Captured: {summary.get('captured', '?')}.")
+    out.append("")
+
+    labels = summary.get("source_labels") or {}
+    if labels:
+        out.append("## Where each source's format comes from")
+        out.append("")
+        out.append(
+            "A source logging in **its own software's default format** is evidence about that"
+            " software. A source logging in a format **this repository authored** is partly a"
+            " measurement of our own choices, and is circular to the degree it is quoted as"
+            " evidence about the wider world."
+        )
+        out.append("")
+        out.append("| source | tier | format origin |")
+        out.append("|---|---|---|")
+        for source, label in sorted(labels.items()):
+            out.append(
+                f"| `{source}` | {label.get('tier', '-')} | {label.get('format', '-')} |"
+            )
+        out.append("")
+
     out.append(
         "Percentiles are **nearest-rank** over the whole capture (every flush window's raw"
         f" samples concatenated). A p99 is `n/a` below {MIN_FOR_P99} values and a p90 below"
@@ -305,6 +345,22 @@ def render_markdown(summary: dict) -> str:
         out.append("")
 
     return "\n".join(out) + "\n"
+
+
+def read_provenance(path: pathlib.Path | None) -> dict:
+    """The banner fields out of a run's provenance.txt: `producer`, `representativeness`, `captured`.
+
+    A trivial `name: value` read of the file `lib.sh` writes, not a general parser -- everything
+    else in that file is for a human reading the run directory, not for this summary.
+    """
+    fields: dict = {}
+    if path is None or not path.is_file():
+        return fields
+    for line in path.read_text().splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name in ("producer", "representativeness", "captured"):
+            fields[name] = value.strip()
+    return fields
 
 
 def summarize(series: "OrderedDict[tuple, Series]") -> dict:
@@ -394,6 +450,16 @@ def self_test() -> None:
     assert len(summary["attribute_widths"]) == 1, summary["attribute_widths"]
     assert "Attribute width per event" in render_markdown(summary)
 
+    # The banner, and the loud absence of one. A summary that opened with a bare table would let a
+    # number from a stack we built to demo ourselves be read as evidence about the world.
+    assert "Representativeness: not stated" in render_markdown(summary)
+    banner = dict(summary, representativeness="own demo stack -- harness exercise", producer="demo")
+    rendered = render_markdown(banner)
+    assert rendered.index("own demo stack") < rendered.index("Attribute width"), rendered[:400]
+
+    labelled = dict(banner, source_labels={"nginx_in": {"tier": "nginx", "format": "authored here"}})
+    assert "Where each source's format comes from" in render_markdown(labelled)
+
     # And the guard itself: a sketched shape series must stop the run, not be summarized.
     sketched = (
         "2026-09-20T15:56:20.153724900Z\n"
@@ -419,6 +485,15 @@ def main() -> None:
     )
     ap.add_argument("--shape-log", help="the file_out capture to parse")
     ap.add_argument("--out-dir", help="where summary.json / summary.md are written")
+    ap.add_argument(
+        "--provenance",
+        help="the run's provenance.txt, whose `representativeness:` line becomes the banner",
+    )
+    ap.add_argument(
+        "--source-labels",
+        help='optional JSON: {"<source>": {"tier": ..., "format": ...}} -- where each source\'s'
+        " own log/metric format came from",
+    )
     ap.add_argument("--self-test", action="store_true", help="check the parser against a real render")
     args = ap.parse_args()
 
@@ -434,6 +509,9 @@ def main() -> None:
         print(f"summarize: no logit.shape.* records in {args.shape_log}", file=sys.stderr)
         sys.exit(1)
     summary = summarize(series)
+    summary.update(read_provenance(pathlib.Path(args.provenance) if args.provenance else None))
+    if args.source_labels:
+        summary["source_labels"] = json.loads(pathlib.Path(args.source_labels).read_text())
 
     out_dir = pathlib.Path(args.out_dir)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=False) + "\n")
