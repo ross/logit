@@ -1,0 +1,93 @@
+# The wire-grouping variant of hostagents.yaml -- identical pipeline, ports, and taps; the only
+# difference is `receive.batch_max_events: 1` on the three accumulator-fronted legs
+# (`collectd_network`, `graphite_collectd`, `graphite_telegraf`), so `logit.shape.batch.events`
+# reads as the wire's own grouping instead of the accumulator's regrouping. See hostagents.yaml's
+# header for the full picture and tools/shape-survey/producers/hostagents.sh for how the two
+# configs are run back to back against the same collectd/Telegraf processes.
+#
+# `prometheus_telegraf` and `otlp_telegraf` are unchanged: both bypass the accumulator in either
+# variant (`receive:` is not a valid field on either kind -- `logit validate` rejects it), so they
+# have no wire-grouping variant to provide.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  collectd_network:
+    type: collectd_in
+    bind: 0.0.0.0:25826
+    receive:
+      batch_max_events: 1
+
+  graphite_collectd:
+    type: graphite_in
+    bind: 0.0.0.0:2003
+    receive:
+      batch_max_events: 1
+
+  graphite_telegraf:
+    type: graphite_in
+    bind: 0.0.0.0:2004
+    receive:
+      batch_max_events: 1
+
+  prometheus_telegraf:
+    type: prometheus_in
+    scrape_targets: ["http://telegraf:9273/metrics"]
+    interval: 5s
+
+  otlp_telegraf:
+    type: otlp_in
+    bind: 0.0.0.0:4317
+    protocol: grpc
+
+  tap_collectd_network:
+    type: shape
+    sources: [collectd_network]
+    interval: 10s
+    resource: drop
+
+  tap_graphite_collectd:
+    type: shape
+    sources: [graphite_collectd]
+    interval: 10s
+    resource: drop
+
+  tap_graphite_telegraf:
+    type: shape
+    sources: [graphite_telegraf]
+    interval: 10s
+    resource: drop
+
+  tap_prometheus_telegraf:
+    type: shape
+    sources: [prometheus_telegraf]
+    interval: 10s
+    resource: drop
+
+  tap_otlp_telegraf:
+    type: shape
+    sources: [otlp_telegraf]
+    interval: 10s
+    resource: drop
+
+  shape_rollup:
+    type: aggregate
+    sources:
+      [
+        tap_collectd_network,
+        tap_graphite_collectd,
+        tap_graphite_telegraf,
+        tap_prometheus_telegraf,
+        tap_otlp_telegraf,
+      ]
+    interval: 10s
+    distributions: samples
+    max_samples_per_series: 5000000
+    max_retained_series: 1000000
+
+  shape_out:
+    type: file_out
+    sources: [shape_rollup]
+    path: /out/shape.log
+    rotate:
+      max_bytes: "64GiB"
