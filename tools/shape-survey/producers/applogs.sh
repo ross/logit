@@ -44,7 +44,10 @@ SHAPE_SURVEY_APPLOGS_DJANGO_RATE=8
 # they are this survey's own apps, pinned inside their Dockerfiles, and a rebuild is seconds once
 # the base layers are cached. Named `shape-survey-applogs-*` like everything else this harness
 # creates, and deliberately NOT removed at cleanup -- an image is not run state, and re-running the
-# survey should not pay for five rebuilds.
+# survey should not pay for five rebuilds. Not gated on `SHAPE_SURVEY_SKIP_IMAGE` either (the same
+# call `hostagents` makes for its collectd image): that variable exists for the one shared
+# `logit:shape-survey` tag two concurrent surveys race on, and these five are producer-local, so
+# nothing else can be rebuilding them underneath a running capture.
 survey_applogs_images() {
     local dir name
     for name in python node go ruby django; do
@@ -527,8 +530,14 @@ survey_applogs() {
     # more than one of them.
     survey_capture_for 20
 
-    { echo "lines written per app log file:"; wc -l "${run_dir}"/applogs/*.log | sed 's/^/  /'; } \
-        >>"${run_dir}/provenance.txt"
+    # File *names*, not paths: `wc -l ${run_dir}/applogs/*.log` writes this checkout's absolute
+    # path into provenance.txt, which `combine.py` then quotes verbatim in its appendix. A run
+    # directory's own layout is not something a shared summary should carry off the machine --
+    # the same reason `shape` reports counts and lengths and nothing else.
+    {
+        echo "lines written per app log file:"
+        ( cd "${run_dir}/applogs" && wc -l ./*.log ) | sed -e 's#\./##' -e 's/^/  /'
+    } >>"${run_dir}/provenance.txt"
 
     stop_logit
 
