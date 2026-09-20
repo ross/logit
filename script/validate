@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/validate
-# Runs `logit validate` over every shipped config -- demo/logit.yaml and every examples/*.yaml --
-# so a component field rename or a new validation rule doesn't silently leave a config broken.
+# Runs `logit validate` over every shipped config -- demo/logit.yaml, every examples/*.yaml, every
+# perf/scenarios/*.yaml and every tools/shape-survey/configs/*.yaml -- so a component field rename
+# or a new validation rule doesn't silently leave a config broken.
 # Part of script/cibuild. Needs INFLUXDB_TOKEN resolvable (every shipped config's `influxdb_out`
 # uses `!env INFLUXDB_TOKEN`, ADR `env-yaml-tag`), and PROMETHEUS_REMOTE_WRITE_AUTHORIZATION for
 # the one `prometheus_out` example that carries an auth header the same way.
@@ -29,7 +30,7 @@ fi
 cargo build --quiet -p logit-cli
 LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
-for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml; do
+for config in demo/logit.yaml examples/*.yaml perf/scenarios/*.yaml tools/shape-survey/configs/*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"
 done
