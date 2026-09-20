@@ -26,6 +26,9 @@ packages:
   - linux-perf # so `perf stat -e cycles true` can answer "does this guest have a hardware PMU"
               # in one command, without building crates/logit-perf/Dockerfile first -- see the
               # ADR's "no virtualized PMU" limitation
+  - tmux      # a long unattended measurement session runs inside one: it survives an SSH drop
+              # the way a bare shell command doesn't, and unlike `nohup` the operator can
+              # reattach to watch it (`script/vm shell 'tmux attach -t <name>'`)
 
 # bootcmd runs in cloud-init's `init` stage -- before `packages:` installs anything and long
 # before runcmd. That ordering matters: Debian's apt-daily / unattended-upgrades units fire on a
