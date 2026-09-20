@@ -22,7 +22,7 @@
 components:
   gen:
     type: generate_in
-    count: 7000000
+    count: 9500000
     event:
       log: '{{"host":"static.local","request_method":"GET","status":200,"body_bytes_sent":612,"request_time":0.001,"upstream_response_time":"0.004"}}'
 

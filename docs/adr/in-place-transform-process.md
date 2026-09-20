@@ -116,6 +116,15 @@ Consequences below say so explicitly.
 after is the W1 branch as measured (its tree is what PR #233 carries; the branch was later
 rewritten to fold two commits, byte-identical tree).
 
+> **Laptop numbers, kept as-is.** The 2026-09-20 effort that moved every other recorded performance
+> figure in this repo onto the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`)
+> deliberately did not re-run this specific before/after: the claim here is a same-day, same-box
+> *ratio* between two commits (a landed optimization's percentage improvement), not an absolute
+> throughput number, and re-measuring a already-landed, already-decided change on a different box
+> would cost VM time to reproduce a conclusion nobody doubts rather than to learn anything new.
+> Read every absolute figure below as this laptop, that day; read every percentage as the durable
+> content.
+
 **Microbenchmarks** (divan, `taskset -c 2`, fastest of three runs):
 
 | bench | before | after |
