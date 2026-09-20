@@ -1,0 +1,245 @@
+# The `applogs` producer's pipeline (tools/shape-survey/producers/applogs.sh) -- real structured-
+# logging libraries at pinned versions, each in its documented production configuration inside a
+# tiny HTTP app, plus one OpenTelemetry-auto-instrumented Django app, measured by `shape`
+# (docs/adr/shape-observer-component.md).
+#
+# TWO HALVES, MEASURED DIFFERENTLY
+#
+# A. The JSON loggers (tools/shape-survey/applogs/{python,node,go,ruby}/). Each app writes one JSON
+#    line per request to its own file on a shared volume; one `tail_in` per file follows it. The
+#    full two-tap pattern applies here and is the whole point:
+#
+#      <app>_in --+--> tap_input  (shape: the raw line -- 2 attributes, a long body)
+#                 |
+#                 +--> <app>_json (json) --> tap_<app> (shape: the line's fields as attributes,
+#                                                       its nested objects as nested maps)
+#
+#    `json` merges only the TOP level, so pino-http's `req`/`res` and semantic_logger's `payload`
+#    stay nested maps inside one attribute -- which is exactly the quantity
+#    docs/plans/data-shape-survey.md wants a real distribution of.
+#
+# B. The Django + OpenTelemetry leg. `otlp_in` receives traces, metrics and logs straight from the
+#    SDK -- no Collector in between, so the resource width measured here is the Python SDK's own.
+#    ONE tap, not two: these events arrive finished and structured, and a second tap would measure
+#    `shape` measuring an identity function (tools/shape-survey/README.md's "The config pattern").
+#
+# WHY THE TAPS ARE ARRANGED THE WAY THEY ARE
+#
+# `shape` tags every per-event and per-batch measurement with `source` (the origin component), so
+# eight sources through one `shape` stay separable -- but its four cumulative gauges
+# (`distinct_keys`, `distinct_keysets`, `keyset_share.top1`/`top5`) are per COMPONENT. So:
+#
+#   * ONE shared `tap_input` for all eight raw-line sources. At that tap every app's key-set is the
+#     same two `tail_in` attributes, so a per-app key-set table there would answer nothing.
+#   * ONE `shape` PER APP after its `json` stage, where the key-set *is* the library's record
+#     shape and "how many distinct key-sets does this library produce" is the question.
+#
+# NO `receive:` BLOCK: `tail_in` has none (it is not a datagram listener), so
+# `logit.shape.batch.events` on the file legs is the tailer's own read-chunk grouping rather than
+# a wire framing decision -- read it as "lines the tailer handed over at once", not as a producer's
+# packing. `otlp_in` bypasses the accumulator entirely, so ITS batch counts are the SDK's own
+# BatchSpanProcessor/BatchLogRecordProcessor export grouping, which is a real, interesting number.
+#
+# NO `set` STAGE ANYWHERE. `tail_in` stamps no resource attributes of its own, and this producer
+# adds none, so `logit.shape.batch.resource_attributes` is 0 on every file leg by construction --
+# leaving the Django leg's value as what it is: the number of attributes a default Python OTel SDK
+# Resource carries, with nothing of this repo's mixed in.
+admin:
+  # start_logit polls `logit ready` against this rather than sleeping.
+  bind: 0.0.0.0:9600
+
+components:
+  # -- A: one tail_in per log file -------------------------------------------------------------------
+  # Every app writes into /out/applogs/ on the run directory, which logit has mounted at /out.
+  # `read_from: beginning` so a line written between the app starting and logit's first scan is
+  # still captured; no checkpoint, because each run is a fresh directory and resuming would be
+  # meaningless.
+
+  # structlog, documented production JSON config. No default-configuration sibling: structlog's
+  # out-of-the-box renderer is ConsoleRenderer (text), not JSON -- see app_structlog.py.
+  structlog_prod_in:
+    type: tail_in
+    paths: ["/out/applogs/structlog-prod.log"]
+    read_from: beginning
+
+  # python-json-logger, the one Python library here with a real JSON default to contrast against:
+  # `JsonFormatter()` bare versus the quickstart's format-string form.
+  pyjson_prod_in:
+    type: tail_in
+    paths: ["/out/applogs/pyjson-prod.log"]
+    read_from: beginning
+
+  pyjson_default_in:
+    type: tail_in
+    paths: ["/out/applogs/pyjson-default.log"]
+    read_from: beginning
+
+  # pino + pino-http at pino-http's defaults -- the only app in this survey whose *library*
+  # decides the record's fields, via pino-std-serializers' nested `req`/`res` objects.
+  pino_http_in:
+    type: tail_in
+    paths: ["/out/applogs/pino-http.log"]
+    read_from: beginning
+
+  # A bare `pino()` logger, same eight fields, so the pair measures pino-http's serializers alone.
+  pino_default_in:
+    type: tail_in
+    paths: ["/out/applogs/pino-default.log"]
+    read_from: beginning
+
+  # Go's `log/slog` JSONHandler with nil options -- the default configuration, which for slog is
+  # also the only one.
+  slog_default_in:
+    type: tail_in
+    paths: ["/out/applogs/slog-default.log"]
+    read_from: beginning
+
+  # zap's `NewProductionConfig()`, sink redirected to a file and nothing else changed.
+  zap_prod_in:
+    type: tail_in
+    paths: ["/out/applogs/zap-prod.log"]
+    read_from: beginning
+
+  # semantic_logger with `formatter: :json` -- Ruby's stand-in for lograge, which needs Rails (see
+  # applogs/ruby/app.rb's header for why Rails was dropped).
+  semlog_prod_in:
+    type: tail_in
+    paths: ["/out/applogs/semlog-prod.log"]
+    read_from: beginning
+
+  # -- A, tap 1: the raw line ------------------------------------------------------------------------
+  # Straight off `tail_in`: a `LogRecord` whose body is the whole JSON line and whose attributes
+  # are the tailer's own file provenance. `body_bytes` here is the line length -- the "few
+  # attributes, long body" end of the two-tap comparison.
+  tap_input:
+    type: shape
+    sources:
+      [
+        structlog_prod_in,
+        pyjson_prod_in,
+        pyjson_default_in,
+        pino_http_in,
+        pino_default_in,
+        slog_default_in,
+        zap_prod_in,
+        semlog_prod_in,
+      ]
+    interval: 10s
+    # `drop` (the default), stated: no observed resource attribute leaves this pipeline.
+    resource: drop
+
+  # -- A, the realistic chain: parse the JSON --------------------------------------------------------
+  # One `json` per source rather than one shared stage, purely so each app can have its own
+  # `shape` downstream (see the header). `skip_to_brace` is off: every line here is JSON from its
+  # first byte, and turning it on would hide a library that ever emitted a prefix.
+  structlog_prod_json: { type: json, sources: [structlog_prod_in] }
+  pyjson_prod_json: { type: json, sources: [pyjson_prod_in] }
+  pyjson_default_json: { type: json, sources: [pyjson_default_in] }
+  pino_http_json: { type: json, sources: [pino_http_in] }
+  pino_default_json: { type: json, sources: [pino_default_in] }
+  slog_default_json: { type: json, sources: [slog_default_in] }
+  zap_prod_json: { type: json, sources: [zap_prod_in] }
+  semlog_prod_json: { type: json, sources: [semlog_prod_in] }
+
+  # -- A, tap 2: after parsing, one component per app ------------------------------------------------
+  tap_structlog_prod:
+    type: shape
+    sources: [structlog_prod_json]
+    interval: 10s
+    resource: drop
+
+  tap_pyjson_prod:
+    type: shape
+    sources: [pyjson_prod_json]
+    interval: 10s
+    resource: drop
+
+  tap_pyjson_default:
+    type: shape
+    sources: [pyjson_default_json]
+    interval: 10s
+    resource: drop
+
+  tap_pino_http:
+    type: shape
+    sources: [pino_http_json]
+    interval: 10s
+    resource: drop
+
+  tap_pino_default:
+    type: shape
+    sources: [pino_default_json]
+    interval: 10s
+    resource: drop
+
+  tap_slog_default:
+    type: shape
+    sources: [slog_default_json]
+    interval: 10s
+    resource: drop
+
+  tap_zap_prod:
+    type: shape
+    sources: [zap_prod_json]
+    interval: 10s
+    resource: drop
+
+  tap_semlog_prod:
+    type: shape
+    sources: [semlog_prod_json]
+    interval: 10s
+    resource: drop
+
+  # -- B: Django under opentelemetry-instrument ------------------------------------------------------
+  # OTLP/gRPC on 4317, which is what `opentelemetry-exporter-otlp`'s own default protocol is -- the
+  # SDK is left at its defaults apart from the endpoint and the logging opt-in (see the producer).
+  # Traces, metrics and logs all arrive on this one listener.
+  django_otlp_in:
+    type: otlp_in
+    bind: 0.0.0.0:4317
+    protocol: grpc
+
+  # One tap, and it carries all three signals: `shape` tags each measurement with `signal`
+  # (`logs`/`metrics`/`spans`, `+`-joined when an event carries several), so the span rows, the
+  # metric-data-point rows and the log rows stay separable inside one component while sharing its
+  # cumulative key tables -- which is what "how many distinct key-sets does one SDK's output have"
+  # means here.
+  tap_django:
+    type: shape
+    sources: [django_otlp_in]
+    interval: 10s
+    resource: drop
+
+  # -- the capture -----------------------------------------------------------------------------------
+  # `distributions: samples` keeps `shape`'s raw observations raw through the window;
+  # `max_samples_per_series` is far above what this capture can produce (tens of thousands of
+  # lines), and past it `aggregate` would fall back to a DdSketch and summarize.py would fail
+  # loudly rather than report an approximation as a measurement.
+  shape_rollup:
+    type: aggregate
+    sources:
+      [
+        tap_input,
+        tap_structlog_prod,
+        tap_pyjson_prod,
+        tap_pyjson_default,
+        tap_pino_http,
+        tap_pino_default,
+        tap_slog_default,
+        tap_zap_prod,
+        tap_semlog_prod,
+        tap_django,
+      ]
+    interval: 10s
+    distributions: samples
+    max_samples_per_series: 5000000
+    max_retained_series: 1000000
+
+  shape_out:
+    type: file_out
+    sources: [shape_rollup]
+    path: /out/shape.log
+    rotate:
+      # `file_out` requires a rotation trigger, and a survey that rotated would silently lose the
+      # start of its own capture.
+      max_bytes: "64GiB"
