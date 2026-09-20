@@ -136,21 +136,31 @@ survey_demo_config() {
 EOF
 }
 
+# The stack, under this run's own compose project. `survey_compose` does the namespacing, the
+# "somebody else's demo stack is already up" guard (demo/compose.yaml gives `nginx`/`redis` fixed
+# container names, since `docker_in` follows them by name, so only one can exist on a host) and the
+# teardown registration -- see lib.sh.
 survey_demo_compose() {
-    ${DOCKER} compose -f "${ROOT}/demo/compose.yaml" -f "${ROOT}/tools/shape-survey/demo-overlay.yaml" \
-        --env-file "${SURVEY_RUN_DIR}/compose.env" "$@"
+    survey_compose stack \
+        -f "${ROOT}/demo/compose.yaml" -f "${ROOT}/tools/shape-survey/demo-overlay.yaml" \
+        --env-file "${SURVEY_RUN_DIR}/compose.env" -- "$@"
+}
+
+# The readiness condition `survey_capture_until` polls below. `logit`'s own healthcheck is
+# `logit ready` against demo/logit.yaml's `admin:` block, so compose's health state is the signal
+# here -- no blind sleep, same as start_logit. Compose names the container after the project, so it
+# is asked for the id rather than guessed at: `docker inspect` on a name that does not exist prints
+# an empty *stdout* line before failing, which quietly turned a later "healthy" into "\nhealthy"
+# and never matched.
+survey_demo_healthy() {
+    local cid
+    cid="$(survey_demo_compose ps -q logit 2>/dev/null || true)"
+    [ -n "${cid}" ] || return 1
+    [ "$(${DOCKER} inspect --format '{{.State.Health.Status}}' "${cid}" 2>/dev/null || true)" = "healthy" ]
 }
 
 survey_demo() {
     local run_dir config duration
-
-    # demo/compose.yaml gives `nginx`/`redis` fixed container names (docker_in follows them by
-    # name), so only one demo stack can exist on a host at a time. If one is already up it is
-    # somebody else's -- this daemon is shared -- and it is not ours to stop.
-    if [ -n "$(${DOCKER} compose -f "${ROOT}/demo/compose.yaml" ps -q 2>/dev/null)" ]; then
-        survey_fail "a demo stack is already running on this daemon. It is not this run's to stop" \
-            "-- bring it down yourself (script/demo down -v) if it is yours, or wait."
-    fi
 
     survey_out_dir demo
     run_dir="${SURVEY_RUN_DIR}"
@@ -188,33 +198,17 @@ survey_demo() {
         echo "SHAPE_SURVEY_RUN_DIR=${run_dir}"
     } >"${run_dir}/compose.env"
 
-    # Registered before `up`, so a failure anywhere below still tears the stack down. `down -v`
-    # rather than `down`: the checkpoints and the Postgres log volume are this run's, and leaving
-    # them would make the next run resume a tail mid-file instead of reading from the beginning.
-    survey_on_cleanup "${DOCKER} compose -f '${ROOT}/demo/compose.yaml' -f '${ROOT}/tools/shape-survey/demo-overlay.yaml' --env-file '${run_dir}/compose.env' down -v --remove-orphans >/dev/null 2>&1"
-
+    # The first `survey_compose` call registers the teardown hook before `up` returns, so a
+    # failure anywhere below still brings the stack down (`down -v`: the checkpoints and the
+    # Postgres log volume are this run's, and leaving them would make the next run resume a tail
+    # mid-file instead of reading from the beginning).
     echo "shape-survey: bringing up the demo stack (this builds demo images on a first run)"
     survey_demo_compose up -d --build
 
-    # `logit`'s own healthcheck is `logit ready` against demo/logit.yaml's `admin:` block, so
-    # compose's health state is the readiness signal here -- no blind sleep, same as start_logit.
-    # Compose names the container after the project, so it is asked for the id rather than
-    # guessed at: `docker inspect` on a name that does not exist prints an empty *stdout* line
-    # before failing, which quietly turned a later "healthy" into "\nhealthy" and never matched.
-    local i cid state=""
-    for i in $(seq 1 180); do
-        cid="$(survey_demo_compose ps -q logit 2>/dev/null || true)"
-        if [ -n "${cid}" ]; then
-            state="$(${DOCKER} inspect --format '{{.State.Health.Status}}' "${cid}" 2>/dev/null || true)"
-        fi
-        [ "${state}" = "healthy" ] && break
-        sleep 1
-    done
-    [ "${state}" = "healthy" ] ||
-        survey_fail "the demo stack's logit never became healthy (last state: ${state:-unknown})"
-    echo "shape-survey: stack healthy; capturing for ${duration}s"
+    survey_capture_until survey_demo_healthy 180
+    echo "shape-survey: stack healthy"
 
-    sleep "${duration}"
+    survey_capture_for "${duration}"
 
     echo "shape-survey: stopping logit (SIGTERM, up to 60s for the final flush)"
     survey_demo_compose stop -t 60 logit

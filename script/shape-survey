@@ -72,11 +72,16 @@ trap survey_cleanup EXIT
 survey_self_test
 
 survey_image
-survey_network
 
+# One producer at a time, each with its own network, container names and compose projects
+# (`survey_begin`), each torn down before the next starts. That namespacing is also what makes two
+# *concurrent* `script/shape-survey <producer>` invocations safe on one shared daemon -- see
+# tools/shape-survey/lib.sh's header.
 for p in "${producers[@]}"; do
     echo "== surveying: ${p} =="
+    survey_begin "${p}"
     "survey_${p//-/_}"
+    survey_cleanup
 done
 
 echo "Surveys written under ${SHAPE_SURVEY_OUT:-${ROOT}/perf/results/shape-survey}/ -- read each run's summary.md."

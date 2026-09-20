@@ -344,6 +344,15 @@ def render_markdown(summary: dict) -> str:
             )
         out.append("")
 
+    # The producer's own section, last: everything above is the general engine's, and a reading
+    # that needs to know what the source *is* ("series per scrape, per exporter") belongs to the
+    # producer that knows it. It is appended verbatim rather than re-rendered here, which is what
+    # keeps this file free of anything producer-specific.
+    section = summary.get("producer_section")
+    if section:
+        out.append(section.rstrip("\n"))
+        out.append("")
+
     return "\n".join(out) + "\n"
 
 
@@ -460,6 +469,10 @@ def self_test() -> None:
     labelled = dict(banner, source_labels={"nginx_in": {"tier": "nginx", "format": "authored here"}})
     assert "Where each source's format comes from" in render_markdown(labelled)
 
+    # A producer's appended section lands verbatim, after the general engine's tables.
+    sectioned = render_markdown(dict(banner, producer_section="## Per exporter\n\nseries per scrape\n"))
+    assert sectioned.index("Attribute width") < sectioned.index("## Per exporter"), sectioned[-400:]
+
     # And the guard itself: a sketched shape series must stop the run, not be summarized.
     sketched = (
         "2026-09-20T15:56:20.153724900Z\n"
@@ -494,6 +507,12 @@ def main() -> None:
         help='optional JSON: {"<source>": {"tier": ..., "format": ...}} -- where each source\'s'
         " own log/metric format came from",
     )
+    ap.add_argument(
+        "--append",
+        help="a producer-written markdown file appended to the end of summary.md (and recorded in"
+        " summary.json as `producer_section`) -- the reading of these numbers only that producer"
+        " can give, kept out of this general engine",
+    )
     ap.add_argument("--self-test", action="store_true", help="check the parser against a real render")
     args = ap.parse_args()
 
@@ -512,6 +531,9 @@ def main() -> None:
     summary.update(read_provenance(pathlib.Path(args.provenance) if args.provenance else None))
     if args.source_labels:
         summary["source_labels"] = json.loads(pathlib.Path(args.source_labels).read_text())
+
+    if args.append:
+        summary["producer_section"] = pathlib.Path(args.append).read_text()
 
     out_dir = pathlib.Path(args.out_dir)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=False) + "\n")

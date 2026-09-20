@@ -59,7 +59,7 @@ survey_interop() {
         (cd "${corpus}" && du -sb ./*/ | sed 's/^/  /')
     } >>"${run_dir}/provenance.txt"
 
-    start_logit interop "${config}"
+    start_logit "${config}"
 
     local spec proto target files
     while IFS='|' read -r proto target files; do
