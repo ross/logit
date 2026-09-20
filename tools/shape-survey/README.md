@@ -19,6 +19,33 @@ SHAPE_SURVEY_SKIP_IMAGE=1 script/shape-survey interop  # reuse the already-built
 SHAPE_SURVEY_OUT=/tmp/x script/shape-survey interop    # write runs somewhere else
 ```
 
+## Two surveys at once
+
+**Two `script/shape-survey <producer>` invocations may run at the same time on one docker daemon**
+— producers are written by different people and a capture takes minutes to a quarter of an hour, so
+that is the normal case rather than an edge one. Everything a run creates is namespaced by
+*producer*:
+
+| Resource | Name |
+|---|---|
+| network | `shape-survey-<producer>-net` |
+| containers | `shape-survey-<producer>-<suffix>` (`survey_container_name`) |
+| compose project | `shape-survey-<producer>-<suffix>` (`survey_compose`) |
+| run directory | `perf/results/shape-survey/<producer>/<UTC timestamp>/` |
+
+and `survey_cleanup` only ever names resources out of this invocation's own bookkeeping, so it
+cannot touch the other run's — or another session's. The one shared resource is the image tag
+`logit:shape-survey`: `survey_image` takes an `flock` around the build so two invocations cannot
+build it at once, and the second invocation is better off with `SHAPE_SURVEY_SKIP_IMAGE=1`, which
+reuses the already-built image (and fails loudly if there isn't one) rather than re-tagging it
+underneath a running survey. The network alias `logit`, and each service's own alias, stay unscoped
+on purpose: they live *inside* one producer's network, where nothing can collide with them.
+
+The daemon is shared with other work besides surveys, so the standing rules apply: never prune,
+never remove a resource this run did not create, and if `docker network create` fails with *"all
+predefined address pools have been fully subnetted"*, **stop and report it** — the fix is somebody
+else releasing a network, not this harness deleting one.
+
 ## What comes out
 
 One directory per run, `perf/results/shape-survey/<producer>/<UTC timestamp>/` by default
@@ -105,12 +132,50 @@ What `lib.sh` gives you:
 |---|---|
 | `survey_out_dir <producer>` | creates the run directory and sets `SURVEY_RUN_DIR` (call it plainly, never in `$( )` — a subshell would throw the assignment away) |
 | `survey_provenance <producer> <representativeness>` | writes `provenance.txt`'s common half; append your own software versions to the same file |
-| `start_logit <producer> <config>` | `logit validate`s the config in the image, runs it on the run's network under the alias `logit` with `/out` mounted, and waits on `logit ready` |
+| `start_logit <config> [docker run args…]` | `logit validate`s the config in the image, runs it on the producer's network under the alias `logit` with `/out` mounted, and waits on `logit ready`. Extra args are passed through (an `-e` a config resolves with `!env`, say) |
 | `stop_logit` | `docker stop -t 60` (so the final flush lands), captures `logit.log`, fails if `shape.log` is missing or empty |
-| `survey_python <suffix> <docker args> -- <cmd>` | runs `replay.py`/`summarize.py`/`check_interop.py` in a throwaway `python:3.12-slim` with `/tools` and `/out` mounted |
-| `survey_summarize` | `summarize.py` over the run's `shape.log`, with the banner and any `source-labels.json` |
+| `survey_start_service <suffix> [--ready-cmd '<cmd>' \| --ready-log '<regex>' \| --ready-http <url>] [--ready-timeout <s>] -- <docker run args…>` | starts a long-lived **service under test** on the producer's network under the alias `<suffix>`, with a bounded readiness wait (never a blind sleep), its image and digest appended to `provenance.txt`, and its log captured at teardown |
+| `survey_service_logs <suffix>` | that service's log into `service-<suffix>.log` — automatic at cleanup, callable mid-run |
+| `survey_capture_for <seconds>` | holds the capture open for a fixed window, progress line every 30 s |
+| `survey_capture_until '<cmd>' <timeout>` | polls `<cmd>` (through `eval`, so a shell function name works) until it succeeds; a timeout is mandatory and failing it fails the run |
+| `survey_compose <project-suffix> <compose global args…> -- <compose args…>` | `docker compose` under project `shape-survey-<producer>-<suffix>`, with the "somebody else's stack is already up" guard and `down -v --remove-orphans` teardown registered on first use |
+| `survey_python <suffix> <docker args> -- <cmd>` | runs `replay.py`/`summarize.py`/`check_interop.py`/a generated script in a throwaway `python:3.12-slim` with `/tools` and `/out` mounted |
+| `survey_summarize [--append <file in the run dir>]` | `summarize.py` over the run's `shape.log`, with the banner, any `source-labels.json`, and optionally your own markdown section on the end |
 | `survey_on_cleanup <snippet>` | an idempotent teardown hook for a producer whose lifecycle is not "remove these containers" |
 | `survey_track <name>` | register a container you started yourself for cleanup |
+| `survey_container_name <suffix>` / `survey_project_name <suffix>` | the namespaced names; never build one any other way |
+
+`survey_begin <producer>` and `survey_cleanup` bracket each producer and are the dispatcher's
+business, not a producer's.
+
+### Your own summary section
+
+`summarize.py` stays the general engine: it knows about series, percentiles and value→count
+tables, and nothing about what a source *is*. A reading that needs to know — "series per scrape,
+per exporter" — is the producer's, and goes in through `--append`:
+
+```sh
+survey_summarize                        # writes summary.json first
+...generate ${SURVEY_RUN_DIR}/section.md from summary.json...
+survey_summarize --append section.md    # and again, with the section on the end
+```
+
+`summary.json` carries every series' **full value→count table** (for every integer-valued series),
+so a producer's section script computes whatever fraction or median it needs from that file and
+never re-parses `shape.log`.
+
+### Combining runs
+
+`combine.py` reads N run directories' `summary.json` + `provenance.txt` and emits one markdown
+table per dimension, one row per producer × source × tap × signal, each row carrying its run's
+representativeness line — the attribute widths, the per-batch series, the `values.*` type mix as
+percentages, the counters and the cumulative gauges. That is what
+[`docs/design/data-shapes.md`](../../docs/design/data-shapes.md) gets written from.
+
+```sh
+python3 tools/shape-survey/combine.py perf/results/shape-survey/*/*/ --out /tmp/combined.md
+python3 tools/shape-survey/combine.py --self-test
+```
 
 Rules the harness holds to, which a new producer inherits:
 
