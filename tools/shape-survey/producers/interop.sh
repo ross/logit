@@ -40,7 +40,8 @@ EOF
 
 survey_interop() {
     local run_dir config corpus
-    run_dir="$(survey_out_dir interop)"
+    survey_out_dir interop
+    run_dir="${SURVEY_RUN_DIR}"
     config="${ROOT}/tools/shape-survey/configs/interop.yaml"
     corpus="${ROOT}/testdata/interop"
 

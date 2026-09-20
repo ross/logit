@@ -69,11 +69,28 @@ survey_network() {
     fi
 }
 
-# survey_cleanup: removes every container this run started and the network, in that order. Safe to
-# call twice, and safe to call after a partial run. Only ever names containers from
-# SURVEY_CONTAINERS, so it cannot touch another session's.
+# Shell snippets a producer registers with `survey_on_cleanup` and `survey_cleanup` runs first --
+# for a producer whose teardown is not "remove these containers" (a compose stack, say). Kept
+# general rather than special-casing any one producer here, per this file's own no-producer-
+# specifics rule.
+SURVEY_CLEANUP_HOOKS=()
+
+# survey_on_cleanup <shell snippet>: run this at cleanup, before the containers and network go.
+# A hook must be idempotent -- cleanup can run after a producer already tore itself down.
+survey_on_cleanup() {
+    SURVEY_CLEANUP_HOOKS+=("$1")
+}
+
+# survey_cleanup: runs any registered hooks, then removes every container this run started and the
+# network, in that order. Safe to call twice, and safe to call after a partial run. Only ever names
+# containers from SURVEY_CONTAINERS, so it cannot touch another session's.
 survey_cleanup() {
-    local name
+    local hook name
+    for hook in "${SURVEY_CLEANUP_HOOKS[@]-}"; do
+        [ -n "${hook}" ] || continue
+        eval "${hook}" || true
+    done
+    SURVEY_CLEANUP_HOOKS=()
     for name in "${SURVEY_CONTAINERS[@]-}"; do
         [ -n "${name}" ] || continue
         ${DOCKER} rm -f "${name}" >/dev/null 2>&1 || true
@@ -106,9 +123,13 @@ survey_image() {
 
 # ---- run directories and provenance -------------------------------------------------------------
 
-# survey_out_dir <producer>: creates and echoes this run's output directory, and sets
-# SURVEY_RUN_DIR to it. Under perf/results/ by default, which .gitignore already covers -- raw
-# captures and survey output never enter the repo, and nothing here ever writes under testdata/.
+# survey_out_dir <producer>: creates this run's output directory and sets SURVEY_RUN_DIR to it.
+# Under perf/results/ by default, which .gitignore already covers -- raw captures and survey
+# output never enter the repo, and nothing here ever writes under testdata/.
+#
+# **Call it as a plain command and then read `${SURVEY_RUN_DIR}`**, never as `$(survey_out_dir x)`:
+# a command substitution runs in a subshell, so the assignment would be thrown away and everything
+# downstream would try to write to `/`. It prints the path for the log, not for capture.
 survey_out_dir() {
     local producer="$1" stamp
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -118,7 +139,7 @@ survey_out_dir() {
     # relationship to whoever owns this checkout -- world-writable is what lets `file_out` create
     # its log here, the same accommodation record_otlp makes for the Collector's file exporter.
     chmod 777 "${SURVEY_RUN_DIR}"
-    echo "${SURVEY_RUN_DIR}"
+    echo "shape-survey: run directory ${SURVEY_RUN_DIR}"
 }
 
 # survey_provenance <producer> <representativeness>: writes the common half of provenance.txt --
