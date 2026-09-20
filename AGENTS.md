@@ -453,7 +453,12 @@ not a style preference:
   alike (`docs/OVERVIEW.md`). The fixtures now cover logs-only, wide-JSON, distribution-heavy, and
   span shapes alongside the original mixed one, but that closes the *measurement* gap, not the
   sizing *decisions* those numbers feed — see `docs/design/memory.md` §0 and §8 before treating any
-  one number as settled across workloads.
+  one number as settled across workloads. [`docs/design/data-shapes.md`](docs/design/data-shapes.md)
+  is what real producers actually send — a desk survey plus live captures measured by the `shape`
+  component — and its headline is that per-event width is **bimodal by signal** (metric events at
+  0–6 attributes, parsed structured logs at 9 and up, spans across both), so a number that is right
+  for one leg is wrong for another. Reach for it before picking a "representative" shape, and mind
+  its own §7: none of it is production traffic.
 
 ## Where things live
 

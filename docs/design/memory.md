@@ -1487,6 +1487,14 @@ were enough to rule out shrinking `AttrMap`; they are not enough to pick a numbe
 these, because that needs a real distribution of attribute/metric counts across production
 traffic, which doesn't exist yet and can't be synthesized honestly.
 
+**The distribution now exists, short of production:** [`data-shapes.md`](data-shapes.md) is a desk
+survey plus live captures of real third-party software measured by the `shape` component, and its
+§6 states what it implies for both items — per-event width is bimodal by signal (metric events at
+0–6 attributes, parsed structured logs at 9 and up with 100% of them past 8, spans across both),
+and live collectd puts 17.7% of its events at 2–3 metrics and none higher. It deliberately decides
+nothing; both items stay deferred to the sizing ADR that document lists as its first follow-up,
+and its own §7 is explicit that none of it is production traffic.
+
 12. **`AttrMap`'s inline capacity, increased rather than shrunk.** Would reduce spills on wider
     shapes (the nginx config's 10 attributes, wide-JSON's 32), at the cost of a larger `AttrMap` —
     and therefore `Event` — for every event, paid whether or not the wider shape is common in a
@@ -1533,6 +1541,14 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
   12-13). That needs real production telemetry, not more synthetic fixtures — recorded as
   deliberately deferred rather than guessed, per the direction settled when `DdSketch`/`SpanRecord`
   were measured and then not boxed for the same reason (§1, [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)).
+  **Substantially answered since, for everything short of production:**
+  [`data-shapes.md`](data-shapes.md) measures real third-party producers with the `shape` component
+  and counts the rest from pinned sources. It also says something about the fixtures above — the
+  wide-JSON shape's 32 attributes is an access-log or audit-log width, not an application-log one
+  (every logging library measured landed at 9–15), and there is no fixture at all for the commonest
+  measured log shape, a span at the 16–17 ceiling, or a nested-map record. What remains open is the
+  production distribution itself and the decision; `shape` exists so an operator can supply the
+  former from traffic that can't leave its environment.
 - **What do the unmeasured workload shapes actually cost?** Answered, for allocation and clone
   cost: logs-only, wide-JSON, distribution-heavy metrics, and spans are all fixtured and measured
   (§0, §2), and that evidence is what drove §8 items 8-10's decisions (one confirmed-unchanged, two

@@ -258,6 +258,23 @@ that spills at 4/8/12/16 inline slots, what a plain `Vec`, a per-batch arena, or
 layout would see, the typical string-attribute cost per event; gaps and low-confidence areas.
 `memory.md`'s open question is updated to point at the result.
 
+**As built.** [`docs/design/data-shapes.md`](../design/data-shapes.md) is the synthesis, led by its
+five findings; [`docs/design/data-shapes-rows.md`](../design/data-shapes-rows.md) is the appendix
+the plan called for — the 132 desk rows the synthesis draws on, condensed from about 300, each with
+its citation, its two grades, and a mark saying whether the verification pass confirmed or corrected
+it (106 rows re-derived; about 83% confirmed exactly, the rest off by a small count or a label, none
+changing a headline). Three things differ from what this plan set out:
+
+- The archetype table gained an "evidence" column, because two of the six archetypes — edge/access
+  logs and wide events — ended with no capture behind them, and the Kubernetes one has no cluster
+  capture. The doc says so where it matters rather than presenting six peers.
+- `demo/`'s numbers are recorded and used for nothing. It gets its own representativeness tier,
+  below a third party's demo: a stack built to demonstrate `logit`, with formats authored here.
+- The doc's follow-up list leads with two things this plan did not foresee: an NDJSON format for
+  `file_out`/`stdio_out` (the survey's readout depends on parsing a human text render, the only
+  sink that carries raw `Samples`), and running a peer's own flat-map benchmark, which measures the
+  same question directly.
+
 ## Follow-ups (listed in the doc; not done in this pass)
 
 1. An ADR on `AttrMap`/`MetricList` sizing — keep 8, grow to 12/16, a plain `Vec`, a per-batch
