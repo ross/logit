@@ -159,13 +159,34 @@ statsd_in ─┬─> (real pipeline)
 Real software → the matching input → `shape` (tap 1), and → a realistic transform chain → `shape`
 (tap 2) → `aggregate` → `file_out`, with the histograms read off the shutdown flush.
 `script/shape-survey` follows `script/record-fixtures`' precedent: a deliberate, reviewed act, never
-run by CI, one function per producer, software versions and date recorded.
-`tools/shape-survey/*.yaml` joins the globs in `script/validate` and
+run by CI, software versions and date recorded. It goes one step further on the "one function per
+producer" rule: a producer is **one file**, `tools/shape-survey/producers/<name>.sh`, discovered by
+glob rather than named in a list, so producers can be added in parallel with no shared file to
+edit — nothing producer-specific lives in `lib.sh` or in the dispatcher.
+
+`tools/shape-survey/configs/*.yaml` joins the globs in `script/validate` and
 `every_shipped_config_loads_and_validates`. A p99 is quoted only with ≥100k events behind it.
 
 **First, and free:** replay `testdata/interop/{statsd,otlp,prometheus,collectd,graphite,syslog}`
 through `shape`. The statsd corpus's tags-per-line and lines-per-datagram figures are independently
 known, so `shape` either reproduces them or is wrong — that is its acceptance test.
+`tools/shape-survey/check_interop.py` is that test: it re-derives events-per-datagram and
+attributes-per-event from the `.raw` files with its own parser (importing nothing from
+`summarize.py`, copying nothing from the corpus README) and asserts `shape` reported the same.
+As built, it reproduces exactly — events per datagram `[1×48, 7×1, 8×3, 10×3, 11×1]` and
+attributes per event `[0×38, 1×17, 5×4, 6×9, 7×20, 8×32]` over the corpus's 56 datagrams and 120
+lines.
+
+**Every producer states its representativeness in one line**, written into the run's
+`provenance.txt` and printed by `summarize.py` as the banner at the top of `summary.md`, above any
+number. That is structural rather than a footnote because these tables get quoted: the `demo`
+producer is the harness's best end-to-end exercise and its weakest evidence — the stack exists to
+demonstrate `logit`, parts of it are configured for visibility rather than the way an operator
+would run them, and several of the formats it measures (nginx's JSON `log_format`, the Django and
+Celery logging configs) were authored in this repository, which makes measuring them circular. That
+producer therefore also labels each tier with whether its format is the software's own default
+(HAProxy's `option httplog`, Postgres's `jsonlog`, Redis's log line, Docker's json-file envelope)
+or one of ours, and `summarize.py` renders that table above the distributions.
 
 | Capture | Signals | Box |
 |---|---|---|

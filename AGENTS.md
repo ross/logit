@@ -302,9 +302,10 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
-| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
+| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`, `perf/scenarios/`, `tools/shape-survey/configs/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, is denominated over events *delivered*, and takes `--verify` (a strict zero-drop self-check) / `--rate-scale` (moves the operating point without editing a spec) ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
+| `script/shape-survey [producer ...]` | Out-of-CI data-shape capture harness (`tools/shape-survey/`, [docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)) — drives real traffic through the `shape` component and summarizes what the events look like. Producers are discovered by globbing `tools/shape-survey/producers/*.sh`, one file each; `interop` replays `testdata/interop/` and is the instrument's acceptance test (it must reproduce the statsd corpus's independently-counted numbers), `demo` taps `demo/`'s own stack without modifying it. Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -475,6 +476,8 @@ crates/
 `generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
 `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`; `perf/results/` is
 where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
+
+`tools/shape-survey/` is the data-shape capture harness `script/shape-survey` drives ([docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)): `lib.sh` (shared docker plumbing, nothing producer-specific), stdlib-only `replay.py`/`summarize.py`/`check_interop.py`, one file per producer under `producers/`, and capture configs under `configs/` — which join `script/validate` and `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`/`perf/scenarios/`. Runs land in `perf/results/shape-survey/<producer>/<timestamp>/` (gitignored); raw traffic never enters the repo and nothing there writes under `testdata/`. Every producer states a one-line **representativeness** in `provenance.txt`, which `summarize.py` prints as the banner above every table — the `demo` producer's numbers in particular are a harness exercise, not evidence of production shape, and some of the formats it measures were authored in this repo.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):

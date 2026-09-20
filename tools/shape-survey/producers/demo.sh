@@ -175,8 +175,12 @@ survey_demo() {
 
     config="${run_dir}/logit.yaml"
     survey_demo_config "${config}"
+    # `INFLUXDB_TOKEN` because demo/logit.yaml's `influx_out` resolves its token through `!env`
+    # (ADR `env-yaml-tag`), and `validate` resolves those exactly as `run` does. The same default
+    # demo/compose.yaml itself uses, so validating here and running there see the same config.
     echo "shape-survey: validating the generated ${config}"
-    ${DOCKER} run --rm -v "${config}:/config.yaml:ro,z" "${SURVEY_IMAGE}" validate /config.yaml ||
+    ${DOCKER} run --rm -e "INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-logit-demo-token}" \
+        -v "${config}:/config.yaml:ro,z" "${SURVEY_IMAGE}" validate /config.yaml ||
         survey_fail "the generated demo config did not validate -- the tap block or demo/logit.yaml changed"
 
     {
