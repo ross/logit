@@ -5,8 +5,8 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, and `route` are implemented (`rename`/`filter`/
-//! `sample`/`throttle`/`dedup` were retired rather than landing --
+//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, and `route` are implemented (`rename`/
+//! `filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
 //! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
@@ -22,6 +22,7 @@ mod regex;
 mod route;
 mod scale;
 mod set;
+mod shape;
 mod signals;
 mod trace_context;
 
@@ -40,6 +41,7 @@ pub use regex::RegexParser;
 pub use route::Route;
 pub use scale::Scale;
 pub use set::Set;
+pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
 pub use signals::{DropSignals, HasSignal, KeepSignals, MatchMode, SignalSet};
 pub use trace_context::{SpanLift, TraceContext};
 

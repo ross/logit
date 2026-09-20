@@ -32,7 +32,7 @@ use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, KeepValues, Kv,
-    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set,
+    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -574,6 +574,14 @@ pub fn nginx_event_with_uppercase_host() -> Event {
     let mut event = nginx_event();
     event.attributes.insert("host", Value::str("STATIC.LOCAL"));
     event
+}
+
+/// The `tap` component from [`examples/shape-tap.yaml`](../../../examples/shape-tap.yaml), with
+/// every field at its default -- `resource: drop`, both caps at 4096 -- and a name, so the
+/// measured path is the one a real config builds, `tap` tag included
+/// (`docs/adr/shape-observer-component.md`).
+pub fn shape() -> Shape {
+    Shape::new(Duration::from_secs(10)).with_name("tap")
 }
 
 /// A `set` configured with one attribute pair and no resource pairs -- the per-event-only path

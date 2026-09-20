@@ -59,7 +59,7 @@ use logit_transforms::{
     KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
     Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
     Route as RouteTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
-    SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Shape as ShapeTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -686,6 +686,19 @@ fn build_spec(
             KeepValuesTransform::new(to_allow_lists(resource), to_allow_lists(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
+        // `with_name(id)` is what makes the `tap` tag possible: the registry already knows this
+        // component's own id (it builds the telemetry handle above from it), so two `shape` taps
+        // feeding one `aggregate` stay distinct series with no new plumbing
+        // (`docs/adr/shape-observer-component.md`).
+        Shape { interval, resource, max_tracked_keys, max_tracked_keysets } => {
+            NodeSpec::Transform(Box::new(
+                ShapeTransform::new(*interval)
+                    .with_resource_kept(matches!(resource, logit_config::ShapeResource::Keep))
+                    .with_caps(*max_tracked_keys, *max_tracked_keysets)
+                    .with_name(id)
+                    .with_telemetry(telemetry.clone()),
+            ))
+        }
         // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
         // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
         // `HasProvenanceTransform::new` takes -- interning happens inside the transform itself
@@ -3802,6 +3815,38 @@ mod tests {
             build_spec("keep_values", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// `shape` also proves the `tap` tag's plumbing end to end: `build_spec` is handed the
+    /// component's own id, and that is what `Shape::with_name` turns into the tag
+    /// (`docs/adr/shape-observer-component.md`).
+    #[test]
+    fn build_spec_builds_a_shape_transform_carrying_its_own_id() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Shape {
+                interval: Duration::from_secs(10),
+                resource: logit_config::ShapeResource::Drop,
+                max_tracked_keys: 4096,
+                max_tracked_keysets: 4096,
+            },
+        };
+        let (spec, _) = build_spec("tap_a", &component, Path::new(""), None).unwrap();
+        let NodeSpec::Transform(mut transform) = spec else {
+            panic!("shape is a transform");
+        };
+        let resource = Arc::new(logit_core::Resource::default());
+        let mut event = logit_core::Event::empty(0, logit_core::AttrMap::new());
+        assert!(transform.process(&resource, &mut event));
+        assert_eq!(
+            event.attributes.get("tap").and_then(|v| v.as_str()),
+            Some("tap_a"),
+            "the registry's component id becomes the tap tag"
+        );
     }
 
     #[test]
