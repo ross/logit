@@ -179,7 +179,9 @@ def dist(metric, source, tap, signal=None):
 
 
 def stats_cells(stats):
-    return f"{num(stats.get('p50'))} | {num(stats.get('p90'))} | {num(stats.get('max'))}"
+    """p50/p90/max in ONE table cell -- `/`-joined, not `|`-joined, or the row would grow three
+    columns per measure and stop lining up with its header."""
+    return f"{num(stats.get('p50'))} / {num(stats.get('p90'))} / {num(stats.get('max'))}"
 
 
 out = []
@@ -339,6 +341,14 @@ for row in rows("attribute_widths", tap="tap_django"):
         f" {pct(f['>4'])} | {pct(f['>8'])} | {pct(f['>12'])} | {pct(f['>16'])} | {table(hist(s), 14)} |"
     )
 out.append("")
+out.append(
+    "**`signal=metric` is attributes per DATA POINT**, not per metric family: `otlp_in` emits one"
+    " event per data point, carrying that point's own attributes. **`signal=log`** is one OTLP log"
+    " record, whose attributes are what `opentelemetry-instrumentation-logging` puts on it"
+    " (`code.*`, the thread and process fields) -- the log *message* is the body, measured"
+    " separately as `body_bytes`."
+)
+out.append("")
 out.append("| desk count (static, from the instrumentation source) | min / typical / max |")
 out.append("|---|---|")
 for what, triple in DESK.items():
@@ -353,19 +363,58 @@ out.append(
     " as much as of any one span."
 )
 out.append("")
+
+# The pooled span distribution, split back into the three span kinds by attribute count. The
+# partition boundaries are the gaps in the histogram itself, and the identification is checked
+# against the traffic mix rather than asserted: the `requests` CLIENT spans must number exactly
+# the /fanout/ requests, and the SERVER spans exactly the requests plus those same fanout-internal
+# calls. If a future run's counts stop matching that, the labels below are the thing to re-derive.
+SPAN_KINDS = [
+    ("sqlite3 dbapi CLIENT", range(0, 4), "3 / 6 / 7"),
+    ("`requests` CLIENT", range(4, 7), "3 / 4 / 6"),
+    ("Django WSGI SERVER", range(7, 64), "7 / 10 / 14"),
+]
+span_row = one("attribute_widths", tap="tap_django", signal="span")
+if span_row:
+    h = hist(span_row["stats"])
+    out.append("**Static desk count versus this run, per span kind (the pooled row, partitioned by attribute count):**")
+    out.append("")
+    out.append("| span kind | desk min/typical/max | measured min | median | max | spans | measured median / desk typical |")
+    out.append("|---|---|--:|--:|--:|--:|--:|")
+    for label, window, desk in SPAN_KINDS:
+        values = sorted(v for v in h if v in window)
+        if not values:
+            continue
+        counted = [v for v in values for _ in range(h[v])]
+        median = counted[(len(counted) - 1) // 2]
+        typical = float(desk.split("/")[1])
+        out.append(
+            f"| {label} | {desk} | {values[0]} | {median} | {values[-1]} | {len(counted)} |"
+            f" **{median / typical:.2f}x** |"
+        )
+    out.append("")
+    resource = dist("logit.shape.batch.resource_attributes", "django_otlp_in", "tap_django")
+    if resource:
+        out.append(
+            f"And the resource: the desk count said **5** attributes for a default Python SDK"
+            f" resource; this run measured **{num(resource.get('p50'))}** on every batch"
+            f" ({num(resource.get('p50') / 5)}x), with no Collector in the path to add any."
+        )
+        out.append("")
 for metric, label in (
     ("logit.shape.batch.events", "events per OTLP export (the SDK's own batch processors)"),
     ("logit.shape.batch.resource_attributes", "resource attributes per batch"),
     ("logit.shape.batch.scope_attributes", "scope attributes per batch"),
     ("logit.shape.metrics", "metric records per event"),
-    ("logit.shape.samples_per_metric", "data points per metric record"),
+    ("logit.shape.samples_per_metric", "samples per metric record"),
     ("logit.shape.span_events", "events per span"),
+    ("logit.shape.span_event_attributes", "attributes per span event"),
     ("logit.shape.span_links", "links per span"),
+    ("logit.shape.key_bytes", "attribute key bytes"),
+    ("logit.shape.value_bytes", "attribute value bytes"),
 ):
     for row in rows("distributions", metric=metric, tap="tap_django"):
         s = row["stats"]
-        if not out or not out[-1].startswith("| measure"):
-            pass
         out.append(
             f"- **{label}** (`signal={row['signal'] or 'batch'}`): n={s['count']},"
             f" p50 {num(s['p50'])}, p90 {num(s['p90'])}, max {num(s['max'])}"
