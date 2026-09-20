@@ -65,7 +65,8 @@ Two deliberate edges to it:
 - `resource: drop` (the default) substitutes one cached, empty `Resource` through `map_resource`,
   so no resource attribute flows out. `resource: keep` forwards the incoming resource unchanged —
   an operator opting into a per-service breakdown downstream, and into that identity flowing with
-  it.
+  it. `keep` governs the per-event output only: what goes out at `flush` always goes out under the
+  empty `Resource`, because a window spans many batches and there is no single resource to keep.
 - The batch's `Scope` passes through unchanged. `Transform` has no hook to substitute one, and a
   scope names an instrumentation library, not a payload; adding a trait hook every implementer
   carries, for this one component, is not worth it.

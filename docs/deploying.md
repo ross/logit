@@ -1148,6 +1148,10 @@ describes the traffic's shape, not a sample of it. Two things to know about the 
 - `resource: drop` (the default) replaces the batch's `Resource` with an empty one, so no resource
   attribute value flows out. `resource: keep` forwards it unchanged — set it only when a
   per-service breakdown downstream is worth that identity travelling with the measurements.
+  It applies to the per-event measurements only: the per-batch and cumulative measurements go out
+  at each flush under an empty `Resource` regardless, because a flush window spans many batches
+  and has no single resource to keep. For a per-service view of those, place one `shape` per
+  source.
 - The batch's `Scope` passes through either way. A scope names an instrumentation library rather
   than carrying payload, and a transform has no hook to substitute one.
 
