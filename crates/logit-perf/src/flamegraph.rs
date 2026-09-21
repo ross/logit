@@ -49,11 +49,15 @@ const PROFILE: &str = "profiling";
 const PERF: &str = "perf";
 const COLLAPSE: &str = "inferno-collapse-perf";
 const FLAMEGRAPH: &str = "inferno-flamegraph";
+/// `--folded`'s extra stage. Coreutils, not a fourth Rust process.
+const TEE: &str = "tee";
 
 pub struct FlamegraphArgs {
     pub scenario: String,
     /// Defaults to `perf/results/<scenario>.svg` under the repo root.
     pub out: Option<PathBuf>,
+    /// Where to keep the collapsed stacks, if anywhere -- see [`collapse_to_svg`].
+    pub folded: Option<PathBuf>,
     /// Sampling frequency in Hz. 999 rather than a round 1000 so the sampler can't lock step with
     /// anything in the program running on a whole-millisecond cadence -- the usual convention.
     pub freq: u32,
@@ -175,7 +179,7 @@ fn record_and_render(
     // while `out` is under the bind-mounted checkout.
     let staged = staging_path(out);
     let _cleanup = RemoveOnDrop(staged.clone());
-    collapse_to_svg(perf_data, &staged)?;
+    collapse_to_svg(perf_data, &staged, args.folded.as_deref())?;
 
     let bytes = fs::metadata(&staged).map(|m| m.len()).unwrap_or(0);
     if bytes == 0 {
@@ -227,8 +231,22 @@ fn record_argv(freq: u32, perf_data: &Path) -> Vec<String> {
 /// `perf script -i <perf.data> | inferno-collapse-perf | inferno-flamegraph > <out>`, as three
 /// real processes connected by pipes. Every stage's status is checked: a silent failure in the
 /// middle of the pipeline would otherwise leave a plausible-looking but empty SVG.
-fn collapse_to_svg(perf_data: &Path, out: &Path) -> anyhow::Result<()> {
-    println!("-- {PERF} script | {COLLAPSE} | {FLAMEGRAPH} > {}", out.display());
+///
+/// With `folded`, the middle stage's output is *also* written to that path, via `tee` -- still one
+/// pipeline, still streaming. The collapsed stacks are the only form of this capture anything can
+/// compute over (`perf/folded_share.py` answers "what share of samples is under malloc?" from
+/// them); the SVG is a rendering of the same data, and a `perf script` dump of a multi-million-event
+/// scenario is hundreds of megabytes, so keeping the folded middle is what makes a second question
+/// about one capture cheap rather than another multi-minute `perf record`.
+fn collapse_to_svg(perf_data: &Path, out: &Path, folded: Option<&Path>) -> anyhow::Result<()> {
+    match folded {
+        Some(folded) => println!(
+            "-- {PERF} script | {COLLAPSE} | tee {} | {FLAMEGRAPH} > {}",
+            folded.display(),
+            out.display()
+        ),
+        None => println!("-- {PERF} script | {COLLAPSE} | {FLAMEGRAPH} > {}", out.display()),
+    }
     let mut script = Command::new(PERF)
         .arg("script")
         .arg("-i")
@@ -246,17 +264,40 @@ fn collapse_to_svg(perf_data: &Path, out: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("spawning `{COLLAPSE}`"))?;
     let collapse_out = collapse.stdout.take().expect("stdout was piped");
 
+    // `tee`, not a fourth Rust stage: the point is to keep one streaming pipeline, and coreutils
+    // is already a hard dependency of every image this runs in.
+    let mut tee = None;
+    let mut flame_stdin = collapse_out;
+    if let Some(folded) = folded {
+        if let Some(parent) = folded.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut child = Command::new(TEE)
+            .arg(folded)
+            .stdin(Stdio::from(flame_stdin))
+            .stdout(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning `{TEE} {}`", folded.display()))?;
+        flame_stdin = child.stdout.take().expect("stdout was piped");
+        tee = Some(child);
+    }
+
     let svg = fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut flame = Command::new(FLAMEGRAPH)
-        .stdin(Stdio::from(collapse_out))
+        .stdin(Stdio::from(flame_stdin))
         .stdout(Stdio::from(svg))
         .spawn()
         .with_context(|| format!("spawning `{FLAMEGRAPH}`"))?;
 
     // Waited in pipeline order, so an upstream stage's failure is reported as itself rather than
     // as the downstream stage seeing an early EOF.
-    for (name, child) in [(PERF, &mut script), (COLLAPSE, &mut collapse), (FLAMEGRAPH, &mut flame)]
-    {
+    let mut stages: Vec<(&str, &mut std::process::Child)> =
+        vec![(PERF, &mut script), (COLLAPSE, &mut collapse)];
+    if let Some(child) = tee.as_mut() {
+        stages.push((TEE, child));
+    }
+    stages.push((FLAMEGRAPH, &mut flame));
+    for (name, child) in stages {
         let status = child.wait().with_context(|| format!("waiting for `{name}`"))?;
         if !status.success() {
             bail!("`{name}` failed with {status}");
