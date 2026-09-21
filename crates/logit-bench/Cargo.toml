@@ -40,9 +40,20 @@ serde.workspace = true
 # (`cargo-deny`) flags (RUSTSEC-2023-0089) -- avoided entirely rather than suppressed.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rkyv = "0.8"
+# The attribute-sizing arms' mirror of `AttrMap` (`src/bakeoff/attr_arms/`) has to have the same
+# backing store as the real one -- `SmallVec<[(Symbol, Value); 8]>`, at the workspace's version and
+# feature set (`union`), since both the layout and `Clone`'s growth policy are what that arm is
+# measuring. Through the workspace, so it can't drift from `logit-core`'s.
+smallvec.workspace = true
 
 [dev-dependencies]
 divan = "0.1"
+# `benches/size_vs_alloc.rs`'s `#[global_allocator]`, at the same version `logit-cli` ships
+# (`docs/adr/jemalloc-global-allocator.md`). That bench measures what an allocation *costs*, so it
+# has to run against the allocator production actually uses -- `benches/pipeline.rs`'s
+# `divan::AllocProfiler` wraps the **system** allocator and counts from inside the timed region,
+# which is the right trade for an allocation-count bench and the wrong one for this.
+tikv-jemallocator = "0.6"
 tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
@@ -53,4 +64,16 @@ harness = false
 
 [[bench]]
 name = "wire_format"
+harness = false
+
+[[bench]]
+name = "size_vs_alloc"
+harness = false
+
+# The attribute-sizing arms (`docs/plans/event-sizing.md`'s W3b). Installs the same real jemalloc
+# `#[global_allocator]` as `size_vs_alloc` and for the same reason: these measure what a clone and
+# an allocation *cost*, so they have to run against the allocator production uses. The matching
+# allocation counts live in `tests/attr_arms.rs`, which wraps `System` instead.
+[[bench]]
+name = "attr_arms"
 harness = false

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-12
-updated: 2026-09-18
+updated: 2026-09-21
 ---
 
 # Enabling plan: a load-test harness for the real `logit` binary
@@ -84,6 +84,19 @@ Lua a scenario needs — validated the same way every other example config is.
 | `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 25M | ~3.15M/s |
 | `logfmt-parse` | `generate_in` (logfmt line, `fixtures::LOGFMT_LINE`) → `logfmt` → `null_out` | The logfmt parse alone; nine interner probes per event until `logfmt` adopts `KeyCache` | 9.5M | ~1.60M/s |
 | `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` (no `kv_metrics`) | Three parsers contending on the process-wide interner at once, read against `json-parse` | 9.5M | ~1.44M/s (generated; each parsed 3×) |
+| `json-parse-app-log` | `generate_in` (`fixtures::FLAT_JSON_LOG_BODY` + `tail_in`'s `log.file.path`) → `json` → `null_out` | The parse at the commonest *measured* log width, 12 attributes (`docs/design/data-shapes.md` §5.3), read against `json-parse` | 12M | run, not yet retuned (10.9 s/repeat) |
+| `json-parse-nested-log` | `generate_in` (`fixtures::PINO_HTTP_LOG_BODY` + the same path attribute) → `json` → `null_out` | The same parse on a *nested* record: 10 attributes but four boxed `Value::Map`s | 8M | run, not yet retuned (13.9 s/repeat) |
+| `json-parse-access-log` | `generate_in` (`fixtures::POSTGRES_JSONLOG_BODY` + the same path attribute) → `json` → `null_out` | The widest, highest-rate log class, 30 attributes — the only shipped scenario whose `AttrMap` reallocs | 5M | run, not yet retuned (12.4 s/repeat) |
+
+The last three rows are [`docs/plans/event-sizing.md`](event-sizing.md)'s W1 (2026-09-21): three
+widths of the same `json` parse, so a sizing arm can be read against the bimodal log population
+`docs/design/data-shapes.md` §6 describes rather than against one shape. Their counts were first
+estimates scaled off `json-parse`'s by key count. **They have since been run** — the event-sizing
+bake-off (`docs/design/performance.md` §8) ran all three on `main`, median of six repeats — and none
+landed in the 5–10 s band: 10.9 s, 13.9 s, and 12.4 s respectively, all overshooting. Their counts
+were then lowered to 9M, 4.5M and 3M — each scaled to ~8 s from its measured wall time; a
+`--repeat 5` pass against this table's own protocol, at the new counts, is the next thing owed to
+them.
 
 Counts target roughly 5-10 seconds of wall time each. **Retuned 2026-09-20 for the disposable perf
 VM** (`docs/adr/disposable-azure-perf-vm.md`), the project's reference box — most scenarios already

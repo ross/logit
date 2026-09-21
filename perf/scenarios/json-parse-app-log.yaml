@@ -1,0 +1,46 @@
+# The commonest measured application-log shape: generate_in renders a Go `log/slog`-style
+# JSON line of eleven flat fields, `json` merges them onto tail_in's own `log.file.path` for a
+# 12-attribute event, then null_out discards. Twelve is the p50 width
+# docs/design/data-shapes.md §5.3 measured across eight real logging libraries in their documented
+# production configuration -- and the width json-parse.yaml's six-field nginx body does not
+# reach.
+#
+#   script/perf run --scenario json-parse-app-log
+#
+# `gen`'s `log:` template is `fixtures::FLAT_JSON_LOG_BODY` from crates/logit-bench/src/fixtures.rs,
+# verbatim, and its one `log.file.path` attribute is what `tail_in` stamps on every line it reads
+# (crates/logit-inputs/src/tail/line.rs) -- so this scenario parses the exact shape
+# crates/logit-bench/tests/allocations.rs's `json_parse_flat_json_log_event` already pins at the
+# component level, at the same total attribute width. `{{`/`}}` are logit_core::template's
+# brace-escape, needed because a JSON body is nothing but braces. No `{seq}` substitution, for
+# json-parse.yaml's reason: one representative line, parsed as fast as the runtime allows.
+#
+# No `kv_metrics` after the parse, following logfmt-parse.yaml rather than json-parse.yaml: this
+# scenario exists to isolate the parse at a *width*, and a metrics stage on top would fold its own
+# per-event cost into the comparison between these three.
+#
+# Why it exists alongside json-parse: at 12 attributes the event's AttrMap has spilled past its
+# 8-slot inline capacity (one allocation, 768 bytes with room for 16 --
+# `attr_map_spills_to_double_its_inline_capacity_then_reallocs`), where json-parse's ~10-attribute
+# nginx shape sits barely over the same line and logfmt-parse's 9 sits one slot over it. Read
+# against json-parse, this is the per-key parse cost at the width a real logging library produces.
+#
+# The count targets docs/plans/load-test-harness.md's 5-10 s band. The first estimate (12M, scaled
+# off json-parse's by key count) ran 10.9 s on the reference VM (docs/design/performance.md §8), so
+# this is that count scaled to ~8 s from the measured wall time -- not yet re-run at this value.
+components:
+  gen:
+    type: generate_in
+    count: 9000000
+    event:
+      log: '{{"time":"2026-09-07T06:52:01.123456789Z","level":"INFO","msg":"request completed","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":18.4,"bytes":842,"remote_addr":"198.51.100.23","request_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d40abc","user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}}'
+      attributes:
+        log.file.path: /var/log/app/app.log
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  out:
+    type: null_out
+    sources: [parsed]

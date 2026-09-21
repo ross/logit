@@ -1530,8 +1530,8 @@ pub fn remote_write_request_v2() -> Vec<u8> {
 pub fn collectd_event() -> Event {
     let mut attributes = AttrMap::new();
     attributes.insert(logit_proto::collectd::ATTR_HOST, Value::str("fixture-host"));
-    attributes.insert(logit_proto::collectd::ATTR_PLUGIN, Value::str("load"));
-    attributes.insert(logit_proto::collectd::ATTR_TYPE, Value::str("load"));
+    attributes.insert(logit_proto::collectd::ATTR_PLUGIN, sstr("load"));
+    attributes.insert(logit_proto::collectd::ATTR_TYPE, sstr("load"));
     attributes.insert(logit_proto::collectd::ATTR_INTERVAL, Value::F64(10.0));
     // A positive timestamp: `collectd_out`'s encoder drops a `timestamp <= 0` event outright
     // (`nanos_to_cdtime`'s own "no time given" reading), so `0` here would silently encode to
@@ -1676,4 +1676,394 @@ pub fn generate_literal() -> GenerateInput {
 /// [`generate_literal`]'s count is precisely what two placeholders cost per event.
 pub fn generate_templated() -> GenerateInput {
     generate_input(GENERATE_LOG_TEMPLATED, "web-{seq%10}")
+}
+
+// -------------------------------------------------------------------------------------------
+// Survey-derived shapes (docs/design/data-shapes.md §7 follow-up 2,
+// docs/plans/event-sizing.md W1)
+// -------------------------------------------------------------------------------------------
+//
+// Six shapes the data-shape survey asked for by name and nothing in this file sat at. Every one
+// of them is **modelled, not captured**: each doc comment below names the survey row it is built
+// to sit on and what part of it is the model's own invention, per this file's own provenance
+// standard (see [`SSHD_SYSLOG_LINE`] and `docs/design/memory.md`'s "Fixtures" section). The
+// survey's own §0 and §7 are explicit that none of its numbers are production traffic either, so
+// these fixtures inherit that caveat rather than escaping it.
+//
+// Four of the six are built the way the leg that produces them really works -- a `tail_in`-style
+// log event carrying a JSON body, parsed by the real `json` transform -- because that is the only
+// way the attribute *width* these exist to pin is produced by the code under measurement rather
+// than by the fixture. `tail_in` stamps exactly one attribute of its own, `log.file.path`
+// (`crates/logit-inputs/src/tail/line.rs`), and the survey's §5.3 counts are taken from a `shape`
+// tap after `json` on exactly that leg -- so the path attribute is part of every measured width
+// below, and is included here for the same reason.
+
+/// The attribute `tail_in` stamps on every line it reads (`crates/logit-inputs/src/tail/line.rs`)
+/// -- the one attribute an unparsed log event carries on the leg `docs/design/data-shapes.md`
+/// §5.3 measured, and therefore part of every width in that table.
+const TAIL_PATH_KEY: &str = "log.file.path";
+
+/// A `Value::Str` over a `'static` literal, never a `Bytes::from(String)`.
+///
+/// Every directly-constructed fixture below uses this rather than [`Value::str`], for
+/// [`sshd_message_event`]'s reason applied to attribute values: `bytes::Bytes`'s `Vec`-backed
+/// representation defers one allocation to its *first* `clone`, so a fixture built from
+/// `Value::str` pays a one-time promotion per string inside whatever region first clones it --
+/// which for these shapes is the `Event::clone` measurement itself. A value that really arrived
+/// off the wire is always already a shared slice of a decoder's buffer; `Bytes::from_static` is
+/// that, with no promotion to leak into a measurement.
+fn sstr(literal: &'static str) -> Value {
+    Value::Str(Bytes::from_static(literal.as_bytes()))
+}
+
+/// A log event carrying `body` as its message and nothing but [`TAIL_PATH_KEY`] in its attributes
+/// -- the exact shape `tail_in` hands `json`, so a `json.process` over it produces the *total*
+/// attribute width `docs/design/data-shapes.md` §5.3 tabulates (the library's own keys plus the
+/// path), not just the JSON key count.
+///
+/// The message is cloned once before it is ever handed to a transform, for [`csv_event`]'s reason:
+/// `bytes::Bytes` defers its shared representation to a buffer's first clone, and a fixture that
+/// paid that promotion inside the measured region would be measuring its own construction.
+fn tailed_json_event(body: &'static str, cache: &'static OnceLock<Bytes>) -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert(TAIL_PATH_KEY, sstr("/var/log/app/app.log"));
+    Event::log(
+        1_725_091_200_123_000_000,
+        attributes,
+        LogRecord {
+            message: Value::Str(cached_message(body, cache)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    )
+}
+
+/// **The commonest measured log shape**: eleven flat JSON fields which, merged onto `tail_in`'s own
+/// `log.file.path`, make a **12-attribute** event -- the p50 in
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §5.3 for both Go
+/// `log/slog`'s `JSONHandler` (12 / max 13) and structlog's documented production recipe (12 / 13),
+/// and the middle of §2's "after `json` it is 9-14" band. §6 names its absence explicitly: "There
+/// is no fixture for the commonest measured log shape (12 flat string attributes)".
+///
+/// Modelled on `log/slog`'s `JSONHandler` because its arithmetic is the one that reproduces the
+/// measured number exactly and visibly: slog's default line is **3** fields (`time`, `level`,
+/// `msg`, `log/slog`'s `handler.go` -- `docs/design/data-shapes-rows.md` §A), the survey's apps
+/// each logged **8** ordinary access fields on top, and `tail_in` adds **1** -- 3 + 8 + 1 = 12.
+/// Key and value lengths follow §2's measured bands rather than being chosen freely: keys are 3-11
+/// bytes (median 6, against a measured median of 4-9), string values 3-36 bytes with one
+/// user-agent in the tail (median 14, against a measured median of 10-16 and a p90 of 26-37).
+///
+/// **Modelled, not captured.** No slog process was run for this; the envelope is read off slog's
+/// documented default output and the eight access fields are the survey's own description of the
+/// workload its apps logged ("method, path, status, duration and the like"), not a recorded line.
+/// [`WIDE_JSON_SYSLOG_LINE`] is what this is *not*: at 28 JSON fields that one is an access-log
+/// or audit-log width, which §6 says explicitly ("wider than any library measured (9-15)").
+pub const FLAT_JSON_LOG_BODY: &str = concat!(
+    r#"{"time":"2026-09-07T06:52:01.123456789Z","level":"INFO","msg":"request completed","#,
+    r#""method":"POST","path":"/api/v1/orders","status":201,"duration_ms":18.4,"#,
+    r#""bytes":842,"remote_addr":"198.51.100.23","request_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d40abc","#,
+    r#""user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}"#
+);
+
+/// A `tail_in`-shaped log event carrying [`FLAT_JSON_LOG_BODY`] -- one attribute before `json`,
+/// **12 after**.
+pub fn flat_json_log_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    tailed_json_event(FLAT_JSON_LOG_BODY, &MESSAGE)
+}
+
+/// The **nested** log shape, and the only one in this file: pino-http's completion record, whose
+/// request serializers make the record *narrower* at the top and deeper underneath.
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §5.3 measures it at 9
+/// attributes (max 10) after `json` with **4 nested maps, median width 3, depth 2**, and §6 calls
+/// nested maps out as the thing that "multiply whatever is chosen" -- each `Value::Map` is a boxed
+/// `AttrMap` paying the full inline footprint again (`crates/logit-core/src/value.rs`). §6 also
+/// names the gap this closes: there is no fixture "for a nested-map record".
+///
+/// Nine top-level keys, exactly the desk row's count (`docs/design/data-shapes-rows.md` §A,
+/// pino-http@v11): pino's own five (`level`, `time`, `msg`, `pid`, `hostname`) plus `reqId`,
+/// `responseTime`, `req{}` and `res{}`. With `tail_in`'s path that is **10 event attributes**, the
+/// measured maximum (the measured p50 of 9 is the same record without a path attribute -- a
+/// `docker_in` or OTLP leg).
+///
+/// Four maps at depth 2: `req{}` and `res{}` each carry a nested `headers{}`, which is
+/// `logit_transforms::shape`'s own accounting (it counts maps recursively and reports
+/// `value_depth` as the deepest container chain, `crates/logit-transforms/src/shape.rs`) and is
+/// what makes the measured 4 / 3 / 2 triple reproduce here. **The per-map widths are the model's
+/// own**: the survey reports pooled percentiles over all maps and all events, not a width per map,
+/// so three keys each is a choice consistent with its median of 3, not a recorded shape. The
+/// serializers' own field lists come from `pino-std-serializers`' documented `req`/`res` output.
+///
+/// **Modelled, not captured** -- no pino-http process was run for this. One hazard the survey met
+/// is worth keeping in view when reading any number off this fixture: misconfiguring pino-http's
+/// destination silently drops the serializers, and the record then carries kilobytes of raw socket
+/// internals. This models the configured shape, which is the narrow one.
+pub const PINO_HTTP_LOG_BODY: &str = concat!(
+    r#"{"level":30,"time":1725091200123,"pid":4821,"hostname":"api-7c9f8d6b5-abcde","#,
+    r#""reqId":"req-8461","#,
+    r#""req":{"method":"POST","url":"/api/v1/orders","#,
+    r#""headers":{"host":"shop.example.com","content-type":"application/json","content-length":"842"}},"#,
+    r#""res":{"statusCode":201,"#,
+    r#""headers":{"content-type":"application/json","content-length":"57","vary":"Accept-Encoding"}},"#,
+    r#""responseTime":18,"msg":"request completed"}"#
+);
+
+/// A `tail_in`-shaped log event carrying [`PINO_HTTP_LOG_BODY`] -- one attribute before `json`,
+/// **10 after**, four of which are (or contain) boxed `AttrMap`s.
+pub fn pino_http_log_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    tailed_json_event(PINO_HTTP_LOG_BODY, &MESSAGE)
+}
+
+/// The widest, highest-rate log class in the survey, and the one
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §7 flags as having **no
+/// capture behind it at all**: "Edge and access-log streams (15-34 fields, the highest event rates)
+/// rest on Counted rows."
+///
+/// **PostgreSQL's `jsonlog`**, 29 keys, is the one chosen -- `docs/design/data-shapes-rows.md` §A
+/// (`T5b#C4`, counted against PostgreSQL's own `runtime-config-logging` §19.8.4-5), and not an
+/// arbitrary pick: `tail_in` is already live against exactly this format in `demo/logit.yaml`'s
+/// `postgres_in`, so this fixture's width is one a config in this repository really produces. With
+/// `tail_in`'s own `log.file.path` that is a **30-attribute** event, the middle of the 15-34 band
+/// (ALB's 34 and CloudFront's 33 are the other candidates §2 counts; either would sit two to four
+/// attributes wider and one `realloc` further along [the growth ladder]
+/// (../../tests/allocations.rs)).
+///
+/// **All 29 keys present at once.** PostgreSQL emits the error-detail keys (`detail`, `hint`,
+/// `internal_query`, `context`, `statement`, ...) only on the lines that have them, so a routine
+/// statement log is narrower than this; the survey's count is the format's full width, and this
+/// fixture is that width -- the widest line the format produces, not its median line, which is
+/// what the "desk-counted class" row means. **Modelled, not captured**: no PostgreSQL instance was
+/// run for this, and the values are plausible rather than recorded.
+pub const POSTGRES_JSONLOG_BODY: &str = concat!(
+    r#"{"timestamp":"2026-09-07 06:52:01.123 UTC","user":"orders_app","dbname":"orders","#,
+    r#""pid":4821,"remote_host":"10.0.0.17","remote_port":54871,"#,
+    r#""session_id":"68bd2f41.12d5","line_num":142,"ps":"INSERT","#,
+    r#""session_start":"2026-09-07 06:40:11 UTC","vxid":"4/2841","txid":"918273","#,
+    r#""error_severity":"ERROR","state_code":"23505","#,
+    r#""message":"duplicate key value violates unique constraint \"orders_pkey\"","#,
+    r#""detail":"Key (id)=(12345) already exists.","hint":"Retry with a fresh identifier.","#,
+    r#""internal_query":"INSERT INTO orders (id) VALUES ($1)","internal_position":13,"#,
+    r#""context":"PL/pgSQL function place_order(integer) line 8 at SQL statement","#,
+    r#""statement":"SELECT place_order(12345)","cursor_position":8,"#,
+    r#""func_name":"_bt_check_unique","file_name":"nbtinsert.c","file_line_num":666,"#,
+    r#""application_name":"orders-api","backend_type":"client backend","#,
+    r#""query_id":-3491082746118273645,"leader_pid":4788}"#
+);
+
+/// A `tail_in`-shaped log event carrying [`POSTGRES_JSONLOG_BODY`] -- one attribute before `json`,
+/// **30 after**.
+pub fn access_log_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    tailed_json_event(POSTGRES_JSONLOG_BODY, &MESSAGE)
+}
+
+/// A **17-attribute HTTP server span**, the measured ceiling and the shape
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §6 says has no fixture
+/// ("for a span at the 16-17 ceiling"). It does not replace [`span_event`], which stays: that one
+/// is deliberately inside `AttrMap`'s inline capacity and measures the `events`/`links` `Vec`s,
+/// this one is deliberately past it and measures the spilled map.
+///
+/// Seventeen attributes, named from the OpenTelemetry HTTP semantic conventions on the path an
+/// instrumentation really sets them. §4 counts a conforming HTTP server span at **16** under
+/// default configuration (3 required + 7 conditionally required + 6 recommended) and measures the
+/// OpenTelemetry Demo at **p50 8, p90 17, max 18** over 114,551 spans; Java's agent, Go's
+/// `otelhttp` and .NET's AspNetCore land at 16, 16 and 17 respectively with no configuration. This
+/// sits at the p90, one attribute over the spec's default count -- `network.transport` is the
+/// seventeenth, a recommended attribute a real agent does set.
+///
+/// **No span events and no links**, unlike [`span_event`], and that is the measured finding rather
+/// than a simplification: §4 reports 76% of demo spans carrying no events at all, and **no span in
+/// 114,551 carried a link**. So the clone cost of this fixture is its spilled attribute map and
+/// nothing else, where [`span_event`]'s is two `Vec`s and no spill -- between them they separate
+/// the two costs a span can have.
+///
+/// **Modelled, not captured**: the attribute *names* are the conventions', but no OTLP payload was
+/// recorded for this -- it is built by hand against `crates/logit-core/src/span.rs`, per
+/// `docs/design/memory.md`'s Fixtures pattern #2.
+pub fn wide_server_span_event() -> Event {
+    let mut attrs = AttrMap::new();
+    // Required (3).
+    attrs.insert("http.request.method", sstr("POST"));
+    attrs.insert("url.path", sstr("/api/v1/orders"));
+    attrs.insert("url.scheme", sstr("https"));
+    // Conditionally required (7).
+    attrs.insert("http.response.status_code", Value::I64(201));
+    attrs.insert("http.route", sstr("/api/v1/orders"));
+    attrs.insert("network.protocol.version", sstr("1.1"));
+    attrs.insert("server.address", sstr("shop.example.com"));
+    attrs.insert("server.port", Value::I64(443));
+    attrs.insert("url.query", sstr("notify=true"));
+    attrs.insert("client.address", sstr("198.51.100.23"));
+    // Recommended (6).
+    attrs.insert("client.port", Value::I64(54871));
+    attrs.insert("network.peer.address", sstr("10.0.0.17"));
+    attrs.insert("network.peer.port", Value::I64(443));
+    attrs.insert("network.protocol.name", sstr("http"));
+    attrs.insert("user_agent.original", sstr("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"));
+    attrs.insert("url.full", sstr("https://shop.example.com/api/v1/orders?notify=true"));
+    // The seventeenth, taking this from the spec's default 16 to the measured p90 of 17.
+    attrs.insert("network.transport", sstr("tcp"));
+
+    let record = SpanRecord {
+        trace_id: [0xAB; 16],
+        span_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        parent_span_id: Some([0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]),
+        name: sstr("POST /api/v1/orders"),
+        kind: SpanKind::Server,
+        status: SpanStatus::Ok,
+        events: Vec::new(),
+        links: Vec::new(),
+        end_timestamp: 1_725_091_200_090_000_000,
+        flags: 0,
+        ext: None,
+    };
+    Event::span(1_725_091_200_000_000_000, attrs, record)
+}
+
+/// The **only measured `MetricList` spill**: one collectd value list carrying three data sources,
+/// which [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §3 puts at **17.4% of
+/// 16,590 events** under a default plugin set (2 records; 0.4% carry 3, and nothing carried more).
+/// Every other metric input in the tree emits one metric per event by construction, so this is the
+/// shape that decides whether `MetricList`'s single inline slot costs anything at all --
+/// `memory.md` §8 item 13's open question.
+///
+/// Six attributes, which is collectd's measured width exactly: §3 reports p50 = p90 = max = **6**
+/// over the whole corpus, and six is also the full `collectd.*` identity set the decoder stamps
+/// (`crates/logit-proto/src/collectd/mod.rs`) -- host, plugin, plugin instance, type, type
+/// instance, interval. So this event's map stays *inline* and its metric list spills, the exact
+/// inverse of every log fixture above.
+///
+/// Built by hand rather than decoded from [`collectd_load_packet`] (which produces the same three
+/// records but only four attributes, having no instances to stamp): the point here is the
+/// post-decode shape at the measured width, and `docs/design/memory.md`'s Fixtures section
+/// sanctions a directly-constructed event where no wire literal produces the shape wanted. The
+/// record names are what `CollectdDecoder` really produces for a three-source list with a
+/// `types.db` attached -- `<plugin>.<type>.<data source>` (`collectd/decode.rs`).
+///
+/// **Modelled, not captured, and one key is the model's own.** `load` is collectd's canonical
+/// three-data-source type, and its `relative` type instance is real (the `load` plugin's
+/// `ReportRelative`) -- but a real `load` list carries no *plugin* instance, so a decoded one is
+/// five attributes, not six. The sixth is present deliberately: the survey measures the record
+/// count (3) and the attribute width (6) over the same corpus but does not say they co-occur on
+/// one list, and this fixture crosses them on purpose so one event exercises both spills'
+/// absence/presence at the measured numbers. A reviewer reading a per-attribute cost off this
+/// should know the sixth key is the fixture's, not collectd's.
+pub fn collectd_three_record_event() -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert(logit_proto::collectd::ATTR_HOST, sstr("web-1"));
+    attributes.insert(logit_proto::collectd::ATTR_PLUGIN, sstr("load"));
+    attributes.insert(logit_proto::collectd::ATTR_PLUGIN_INSTANCE, sstr("0"));
+    attributes.insert(logit_proto::collectd::ATTR_TYPE, sstr("load"));
+    attributes.insert(logit_proto::collectd::ATTR_TYPE_INSTANCE, sstr("relative"));
+    attributes.insert(logit_proto::collectd::ATTR_INTERVAL, Value::F64(10.0));
+
+    let mut event = Event::empty(1_700_000_000_000_000_000, attributes);
+    for (name, value) in
+        [("load.load.shortterm", 0.1), ("load.load.midterm", 0.2), ("load.load.longterm", 0.3)]
+    {
+        event
+            .metrics
+            .push(MetricRecord::new(logit_core::interner::intern(name), MetricKind::Gauge(value)));
+    }
+    event
+}
+
+/// A **17-attribute `Resource`**: the collector-enriched identity
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §4 measured at **min 10,
+/// median 17, p90 28, max 29** per batch through the OpenTelemetry Demo's collector with
+/// `resource_detection` on. §6: "Whatever `AttrMap` becomes, `Resource` is the consumer that is
+/// already always spilled" -- at 17 attributes against 8 inline slots this one allocates on
+/// construction and on every clone, once per batch.
+///
+/// The names are the conventions' own identity groups as a collector fills them -- `service.*`
+/// (the SDK's default resource), `telemetry.sdk.*` (which every SDK sets), `k8s.*` (what
+/// `k8sattributes` adds: §4 counts 6 by default and 30 fully enabled), plus host, container and
+/// cloud attributes from `resourcedetection`. **Modelled, not captured**: the survey measured
+/// *counts*, not which keys; §7 is explicit that "Kubernetes enrichment is Counted, not Measured",
+/// so the seventeen names here are a plausible 17 of the conventions' 38, not a recorded set.
+pub fn enriched_resource() -> Arc<Resource> {
+    let mut attributes = AttrMap::new();
+    for (key, value) in [
+        ("service.name", "orders-api"),
+        ("service.namespace", "shop"),
+        ("service.version", "3.4.1"),
+        ("service.instance.id", "c3f7a1e2-9b44-4f0a-8c2d-11f2a9d40abc"),
+        ("telemetry.sdk.name", "opentelemetry"),
+        ("telemetry.sdk.language", "go"),
+        ("telemetry.sdk.version", "1.38.0"),
+        ("k8s.cluster.name", "prod-1"),
+        ("k8s.namespace.name", "shop"),
+        ("k8s.pod.name", "orders-api-7c9f8d6b5-abcde"),
+        ("k8s.pod.uid", "9f21c8e4-1b3d-4a7e-9c02-6d5f4b1a8e30"),
+        ("k8s.node.name", "ip-10-0-3-17.ec2.internal"),
+        ("k8s.deployment.name", "orders-api"),
+        ("k8s.container.name", "orders-api"),
+        ("container.id", "a1b2c3d4e5f60718293a4b5c6d7e8f90"),
+        ("host.name", "ip-10-0-3-17"),
+        ("cloud.region", "us-east-1"),
+    ] {
+        attributes.insert(key, sstr(value));
+    }
+    Arc::new(Resource { attributes, dropped_attributes_count: 0, schema_url: None })
+}
+
+/// One OpenTelemetry log record at its measured median shape --
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §2: "a median of 9
+/// attributes (max 11) through the demo's collector, ... with a median body of 84 bytes", almost
+/// never nested (268 of 36,524 records). Nine attributes is one slot *past* `AttrMap`'s inline
+/// capacity, which is the point: the median OpenTelemetry log record spills, by one. The body here
+/// is 84 bytes exactly.
+///
+/// **Modelled, not captured**: the counts are measured, the key names are the conventions' own.
+fn otlp_log_record_event(index: usize) -> Event {
+    let mut attributes = AttrMap::new();
+    attributes.insert("code.function", sstr("placeOrder"));
+    attributes.insert("code.namespace", sstr("shop.orders"));
+    attributes.insert("log.iostream", sstr("stdout"));
+    attributes.insert("thread.id", Value::I64(42));
+    attributes.insert("thread.name", sstr("http-nio-8080-exec-3"));
+    attributes.insert("http.request.method", sstr("POST"));
+    attributes.insert("http.route", sstr("/api/v1/orders"));
+    attributes.insert("http.response.status_code", Value::I64(201));
+    attributes.insert("order.id", Value::I64(index as i64));
+    Event::log(
+        1_725_091_200_123_000_000 + index as i64,
+        attributes,
+        LogRecord {
+            // 84 bytes, the measured median body length for an OpenTelemetry log record.
+            message: sstr(
+                "order placed: id=0000 customer=shop/eu-west total=42.50 currency=EUR status=OK ",
+            ),
+            severity: Some(logit_core::Severity::Info),
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 1_725_091_200_123_000_000,
+            dropped_attributes_count: 0,
+        },
+    )
+}
+
+/// **Five events sharing a 17-attribute [`enriched_resource`]** -- the batch shape
+/// [`docs/design/data-shapes.md`](../../../docs/design/data-shapes.md) §3 measured for a
+/// collector export (median **5** events per batch, p90 16) carrying §4's median resource. The
+/// pairing is the fixture: a `Resource` is `Arc`-shared across a batch
+/// (`crates/logit-core/src/event.rs`), so its spilled map is paid once per five events rather than
+/// once each -- and an `EventBatch::clone` (`docs/design/memory.md` §3's copy-on-write path) pays
+/// it again per contended fan-out branch, while the `Arc` alone does not.
+///
+/// The events are [`otlp_log_record_event`]s, so what this fixture separates is the two places an
+/// `AttrMap` is paid: five per-event maps at the measured median width (9, one past inline) and
+/// one much wider resource map that is *not* cloned with the batch at all, only `Arc`-bumped.
+pub fn enriched_resource_batch() -> EventBatch {
+    EventBatch {
+        resource: enriched_resource(),
+        scope: None,
+        events: (0..5).map(otlp_log_record_event).collect(),
+    }
 }

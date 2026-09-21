@@ -421,6 +421,283 @@ mod sink_queue {
     }
 }
 
+/// The six survey-derived shapes (`docs/design/data-shapes.md` §7 follow-up 2,
+/// `docs/plans/event-sizing.md` W1), across the operations a sizing decision turns on: build,
+/// lookup (hit and miss), mutate (one insert, one remove), **clone**, a 1000-event batch scan, and
+/// a native encode/decode. `tests/allocations.rs`'s "Survey-derived shapes" section pins the
+/// allocation counts for the same fixtures; this module is their wall-clock view.
+///
+/// **No number from this module belongs in a document.** `docs/design/memory.md`'s preamble and
+/// `docs/design/performance.md`'s are explicit that a workstation with heterogeneous cores makes
+/// unpinned runs bimodal by about 2x, and that every recorded figure comes from the perf VM. These
+/// benches exist so W3's arms have something to run; the numbers come later, from
+/// `script/vm`/`script/perf`.
+///
+/// The parameterisation is by shape rather than by width, because the shapes differ in more than
+/// width: `pino_http_log` is narrower than `flat_json_log` and far more expensive to clone (four
+/// boxed `Value::Map`s), and `collectd_3_record` is narrow enough to stay inline while its
+/// *metric* list spills. A benchmark indexed by attribute count alone would miss both.
+mod survey_shapes {
+    use super::*;
+    use logit_core::{Event, EventBatch, Value};
+    use logit_proto::native::{NativeDecoder, NativeEncoder};
+
+    /// Every shape, and the attribute each lookup bench reads -- one that is really present, so
+    /// `lookup_hit` measures a successful binary search rather than a miss in disguise.
+    const SHAPES: [&str; 6] = [
+        "flat_json_log",
+        "pino_http_log",
+        "access_log",
+        "server_span",
+        "collectd_3_record",
+        "otlp_log_record",
+    ];
+
+    /// A key no shape carries, for `lookup_miss`. `AttrMap::get` is deliberately non-interning
+    /// (`docs/design/memory.md` §4), so a miss costs a failed interner *lookup* plus a failed
+    /// binary search and never grows the table -- which is exactly the path this measures.
+    const MISSING_KEY: &str = "no.such.attribute.anywhere";
+
+    fn hit_key(shape: &str) -> &'static str {
+        match shape {
+            "flat_json_log" => "status",
+            "pino_http_log" => "reqId",
+            "access_log" => "backend_type",
+            "server_span" => "user_agent.original",
+            "collectd_3_record" => "collectd.type",
+            "otlp_log_record" => "thread.name",
+            other => unreachable!("unknown shape {other}"),
+        }
+    }
+
+    /// The fixture for `shape`, already through whatever parser produces it -- so every bench
+    /// below starts from the same event `tests/allocations.rs` measured.
+    fn event(shape: &str) -> Event {
+        let resource = fixtures::resource();
+        let mut json = fixtures::json_parser();
+        let mut parse = |mut event: Event| {
+            assert!(json.process(&resource, &mut event), "json always forwards");
+            event
+        };
+        match shape {
+            "flat_json_log" => parse(fixtures::flat_json_log_event()),
+            "pino_http_log" => parse(fixtures::pino_http_log_event()),
+            "access_log" => parse(fixtures::access_log_event()),
+            "server_span" => fixtures::wide_server_span_event(),
+            "collectd_3_record" => fixtures::collectd_three_record_event(),
+            "otlp_log_record" => {
+                fixtures::enriched_resource_batch().events.into_iter().next().expect("5 events")
+            }
+            other => unreachable!("unknown shape {other}"),
+        }
+    }
+
+    fn one_event_batch(shape: &str) -> EventBatch {
+        EventBatch { resource: fixtures::resource(), scope: None, events: vec![event(shape)] }
+    }
+
+    /// Building the shape from scratch. For the three JSON-bodied shapes this is the real `json`
+    /// transform over a `tail_in`-shaped event (the leg `docs/design/data-shapes.md` §5.3
+    /// measured); for the other three it is the fixture's own directly-constructed `insert` loop,
+    /// which is what `AttrMap`'s O(k²)-bytes sorted insert costs with no parser in front of it.
+    #[divan::bench(args = SHAPES)]
+    fn build(bencher: Bencher, shape: &str) {
+        let resource = fixtures::resource();
+        let mut json = fixtures::json_parser();
+        drop(event(shape)); // warm the key cache and the interner
+        match shape {
+            "flat_json_log" => bencher
+                .with_inputs(fixtures::flat_json_log_event)
+                .bench_local_refs(|event| json.process(&resource, event)),
+            "pino_http_log" => bencher
+                .with_inputs(fixtures::pino_http_log_event)
+                .bench_local_refs(|event| json.process(&resource, event)),
+            "access_log" => bencher
+                .with_inputs(fixtures::access_log_event)
+                .bench_local_refs(|event| json.process(&resource, event)),
+            "server_span" => bencher.bench_local(fixtures::wide_server_span_event),
+            "collectd_3_record" => bencher.bench_local(fixtures::collectd_three_record_event),
+            "otlp_log_record" => bencher.bench_local(fixtures::enriched_resource_batch),
+            other => unreachable!("unknown shape {other}"),
+        }
+    }
+
+    #[divan::bench(args = SHAPES)]
+    fn lookup_hit(bencher: Bencher, shape: &str) {
+        let event = event(shape);
+        let key = hit_key(shape);
+        assert!(event.attributes.get(key).is_some(), "{shape}: {key} should be present");
+        bencher.bench_local(|| divan::black_box(&event).attributes.get(divan::black_box(key)));
+    }
+
+    #[divan::bench(args = SHAPES)]
+    fn lookup_miss(bencher: Bencher, shape: &str) {
+        let event = event(shape);
+        bencher
+            .bench_local(|| divan::black_box(&event).attributes.get(divan::black_box(MISSING_KEY)));
+    }
+
+    /// One `insert` into an already-built map -- a `set`/`trace_context`/`regex`-shaped mutation.
+    /// The map is rebuilt per iteration (outside the timed region) so the insert is always the
+    /// k+1-th, never an overwrite of the previous iteration's.
+    #[divan::bench(args = SHAPES)]
+    fn insert_one(bencher: Bencher, shape: &str) {
+        bencher.with_inputs(|| event(shape)).bench_local_refs(|event| {
+            event.attributes.insert("bench.inserted", Value::I64(1));
+        });
+    }
+
+    /// One `remove` -- `keep`/`remove`'s per-attribute cost, an O(k) `Vec::remove` after the same
+    /// binary search `lookup_hit` measures.
+    #[divan::bench(args = SHAPES)]
+    fn remove_one(bencher: Bencher, shape: &str) {
+        let key = hit_key(shape);
+        bencher.with_inputs(|| event(shape)).bench_local_refs(|event| {
+            event.attributes.remove(divan::black_box(key));
+        });
+    }
+
+    /// What one extra fan-out branch costs. `docs/design/data-shapes.md` §6: VRL's own
+    /// flat-versus-tree crossover moved from about 128 fields to about 16 once the benchmark
+    /// cloned, so this is the bench the sizing arms are judged on, not `build`.
+    #[divan::bench(args = SHAPES)]
+    fn clone(bencher: Bencher, shape: &str) {
+        let event = event(shape);
+        bencher.bench_local(|| divan::black_box(&event).clone());
+    }
+
+    /// A 1000-event batch (`receive.batch_max_events`' default) scanned end to end, reading one
+    /// attribute per event -- the cache-density measurement `size_of::<Event>()` moves and
+    /// `AttrMap::get` alone does not. At 864 bytes an `Event` this walks 864 KB per iteration.
+    #[divan::bench(args = SHAPES)]
+    fn scan_1000(bencher: Bencher, shape: &str) {
+        let key = hit_key(shape);
+        let one = event(shape);
+        let events: Vec<Event> = (0..1000).map(|_| one.clone()).collect();
+        bencher.bench_local(|| {
+            let mut found = 0usize;
+            for event in divan::black_box(&events) {
+                if event.attributes.get(key).is_some() {
+                    found += 1;
+                }
+            }
+            found
+        });
+    }
+
+    #[divan::bench(args = SHAPES)]
+    fn native_encode(bencher: Bencher, shape: &str) {
+        let batch = one_event_batch(shape);
+        let mut encoder = NativeEncoder::default();
+        drop(encoder.encode(&batch));
+        bencher.bench_local(|| encoder.encode(divan::black_box(&batch)));
+    }
+
+    /// The decode side, where `docs/plans/event-sizing.md`'s lead finding lives: `read_attr_map_at`
+    /// (`crates/logit-proto/src/native/value.rs`) reads the exact attribute count off the wire and
+    /// discards it, then rebuilds the map by k sorted `insert_sym`s -- in the *writer's* symbol
+    /// order, which dictionary remapping has already made unsorted for the reader. So this is the
+    /// O(k²)-bytes build in its purest form.
+    #[divan::bench(args = SHAPES)]
+    fn native_decode(bencher: Bencher, shape: &str) {
+        let batch = one_event_batch(shape);
+        let mut encoder = NativeEncoder::default();
+        let framed = encoder.encode(&batch).expect("should encode");
+        let mut decoder = NativeDecoder;
+        let mut warm = Vec::new();
+        drop(decoder.decode_into(framed.clone(), 0, &mut warm));
+        bencher.bench_local(|| {
+            let mut events = Vec::new();
+            drop(decoder.decode_into(divan::black_box(framed.clone()), 0, &mut events));
+            events
+        });
+    }
+}
+
+/// The batch-level half of the survey shapes: five events sharing a 17-attribute `Resource`
+/// (`docs/design/data-shapes.md` §3's median collector batch carrying §4's median resource), and
+/// the runtime paths a batch of any shape goes through.
+///
+/// What is reachable here and what is not:
+///
+/// - **`retain_mut`** -- reachable, as `logit_pipeline::process_batch`, which *is* the
+///   `events.retain_mut(...)` path (ADR `in-place-transform-process`). Benched below.
+/// - **`route_batch`** -- reachable, a plain synchronous call. Benched below.
+/// - **`drain_inbox`** -- reachable but not meaningfully benchable per iteration. It is a loop
+///   that returns only when its inbox closes (`crates/logit-pipeline/src/runtime.rs`), so every
+///   iteration would have to build a fresh `mpsc` channel and `SinkStore`, drop the sender, and
+///   then measure mostly that setup. `tests/allocations.rs`'s
+///   `drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc` covers the path where the
+///   one-shot shape does not distort the measurement -- an allocation count, not a timing.
+/// - **`Fanout::send`'s copy-on-write clone** -- reachable and already benched, in `mod runtime`
+///   below (`fanout_send_two_consumers`), on the nginx shape.
+mod survey_batch {
+    use super::*;
+    use logit_core::{EventBatch, Telemetry};
+    use logit_pipeline::{process_batch, unwrap_batch, BatchContext, Delivered, RouterScratch};
+    use std::sync::Arc;
+
+    /// `EventBatch::clone` over the measured collector batch: five 9-attribute events (one slot
+    /// past inline, so every one of them spills) and a 17-attribute `Resource` that is
+    /// `Arc`-shared and therefore *not* copied. The asymmetry is the point -- see
+    /// `tests/allocations.rs`'s `clone_enriched_resource_batch`.
+    #[divan::bench]
+    fn clone_enriched_batch(bencher: Bencher) {
+        let batch = fixtures::enriched_resource_batch();
+        bencher.bench_local(|| divan::black_box(&batch).clone());
+    }
+
+    /// The same clone reached the way the runtime reaches it: `unwrap_batch` on a contended
+    /// `Delivered::Shared`, which is what a two-mutating-consumer fan-out always pays
+    /// (`docs/design/memory.md` §3).
+    #[divan::bench]
+    fn unwrap_contended_enriched_batch(bencher: Bencher) {
+        let shared = Arc::new(fixtures::enriched_resource_batch());
+        bencher.bench_local(|| {
+            let _keep_alive = Arc::clone(&shared);
+            unwrap_batch(Delivered::Shared(Arc::clone(&shared), BatchContext::default()))
+        });
+    }
+
+    fn wide_batch(count: usize) -> EventBatch {
+        let resource = fixtures::resource();
+        let mut json = fixtures::json_parser();
+        let mut event = fixtures::access_log_event();
+        assert!(json.process(&resource, &mut event), "json always forwards");
+        EventBatch { resource, scope: None, events: (0..count).map(|_| event.clone()).collect() }
+    }
+
+    /// `process_batch` -- the `Vec::retain_mut` path every transform node runs -- over 100 of the
+    /// widest survey shape, through `keep`. `keep` rebuilds the map, so this is where a 30-entry
+    /// `AttrMap`'s per-event cost shows up at batch scale rather than one event at a time.
+    #[divan::bench]
+    fn process_batch_100_access_logs(bencher: Bencher) {
+        let mut keep = fixtures::keep();
+        let telemetry = Telemetry::default();
+        bencher
+            .with_inputs(|| wide_batch(100))
+            .bench_local_values(|batch| process_batch(&mut keep, batch, &telemetry));
+    }
+
+    /// `route_batch`'s partition-and-move pass over the same 100 wide events -- one
+    /// `size_of::<Event>()` move per event (`docs/design/memory.md` §3's routing section), which
+    /// is the batch-level cost that scales directly with `Event`'s size rather than with its
+    /// allocation count.
+    #[divan::bench]
+    fn route_batch_100_access_logs(bencher: Bencher) {
+        let mut router = logit_transforms::Route::new(
+            logit_config::RouteBy::Attribute("backend_type".to_string()),
+            &[("client backend".to_string(), "backends".to_string())].into_iter().collect(),
+            &["backends".to_string()],
+        );
+        let mut scratch = RouterScratch::new(1);
+        let telemetry = Telemetry::default();
+        bencher.with_inputs(|| wide_batch(100)).bench_local_values(|batch| {
+            logit_pipeline::runtime::route_batch(&mut router, &mut scratch, batch, &telemetry)
+        });
+    }
+}
+
 /// Decode through aggregation for one access-log line -- the number that bounds ingest throughput
 /// for the reference config.
 #[divan::bench]

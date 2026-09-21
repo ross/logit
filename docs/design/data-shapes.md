@@ -566,11 +566,15 @@ product-scoped figure.
 
 Decisions and builds this data is for:
 
-1. **An ADR on `AttrMap` and `MetricList` sizing.** §6 frames it: the candidates are keeping 8, a
+1. **An ADR on `AttrMap` and `MetricList` sizing.** **Done for `AttrMap`, 2026-09-21:**
+   [ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md) —
+   8 stays, measured on both sides on the perf VM, and pre-sizing the spill was built and measured
+   *slower* end to end (`performance.md` §8). `MetricList` remains open. As first framed, §6 frames it: the candidates are keeping 8, a
    larger constant, no inline storage, a per-batch arena, and a shared-key layout; measured with the
    allocation pins and `script/perf`, on benchmarks that clone, across the bimodal population rather
    than one shape.
-2. **Survey-derived fixtures and perf scenarios** at the measured medians and tails: a 12-attribute
+2. **Survey-derived fixtures and perf scenarios** (**done**, `crates/logit-bench/src/fixtures.rs` and
+   `perf/scenarios/json-parse-{app,nested,access}-log.yaml`) at the measured medians and tails: a 12-attribute
    flat JSON log, a pino-http-style nested record, a 16–17-attribute server span, a 30-field
    access-log line, a 3-record collectd event, and a 17-attribute resource over a 5-event batch.
 3. **An NDJSON format for `file_out`/`stdio_out`.** It would give `shape` — and any operator — a

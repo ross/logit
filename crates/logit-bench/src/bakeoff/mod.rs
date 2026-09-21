@@ -8,6 +8,10 @@
 //! - **`rkyv`** -- zero-copy archival, over [`wire_mirror::WireBatch`].
 //! - **`postcard`** -- derived `serde` binary encoding, over the same mirror type.
 
+/// A second, unrelated bake-off built on the same "mirror the shipped type locally, change
+/// nothing in production" pattern: the attribute-sizing arms of
+/// `docs/plans/event-sizing.md`'s W3b (`benches/attr_arms.rs`, `tests/attr_arms.rs`).
+pub mod attr_arms;
 pub mod wire_mirror;
 
 use bytes::Bytes;
