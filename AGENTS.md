@@ -260,9 +260,11 @@ release `logit run <config>` process against `perf/scenarios/*.yaml` and measure
 telemetry leg into a per-node time breakdown and `flamegraph` driving `perf`/`inferno` in a
 throwaway image. [ADR `load-test-harness`](docs/adr/load-test-harness.md),
 [docs/plans/load-test-harness.md](docs/plans/load-test-harness.md), and
-[docs/design/performance.md](docs/design/performance.md) (the first recorded run) have the full
-account; the harness is built and runnable by hand, deliberately not wired into `script/cibuild`
-or any schedule yet. `target`/`route` are real, implemented `ComponentKind`s too: a `target` is a
+[docs/design/performance.md](docs/design/performance.md) (the recorded numbers, kept current as
+the harness and the code evolve — measured on the disposable perf VM,
+[ADR `disposable-azure-perf-vm`](docs/adr/disposable-azure-perf-vm.md), since 2026-09-20) have the
+full account; the harness is built and runnable by hand, deliberately not wired into
+`script/cibuild` or any schedule yet. `target`/`route` are real, implemented `ComponentKind`s too: a `target` is a
 named, zero-cost destination a router directs events into, and `route` is the native equality-only
 router that fills it, closing the two structural costs (a filter chain paid by every branch, and
 the deep clone an all-mutating fan-out can't avoid) the central-collector split-apart topology had

@@ -10,3 +10,10 @@ __pycache__/
 # script/perf run's output (crates/logit-perf, docs/adr/load-test-harness.md) -- deliberately
 # untracked: a results file records one machine's numbers at one commit, not something to commit.
 /perf/results/
+
+# script/vm build's stashed binaries (docs/adr/disposable-azure-perf-vm.md's "Multiple sources,
+# one VM" section) -- same reasoning as /perf/results/ above, and just as important to exclude:
+# left untracked, an unbuilt-until-now perf/bins/ makes `git status --porcelain` report the
+# checkout dirty from the first `script/vm build` on, which poisons LOGIT_PERF_GIT_DIRTY in every
+# results file `script/perf run` writes afterward on that same checkout.
+/perf/bins/

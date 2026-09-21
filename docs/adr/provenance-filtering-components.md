@@ -42,8 +42,8 @@ component id, drawn from a graph's own `components:` map -- closed and known ahe
 not the "genuine widening of what a native component can express" `has_attributes` had to argue
 for. Fan-out-after-`logit_in` is exactly the central-collector role
 `attribute-filtering-components.md`'s cost table is about, and it applies here unchanged: a Lua
-route costs 9 allocations/event and 1.07 µs/event plus a dedicated OS thread and LuaJIT VM per
-node; a native `Transform` costs 1 allocation/event and 360 ns/event, an ordinary tokio task. This
+route costs 9 allocations/event and 1.61 µs/event plus a dedicated OS thread and LuaJIT VM per
+node; a native `Transform` costs 1 allocation/event and 525 ns/event, an ordinary tokio task. This
 is the same measured trigger firing a second time, not a new one.
 
 ## Decision

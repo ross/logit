@@ -9,9 +9,11 @@ seed: 20260918
 ring_datagrams: 8191
 model: statsd-app.yaml
 
-# ~13.5 lines per datagram, so 116,000 datagrams/s is ~1.6M metrics/s offered -- the same
-# small-overload regime the other two specs sit in, reached with far fewer, far larger datagrams.
-rate: 116000
+# Retuned 2026-09-20 for the disposable perf VM (script/vm): bisected on current main to 3.97%
+# kernel drop at this rate. ~13.5 lines per datagram, so 107,000 datagrams/s is ~1.44M metrics/s
+# offered -- the same small-overload regime the other two specs sit in, reached with far fewer,
+# far larger datagrams.
+rate: 107000
 
 datagram_mix:
   - { weight: 1, max_bytes: 1432 }

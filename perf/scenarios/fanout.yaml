@@ -17,7 +17,7 @@
 components:
   gen:
     type: generate_in
-    count: 20000000
+    count: 25000000
     event:
       attributes:
         method: GET

@@ -10,8 +10,8 @@
 # (docs/adr/disposable-azure-perf-vm.md). The laptop can't give a trustworthy number: its
 # heterogeneous cores make an unpinned `script/perf run` come out bimodal depending on which core
 # type the worker threads land on, and thermal throttling plus whatever else the machine is doing
-# move the answer again. This provisions four homogeneous full physical AMD EPYC cores
-# (Standard_F4as_v6, SMT disabled), measures on them, and deletes the whole thing.
+# move the answer again. This provisions eight homogeneous full physical AMD EPYC cores
+# (Standard_F8as_v6, SMT disabled), measures on them, and deletes the whole thing.
 #
 # `down` DELETES THE RESOURCE GROUP. There is deliberately no stop/deallocate/start path and no
 # snapshot path: zero cost when the machine isn't in use is the requirement, and a stopped VM
@@ -50,8 +50,14 @@ LOGIT_VM_SUBSCRIPTION="${LOGIT_VM_SUBSCRIPTION:-}"
 
 LOGIT_VM_LOCATION="${LOGIT_VM_LOCATION:-westus2}"
 LOGIT_VM_ZONE="${LOGIT_VM_ZONE:-1}"
-# 4 vCPU = 4 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
-LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F4as_v6}"
+# 8 vCPU = 8 full physical AMD EPYC cores (az vm list-skus reports vCPUsPerCore: 1, i.e. SMT off).
+# The reference size: enough room that a fan-out/router/parallel-parser scenario or a driven UDP
+# scenario's sender+child+telemetry leg don't contend with each other for a core the way they did
+# on the 4-vCPU size this replaced (see the ADR's "The size, and why N vCPUs is N cores" section).
+LOGIT_VM_SIZE="${LOGIT_VM_SIZE:-Standard_F8as_v6}"
+# check_quota() derives the vCPU count it checks for from this, in case LOGIT_VM_SIZE is ever
+# pointed outside the Fasv6 family -- overrides LOGIT_VM_SIZE's own name-derived count.
+LOGIT_VM_VCPUS="${LOGIT_VM_VCPUS:-}"
 # gen2 only for this series; verified present in westus2 (and eastus, centralus). Pin an
 # explicit version instead of `latest` to compare across sessions -- logit-vm-metadata.txt
 # records whichever version `latest` actually resolved to.
@@ -97,8 +103,10 @@ LOGIT_VM_SSH_KEY="${LOGIT_VM_SSH_KEY:-${HOME}/.ssh/logit-perf-vm}"
 LOGIT_VM_KNOWN_HOSTS="${LOGIT_VM_KNOWN_HOSTS:-${HOME}/.ssh/logit-perf-vm.known_hosts}"
 
 # VM + 128GiB Premium SSD + a Standard static public IP, westus2 PAYG Linux -- for status's
-# running-cost line. A rough nag, not a bill.
-LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.305}"
+# running-cost line. A rough nag, not a bill. Azure retail-price API, 2026-09-20: F8as_v6 compute
+# alone is $0.546/hr (exactly 2x F4as_v6's $0.273/hr); +$0.032/hr for the disk/IP overhead the
+# F4as_v6 estimate this replaced (0.305) already carried, since neither scales with vCPU count.
+LOGIT_VM_HOURLY_USD="${LOGIT_VM_HOURLY_USD:-0.58}"
 
 VNET="${LOGIT_VM_RESOURCE_GROUP}-vnet"
 SUBNET="${LOGIT_VM_RESOURCE_GROUP}-subnet"
@@ -149,11 +157,20 @@ preflight() {
     echo "subscription:  ${account}"
 }
 
-# Regional and per-family vCPU headroom for the 4 this VM wants.
+# Regional and per-family vCPU headroom for however many LOGIT_VM_SIZE wants.
 #
 # `az vm list-usage` returns currentValue and limit as JSON *strings*, so a JMESPath numeric
 # filter on them crashes the CLI outright -- pulled out as text and compared in the shell instead.
 check_quota() {
+    local vcpus="${LOGIT_VM_VCPUS}"
+    if [ -z "${vcpus}" ]; then
+        if [[ "${LOGIT_VM_SIZE}" =~ ^Standard_F([0-9]+)as_v6$ ]]; then
+            vcpus="${BASH_REMATCH[1]}"
+        else
+            echo "script/vm: can't infer vCPU count from LOGIT_VM_SIZE=${LOGIT_VM_SIZE}; set LOGIT_VM_VCPUS explicitly" >&2
+            exit 2
+        fi
+    fi
     # `[0].[currentValue, limit]` returns a bare 2-element array, and `-o tsv` prints a bare
     # array one element per line, not tab-joined -- so a single `read var1 var2 <<<...` only ever
     # captured the first element, leaving the second empty and the arithmetic below silently
@@ -165,8 +182,8 @@ check_quota() {
     read -r core_used core_limit <<<"$("${AZ[@]}" vm list-usage -l "${LOGIT_VM_LOCATION}" \
         --query "{u:[?name.value=='cores']|[0].currentValue, l:[?name.value=='cores']|[0].limit}" -o tsv)"
     echo "quota:         Fasv6 ${family_used}/${family_limit} vCPU, regional ${core_used}/${core_limit} vCPU"
-    if [ $((family_limit - family_used)) -lt 4 ] || [ $((core_limit - core_used)) -lt 4 ]; then
-        echo "not enough vCPU quota in ${LOGIT_VM_LOCATION} for a 4-vCPU VM." >&2
+    if [ $((family_limit - family_used)) -lt "${vcpus}" ] || [ $((core_limit - core_used)) -lt "${vcpus}" ]; then
+        echo "not enough vCPU quota in ${LOGIT_VM_LOCATION} for a ${vcpus}-vCPU VM." >&2
         exit 1
     fi
 }
