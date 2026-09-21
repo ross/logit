@@ -93,6 +93,15 @@ the shape:
   `AttrMap = SmallVec<[(Symbol, Value); 8]>`, kept sorted by `Symbol`, beats a `HashMap` at this
   size for both lookup and iteration, and gives deterministic ordering for free — which matters for
   the wire format's dictionary encoding and for reproducible tests.
+- **Two ways to build one.** `insert`/`insert_sym` puts one entry at its sorted position, which is
+  what a component setting a key at a time wants; building a `k`-attribute map that way moves
+  O(k²) bytes, because every insert shifts the entries after it. A producer that knows its width —
+  a decoder with a count on the wire, a parser holding a filled scratch — uses `extend_unsorted`
+  (or the `bulk_insert` guard behind it) instead: one `reserve_exact`, an append in any order, and
+  one sort. Same result, entry for entry, including last-write-wins on a repeated key; one
+  exactly-sized allocation instead of smallvec's power-of-two growth chain. See
+  [docs/design/memory.md](memory.md) §1 for both ladders and
+  [docs/plans/event-sizing.md](../plans/event-sizing.md) for why it exists.
 
 ## Well-known attribute names
 

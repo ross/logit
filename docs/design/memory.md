@@ -209,11 +209,43 @@ bytes of heap for 432 bytes of entries, on top of the 392 inline bytes it has al
 abandoned. The `alloc` column stays at **1** however wide the map gets, because every doubling
 after the spill is a `realloc`; so allocation count, the metric this file is built on, is nearly
 blind to width past 9 — a 30-attribute access log and a 12-attribute application log are
-indistinguishable by it (§2's two `json` rows), and differ only in bytes moved. And `AttrMap`
-exposes no `reserve`/`with_capacity` at all, so no producer can avoid any of this even where it
-knows the count exactly: the native decoder reads an exact count off the wire and discards it
-(`native/value.rs`'s `read_attr_map_at`), while the metric list beside it *does* reserve
-(`native/record.rs`'s `read_record_list_into`).
+indistinguishable by it (§2's two `json` rows), and differ only in bytes moved.
+
+The third — that `AttrMap` exposed no `reserve`/`with_capacity` at all, so no producer could avoid
+any of this even where it knew the count exactly — **has since been fixed**
+(`docs/plans/event-sizing.md`'s arm P). `AttrMap` now has `with_capacity`/`capacity`/`reserve`/
+`reserve_exact` and, more to the point, a bulk build (`extend_unsorted`, and the `bulk_insert`
+guard behind it) that reserves once, appends, and sorts once. Its ladder is flat:
+
+| Attributes | allocs | reallocs | heap bytes | capacity |
+|--:|--:|--:|--:|--:|
+| 1, 8 | 0 | 0 | 0 (inline) | 8 |
+| 9 | **1** | 0 | 432 | 9 |
+| 12 | 1 | 0 | 576 | 12 |
+| 17 | 1 | 0 | 816 | 17 |
+| 30 | 1 | 0 | 1440 | 30 |
+| 33 | 1 | 0 | 1584 | 33 |
+
+(`attr_map_bulk_build_is_one_exact_allocation`, same file.) One allocation of exactly `k × 48`
+bytes at every width — `docs/plans/event-sizing.md`'s invariant I2 — where the sorted-`insert`
+ladder above takes the next power of two and reaches it in steps. The reservation is
+`reserve_exact`, not `reserve`: smallvec's `reserve` rounds up, which is the 768-for-576 the row
+above records, and a producer reaching for a bulk build has by definition just counted what it is
+about to insert.
+
+Two properties of that build are pinned rather than assumed, because both are quiet failure modes.
+The sort is `sort_unstable_by_key`: `slice::sort` is stable and buys its stability with a scratch
+buffer above roughly twenty elements, so a 30-field access log would have paid a second allocation
+per event, having just been handed its first one back
+(`attr_map_bulk_build_sorts_without_allocating`). And duplicate keys are resolved *before* the
+sort — an unstable sort says nothing about which of two equal keys was pushed first — with no
+allocation of their own: a 128-bit membership filter over the keys pushed so far for duplicates
+within the incoming run, and a backwards `swap_remove` pass for collisions with what the map
+already held. Last write wins either way, exactly as a sequence of `insert_sym` calls does.
+
+The sorted `insert`/`insert_sym` path is unchanged and still the right one for a producer that
+genuinely inserts one key at a time (`set`, a Lua attribute write); the ladder above is what it
+still costs.
 
 **Both inline capacities are compile-time constants** — `SmallVec<[T; N]>`'s `N` is a const array
 length, monomorphized into the type, with no runtime equivalent. There is no way to tune this per
@@ -303,7 +335,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `json` parse 12-attribute flat log | **1** | the survey's commonest measured log width (`docs/design/data-shapes.md` §5.3), through the real `tail_in`-shaped leg: one `log.file.path` plus eleven JSON keys. The one allocation is the `AttrMap` spill; every value slices the message `Bytes` |
 | `json` parse 10-attribute nested pino-http record | **5** | 1 spill + **4 boxed `Value::Map`s** (`req{}`, `res{}` and the `headers{}` inside each). A *narrower* event than the row above and five times the allocations -- `Value::Map` is `Box<AttrMap>`, so every nested object pays the full 392-byte inline footprint again, whatever its width (§6 of `data-shapes.md`: "nested maps multiply whatever is chosen") |
-| `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **2 reallocs** -- the only shipped shape whose map grows twice (8 → 16 → 32, §1's ladder). Only *one* of the three allocations is the map: the other two are a single JSON-escaped value, PostgreSQL quoting the constraint name in a violation message, which cannot be sliced zero-copy |
+| `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **1 realloc**, and that one is not the map -- it is the `shrink_to_fit` on a single JSON-escaped value, PostgreSQL quoting the constraint name in a violation message, which cannot be sliced zero-copy (two of the three allocations are that same value). Was 3 allocs + **2** reallocs while the merge was a loop of `insert_sym`: the map grew 8 → 16 → 32 and ended in a 1536-byte buffer. It now takes one exactly-sized 1440-byte buffer, §1's bulk-build ladder |
 | `Event::clone` (12-attribute flat log) | **1** | the spilled `AttrMap`, nothing else |
 | `Event::clone` (30-attribute access log) | **1** | **the same as the 12-attribute row** -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer, so a spilled map costs exactly one allocation however far past 8 it is. The two shapes differ only in bytes moved (1440 against 576, plus 864 for the `Event` either way): the clearest single demonstration that allocation count and copy cost rank these shapes differently |
 | `Event::clone` (10-attribute nested pino-http record) | **5** | 1 spill + 1 per boxed `Value::Map`. The narrowest of the three log shapes and by far the most expensive to clone |
@@ -885,10 +917,10 @@ batch except the last:
 |---|---:|---:|---|
 | 12-attribute flat JSON log | **16** | **5** | |
 | 10-attribute nested pino-http record | **24** | **9** | decode's extra four are the boxed `Value::Map`s, same cause as `json`'s |
-| 30-attribute access log | **24** | **5** | **decode is flat in width** -- the same 5 as the 12-attribute row, with the growth chain showing up as reallocs instead. This is `read_attr_map_at` reading the exact count off the wire and discarding it, then rebuilding the map by 30 sorted `insert_sym`s in the *writer's* symbol order, which dictionary remapping has already made unsorted for the reader |
+| 30-attribute access log | **24** | **5** | **decode is flat in width**, and now flat in reallocations too: `read_attr_map_at` reads the exact count off the wire and reserves against it, where it used to discard the count and rebuild the map by 30 sorted `insert_sym`s in the *writer's* symbol order (which dictionary remapping has already made unsorted for the reader). This row and the span's each shed one realloc; every decode in the table is now 0 |
 | 17-attribute server span | **20** | **5** | |
 | 3-record collectd event | **20** | **5** | |
-| 5 events, 17-attribute `Resource` | **53** | **10** | the one measurement where the resource's own width is paid: `logit_proto::native` writes it once per batch rather than `Arc`-sharing it |
+| 5 events, 17-attribute `Resource` | **53** | **10** | the one measurement where the resource's own width is paid: `logit_proto::native` writes it once per batch rather than `Arc`-sharing it. Decode's live bytes fell from 14464 to 12064 on the bulk build -- exact sizing, not fewer allocations |
 
 Encode tracks the number of *fields* written, not the attribute count -- the span and the
 three-record collectd event both write more structure than the 12-attribute log while carrying

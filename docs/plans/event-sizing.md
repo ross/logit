@@ -17,8 +17,9 @@ allocation behaviour, optimizing CPU, allocations, and memory.
 The question as first posed was "should the defaults handle 90% of situations without an
 allocation, or 50%, or can `Event` learn the shape after a warm-up or take configured hints?" The
 survey answers the first half by dissolving it — see "Target metric" below — and the code answers
-the second half with a finding nobody had gone looking for: **`AttrMap` cannot be pre-sized at
-all**, by anyone, even where the count is already in hand.
+the second half with a finding nobody had gone looking for: **`AttrMap` could not be pre-sized at
+all**, by anyone, even where the count was already in hand. (W3a fixed that; the paragraphs below
+still describe the code as this plan found it.)
 
 Stream key **`sizing`**. Branches `sizing/w0`…, a linear stack — each branch cut from its
 parent's, its PR targeting that branch, retargeted to `main` once the parent merges
@@ -69,7 +70,8 @@ sorted by `Symbol`, binary-search lookup, positional insert — so building a k-
 `insert` at a time moves O(k²) bytes. `size_of::<Event>()` is `48·N + 480`: 672 at N=4, 864 today,
 1056 at 12, 1248 at 16, 1632 at 24.
 
-- **`AttrMap`'s public surface has no `reserve`, no `with_capacity`, and no bulk build.** Every
+- **`AttrMap`'s public surface had no `reserve`, no `with_capacity`, and no bulk build** (fixed
+  in W3a — see "Workstreams" below; this is the state the plan was written against). Every
   producer that knows the count discards it: the native decoder reads an exact count and then
   loops `insert` (`logit_proto::native::value::read_attr_map_at` — while the metric list beside it
   *does* reserve, `native::record::read_record_list_into`); OTLP has `kvs.len()`; `csv` and `regex`
@@ -234,6 +236,43 @@ resource/scope group is 5 events).
 - **W3 — the arms**, under `crates/logit-bench/src/bakeoff/` beside `wire_mirror.rs`. P is small
   enough to build for real in `logit-core`; S and E through a const-generic mirror; K and R
   bench-only.
+  - **W3a — arm P. Landed, for real, in `logit-core` rather than as a bench mirror.** `AttrMap`
+    gained `with_capacity`/`capacity`/`reserve`/`reserve_exact` and a bulk build:
+    `extend_unsorted(pairs)` for a producer holding an `ExactSizeIterator`, and the `bulk_insert`
+    guard behind it for one whose push loop can fail partway. One `reserve_exact`, an append in
+    push order, one sort. `reserve_exact` and not `reserve` — smallvec's `reserve` rounds to the
+    next power of two, which is 768 bytes for a 12-attribute log against 576 exact — and the sort
+    is `sort_unstable_by_key`, because `slice::sort` is stable and takes a scratch buffer above
+    roughly twenty elements, which a 30-field access log would have paid for on every event.
+    Unstable then says nothing about which of two equal keys came first, so duplicates are
+    resolved before it, allocation-free: a 128-bit membership filter within the incoming run, a
+    backwards `swap_remove` pass against what the map already held. Last write wins either way,
+    which a proptest checks entry for entry against the `insert_sym` sequence it replaces.
+  - **Every producer already knew its width; no learning was needed.** The arm's fallback — "a
+    per-instance high-water hint on `&mut self` for anything with neither a count nor a scratch" —
+    was not built, because the audit's list held up: `json`/`logfmt`/`kv` have `scratch.len()` at
+    the merge, `csv` and `regex` know theirs at construction, the native decoder reads an exact
+    count off the wire, OTLP has `kvs.len()`. The **one** producer with no count anywhere is Lua's
+    `Event.new(t)`/attribute-table conversion, and it has no count because Lua will not give one:
+    `Table::len` covers only a table's array part. It takes the bulk build with a zero
+    reservation — the sort still retires the O(k²), the growth chain is unchanged — and a
+    learned hint would be guessing at a width the VM is holding and won't say. So: nothing to
+    learn, and the ADR should say so plainly rather than leave the option open.
+  - Adopted at `json`'s merge, `logfmt`'s `merge_into` (which `kv` shares), `csv`, `regex`,
+    `logit_proto::native`'s `read_attr_map_at` (nested `Value::Map`s and the Resource/Scope maps
+    included, keeping the `count.min(4096)` defensive cap), and OTLP's `key_values_into_attrs`
+    (which every OTLP signal, and OTLP/JSON, funnels through). No `KeyCache` was added to the OTLP
+    path — still a real, independent win, and still W5's to record. Untouched, deliberately: the
+    statsd, syslog, collectd, graphite and Prometheus decoders, whose per-event attribute sets are
+    0–8 and so inline either way, where a bulk build would trade a handful of shifts for a sort
+    and a filter word.
+  - Pins that moved, all exactly as predicted: `json`'s 30-attribute access log 3 allocs + **2**
+    reallocs → 3 + **1** (the survivor is a JSON-escaped value's `shrink_to_fit`, not the map),
+    and every native decode's reallocation count → **0** (the 30-attribute log, the 17-attribute
+    span and the 17-attribute-resource batch each shed one; that batch's live bytes fell 14464 →
+    12064). Allocation counts are unchanged everywhere, which is the point — the win is in the
+    reallocation and capacity columns that `allocs` was always blind to. `type_sizes.rs` does not
+    move: this arm changes no `size_of`.
 - **W4 — the VM session.** `script/vm build <ref>` per real-binary arm, `script/perf run
   --logit-bin` / `compare` across every scenario class; summary into `docs/design/performance.md`.
 - **W5 — the ADR**, `docs/adr/event-sizing-and-allocation-strategy.md`: the decision and its

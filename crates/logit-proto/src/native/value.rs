@@ -181,14 +181,27 @@ pub fn read_attr_map(bytes: &mut Bytes, dict: &Dict) -> Result<AttrMap, CodecErr
     read_attr_map_at(bytes, dict, 0)
 }
 
+/// The exact entry count is on the wire ([`write_attr_map`] puts it there), so the map is built
+/// in one reservation and one sort rather than `count` sorted `insert_sym`s -- which mattered more
+/// here than anywhere else, because entries arrive in the *writer's* `Symbol` order and, after the
+/// dictionary remap, that is not the reader's: every insert was a genuine sorted insert,
+/// O(count²) bytes moved to rebuild a map the encoder had already sorted
+/// (`docs/plans/event-sizing.md`'s arm P). `count` is capped at 4096 for the reservation, the same
+/// defensive pattern every other counted collection in this codec uses
+/// ([`crate::native::record`]'s `read_record_list_into`) -- a declared count is attacker-controlled,
+/// the loop below is bounded by the bytes actually present, and a map genuinely wider than 4096
+/// just grows the ordinary way.
 fn read_attr_map_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<AttrMap, CodecError> {
     let count = read_uvarint(bytes)? as usize;
     let mut map = AttrMap::new();
-    for _ in 0..count {
-        let idx = read_uvarint(bytes)? as u32;
-        let key = dict.get(idx)?;
-        let value = read_value_at(bytes, dict, depth)?;
-        map.insert_sym(key, value);
+    {
+        let mut bulk = map.bulk_insert(count.min(4096));
+        for _ in 0..count {
+            let idx = read_uvarint(bytes)? as u32;
+            let key = dict.get(idx)?;
+            let value = read_value_at(bytes, dict, depth)?;
+            bulk.push(key, value);
+        }
     }
     Ok(map)
 }

@@ -3757,11 +3757,18 @@ fn re_interning_an_existing_string_is_free() {
 /// therefore holds 1536 bytes of heap for 1152 bytes of entries, on top of the 392 inline bytes it
 /// has already paid for and abandoned.
 ///
-/// Capacity is read off `peak_live_bytes` rather than asked for: `AttrMap` exposes no `capacity`
-/// (nor `reserve`/`with_capacity` -- that absence is the plan's lead finding), and at 48 bytes per
-/// `(Symbol, Value)` entry (`crates/logit-core/tests/type_sizes.rs`) the live heap at the end of
-/// the region *is* `capacity * 48`. Nothing else allocates inside the measured region: the symbols
-/// are interned up front and the values are `I64`s.
+/// Capacity is read off `peak_live_bytes` rather than asked for, and stays that way now that
+/// `AttrMap::capacity` exists: at 48 bytes per `(Symbol, Value)` entry
+/// (`crates/logit-core/tests/type_sizes.rs`) the live heap at the end of the region *is*
+/// `capacity * 48`, so measuring it rather than asking keeps this test a check on the allocator
+/// and not on the accessor. Nothing else allocates inside the measured region: the symbols are
+/// interned up front and the values are `I64`s.
+///
+/// **This is the ladder the bulk build exists to avoid**, and it is still reachable and still
+/// pinned: `insert_sym` is unchanged, so a producer that genuinely inserts one key at a time (a
+/// `set` transform, a Lua attribute write) behaves exactly as it always did.
+/// [`attr_map_bulk_build_is_one_exact_allocation`] is the sibling that pins what
+/// [`AttrMap::extend_unsorted`] does with the same widths.
 #[test]
 fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
     let syms: Vec<logit_core::interner::Symbol> =
@@ -3796,6 +3803,158 @@ fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
         let measured = if stats.peak_live_bytes == 0 { 8 } else { stats.peak_live_bytes / 48 };
         assert_eq!(measured, capacity, "AttrMap: build {k} attributes -- capacity");
     }
+}
+
+/// The bulk build's ladder, against
+/// [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`]'s: **one allocation, of exactly
+/// the right size, at every width** -- `docs/plans/event-sizing.md`'s invariant I2, which the
+/// sorted-`insert` ladder above fails past 16.
+///
+/// | k | allocs | reallocs | capacity | (`insert_sym`: allocs / reallocs / capacity) |
+/// |--:|--:|--:|--:|---|
+/// | 8 | 0 | 0 | 8 (inline) | 0 / 0 / 8 |
+/// | 9 | 1 | 0 | **9** | 1 / 0 / 16 |
+/// | 12 | 1 | 0 | **12** | 1 / 0 / 16 |
+/// | 17 | 1 | 0 | **17** | 1 / **1** / 32 |
+/// | 30 | 1 | 0 | **30** | 1 / **1** / 32 |
+/// | 33 | 1 | 0 | **33** | 1 / **2** / 64 |
+///
+/// Two separate wins in one column. The realloc chain goes, which
+/// `docs/plans/event-sizing.md`'s W2 measurements price at roughly 80-114 ns a step. And the
+/// buffer is `k * 48` bytes rather than the next power of two's -- 576 for a 12-attribute log
+/// where the growth ladder takes 768, 1440 for a 30-field access log where it takes 1536 -- which
+/// is why `AttrMap::reserve_exact` and not `reserve` is what the bulk build calls.
+///
+/// I1 is the k = 8 row: at or under the inline capacity the bulk build still allocates nothing.
+/// It is not a separate reservation that has to be checked against the inline capacity --
+/// smallvec's `reserve_exact` is a no-op while the inline buffer is big enough — but it is the
+/// invariant, so it is pinned.
+#[test]
+fn attr_map_bulk_build_is_one_exact_allocation() {
+    let syms: Vec<logit_core::interner::Symbol> =
+        (0..33).map(|i| logit_core::interner::intern(&format!("bulk.probe.k{i:02}"))).collect();
+
+    let build = |k: usize| {
+        measure(|| {
+            let mut map = AttrMap::new();
+            // `.rev()`: push order and sorted order disagree at every position, which is the real
+            // case -- `Symbol` order is local interning order, so nothing off a wire or out of a
+            // parser scratch arrives sorted.
+            map.extend_unsorted(
+                syms.iter().take(k).enumerate().rev().map(|(i, s)| (*s, Value::I64(i as i64))),
+            );
+            map
+        })
+    };
+    drop(build(33)); // warm
+
+    for (k, allocs, capacity) in
+        [(8usize, 0u64, 8usize), (9, 1, 9), (12, 1, 12), (17, 1, 17), (30, 1, 30), (33, 1, 33)]
+    {
+        let (map, stats) = build(k);
+        assert_eq!(map.len(), k);
+        expect_allocs(&format!("AttrMap: bulk-build {k} attributes"), stats, allocs);
+        assert_eq!(stats.reallocs, 0, "AttrMap: bulk-build {k} attributes -- realloc count");
+        assert_eq!(map.capacity(), capacity, "AttrMap: bulk-build {k} attributes -- capacity");
+    }
+}
+
+/// **The sort must not allocate**, and this is what says so.
+///
+/// `AttrMap`'s bulk build appends and sorts once instead of inserting into sorted position k
+/// times. The obvious sort for that is `slice::sort` -- but it is stable, and a stable sort buys
+/// its stability with a scratch buffer above roughly twenty elements. A 30-field access log would
+/// then pay a second allocation on every single event, silently, having just been given its first
+/// one back. So the bulk build sorts with `sort_unstable_by_key`, and resolves duplicate keys
+/// *before* the sort rather than relying on stability to order them -- which is the other half of
+/// what this pins, since the duplicate resolution must not allocate either (no `HashSet`, no
+/// index vector).
+///
+/// Both widths straddle the stable-sort threshold, and both carry repeated keys: k = 30 with six
+/// duplicates, k = 64 with twelve. One allocation each, no reallocation, whatever the duplicates
+/// do -- and the last write of a repeated key still wins, which is checked here rather than left
+/// to `logit-core`'s own unit tests because the two properties are pinned by the same build.
+#[test]
+fn attr_map_bulk_build_sorts_without_allocating() {
+    let syms: Vec<logit_core::interner::Symbol> =
+        (0..64).map(|i| logit_core::interner::intern(&format!("bulk.dup.probe.k{i:02}"))).collect();
+
+    // `k` pairs over `k - k/5` distinct keys: every fifth key is pushed a second time, later,
+    // with a value that has to win.
+    let pairs = |k: usize| -> Vec<(logit_core::interner::Symbol, Value)> {
+        let distinct = k - k / 5;
+        (0..k)
+            .map(|i| {
+                let key = if i < distinct { i } else { ((i - distinct) * 5) % distinct };
+                (syms[key], Value::I64(i as i64))
+            })
+            .collect()
+    };
+
+    let build = |k: usize| {
+        let input = pairs(k);
+        measure(move || {
+            let mut map = AttrMap::new();
+            map.extend_unsorted(input);
+            map
+        })
+    };
+    drop(build(64)); // warm
+
+    for k in [30usize, 64] {
+        let distinct = k - k / 5;
+        let (map, stats) = build(k);
+        assert_eq!(map.len(), distinct, "bulk-build {k} pairs -- duplicates collapsed");
+        expect_allocs(&format!("AttrMap: bulk-build {k} pairs with duplicates"), stats, 1);
+        assert_eq!(
+            stats.reallocs, 0,
+            "bulk-build {k} pairs -- the sort must not reallocate either"
+        );
+
+        // Last write wins, for every repeated key.
+        for i in distinct..k {
+            let key = ((i - distinct) * 5) % distinct;
+            assert_eq!(
+                map.get_sym(syms[key]),
+                Some(&Value::I64(i as i64)),
+                "bulk-build {k} pairs -- key {key} should hold the later write"
+            );
+        }
+    }
+}
+
+/// The case that is the norm rather than the edge: a transform merging into an event that
+/// *already* carries attributes -- `json` onto `tail_in`'s `log.file.path`, `regex` onto a syslog
+/// event's header fields. It has to take the one-reservation path too, and the entries already
+/// there have to survive unless the incoming run overwrites them by name.
+///
+/// 1 existing attribute + 29 incoming is exactly the 30-attribute access log
+/// ([`json_parse_access_log_event`]), and it is one allocation of exactly 30 entries: the
+/// reservation counts what is already in the map, not just what is arriving.
+#[test]
+fn attr_map_bulk_build_onto_a_populated_map() {
+    let syms: Vec<logit_core::interner::Symbol> = (0..30)
+        .map(|i| logit_core::interner::intern(&format!("bulk.onto.probe.k{i:02}")))
+        .collect();
+
+    let build = || {
+        measure(|| {
+            let mut map = AttrMap::new();
+            map.insert_sym(syms[29], Value::I64(-1));
+            map.extend_unsorted(
+                syms.iter().take(29).enumerate().rev().map(|(i, s)| (*s, Value::I64(i as i64))),
+            );
+            map
+        })
+    };
+    drop(build()); // warm
+
+    let (map, stats) = build();
+    assert_eq!(map.len(), 30);
+    assert_eq!(map.get_sym(syms[29]), Some(&Value::I64(-1)), "the pre-existing entry survives");
+    expect_allocs("AttrMap: bulk-build 29 onto a 1-entry map", stats, 1);
+    assert_eq!(stats.reallocs, 0, "AttrMap: bulk-build onto a populated map -- realloc count");
+    assert_eq!(map.capacity(), 30, "the reservation counts what was already there");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3869,13 +4028,17 @@ fn json_parse_pino_http_nested_event() {
     expect_allocs("json: parse 10-attribute nested pino-http log", stats, 5);
 }
 
-/// The widest log class in the survey, at 30 attributes: **three** allocations and, uniquely among
-/// these shapes, **two reallocations** -- the growth chain
-/// [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`] pins. The map spills at 9 (cap
-/// 16), grows to 32 at 17, and at 30 sits in a 1536-byte buffer holding 1440 bytes of entries,
-/// having moved the whole thing twice.
+/// The widest log class in the survey, at 30 attributes: **three** allocations and **one**
+/// reallocation.
 ///
-/// Two of the three allocations are not the map at all: PostgreSQL's error message quotes an
+/// Both numbers used to be higher by the map's own growth chain -- the map spilled at 9 (cap 16)
+/// and grew to 32 at 17, so 30 entries sat in a 1536-byte buffer holding 1440 bytes, having been
+/// moved twice. `json` now merges its scratch with one [`AttrMap::extend_unsorted`]
+/// (`docs/plans/event-sizing.md`'s arm P), so the map takes one 1440-byte buffer, exactly sized,
+/// and the remaining reallocation is not the map at all: it is the `shrink_to_fit` in `logfmt`'s
+/// `unescape`, on the one value below that carries a JSON escape.
+///
+/// Two of the three allocations are not the map either: PostgreSQL's error message quotes an
 /// identifier (`"orders_pkey"`), so that one value carries a JSON escape and cannot be sliced
 /// zero-copy out of the body the way every other value here is. That is a real property of the
 /// format rather than a fixture artifact -- a constraint-violation line always names the
@@ -3896,7 +4059,8 @@ fn json_parse_access_log_event() {
     });
     assert_eq!(event.attributes.len(), 30, "1 from tail_in + PostgreSQL jsonlog's 29 keys");
     expect_allocs("json: parse 30-attribute access log", stats, 3);
-    assert_eq!(stats.reallocs, 2, "the map grows 8 -> 16 -> 32 on the way to 30 entries");
+    assert_eq!(stats.reallocs, 1, "the one escaped value's `shrink_to_fit`, and nothing else");
+    assert_eq!(event.attributes.capacity(), 30, "one exactly-sized buffer, no growth chain");
 }
 
 /// Parses each of the three JSON-bodied survey shapes and clones the result, so every shape's
@@ -4036,15 +4200,24 @@ fn expect_native_round_trip_allocs(
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].attributes.len(), attributes, "{label}: round trip changed the width");
     expect_allocs(&format!("native: decode {label}"), stats, decode_allocs);
+    // Not a parameter, because it is the same for every shape and it is the point: the decoder
+    // reads an exact attribute count off the wire and now reserves against it, so no shape's map
+    // grows in steps on the way to its width. Before `read_attr_map_at` took an
+    // `AttrMap::bulk_insert`, the 30-attribute access log and the 17-attribute span each
+    // reallocated once here (`docs/plans/event-sizing.md`'s arm P).
+    assert_eq!(stats.reallocs, 0, "native: decode {label} -- the map must not grow in steps");
 }
 
 /// A native round trip per survey shape. Encode and decode are pinned separately because they
 /// fail differently: the encoder's cost is per field written (it grows with width), while the
-/// decoder's is flat in width and is where the plan's lead finding lives --
-/// `read_attr_map_at` (`crates/logit-proto/src/native/value.rs`) reads the exact attribute count
-/// off the wire and then throws it away, because `AttrMap` has no `with_capacity`. A 30-attribute
-/// map is therefore rebuilt by 30 sorted inserts into a map that spills and reallocs twice on the
-/// way, which is the `reallocs` column below, not the `allocs` one.
+/// decoder's is flat in width and is where the plan's lead finding was --
+/// `read_attr_map_at` (`crates/logit-proto/src/native/value.rs`) read the exact attribute count
+/// off the wire and then threw it away, because `AttrMap` had no `with_capacity`. A 30-attribute
+/// map was rebuilt by 30 sorted inserts into a map that spilled and grew on the way, and (because
+/// entries arrive in the *writer's* `Symbol` order, which after the dictionary remap is not the
+/// reader's) every one of those inserts was a genuine sorted insert. It is now one reservation
+/// and one sort, which shows up in the reallocation count the helper asserts rather than in the
+/// `allocs` column below -- decode's allocation count is unchanged.
 ///
 /// | Shape | encode | decode |
 /// |---|--:|--:|
@@ -4113,6 +4286,10 @@ fn native_round_trip_enriched_resource_batch() {
     assert_eq!(events.len(), 5);
     assert_eq!(events[0].attributes.len(), 9);
     expect_allocs("native: decode 5-event batch, 17-attr resource", stats, 10);
+    // The resource's own 17 attributes used to make this the one decode in the suite that
+    // reallocated; it is now one exactly-sized buffer per map, which also takes the region's live
+    // bytes from 14464 to 12064 (`docs/plans/event-sizing.md`'s arm P).
+    assert_eq!(stats.reallocs, 0, "the 17-attribute resource no longer grows in steps");
 }
 
 // ---------------------------------------------------------------------------------------------

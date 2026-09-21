@@ -53,16 +53,19 @@ impl fmt::Display for ParseError {
     }
 }
 
-/// Moves every pair out of `scratch` into `attrs`, via [`AttrMap::insert_sym`] rather than
-/// `resolve()` -> `insert(&str)` -- `scratch`'s keys are already `Symbol`s (interned straight off
-/// the message's byte slice), so re-resolving one to a `&str` just to re-intern it would be pure
-/// waste. Last-write-wins on a duplicate key is free here: `scratch` may push the same key twice
-/// (a duplicate in the source line), and `insert_sym` overwrites on collision, so merging in push
-/// order makes the later occurrence win -- identical to `json`'s own duplicate-key policy.
+/// Moves every pair out of `scratch` into `attrs`, by `Symbol` rather than `resolve()` ->
+/// `insert(&str)` -- `scratch`'s keys are already `Symbol`s (interned straight off the message's
+/// byte slice), so re-resolving one to a `&str` just to re-intern it would be pure waste.
+///
+/// One [`AttrMap::extend_unsorted`] rather than a loop of `insert_sym`: `scratch.len()` is the
+/// exact number of entries about to land, so the map reserves once instead of walking smallvec's
+/// growth chain, and sorts once instead of shifting the entries after each new key's sorted
+/// position (`docs/plans/event-sizing.md`'s arm P). Last-write-wins on a duplicate key is
+/// preserved: `scratch` may push the same key twice (a duplicate in the source line), and
+/// `extend_unsorted` resolves that in push order exactly as repeated `insert_sym` did --
+/// identical to `json`'s own duplicate-key policy.
 fn merge_into(scratch: &mut Vec<(Symbol, Value)>, attrs: &mut AttrMap) {
-    for (key, value) in scratch.drain(..) {
-        attrs.insert_sym(key, value);
-    }
+    attrs.extend_unsorted(scratch.drain(..));
 }
 
 /// Consumes the five escapes `logfmt` understands; anything else (including a lone trailing

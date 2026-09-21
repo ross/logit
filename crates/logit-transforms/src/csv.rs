@@ -134,11 +134,19 @@ impl Transform for CsvParser {
             return true;
         }
 
-        for (&sym, &(start, end, needs_unescape)) in self.columns.iter().zip(self.scratch.iter()) {
-            let field = raw.slice(start as usize..end as usize);
-            let value = if needs_unescape { unescape(&field) } else { field };
-            event.attributes.insert_sym(sym, Value::Str(value));
-        }
+        // One bulk build rather than a column-at-a-time `insert_sym`: the schema is positional, so
+        // the exact width is known at construction and `zip` carries it, which lets the map
+        // reserve once and sort once instead of shifting every entry past each new column's
+        // sorted position (`docs/plans/event-sizing.md`'s arm P). A schema that declares the same
+        // column name twice still resolves the way repeated `insert_sym` resolved it -- the
+        // rightmost column wins.
+        event.attributes.extend_unsorted(self.columns.iter().zip(self.scratch.iter()).map(
+            |(&sym, &(start, end, needs_unescape))| {
+                let field = raw.slice(start as usize..end as usize);
+                let value = if needs_unescape { unescape(&field) } else { field };
+                (sym, Value::Str(value))
+            },
+        ));
         self.telemetry.count("logit.transform.rows.parsed", 1.0, &[]);
         true
     }

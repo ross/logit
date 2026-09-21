@@ -1342,6 +1342,12 @@ fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Attr
 /// value *inside* one reports that helper's unprefixed attribute-conversion error.
 fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
+    // Built through `bulk_insert` for the single sort, not for a reservation: a Lua table's hash
+    // part has no length Lua will tell us (`Table::len` covers only the array part), so this is
+    // the one attribute producer in the tree with no count to hand over. `bulk_insert(0)` still
+    // retires the O(k²) shifting a sorted `insert` per key costs; the growth chain is unchanged.
+    // See `docs/plans/event-sizing.md`'s W3 entry.
+    let mut bulk = map.bulk_insert(0);
     for pair in t.pairs::<LuaValue, LuaValue>() {
         let (k, value) = pair?;
         let LuaValue::String(k) = k else {
@@ -1357,8 +1363,9 @@ fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMa
                 dotted(path, key)
             )));
         };
-        map.insert(k, value_at(value, || dotted(&dotted(path, key), k))?);
+        bulk.push(intern(k), value_at(value, || dotted(&dotted(path, key), k))?);
     }
+    drop(bulk);
     Ok(map)
 }
 

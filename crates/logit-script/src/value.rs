@@ -4,7 +4,7 @@
 //! snapshot) -- one definition of this mapping, not two ad hoc conversions drifting apart.
 
 use bytes::Bytes;
-use logit_core::interner::resolve;
+use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Value};
 use mlua::{Lua, Table, Value as LuaValue};
 use std::borrow::Cow;
@@ -283,10 +283,14 @@ fn lua_table_to_value(table: Table) -> mlua::Result<Value> {
 /// (`construct::attributes_from_table`), sharing only `lua_to_value`.
 pub(crate) fn lua_table_to_attrmap(table: Table) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
+    // One sort rather than a sorted insert per key -- see `construct::attributes_from_table` for
+    // why the reservation is 0 here: a Lua table's hash part carries no length.
+    let mut bulk = map.bulk_insert(0);
     for pair in table.pairs::<mlua::String, LuaValue>() {
         let (key, value) = pair?;
-        map.insert(key.to_str()?, lua_to_value(value)?);
+        bulk.push(intern(key.to_str()?), lua_to_value(value)?);
     }
+    drop(bulk);
     Ok(map)
 }
 

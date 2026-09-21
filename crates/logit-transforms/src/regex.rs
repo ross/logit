@@ -23,6 +23,12 @@ pub struct RegexParser {
     /// and for every unnamed group. Built once in [`RegexParser::new`] from
     /// `Regex::capture_names`, not re-derived per event.
     names: Vec<Option<Symbol>>,
+    /// How many of [`RegexParser::names`] are `Some` -- the most attributes one match can
+    /// contribute, counted once at construction so `process` can open its bulk build with a
+    /// reservation instead of growing the map group by group. An upper bound rather than the
+    /// exact width, since a non-participating or empty group contributes nothing; over-reserving
+    /// by a group or two costs capacity, never an extra allocation.
+    named_groups: usize,
     /// Reused across events -- `captures_read` fills this in place instead of allocating a fresh
     /// `Captures` per line.
     locs: CaptureLocations,
@@ -40,9 +46,17 @@ impl RegexParser {
     /// call is unreachable in practice.
     pub fn new(pattern: &str, field: Option<&str>) -> Result<Self, ::regex::Error> {
         let re = Regex::new(pattern)?;
-        let names = re.capture_names().map(|n| n.map(intern)).collect();
+        let names: Vec<Option<Symbol>> = re.capture_names().map(|n| n.map(intern)).collect();
+        let named_groups = names.iter().filter(|n| n.is_some()).count();
         let locs = re.capture_locations();
-        Ok(Self { re, names, locs, field: field.map(intern), telemetry: Telemetry::default() })
+        Ok(Self {
+            re,
+            names,
+            named_groups,
+            locs,
+            field: field.map(intern),
+            telemetry: Telemetry::default(),
+        })
     }
 
     /// Attaches a telemetry handle -- see `Scale::with_telemetry` for why there's no
@@ -96,11 +110,18 @@ impl Transform for RegexParser {
             return true;
         }
 
-        for i in 1..self.locs.len() {
-            let Some(sym) = self.names[i] else { continue };
-            if let Some((start, end)) = self.locs.get(i) {
-                if end > start {
-                    event.attributes.insert_sym(sym, Value::Str(bytes.slice(start..end)));
+        // One bulk build rather than a group-at-a-time `insert_sym`: `named_groups` bounds the
+        // width, so the map reserves once and sorts once instead of shifting every entry past
+        // each new group's sorted position (`docs/plans/event-sizing.md`'s arm P). The guard
+        // finishes on drop, which is what restores the sorted invariant.
+        {
+            let mut bulk = event.attributes.bulk_insert(self.named_groups);
+            for i in 1..self.locs.len() {
+                let Some(sym) = self.names[i] else { continue };
+                if let Some((start, end)) = self.locs.get(i) {
+                    if end > start {
+                        bulk.push(sym, Value::Str(bytes.slice(start..end)));
+                    }
                 }
             }
         }

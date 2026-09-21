@@ -37,7 +37,7 @@
 
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
-use logit_core::interner::resolve;
+use logit_core::interner::{intern, resolve};
 use logit_core::{AttrMap, Resource, Scope, Value};
 
 /// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the two lossy cases.
@@ -114,11 +114,20 @@ pub(crate) fn attrs_to_key_values(attrs: &AttrMap) -> Vec<pb::KeyValue> {
 
 /// Inserts every `KeyValue` into `attrs`, later entries overwriting an earlier one at the same
 /// key -- `AttrMap::insert`'s own semantics, unchanged here.
+///
+/// One `extend_unsorted` rather than a loop of `insert`: `kvs.len()` is exact, so the map reserves
+/// once and sorts once instead of walking smallvec's growth chain and shifting the entries past
+/// each key's sorted position (`docs/plans/event-sizing.md`'s arm P). A span with 17 attributes --
+/// the survey's median for OTLP spans (`docs/design/data-shapes.md` §4) -- is the shape this is
+/// for, and it is also the one this path cannot fix on its own: every key still goes through a
+/// process-wide `intern` probe, because the OTLP decoder has no `KeyCache` the way `json`/`logfmt`
+/// do. That is a separate, independent win, tracked by `docs/plans/event-sizing.md` W5's
+/// future-investigations list rather than folded in here.
 pub(crate) fn key_values_into_attrs(kvs: Vec<pb::KeyValue>, attrs: &mut AttrMap) {
-    for kv in kvs {
+    attrs.extend_unsorted(kvs.into_iter().map(|kv| {
         let value = kv.value.map(any_value_to_value).unwrap_or(Value::Null);
-        attrs.insert(&kv.key, value);
-    }
+        (intern(&kv.key), value)
+    }));
 }
 
 /// A textual OTLP field (`schema_url`, `InstrumentationScope.name`/`.version`) stored as `Bytes`

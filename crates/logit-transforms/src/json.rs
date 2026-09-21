@@ -107,10 +107,13 @@ impl Transform for JsonParser {
                 // deserializer (`KeySeed`), so `resolve`-ing each back to a `&str` for
                 // `AttrMap::insert` to re-intern -- what this loop used to do -- was two more
                 // interner probes per key for nothing. On the `json-parse` load-test scenario
-                // that round trip was roughly a fifth of all samples.
-                for (key, value) in self.scratch.drain(..) {
-                    event.attributes.insert_sym(key, value);
-                }
+                // that round trip was roughly a fifth of all samples. One `extend_unsorted`
+                // rather than a loop of `insert_sym`, for the reason `merge_into`'s own doc
+                // gives: `scratch.len()` is exact here, so the map reserves once and sorts once
+                // instead of growing in steps and shifting on every key
+                // (`docs/plans/event-sizing.md`'s arm P). Duplicate-key policy is unchanged --
+                // last write wins, in `scratch`'s push order.
+                event.attributes.extend_unsorted(self.scratch.drain(..));
             }
             Err(err) => {
                 // Only ever holds a partial object here; drop it promptly rather than letting it
