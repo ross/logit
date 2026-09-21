@@ -191,6 +191,30 @@ sketch had stayed boxed. The two decisions aren't independent of each other. Als
 same reasoning as `AttrMap`'s: real per-event metric-count data is needed before picking a number,
 not more synthetic-fixture measurement. See §8.
 
+**What a spill actually costs is now measured, not inferred** (`attr_map_spills_to_double_its_inline_
+capacity_then_reallocs`, `crates/logit-bench/tests/allocations.rs`; `docs/plans/event-sizing.md`'s
+W1). Every sizing argument in this file used to rest on smallvec 1.x's documented amortized
+doubling rather than on a number checked here. Building a map one sorted `insert` at a time:
+
+| Attributes | allocs | reallocs | heap bytes | capacity |
+|--:|--:|--:|--:|--:|
+| 1, 8 | 0 | 0 | 0 (inline) | 8 |
+| 9, 16 | **1** | 0 | 768 | 16 |
+| 17, 24, 32 | 1 | **1** | 1536 | 32 |
+| 33 | 1 | **2** | 3072 | 64 |
+
+Three consequences worth having in mind before item 12 in §8 is ever decided. The 9th entry spills
+to **twice** the inline capacity, not to an exactly-sized buffer — a 9-attribute event holds 768
+bytes of heap for 432 bytes of entries, on top of the 392 inline bytes it has already paid for and
+abandoned. The `alloc` column stays at **1** however wide the map gets, because every doubling
+after the spill is a `realloc`; so allocation count, the metric this file is built on, is nearly
+blind to width past 9 — a 30-attribute access log and a 12-attribute application log are
+indistinguishable by it (§2's two `json` rows), and differ only in bytes moved. And `AttrMap`
+exposes no `reserve`/`with_capacity` at all, so no producer can avoid any of this even where it
+knows the count exactly: the native decoder reads an exact count off the wire and discards it
+(`native/value.rs`'s `read_attr_map_at`), while the metric list beside it *does* reserve
+(`native/record.rs`'s `read_record_list_into`).
+
 **Both inline capacities are compile-time constants** — `SmallVec<[T; N]>`'s `N` is a const array
 length, monomorphized into the type, with no runtime equivalent. There is no way to tune this per
 deployment without either recompiling for a specific workload's shape or moving to a design with
@@ -280,6 +304,16 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (statsd shape) | **0** | fits entirely inline |
 | `Event::clone` (distribution-heavy, 5 metrics) | **6** | 1 `MetricList` spill + 1 `bins` Vec per sketch |
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
+| `json` parse 12-attribute flat log | **1** | the survey's commonest measured log width (`docs/design/data-shapes.md` §5.3), through the real `tail_in`-shaped leg: one `log.file.path` plus eleven JSON keys. The one allocation is the `AttrMap` spill; every value slices the message `Bytes` |
+| `json` parse 10-attribute nested pino-http record | **5** | 1 spill + **4 boxed `Value::Map`s** (`req{}`, `res{}` and the `headers{}` inside each). A *narrower* event than the row above and five times the allocations -- `Value::Map` is `Box<AttrMap>`, so every nested object pays the full 392-byte inline footprint again, whatever its width (§6 of `data-shapes.md`: "nested maps multiply whatever is chosen") |
+| `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **2 reallocs** -- the only shipped shape whose map grows twice (8 → 16 → 32, §1's ladder). Only *one* of the three allocations is the map: the other two are a single JSON-escaped value, PostgreSQL quoting the constraint name in a violation message, which cannot be sliced zero-copy |
+| `Event::clone` (12-attribute flat log) | **1** | the spilled `AttrMap`, nothing else |
+| `Event::clone` (30-attribute access log) | **1** | **the same as the 12-attribute row** -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer, so a spilled map costs exactly one allocation however far past 8 it is. The two shapes differ only in bytes moved (1440 against 576, plus 864 for the `Event` either way): the clearest single demonstration that allocation count and copy cost rank these shapes differently |
+| `Event::clone` (10-attribute nested pino-http record) | **5** | 1 spill + 1 per boxed `Value::Map`. The narrowest of the three log shapes and by far the most expensive to clone |
+| `Event::clone` (17-attribute server span) | **1** | the spilled map alone -- the exact complement of the `span shape` row above, whose map stays inline and whose two allocations are its `events`/`links` `Vec`s. Measured spans carry neither: 76% of 114,551 demo spans had no events and **none** had a link (`data-shapes.md` §4) |
+| `Event::clone` (3-record collectd event, 6 attributes) | **1** | `MetricList`'s spill, not the map's: six attributes fit inline and three records do not. The only measured `MetricList` spill in the survey -- 17.4% of 16,590 collectd events carry 2 records, 0.4% carry 3 (`data-shapes.md` §3) |
+| `EventBatch::clone` (5 events, 17-attribute `Resource`) | **6** | 1 `Vec<Event>` + 1 per event: the measured median OpenTelemetry log record carries **9** attributes, one slot past inline, so every event on that leg spills by one. **The 17-attribute resource is not among the six** -- it is `Arc`-shared, so the widest attribute set in the survey is the one place capacity is nearly free (`data-shapes.md` §4, §6) |
+| `unwrap_batch` (contended `Delivered::Shared`, that same batch) | **6** | identical, by construction -- the copy-on-write fallback *is* `EventBatch::clone` (§3) |
 | `stdio_out` encode 100 events | **102** | ~1/event -- fixed, see below, was 1801; +1 since measured through `Encoder::encode` (`&EventBatch` -> `Bytes`) rather than the inherent `render` (`&EventBatch` -> `String`) directly, ADR `rotating-file-output` -- `Bytes::from(String)`'s own small shared-refcount allocation |
 | `influxdb_out` encode 100 events | **230** | 30 of the encoder's own (~0.3/event — see below) + 200 = 2/event re-sketching the fixture's two raw `Samples` distributions (`Samples::sketch`'s `bins` Vec, the same cost the `graphite_out` `Samples` row further down documents). Those 2/event are the allocations `kv_metrics` used to pay for *every* downstream, moved into the one topology that needs a sketch -- an encoder fed straight from `kv_metrics` with no `aggregate` between ([ADR `kv-metrics-semantics`](../adr/kv-metrics-semantics.md)); the reference pipeline's `aggregate` sketches once per series instead |
 | receive queue: push then pop, warm | **0** | `BoundedQueue<Datagram>`, ADR `decoupled-listener-io` -- see below |
@@ -847,6 +881,22 @@ the way `NativeDecoder::decode_into` does, since `Fanout::send` takes the `Event
 | `NativeDecoder::decode_into`, 1 event | **8** | dictionary re-intern + `AttrMap`/`Event` construction; no intermediate object graph, unlike the bake-off's `rkyv`/`postcard` arms, which run through a `WireBatch` mirror first (`docs/adr/native-wire-format-encoding.md`'s finding 4) |
 | `logit_in`: read + decode, 1 event | **7** | `read_frame_with_header` + `decode_batch` directly — one allocation cheaper than `NativeDecoder::decode_into` above: no caller-held `Vec<Event>` to `out.extend` into, since `decode_batch`'s own freshly allocated `Vec` is what `Fanout::send` takes as-is |
 
+The same pair over the six survey-derived shapes (`docs/plans/event-sizing.md` W1), one event per
+batch except the last:
+
+| Shape | encode | decode | Notes |
+|---|---:|---:|---|
+| 12-attribute flat JSON log | **16** | **5** | |
+| 10-attribute nested pino-http record | **24** | **9** | decode's extra four are the boxed `Value::Map`s, same cause as `json`'s |
+| 30-attribute access log | **24** | **5** | **decode is flat in width** -- the same 5 as the 12-attribute row, with the growth chain showing up as reallocs instead. This is `read_attr_map_at` reading the exact count off the wire and discarding it, then rebuilding the map by 30 sorted `insert_sym`s in the *writer's* symbol order, which dictionary remapping has already made unsorted for the reader |
+| 17-attribute server span | **20** | **5** | |
+| 3-record collectd event | **20** | **5** | |
+| 5 events, 17-attribute `Resource` | **53** | **10** | the one measurement where the resource's own width is paid: `logit_proto::native` writes it once per batch rather than `Arc`-sharing it |
+
+Encode tracks the number of *fields* written, not the attribute count -- the span and the
+three-record collectd event both write more structure than the 12-attribute log while carrying
+fewer attributes.
+
 The full bake-off comparison against `otlp`, `rkyv`, and `postcard` — across two shapes and three
 batch sizes, both timing and encoded bytes — lives in
 [ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), not here: those numbers
@@ -1389,6 +1439,46 @@ effective behavior without changing the zero-arg `-> Event` signature. Skipping 
 transform's very first touch of a message look like it costs an allocation it doesn't, every time,
 forever — not a one-off cold-start number worth recording.
 
+**The six survey-derived shapes** (`crates/logit-bench/src/fixtures.rs`, added 2026-09-21 by
+[`docs/plans/event-sizing.md`](../plans/event-sizing.md)'s W1) are what
+[`data-shapes.md`](data-shapes.md) §7's follow-up 2 asked for by name, after §6 found that the
+fixtures here — which hold up better than their own caveats suggested — had no entry at the
+commonest measured log width, none for a nested record, and none for a span at the measured
+ceiling:
+
+| Fixture | Width | The row it sits on |
+|---|---|---|
+| `flat_json_log_event` | 12 attributes, flat | §5.3's p50 for Go `log/slog` and structlog in their documented production configuration |
+| `pino_http_log_event` | 10 attributes, 4 nested maps, depth 2 | §5.3's pino-http row (9 / max 10, 4 / 3 / 2) |
+| `access_log_event` | 30 attributes | §2's PostgreSQL `jsonlog` (29 keys), the desk-counted 15–34 access/audit class |
+| `wide_server_span_event` | 17 attributes, no events, no links | §4's HTTP-server convention (16) at the demo's measured p90 (17) |
+| `collectd_three_record_event` | 6 attributes, 3 metric records | §3's collectd width (p50 = max = 6) and its 3-record tail |
+| `enriched_resource_batch` | 5 events × 9 attributes, 17-attribute `Resource` | §3's median collector batch carrying §4's median resource |
+
+All six are **modelled, not captured**, and each doc comment says which part is the model's own —
+the survey reports counts and pooled percentiles, not key names, so the names are the conventions'
+or the format's while the counts are measured. Two choices in them are worth knowing about when
+reading a number off one: `collectd_three_record_event`'s sixth attribute is the fixture's, not
+collectd's (the survey measures the record count and the attribute width over the same corpus but
+does not say they co-occur on one list), and `pino_http_log_event`'s per-map widths are a choice
+consistent with the measured median of 3, not a recorded shape.
+
+**Four of the six are built through the leg that really produces them** — a `tail_in`-shaped log
+event (one `log.file.path` attribute and a JSON body) handed to the real `json` transform — rather
+than constructed attribute by attribute. That is not decoration: the width these fixtures exist to
+pin is then produced by the code under measurement, at the same total count §5.3 measured on
+exactly that leg, instead of by the fixture. It also gives `perf/scenarios/json-parse-app-log`,
+`-nested-log` and `-access-log` something to render: each scenario's `generate_in` template is the
+matching fixture body verbatim plus the same path attribute, so a scenario and an allocation pin
+measure the same event.
+
+**Their directly-constructed attribute values are `Bytes::from_static`, never `Value::str`**
+(`fixtures::sstr`) — the same promotion rule the paragraph above states, applied to attribute
+values rather than to a message. A fixture built from `Value::str` pays one `Box<Shared>`
+promotion per string inside whatever region first clones it, which for these shapes is the
+`Event::clone` measurement itself; `Bytes::from_static` is what a value that really arrived off
+the wire already is.
+
 **`unescape`'s own allocation count depends on this same `Vec`/`Bytes` conversion rule, the other
 direction.** `Bytes::from(Vec<u8>)` takes the cheap, deferred-promotion path only when
 `vec.len() == vec.capacity()`; otherwise it eagerly allocates the `Shared` control block *inside
@@ -1520,6 +1610,15 @@ survey plus live captures of real third-party software measured by the `shape` c
 and live collectd puts 17.7% of its events at 2–3 metrics and none higher. It deliberately decides
 nothing; both items stay deferred to the sizing ADR that document lists as its first follow-up,
 and its own §7 is explicit that none of it is production traffic.
+
+**And the baseline now exists too.** [`docs/plans/event-sizing.md`](../plans/event-sizing.md) is
+that sizing ADR's enabling plan; its W1 added the six shapes §6 asked for, pinned today's numbers
+for each (§2's `json`/`Event::clone`/native rows above), and measured the growth ladder §1 used to
+infer (§1's table). Two of those numbers bear directly on how these two items should be argued: a
+spilled `AttrMap` clones in **one** allocation whatever its width, so allocation count barely
+separates a 12-attribute log from a 30-attribute one; and the *nested* shape, at 10 attributes, is
+five times more expensive to clone than either. An argument for item 12 denominated in allocations
+alone would rank those three shapes in an order bytes moved does not.
 
 12. **`AttrMap`'s inline capacity, increased rather than shrunk.** Would reduce spills on wider
     shapes (the nginx config's 10 attributes, wide-JSON's 32), at the cost of a larger `AttrMap` —
