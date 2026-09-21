@@ -123,7 +123,7 @@ impl AttrMap {
     /// finishes on `Drop`, so an early return leaves a valid map behind.
     pub fn bulk_insert(&mut self, additional: usize) -> BulkInsert<'_> {
         let base = self.0.len();
-        BulkInsert { map: self, base, seen: 0, remaining: additional }
+        BulkInsert { map: self, base, seen: 0, remaining: additional, ascending: true }
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -236,6 +236,16 @@ pub struct BulkInsert<'a> {
     /// a non-increasing **upper bound** on the map's final length, which is exactly the number
     /// [`BulkInsert::push`] reserves at the moment it first needs the heap.
     remaining: usize,
+    /// Whether the map is still sorted end to end -- true until an append lands below the entry
+    /// before it. **This is the common case, not a lucky one**: the interner numbers keys in
+    /// first-seen order, so a source whose records carry their keys in a stable order (every
+    /// logging library; a native peer re-sending its own sorted map) presents them already in
+    /// ascending `Symbol` order, event after event. While it holds, [`BulkInsert::push`] is a
+    /// compare and an append -- no head search, no filter probe -- and `Drop` has nothing to sort.
+    /// A per-key `insert_sym` loop got the same arrival order for the price of a binary search per
+    /// key, which is why a bulk build that ignored it measured *slower* end to end on the perf VM
+    /// than the loop it replaced (`docs/plans/event-sizing.md`'s W4).
+    ascending: bool,
 }
 
 impl BulkInsert<'_> {
@@ -267,11 +277,21 @@ impl BulkInsert<'_> {
     /// `bulk_insert(0)` (Lua, which cannot get a table's hash-part length out of the VM) is the
     /// deliberate case: it takes the sort and none of the sizing, which is exactly today's growth
     /// behaviour.
+    #[inline]
     pub fn push(&mut self, key: Symbol, value: impl Into<Value>) {
         let value = value.into();
         // Counting this entry: `map.len() + declared` is the run's upper-bound final length.
         let declared = self.remaining;
         self.remaining = declared.saturating_sub(1);
+        let bit = 1u128 << (key.into_usize() & 127);
+
+        // In order so far, and this key sorts after everything the map holds: it can be in
+        // neither the head nor the tail, and appending it keeps the whole map sorted.
+        if self.ascending && self.map.0.last().is_none_or(|(last, _)| key > *last) {
+            self.seen |= bit;
+            self.append(declared, key, value);
+            return;
+        }
 
         // Already in the map before this build opened: overwrite where it sits. The head is
         // sorted and, being the map's own entries, holds each key at most once.
@@ -283,7 +303,6 @@ impl BulkInsert<'_> {
         }
 
         // Already pushed into the tail by this build: same rule, one filter test away.
-        let bit = 1u128 << (key.into_usize() & 127);
         if self.seen & bit != 0 {
             if let Some(slot) = self.map.0[self.base..].iter_mut().find(|(k, _)| *k == key) {
                 slot.1 = value;
@@ -292,6 +311,13 @@ impl BulkInsert<'_> {
         }
         self.seen |= bit;
 
+        // A new key that sorts below the entry before it: `Drop` has a sort to do.
+        self.ascending = false;
+        self.append(declared, key, value);
+    }
+
+    #[inline]
+    fn append(&mut self, declared: usize, key: Symbol, value: Value) {
         if declared > 0 && self.map.0.len() == self.map.0.capacity() {
             // Exactly the rest of the declared run, this entry included: one buffer of
             // `len() + declared` entries, and no second one unless the hint was too low.
@@ -303,8 +329,8 @@ impl BulkInsert<'_> {
 
 impl Drop for BulkInsert<'_> {
     fn drop(&mut self) {
-        if self.map.0.len() == self.base {
-            return; // nothing appended -- either nothing was pushed, or it all overwrote
+        if self.ascending || self.map.0.len() == self.base {
+            return; // still sorted: every append was in order, or nothing was appended at all
         }
         // Every key is distinct: the head held each of its own at most once, [`BulkInsert::push`]
         // kept the tail free of both head keys and tail repeats, so there are no equal elements
@@ -601,6 +627,36 @@ mod tests {
                 .enumerate()
                 .map(|(v, i)| (syms[*i], 1000 + v as i64))
                 .collect();
+
+            let expected = by_repeated_insert(&base, &pairs);
+            let actual = by_bulk(&base, &pairs);
+
+            let expected_entries: Vec<(Symbol, &Value)> = expected.iter().collect();
+            let actual_entries: Vec<(Symbol, &Value)> = actual.iter().collect();
+            proptest::prop_assert_eq!(actual_entries, expected_entries);
+        }
+
+        /// The in-order fast path's own shapes, which uniformly random keys almost never produce:
+        /// an ascending run (the way a real source presents its keys), with a few entries of it
+        /// then perturbed -- a repeat of an earlier key, a key that lands mid-run, a key the head
+        /// already holds -- at an arbitrary point, so the switch from "still sorted" to "needs a
+        /// sort" is exercised at every position, including never.
+        #[test]
+        fn a_mostly_ascending_bulk_build_matches_a_sequence_of_inserts(
+            base_idx in proptest::collection::vec(0usize..40, 0..6),
+            run in proptest::collection::btree_set(0usize..40, 0..30),
+            perturb in proptest::collection::vec((0usize..31, 0usize..40), 0..4),
+        ) {
+            let syms = probe_symbols(40);
+            let base: Vec<(Symbol, i64)> =
+                base_idx.iter().enumerate().map(|(v, i)| (syms[*i], v as i64)).collect();
+            let mut order: Vec<usize> = run.into_iter().collect(); // ascending by construction
+            for (at, key) in perturb {
+                let at = at.min(order.len());
+                order.insert(at, key);
+            }
+            let pairs: Vec<(Symbol, i64)> =
+                order.iter().enumerate().map(|(v, i)| (syms[*i], 1000 + v as i64)).collect();
 
             let expected = by_repeated_insert(&base, &pairs);
             let actual = by_bulk(&base, &pairs);
