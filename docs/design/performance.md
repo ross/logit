@@ -209,6 +209,14 @@ means when that range is wide.
 | `passthrough` | 25M | 3,582,184 | 3,474,559 – 3,650,615 | 0.346 | 76.5 MiB | 6.98 s |
 | `route` | 25M | 3,151,261 | 2,893,512 – 3,220,361 | 0.654 | 154.5 MiB | 7.93 s |
 
+Three scenarios ship **without a row here**: `json-parse-app-log`, `json-parse-nested-log` and
+`json-parse-access-log`, added 2026-09-21 by [`docs/plans/event-sizing.md`](../plans/event-sizing.md)'s
+W1 as three widths of the same `json` parse (12, 10-with-four-nested-maps, and 30 attributes). They
+have never been run on the VM, and their configured counts are first estimates scaled off
+`json-parse`'s by key count rather than tuned to the 5–10 s band — so the first session that runs
+them should expect to retune them, and until then there is deliberately no number for them in this
+document.
+
 `json-parse-x3` and `logfmt-parse` have no row in the laptop-era version of this table at all —
 they landed after it was last written (`docs/plans/load-test-harness.md`'s "Owed now" tracked this
 as outstanding); this is their first recorded numbers here.

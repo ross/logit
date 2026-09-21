@@ -1,0 +1,45 @@
+# The nested log shape: generate_in renders a pino-http completion record, `json` merges its
+# nine top-level fields onto tail_in's `log.file.path`, and the two request/response objects become
+# `Value::Map`s -- four boxed AttrMaps per event, counting the `headers{{}}` inside each. null_out
+# discards. docs/design/data-shapes.md §5.3 measured pino-http at 9 attributes with 4 nested maps,
+# median width 3, depth 2; §6 names nested maps as the thing that "multiply whatever is chosen",
+# since every `Value::Map` is a boxed AttrMap paying the full inline footprint again.
+#
+#   script/perf run --scenario json-parse-nested-log
+#
+# `gen`'s `log:` template is `fixtures::PINO_HTTP_LOG_BODY` from crates/logit-bench/src/fixtures.rs,
+# verbatim, and its one `log.file.path` attribute is what `tail_in` stamps on every line it reads
+# (crates/logit-inputs/src/tail/line.rs) -- so this scenario parses the exact shape
+# crates/logit-bench/tests/allocations.rs's `json_parse_pino_http_nested_event` already pins at the
+# component level, at the same total attribute width. `{{`/`}}` are logit_core::template's
+# brace-escape, needed because a JSON body is nothing but braces. No `{seq}` substitution, for
+# json-parse.yaml's reason: one representative line, parsed as fast as the runtime allows.
+#
+# No `kv_metrics` after the parse, following logfmt-parse.yaml rather than json-parse.yaml: this
+# scenario exists to isolate the parse at a *width*, and a metrics stage on top would fold its own
+# per-event cost into the comparison between these three.
+#
+# Why it exists alongside json-parse-app-log: it is *narrower* (10 attributes against 12) and
+# costs five allocations to parse against one, four of them the nested maps
+# (`json_parse_pino_http_nested_event`). Any sizing arm that improves flat width without touching
+# `Value::Map` should show up as this scenario moving least.
+#
+# The count targets docs/plans/load-test-harness.md's 5-10 s band and is a **first estimate**,
+# scaled off json-parse's 19M by this shape's key count -- it has never been run on the reference
+# VM, so it will want retuning the first time it is (docs/design/performance.md §1).
+components:
+  gen:
+    type: generate_in
+    count: 8000000
+    event:
+      log: '{{"level":30,"time":1725091200123,"pid":4821,"hostname":"api-7c9f8d6b5-abcde","reqId":"req-8461","req":{{"method":"POST","url":"/api/v1/orders","headers":{{"host":"shop.example.com","content-type":"application/json","content-length":"842"}}}},"res":{{"statusCode":201,"headers":{{"content-type":"application/json","content-length":"57","vary":"Accept-Encoding"}}}},"responseTime":18,"msg":"request completed"}}'
+      attributes:
+        log.file.path: /var/log/app/app.log
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  out:
+    type: null_out
+    sources: [parsed]
