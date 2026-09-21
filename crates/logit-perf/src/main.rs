@@ -174,6 +174,12 @@ enum Command {
         /// Defaults to `perf/results/<scenario>.svg`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Also keep the collapsed stacks at this path -- the `inferno-collapse-perf` output the
+        /// SVG is rendered from, one `a;b;c <count>` line per unique stack. This is what a
+        /// share-of-samples summary is computed from (`perf/folded_share.py`); the SVG is a
+        /// picture of the same data and a poor thing to compute against.
+        #[arg(long)]
+        folded: Option<PathBuf>,
         /// `perf record -F` sampling frequency, in Hz.
         #[arg(long, default_value_t = 999)]
         freq: u32,
@@ -266,6 +272,7 @@ fn main() {
         Command::Flamegraph {
             scenario,
             out,
+            folded,
             freq,
             settle,
             timeout,
@@ -278,6 +285,7 @@ fn main() {
             flamegraph::FlamegraphArgs {
                 scenario,
                 out,
+                folded,
                 freq,
                 settle,
                 timeout,
