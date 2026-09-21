@@ -135,6 +135,32 @@ pub enum NormalizeStep {
     Lower,
 }
 
+/// `ComponentKind::Flatten`'s `attributes`/`resource` fields: which top-level attributes to
+/// expand. `#[serde(untagged)]`: a bare `all`/`none` picks the blanket mode
+/// ([`FlattenKeyword`]), a sequence names literal top-level attribute names explicitly --
+/// `SetValue`'s "let YAML's own shape decide the variant" convention, unambiguous here because a
+/// keyword and a sequence never parse as each other. A named entry is a literal attribute name,
+/// never a path into a nested value (`docs/adr/kv-metrics-semantics.md`'s "nested fields are not
+/// addressable" -- `flatten` is what makes one addressable, not a new way to spell a path to one).
+/// See `docs/adr/flatten-transform.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum FlattenFields {
+    Keyword(FlattenKeyword),
+    Named(Vec<String>),
+}
+
+/// See [`FlattenFields`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlattenKeyword {
+    /// Every nested attribute (or resource attribute) is expanded -- `ComponentKind::Flatten`'s
+    /// default for `attributes`.
+    All,
+    /// Nothing is expanded -- `ComponentKind::Flatten`'s default for `resource`.
+    None,
+}
+
 /// One field's clamp, under `ComponentKind::KeepValues`'s `resource`/`attributes` maps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValueAllowList {
@@ -1283,6 +1309,40 @@ pub enum ComponentKind {
         #[serde(default = "default_max_tracked_keysets")]
         max_tracked_keysets: usize,
     },
+    /// Rewrites a nested `Value::Map`/`Value::Array` attribute into flat, dot-joined keys --
+    /// `{"foo": {"key": "bar"}}` becomes `foo.key = "bar"`, `{"tags": ["a","b"]}` becomes
+    /// `tags.0`/`tags.1`, and the two compose (`{"items": [{"name": "x"}]}` becomes
+    /// `items.0.name`). The event model itself still nests and every decoder still produces
+    /// nesting (`docs/adr/json-parsing-into-attributes.md`); this is an operator-placed, one-way
+    /// rewrite for the leg of a pipeline whose wire has none -- `influxdb_out`, `statsd_out`,
+    /// `prometheus_out`, `graphite_out`, and `collectd_out` each drop a `Value::Map` attribute
+    /// outright, so this is how nested JSON/OTLP data becomes a tag on any of them at all. Never
+    /// drops an event, and never removes an attribute that wasn't itself nested. See
+    /// `docs/adr/flatten-transform.md`, which confronts the three places this codebase previously
+    /// rejected dotted-key flattening as *implicit* decoder/matcher behavior.
+    Flatten {
+        /// Which top-level attributes to expand. `all` (the default) means every nested
+        /// attribute -- the useful default for a source whose keys the operator doesn't control
+        /// (a Kubernetes label map, an OTLP `KvlistValue`). A named list is a literal attribute
+        /// name, never a path -- see [`FlattenFields`]. Rejected at graph-validation time
+        /// (`crates/logit-pipeline/src/graph.rs` rule 59) if both this and `resource` are `none`,
+        /// or if a named list is empty or contains an empty or duplicate name.
+        #[serde(default = "default_flatten_attributes")]
+        attributes: FlattenFields,
+        /// Also expand the batch's `Resource` attributes, under the same rules, once per batch
+        /// behind an `Arc::ptr_eq` cache. `none` by default: a resource is a small, mostly
+        /// operator-declared identity map, and paying a per-batch `Resource` rebuild for a map
+        /// that usually isn't nested has no case behind it. Event attributes are controlled
+        /// separately by `attributes` above. `Scope` attributes are never touched -- `Transform`
+        /// has no hook to substitute one through.
+        #[serde(default = "default_flatten_resource")]
+        resource: FlattenFields,
+        /// Whether an array expands by index (`tags.0`, the default) or is left as a leaf and
+        /// written back whole at its path (`skip`), for a source whose arrays are data rather
+        /// than structure. Under `skip` a *top-level* array attribute is left entirely untouched.
+        #[serde(default)]
+        arrays: FlattenArrays,
+    },
     // `filter`/`rename`/`sample`/`throttle`/`dedup` used to live here too -- retired, not merely
     // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
     // a `lua` component (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the
@@ -2178,6 +2238,26 @@ fn default_max_tracked_keys() -> usize {
 /// [`ComponentKind::Shape`]'s `max_tracked_keysets` default -- see [`default_max_tracked_keys`].
 fn default_max_tracked_keysets() -> usize {
     4096
+}
+
+/// [`ComponentKind::Flatten`]'s `arrays` field: whether an array expands by index or is treated
+/// as a leaf. See that field's own doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlattenArrays {
+    #[default]
+    Index,
+    Skip,
+}
+
+/// [`ComponentKind::Flatten`]'s `attributes` default -- every nested attribute.
+fn default_flatten_attributes() -> FlattenFields {
+    FlattenFields::Keyword(FlattenKeyword::All)
+}
+
+/// [`ComponentKind::Flatten`]'s `resource` default -- nothing.
+fn default_flatten_resource() -> FlattenFields {
+    FlattenFields::Keyword(FlattenKeyword::None)
 }
 
 /// [`ComponentKind::Aggregate`]'s `distributions` field -- whether a raw `Samples` series
@@ -3998,6 +4078,64 @@ mod tests {
         let step: NormalizeStep = serde_json::from_str(r#""lower""#).unwrap();
         assert_eq!(step, NormalizeStep::Lower);
         assert_eq!(serde_json::to_string(&NormalizeStep::Lower).unwrap(), r#""lower""#);
+    }
+
+    #[test]
+    fn flatten_component_deserializes_with_every_field_defaulted() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "flatten", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::Flatten { attributes, resource, arrays } => {
+                assert_eq!(attributes, FlattenFields::Keyword(FlattenKeyword::All));
+                assert_eq!(resource, FlattenFields::Keyword(FlattenKeyword::None));
+                assert_eq!(arrays, FlattenArrays::Index);
+            }
+            other => panic!("expected Flatten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "flatten", "sources": ["in"], "attributes": ["http", "k8s.labels"],
+                "resource": "all", "arrays": "skip"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Flatten { attributes, resource, arrays } => {
+                assert_eq!(
+                    attributes,
+                    FlattenFields::Named(vec!["http".to_string(), "k8s.labels".to_string()])
+                );
+                assert_eq!(resource, FlattenFields::Keyword(FlattenKeyword::All));
+                assert_eq!(arrays, FlattenArrays::Skip);
+            }
+            other => panic!("expected Flatten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_fields_keyword_none_deserializes() {
+        let fields: FlattenFields = serde_json::from_str(r#""none""#).unwrap();
+        assert_eq!(fields, FlattenFields::Keyword(FlattenKeyword::None));
+    }
+
+    #[test]
+    fn flatten_fields_rejects_an_unknown_keyword() {
+        assert!(serde_json::from_str::<FlattenFields>(r#""everything""#).is_err());
+    }
+
+    #[test]
+    fn flatten_arrays_uses_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<FlattenArrays>(r#""index""#).unwrap(),
+            FlattenArrays::Index
+        );
+        assert_eq!(
+            serde_json::from_str::<FlattenArrays>(r#""skip""#).unwrap(),
+            FlattenArrays::Skip
+        );
+        assert!(serde_json::from_str::<FlattenArrays>(r#""Skip""#).is_err());
     }
 
     #[test]

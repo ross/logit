@@ -50,9 +50,10 @@ use logit_proto::graphite::{
     Tags as GraphiteWireTags,
 };
 use logit_transforms::{
-    AggregateTemporality as TransformTemporality, Aggregator, CsvParser,
+    AggregateTemporality as TransformTemporality, Aggregator, Arrays as TransformArrays, CsvParser,
     Distributions as TransformDistributions, DropAttributes as DropAttributesTransform,
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
+    Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
     HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
     KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
@@ -699,6 +700,14 @@ fn build_spec(
                     .with_telemetry(telemetry.clone()),
             ))
         }
+        Flatten { attributes, resource, arrays } => NodeSpec::Transform(Box::new(
+            FlattenTransform::new(
+                to_flatten_fields(attributes),
+                to_flatten_fields(resource),
+                to_flatten_arrays(*arrays),
+            )
+            .with_telemetry(telemetry.clone()),
+        )),
         // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
         // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
         // `HasProvenanceTransform::new` takes -- interning happens inside the transform itself
@@ -1531,6 +1540,31 @@ fn to_allow_lists(
             (field.clone(), normalize, allow, other)
         })
         .collect()
+}
+
+/// Converts `logit-config`'s `FlattenFields` (`ComponentKind::Flatten`'s `attributes`/`resource`
+/// fields) into the `logit_transforms::Fields` `Flatten::new` takes -- `logit-transforms` doesn't
+/// depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), same reasoning as
+/// [`to_allow_lists`].
+fn to_flatten_fields(fields: &logit_config::FlattenFields) -> TransformFields {
+    match fields {
+        logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::All) => {
+            TransformFields::All
+        }
+        logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None) => {
+            TransformFields::None
+        }
+        logit_config::FlattenFields::Named(names) => TransformFields::Named(names.clone()),
+    }
+}
+
+/// Converts `logit-config`'s `FlattenArrays` into `logit_transforms::Arrays` -- same reasoning as
+/// [`to_flatten_fields`].
+fn to_flatten_arrays(arrays: logit_config::FlattenArrays) -> TransformArrays {
+    match arrays {
+        logit_config::FlattenArrays::Index => TransformArrays::Index,
+        logit_config::FlattenArrays::Skip => TransformArrays::Skip,
+    }
 }
 
 #[cfg(test)]
@@ -3815,6 +3849,56 @@ mod tests {
             build_spec("keep_values", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Transform(_)
         ));
+    }
+
+    /// Runs the built transform against an event rather than only checking the `NodeSpec`
+    /// variant -- proving `FlattenFields`/`FlattenArrays` actually reach `Flatten::new` as the
+    /// expected selection, `build_spec_builds_a_working_scale_transform`'s pattern.
+    #[test]
+    fn build_spec_builds_a_working_flatten_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Flatten {
+                attributes: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::All),
+                resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+                arrays: logit_config::FlattenArrays::Index,
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("flat", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        let mut nested = logit_core::AttrMap::new();
+        nested.insert("key", logit_core::Value::str("bar"));
+        attrs.insert("foo", logit_core::Value::Map(Box::new(nested)));
+        let event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        let mut event = event;
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        assert_eq!(
+            event.attributes.get("foo.key"),
+            Some(&logit_core::Value::str("bar")),
+            "attributes: all (the default) should have expanded the nested attribute"
+        );
     }
 
     /// `shape` also proves the `tap` tag's plumbing end to end: `build_spec` is handed the

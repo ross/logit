@@ -1146,6 +1146,67 @@ fn keep_values_one_event_needs_lowering() {
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
 
+/// Free: `nginx_event`'s attributes are all flat strings/numbers, so `flatten`'s phase-1 scan
+/// selects nothing -- no buffer is touched, no `Symbol` is interned, nothing is removed or
+/// reinserted. `docs/adr/flatten-transform.md`'s "a flat event is untouched" property, in
+/// allocation terms.
+#[test]
+fn flatten_already_flat_event() {
+    let mut f = fixtures::flatten();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    f.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| f.process(&resource, &mut event));
+    assert!(forwarded, "flatten forwards");
+    expect_allocs("flatten: already-flat event", stats, 0);
+}
+
+/// `pino_http_event`'s `req`/`res` (and their nested `headers`) expand into flat, dot-joined
+/// attributes -- warmed first so every path this shape produces is already in the component's
+/// `KeyCache` (`docs/adr/flatten-transform.md`'s steady-state case), leaving only the result
+/// `AttrMap`'s own growth: six flat attributes survive untouched plus the eight leaves `req`/`res`
+/// expand into, 14 total, spilling the map past its 8-slot inline capacity -- one allocation
+/// (`bytes=768` is exactly 16 slots at 48 bytes each), not one per inserted entry, because
+/// `SmallVec`'s first over-capacity push grows straight to a capacity the rest of this event's
+/// inserts fit inside.
+#[test]
+fn flatten_pino_http_event_warm() {
+    let mut f = fixtures::flatten();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::pino_http_event();
+    f.process(&resource, &mut warm);
+
+    let mut event = fixtures::pino_http_event();
+    let (forwarded, stats) = measure(|| f.process(&resource, &mut event));
+    assert!(forwarded, "flatten forwards");
+    assert_eq!(
+        event.attributes.get("req.headers.host"),
+        Some(&Value::str("api.example.com")),
+        "a doubly-nested path should have expanded"
+    );
+    expect_allocs("flatten: pino-http shape, warm KeyCache", stats, 1);
+}
+
+/// [`flatten_pino_http_event_warm`]'s first-ever call against this shape: every distinct
+/// `req.method`/`req.headers.host`/... path is a `KeyCache` miss, so each one pays lasso's
+/// per-new-key allocation plus the cache's own `Box<str>` copy of the path
+/// (`logit_core::interner::KeyCache`'s doc comment) on top of the warm case's `AttrMap` growth --
+/// the cost `docs/design/data-shapes.md`'s pino-http finding says this shape pays "again" on every
+/// event that carries it for the first time in a process's life.
+#[test]
+fn flatten_pino_http_event_cold_key_cache() {
+    let mut f = fixtures::flatten();
+    let resource = fixtures::resource();
+
+    let mut event = fixtures::pino_http_event();
+    let (forwarded, stats) = measure(|| f.process(&resource, &mut event));
+    assert!(forwarded, "flatten forwards");
+    assert_eq!(event.attributes.get("req.headers.host"), Some(&Value::str("api.example.com")));
+    expect_allocs("flatten: pino-http shape, cold KeyCache (first event)", stats, 12);
+}
+
 /// `shape` is the one transform here that deliberately *doesn't* aim for zero
 /// ([ADR `shape-observer-component`](../../../docs/adr/shape-observer-component.md)): a
 /// measurement event carries a dozen-odd metric records, so it always spills `MetricList`'s single

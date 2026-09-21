@@ -552,6 +552,19 @@ already built that have a known, accepted rough edge.
   `keep`-in-front recommendation specifically for `otlp_in`, not just the general
   `aggregate`-cardinality one
   [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) already demonstrates.
+
+  **`flatten` (`crates/logit-transforms/src/flatten.rs`,
+  [ADR `flatten-transform`](adr/flatten-transform.md)) sits downstream of all of the above and adds
+  no new bound by design.** Its marginal exposure over what `json`/`syslog_in`/`otlp_in` already
+  accept is two things: path *combinations* of already-interned keys (a product, not a sum — bounded
+  by the fixed internal recursion-depth wall, not a key-count cap), and array indices, which are a
+  genuinely new key axis no existing component mints — a 10,000-element array attribute flattens
+  into `tags.0`..`tags.9999`, ten thousand new symbols, interned forever. There is deliberately no
+  `max_keys`-style cap (a settled decision, not an oversight — see the ADR's Alternatives); the
+  operator's levers are a narrowed `attributes:`/`resource:` list and `arrays: skip`. A rotating key
+  space in *value* position that `flatten` promotes to *key* position (a map keyed by request or
+  user IDs, say) is the same exposure `json`/`otlp_in` already have one level shallower, now
+  multiplied by every distinct path above it.
 - ~~**`statsd_in` copies tag values instead of slicing them**~~ — **closed.** It used to build
   attribute values with `attributes.insert(k, v)` on a `&str`, routing through
   `Value::str` → `Bytes::from(String)` (copying bytes already in the datagram buffer), then

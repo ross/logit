@@ -1,0 +1,78 @@
+# A contributor-facing fixture for `flatten` (docs/adr/flatten-transform.md): proves
+# tail_in -> json -> flatten -> keep -> kv_metrics -> aggregate -> influxdb_out against a nested
+# JSON log line -- the shape none of this repo's other example configs carries (nginx's access log
+# and statsd's wire lines are both already flat). Not wired into `script/server`/`compose.yaml`;
+# covered by `script/validate` and `every_shipped_config_loads_and_validates`
+# (`crates/logit-cli/src/config.rs`) like every other shipped config.
+#
+# A pino-http-style completion record is the motivating shape
+# (docs/design/data-shapes-rows.md's pino-http row): the request/response detail an application's
+# structured-logging library nests under `req`/`res` is exactly the data no existing tag-rendering
+# sink (influxdb_out included) can represent at all -- see the ADR's Context for the full list.
+#
+# Topology:
+#
+#   app.log --tail--> app_in (tail_in)
+#                          |
+#                          v
+#                    app_json (json)     <- req/res land as nested Value::Maps
+#                          |
+#                          v
+#                     app_flat (flatten) <- req.method, req.url, res.statusCode become ordinary,
+#                          |                 dot-named attributes -- addressable by `keep` below,
+#                          v                 which could never select a nested Value::Map
+#                    app_trimmed (keep)  <- only the two dotted tags aggregate should key on
+#                          |
+#                          v
+#                    app_metrics (kv_metrics)
+#                          |
+#                          v
+#                    app_windowed (aggregate)
+#                          |
+#                          v
+#                      influx_out
+#
+# `flatten` creates attribute width, and width is cardinality (the ADR's loudest consequence) --
+# `app_trimmed` runs *after* `app_flat`, never before, the same placement discipline `keep` already
+# recommends ahead of `aggregate` in every other example.
+components:
+  app_in:
+    type: tail_in
+    paths: ["/var/log/app/*.jsonl"]
+
+  app_json:
+    type: json
+    sources: [app_in]
+
+  # attributes: all (the default) -- this app's own logging library decides req/res's shape, not
+  # this config, so a named field list would need editing every time that shape changes.
+  app_flat:
+    type: flatten
+    sources: [app_json]
+
+  # keep after flatten, not before: req.method/res.statusCode don't exist as attributes until
+  # flatten runs, and everything flatten doesn't touch (a wide k8s.labels map, say) stays bounded
+  # by never being kept.
+  app_trimmed:
+    type: keep
+    sources: [app_flat]
+    fields: [req.method, res.statusCode]
+
+  app_metrics:
+    type: kv_metrics
+    sources: [app_trimmed]
+    counters:
+      - name: app.requests # +1 per event
+
+  app_windowed:
+    type: aggregate
+    sources: [app_metrics]
+    interval: 10s
+
+  influx_out:
+    type: influxdb_out
+    sources: [app_windowed]
+    url: http://influxdb:8086
+    org: logit
+    bucket: metrics
+    token: !env INFLUXDB_TOKEN

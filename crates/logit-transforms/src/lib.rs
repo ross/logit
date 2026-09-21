@@ -5,13 +5,14 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, and `route` are implemented (`rename`/
+//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, and `route` are implemented (`rename`/
 //! `filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
 //! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
 mod csv;
+mod flatten;
 mod json;
 mod keep;
 mod keep_values;
@@ -31,6 +32,7 @@ use logit_core::Value;
 pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
+pub use flatten::{Arrays, Fields, Flatten};
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use keep_values::{ClampConfig, KeepValues, Normalize};
@@ -396,6 +398,97 @@ mod chained_pipeline_test {
                 other => panic!("unexpected series name: {other}"),
             }
         }
+    }
+
+    /// A `json -> flatten -> keep -> kv_metrics -> aggregate` chain over a pino-http-shaped
+    /// line (`crates/logit-bench/src/fixtures.rs`'s `pino_http_event` doc comment has the same
+    /// shape as a directly-constructed `Event`): proves `flatten`'s dotted keys
+    /// (`req.method`, `res.statusCode`) are what makes a nested field *addressable* by `keep`
+    /// afterward, exactly the claim `docs/adr/flatten-transform.md` makes against
+    /// `kv-metrics-semantics`' "nested fields are not addressable" -- before `flatten` runs,
+    /// `req`/`res` are `Value::Map`s that `keep`'s literal-name matcher could never select.
+    #[test]
+    fn json_flatten_keep_kv_metrics_aggregate_chain_produces_correctly_tagged_metrics() {
+        let resource = Arc::new(Resource::default());
+
+        let raw = r#"{"level":30,"pid":1,"hostname":"web-1","reqId":"req-1",
+                       "responseTime":12.4,
+                       "req":{"method":"GET","url":"/v1/widgets",
+                              "headers":{"host":"api.example.com"}},
+                       "res":{"statusCode":200}}"#;
+        let mut event = Event::log(
+            0,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str(raw),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+
+        // json: the raw body becomes attributes, req/res nested as Value::Map.
+        let mut json = JsonParser::new(false);
+        assert!(json.process(&resource, &mut event), "json always forwards");
+        assert_eq!(event.attributes.len(), 7, "every top-level JSON key should have landed");
+        assert!(
+            matches!(event.attributes.get("req"), Some(Value::Map(_))),
+            "req should still be nested before flatten runs"
+        );
+
+        // flatten: attributes: all (the default) expands req/res (and req's own nested headers)
+        // into dotted keys.
+        let mut flatten = Flatten::new(Fields::All, Fields::None, Arrays::Index);
+        assert!(flatten.process(&resource, &mut event), "flatten always forwards");
+        assert_eq!(event.attributes.get("req"), None, "req should be consumed");
+        assert_eq!(event.attributes.get("req.method"), Some(&Value::str("GET")));
+        assert_eq!(
+            event.attributes.get("req.headers.host"),
+            Some(&Value::str("api.example.com")),
+            "recursion should compose: req -> headers -> host"
+        );
+        assert_eq!(event.attributes.get("res.statusCode"), Some(&Value::U64(200)));
+
+        // keep: only the two dotted paths flatten just created survive -- unaddressable before
+        // flatten ran, ordinary literal attribute names after.
+        let mut keep = Keep::new(vec!["req.method".to_string(), "res.statusCode".to_string()]);
+        assert!(keep.process(&resource, &mut event), "keep always forwards");
+        let kept: Vec<&str> = event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(kept.len(), 2, "exactly the two kept dotted attributes should survive");
+
+        // kv_metrics: one no-field counter.
+        let mut kv = KvMetrics::new(
+            vec![MetricSpec { name: "http.requests".to_string(), field: None, unit: None }],
+            vec![],
+            vec![],
+        );
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
+        assert_eq!(event.metrics.len(), 1);
+
+        // aggregate: the one metric is mergeable, so it's fully absorbed.
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        assert!(agg.process(&resource, &mut event), "the log half should be forwarded");
+        assert!(event.metrics.is_empty(), "the metric should have been absorbed");
+
+        let flushed = agg.flush(1_000_000_000);
+        assert_eq!(flushed.len(), 1, "one resource group");
+        let (_, _, events) = &flushed[0];
+        assert_eq!(events.len(), 1, "one series");
+        let (series_event, _links) = &events[0];
+        let tags: Vec<&str> = series_event.attributes.iter().map(|(k, _)| resolve(k)).collect();
+        assert_eq!(
+            tags.len(),
+            2,
+            "the series' tags must be exactly what keep named, no more and no less"
+        );
+        assert_eq!(series_event.attributes.get("req.method"), Some(&Value::str("GET")));
+        assert_eq!(series_event.attributes.get("res.statusCode"), Some(&Value::U64(200)));
+        assert!(
+            matches!(series_event.metrics[0].kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+        );
     }
 
     /// The `logfmt` mirror of

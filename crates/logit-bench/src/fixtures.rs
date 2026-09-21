@@ -31,8 +31,9 @@ use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
-    AggregateTemporality, Aggregator, CsvParser, Distributions, JsonParser, Keep, KeepValues, Kv,
-    KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set, Shape,
+    AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
+    JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set,
+    Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -584,6 +585,12 @@ pub fn shape() -> Shape {
     Shape::new(Duration::from_secs(10)).with_name("tap")
 }
 
+/// A `flatten` at its defaults (`attributes: all`, `resource: none`, `arrays: index`) -- the
+/// common case, for `crates/logit-bench/tests/allocations.rs`'s `flatten_*` measurements.
+pub fn flatten() -> Flatten {
+    Flatten::new(Fields::All, Fields::None, Arrays::Index)
+}
+
 /// A `set` configured with one attribute pair and no resource pairs -- the per-event-only path
 /// (`crates/logit-bench/tests/allocations.rs`'s `set_attributes_one_event`).
 pub fn set_attributes() -> Set {
@@ -844,6 +851,59 @@ pub fn wide_counter_event(name: &str, value: f64) -> Event {
         0,
         attributes,
         MetricRecord::new(logit_core::interner::intern(name), MetricKind::counter(value)),
+    )
+}
+
+/// A directly-constructed log event in the pino-http completion-record shape
+/// `docs/design/data-shapes-rows.md`'s survey row measured: pino's 5 flat fields
+/// (`level`/`time`/`msg`/`pid`/`hostname`) plus `reqId`/`responseTime` (flat) and `req`/`res`
+/// (nested `Value::Map`s), each of which itself nests a `headers` map -- four boxed `AttrMap`s per
+/// event at depth 2, `docs/design/data-shapes.md`'s headline finding about this shape
+/// (`crates/logit-bench/tests/allocations.rs`'s `flatten_*` measurements, the one fixture in this
+/// module built to have something for `flatten` to do). Field values are illustrative, not a
+/// captured record -- `docs/design/data-shapes.md` §7 is explicit that none of this survey is
+/// production traffic.
+pub fn pino_http_event() -> Event {
+    let mut req_headers = AttrMap::new();
+    req_headers.insert("host", Value::str("api.example.com"));
+    req_headers.insert("user-agent", Value::str("curl/8.0"));
+    req_headers.insert("accept", Value::str("*/*"));
+
+    let mut req = AttrMap::new();
+    req.insert("method", Value::str("GET"));
+    req.insert("url", Value::str("/v1/widgets"));
+    req.insert("headers", Value::Map(Box::new(req_headers)));
+
+    let mut res_headers = AttrMap::new();
+    res_headers.insert("content-type", Value::str("application/json"));
+    res_headers.insert("content-length", Value::I64(612));
+
+    let mut res = AttrMap::new();
+    res.insert("statusCode", Value::I64(200));
+    res.insert("headers", Value::Map(Box::new(res_headers)));
+
+    let mut attributes = AttrMap::new();
+    attributes.insert("level", Value::I64(30));
+    attributes.insert("time", Value::I64(1_725_000_000_000));
+    attributes.insert("pid", Value::I64(1));
+    attributes.insert("hostname", Value::str("web-1"));
+    attributes.insert("reqId", Value::str("req-1"));
+    attributes.insert("responseTime", Value::F64(12.4));
+    attributes.insert("req", Value::Map(Box::new(req)));
+    attributes.insert("res", Value::Map(Box::new(res)));
+
+    Event::log(
+        0,
+        attributes,
+        LogRecord {
+            message: Value::str("request completed"),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
     )
 }
 
