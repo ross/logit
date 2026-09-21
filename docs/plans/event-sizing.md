@@ -273,16 +273,6 @@ resource/scope group is 5 events).
     12064). Allocation counts are unchanged everywhere, which is the point — the win is in the
     reallocation and capacity columns that `allocs` was always blind to. `type_sizes.rs` does not
     move: this arm changes no `size_of`.
-- **W3c — an exactly-sized `AttrMap::clone`. Landed.** W3b's clone arm found that a derived
-  `Clone` sizes a spilled copy through smallvec's `reserve` — the next power of two, so 768 B for
-  a 12-attribute map that needs 576 and 1536 for a 30-attribute one that needs 1440 — on every
-  fan-out branch that copies an event. (W1's baseline had called that buffer exactly-sized; it
-  wasn't, and the count-only pin couldn't tell.) `AttrMap` now has a hand-written `Clone` that
-  calls `reserve_exact(len)` first: the same one allocation, sized to `len`, pinned by bytes in
-  `clone_of_a_spilled_attr_map_is_sized_to_len`. This is invariant I2 applied to the copy rather
-  than the build. The per-entry cost W3b measured (an outlined ten-arm `Value::clone` and, at
-  realistic string shares, an atomic refcount bump per value) is untouched — that is the clone
-  arm's open question for W4, not this change.
 - **W3b — bench-only arms.** Arms **C**, **E** and **K**, under
   `crates/logit-bench/src/bakeoff/attr_arms/`, beside the native-wire-format bake-off and built to
   its pattern: a local mirror of the shipped type, measured against it, with every simplification
@@ -319,8 +309,53 @@ resource/scope group is 5 events).
     The allocation counts come from `cargo nextest run -p logit-bench --test attr_arms
     --no-capture`. **No timing number from either goes in this repository** (this plan's "Settled
     decisions", `docs/design/performance.md` §0).
-- **W4 — the VM session.** `script/vm build <ref>` per real-binary arm, `script/perf run
-  --logit-bin` / `compare` across every scenario class; summary into `docs/design/performance.md`.
+- **W3c — an exactly-sized `AttrMap::clone`. Landed.** W3b's clone arm found that a derived
+  `Clone` sizes a spilled copy through smallvec's `reserve` — the next power of two, so 768 B for
+  a 12-attribute map that needs 576 and 1536 for a 30-attribute one that needs 1440 — on every
+  fan-out branch that copies an event. (W1's baseline had called that buffer exactly-sized; it
+  wasn't, and the count-only pin couldn't tell.) `AttrMap` now has a hand-written `Clone` that
+  calls `reserve_exact(len)` first: the same one allocation, sized to `len`, pinned by bytes in
+  `clone_of_a_spilled_attr_map_is_sized_to_len`. This is invariant I2 applied to the copy rather
+  than the build. The per-entry cost W3b measured (an outlined ten-arm `Value::clone` and, at
+  realistic string shares, an atomic refcount bump per value) is untouched — that is the clone
+  arm's open question for W4, not this change.
+- **W4 — the VM session.** Branch `sizing/w4` is W3c with W3b merged in — the one tree that holds
+  every arm. Real-binary refs, all built on it: `main` (before), `sizing/w4` (arm P + the
+  exactly-sized clone, N=8), and the measurement-only `sizing/arm-n0`, `sizing/arm-n4`,
+  `sizing/arm-n16` (the same tree with `INLINE_CAPACITY` changed and nothing else; their exact
+  pins fail by design and they never merge).
+
+  ```sh
+  # operator
+  LOGIT_VM_REPO_REF=sizing/w4 \
+  LOGIT_VM_REPO_REFS=main,sizing/arm-n0,sizing/arm-n4,sizing/arm-n16 script/vm up
+
+  # agent, on the VM: every arm x every signal class, the narrow-metric legs included --
+  # arm S's kill criterion is read off `passthrough`/`aggregate`/the statsd legs, not the logs
+  for bin in main sizing-w4 sizing-arm-n0 sizing-arm-n4 sizing-arm-n16; do
+    for s in passthrough aggregate fanout route json-parse logfmt-parse \
+             json-parse-app-log json-parse-nested-log json-parse-access-log native-relay; do
+      script/perf run --scenario "$s" --logit-bin "perf/bins/$bin/logit"
+    done
+  done
+  # then W2's three instruments and W3b's bench, pinned:
+  taskset -c 2 cargo bench -p logit-bench --bench size_vs_alloc
+  taskset -c 2 cargo bench -p logit-bench --bench attr_arms
+
+  # operator
+  script/vm down
+  ```
+
+  Read-outs, in this order: (1) P against `main` on the three log scenarios and `native-relay`
+  — does the bulk build's gain survive the VM, and is its run-to-run bimodality (seen on the
+  workstation) real; (2) **arm S's registered kill**: N=16 costing any narrow-metric leg ≥5% CPU
+  µs/event ends large static N, and N=0/N=4 are read the same way against the log legs; (3) the
+  alloc/move/clone ratios from `size_vs_alloc`, which replace
+  [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)'s
+  unmeasured premise with numbers; (4) arms C, E and K from `attr_arms`, K against both its
+  registered criterion *and* the 196-key-set gateway under a bounded cache. Scenario event counts
+  for the three W1 scenarios get retuned to the 5–10 s band on first contact. Summary into
+  `docs/design/performance.md`; artifacts to `~/lib/logit/tmp/perf/`, never the repo.
 - **W5 — the ADR**, `docs/adr/event-sizing-and-allocation-strategy.md`: the decision and its
   numbers, the arms that lost and why, I1–I3, an amendment note on
   `minimize-allocations-over-event-size`, and the future-investigations list — `MetricList` N
