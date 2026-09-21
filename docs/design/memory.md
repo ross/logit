@@ -256,6 +256,9 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `keep` filter to 3 attrs | **0** | 3 attributes fit inline |
 | `keep_values` clamp `host`, already allowed and lowercase | **0** | `Clamp::normalize` returns `None` (nothing changed) and the allowed path never calls `insert_sym` -- the steady-state case pays nothing, same property `keep`'s row above pins |
 | `keep_values` clamp `host`, `normalize: [lower]` needs to lower it | **1** | the one path that isn't free: an uppercase byte forces a fresh `Bytes` for the write-back. The cardinality win `normalize:` exists for costs exactly one allocation per event that actually needed it, never per event that didn't |
+| `shape` measure 1 statsd event | **1** | the `MetricList` spill, and only that: a measurement event carries a dozen-odd records where the incoming one held its single record inline, so `reserve` has to go to the heap ([ADR `shape-observer-component`](../adr/shape-observer-component.md)). The tags fit `AttrMap` inline and every `Samples` is well inside `SAMPLES_INLINE` |
+| `shape` measure 1 nginx event | **0** | + 1 realloc, and **cheaper than the statsd row above despite measuring more** -- the inversion is what clearing and refilling `event.attributes`/`event.metrics` in place buys. This event arrives with both already spilled (10 attributes past 8, 4 records past 1), so the tags land in storage that already exists and `reserve` *grows* the existing `MetricList` buffer instead of allocating a new one |
+| `shape` measure 1 wide-JSON event (32 attrs) | **3** | 1 `MetricList` spill + 1 each for `logit.shape.key_bytes`/`.value_bytes`, which carry 32 values apiece and so run past `SAMPLES_INLINE`'s 19. Inherent -- a per-attribute measurement of a 32-attribute event *is* 32 numbers -- and the reason `shape` belongs on a tap branch rather than in the flow |
 | `set` through `process_batch`, attributes only | **0** | nothing at all: `process_batch` is a `Vec::retain_mut` over the batch's own `events` ([ADR `in-place-transform-process`](../adr/in-place-transform-process.md)), and `map_resource` returns `None` immediately, same as `keep` |
 | `set.map_resource`, cached (same input `Arc`) | **0** | the one-entry `Arc::ptr_eq` cache hits -- see below |
 | `set.map_resource`, cache miss (distinct input `Arc`) | **1** | `Arc::new(Resource { .. })` -- the `AttrMap` clone/insert itself stays inline on an empty resource |
@@ -1507,6 +1510,14 @@ were enough to rule out shrinking `AttrMap`; they are not enough to pick a numbe
 these, because that needs a real distribution of attribute/metric counts across production
 traffic, which doesn't exist yet and can't be synthesized honestly.
 
+**The distribution now exists, short of production:** [`data-shapes.md`](data-shapes.md) is a desk
+survey plus live captures of real third-party software measured by the `shape` component, and its
+§6 states what it implies for both items — per-event width is bimodal by signal (metric events at
+0–6 attributes, parsed structured logs at 9 and up with 100% of them past 8, spans across both),
+and live collectd puts 17.7% of its events at 2–3 metrics and none higher. It deliberately decides
+nothing; both items stay deferred to the sizing ADR that document lists as its first follow-up,
+and its own §7 is explicit that none of it is production traffic.
+
 12. **`AttrMap`'s inline capacity, increased rather than shrunk.** Would reduce spills on wider
     shapes (the nginx config's 10 attributes, wide-JSON's 32), at the cost of a larger `AttrMap` —
     and therefore `Event` — for every event, paid whether or not the wider shape is common in a
@@ -1553,6 +1564,14 @@ traffic, which doesn't exist yet and can't be synthesized honestly.
   12-13). That needs real production telemetry, not more synthetic fixtures — recorded as
   deliberately deferred rather than guessed, per the direction settled when `DdSketch`/`SpanRecord`
   were measured and then not boxed for the same reason (§1, [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)).
+  **Substantially answered since, for everything short of production:**
+  [`data-shapes.md`](data-shapes.md) measures real third-party producers with the `shape` component
+  and counts the rest from pinned sources. It also says something about the fixtures above — the
+  wide-JSON shape's 32 attributes is an access-log or audit-log width, not an application-log one
+  (every logging library measured landed at 9–15), and there is no fixture at all for the commonest
+  measured log shape, a span at the 16–17 ceiling, or a nested-map record. What remains open is the
+  production distribution itself and the decision; `shape` exists so an operator can supply the
+  former from traffic that can't leave its environment.
 - **What do the unmeasured workload shapes actually cost?** Answered, for allocation and clone
   cost: logs-only, wide-JSON, distribution-heavy metrics, and spans are all fixtured and measured
   (§0, §2), and that evidence is what drove §8 items 8-10's decisions (one confirmed-unchanged, two

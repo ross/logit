@@ -1,0 +1,147 @@
+# The `hostagents` producer's pipeline (tools/shape-survey/producers/hostagents.sh) -- collectd
+# and Telegraf, each installed from its own official distribution in DEFAULT configuration, driving
+# `logit` over every wire this repo has a listener for. See tools/shape-survey/hostagents/ for the
+# agent images/config, and this producer's representativeness line (provenance.txt) for what a
+# default host-agent install running inside a container idle is -- and is not -- evidence about.
+#
+# WHY THIS PRODUCER MATTERS
+#
+# Almost every metrics input this repo has emits **one metric per event** --
+# `logit.shape.metrics` is a constant 1 for statsd_in, otlp_in, prometheus_in, and graphite_in
+# alike. `collectd_in` is the one exception: it decodes one event per collectd *value list*,
+# carrying that type's N data sources as N `MetricRecord`s on one event (`load` has 3,
+# `if_octets`/`disk_octets` 2, most types 1) -- see docs/adr/collectd-binary-relay.md. So the
+# collectd leg below is this survey's only live measurement of metrics-per-event; everything else
+# here is measured for comparison (attribute shape, batching) but tells `MetricList` nothing new.
+#
+# FIVE LEGS, ONE HOST-METRICS SOURCE EACH, THE WIRE THAT INPUT DECODES IN PARENTHESES
+#
+#   collectd_network  <- collectd's `network` plugin                  (collectd binary, UDP 25826)
+#   graphite_collectd <- collectd's `write_graphite` plugin           (carbon plaintext, TCP 2003)
+#   graphite_telegraf <- Telegraf's `outputs.graphite`                (carbon plaintext, TCP 2004)
+#   prometheus_telegraf <- Telegraf's `outputs.prometheus_client`, scraped (Prometheus text/OM, HTTP)
+#   otlp_telegraf     <- Telegraf's `outputs.opentelemetry`           (OTLP/gRPC)
+#
+# One collectd process feeds the first two (measuring the same host through two protocols); one
+# Telegraf process feeds the last three (measuring how each output serializer flattens the same
+# fields-heavy points -- see the producer's own section.md for events-per-flush per output).
+#
+# **One tap per input, not two.** A metrics input's events arrive finished -- there is no realistic
+# transform chain an operator would run between a scrape/receive and a sink
+# (tools/shape-survey/README.md's "The config pattern", and exporters.yaml's identical choice).
+#
+# **This is the default-batching variant.** `collectd_network`, `graphite_collectd` and
+# `graphite_telegraf` are accumulator-fronted (docs/adr/decoupled-listener-io.md) and run their
+# default `receive.batch_max_events`, so `logit.shape.batch.events` on those three legs is the
+# accumulator's regrouping, not collectd's/Telegraf's own datagram/line boundaries.
+# configs/hostagents-wire-grouped.yaml is the same pipeline with `batch_max_events: 1` on those
+# three, so a batch there reads as the wire's own grouping -- one datagram for the UDP legs, and
+# for `graphite_telegraf`'s TCP leg, one *line* per batch, since a TCP `graphite_in` has no receive
+# queue/accumulator of its own to regroup with (only the four batch-assembly/shutdown `receive:`
+# fields apply there at all -- AGENTS.md, docs/adr/decoupled-listener-io.md). `prometheus_telegraf`
+# and `otlp_telegraf` bypass the accumulator entirely in both variants, so their batches are always
+# the wire's (one scrape response, one OTLP request).
+admin:
+  # start_logit polls `logit ready` against this rather than sleeping.
+  bind: 0.0.0.0:9600
+
+components:
+  # -- the inputs ------------------------------------------------------------------------------------
+
+  # collectd's `network` plugin, collectd's own default port -- one event per value list, N metric
+  # records in wire order for an N-data-source type. No `types_db:`: nothing downstream reads a
+  # data-source name (tools/shape-survey/README.md's counts-only instrument has no use for one
+  # either), and a pure relay's wire is unaffected by it either way (examples/collectd-relay.yaml).
+  collectd_network:
+    type: collectd_in
+    bind: 0.0.0.0:25826
+
+  # collectd's `write_graphite` plugin -- carbon plaintext, the same host through a second protocol.
+  graphite_collectd:
+    type: graphite_in
+    bind: 0.0.0.0:2003
+
+  # Telegraf's `outputs.graphite` -- a distinct bind from graphite_collectd's so `shape`'s `source`
+  # tag (the origin *component*) separates the two agents even though both speak carbon plaintext.
+  graphite_telegraf:
+    type: graphite_in
+    bind: 0.0.0.0:2004
+
+  # Telegraf's `outputs.prometheus_client`, scraped. `interval: 5s` against Telegraf's own 10s
+  # `flush_interval` -- oversampling a registry that changes once per flush costs nothing and buys
+  # more scrapes inside the capture window (the same reasoning exporters.yaml uses).
+  prometheus_telegraf:
+    type: prometheus_in
+    scrape_targets: ["http://telegraf:9273/metrics"]
+    interval: 5s
+
+  # Telegraf's `outputs.opentelemetry`, OTLP/gRPC. If this leg is missing from a run's summary, the
+  # producer's own provenance.txt says why (tools/shape-survey/producers/hostagents.sh).
+  otlp_telegraf:
+    type: otlp_in
+    bind: 0.0.0.0:4317
+    protocol: grpc
+
+  # -- the taps ----------------------------------------------------------------------------------------
+  # One `shape` per input (not one shared component) for the same reason exporters.yaml gives: the
+  # four cumulative gauges (distinct_keys, distinct_keysets, keyset_share.top1/top5) are per
+  # **component**, with no `source` breakdown, so five inputs through one `shape` would answer a
+  # question about none of them individually. `resource: drop` is the default, stated.
+  tap_collectd_network:
+    type: shape
+    sources: [collectd_network]
+    interval: 10s
+    resource: drop
+
+  tap_graphite_collectd:
+    type: shape
+    sources: [graphite_collectd]
+    interval: 10s
+    resource: drop
+
+  tap_graphite_telegraf:
+    type: shape
+    sources: [graphite_telegraf]
+    interval: 10s
+    resource: drop
+
+  tap_prometheus_telegraf:
+    type: shape
+    sources: [prometheus_telegraf]
+    interval: 10s
+    resource: drop
+
+  tap_otlp_telegraf:
+    type: shape
+    sources: [otlp_telegraf]
+    interval: 10s
+    resource: drop
+
+  # -- the capture -----------------------------------------------------------------------------------
+  # `distributions: samples` keeps `shape`'s raw observations raw through the window, and
+  # `max_samples_per_series` is far above what a 10-minute, 10s-interval capture from five hosts'
+  # worth of agent output can produce; past it `aggregate` falls back to a DdSketch and
+  # summarize.py fails loudly rather than reporting an approximation as a measurement.
+  shape_rollup:
+    type: aggregate
+    sources:
+      [
+        tap_collectd_network,
+        tap_graphite_collectd,
+        tap_graphite_telegraf,
+        tap_prometheus_telegraf,
+        tap_otlp_telegraf,
+      ]
+    interval: 10s
+    distributions: samples
+    max_samples_per_series: 5000000
+    max_retained_series: 1000000
+
+  shape_out:
+    type: file_out
+    sources: [shape_rollup]
+    path: /out/shape.log
+    rotate:
+      # `file_out` requires a rotation trigger, and a survey that rotated would silently lose the
+      # start of its own capture.
+      max_bytes: "64GiB"

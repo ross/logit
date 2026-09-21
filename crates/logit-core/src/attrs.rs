@@ -74,6 +74,16 @@ impl AttrMap {
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| self.0.remove(i).1)
     }
 
+    /// Empties the map, **keeping** whatever backing storage it already holds -- so a caller that
+    /// clears and refills one map per event pays no allocation for the refill once the map has
+    /// spilled. `logit-transforms`' `shape` is the first caller: it rewrites an event in place
+    /// into a measurement event, replacing the observed attributes with its own small tag set
+    /// (`docs/adr/shape-observer-component.md`), and reusing the map it is about to overwrite is
+    /// the natural way to do that.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }

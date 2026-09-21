@@ -276,7 +276,20 @@ that field's `other` (or is removed) rather than an unbounded new series, with a
 `normalize:` step (today just ASCII-lowercasing) applied and written back before the allow test
 ([ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md)).
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) now runs one, clamping `$host`
-ahead of `aggregate`.
+ahead of `aggregate`. `shape` is the newest real, implemented `ComponentKind`, and the odd one out
+among the transforms: it is an *observer*, tapped off a flow by ordinary fan-out and never placed
+in it, rewriting every event it sees into a measurement of that event's own shape -- attribute and
+nested-map counts, key/value byte lengths, a per-type value count, metric and span widths, tagged
+`signal`/`source`/`tap` -- plus, on its `interval`, per-batch measurements (events, resource/scope
+attribute counts, distinct key-sets per batch) and cumulative gauges (distinct keys, distinct
+key-sets, top-1/top-5 key-set share, an overflow flag). It emits **counts and lengths only**, never
+an observed key, value, body or metric name, in a metric, tag, diagnostic or telemetry point --
+that property is the point, and it is what a reviewer should check first on any change to it. Raw
+`Samples` out, never a sketch: an `aggregate` downstream summarizes, per `lossless-transit`
+([ADR `shape-observer-component`](docs/adr/shape-observer-component.md),
+[examples/shape-tap.yaml](examples/shape-tap.yaml),
+[docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md) -- W1 of the survey this
+instrument exists to collect).
 
 ## Environment
 
@@ -291,9 +304,10 @@ usually aren't. Use `script/*`, not bare `cargo`:
 | `script/format [--check]` | `cargo fmt --all` |
 | `script/check [test args]` | Routine format-check + lint + workspace tests, in one dev container |
 | `script/schema` | Regenerate `schema/logit.schema.json` — run after any `logit-config` type change, and commit the result |
-| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`); ordinary tests enforce this too |
+| `script/validate` | Manually run `logit validate` over every shipped config (`demo/`, `examples/`, `perf/scenarios/`, `tools/shape-survey/configs/`); ordinary tests enforce this too |
 | `script/bench [filter]` | `cargo bench -p logit-bench` — throughput + per-benchmark allocation counts. Not part of `cibuild` |
 | `script/perf run\|compare\|attribute\|flamegraph\|list` | Out-of-CI load-test harness (`crates/logit-perf`, `docs/adr/load-test-harness.md`) — spawns the real `logit` binary against `perf/scenarios/*.yaml`. A `udp-statsd*` scenario is instead driven over a real socket from its `perf/load/` sidecar spec, needs `--pin-sender`/`--pin-child`, is denominated over events *delivered*, and takes `--verify` (a strict zero-drop self-check) / `--rate-scale` (moves the operating point without editing a spec) ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)). `attribute` decodes a temporary `internal` dump into a per-node time breakdown; `flamegraph` runs `perf record` in its own throwaway image (`crates/logit-perf/Dockerfile`, not `Dockerfile.dev`). Not part of `cibuild` |
+| `script/shape-survey [producer ...]` | Out-of-CI data-shape capture harness (`tools/shape-survey/`, [docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)) — drives real traffic through the `shape` component and summarizes what the events look like. Producers are discovered by globbing `tools/shape-survey/producers/*.sh`, one file each, six today: `interop` replays `testdata/interop/` and is the instrument's acceptance test (it must reproduce the statsd corpus's independently-counted numbers), `exporters` scrapes six official Prometheus exporters in default configuration through one `prometheus_in` per target (where `logit.shape.attributes` reads as labels per series and `logit.shape.batch.events` as series per scrape; cAdvisor is deliberately not among them — it needs `--privileged`), `applogs` runs eight real logging libraries at pinned versions in tiny HTTP apps through `tail_in` plus one auto-instrumented Django exporting OTLP straight to `otlp_in`, `oteldemo` runs the OpenTelemetry Demo at a pinned tag through its own Collector (~10 SDK languages at once, and ~20 GB of RAM), `hostagents` runs collectd and Telegraf in default configuration over five wires at once (collectd binary, carbon ×2, a scrape, OTLP/gRPC), and `demo` taps `demo/`'s own stack without modifying it. Each states its own representativeness line and its own caveats — `tools/shape-survey/README.md`'s "Producers" table has all six side by side. Every run is namespaced `shape-survey-<producer>-…`, so **two invocations can run concurrently** on one daemon (`SHAPE_SURVEY_SKIP_IMAGE=1` for the second). `tools/shape-survey/combine.py` folds several runs into one cross-producer table set. Runs on the host and drives docker, like `script/record-fixtures`. Not part of `cibuild` |
 | `script/audit` | `cargo-deny` + `cargo-audit` |
 | `script/cibuild` | The exact sequence CI runs, in order — run this before opening a PR |
 | `script/console` | Interactive shell in the dev container, for anything not covered above |
@@ -441,7 +455,12 @@ not a style preference:
   alike (`docs/OVERVIEW.md`). The fixtures now cover logs-only, wide-JSON, distribution-heavy, and
   span shapes alongside the original mixed one, but that closes the *measurement* gap, not the
   sizing *decisions* those numbers feed — see `docs/design/memory.md` §0 and §8 before treating any
-  one number as settled across workloads.
+  one number as settled across workloads. [`docs/design/data-shapes.md`](docs/design/data-shapes.md)
+  is what real producers actually send — a desk survey plus live captures measured by the `shape`
+  component — and its headline is that per-event width is **bimodal by signal** (metric events at
+  0–6 attributes, parsed structured logs at 9 and up, spans across both), so a number that is right
+  for one leg is wrong for another. Reach for it before picking a "representative" shape, and mind
+  its own §7: none of it is production traffic.
 
 ## Where things live
 
@@ -454,7 +473,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)
@@ -464,6 +483,8 @@ crates/
 `generate_in` listener into `null_out` or a real sink), covered by `script/validate` and
 `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`; `perf/results/` is
 where `script/perf run`/`attribute`/`flamegraph` write their (gitignored) output.
+
+`tools/shape-survey/` is the data-shape capture harness `script/shape-survey` drives ([docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md)): `lib.sh` (shared docker plumbing, nothing producer-specific), stdlib-only `replay.py`/`summarize.py` (which parses `stdio_out`'s human render — the whole `render_value` grammar, arrays and maps included, under `--self-test`)/`check_interop.py`/`combine.py` (the cross-run report), one file per producer under `producers/` (`interop`, `exporters`, `applogs`, `oteldemo`, `hostagents`, `demo` — see that directory's README for what each runs and what its numbers are worth), and capture configs under `configs/` — which join `script/validate` and `every_shipped_config_loads_and_validates` alongside `demo/`/`examples/`/`perf/scenarios/`. Runs land in `perf/results/shape-survey/<producer>/<timestamp>/` (gitignored); raw traffic never enters the repo and nothing there writes under `testdata/`. Everything a run creates is namespaced by producer (`shape-survey-<producer>-net`, `shape-survey-<producer>-<suffix>` containers and compose projects), so two producers can be captured at the same time on one shared daemon and cleanup can only ever touch its own. Every producer states a one-line **representativeness** in `provenance.txt`, which `summarize.py` prints as the banner above every table and `combine.py` repeats on every row — the `demo` producer's numbers in particular are a harness exercise, not evidence of production shape, and some of the formats it measures were authored in this repo.
 
 `perf/load/*.yaml` are the **sidecar load specs** for real-socket scenarios
 ([ADR `udp-intake-batching-and-socket-visibility`](docs/adr/udp-intake-batching-and-socket-visibility.md)):

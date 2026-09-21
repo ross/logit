@@ -314,6 +314,12 @@
 //!     the `0` end. A `read_batch` *larger than* `max_datagrams` is deliberately legal: `push_many`
 //!     has a defined answer for a batch bigger than the whole queue, so a rule against it would
 //!     only refuse a configuration that works.
+//! 58. A `shape`'s `max_tracked_keys` or `max_tracked_keysets` of `0` is rejected
+//!     (`docs/adr/shape-observer-component.md`) -- rules 9/15/18/28/45's impossible-bound shape
+//!     again. A cap of `0` tracks nothing at all, so `logit.shape.distinct_keys`/
+//!     `.distinct_keysets` would read `0` and `logit.shape.tracking_overflow` `1` forever, from a
+//!     component that looks configured. There is no "turn the table off" spelling because the
+//!     cumulative gauges *are* half of what this component is for; remove the `shape` instead.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -407,6 +413,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Logfmt { .. }
         | Kv { .. }
         | Regex { .. }
+        | Shape { .. }
         | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
@@ -466,6 +473,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Logfmt { .. } => "logfmt",
         Kv { .. } => "kv",
         Regex { .. } => "regex",
+        Shape { .. } => "shape",
         Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
@@ -563,6 +571,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Logfmt { .. }
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
+            | ComponentKind::Shape { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -590,6 +599,7 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
         ComponentKind::Aggregate { interval, .. }
         | ComponentKind::Internal { interval, .. }
+        | ComponentKind::Shape { interval, .. }
         | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
         _ => None,
     }
@@ -2749,6 +2759,30 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 58: a `shape`'s two cumulative-table caps may not be `0`
+    // (`docs/adr/shape-observer-component.md`). Rules 9/15/18/28/45's impossible-bound shape: a cap
+    // of `0` tracks nothing at all, so the gauges the table exists to produce read `0` (and
+    // `tracking_overflow` reads `1`) forever from a component that looks configured. There is no
+    // "turn the table off" spelling on purpose -- the cumulative measurements are half of what
+    // `shape` is for; an operator who doesn't want them removes the component.
+    for (id, component) in &components {
+        if let ComponentKind::Shape { max_tracked_keys, max_tracked_keysets, .. } = &component.kind
+        {
+            for (field, value) in [
+                ("max_tracked_keys", *max_tracked_keys),
+                ("max_tracked_keysets", *max_tracked_keysets),
+            ] {
+                if value == 0 {
+                    anyhow::bail!(
+                        "component '{id}': shape '{field}' is 0 -- nothing would ever be tracked, \
+                         so every cumulative gauge would read 0 and 'logit.shape.tracking_overflow' \
+                         1 forever. Remove the component instead of capping it to nothing"
+                    );
+                }
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
@@ -4810,6 +4844,75 @@ mod tests {
         ]))
         .expect("should resolve");
         assert_eq!(graph.components["kv"].role(), Role::Transform);
+    }
+
+    /// A `shape` with everything defaulted -- the whole config an operator writes in the common
+    /// case (`docs/adr/shape-observer-component.md`).
+    fn shape_defaults() -> ComponentKind {
+        ComponentKind::Shape {
+            interval: Duration::from_secs(10),
+            resource: logit_config::ShapeResource::Drop,
+            max_tracked_keys: 4096,
+            max_tracked_keysets: 4096,
+        }
+    }
+
+    #[test]
+    fn a_shape_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("tap", vec!["in"], shape_defaults()),
+            ("out", vec!["tap"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["tap"].role(), Role::Transform);
+        assert_eq!(graph.components["tap"].kind_name(), "shape");
+    }
+
+    /// Rule 9 reaches `shape` through [`interval`] -- the same gate `aggregate` and `internal`
+    /// pass through, not a second zero check of its own.
+    #[test]
+    fn a_shape_with_a_zero_interval_is_rejected() {
+        let mut kind = shape_defaults();
+        if let ComponentKind::Shape { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("tap", vec!["in"], kind),
+            ("out", vec!["tap"], sink()),
+        ]));
+        assert!(err.contains("interval"), "{err}");
+    }
+
+    /// Rule 58, key half.
+    #[test]
+    fn a_shape_with_a_zero_key_cap_is_rejected() {
+        let mut kind = shape_defaults();
+        if let ComponentKind::Shape { max_tracked_keys, .. } = &mut kind {
+            *max_tracked_keys = 0;
+        }
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("tap", vec!["in"], kind),
+            ("out", vec!["tap"], sink()),
+        ]));
+        assert!(err.contains("max_tracked_keys"), "{err}");
+    }
+
+    /// Rule 58, key-set half.
+    #[test]
+    fn a_shape_with_a_zero_keyset_cap_is_rejected() {
+        let mut kind = shape_defaults();
+        if let ComponentKind::Shape { max_tracked_keysets, .. } = &mut kind {
+            *max_tracked_keysets = 0;
+        }
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("tap", vec!["in"], kind),
+            ("out", vec!["tap"], sink()),
+        ]));
+        assert!(err.contains("max_tracked_keysets"), "{err}");
     }
 
     #[test]

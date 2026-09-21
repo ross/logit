@@ -1146,6 +1146,85 @@ fn keep_values_one_event_needs_lowering() {
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
 
+/// `shape` is the one transform here that deliberately *doesn't* aim for zero
+/// ([ADR `shape-observer-component`](../../../docs/adr/shape-observer-component.md)): a
+/// measurement event carries a dozen-odd metric records, so it always spills `MetricList`'s single
+/// inline slot. These three pins record what that costs on the three fixture shapes rather than
+/// leaving it to be discovered, and they are the numbers `docs/design/memory.md` §2 quotes.
+///
+/// The statsd shape is the cheap end: a handful of attributes, one metric, no log and no span. One
+/// allocation, and it is exactly that spill -- the incoming `MetricList` holds its single record
+/// inline, so `reserve`ing room for the dozen measurement records has to go to the heap. Nothing
+/// else does: the tags fit `AttrMap`'s inline capacity, and every `Samples` here is well inside
+/// `SAMPLES_INLINE`.
+#[test]
+fn shape_one_statsd_event() {
+    let mut shape = fixtures::shape();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::statsd_event();
+    shape.process(&resource, &mut warm);
+
+    let mut event = fixtures::statsd_event();
+    let (forwarded, stats) = measure(|| shape.process(&resource, &mut event));
+    assert!(forwarded, "shape never absorbs an event");
+    expect_allocs("shape: measure 1 statsd event", stats, 1);
+}
+
+/// The nginx shape: 10 attributes, 4 metrics, a log body -- *more* measurements than the statsd
+/// shape above, and **cheaper**: zero allocations, one realloc. That inversion is the whole point
+/// of clearing and refilling `event.attributes`/`event.metrics` rather than replacing them. This
+/// event arrives with both already spilled (10 attributes past `AttrMap`'s 8, 4 records past
+/// `MetricList`'s 1), so the tags land in storage that already exists and `reserve` grows the
+/// existing `MetricList` buffer -- a realloc, which this file counts separately and deliberately
+/// (see the module doc). A wider event costs the tap less than a narrow one, not more.
+#[test]
+fn shape_one_nginx_event() {
+    let mut shape = fixtures::shape();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    shape.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| shape.process(&resource, &mut event));
+    assert!(forwarded, "shape never absorbs an event");
+    assert_eq!(stats.reallocs, 1, "the `MetricList` growth, not a fresh allocation");
+    expect_allocs("shape: measure 1 nginx event", stats, 0);
+}
+
+/// The wide-JSON shape: 32 attributes, all strings. Three allocations, and the split says where a
+/// wide event's cost actually is: one `MetricList` spill, plus one each for
+/// `logit.shape.key_bytes` and `logit.shape.value_bytes`, which carry 32 values apiece and so run
+/// past `SAMPLES_INLINE`'s 19. Those two are inherent -- a per-attribute measurement of a 32-
+/// attribute event *is* 32 numbers -- and they are the reason `shape` belongs on a tap branch
+/// rather than in the flow.
+#[test]
+fn shape_one_wide_json_event() {
+    let mut shape = fixtures::shape();
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut decoder = fixtures::syslog_decoder();
+    let datagram = fixtures::wide_json_syslog_datagram(1);
+    let mut decode_one = || {
+        let mut event = decoder
+            .decode(datagram.clone())
+            .expect("should decode")
+            .events
+            .pop()
+            .expect("one event");
+        assert!(json.process(&resource, &mut event), "json forwards");
+        event
+    };
+
+    let mut warm = decode_one();
+    shape.process(&resource, &mut warm);
+
+    let mut event = decode_one();
+    assert_eq!(event.attributes.len(), 32);
+    let (forwarded, stats) = measure(|| shape.process(&resource, &mut event));
+    assert!(forwarded, "shape never absorbs an event");
+    expect_allocs("shape: measure 1 wide-JSON event", stats, 3);
+}
+
 /// Also free in steady state, and that is *because* `keep` ran first. `aggregate` clones the whole
 /// attribute map into a `SeriesKey` per metric per event, but three attributes fit inline, so the
 /// clone is a 400-byte memcpy rather than a heap allocation, and the `HashMap` entry hits.

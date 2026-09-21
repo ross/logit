@@ -1245,6 +1245,44 @@ pub enum ComponentKind {
         #[serde(default)]
         field: Option<String>,
     },
+    /// Rewrites every event it sees into a *measurement of that event's shape* -- attribute and
+    /// nested-map counts, key/value byte lengths, value types, metric and span widths -- and, on
+    /// its `interval`, the per-batch and cumulative facts a per-event rewrite has nowhere to put
+    /// (events and resource/scope attributes per batch; distinct keys, distinct key-sets, and the
+    /// share of events the most common one and five key-sets carry). The original payload is
+    /// dropped, so this belongs on its own branch of an ordinary fan-out, never in the flow it
+    /// measures. See `docs/adr/shape-observer-component.md`.
+    ///
+    /// **It emits counts and lengths only** -- never an attribute key, an attribute value, a log
+    /// body, or a metric name from an observed event, in any metric, tag, diagnostic, or telemetry
+    /// point. That is what lets its output leave an environment the traffic itself can't.
+    ///
+    /// Distribution-shaped quantities go out raw (`MetricKind::Samples`); put an `aggregate`
+    /// downstream to summarize them, per `docs/adr/lossless-transit.md`'s "summarization is opt-in
+    /// and named."
+    Shape {
+        /// How often the per-batch and cumulative measurements are emitted. The per-event ones
+        /// ride out on the events themselves and never wait for this.
+        #[serde(with = "humantime_serde_duration", default = "default_shape_interval")]
+        #[schemars(with = "String")]
+        interval: Duration,
+        /// Whether the batch's `Resource` is forwarded (`keep`) or replaced with an empty one
+        /// (`drop`, the default) -- see [`ShapeResource`]. The batch's `Scope` always passes
+        /// through: `Transform` has no hook to substitute one, and a scope names an
+        /// instrumentation library rather than carrying payload.
+        #[serde(default)]
+        resource: ShapeResource,
+        /// A hard cap on the distinct top-level attribute keys tracked since start -- a
+        /// DoS/memory guard, not a tuning knob, the same role `aggregate`'s `max_retained_series`
+        /// plays. Past it a new key is counted as overflow rather than tracked, and
+        /// `logit.shape.tracking_overflow` goes to `1`.
+        #[serde(default = "default_max_tracked_keys")]
+        max_tracked_keys: usize,
+        /// A hard cap on the distinct top-level key-*sets* tracked since start -- see
+        /// `max_tracked_keys`: same guard, same overflow behavior.
+        #[serde(default = "default_max_tracked_keysets")]
+        max_tracked_keysets: usize,
+    },
     // `filter`/`rename`/`sample`/`throttle`/`dedup` used to live here too -- retired, not merely
     // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
     // a `lua` component (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the
@@ -2106,6 +2144,40 @@ fn default_max_line_bytes() -> u64 {
 /// `Csv::delimiter`'s default -- a plain comma, the overwhelmingly common case.
 fn default_csv_delimiter() -> char {
     ','
+}
+
+/// [`ComponentKind::Shape`]'s `resource` field -- whether the batch resource a `shape` sees is
+/// forwarded or replaced. `drop` is the default because this component's defining property is that
+/// its output carries no observed key or value, and a `Resource`'s attributes are observed values
+/// like any other. `keep` is the operator's explicit opt-in to that identity flowing downstream,
+/// in exchange for a per-service breakdown. See `docs/adr/shape-observer-component.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeResource {
+    /// Substitute one cached, empty `Resource`, so no resource attribute value flows out.
+    #[default]
+    Drop,
+    /// Forward the incoming resource unchanged.
+    Keep,
+}
+
+/// [`ComponentKind::Shape`]'s `interval` default -- ten seconds, matching the reference
+/// `aggregate` window, since a `shape` is almost always configured as a pair with one.
+fn default_shape_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
+/// [`ComponentKind::Shape`]'s `max_tracked_keys` default -- a DoS/memory guard, not a tuning knob,
+/// the same role `default_max_retained_series` plays for `aggregate`. `logit-transforms`'
+/// `DEFAULT_MAX_TRACKED_KEYS` mirrors this for a direct `Shape::new` caller (that crate does not
+/// read this one's types -- `docs/design/pipeline-graph.md`'s crate layout).
+fn default_max_tracked_keys() -> usize {
+    4096
+}
+
+/// [`ComponentKind::Shape`]'s `max_tracked_keysets` default -- see [`default_max_tracked_keys`].
+fn default_max_tracked_keysets() -> usize {
+    4096
 }
 
 /// [`ComponentKind::Aggregate`]'s `distributions` field -- whether a raw `Samples` series
@@ -3873,6 +3945,52 @@ mod tests {
             }
             other => panic!("expected KeepValues, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shape_component_deserializes_with_every_field_defaulted() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "shape", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::Shape { interval, resource, max_tracked_keys, max_tracked_keysets } => {
+                assert_eq!(interval, Duration::from_secs(10));
+                assert_eq!(resource, ShapeResource::Drop, "counts-only is the default");
+                assert_eq!(max_tracked_keys, 4096);
+                assert_eq!(max_tracked_keysets, 4096);
+            }
+            other => panic!("expected Shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "shape", "sources": ["in"], "interval": "30s", "resource": "keep",
+                "max_tracked_keys": 128, "max_tracked_keysets": 64}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Shape { interval, resource, max_tracked_keys, max_tracked_keysets } => {
+                assert_eq!(interval, Duration::from_secs(30));
+                assert_eq!(resource, ShapeResource::Keep);
+                assert_eq!(max_tracked_keys, 128);
+                assert_eq!(max_tracked_keysets, 64);
+            }
+            other => panic!("expected Shape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_resource_uses_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<ShapeResource>(r#""drop""#).unwrap(),
+            ShapeResource::Drop
+        );
+        assert_eq!(
+            serde_json::from_str::<ShapeResource>(r#""keep""#).unwrap(),
+            ShapeResource::Keep
+        );
+        assert!(serde_json::from_str::<ShapeResource>(r#""Keep""#).is_err());
     }
 
     #[test]

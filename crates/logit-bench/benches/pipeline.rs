@@ -167,6 +167,19 @@ fn keep(bencher: Bencher) {
         .bench_local_refs(|event| keep.process(&resource, event));
 }
 
+/// `shape` over the nginx shape (10 attributes, 4 metrics, a log body) -- the whole per-event
+/// path: the recursive attribute walk, the `resolve` per key for its length, the key-set hash, and
+/// the in-place rewrite into a measurement event
+/// (`docs/adr/shape-observer-component.md`).
+#[divan::bench]
+fn shape(bencher: Bencher) {
+    let resource = fixtures::resource();
+    let mut shape = fixtures::shape();
+    bencher
+        .with_inputs(fixtures::nginx_event)
+        .bench_local_refs(|event| shape.process(&resource, event));
+}
+
 #[divan::bench]
 fn aggregate_absorb(bencher: Bencher) {
     let resource = fixtures::resource();

@@ -1,0 +1,175 @@
+# The `interop` producer's pipeline (tools/shape-survey/producers/interop.sh) -- every recorded
+# corpus under testdata/interop/ replayed at the listener that decoded it, measured by `shape`
+# (docs/adr/shape-observer-component.md) and folded into one capture file.
+#
+# This is the survey's **acceptance test**, not just its cheapest capture: the statsd corpus's
+# lines-per-datagram and tags-per-line figures are independently known
+# (testdata/interop/statsd/README.md), and tools/shape-survey/check_interop.py re-derives them
+# from the `.raw` files with its own parser and asserts `shape` reported the same thing. An
+# instrument that cannot reproduce a number somebody else already counted is not measuring what
+# the survey thinks it is.
+#
+# Topology, per corpus:
+#
+#   <listener> --+--> tap_input  (shape, straight off the wire)   --+
+#                |                                                  +--> shape_rollup --> shape_out
+#                +--> <realistic transform chain> --> tap_landed  --+       (aggregate)    (file_out)
+#
+# **Two taps only where there is a real chain to measure across.** The syslog leg gets both --
+# `set` stamps a resource identity and `json` merges a JSON body's fields into attributes, which is
+# exactly the widening the survey is trying to quantify (docs/plans/data-shape-survey.md's "at two
+# taps" row). Every other corpus here is metrics or OTLP: `statsd_in`/`collectd_in`/`graphite_in`
+# emit one finished metric event per line/value-list with nothing an operator would realistically
+# parse out of it afterwards, and `prometheus_in`/`otlp_in` receive events that arrived structured.
+# A second tap on those would measure `shape` measuring an identity function. Where a corpus grows
+# a real chain later, it gets its second tap then.
+#
+# `receive.batch_max_events: 1` on every accumulator-fronted listener, so **a batch is a wire
+# group**: one datagram, one connection's framing decision, one scrape. That is the quantity the
+# survey wants from a recorded corpus -- the producer's own packing -- and not the
+# `BatchAccumulator`'s default 1000-event regrouping, which would say more about logit's defaults
+# than about the producer. `prometheus_in`'s receiver and `otlp_in` bypass the accumulator entirely
+# (docs/adr/shape-observer-component.md), so they already report the wire's grouping with nothing
+# configured.
+admin:
+  # start_logit polls `logit ready` against this rather than sleeping, so every config under
+  # configs/ needs one.
+  bind: 0.0.0.0:9600
+
+components:
+  # -- the listeners, one per recorded corpus ------------------------------------------------------
+  statsd_in:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+    receive:
+      batch_max_events: 1
+
+  syslog_udp_in:
+    type: syslog_in
+    bind: 0.0.0.0:5514
+    receive:
+      batch_max_events: 1
+
+  # rsyslog's own TCP forwarding, RFC 6587 non-transparent (LF-terminated) framing -- the second
+  # half of the syslog corpus, and a different framing decision from the UDP captures rather than
+  # the same messages over another transport.
+  syslog_tcp_in:
+    type: syslog_in
+    bind: 0.0.0.0:601
+    transport: tcp
+    receive:
+      batch_max_events: 1
+
+  collectd_in:
+    type: collectd_in
+    bind: 0.0.0.0:25826
+    receive:
+      batch_max_events: 1
+
+  # Carbon's two wire protocols are two listeners, exactly as carbon itself runs them: plaintext on
+  # 2003, the length-prefixed pickle batch on 2004. Keeping them apart is what lets the summary
+  # attribute a shape to the protocol that produced it (`source` is the component name).
+  graphite_plain_in:
+    type: graphite_in
+    bind: 0.0.0.0:2003
+    transport: tcp
+    protocol: plaintext
+    receive:
+      batch_max_events: 1
+
+  graphite_pickle_in:
+    type: graphite_in
+    bind: 0.0.0.0:2004
+    transport: tcp
+    protocol: pickle
+    receive:
+      batch_max_events: 1
+
+  # Remote-write **receiver** mode (`bind:`, not `scrape_targets:`) -- the recorded corpus is real
+  # Prometheus POST bodies, 1.0 and 2.0, replayed with their own `.headers` sidecars so each one
+  # decodes as the version it was sent as. The metadata cache is what makes the 1.0 captures typed
+  # at all; its defaults are fine for a corpus this size.
+  prom_rw_in:
+    type: prometheus_in
+    bind: 0.0.0.0:9201
+    path: /api/v1/write
+
+  # OTLP/JSON over HTTP (docs/adr/otlp-json-decoding.md) -- testdata/interop/otlp/ is what the
+  # Collector's own `file` exporter wrote, one JSON request body per line.
+  otlp_http_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
+
+  # -- tap 1: straight off the wire ----------------------------------------------------------------
+  # One `shape` for every listener rather than one each: `shape` keys its per-batch window by the
+  # batch's provenance origin and tags every measurement with `source`, so the listeners stay
+  # distinguishable downstream while sharing one component's cumulative key/key-set tables.
+  tap_input:
+    type: shape
+    sources:
+      [
+        statsd_in,
+        syslog_udp_in,
+        syslog_tcp_in,
+        collectd_in,
+        graphite_plain_in,
+        graphite_pickle_in,
+        prom_rw_in,
+        otlp_http_in,
+      ]
+    interval: 10s
+    # `drop` (the default), stated explicitly because it is the property that lets this output
+    # leave an environment the traffic could not: no observed resource attribute flows out.
+    resource: drop
+
+  # -- the syslog leg's realistic chain, and tap 2 --------------------------------------------------
+  # What an operator actually runs in front of syslog: declare the resource identity the protocol
+  # cannot carry (`set`, ADR `operator-declared-resource-attributes`), then parse a JSON body into
+  # attributes where there is one (`json`). demo/logit.yaml runs exactly this pair per tier. The
+  # corpus has both kinds of line -- four plain `logger`/rsyslog messages and one JSON body from
+  # Python's SysLogHandler -- so the difference between the two taps here is precisely "what did
+  # parsing add".
+  syslog_identity:
+    type: set
+    sources: [syslog_udp_in, syslog_tcp_in]
+    resource:
+      service.name: shape-survey-syslog
+      service.namespace: shape-survey
+
+  syslog_json:
+    type: json
+    sources: [syslog_identity]
+
+  tap_landed:
+    type: shape
+    sources: [syslog_json]
+    interval: 10s
+    resource: drop
+
+  # -- the capture ---------------------------------------------------------------------------------
+  # `distributions: samples` is load-bearing: it is what keeps `shape`'s raw observations raw
+  # through the window instead of sketching them, and it is the only reason the values are still
+  # there to be read out of the render (docs/adr/lossless-transit.md's "summarization is opt-in and
+  # named"). `max_samples_per_series` is far above anything this corpus can produce -- past it
+  # `aggregate` falls back to a DdSketch, and summarize.py fails loudly on any sketched
+  # `logit.shape.*` series rather than reporting an approximation as a measurement.
+  shape_rollup:
+    type: aggregate
+    sources: [tap_input, tap_landed]
+    interval: 10s
+    distributions: samples
+    max_samples_per_series: 5000000
+    max_retained_series: 1000000
+
+  # file_out, not stdio_out, so the capture is a file the summarizer reads rather than something
+  # interleaved with logit's own self-logging in `docker logs`. `rotate.max_bytes` is deliberately
+  # enormous: `file_out` requires a rotation trigger (graph rule 29), and a survey that rotated
+  # would silently lose the beginning of its own capture -- the same reason
+  # crates/logit-perf/src/telemetry_leg.rs picks an unreachable bound.
+  shape_out:
+    type: file_out
+    sources: [shape_rollup]
+    path: /out/shape.log
+    rotate:
+      max_bytes: "64GiB"

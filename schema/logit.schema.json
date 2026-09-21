@@ -1296,6 +1296,49 @@
           }
         },
         {
+          "description": "Rewrites every event it sees into a *measurement of that event's shape* -- attribute and nested-map counts, key/value byte lengths, value types, metric and span widths -- and, on its `interval`, the per-batch and cumulative facts a per-event rewrite has nowhere to put (events and resource/scope attributes per batch; distinct keys, distinct key-sets, and the share of events the most common one and five key-sets carry). The original payload is dropped, so this belongs on its own branch of an ordinary fan-out, never in the flow it measures. See `docs/adr/shape-observer-component.md`.\n\n**It emits counts and lengths only** -- never an attribute key, an attribute value, a log body, or a metric name from an observed event, in any metric, tag, diagnostic, or telemetry point. That is what lets its output leave an environment the traffic itself can't.\n\nDistribution-shaped quantities go out raw (`MetricKind::Samples`); put an `aggregate` downstream to summarize them, per `docs/adr/lossless-transit.md`'s \"summarization is opt-in and named.\"",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "interval": {
+              "description": "How often the per-batch and cumulative measurements are emitted. The per-event ones ride out on the events themselves and never wait for this.",
+              "default": "10s",
+              "type": "string"
+            },
+            "max_tracked_keys": {
+              "description": "A hard cap on the distinct top-level attribute keys tracked since start -- a DoS/memory guard, not a tuning knob, the same role `aggregate`'s `max_retained_series` plays. Past it a new key is counted as overflow rather than tracked, and `logit.shape.tracking_overflow` goes to `1`.",
+              "default": 4096,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "max_tracked_keysets": {
+              "description": "A hard cap on the distinct top-level key-*sets* tracked since start -- see `max_tracked_keys`: same guard, same overflow behavior.",
+              "default": 4096,
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0.0
+            },
+            "resource": {
+              "description": "Whether the batch's `Resource` is forwarded (`keep`) or replaced with an empty one (`drop`, the default) -- see [`ShapeResource`]. The batch's `Scope` always passes through: `Transform` has no hook to substitute one, and a scope names an instrumentation library rather than carrying payload.",
+              "default": "drop",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ShapeResource"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "shape"
+              ]
+            }
+          }
+        },
+        {
           "description": "`rename`d explicitly: `rename_all = \"snake_case\"` alone would tag this `influx_db_out` (a word break at the embedded capital `Db`), not `influxdb_out` as published in `docs/design/pipeline-graph.md` and every example config.",
           "type": "object",
           "required": [
@@ -2677,6 +2720,25 @@
           "type": "string",
           "enum": [
             "members"
+          ]
+        }
+      ]
+    },
+    "ShapeResource": {
+      "description": "[`ComponentKind::Shape`]'s `resource` field -- whether the batch resource a `shape` sees is forwarded or replaced. `drop` is the default because this component's defining property is that its output carries no observed key or value, and a `Resource`'s attributes are observed values like any other. `keep` is the operator's explicit opt-in to that identity flowing downstream, in exchange for a per-service breakdown. See `docs/adr/shape-observer-component.md`.",
+      "oneOf": [
+        {
+          "description": "Substitute one cached, empty `Resource`, so no resource attribute value flows out.",
+          "type": "string",
+          "enum": [
+            "drop"
+          ]
+        },
+        {
+          "description": "Forward the incoming resource unchanged.",
+          "type": "string",
+          "enum": [
+            "keep"
           ]
         }
       ]

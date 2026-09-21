@@ -1758,3 +1758,49 @@ already built that have a known, accepted rough edge.
   does for a hostname/CPU-model mismatch. Not built here — flagged as a real code change
   (`crates/logit-perf/src/result.rs`'s `BoxState`, plus a `compare.rs` warning), out of scope for a
   docs-only rewrite.
+
+- **`shape`'s cumulative gauges are since process start, not windowed.**
+  `logit.shape.distinct_keys`, `.distinct_keysets`, `.keyset_share.top1`/`.top5` and
+  `.tracking_overflow` (`crates/logit-transforms/src/shape.rs`,
+  [ADR `shape-observer-component`](adr/shape-observer-component.md)) accumulate from startup and
+  are re-reported unchanged on every flush; they never reset. For the survey this instrument was
+  built for that is what's wanted — a capture's whole key-set population, not the last ten seconds'
+  — but it means a long-lived tap's distinct-key count only ever rises, so it cannot show that a
+  producer *stopped* emitting a key, and `tracking_overflow` latches at `1` for the life of the
+  process once either cap is hit. A windowed variant (a second set of gauges reset per flush, or a
+  decaying table) is real future work; restarting the process is the only reset today.
+
+- **`shape` tracks top-level attribute keys only.** A nested `Value::Map`'s keys are counted in
+  that map's width (`logit.shape.nested_map_width`) and its values in the per-type counters, but
+  they never enter the distinct-key set or the key-set hash. Two events whose top-level keys match
+  and whose nested maps differ entirely are one key-set as far as `logit.shape.distinct_keysets` is
+  concerned. This is deliberate — the key-set identity is what `AttrMap`'s own sorted `Symbol`
+  sequence gives for free, and the sizing questions the survey feeds
+  (`docs/design/memory.md` §8) are about the top-level map — but it means a shop whose width lives
+  under a `k8s`/`labels` map reads as narrow on the distinct-key gauges and wide only on the nested
+  ones. Read the two together.
+
+- **A batch's `Scope` passes through `shape` untouched, unlike its `Resource`.** `resource: drop`
+  substitutes an empty `Resource` so no resource attribute value leaves the tap, but there is no
+  equivalent for `Scope`: `Transform` has no scope-substitution hook, and adding one every
+  implementer would have to carry, for this one component, wasn't judged worth it
+  ([ADR `shape-observer-component`](adr/shape-observer-component.md)). A scope names an
+  instrumentation library rather than carrying payload, so this is a narrow exception to the
+  counts-only property rather than a hole in it — but an `otlp_in` whose senders put identifying
+  information in `Scope.attributes` should know that it rides through. `shape`'s *flush* output
+  carries no scope at all (a window spans many batches, so there is no single one to keep).
+
+- **Nothing bounds a single `shape` measurement event.** `logit.shape.key_bytes` and
+  `.value_bytes` carry one value per top-level key and per string leaf, so an event with ten
+  thousand attributes produces a ten-thousand-value `Samples` — the only bound is whatever bounded
+  the event that produced it. Every *table* in the component is capped and counted
+  (`max_tracked_keys`, `max_tracked_keysets`, the per-window batch cap); the per-event vectors are
+  the one place that discipline isn't applied, on the reasoning that truncating a measurement of
+  width at exactly the widths worth knowing about defeats the instrument. A per-event value cap
+  with a drop counter is the obvious fix if a tap ever meets a genuinely pathological producer.
+
+- **`shape` measures `Resource`/`Scope` width as a count only.** `logit.shape.batch.resource_attributes`
+  and `.scope_attributes` are attribute counts per batch; there is no resource-side equivalent of
+  `key_bytes`/`value_bytes`/`nested_maps`. The per-batch cost `docs/design/memory.md` cares about
+  is therefore only half visible — a 20-attribute resource of short enums and one of long ARNs and
+  a nested label map read the same.

@@ -1,0 +1,190 @@
+# The `exporters` producer's pipeline (tools/shape-survey/producers/exporters.sh) -- official
+# Prometheus exporters, in their **default** configuration, scraped by `prometheus_in` and measured
+# by `shape` (docs/adr/shape-observer-component.md).
+#
+# WHAT `shape` IS MEASURING HERE, IN PROMETHEUS'S OWN WORDS
+#
+# `prometheus_in` in scrape mode emits **one event per series** and **one batch per target per
+# scrape** (docs/adr/prometheus-scrape-and-exposition.md). So at the tap:
+#
+#   logit.shape.attributes    = LABELS PER SERIES
+#   logit.shape.batch.events  = SERIES PER SCRAPE (one exporter's whole /metrics response)
+#   logit.shape.key_bytes     = label-name lengths
+#   logit.shape.value_bytes   = label-value lengths
+#
+# Those four are the numbers this capture exists for, and they are the ones nobody publishes: the
+# desk survey found that redis_exporter, mysqld_exporter, postgres_exporter,
+# nginx-prometheus-exporter and blackbox_exporter commit no exposition fixtures at all.
+#
+# **Labels per series is wire labels plus a small, stated constant.** `prometheus_in`'s scrape mode
+# puts its own identity on the **resource** -- `instance` (host:port) and `prometheus.target` (the
+# scrape URL, redacted) -- not on the event, and this tap runs `resource: drop`, so an event's
+# attributes are the exposition line's own labels plus at most:
+#
+#   * `prometheus.type`      on a family whose wire type the model has no distinct kind for
+#                            (`untyped`/`unknown`, `info`, `stateset`, `gaugehistogram`) -- which
+#                            is not hypothetical here: node_exporter answers in text 0.0.4 and
+#                            emits its whole `node_netstat_*`/`node_vmstat_*` surface untyped, so
+#                            ~2% of its series carry this one extra attribute, and
+#   * `prometheus.timestamp` when the exposition line carried its own timestamp (exporters here
+#                            do not, so this should not appear at all).
+#
+# A histogram's `le` and a summary's `quantile` are *not* labels on the event either: they are
+# structure inside the metric record, which is why a histogram family contributes one event rather
+# than one per bucket. Read the attribute-width table with all of that attached.
+#
+# **One `prometheus_in` per target**, named after the exporter, rather than one component with six
+# `scrape_targets:`. `shape` tags every measurement with the batch's provenance `source`, which is
+# the *component* name -- so a single multi-target component would report every exporter's numbers
+# folded into one row. This is the whole reason the config looks repetitive.
+#
+# **One tap, not two.** A metrics input's events arrive finished: there is no realistic transform
+# chain an operator would run between a scrape and a sink, so a second tap would measure `shape`
+# measuring an identity function (tools/shape-survey/README.md's "The config pattern").
+#
+# **The exporters are in default configuration, and the services they watch are idle.** What this
+# is evidence about is label and series *structure* per exporter; series *counts* scale with the
+# number of real objects (devices, databases, keyspaces, vhosts) and are a floor, not a typical.
+admin:
+  # start_logit polls `logit ready` against this rather than sleeping.
+  bind: 0.0.0.0:9600
+
+components:
+  # -- the exporters, one component each ------------------------------------------------------------
+  # `interval: 5s` against a default of 15s: this capture wants >=10 scrapes per target inside a
+  # ~70s window, and an idle exporter's output does not change between scrapes, so a faster cadence
+  # is a cheaper sample of the same thing rather than a different one.
+  #
+  # Each hostname is the network alias `survey_start_service` gives that container inside this
+  # producer's own docker network (tools/shape-survey/lib.sh).
+
+  # The host's own kernel/filesystem/network metrics -- as seen from inside a container, which is
+  # the caveat provenance.txt records: fewer block devices, filesystems and network interfaces than
+  # a real host, so its series count is a floor even by this capture's standards.
+  node_exporter:
+    type: prometheus_in
+    scrape_targets: ["http://node-exporter:9100/metrics"]
+    interval: 5s
+
+  # postgres_exporter against a stock `postgres` with one empty database. Its per-database and
+  # per-table families are where a real estate's series count comes from; here they are at their
+  # smallest possible value.
+  postgres_exporter:
+    type: prometheus_in
+    scrape_targets: ["http://postgres-exporter:9187/metrics"]
+    interval: 5s
+
+  # redis_exporter against a stock `redis` with no keyspaces in use -- same caveat, `db*` families
+  # absent rather than small.
+  redis_exporter:
+    type: prometheus_in
+    scrape_targets: ["http://redis-exporter:9121/metrics"]
+    interval: 5s
+
+  # nginx-prometheus-exporter reading the open-source `stub_status` module (the only thing the
+  # open-source build exposes; NGINX Plus's richer API would be a different, larger shape).
+  nginx_exporter:
+    type: prometheus_in
+    scrape_targets: ["http://nginx-exporter:9113/metrics"]
+    interval: 5s
+
+  # blackbox_exporter's **probe** endpoint, the shape an operator actually scrapes: `/probe` runs a
+  # synthetic check per request and answers with that probe's own result series, not a registry.
+  # The `target`/`module` query string is part of the URL; `prometheus_in` strips a query string
+  # from the `prometheus.target` *attribute* it stamps (credentials in scrape URLs) but sends the
+  # URL as given.
+  blackbox_probe:
+    type: prometheus_in
+    scrape_targets: ["http://blackbox-exporter:9115/probe?module=http_2xx&target=http://nginx"]
+    interval: 5s
+
+  # The app-runtime example, and deliberately the cheapest honest one: blackbox_exporter's *own*
+  # `/metrics` is a stock `client_golang` default registry -- `go_*`, `process_*`, `promhttp_*` --
+  # which is exactly what any Go service instrumented with the standard library exposes before
+  # anybody adds an application metric. Noted as such rather than dressed up as an application.
+  go_runtime:
+    type: prometheus_in
+    scrape_targets: ["http://blackbox-exporter:9115/metrics"]
+    interval: 5s
+
+  # -- the taps ----------------------------------------------------------------------------------------
+  # **One tap stage** (see the header), but **one `shape` component per exporter** rather than one
+  # shared component with six sources, which is a deliberate difference from configs/interop.yaml.
+  #
+  # `shape`'s per-event and per-batch series carry a `source` tag and so stay separable inside one
+  # component -- but its four cumulative gauges (`distinct_keys`, `distinct_keysets`,
+  # `keyset_share.top1`/`top5`) are per **component**: they are that component's own tracking
+  # tables, and they carry `tap` alone with no `source`
+  # (crates/logit-transforms/src/shape.rs). Six exporters through one `shape` would answer
+  # "how many distinct label-name sets do these six exporters produce between them", which is not a
+  # fact about any exporter. One per target answers it per exporter, at the cost of six tracking
+  # tables and this repetition.
+  #
+  # `resource: drop` is the default, stated: no observed resource attribute leaves this pipeline,
+  # which is also why the attribute counts above are wire labels rather than wire labels +
+  # `instance`/`prometheus.target`.
+  tap_node_exporter:
+    type: shape
+    sources: [node_exporter]
+    interval: 10s
+    resource: drop
+
+  tap_postgres_exporter:
+    type: shape
+    sources: [postgres_exporter]
+    interval: 10s
+    resource: drop
+
+  tap_redis_exporter:
+    type: shape
+    sources: [redis_exporter]
+    interval: 10s
+    resource: drop
+
+  tap_nginx_exporter:
+    type: shape
+    sources: [nginx_exporter]
+    interval: 10s
+    resource: drop
+
+  tap_blackbox_probe:
+    type: shape
+    sources: [blackbox_probe]
+    interval: 10s
+    resource: drop
+
+  tap_go_runtime:
+    type: shape
+    sources: [go_runtime]
+    interval: 10s
+    resource: drop
+
+  # -- the capture -----------------------------------------------------------------------------------
+  # `distributions: samples` keeps `shape`'s raw observations raw through the window, and
+  # `max_samples_per_series` is far above what this capture can produce (a few thousand series x a
+  # dozen scrapes); past it `aggregate` falls back to a DdSketch and summarize.py fails loudly
+  # rather than reporting an approximation as a measurement.
+  shape_rollup:
+    type: aggregate
+    sources:
+      [
+        tap_node_exporter,
+        tap_postgres_exporter,
+        tap_redis_exporter,
+        tap_nginx_exporter,
+        tap_blackbox_probe,
+        tap_go_runtime,
+      ]
+    interval: 10s
+    distributions: samples
+    max_samples_per_series: 5000000
+    max_retained_series: 1000000
+
+  shape_out:
+    type: file_out
+    sources: [shape_rollup]
+    path: /out/shape.log
+    rotate:
+      # `file_out` requires a rotation trigger, and a survey that rotated would silently lose the
+      # start of its own capture.
+      max_bytes: "64GiB"

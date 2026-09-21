@@ -1,0 +1,71 @@
+# Taps a flow with `shape` (docs/adr/shape-observer-component.md) without perturbing it: the real
+# leg (`statsd -> rollup -> metrics`) is untouched, and a second branch off the same listener turns
+# every event into a *measurement of its own shape* -- how many attributes it carried, how long its
+# keys and values were, how deeply its values nested, how many metric records rode on it -- which a
+# second `aggregate` folds into distributions for an ordinary sink.
+#
+#   statsd ─┬─> rollup ─> metrics        (the real pipeline, unchanged)
+#           └─> tap ─> shape_rollup ─> shape_out
+#
+# `shape` emits **counts and lengths only** -- never an attribute key, an attribute value, a log
+# body, or a metric name from an observed event, in any metric, tag or diagnostic. That is what
+# lets this output leave an environment the traffic itself can't: what comes out of `shape_out` is
+# a description of the traffic's shape, not a sample of the traffic.
+#
+# Two things to know before running this against a production flow:
+#
+#   * A tap turns a single-consumer edge into a fan-out, and `shape` mutates, so one of the two
+#     branches pays a batch clone (docs/design/memory.md §3 has the shape-by-shape account).
+#     Measure, then remove the tap.
+#   * `shape` never summarizes -- every distribution-shaped quantity goes out as raw
+#     `MetricKind::Samples`, and the `aggregate` below is what turns them into distributions
+#     (docs/adr/lossless-transit.md's "summarization is opt-in and named"). Swap in
+#     `distributions: samples` there if you want the exact values rather than a sketch.
+#
+# Place a second `shape` at the far end of a transform chain to measure how much wider events get
+# on their way through -- the two taps stay distinct series downstream because each one tags its
+# output with its own component name (`tap`).
+components:
+  statsd:
+    type: statsd_in
+    bind: 0.0.0.0:8125
+
+  # -- the real pipeline, which never sees the tap ------------------------------------------------
+  rollup:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+
+  metrics:
+    type: stdio_out
+    sources: [rollup]
+    target: stdout
+
+  # -- the tap ------------------------------------------------------------------------------------
+  tap:
+    type: shape
+    sources: [statsd]
+    # How often the per-batch measurements (events, resource/scope attributes and distinct
+    # key-sets per batch) and the cumulative gauges (distinct keys, distinct key-sets, the share of
+    # events the most common one and five key-sets carry) are emitted. The per-event measurements
+    # ride out on the events themselves and never wait for this.
+    interval: 10s
+    # `drop` (the default) replaces the batch's Resource with an empty one, so no resource
+    # attribute value flows out. Set `keep` only if a per-service breakdown downstream is worth
+    # that identity travelling with the measurements.
+    resource: drop
+    # Bounds on the two cumulative tables -- a DoS/memory guard, not a tuning knob. Past either,
+    # new keys/key-sets are counted rather than tracked and `logit.shape.tracking_overflow` goes
+    # to 1.
+    max_tracked_keys: 4096
+    max_tracked_keysets: 4096
+
+  shape_rollup:
+    type: aggregate
+    sources: [tap]
+    interval: 10s
+
+  shape_out:
+    type: stdio_out
+    sources: [shape_rollup]
+    target: stdout

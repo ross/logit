@@ -159,25 +159,96 @@ statsd_in ─┬─> (real pipeline)
 Real software → the matching input → `shape` (tap 1), and → a realistic transform chain → `shape`
 (tap 2) → `aggregate` → `file_out`, with the histograms read off the shutdown flush.
 `script/shape-survey` follows `script/record-fixtures`' precedent: a deliberate, reviewed act, never
-run by CI, one function per producer, software versions and date recorded.
-`tools/shape-survey/*.yaml` joins the globs in `script/validate` and
+run by CI, software versions and date recorded. It goes one step further on the "one function per
+producer" rule: a producer is **one file**, `tools/shape-survey/producers/<name>.sh`, discovered by
+glob rather than named in a list, so producers can be added in parallel with no shared file to
+edit — nothing producer-specific lives in `lib.sh` or in the dispatcher.
+
+`tools/shape-survey/configs/*.yaml` joins the globs in `script/validate` and
 `every_shipped_config_loads_and_validates`. A p99 is quoted only with ≥100k events behind it.
 
 **First, and free:** replay `testdata/interop/{statsd,otlp,prometheus,collectd,graphite,syslog}`
 through `shape`. The statsd corpus's tags-per-line and lines-per-datagram figures are independently
 known, so `shape` either reproduces them or is wrong — that is its acceptance test.
+`tools/shape-survey/check_interop.py` is that test: it re-derives events-per-datagram and
+attributes-per-event from the `.raw` files with its own parser (importing nothing from
+`summarize.py`, copying nothing from the corpus README) and asserts `shape` reported the same.
+As built, it reproduces exactly — events per datagram `[1×48, 7×1, 8×3, 10×3, 11×1]` and
+attributes per event `[0×38, 1×17, 5×4, 6×9, 7×20, 8×32]` over the corpus's 56 datagrams and 120
+lines.
 
-| Capture | Signals | Box |
-|---|---|---|
-| `demo/` as it stands (nginx, haproxy, postgres, redis, Django, Celery) | logs | 15 min under `traffic` |
-| `demo/` with an OpenTelemetry auto-instrumentation overlay on Django and Celery → `otlp_in` (an overlay; `demo/` itself unchanged) | all three | 15 min; also yields the static-to-runtime correction factor |
-| OpenTelemetry Demo → `otlp_in` | all three | one 30-minute run — the most expensive item for one archetype, so boxed hardest |
-| node_exporter, cAdvisor, postgres and redis exporters → `prometheus_in` | metrics | 10 scrapes; kube-state-metrics Counted from published output unless a `kind` cluster is trivial |
-| Telegraf and collectd default plugin sets → `statsd_in`/`collectd_in`/`graphite_in` | metrics | 10 min |
-| Real JSON loggers (pino, structlog, zap, lograge) in minimal apps → `syslog_in`/`tail_in` + `json` | logs | replaces `fixtures.rs`'s "no live pino process was captured" caveat |
-| Loghub samples → `tail_in` | logs | body length only |
+**The `exporters` producer** is the first captured-from-scratch one: official exporter images
+(node_exporter, postgres_exporter, redis_exporter, nginx-prometheus-exporter, blackbox_exporter's
+`/probe` and its own `client_golang` registry) in **default** configuration, one `prometheus_in`
+per target so `source` separates them, at a 5s interval for ≥10 scrapes each. At a scrape-mode tap
+`logit.shape.attributes` *is* labels per series and `logit.shape.batch.events` *is* series per
+scrape; `instance`/`prometheus.target` ride on the resource (dropped at the tap), so a count is the
+wire's own labels plus `prometheus.type` on an untyped family. cAdvisor is **not** captured: it
+needs more than read-only `/`, `/sys` and `/var/lib/docker` on this daemon (`inotify_add_watch
+/sys/fs/cgroup: permission denied` without `--privileged`), and the run records that rather than
+measuring a privileged configuration nobody would call default. Series counts from idle
+single-instance services are a floor; the label *structure* is not.
+
+**`combine.py`** folds N run directories into one cross-producer report — one table per dimension,
+one row per producer × source × tap × signal, each row carrying its run's representativeness line.
+That is what W3's tables get written from, and it recomputes the >4/>8/>12/>16 spill fractions from
+`summary.json`'s exact value→count tables rather than re-reading any capture.
+
+**Every producer states its representativeness in one line**, written into the run's
+`provenance.txt` and printed by `summarize.py` as the banner at the top of `summary.md`, above any
+number. That is structural rather than a footnote because these tables get quoted: the `demo`
+producer is the harness's best end-to-end exercise and its weakest evidence — the stack exists to
+demonstrate `logit`, parts of it are configured for visibility rather than the way an operator
+would run them, and several of the formats it measures (nginx's JSON `log_format`, the Django and
+Celery logging configs) were authored in this repository, which makes measuring them circular. That
+producer therefore also labels each tier with whether its format is the software's own default
+(HAProxy's `option httplog`, Postgres's `jsonlog`, Redis's log line, Docker's json-file envelope)
+or one of ours, and `summarize.py` renders that table above the distributions.
+
+### What was actually built and run
+
+Six producers, all captured. The window is each producer's default, overridable per run.
+
+| Producer | What it captures | Signals | Window |
+|---|---|---|---|
+| `interop` | every recorded corpus under `testdata/interop/` replayed at the listener that decoded it — statsd, syslog (UDP and a real RFC 6587 TCP stream), collectd, carbon plaintext and pickle, Prometheus remote-write, OTLP/JSON. Also the instrument's acceptance test | all three | corpus-driven |
+| `exporters` | node, postgres, redis, nginx, blackbox and Go-runtime exporters, official images in default configuration, one `prometheus_in` per target at 5 s | metrics | 70 s (≥10 scrapes each) |
+| `applogs` | eight log streams from five tiny HTTP apps — structlog, python-json-logger (both its documented and its bare-default config), pino-http, bare pino, Go `log/slog`, zap, semantic_logger — each through `tail_in` + `json`; plus one Django app under `opentelemetry-instrument` straight into `otlp_in` with no Collector | all three | 300 s |
+| `oteldemo` | the OpenTelemetry Demo at a pinned tag, cloned at run time, under its own Locust generator, through the demo's own Collector into `otlp_in` | all three | 1200 s, plus an opt-in 180 s `resource: keep` run |
+| `hostagents` | collectd and Telegraf in default configuration over five wires at once: collectd binary, carbon plaintext from each agent, a scraped Telegraf Prometheus endpoint, Telegraf OTLP/gRPC | metrics | 600 s, then a 180 s wire-grouped second run |
+| `demo` | this repo's own `demo/` stack, config generated from `demo/logit.yaml` at run time through a compose overlay; `demo/` itself untouched | logs, spans | 900 s |
 
 Raw captures never enter the repo.
+
+### Deviations from the planned capture list, and why
+
+The table above replaced the one this plan opened with. Four planned items were not captured, and
+one was replaced; none of it is a gap somebody forgot.
+
+- **kube-state-metrics was not captured.** It needs a real cluster (`kind` or otherwise) to have
+  any objects to report on, and an empty one reports an empty shape. Nothing was counted from
+  published output in its place either, so there is no kube-state-metrics row at all.
+- **cAdvisor was not captured.** It cannot start without `--privileged` on this daemon
+  (`inotify_add_watch /sys/fs/cgroup: permission denied` with read-only `/`, `/sys` and
+  `/var/lib/docker`), and a survey does not run a privileged container to measure a label set.
+  `exporters`' `provenance.txt` records the attempt and the error.
+- **Loghub samples were not replayed.** The item was body-length-only from the start, and every
+  other producer now measures body length from live software; a corpus of anonymized 2010s log
+  files would have added a row whose provenance nobody could state in one line.
+- **Rails/lograge was not captured.** lograge is a Rails railtie with no supported use outside
+  Rails, and a `gem install rails` + `rails new` inside an image build is minutes of build for four
+  routes. The brief's own fallback, **semantic_logger**'s `formatter: :json`, was taken instead —
+  so `applogs`' Ruby row is a semantic_logger row, not a Rails row, and its provenance says so.
+- **Postgres-backed Django was not captured.** `applogs`' Django leg runs on **sqlite**. The dbapi
+  span comes from the same `opentelemetry-instrumentation-dbapi` either way, but sqlite's carries
+  no network peer, so that span's attribute count sits at the low end of the desk range rather than
+  the middle.
+- **The `demo/` OpenTelemetry overlay was replaced.** Rather than bolt auto-instrumentation onto
+  `demo/`'s Django and Celery tiers, `applogs` runs a **standalone** auto-instrumented Django app —
+  at the owner's request, because `demo/` numbers carry little weight (the stack exists to
+  demonstrate `logit`, and several of the formats it measures were authored here). The
+  static-to-runtime correction factor the overlay was meant to yield is produced there instead, and
+  `applogs`' own summary section prints the desk count beside the measured one per span kind.
 
 ## W3 — synthesis
 
@@ -186,6 +257,23 @@ constants" section that states implications **without deciding** — the fractio
 that spills at 4/8/12/16 inline slots, what a plain `Vec`, a per-batch arena, or a shared-key
 layout would see, the typical string-attribute cost per event; gaps and low-confidence areas.
 `memory.md`'s open question is updated to point at the result.
+
+**As built.** [`docs/design/data-shapes.md`](../design/data-shapes.md) is the synthesis, led by its
+five findings; [`docs/design/data-shapes-rows.md`](../design/data-shapes-rows.md) is the appendix
+the plan called for — the 132 desk rows the synthesis draws on, condensed from about 300, each with
+its citation, its two grades, and a mark saying whether the verification pass confirmed or corrected
+it (106 rows re-derived; about 83% confirmed exactly, the rest off by a small count or a label, none
+changing a headline). Three things differ from what this plan set out:
+
+- The archetype table gained an "evidence" column, because two of the six archetypes — edge/access
+  logs and wide events — ended with no capture behind them, and the Kubernetes one has no cluster
+  capture. The doc says so where it matters rather than presenting six peers.
+- `demo/`'s numbers are recorded and used for nothing. It gets its own representativeness tier,
+  below a third party's demo: a stack built to demonstrate `logit`, with formats authored here.
+- The doc's follow-up list leads with two things this plan did not foresee: an NDJSON format for
+  `file_out`/`stdio_out` (the survey's readout depends on parsing a human text render, the only
+  sink that carries raw `Samples`), and running a peer's own flat-map benchmark, which measures the
+  same question directly.
 
 ## Follow-ups (listed in the doc; not done in this pass)
 

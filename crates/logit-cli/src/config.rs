@@ -238,6 +238,18 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        // The data-shape survey's own capture configs (`script/shape-survey`,
+        // docs/plans/data-shape-survey.md). They are ordinary `logit` YAML run against real
+        // traffic, so they join this glob for the same reason `perf/scenarios/` does: a component
+        // field rename must not leave a config that only fails the next time somebody runs a
+        // 15-minute capture with it.
+        let shape_survey_dir = root.join("tools/shape-survey/configs");
+        configs.extend(
+            std::fs::read_dir(&shape_survey_dir)
+                .unwrap_or_else(|err| panic!("reading {}: {err}", shape_survey_dir.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
+        );
         configs.sort();
 
         assert!(configs.len() > 1, "expected demo and example configs");

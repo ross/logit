@@ -934,6 +934,18 @@ Worked examples, one per shipped component:
   `normalize:` step actually changed the value — counting the common already-conforming case would
   make the rate unreadable. No `Diagnostics` — clamping to a fixed allow-list can't fail. See
   [ADR `value-allowlist-cardinality-clamp`](../adr/value-allowlist-cardinality-clamp.md).
+- `shape` (`crates/logit-transforms/src/shape.rs`): three drop counters and nothing else —
+  `logit.transform.batches.dropped` (a flush window's per-batch table hit its 4096-batch cap),
+  `logit.transform.keys.untracked` and `logit.transform.keysets.untracked` (an observation the
+  cumulative table's `max_tracked_*` cap turned away, emitted once per flush rather than once per
+  event). All three are **counts of things not recorded**, which is the one thing a bounded table
+  must never do silently, and all three are untagged on purpose: `shape`'s defining property is
+  that nothing it emits names an observed key or value, and that applies to its own telemetry as
+  much as to its metrics (`logit.shape.*`) and tags (`signal`/`source`/`tap`). The component's
+  *measurements* are not telemetry points at all — they are ordinary events on its own outbound
+  edge, so an `aggregate` downstream summarizes them like any other traffic. No `Diagnostics`:
+  counting a shape cannot fail. See
+  [ADR `shape-observer-component`](../adr/shape-observer-component.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure
