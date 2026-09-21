@@ -24,10 +24,19 @@ pub struct RegexParser {
     /// `Regex::capture_names`, not re-derived per event.
     names: Vec<Option<Symbol>>,
     /// How many of [`RegexParser::names`] are `Some` -- the most attributes one match can
-    /// contribute, counted once at construction so `process` can open its bulk build with a
-    /// reservation instead of growing the map group by group. An upper bound rather than the
-    /// exact width, since a non-participating or empty group contributes nothing; over-reserving
-    /// by a group or two costs capacity, never an extra allocation.
+    /// contribute, counted once at construction so `process` can size its bulk build instead of
+    /// growing the map group by group.
+    ///
+    /// An **upper bound**, not the width: a group that didn't participate, or that matched the
+    /// empty string, contributes no attribute, and which groups those are isn't known until the
+    /// match is read. `AttrMap::bulk_insert` is built for exactly that -- it reserves nothing on
+    /// the strength of this number and only asks for the heap if a push actually finds the map
+    /// full -- so a hint the match doesn't spend costs nothing at all, not even capacity. That
+    /// matters here rather than being a footnote: six `syslog.*` attributes plus one live capture
+    /// out of three named groups is a seven-entry map, which fits inline, and it used to take a
+    /// 432-byte buffer when the reservation was eager
+    /// (`crates/logit-bench/tests/allocations.rs`'s
+    /// `regex_partial_match_onto_a_six_attribute_event` pins that it doesn't).
     named_groups: usize,
     /// Reused across events -- `captures_read` fills this in place instead of allocating a fresh
     /// `Captures` per line.

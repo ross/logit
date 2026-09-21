@@ -920,6 +920,38 @@ fn regex_capture_into_an_inline_map() {
     expect_allocs("regex: capture into an inline map", stats, 0);
 }
 
+/// The reviewers' case for `docs/plans/event-sizing.md`'s invariant I1, through the real
+/// `RegexParser`: a three-named-group pattern of which **one** participates, against the same
+/// six-attribute `syslog_in` event [`regex_parse_one_event`] uses. Six plus one is seven, which
+/// fits `AttrMap` inline, so the event must cost **nothing** -- exactly as it did when `regex`
+/// inserted a capture at a time.
+///
+/// `regex` sizes its bulk build by `named_groups`, the count of *named* groups in the pattern,
+/// because the count of *participating* ones isn't known until the match is read. That makes the
+/// hint an upper bound, and an eager reservation against an upper bound is what
+/// [`attr_map_bulk_build_within_the_inline_capacity_never_allocates`] exists to prevent: here it
+/// would have reserved 3 onto a 6-entry map and taken a 432-byte buffer for a 7-entry result.
+#[test]
+fn regex_partial_match_onto_a_six_attribute_event() {
+    // Two groups that cannot match anything in the line, and one that does.
+    let mut re = logit_transforms::RegexParser::new(
+        r"(?P<never_a>zzzz)?(?P<never_b>yyyy)?port (?P<client_port>\d+)",
+        None,
+    )
+    .expect("pattern should compile");
+    let resource = fixtures::resource();
+    let mut warm = fixtures::sshd_event();
+    assert!(re.process(&resource, &mut warm));
+    assert_eq!(warm.attributes.len(), 7, "six syslog.* attributes plus the one live capture");
+
+    let mut event = fixtures::sshd_event();
+    let (forwarded, stats) = measure(|| re.process(&resource, &mut event));
+    assert!(forwarded, "regex forwards");
+    assert_eq!(event.attributes.len(), 7);
+    expect_allocs("regex: 1 of 3 named groups onto a 6-attribute event", stats, 0);
+    assert_eq!(event.attributes.capacity(), 8, "seven entries must still be inline");
+}
+
 /// The sshd shape: `syslog_in` has already put six `syslog.*` attributes on the event, so
 /// `regex`'s three captures push the map from 6 to 9 entries -- past `AttrMap`'s 8-entry inline
 /// capacity, spilling to the heap once.
@@ -3957,6 +3989,86 @@ fn attr_map_bulk_build_onto_a_populated_map() {
     assert_eq!(map.capacity(), 30, "the reservation counts what was already there");
 }
 
+/// **A map that would have stayed inline must stay inline**, whatever the caller declared --
+/// `docs/plans/event-sizing.md`'s invariant I1, and the regression a review of the first version
+/// of arm P found in it.
+///
+/// The first version reserved `additional` eagerly, at `bulk_insert`. That is wrong for every
+/// caller whose `additional` is an *upper bound* rather than a count of new keys, and there are
+/// two such shapes in the tree:
+///
+/// - **A hint bigger than the run.** `regex` passes its named-group count, but a group that
+///   didn't participate contributes no attribute ([`regex_partial_match_onto_a_six_attribute_event`]
+///   is the same case through the real parser).
+/// - **A run that overwrites rather than appends.** A re-parse onto an event that already carries
+///   those keys adds nothing at all, and used to reserve for all of them anyway.
+///
+/// Both used to cross the 8-entry inline capacity and take a 432-byte buffer for a map that fits
+/// inline, where the `insert_sym` loop they replaced allocated nothing. The reservation is lazy
+/// now -- taken at the moment a push actually finds the map full, and then for the whole rest of
+/// the declared run in one `reserve_exact` -- so I1 and I2 hold together rather than trading off.
+#[test]
+fn attr_map_bulk_build_within_the_inline_capacity_never_allocates() {
+    let syms: Vec<logit_core::interner::Symbol> = (0..10)
+        .map(|i| logit_core::interner::intern(&format!("bulk.inline.probe.k{i:02}")))
+        .collect();
+
+    let six = |syms: &[logit_core::interner::Symbol]| {
+        let mut map = AttrMap::new();
+        for (i, s) in syms.iter().take(6).enumerate() {
+            map.insert_sym(*s, Value::I64(i as i64));
+        }
+        map
+    };
+    // Warm: the interner and the allocator have both seen everything below once.
+    drop(measure(|| six(&syms)));
+
+    // (i) six already there, a hint of three, one entry actually pushed.
+    let (map, stats) = measure(|| {
+        let mut map = six(&syms);
+        {
+            let mut bulk = map.bulk_insert(3);
+            bulk.push(syms[9], Value::I64(99));
+        }
+        map
+    });
+    assert_eq!(map.len(), 7);
+    expect_allocs("AttrMap: hint of 3, one push, onto six", stats, 0);
+    assert_eq!(map.capacity(), 8, "an unspent hint must not spill the map");
+
+    // (ii) six already there, three incoming that all overwrite them.
+    let (map, stats) = measure(|| {
+        let mut map = six(&syms);
+        // An array, not a `vec!`: a `Vec` built inside the measured region would be an
+        // allocation of its own and hide the one being asked about.
+        map.extend_unsorted([
+            (syms[0], Value::I64(100)),
+            (syms[3], Value::I64(103)),
+            (syms[5], Value::I64(105)),
+        ]);
+        map
+    });
+    assert_eq!(map.len(), 6, "three overwrites are not three new entries");
+    assert_eq!(map.get_sym(syms[3]), Some(&Value::I64(103)), "and the later write still wins");
+    expect_allocs("AttrMap: three overwrites onto six", stats, 0);
+    assert_eq!(map.capacity(), 8);
+
+    // (iii) six already there, three genuinely new: one buffer, sized to the result.
+    let (map, stats) = measure(|| {
+        let mut map = six(&syms);
+        map.extend_unsorted([
+            (syms[6], Value::I64(106)),
+            (syms[7], Value::I64(107)),
+            (syms[8], Value::I64(108)),
+        ]);
+        map
+    });
+    assert_eq!(map.len(), 9);
+    expect_allocs("AttrMap: three new onto six", stats, 1);
+    assert_eq!(stats.reallocs, 0);
+    assert_eq!(map.capacity(), 9, "exactly the result's width, not the next power of two");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Survey-derived shapes (docs/design/data-shapes.md §7 follow-up 2, docs/plans/event-sizing.md W1)
 // ---------------------------------------------------------------------------------------------
@@ -4034,16 +4146,30 @@ fn json_parse_pino_http_nested_event() {
 /// Both numbers used to be higher by the map's own growth chain -- the map spilled at 9 (cap 16)
 /// and grew to 32 at 17, so 30 entries sat in a 1536-byte buffer holding 1440 bytes, having been
 /// moved twice. `json` now merges its scratch with one [`AttrMap::extend_unsorted`]
-/// (`docs/plans/event-sizing.md`'s arm P), so the map takes one 1440-byte buffer, exactly sized,
-/// and the remaining reallocation is not the map at all: it is the `shrink_to_fit` in `logfmt`'s
-/// `unescape`, on the one value below that carries a JSON escape.
+/// (`docs/plans/event-sizing.md`'s arm P), so the map takes one 1440-byte buffer, exactly sized.
 ///
-/// Two of the three allocations are not the map either: PostgreSQL's error message quotes an
-/// identifier (`"orders_pkey"`), so that one value carries a JSON escape and cannot be sliced
-/// zero-copy out of the body the way every other value here is. That is a real property of the
-/// format rather than a fixture artifact -- a constraint-violation line always names the
-/// constraint -- and it is worth keeping visible: on the widest, highest-rate log class, the
-/// *attribute container* is one allocation of the three.
+/// **Everything left is one escaped value, and none of it is the map.** PostgreSQL's error
+/// message quotes an identifier (`"orders_pkey"`), so that one value carries a JSON escape and
+/// cannot be sliced zero-copy out of the body the way every other value here is. Measured by
+/// re-running this event with the two `\"` sequences replaced by a plain byte: **1 allocation,
+/// 0 reallocations, 1440 bytes** -- the exactly-sized map and nothing else. So the escape
+/// accounts for exactly 2 allocations and the 1 reallocation, and they are:
+///
+/// - `serde_json`'s own unescape buffer. `SliceRead` assembles an escaped string in a `Vec<u8>`
+///   scratch, one `extend_from_slice` per run of literal bytes and one push per escape, so it
+///   allocates on the first run and *grows* as the rest arrives -- that growth is the
+///   reallocation. `collect_attrmap` builds a `Deserializer::from_slice` per event, so the
+///   scratch starts empty every time; a second escaped value in the same event would reuse it
+///   (verified: two escaped values cost 3 allocations, not 4).
+/// - `Bytes::copy_from_slice` in `json`'s `ValueVisitor::visit_str` (`crates/logit-transforms/
+///   src/json.rs`), which is the documented non-zero-copy path for a value serde_json had to
+///   unescape.
+///
+/// It is **not** `logfmt`'s `unescape`/`shrink_to_fit`, which an earlier version of this comment
+/// claimed: `json` never calls it, and `shrink_to_fit` appears nowhere in `json.rs`.
+///
+/// Worth keeping visible either way: on the widest, highest-rate log class, the *attribute
+/// container* is one allocation of the three.
 #[test]
 fn json_parse_access_log_event() {
     let resource = fixtures::resource();
@@ -4059,7 +4185,7 @@ fn json_parse_access_log_event() {
     });
     assert_eq!(event.attributes.len(), 30, "1 from tail_in + PostgreSQL jsonlog's 29 keys");
     expect_allocs("json: parse 30-attribute access log", stats, 3);
-    assert_eq!(stats.reallocs, 1, "the one escaped value's `shrink_to_fit`, and nothing else");
+    assert_eq!(stats.reallocs, 1, "serde_json's unescape scratch growing; the map has none");
     assert_eq!(event.attributes.capacity(), 30, "one exactly-sized buffer, no growth chain");
 }
 

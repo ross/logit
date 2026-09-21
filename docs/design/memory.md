@@ -233,15 +233,34 @@ ladder above takes the next power of two and reaches it in steps. The reservatio
 above records, and a producer reaching for a bulk build has by definition just counted what it is
 about to insert.
 
-Two properties of that build are pinned rather than assumed, because both are quiet failure modes.
+Three properties of that build are pinned rather than assumed, because all three are quiet failure
+modes.
+
 The sort is `sort_unstable_by_key`: `slice::sort` is stable and buys its stability with a scratch
 buffer above roughly twenty elements, so a 30-field access log would have paid a second allocation
 per event, having just been handed its first one back
-(`attr_map_bulk_build_sorts_without_allocating`). And duplicate keys are resolved *before* the
-sort — an unstable sort says nothing about which of two equal keys was pushed first — with no
-allocation of their own: a 128-bit membership filter over the keys pushed so far for duplicates
-within the incoming run, and a backwards `swap_remove` pass for collisions with what the map
-already held. Last write wins either way, exactly as a sequence of `insert_sym` calls does.
+(`attr_map_bulk_build_sorts_without_allocating`).
+
+Duplicate keys are resolved *before* the sort — an unstable sort says nothing about which of two
+equal keys was pushed first — with no allocation of their own: a key the map already held is
+overwritten where it sits, and a key already pushed in this run is found through a 128-bit
+membership filter and overwritten in the tail. Last write wins either way, exactly as a sequence of
+`insert_sym` calls does.
+
+**And the reservation is lazy**, which is the correction a review of the first version made
+(`docs/plans/event-sizing.md`'s W3a). Reserving `additional` up front is wrong for every caller
+whose `additional` is an upper bound rather than a count of new keys — `regex`'s named-group count,
+where a group that didn't participate contributes nothing; any run that overwrites rather than
+appends, such as a re-parse onto an event that already carries those keys. Six attributes plus a
+hint of three crossed the 8-entry inline capacity and took a 432-byte buffer for a map that fits
+inline, where the `insert_sym` loop it replaced allocated nothing: I2 bought at I1's expense.
+Nothing is reserved now until a push actually finds the map full, and then for the whole rest of the
+declared run in one `reserve_exact` — so a build that stays inline allocates nothing whatever the
+hint said, and one that genuinely spills still takes a single exactly-sized buffer
+(`attr_map_bulk_build_within_the_inline_capacity_never_allocates`,
+`regex_partial_match_onto_a_six_attribute_event`). A hint that was too *low* falls back to
+smallvec's own growth from that point rather than taking a `realloc` per entry; `bulk_insert(0)`
+(Lua, which cannot get a table's hash-part length out of the VM) is the deliberate case.
 
 The sorted `insert`/`insert_sym` path is unchanged and still the right one for a producer that
 genuinely inserts one key at a time (`set`, a Lua attribute write); the ladder above is what it
@@ -335,7 +354,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `Event::clone` (span shape) | **2** | 1 per `Vec` (`events`, `links`) -- every `AttrMap` here stays inline |
 | `json` parse 12-attribute flat log | **1** | the survey's commonest measured log width (`docs/design/data-shapes.md` §5.3), through the real `tail_in`-shaped leg: one `log.file.path` plus eleven JSON keys. The one allocation is the `AttrMap` spill; every value slices the message `Bytes` |
 | `json` parse 10-attribute nested pino-http record | **5** | 1 spill + **4 boxed `Value::Map`s** (`req{}`, `res{}` and the `headers{}` inside each). A *narrower* event than the row above and five times the allocations -- `Value::Map` is `Box<AttrMap>`, so every nested object pays the full 392-byte inline footprint again, whatever its width (§6 of `data-shapes.md`: "nested maps multiply whatever is chosen") |
-| `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **1 realloc**, and that one is not the map -- it is the `shrink_to_fit` on a single JSON-escaped value, PostgreSQL quoting the constraint name in a violation message, which cannot be sliced zero-copy (two of the three allocations are that same value). Was 3 allocs + **2** reallocs while the merge was a loop of `insert_sym`: the map grew 8 → 16 → 32 and ended in a 1536-byte buffer. It now takes one exactly-sized 1440-byte buffer, §1's bulk-build ladder |
+| `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **1 realloc**, and **none of it is the map**: the same event with its one JSON escape removed is 1 alloc, 0 reallocs, 1440 bytes — the exactly-sized map and nothing else. PostgreSQL quotes the constraint name in a violation message, so that value can't be sliced zero-copy, and it costs two allocations plus the reallocation: `serde_json`'s own unescape scratch (a `Vec<u8>` that allocates on the first literal run and *grows* as the rest arrives — that growth is the realloc), then `Bytes::copy_from_slice` in `json`'s `visit_str`. Not `logfmt`'s `shrink_to_fit`, which `json` never calls. Was 3 allocs + **2** reallocs while the merge was a loop of `insert_sym`: the map grew 8 → 16 → 32 and ended in a 1536-byte buffer |
 | `Event::clone` (12-attribute flat log) | **1** | the spilled `AttrMap`, nothing else |
 | `Event::clone` (30-attribute access log) | **1** | **the same as the 12-attribute row** -- `AttrMap`'s hand-written `Clone` reserves exactly `len` before it copies, so a spilled map costs exactly one allocation however far past 8 it is, of exactly `len` × 48 bytes (`clone_of_a_spilled_attr_map_is_sized_to_len`). A derived `Clone` had the same count but went through smallvec's `reserve`, which rounds up to a power of two: 768 B for the 12-attribute map and 1536 for this one. The two shapes differ only in bytes moved (1440 against 576, plus 864 for the `Event` either way): the clearest single demonstration that allocation count and copy cost rank these shapes differently |
 | `Event::clone` (10-attribute nested pino-http record) | **5** | 1 spill + 1 per boxed `Value::Map`. The narrowest of the three log shapes and by far the most expensive to clone |

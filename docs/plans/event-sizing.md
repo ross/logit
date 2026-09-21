@@ -267,12 +267,29 @@ resource/scope group is 5 events).
     0–8 and so inline either way, where a bulk build would trade a handful of shifts for a sort
     and a filter word.
   - Pins that moved, all exactly as predicted: `json`'s 30-attribute access log 3 allocs + **2**
-    reallocs → 3 + **1** (the survivor is a JSON-escaped value's `shrink_to_fit`, not the map),
-    and every native decode's reallocation count → **0** (the 30-attribute log, the 17-attribute
-    span and the 17-attribute-resource batch each shed one; that batch's live bytes fell 14464 →
-    12064). Allocation counts are unchanged everywhere, which is the point — the win is in the
-    reallocation and capacity columns that `allocs` was always blind to. `type_sizes.rs` does not
-    move: this arm changes no `size_of`.
+    reallocs → 3 + **1**, and every native decode's reallocation count → **0** (the 30-attribute
+    log, the 17-attribute span and the 17-attribute-resource batch each shed one; that batch's
+    live bytes fell 14464 → 12064). Allocation counts are unchanged everywhere, which is the
+    point — the win is in the reallocation and capacity columns that `allocs` was always blind
+    to. `type_sizes.rs` does not move: this arm changes no `size_of`. The access log's one
+    surviving reallocation is **not** the map and not, as a first draft of this claimed,
+    `logfmt`'s `shrink_to_fit` (`json` never calls it): the same event with its one JSON escape
+    removed measures 1 alloc, 0 reallocs, 1440 bytes, so the escape accounts for all of it —
+    `serde_json`'s own unescape scratch `Vec<u8>`, which allocates on the first literal run and
+    grows as the rest arrives, plus `Bytes::copy_from_slice` in `json`'s `visit_str`.
+  - **Review follow-up: the reservation had to become lazy.** An independent review found no
+    correctness bug but did find that reserving `additional` eagerly broke I1 for every caller
+    whose `additional` is an *upper bound* rather than a count of new keys: `regex` passing its
+    named-group count when only one group participates, or any run that overwrites keys the event
+    already carries. Six attributes plus a hint of three spilled a map that fits inline, where the
+    `insert_sym` loop it replaced allocated nothing — I2 bought at I1's expense. `bulk_insert` now
+    reserves nothing up front; `push` overwrites an existing key where it sits (which also retires
+    the `Drop`-time `swap_remove` pass, and with it the transient growth an overwriting run used
+    to cause), and asks for the heap only when an append actually finds the map full, then for the
+    whole rest of the declared run in one `reserve_exact`. A hint that is too low falls back to
+    smallvec's own growth rather than a `realloc` per entry. Every exact-capacity pin from the
+    first version holds unchanged; three new ones cover the inline cases, plus a `regex`-level one
+    for the reviewers' own scenario.
 - **W3b — bench-only arms.** Arms **C**, **E** and **K**, under
   `crates/logit-bench/src/bakeoff/attr_arms/`, beside the native-wire-format bake-off and built to
   its pattern: a local mirror of the shipped type, measured against it, with every simplification
