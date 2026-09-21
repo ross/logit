@@ -5,13 +5,14 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, and `route` are implemented (`rename`/
+//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, and `route` are implemented (`rename`/
 //! `filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
 //! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
 mod csv;
+mod flatten;
 mod json;
 mod keep;
 mod keep_values;
@@ -31,6 +32,7 @@ use logit_core::Value;
 pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
+pub use flatten::{Arrays, Fields, Flatten};
 pub use json::JsonParser;
 pub use keep::{Keep, Remove};
 pub use keep_values::{ClampConfig, KeepValues, Normalize};

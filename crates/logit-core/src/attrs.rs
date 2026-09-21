@@ -96,6 +96,19 @@ impl AttrMap {
     pub fn iter(&self) -> impl Iterator<Item = (Symbol, &Value)> {
         self.0.iter().map(|(k, v)| (*k, v))
     }
+
+    /// Consumes the map, yielding its `(Symbol, Value)` pairs in sorted order -- the owned
+    /// counterpart of [`AttrMap::iter`], for a caller that already holds this map by value and is
+    /// about to move every value out of it rather than read it. `logit-transforms`' `flatten` is
+    /// the first caller: a nested `Value::Map` reached mid-walk was `remove_sym`'d out of its
+    /// parent, so its children are about to move again into the outer map -- without this, each
+    /// would have to be cloned out of `iter()` instead, a real allocation for every nested
+    /// `Map`/`Array` child. A free function rather than `IntoIterator` because `AttrMap`
+    /// deliberately doesn't name its backing `SmallVec` in its public API, which `type IntoIter`
+    /// would otherwise have to do.
+    pub fn into_pairs(self) -> impl Iterator<Item = (Symbol, Value)> {
+        self.0.into_iter()
+    }
 }
 
 impl FromIterator<(&'static str, Value)> for AttrMap {
@@ -190,6 +203,24 @@ mod tests {
         let mut map = map;
         assert_eq!(map.remove(never_interned_elsewhere), None);
         assert_eq!(interner::len(), before, "a missed `remove` must not intern the key");
+    }
+
+    #[test]
+    fn into_pairs_yields_every_entry_in_sorted_order() {
+        let mut map = AttrMap::new();
+        map.insert("host", "web-1");
+        map.insert("env", "prod");
+        map.insert("retries", 3_i64);
+
+        let expected: Vec<(Symbol, Value)> = map.iter().map(|(k, v)| (k, v.clone())).collect();
+        let actual: Vec<(Symbol, Value)> = map.into_pairs().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn into_pairs_on_an_empty_map_yields_nothing() {
+        let map = AttrMap::new();
+        assert_eq!(map.into_pairs().count(), 0);
     }
 
     #[test]

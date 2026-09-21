@@ -320,6 +320,14 @@
 //!     `.distinct_keysets` would read `0` and `logit.shape.tracking_overflow` `1` forever, from a
 //!     component that looks configured. There is no "turn the table off" spelling because the
 //!     cumulative gauges *are* half of what this component is for; remove the `shape` instead.
+//! 59. `flatten`-specific validation (`docs/adr/flatten-transform.md`): `attributes: none`
+//!     together with `resource: none` is rejected, rules 7/12/54's "can only ever be a no-op"
+//!     instinct again; an empty named list on either field is rejected, naming `all`/`none` as
+//!     what an operator meant instead; an empty field name within a named list is rejected, rule
+//!     19/20/54's reasoning; and a field name repeated within one named list is rejected, the same
+//!     no-op reasoning once more. `attributes: all` (the default) and a field name containing `.`
+//!     are both deliberately legal -- the former is the useful default, the latter names a literal
+//!     attribute exactly as rule 54's `keep_values` fields already may.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -414,6 +422,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Kv { .. }
         | Regex { .. }
         | Shape { .. }
+        | Flatten { .. }
         | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
@@ -474,6 +483,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Kv { .. } => "kv",
         Regex { .. } => "regex",
         Shape { .. } => "shape",
+        Flatten { .. } => "flatten",
         Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
@@ -572,6 +582,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Kv { .. }
             | ComponentKind::Regex { .. }
             | ComponentKind::Shape { .. }
+            | ComponentKind::Flatten { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -2783,6 +2794,56 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 59: `flatten`-specific validation (`docs/adr/flatten-transform.md`). Neither
+    // `attributes` nor `resource` selecting anything can only ever be a no-op, rules 7/12/54's
+    // "can only ever be a no-op" instinct again. An empty named list could only mean the operator
+    // meant `none` (nothing) or `all` (everything) and wrote a list by mistake instead, so it's
+    // rejected naming both keywords. An empty field name within a named list could never name a
+    // real attribute, rule 19/20/54's reasoning; a field name repeated within one named list is
+    // the same no-op instinct once more. `attributes: all` (the default) is deliberately not
+    // rejected here -- it's the useful default, not a mistake.
+    for (id, component) in &components {
+        if let ComponentKind::Flatten { attributes, resource, .. } = &component.kind {
+            let selects_nothing = |fields: &logit_config::FlattenFields| {
+                matches!(
+                    fields,
+                    logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None)
+                )
+            };
+            if selects_nothing(attributes) && selects_nothing(resource) {
+                anyhow::bail!(
+                    "component '{id}': a flatten with 'attributes: none' and 'resource: none' \
+                     can only ever be a no-op"
+                );
+            }
+            for (field_name, fields) in [("attributes", attributes), ("resource", resource)] {
+                if let logit_config::FlattenFields::Named(names) = fields {
+                    if names.is_empty() {
+                        anyhow::bail!(
+                            "component '{id}': flatten '{field_name}' is an empty list -- write \
+                             'none' to mean nothing, or 'all' to mean every nested attribute"
+                        );
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    for name in names {
+                        if name.is_empty() {
+                            anyhow::bail!(
+                                "component '{id}': a flatten '{field_name}' entry must not be \
+                                 empty -- it could never name a real attribute"
+                            );
+                        }
+                        if !seen.insert(name.as_str()) {
+                            anyhow::bail!(
+                                "component '{id}': flatten '{field_name}' repeats '{name}' -- a \
+                                 duplicate entry can only ever be a no-op"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
@@ -4913,6 +4974,103 @@ mod tests {
             ("out", vec!["tap"], sink()),
         ]));
         assert!(err.contains("max_tracked_keysets"), "{err}");
+    }
+
+    /// A `flatten` with everything defaulted -- `attributes: all`, `resource: none`,
+    /// `arrays: index`.
+    fn flatten_defaults() -> ComponentKind {
+        ComponentKind::Flatten {
+            attributes: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::All),
+            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            arrays: logit_config::FlattenArrays::Index,
+        }
+    }
+
+    #[test]
+    fn a_flatten_resolves_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], flatten_defaults()),
+            ("out", vec!["flat"], sink()),
+        ]))
+        .expect("should resolve");
+        assert_eq!(graph.components["flat"].role(), Role::Transform);
+        assert_eq!(graph.components["flat"].kind_name(), "flatten");
+    }
+
+    #[test]
+    fn a_flatten_with_no_fields_configured_is_accepted() {
+        // The default -- `attributes: all`, `resource: none` -- selects something (every nested
+        // attribute), so it must not trip the "neither selects anything" rejection below.
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], flatten_defaults()),
+            ("out", vec!["flat"], sink()),
+        ]))
+        .expect("attributes: all is not a no-op");
+    }
+
+    #[test]
+    fn a_flatten_with_both_fields_set_to_none_is_rejected() {
+        let kind = ComponentKind::Flatten {
+            attributes: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            arrays: logit_config::FlattenArrays::Index,
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], kind),
+            ("out", vec!["flat"], sink()),
+        ]));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    #[test]
+    fn a_flatten_with_an_empty_named_list_is_rejected() {
+        let kind = ComponentKind::Flatten {
+            attributes: logit_config::FlattenFields::Named(vec![]),
+            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            arrays: logit_config::FlattenArrays::Index,
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], kind),
+            ("out", vec!["flat"], sink()),
+        ]));
+        assert!(err.contains("empty list"), "got: {err}");
+    }
+
+    #[test]
+    fn a_flatten_with_an_empty_field_name_is_rejected() {
+        let kind = ComponentKind::Flatten {
+            attributes: logit_config::FlattenFields::Named(vec![String::new()]),
+            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            arrays: logit_config::FlattenArrays::Index,
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], kind),
+            ("out", vec!["flat"], sink()),
+        ]));
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn a_flatten_with_a_duplicate_field_name_is_rejected() {
+        let kind = ComponentKind::Flatten {
+            attributes: logit_config::FlattenFields::Named(vec![
+                "http".to_string(),
+                "http".to_string(),
+            ]),
+            resource: logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::None),
+            arrays: logit_config::FlattenArrays::Index,
+        };
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("flat", vec!["in"], kind),
+            ("out", vec!["flat"], sink()),
+        ]));
+        assert!(err.contains("repeats"), "got: {err}");
     }
 
     #[test]
