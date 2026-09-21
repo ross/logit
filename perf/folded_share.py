@@ -23,6 +23,13 @@ Three things about that denominator, because they decide what the numbers mean:
   run, so that is all there is, but the tokio worker threads and the generator thread are all in
   here together. Pass `--thread-regex` to restrict to stacks whose thread name matches.
 
+And one thing it structurally cannot measure: **the copy side of the ratio.** `logit`'s release
+binary never calls libc's `memcpy`/`memmove` for an `Event`-sized move -- LLVM inlines those into
+SIMD stores attributed to whatever function issued them -- so the `memmove` column reads ~0% on
+every capture and means "no out-of-line copy", not "no copying". Half the allocation-versus-size
+question is therefore invisible to a flamegraph by construction, which is why
+`crates/logit-bench/benches/size_vs_alloc.rs` exists.
+
 Stdlib only, no repo imports, no dependency on a build: this is deliberately runnable against a
 folded file captured on the perf VM and copied back, on any machine.
 """
@@ -57,21 +64,25 @@ GROUPS = {
         "__rust_realloc",
     ],
     "memmove": ["memcpy", "memmove", "memset", "__memcpy", "__memmove"],
-    "attrmap": ["attrmap", "smallvec", "insert_sym", "spilled", "try_grow", "reserve_one"],
+    # Every attribute-storage frame spells its entry type out, so the literal `(lasso::keys::Spur,`
+    # is a precise marker for `AttrMap`'s own `SmallVec`/`Vec`/slice frames and excludes
+    # `MetricList`, which is a `SmallVec` too. Insert, grow, drop and clone of attribute storage all
+    # land here.
+    "attrmap": ["attrmap", "insert_sym", "(lasso::keys::spur,"],
+    # `Event`/`Value` drop glue -- overlaps `attrmap` by construction, since dropping an `Event`
+    # drops its attributes.
     "value_drop": [
-        "re:value.*drop",
         "re:drop_in_place.*value",
         "re:drop_in_place.*event",
-        "re:drop_in_place.*attrmap",
+        "re:drop_glue.*value",
+        "re:drop_glue.*event",
     ],
-    "event_clone": [
-        "re:clone.*event",
-        "re:event.*clone",
-        "re:eventbatch.*clone",
-        "re:unwrap_batch",
-        "re:attrmap.*clone",
-    ],
-    "interner": ["interner", "lasso", "rodeo"],
+    # Any derived `Clone`, plus the batch-level copy-on-write sites by name.
+    "clone": ["core::clone::clone", "eventbatch", "unwrap_batch", "re:clone.*event"],
+    # `logit_core::interner` and the `lasso` rodeo under it -- deliberately NOT a bare `lasso`
+    # match, which would hit `lasso::keys::Spur` in every `AttrMap` type name and report the
+    # attribute map as the interner.
+    "interner": ["logit_core::interner", "rodeo", "re:(^|::)intern($|<|::)"],
     "serde_json": ["serde_json", "simd_json"],
 }
 
@@ -122,12 +133,21 @@ def read(path, thread_regex):
 
 
 def top_frames(stacks, group, limit):
-    """The matching frames themselves, by samples, so a share can be explained rather than trusted."""
+    """The matching frames themselves, by samples, so a share can be explained rather than trusted.
+
+    Each frame is counted once per stack even when it appears several times in it -- a recursive
+    `drop_in_place` shows up twice in one stack routinely, and counting both would report a share
+    larger than the group's own.
+
+    These shares still overlap each other: one stack containing both `AttrMap::insert_sym` and the
+    `binary_search_by_key` under it is counted for both frames, so this column sums past the group's
+    share rather than partitioning it.
+    """
     counts = defaultdict(int)
     for stack, count in stacks:
-        for frame in stack.split(";"):
-            if matches(frame.lower(), group):
-                counts[frame] += count
+        seen = {frame for frame in stack.split(";") if matches(frame.lower(), group)}
+        for frame in seen:
+            counts[frame] += count
     return sorted(counts.items(), key=lambda kv: -kv[1])[:limit]
 
 
