@@ -211,11 +211,15 @@ means when that range is wide.
 
 Three scenarios ship **without a row here**: `json-parse-app-log`, `json-parse-nested-log` and
 `json-parse-access-log`, added 2026-09-21 by [`docs/plans/event-sizing.md`](../plans/event-sizing.md)'s
-W1 as three widths of the same `json` parse (12, 10-with-four-nested-maps, and 30 attributes). They
-have never been run on the VM, and their configured counts are first estimates scaled off
-`json-parse`'s by key count rather than tuned to the 5–10 s band — so the first session that runs
-them should expect to retune them, and until then there is deliberately no number for them in this
-document.
+W1 as three widths of the same `json` parse (12, 10-with-four-nested-maps, and 30 attributes). Their
+configured counts were first estimates scaled off `json-parse`'s by key count rather than tuned to
+the 5–10 s band. **They have since been run** — the event-sizing bake-off (§8, same day) ran all
+three on `main`, and none landed in the target band: `json-parse-app-log` 10.9 s, `json-parse-nested-
+log` 13.9 s, `json-parse-access-log` 12.4 s (§8's "The three `json-parse-*` scenarios' first real
+run"). That session's own protocol (median of 6, several non-`main` binaries) doesn't match this
+table's (median of 5, `main` alone at one commit), so there is still deliberately no row for them
+here — the first `--repeat 5`, `main`-only, retuned-count run of these three is still owed to this
+table specifically, now with a real starting point for what to lower their counts to.
 
 `json-parse-x3` and `logfmt-parse` have no row in the laptop-era version of this table at all —
 they landed after it was last written (`docs/plans/load-test-harness.md`'s "Owed now" tracked this
@@ -1012,6 +1016,435 @@ hypothesis predicted. `docs/design/memory.md` §5's caveat is updated to say so.
 
 Both items the previous revision of this section named as open — a per-binary capacity metric, and
 confirming the THP explanation — are closed above.
+
+## 8. Event sizing bake-off (2026-09-21)
+
+[ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)
+records the decision this section's numbers back: `AttrMap`'s inline capacity stays 8, and
+attribute maps stay unreserved, per-key `insert_sym` builds — no change to `Event`. This section is
+the full measurement record the ADR draws its tables from; read the ADR for the decision and the
+"why," this section for every number, recomputed from the raw results JSON and bench text rather
+than copied from any intermediate table.
+
+### Box facts and protocol
+
+| Fact | Value |
+|---|---|
+| VM size | `Standard_F8as_v6` (8 vCPU, SMT off — 8 full physical cores, `docs/adr/disposable-azure-perf-vm.md`) |
+| CPU model | AMD EPYC 9V74 80-Core Processor (Genoa, cloud SKU) — from `perf/results/*.json`'s `cpu_model` |
+| `nproc` | 8 — from the same JSON |
+| `rustc` | `rustc 1.98.1 (48a229cea 2026-09-01)` — from the same JSON |
+| Profile | `release` |
+| `box_state` | empty `{}` on every result file — this guest exposes no `cpufreq`/`power_supply` sysfs, same as every other VM session in this document |
+| `main` at head | `8110aece154b1551d9335157b332101c7116e768`, `git.dirty: false` |
+| `sizing-w4`/`9a3ebc3ba294`/experiment binaries | built from the `sizing/w3c`→`sizing/w4` stack and its throwaway experiment commits (`d78c233`, `badc1c2`, `efe9b8b`, and four `EXPERIMENT`/never-merged commits) — one `sha256` per binary, recorded in each result file's `binary` block |
+
+**Protocol.** Every table below is two interleaved rounds of three repeats per binary (round 1:
+every binary back to back; round 2: the same order repeated), pooled to six repeats and read as one
+`median of 6`; `spread = (max − min) / min` over those six. Binaries were built with `script/vm
+build <ref>` (one `sha256` per source, confirmed distinct before any scenario ran, the same
+discipline §7's table follows) and run with `script/perf run --logit-bin perf/bins/<slug>/logit
+--repeat 3`, one round per invocation. All CPU µs/event tables below were independently recomputed
+by taking every repeat's `cpu_us_per_event` straight from the six `perf/results/*.json` files behind
+each binary/round pair (never from an intermediate `.txt` table) and computing the median and spread
+in Python; every value matched the session's own generated tables to rounding. `bench-table.txt`'s
+own micro-bench figures (§8e) were independently re-derived the same way, from `sizing-w4.bench.
+{size_vs_alloc,attr_arms}.{1,2,3}.txt` — three separate `cargo bench` runs, pinned `taskset -c 2`
+per the bench files' own module docs — median of 3 `cargo bench`/divan medians, not divan's raw
+samples. One gap found in the process: `bench-table.txt` itself is missing a row,
+`alloc_free::immediate::432` (true value 4.93 ns ± 1.4%, recomputed here) — every other row in that
+table matched its recomputed value to within rounding.
+
+### (a) `AttrMap` inline capacity: five binaries, ten scenarios
+
+`main`; `sizing-w4` (N=8, the shipped tree, plus arm P's bulk build *before* the in-order fast
+path); `sizing-arm-n0`/`-n4`/`-n16` (the `sizing-w4` tree with `AttrMap`'s inline capacity changed
+to 0/4/16, nothing else). CPU µs/event, median of 6, spread in parentheses; deltas in the ADR's
+Decision (1) table are against the `sizing-w4` column, not `main`.
+
+| Scenario | `main` | `sizing-w4` (N=8) | `arm-n0` (N=0) | `arm-n4` (N=4) | `arm-n16` (N=16) |
+|---|--:|--:|--:|--:|--:|
+| `passthrough` | 0.330 (±0.5%) | 0.328 (±2.2%) | 0.382 (±0.8%) | 0.351 (±0.7%) | 0.364 (±2.7%) |
+| `aggregate` | 0.325 (±1.0%) | 0.325 (±0.7%) | 0.266 (±3.5%) | 0.299 (±1.6%) | 0.345 (±0.8%) |
+| `fanout` | 0.643 (±1.9%) | 0.643 (±2.0%) | 0.726 (±0.8%) | 0.705 (±0.7%) | 0.695 (±0.8%) |
+| `route` | 0.688 (±3.0%) | 0.682 (±3.5%) | 0.729 (±0.6%) | 0.735 (±0.5%) | 0.805 (±2.2%) |
+| `json-parse` (~10 attr) | 0.861 (±0.9%) | 1.004 (±1.1%) | 1.092 (±2.1%) | 1.097 (±0.4%) | 1.046 (±2.7%) |
+| `logfmt-parse` (9 attr) | 1.015 (±0.4%) | 0.944 (±6.1%) | 0.997 (±1.5%) | 0.992 (±1.1%) | 0.854 (±1.4%) |
+| `json-parse-app-log` (12) | 1.302 (±1.0%) | 1.503 (±1.7%) | 1.649 (±3.7%) | 1.571 (±0.6%) | 1.411 (±1.6%) |
+| `json-parse-nested-log` (10, 4 nested maps) | 2.215 (±1.4%) | 2.450 (±0.8%) | 2.580 (±1.7%) | 2.299 (±1.0%) | 2.414 (±0.7%) |
+| `json-parse-access-log` (30) | 3.000 (±1.2%) | 3.598 (±1.7%) | 3.728 (±0.6%) | 3.695 (±1.0%) | 3.491 (±0.5%) |
+| `native-relay` | 1.346 (±1.2%) | 1.351 (±0.7%) | 1.286 (±1.3%) | 1.337 (±4.2%) | 1.398 (±1.2%) |
+
+Peak RSS, MiB (median of 6):
+
+| Scenario | `main` | `sizing-w4` | `arm-n0` | `arm-n4` | `arm-n16` |
+|---|--:|--:|--:|--:|--:|
+| `passthrough` | 67.3 | 67.1 | 73.1 | 83.8 | 79.1 |
+| `aggregate` | 67.3 | 65.2 | 58.4 | 62.9 | 73.0 |
+| `fanout` | 46.2 | 46.2 | 46.3 | 46.1 | 46.1 |
+| `route` | 104.1 | 101.7 | 132.4 | 149.7 | 97.7 |
+| `json-parse` | 103.3 | 85.8 | 61.4 | 69.7 | 93.8 |
+| `logfmt-parse` | 66.1 | 69.4 | 54.7 | 63.5 | 86.3 |
+| `json-parse-app-log` | 61.8 | 63.3 | 54.7 | 58.9 | 71.8 |
+| `json-parse-nested-log` | 67.5 | 70.5 | 54.3 | 58.5 | 79.5 |
+| `json-parse-access-log` | 63.0 | 62.9 | 57.1 | 56.9 | 68.2 |
+| `native-relay` | 224.5 | 237.0 | 270.0 | 261.8 | 217.6 |
+
+Several rows carry a spread past the ~10% mark ordinarily read as clean signal:
+`json-parse-app-log`/`arm-n0` (±3.7%) is fine, but `sizing-w4`/`logfmt-parse` (±6.1%) and
+`arm-n4`/`native-relay` (±4.2%) sit noticeably above this table's typical ±0.5–2%; none crosses 10%
+here, but they are the two noisiest cells in an otherwise tight table and the ADR's own text (0.4–6%
+spread range) is bounded by the `logfmt-parse`/`sizing-w4` cell exactly.
+
+### (b) The in-order fast path: does the bulk build's own regression hold up?
+
+`sizing-w4`'s bulk build (arm P) was measured once, found 12–20% slower than `main` on the json
+legs, and rebuilt with an in-order fast path (`efe9b8b`, "keep an in-order `AttrMap` bulk build on
+an append-only path") before this re-run, tagged `9a3ebc3ba294`. All deltas below are against
+`main`.
+
+| Scenario | `main` | `sizing-w4` (before fix) | `9a3ebc3ba294` (fast path) |
+|---|--:|--:|--:|
+| `passthrough` | 0.333 (±2.3%) | 0.328, −1.7% (±3.0%) | 0.330, −0.9% (±2.3%) |
+| `json-parse` | 0.858 (±1.9%) | 1.007, +17.4% (±0.6%) | 0.950, +10.7% (±3.4%) |
+| `logfmt-parse` | 1.014 (±2.5%) | 0.944, −6.9% (±1.4%) | 0.944, −6.9% (±5.5%) |
+| `json-parse-app-log` | 1.304 (±1.4%) | 1.498, +14.9% (±2.8%) | 1.464, +12.3% (±0.9%) |
+| `json-parse-nested-log` | 2.210 (±1.3%) | 2.470, +11.8% (±1.4%) | 2.387, +8.1% (±1.2%) |
+| `json-parse-access-log` | 2.995 (±0.8%) | 3.587, +19.8% (±0.5%) | 3.494, +16.7% (±0.8%) |
+| `native-relay` | 1.348 (±1.6%) | 1.349, +0.0% (±0.7%) | 1.341, −0.5% (±1.5%) |
+
+The fast path shaves a few points off every json leg (`json-parse` +17.4%→+10.7%,
+`json-parse-access-log` +19.8%→+16.7%) but does not come close to closing the gap: every json
+scenario is still double digits over `main`, `logfmt-parse`'s own ~7% gain is unaffected by which
+version of the bulk build is in the tree (it doesn't touch `logfmt`'s call site), and `native-relay`
+stays flat either way. This is the re-run that motivated widening the comparison in (c): is the
+regression the bulk build itself, or specifically its eager up-front reservation?
+
+### (c) `json`'s merge: reservation and bulk-build A/Bs
+
+Table 1 — against `main`, four binaries: `main`; `9a3ebc3ba294` (the fast-path bulk build, same as
+(b)); `sizing-exp-json-loop` (`json`'s merge put back to `main`'s per-key `insert_sym` loop, on the
+`sizing-w4` tree — i.e. everything else about the tree unchanged, only `json`'s own call site
+reverted); `sizing-exp-json-reserve-loop` (that same loop plus `reserve_exact(n)` up front).
+
+| Scenario | `main` | `9a3ebc3ba294` | `json-loop` | `reserve-loop` |
+|---|--:|--:|--:|--:|
+| `json-parse` | 0.862 (±2.4%) | 0.946, +9.8% (±6.0%) | 0.854, −0.9% (±1.4%) | 0.856, −0.7% (±1.1%) |
+| `json-parse-app-log` | 1.306 (±2.9%) | 1.462, +12.0% (±0.8%) | 1.332, +2.0% (±1.0%) | 1.431, +9.6% (±3.5%) |
+| `json-parse-nested-log` | 2.212 (±1.1%) | 2.393, +8.2% (±1.5%) | 2.234, +1.0% (±1.7%) | 2.345, +6.0% (±0.5%) |
+| `json-parse-access-log` | 3.013 (±2.3%) | 3.499, +16.1% (±0.8%) | 3.033, +0.7% (±1.2%) | 3.225, +7.0% (±2.0%) |
+
+`json-loop` — the per-key loop, nothing else changed — lands within ±2% of `main` on every leg,
+confirming the loop itself was never the problem; every point of regression in the other three
+columns comes from what replaces it. `9a3ebc3ba294`'s own regression here (+8.2% to +16.1%) is the
+recomputed source of the ADR's "cost the json scenarios 8–17%" line — see this section's caveats
+below for why "17%" overstates the recomputed ceiling.
+
+Table 2 — five variants at the two widest shapes, deltas against `json-loop` on the same tree (its
+own baseline, not `main`): `json-loop`; `reserve-loop`; `reserve-pow2-loop` (loop +
+`reserve` rounded to the next power of two); `9a3ebc3ba294` (bulk build, exact reservation, fast
+path); `sizing-exp-bulk-pow2` (bulk build, power-of-two reservation).
+
+| `json`'s merge | `json-parse-app-log` (12 attr) | `json-parse-access-log` (30 attr) |
+|---|--:|--:|
+| `json-loop` | 1.333 (±0.5%) | 3.036 (±1.8%) |
+| `reserve-loop` (`reserve_exact`) | 1.434, +7.6% (±1.9%) | 3.229, +6.4% (±1.9%) |
+| `reserve-pow2-loop` | 1.446, +8.5% (±0.7%) | 3.176, +4.6% (±1.2%) |
+| `9a3ebc3ba294` (bulk, exact) | 1.461, +9.6% (±0.7%) | 3.484, +14.8% (±0.7%) |
+| `sizing-exp-bulk-pow2` | 1.459, +9.5% (±2.0%) | 3.423, +12.8% (±1.2%) |
+
+Every alternative to the untouched loop costs something, at both widths, whether it reserves eagerly
+without changing the insert order (`reserve-loop`/`reserve-pow2-loop`) or bulk-builds
+(`9a3ebc3ba294`/`bulk-pow2`) — reservation shape (exact vs. power-of-two) barely matters next to
+*whether* it reserves early at all.
+
+### (d) The candidate final tree vs. `main`
+
+`sizing-exp-final`: the bulk build kept only at `logfmt` and the native decoder (the two call sites
+where W1's own reasoning argued it should help without json's per-key ordering working against it),
+plus an exactly-sized `AttrMap::clone`. All ten scenarios, deltas and peak RSS against `main`:
+
+| Scenario | `main` | `sizing-exp-final` | Δ | RSS `main`→`final` (MiB) |
+|---|--:|--:|--:|--:|
+| `passthrough` | 0.330 (±3.1%) | 0.327 (±3.5%) | −0.7% | 67.3 → 69.3 |
+| `aggregate` | 0.324 (±0.5%) | 0.326 (±4.7%) | +0.6% | 66.7 → 66.7 |
+| `fanout` | 0.645 (±2.4%) | 0.641 (±1.3%) | −0.6% | 46.1 → 47.2 |
+| `route` | 0.688 (±3.0%) | 0.686 (±1.3%) | −0.4% | 103.9 → 102.3 |
+| `json-parse` | 0.863 (±1.3%) | 0.862 (±0.8%) | −0.2% | 105.5 → 95.7 |
+| `logfmt-parse` | 1.014 (±1.0%) | 0.955 (±1.3%) | −5.8% | 66.6 → 69.8 |
+| `json-parse-app-log` | 1.305 (±3.9%) | 1.357 (±2.1%) | +4.0% | 63.6 → 62.5 |
+| `json-parse-nested-log` | 2.211 (±0.8%) | 2.248 (±0.8%) | +1.7% | 64.3 → 69.7 |
+| `json-parse-access-log` | 2.997 (±0.9%) | 3.067 (±1.8%) | +2.4% | 60.6 → 61.8 |
+| `native-relay` | 1.344 (±2.0%) | 1.352 (±1.1%) | +0.6% | 221.1 → 242.7 |
+
+`json` no longer uses the bulk build at all in this tree, so its three scenarios' movement here
+(+1.7% to +4.0%) is noise/other-changes, not the bulk-build regression — that's the point of scoping
+it down to two call sites. `logfmt-parse`'s −5.8% is the "~6%" win the ADR's Decision (2) weighs
+against ~300 lines of bulk-build code; `native-relay` at +0.6% is the "flat" the same sentence
+claims.
+
+Table — the four-way check, isolating the native decoder's own use of the bulk build and the
+exactly-sized clone, at the two widest json legs plus `passthrough`/`native-relay`:
+`sizing-exp-final`; `-final-nonative` (native decoder's own call site reverted to the loop, only
+`logfmt` keeps the bulk build); `-final-derivedclone` (the derived `#[derive(Clone)]` restored in
+place of the exactly-sized hand-written one).
+
+| Scenario | `main` | `final` | `final-nonative` | `final-derivedclone` |
+|---|--:|--:|--:|--:|
+| `passthrough` | 0.330 (±0.6%) | 0.332, +0.4% (±2.3%) | 0.326, −1.2% (±2.1%) | 0.331, +0.2% (±3.2%) |
+| `json-parse-app-log` | 1.303 (±1.5%) | 1.351, +3.7% (±1.0%) | 1.348, +3.5% (±1.0%) | 1.344, +3.1% (±2.0%) |
+| `json-parse-access-log` | 2.997 (±1.6%) | 3.065, +2.3% (±0.9%) | 3.066, +2.3% (±1.6%) | 3.047, +1.7% (±1.1%) |
+| `native-relay` | 1.345 (±0.8%) | 1.354, +0.7% (±0.4%) | 1.364, +1.4% (±1.5%) | 1.349, +0.3% (±1.2%) |
+
+`final` vs. `final-nonative` is within noise on both json legs (native decode isn't on their path at
+all) and inside a point on `passthrough`/`native-relay` — the native decoder's own bulk-build use
+neither helps nor hurts these four scenarios measurably. `final` vs. `final-derivedclone` is the
+ADR's "measured CPU-neutral (±0.6%)" claim: recomputed deltas are +0.16%, +0.55%, +0.59%, and +0.37%
+across the four rows — the exactly-sized clone is not a CPU win over the ordinary derived one at any
+of these widths, on this tree.
+
+### (e) Micro-benches (pinned `taskset -c 2`, median of 3 `cargo bench` runs)
+
+**Every batch bench below is un-batched by hand** — divan's reported median is for the *whole*
+iteration, not divided by an `ItemsCount` counter, so a bench whose closure does 64 allocations (or
+1000 elements) reports one number for all 64 (or 1000). Batch sizes, confirmed against
+`crates/logit-bench/benches/size_vs_alloc.rs`: `alloc_free::pair_same_thread`/`pair_cross_thread`,
+64 blocks/iteration; `move_value::ptr_move`, 64 moves; `move_value::vec_push_pop`, 64 pushes + 64
+pops = 128 moves; `scan::touch_head`/`drop_batch`/`clone_batch`, 1000 elements (`generate_in`'s own
+`receive.batch_max_events` default). `alloc_free::immediate` and `realloc_chain::*` are already
+one-operation-per-iteration; no division needed.
+
+#### Allocator cost (jemalloc, real allocator, no counting wrapper), by `AttrMap`'s own growth-ladder sizes
+
+| Bytes | `immediate` (ns/pair) | `pair_same_thread` (ns/block, 64 live) | `pair_cross_thread` (ns/block, freed on another thread) |
+|---:|--:|--:|--:|
+| 432 (9 entries exact) | 4.93 (±1.4%) | 5.88 (±13.6%) | 32.69 (±12.9%) |
+| 576 (12 entries exact) | 4.93 (±1.6%) | 7.62 (±5.3%) | 31.12 (±15.7%) |
+| 768 (today's spill, 16×48) | 4.99 (±2.4%) | 10.40 (±11.5%) | 42.94 (±25.0%) |
+| 1440 (30 entries exact) | 5.34 (±2.2%) | 14.39 (±8.6%) | 51.16 (±41.2%) |
+| 1536 (first growth step, 32×48) | 5.34 (±2.2%) | 16.66 (±2.3%) | 68.77 (±5.0%) |
+| 3072 (second growth step, 64×48) | 6.23 (±3.8%) | 25.48 (±0.6%) | 91.92 (±10.3%) |
+
+`immediate`'s 432-byte row is the one missing from `bench-table.txt` (recomputed here, not copied).
+`pair_cross_thread`'s spreads run well past 10% at every size but 1536 — cross-thread free, sent
+down a bounded channel, is this table's least reproducible number even at median of 3×6; read the
+31–92 ns range as an order of magnitude, not a precise curve.
+
+#### Realloc growth steps, against one exactly-sized allocation
+
+| Bench | ns |
+|---|--:|
+| `step_768_to_1536` (first growth step alone) | 53.22 (±13.1%) |
+| `step_1536_to_3072` (second growth step alone) | 81.08 (±1.0%) |
+| `ladder_768_1536_3072` (both steps, touched between) | 148.0 (±5.2%) |
+| `exact_3072` (one allocation, the ladder's end size, touched once) | 57.77 (±1.7%) |
+| `spill_width::432` (9 entries' exact size, touched) | 9.59 (±20.5%) |
+| `spill_width::768` (today's 16-slot spill, touched) | 19.05 (±4.6%) |
+
+The ladder (148.0 ns) against one exact allocation at the same end size (57.77 ns) is what a
+`reserve` ahead of the growth ladder would save on a >32-entry map — real, but 90 ns on an event
+that has already paid at least one allocation regardless.
+
+#### `move_value::ptr_move` (per-move, ns), by candidate `size_of::<Event>()`
+
+| N (bytes) | 496 | 672 | 864 (today) | 1056 | 1248 | 1632 |
+|---|--:|--:|--:|--:|--:|--:|
+| ns/move | 9.69 (±0.8%) | 12.55 (±2.5%) | 16.19 (±1.0%) | 19.16 (±2.1%) | 23.22 (±0.5%) | 30.42 (±1.0%) |
+
+Least-squares slope across all six points: 0.0183 ns/byte, i.e. **~7.0 ns per +384 B** — the ADR's
+"~7 ns more per +384 B" figure, recomputed directly rather than read off two endpoints.
+
+#### `move_value::vec_push_pop` (per-move, ns, through safe `Vec` push/pop rather than a raw `ptr::copy`)
+
+| N (bytes) | 496 | 672 | 864 | 1056 | 1248 | 1632 |
+|---|--:|--:|--:|--:|--:|--:|
+| ns/move | 20.73 (±43.1%) | 25.81 (±1.2%) | 29.88 (±1.2%) | 32.23 (±5.2%) | 35.20 (±2.7%) | 44.91 (±4.2%) |
+
+The 496-byte row's ±43.1% spread is the widest in this whole document's micro-bench tables — one of
+the three runs read roughly half the other two (noise, not a real regime change; the other five
+`N` values in the same bench are all under 5.2%).
+
+#### `scan::touch_head`/`drop_batch`/`clone_batch` (per-element, ns, 1000-element batches, 8 batches rotated so the working set exceeds L2)
+
+| N (bytes) | 496 | 672 | 864 | 1056 | 1248 | 1632 |
+|---|--:|--:|--:|--:|--:|--:|
+| `touch_head` (1 cache line/element) | 1.962 (±7.8%) | 1.281 (±2.4%) | 1.281 (±1.2%) | 1.251 (±2.4%) | 1.331 (±1.5%) | 1.266 (±1.2%) |
+| `drop_batch` | 0.1374 (±2.0%) | 0.1342 (±2.6%) | 0.1412 (±12.5%) | 0.1402 (±36.3%) | 0.1412 (±31.0%) | 0.1446 (±6.5%) |
+| `clone_batch` | 19.08 (±96.1%) | 14.30 (±1.3%) | 18.56 (±0.2%) | 23.27 (±0.6%) | 27.72 (±0.5%) | 37.21 (±7.0%) |
+
+`touch_head` is flat from 672 B upward (1.25–1.33 ns) — the "a 1000-event batch scan is flat in
+`size_of::<Event>()`" claim, with the 496-byte row (1.96 ns) the one exception, itself likely an
+artifact of that size's batch fitting differently against cache-line/page boundaries rather than a
+real trend reversing direction. `drop_batch` recomputes to the ADR's "~0.14 ns per event" almost
+exactly (0.134–0.145 ns across every width). **`clone_batch::496` is this document's least trustworthy
+single cell**: ±96.1% spread, its three raw runs were 19,880 / 19,080 / 10,140 ns — one run read
+essentially half the other two. Excluding it, a least-squares fit over 672→1632 gives **9.19 ns per
++384 B**, matching the ADR's "cloning a batch ~9 ns more per event per +384 B"; *including* it pulls
+the six-point fit down to ~7.1 ns/384 B. The ADR's figure holds, but only once this one cell's noise
+is set aside rather than averaged in.
+
+#### `build_shape` — `AttrMap`'s sorted `insert_sym` vs. an append-then-sort mirror, ns/build
+
+| Width | `sorted_insert` (today) | `append_then_sort` (reserved) | `append_then_sort_unreserved` | `bulk_build` | `bulk_build_onto_populated` |
+|---:|--:|--:|--:|--:|--:|
+| 9 | 169.3 (±1.1%) | 102.3 (±1.0%) | 137.4 (±2.4%) | 186.2 (±2.4%) | 217.6 (±3.5%) |
+| 12 | 226.9 (±1.7%) | 133.6 (±1.4%) | 168.1 (±3.4%) | 236.2 (±1.6%) | 276.4 (±2.3%) |
+| 17 | 345.2 (±8.0%) | 196.9 (±13.8%) | 257.6 (±5.5%) | 331.4 (±7.8%) | 379.1 (±4.8%) |
+| 30 | 695.7 (±4.7%) | 407.9 (±1.8%) | 469.2 (±2.4%) | 617.9 (±1.6%) | 640.4 (±1.2%) |
+
+**These numbers must be read with the caveat the ADR's Decision (2) states explicitly: every key
+sequence here is fed in a fixed, deliberately *unsorted* order** (`build_shape::keys`'s own doc
+comment — "a shuffled order is the realistic one"). The pipeline scenarios in (a)–(d) show the
+opposite is true for a real source with a stable key order (the interner numbers keys in first-seen
+order, so a logging library's keys arrive already ascending by `Symbol`): `sorted_insert`'s binary
+search then lands at the end on every insert and nothing moves, which is why `append_then_sort`
+"wins" this micro-bench by 32–46% at every width but the *pipeline* json scenarios in (c) show the
+untouched loop matching `main` to within ±2%. Treat this table as a worst-case-ordering measurement
+of the two build strategies, not as a prediction of pipeline cost — the gap it shows does not appear
+in (a)–(d)'s real traffic.
+
+#### `attr_clone::clone` — a real `AttrMap`'s own clone, `Value::I64` throughout (ns/clone)
+
+| Width | 8 (inline) | 9 (first spill) | 12 |
+|---|--:|--:|--:|
+| ns | 140.5 (±2.3%) | 168.1 (±4.3%) | 206.9 (±1.9%) |
+
+The 8→9 step (140.5 → 168.1 ns, +19.6%) is the one allocation the spill costs; every width past it
+is the same one allocation, wider.
+
+#### Arm K's pre-registered kill criterion — build + clone of the 12-attribute log, ns (K needed ≥10% under arm P's bulk build to survive)
+
+| Arm | ns |
+|---|--:|
+| `bulk_build_and_clone` (arm P) | 410.3 (±3.7%) |
+| `sorted_insert_and_clone` (today) | 592.9 (±7.7%) |
+| `keyset_build_and_clone` (arm K) | 333.9 (±4.3%) |
+
+Arm K beats arm P by 18.6% here — clears the kill criterion — which is the number the ADR's
+Alternatives section rounds to "19%."
+
+#### Arm K — build cost by shape, ns (`log12`=12 attr, `access30`=30, `nested10`=10 top-level)
+
+| Build path | `log12` | `access30` | `nested10` |
+|---|--:|--:|--:|
+| `sorted_insert` (today) | 328.9 (±27.5%) | 960.7 (±12.2%) | 273.9 (±31.8%) |
+| `bulk_sort` (arm P) | 261.3 (±0.5%) | 790.7 (±3.7%) | 213.7 (±4.4%) |
+| `keyset_hit` (arm K, cache hit) | 172.4 (±3.0%) | 375.3 (±4.3%) | 151.2 (±3.4%) |
+| `keyset_miss` (arm K, cache miss) | 210.6 (±3.0%) | 590.7 (±2.8%) | 183.1 (±3.4%) |
+
+`sorted_insert`'s own spreads here (±27.5%, ±31.8%) are this table's own reminder that the *shuffled*
+key order this whole `attr_arms` suite (like `build_shape` above) constructs its scratch inputs from
+makes even the control noisy — a real source's ascending-`Symbol` order does not reproduce this in
+the pipeline tables above.
+
+#### Arm K — clone cost by shape, ns
+
+| Clone path | `log12` | `access30` | `nested10` |
+|---|--:|--:|--:|
+| `attrmap` (today) | 235.6 (±3.7%) | 555.4 (±2.3%) | 198.7 (±3.1%) |
+| `keyset` (arm K) | 143.1 (±0.5%) | 345.2 (±0.3%) | 118.9 (±1.6%) |
+
+#### Arm K — the adversarial gateway (196 distinct key-sets, top-1 9.5%, top-5 36.1%), ns/event
+
+| Path | ns |
+|---|--:|
+| `bulk_sort` (arm P, no cache to miss) | 273.8 (±1.1%) |
+| `keyset_cache_64` (arm K, 64-entry bounded cache) | 432.9 (±0.3%) |
+| `keyset_cache_unbounded` (arm K, room for every shape) | 193.1 (±3.0%) |
+
+A bounded cache sized for this survey's own key-set counts *loses* to the bulk build by 58.1% here
+(the ADR's "58%") — the unbounded ceiling (193.1 ns, a 29% win over the bulk build) shows the cache
+itself, not the representation, is what a mixed-gateway workload needs sized correctly; 64 entries
+against 196 real shapes evicts too often to pay for its own hash-and-lookup overhead.
+
+#### Arm E — nested `Value::Map`, boxed `AttrMap` ("today") vs. an inline thin map, ns
+
+| Shape | `build_today` | `build_thin` | `clone_today` | `clone_thin` | `drop_today` | `drop_thin` |
+|---|--:|--:|--:|--:|--:|--:|
+| 1 nested map | 588.1 (±1.3%) | 548.2 (±18.5%) | 266.9 (±7.7%) | 128.0 (±2.0%) | 51.2 (±32.5%) | 28.4 (±0.6%) |
+| 4 nested maps | 1081.0 (±2.4%) | 981.2 (±17.1%) | 570.7 (±2.2%) | 251.3 (±1.0%) | 104.4 (±13.2%) | 59.4 (±0.5%) |
+| pino-http (4 maps, the measured shape) | 1026.0 (±2.0%) | 915.9 (±17.8%) | 539.3 (±5.3%) | 235.7 (±0.8%) | 108.0 (±12.5%) | 59.5 (±0.8%) |
+
+The thin representation clones the pino-http record 56.3% faster (539.3 → 235.7 ns — the ADR's
+"56%") and drops it 45% faster; its own build numbers carry noticeably more spread (17–19%) than
+"today"'s (1–2%), one of this table's own open questions rather than a settled reading.
+
+#### Arm E — `Scope`/`Resource`-width embedding, build and clone, ns
+
+| Width | `build_attrmap` | `build_thin` | `clone_attrmap` | `clone_thin` |
+|---:|--:|--:|--:|--:|
+| 0 (`Scope`'s own median) | 21.5 (±42.8%) | 4.4 (±3.2%) | 14.7 (±63.7%) | 4.1 (±0.4%) |
+| 5 (a `Resource` outside a collector) | 115.3 (±46.4%) | 102.3 (±3.6%) | 101.7 (±13.1%) | 44.0 (±3.2%) |
+| 17 (the measured median behind a collector) | 446.6 (±26.1%) | 357.8 (±5.5%) | 336.4 (±7.8%) | 162.4 (±2.7%) |
+| 29 (the measured maximum) | 850.9 (±13.7%) | 728.4 (±0.9%) | 533.1 (±5.7%) | 290.2 (±0.5%) |
+
+**`Resource`/`Scope` are `Arc`-shared and typically not cloned per event** — this table (and the
+"future investigations" it feeds, the ADR's `SeriesKey`-embedded-`AttrMap` item) is a build/clone
+cost that most pipelines pay once per batch, not once per event; the 0-width row's ±42.8%/±63.7%
+spreads are close-to-zero-cost noise (single-digit-to-low-double-digit-ns absolute values), not a
+real finding.
+
+#### Arm C — clone candidates by value mix, at the 12-attribute log width, ns/clone
+
+| Candidate | scalar | 75% str | 100% str |
+|---|--:|--:|--:|
+| `baseline` (today's shipped clone) | 205.6 (±12.5%) | 233.8 (±5.9%) | 243.2 (±5.5%) |
+| `exact_loop` | 233.2 (±7.4%) | 250.1 (±5.3%) | 259.5 (±4.9%) |
+| `scalar_branch` | 160.6 (±10.0%) | 234.4 (±2.4%) | 262.6 (±3.4%) |
+| `detect_pod` | 67.6 (±13.8%) | 241.3 (±3.7%) | 257.6 (±3.4%) |
+| `pod_flag` | 68.6 (±2.3%) | 231.3 (±1.3%) | 255.1 (±1.0%) |
+
+At the all-scalar mix, `detect_pod`/`pod_flag` are a real win (67–69 ns against baseline's 205.6 —
+a bitwise-copy fast path only legal when every value is scalar), but that mix is not the survey's
+own measured band (0–100% string share, median toward the middle); at 75%/100% string share — where
+the survey's own logs actually sit — every candidate is within a few percent of `baseline`, several
+of them (`pod_flag` at 75%) marginally *under* it but inside `baseline`'s own ±5.9% spread. This is
+the recomputed basis for the ADR's "no clone candidate won at realistic string shares."
+
+### Caveats this data itself surfaces
+
+- **Every spread past ~10% above is called out at its own row**, not folded into a single "noise"
+  disclaimer — `pair_cross_thread` (every size but 1536), `vec_push_pop::496` (±43.1%),
+  `clone_batch::496` (±96.1%), `sorted_insert`'s per-shape numbers in `keyset_k::build` (±12–32%),
+  and several `embed_e` rows (`build_attrmap` at width 0/5, ±43–46%) are all real measurements, not
+  typos, and none should be read as more precise than its own spread allows.
+- **`sizing-w4`'s micro-bench `build_shape` groups (and `attr_arms`' `keyset_k::build`/
+  `kill_criterion` scratch inputs) feed keys in a fixed, deliberately unsorted order** — confirmed
+  from `build_shape::keys`'s own doc comment in `crates/logit-bench/benches/size_vs_alloc.rs`. The
+  pipeline tables in (a)–(d) are what showed this is unrepresentative: a real source's keys arrive
+  in the process interner's first-seen order (ascending `Symbol`, confirmed against
+  `crates/logit-core/src/interner.rs`), which is the best case for today's sorted `insert_sym`, not
+  the shuffled case these micro-benches construct. Any micro-bench number above that looks like a
+  clean win for an alternative build strategy should be read against this gap before it is trusted.
+- **The Azure guest exposes no virtualized PMU** (`perf stat -e cycles true` returns `<not
+  supported>`, same as every other VM session in this document) — nothing here is cycle-accurate or
+  branch-mispredict-attributed; every number is wall/CPU time from `wait4` or divan's own timer, and
+  "why early reservation loses to late growth" (the ADR's own open question) has no counter-level
+  answer available on this box.
+- **The `8–17%` figure in the ADR's Decision (2)** ("the bulk build cost the json scenarios 8–17%
+  end to end") recomputes, against `9a3ebc3ba294` — the fast-path bulk build, the one actually
+  compared throughout (c) and (d) — to **8.2–16.1%** (table (c)'s Table 1: +9.8%, +12.0%, +8.2%,
+  +16.1%). The upper bound is ~1 point over what this session's own data supports; 16% is the
+  recomputed ceiling, not 17%.
+
+### The three `json-parse-*` scenarios' first real run
+
+`json-parse-app-log`, `json-parse-nested-log`, and `json-parse-access-log` shipped 2026-09-21 with
+counts that were first estimates, scaled off `json-parse`'s by key count, explicitly never run on
+the reference VM (§1 above, before this session). This session ran all three, on `main`, as part of
+every table above. Their actual `wall_s` (median of 6, `main` binary):
+
+| Scenario | Count | Median wall_s | 5–10 s band? |
+|---|--:|--:|---|
+| `json-parse-app-log` | 12M | 10.9 s | No — overshoots by ~1 s |
+| `json-parse-nested-log` | 8M | 13.9 s | No — overshoots by ~4 s |
+| `json-parse-access-log` | 5M | 12.4 s | No — overshoots by ~2.4 s |
+
+None of the three landed in the target band on `main` at their shipped counts; all three ran long,
+`json-parse-nested-log` most of all. The first estimates were too generous across the board and want
+lowering, not just retuning in either direction — a first real data point for the "the first session
+that runs them should expect to retune them" line these scenarios' own YAML and
+`docs/plans/load-test-harness.md` already carried.
 
 ## Open questions
 
