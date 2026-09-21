@@ -400,6 +400,9 @@ mod inotify {
                 // writes of up to `cap` bytes; `inner` is the same fd `readable()` just reported
                 // ready, read non-blocking (`IN_NONBLOCK`, set at `open_inotify`).
                 let read = guard.try_io(|inner| {
+                    // SAFETY: as described above this `try_io` call -- `ptr`/`cap` describe
+                    // `self.buf`'s own live allocation, valid for writes of up to `cap` bytes;
+                    // `inner` is the same fd `readable()` just reported ready, read non-blocking.
                     let n =
                         unsafe { libc::read(inner.as_raw_fd(), ptr.cast::<libc::c_void>(), cap) };
                     if n < 0 {

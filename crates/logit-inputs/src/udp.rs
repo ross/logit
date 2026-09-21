@@ -752,6 +752,7 @@ impl BatchReader {
                 let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
                 let base = slots.as_mut_ptr();
                 for i in 0..vlen {
+                    // SAFETY: as described in the comment opening this closure, above `iovs`.
                     unsafe {
                         iovs.add(i).write(libc::iovec {
                             iov_base: base.add(i * MAX_DATAGRAM_BYTES).cast::<libc::c_void>(),
@@ -785,6 +786,7 @@ impl BatchReader {
                             // `msg_hdr.msg_flags` on each of the first `n` headers -- the array
                             // itself is the one written above.
                             *len = unsafe { (*hdrs.add(i)).msg_len };
+                            // SAFETY: as immediately above -- same `i < n <= vlen` header.
                             flags[i] = unsafe { (*hdrs.add(i)).msg_hdr.msg_flags };
                         }
                         return Ok(n as usize);
