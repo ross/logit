@@ -918,6 +918,7 @@ dependencies = [
  "prost",
  "rkyv",
  "serde",
+ "tikv-jemallocator",
  "tokio",
 ]
 
