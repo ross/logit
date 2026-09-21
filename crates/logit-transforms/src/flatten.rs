@@ -87,9 +87,14 @@ impl CompiledFields {
 /// Reused across every event/batch this component sees, never reallocated in steady state.
 #[derive(Default)]
 struct Scratch {
-    /// Top-level keys selected for expansion this call, lifted out before any mutation --
-    /// `AttrMap` has no `iter_mut`/`retain`, and can't be mutated while `iter()` borrows it.
-    pending: Vec<Symbol>,
+    /// The top-level entries selected for expansion this call, **owned** -- every selected value
+    /// is removed from the map before any of them is expanded, so an expansion can never consume
+    /// a value another selected entry is still waiting on. `AttrMap` has no
+    /// `iter_mut`/`retain`/`drain` and can't be mutated while `iter()` borrows it, so selecting
+    /// and taking are two passes over this one buffer rather than one: a selected entry is pushed
+    /// with a `Value::Null` stand-in that the taking pass replaces. One buffer, not two, so the
+    /// per-call allocation profile is unchanged from collecting bare `Symbol`s.
+    pending: Vec<(Symbol, Value)>,
     /// One buffer for the whole walk; a child path is built by appending onto the parent's and
     /// truncated back on the way out (`push`/`truncate`, not `format!`), so no allocation happens
     /// below the buffer's high-water mark.
@@ -144,9 +149,22 @@ fn expandable(value: &Value, arrays: Arrays) -> bool {
 /// Expands every selected, expandable top-level attribute in `attrs` in place. Shared by
 /// `process` (`event.attributes`) and `map_resource` (a rebuilt `Resource`'s attributes).
 ///
-/// Two-phase, because `AttrMap` has no `iter_mut`/`retain`/`drain` and can't be mutated while
+/// Three-phase, because `AttrMap` has no `iter_mut`/`retain`/`drain` and can't be mutated while
 /// iterated: phase 1 only *reads* `attrs` to decide which top-level keys to expand, phase 2
-/// removes and expands each in turn.
+/// removes all of them, and only then does phase 3 expand each in turn.
+///
+/// Taking every selected value before expanding any of them is what keeps the result independent
+/// of the order [`AttrMap::iter`] happens to yield keys in -- that order is `Symbol` order, which
+/// is process-global first-intern order, not document order, so anything depending on it depends
+/// on what some unrelated component interned first. The case that makes the difference visible is
+/// an event carrying both a nested `a = {"b": 9}` and a literal, still-nested sibling
+/// `a.b = {"x": 1}`: expanding `a` writes a leaf at `a.b`, and were `a.b`'s own value still
+/// sitting in the map at that point it would be overwritten and its subtree lost before it was
+/// ever walked -- and the leaf then removed and rewritten a second time when phase 2 reached the
+/// now-stale entry, counting `logit.transform.values.flattened` twice for one leaf. Taken up
+/// front, both expand from values this function owns and land side by side (`a.b` and `a.b.x`)
+/// whichever is visited first. Two expansions that produce the same final leaf *path* still
+/// collide; that one is `docs/adr/flatten-transform.md`'s deliberate, documented last-write-wins.
 fn flatten_map(
     attrs: &mut AttrMap,
     fields: &CompiledFields,
@@ -155,14 +173,29 @@ fn flatten_map(
     telemetry: &Telemetry,
 ) {
     scratch.pending.clear();
+    // Phase 1 -- select. Reads only: the value can't be taken while `iter()` borrows the map, so
+    // `Value::Null` stands in until phase 2 replaces it. A real `Value::Null` is never
+    // `expandable`, so a stand-in can't be confused for selected data.
     for (sym, value) in attrs.iter() {
         if fields.selects(sym) && expandable(value, arrays) {
-            scratch.pending.push(sym);
+            scratch.pending.push((sym, Value::Null));
         }
     }
+    // Phase 2 -- take. Every selected value leaves `attrs` here, before phase 3 writes anything
+    // back into it. `retain_mut` rather than an `expect`: an entry the map no longer holds is
+    // simply not expanded, instead of being argued impossible in a panic message.
+    scratch.pending.retain_mut(|entry| match attrs.remove_sym(entry.0) {
+        Some(value) => {
+            entry.1 = value;
+            true
+        }
+        None => false,
+    });
+    // Phase 3 -- expand. By index, taking each value back out as it goes, because `expand` needs
+    // `scratch` itself and so can't run while `pending` is borrowed.
     for i in 0..scratch.pending.len() {
-        let sym = scratch.pending[i];
-        let value = attrs.remove_sym(sym).expect("selected from this map in phase 1, above");
+        let sym = scratch.pending[i].0;
+        let value = std::mem::replace(&mut scratch.pending[i].1, Value::Null);
         scratch.path.clear();
         scratch.path.push_str(resolve(sym));
         expand(value, 1, arrays, attrs, scratch, telemetry);
@@ -542,6 +575,65 @@ mod tests {
             Some(&Value::I64(200)),
             "the flattened leaf, written after the literal attribute, wins"
         );
+    }
+
+    // -- dotted siblings ----------------------------------------------------------------------
+
+    /// A nested attribute and a literal attribute named after one of the paths it expands into
+    /// are both selected, and neither may destroy the other: expanding `fsib1` writes a leaf at
+    /// `fsib1.b`, which is itself a selected source key whose value is still nested. Both names
+    /// are interned by this test and nowhere else in the crate, so the order `AttrMap::iter`
+    /// yields them in is decided here rather than by whatever the process interned first -- this
+    /// one pins the nested-key-first order, and
+    /// [`the_same_dotted_sibling_pair_survives_in_the_other_intern_order`] the mirror. The result
+    /// must be identical either way.
+    #[test]
+    fn a_nested_attribute_and_a_dotted_sibling_both_survive() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("flat", "flatten", "transform");
+        let mut f = flatten_all().with_telemetry(telemetry);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[
+            ("fsib1", map(&[("b", Value::I64(9))])),
+            ("fsib1.b", map(&[("x", Value::I64(1))])),
+        ]);
+        assert!(f.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("fsib1.b"), Some(&Value::I64(9)));
+        assert_eq!(
+            event.attributes.get("fsib1.b.x"),
+            Some(&Value::I64(1)),
+            "the sibling's own subtree must survive the leaf written over its key"
+        );
+        assert_eq!(event.attributes.len(), 2);
+
+        let events = registry.drain(0);
+        assert_eq!(
+            counter_value(&events, "logit.transform.values.flattened"),
+            Some(2.0),
+            "one count per leaf written, not one per source key removed"
+        );
+    }
+
+    /// [`a_nested_attribute_and_a_dotted_sibling_both_survive`] with the two source keys interned
+    /// in the opposite order, which is the order `AttrMap::iter` -- and so the expansion order --
+    /// follows. Same assertions: the outcome must not depend on it.
+    #[test]
+    fn the_same_dotted_sibling_pair_survives_in_the_other_intern_order() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("flat", "flatten", "transform");
+        let mut f = flatten_all().with_telemetry(telemetry);
+        let resource = default_resource();
+        let mut event = event_with_attrs(&[
+            ("fsib2.b", map(&[("x", Value::I64(1))])),
+            ("fsib2", map(&[("b", Value::I64(9))])),
+        ]);
+        assert!(f.process(&resource, &mut event));
+        assert_eq!(event.attributes.get("fsib2.b"), Some(&Value::I64(9)));
+        assert_eq!(event.attributes.get("fsib2.b.x"), Some(&Value::I64(1)));
+        assert_eq!(event.attributes.len(), 2);
+
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.transform.values.flattened"), Some(2.0));
     }
 
     // -- resource -----------------------------------------------------------------------------

@@ -80,7 +80,7 @@ enum Arrays { Index, Skip }              // mirrors logit_config::FlattenArrays
 enum Fields { All, None, Named(Vec<Symbol>) }  // mirrors logit_config::FlattenFields, interned once
 
 struct Scratch {
-    pending: Vec<Symbol>,   // selected source keys, lifted out before any mutation
+    pending: Vec<(Symbol, Value)>,  // selected source entries, taken out before any expansion
     path: String,           // one buffer for the whole walk, truncate-on-backtrack
     keys: KeyCache,         // path -> Symbol memo, JsonParser's pattern
 }
@@ -98,7 +98,8 @@ pub struct Flatten {
 `process`/`map_resource` share a free `flatten_map(&mut AttrMap, &Fields, Arrays, &mut Scratch,
 &Telemetry)`, the `keep_values::clamp_field` shape: phase 1 scans `attrs.iter()` and collects
 selected, expandable top-level symbols into `scratch.pending` (cannot mutate while iterating);
-phase 2 `remove_sym`s each in turn and recursively `expand`s it, writing leaves back via
+phase 2 `remove_sym`s every one of them, so no selected value is still in the map once expansion
+starts; phase 3 recursively `expand`s each, writing leaves back via
 `scratch.keys.get_or_intern(&scratch.path)` + `attrs.insert_sym`. Recursion is bounded by a fixed
 internal `MAX_DEPTH` constant (not config), mirroring
 `logit_proto::native::value::MAX_VALUE_DEPTH`; a value that hits the wall is written back whole,
