@@ -1932,10 +1932,13 @@ mod tests {
         assert!(used >= 0.0, "a fill level is never negative, got {used}");
         // The pairing the metric's whole meaning depends on: both terms come from the same
         // `SO_MEMINFO` read, so the ratio is exactly the one the kernel itself tests. No upper
-        // bound of 1.0 on it, deliberately -- the kernel charges an arriving packet's `truesize`
-        // and *then* tests the total against the ceiling, so a sample taken mid-drop legitimately
-        // reads a little over 1.0 (observed at 1.17 against a real flood), and asserting
-        // `<= 1.0` would be a flake waiting to happen. See `SockMeminfo::receive_utilization`.
+        // bound of 1.0 on it, deliberately -- the kernel admits a datagram whenever the
+        // *already-charged* total is at or below the ceiling and then charges the whole of its
+        // `truesize` on top, so a saturated queue settles at up to `rcvbuf + truesize` and reads
+        // over 1.0 for as long as it stays there (observed at 1.17 against a real flood).
+        // Asserting `<= 1.0` would be a flake waiting to happen. See
+        // `SockMeminfo::receive_utilization`, which has both kernel generations' spelling of that
+        // same admission rule.
         assert!(
             (utilization - used / granted).abs() < 1e-9,
             "utilization must be `used.bytes / receive_buffer.bytes`, not a ratio against the \
@@ -1980,6 +1983,111 @@ mod tests {
             (utilization - used / granted).abs() < 1e-9,
             "utilization must be `used.bytes / receive_buffer.bytes`"
         );
+    }
+
+    /// This module's headline claim, checked against the number an operator would check it
+    /// against: **`logit.input.kernel.drops` is the same counter `/proc/net/udp`'s `drops` column
+    /// prints**, to the packet, on the same socket at the same moment.
+    ///
+    /// `logit_pipeline::sockstat`'s module doc asserts this identity ("`SK_MEMINFO_DROPS` is the
+    /// same `sk->sk_drops` that procfs's `drops` column prints, so the two agree by
+    /// construction") and `docs/plans/udp-intake.md` recorded checking it as a manual step. It is
+    /// neither manual nor approximate: both sides read the same field --
+    /// `sk_get_meminfo` (`net/core/sock.c`) does `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)`
+    /// and `udp4_format_sock` (`net/ipv4/udp.c`) prints `atomic_read(&sp->sk_drops)` as its last
+    /// column, both verified at v6.12 -- so this is an equality, not a threshold.
+    ///
+    /// It is also the only test in the tree that pins the `SK_MEMINFO_DROPS` *index* against
+    /// something other than itself. A mutant that read `SK_MEMINFO_BACKLOG` (7) or
+    /// `SK_MEMINFO_OPTMEM` (6) instead still reports "some number" and still passes every
+    /// nonzero-drops assertion elsewhere; only an equality against an independently-produced
+    /// figure catches it.
+    ///
+    /// **Ordering.** The blast finishes before anything is read, and nothing else sends to this
+    /// socket, so `sk_drops` is frozen by the time the comparison runs. The socket is still open
+    /// throughout -- procfs only lists live sockets, and the row is found by the socket's own
+    /// inode (`/proc/self/fd/<fd>` reads back as `socket:[<inode>]`), not by address, which is
+    /// what makes it unambiguous even with another test's loopback socket bound nearby.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_kernels_drop_counter_agrees_with_proc_net_udp_to_the_packet() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut diag = Diagnostics::default();
+        let (socket, _group) =
+            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
+                .await
+                .expect("binding an ephemeral port should succeed");
+        let addr = socket.local_addr().expect("a bound socket has an address");
+
+        // The blaster is awaited to completion, so nothing is still in flight below.
+        blast(addr, OVERRUN_DATAGRAMS).await;
+
+        let Some(procfs_drops) = proc_net_udp_drops(&socket) else {
+            println!("skipping: /proc/net/udp is not readable in this environment");
+            return;
+        };
+
+        let mut sampler =
+            ReceiveBufferSampler::new(&socket, telemetry.clone(), Diagnostics::default());
+        sampler.sample_once();
+        assert!(sampler.enabled, "SO_MEMINFO is available on this kernel -- test premise");
+
+        // A third, independent reading: straight off the fd, bypassing the sampler entirely.
+        let direct = logit_pipeline::sockstat::meminfo(
+            logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor"),
+        )
+        .expect("SO_MEMINFO on a socket this process just opened");
+
+        let reported = kernel_drops(&registry.drain(0));
+        assert!(
+            procfs_drops > 0,
+            "the flood must have overrun a {TINY_RECEIVE_BUFFER}-byte buffer"
+        );
+        assert_eq!(
+            reported, procfs_drops as f64,
+            "logit.input.kernel.drops must equal /proc/net/udp's drops column for this socket \
+             exactly -- it is literally the same sk_drops field"
+        );
+        assert_eq!(
+            u64::from(direct.drops),
+            procfs_drops,
+            "and so must a direct SO_MEMINFO read, which is what rules out the counter's \
+             first-sample arithmetic hiding an index mistake"
+        );
+    }
+
+    /// This socket's `drops` column in `/proc/net/udp[6]`, found by inode. `None` if procfs is
+    /// unreadable or the row is not there (neither is something this code could be blamed for).
+    ///
+    /// The row layout is fixed by `udp4_format_sock`'s `seq_printf` (`net/ipv4/udp.c`, and
+    /// `__ip6_dgram_sock_seq_show` in `net/ipv6/datagram.c` for udp6, which prints the same
+    /// columns with wider addresses): whitespace-separated, `sl` is field 0, `inode` is field 9
+    /// and `drops` is field 12 and last. `tx_queue:rx_queue` and `tr:tm->when` are each one
+    /// colon-joined field, which is what makes the count come out at 13 rather than 15.
+    #[cfg(target_os = "linux")]
+    fn proc_net_udp_drops(socket: &UdpSocket) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+
+        // `/proc/self/fd/<fd>` is a symlink that reads back as `socket:[<inode>]` -- the inode
+        // procfs's socket tables key on. Cheaper and safer than an `fstat`, and no `unsafe`.
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).ok()?;
+        let link = link.to_str()?;
+        let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+
+        for table in ["/proc/net/udp", "/proc/net/udp6"] {
+            let Ok(contents) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            for row in contents.lines().skip(1) {
+                let fields: Vec<&str> = row.split_whitespace().collect();
+                if fields.len() < 13 || fields[9] != inode {
+                    continue;
+                }
+                return fields[12].parse().ok();
+            }
+        }
+        None
     }
 
     /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
