@@ -891,7 +891,10 @@ impl AcceptQueueSampler {
     ///
     /// `logit.input.accept_queue.utilization` is skipped when the kernel reports a backlog of 0
     /// (nothing does for a real listener, but the division is not this function's to guess at), so
-    /// the gauge's presence is itself the evidence that a ceiling was read.
+    /// the gauge's presence is itself the evidence that a ceiling was read. It is **not** clamped
+    /// to 1.0 and must not be: `sk_acceptq_is_full` is strictly greater-than, so a `listen(N)`
+    /// socket settles at a depth of `N + 1` and a utilization of `(N + 1) / N` at the point the
+    /// kernel starts refusing. See `sockstat::listen_queue`'s doc for the kernel citation.
     ///
     /// Takes the listener it is about, rather than a descriptor captured at construction -- see
     /// [`Self::read_queue`]'s doc for why that is the whole of the identity guarantee here.
@@ -3376,10 +3379,14 @@ mod tests {
             .expect("the utilization gauge's presence means the kernel reported a real backlog");
         assert!(depth >= 0.0, "a queue depth is never negative, got {depth}");
         assert!(limit > 0.0, "a listening socket always has a backlog ceiling, got {limit}");
-        assert!(
-            (0.0..=1.0).contains(&utilization),
-            "utilization is depth/backlog, so it lives in [0, 1], got {utilization}"
-        );
+        // No upper bound of 1.0 on it, deliberately: `sk_acceptq_is_full` is strictly
+        // greater-than, so the depth reaches `limit + 1` before the kernel refuses and the ratio
+        // legitimately exceeds 1.0 --
+        // `an_over_full_accept_queue_reports_a_utilization_above_one` below demonstrates it
+        // against a real socket. This test's own listener has a backlog of hundreds, so the
+        // reading here says nothing either way; asserting `<= 1.0` was a false statement about
+        // the metric that any lowered backlog would have turned into a flake.
+        assert!(utilization >= 0.0, "utilization is depth/backlog, never negative: {utilization}");
         assert!(
             (utilization - depth / limit).abs() < 1e-9,
             "the three must be consistent: utilization is exactly depth/limit"
@@ -3431,6 +3438,111 @@ mod tests {
         assert_eq!(gauge_of(&events, "logit.input.accept_queue.depth"), None);
         assert_eq!(gauge_of(&events, "logit.input.accept_queue.limit"), None);
         assert_eq!(gauge_of(&events, "logit.input.accept_queue.utilization"), None);
+    }
+
+    /// The kernel's accept queue really does exceed its own ceiling, and the gauge really does
+    /// report the overshoot rather than clamping it.
+    ///
+    /// `sk_acceptq_is_full` (`include/net/sock.h`, v6.12) is
+    /// `sk_ack_backlog > sk_max_ack_backlog` -- strictly greater, with a standing kernel comment
+    /// pointing at commit 64a146513f8f for why it is not `>=` -- and `sk_acceptq_added`
+    /// (`inet_csk_reqsk_queue_add`, `net/ipv4/inet_connection_sock.c`) increments after that check
+    /// with no second test. So a `listen(1)` socket admits two connections and settles at depth 2,
+    /// which is `limit + 1` and a utilization of 2.0.
+    ///
+    /// Deterministic on loopback rather than racy: the third connect's handshake cannot complete
+    /// (the queue is over the ceiling by then, so the kernel drops it and the client retries with
+    /// backoff), and the first two cannot be taken off the queue because nothing ever calls
+    /// `accept`. All three connects are nonblocking so a refused one cannot hang the test. If the
+    /// kernel this runs on has not finished both handshakes within the poll window, the
+    /// assertions still hold -- they bound the depth and pin the ratio -- and only the `== 2.0`
+    /// case is skipped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_over_full_accept_queue_reports_a_utilization_above_one() {
+        use socket2::{Domain, Socket, Type};
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("a literal address");
+        let server = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket(2)");
+        server.bind(&addr.into()).expect("bind to an ephemeral loopback port");
+        // The whole point: a ceiling small enough that three connections cannot fit under it.
+        server.listen(1).expect("listen(2) with a backlog of exactly one");
+        server.set_nonblocking(true).expect("tokio requires a nonblocking listener");
+        let bound = server
+            .local_addr()
+            .expect("a bound socket has an address")
+            .as_socket()
+            .expect("an AF_INET address");
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let client = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket(2)");
+            client.set_nonblocking(true).expect("a blocking connect could hang on a full queue");
+            // `EINPROGRESS` is the expected answer for all three; the handshake finishes (or does
+            // not) in the kernel while this test waits below.
+            let _ = client.connect(&bound.into());
+            clients.push(client);
+        }
+
+        let listener = TokioTcpListener::from_std(std::net::TcpListener::from(server))
+            .expect("a nonblocking listening socket is a valid tokio listener");
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
+        let mut sampler = AcceptQueueSampler::new(&listener, telemetry, Diagnostics::default());
+
+        // Poll rather than sleep a fixed time: two loopback handshakes are quick, but "quick" is
+        // not a guarantee worth flaking over.
+        let mut depth = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let (d, _limit) = read_listen_queue(&listener).expect("TCP_INFO on a real listener");
+            depth = d;
+            if depth >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let (queued, limit) = read_listen_queue(&listener).expect("TCP_INFO on a real listener");
+        assert_eq!(
+            limit, 1,
+            "listen(1) is what this socket asked for, and somaxconn cannot \
+                              raise it -- only lower it, and never below 1"
+        );
+        assert!(
+            queued <= limit + 1,
+            "the kernel admits one connection past its own ceiling and no more, got {queued}"
+        );
+
+        sampler.sample_once(&listener);
+        let events = registry.drain(0);
+        let reported_depth = gauge_of(&events, "logit.input.accept_queue.depth")
+            .expect("the depth should have been gauged");
+        let reported_limit = gauge_of(&events, "logit.input.accept_queue.limit")
+            .expect("the ceiling should have been gauged");
+        let utilization = gauge_of(&events, "logit.input.accept_queue.utilization")
+            .expect("the utilization should have been gauged");
+        assert_eq!(reported_limit, 1.0);
+        assert!(
+            (utilization - reported_depth / reported_limit).abs() < 1e-9,
+            "utilization is exactly depth/limit, unclamped: {utilization} vs \
+             {reported_depth}/{reported_limit}"
+        );
+        if depth >= 2 {
+            assert!(
+                utilization > 1.0,
+                "a listen(1) socket holding two connections is over its ceiling, and the gauge \
+                 must say so rather than clamp: {utilization}"
+            );
+        } else {
+            eprintln!(
+                "SKIPPED the >1.0 half: this kernel left the accept queue at depth {depth} \
+                 within the poll window; the depth bound and the depth/limit identity were still \
+                 checked"
+            );
+        }
+
+        drop(clients);
     }
 
     /// The sample happens **before** the accept, not after it -- the semantic the whole design

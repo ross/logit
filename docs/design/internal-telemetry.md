@@ -466,7 +466,7 @@ point every datagram passes through:
 | `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
 | `logit.input.receive_buffer.requested.bytes` | gauge | what `receive.receive_buffer_bytes` asked for, absent when unset — sampled once at bind, and genuinely bind-only: it is config, not a kernel reading |
 | `logit.input.receive_buffer.used.bytes` | gauge | `SO_MEMINFO`'s `SK_MEMINFO_RMEM_ALLOC`: bytes the kernel currently charges this socket's receive queue. **Not** queued payload bytes — each packet is charged its `skb->truesize`, several hundred bytes above its own length |
-| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is where the kernel begins dropping. Readings a little *above* 1.0 are normal under load: the kernel charges an arriving packet and then tests the total, so a sample can land mid-drop |
+| `logit.input.receive_buffer.utilization` | gauge | `used.bytes / receive_buffer.bytes`, both from the same `SO_MEMINFO` read. 1.0 is not "nearly full" — it is where the kernel begins dropping. Readings *above* 1.0 are normal under load and must never be clamped: the kernel admits a datagram whenever the already-charged total is at or below the ceiling and then charges its whole `truesize` on top, so a saturated queue settles at up to `rcvbuf + truesize` |
 | `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
 
 The last three are Linux-only (`logit_pipeline::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+)
@@ -495,7 +495,7 @@ also Linux-only, from `getsockopt(TCP_INFO)` on the listening socket:
 |---|---|---|
 | `logit.input.accept_queue.depth` | gauge | connections that have completed their handshake and are waiting to be accepted (`tcpi_unacked`, which the kernel aliases onto `sk_ack_backlog` for a socket in `LISTEN`) |
 | `logit.input.accept_queue.limit` | gauge | the backlog ceiling itself (`tcpi_sacked`, aliased onto `sk_max_ack_backlog`) — what `listen(2)` was given, after `net.core.somaxconn` clamped it. Re-emitted each sample, same reason as `receive_buffer.bytes` |
-| `logit.input.accept_queue.utilization` | gauge | that depth against that ceiling — 1.0 is where the kernel starts refusing connections outright |
+| `logit.input.accept_queue.utilization` | gauge | that depth against that ceiling. Like `receive_buffer.utilization` three rows up, readings *above* 1.0 are legitimate and never clamped: `sk_acceptq_is_full` is strictly greater-than (`include/net/sock.h`) and the queue is incremented after that check, so a `listen(N)` socket settles at `N + 1` and refusal begins just *above* 1.0, not at it |
 
 Sampled before each `accept()` *and* on the same one-second interval: the per-accept sample is the
 depth at the instant that matters, and the interval one is what keeps a listener that is blocked in
