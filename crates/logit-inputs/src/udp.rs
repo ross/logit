@@ -616,7 +616,7 @@ async fn read_loop(
             _ = shutdown.wait_for(|&due| due) => break Ok(()),
         };
         if let Err(err) = read {
-            break Err(err.into());
+            break Err(describe_read_failure(socket, err));
         }
         let bytes: usize = batch.iter().map(|datagram| datagram.bytes.len()).sum();
         telemetry.count("logit.input.reads", 1.0, &[]);
@@ -633,6 +633,57 @@ async fn read_loop(
     };
     queue.close();
     result
+}
+
+/// The syscall [`BatchReader::read_batch`] takes datagrams off the socket with, by name -- for the
+/// one message an operator ever sees it in, the fatal error [`read_loop`] stops on.
+#[cfg(target_os = "linux")]
+const READ_SYSCALL: &str = "recvmmsg(2)";
+#[cfg(not(target_os = "linux"))]
+const READ_SYSCALL: &str = "recvfrom(2)";
+
+/// Turns a fatal read error into something an operator can act on.
+///
+/// Without this the only context added on the way out is `run_input`'s
+/// `.with_context(|| format!("component '{id}'"))` (`logit_pipeline::runtime`), so a sandbox that
+/// blocks the syscall reports `component 'statsd_in': Function not implemented (os error 38)` --
+/// no syscall named, no socket named, nothing to search for. That is the same failure quinn#1947
+/// and bun#42678 both hit (a seccomp profile refusing `recvmmsg`); `logit` at least fails cleanly
+/// rather than spinning, which is the part bun had to fix, but the message was no more useful than
+/// theirs was. `recvmmsg(2)` is unconditional on Linux, so the obvious operator response -- drop
+/// `receive.read_batch` to 1 -- does not help, and the hint says so rather than leaving it to be
+/// discovered. There is deliberately no runtime `recvmmsg` -> `recvmsg` fallback latch
+/// (quinn#2079's pattern); that is an open design decision, not an oversight -- see
+/// `docs/known-gaps.md`.
+///
+/// The bound address comes from `getsockname(2)` via `local_addr`, not from the configured `bind:`
+/// string: it is the address actually in use (a `:0` port resolved, or whichever candidate won
+/// [`bind_first_available`]'s fallthrough), and it costs one syscall on a path that is about to
+/// terminate the listener anyway.
+fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) -> anyhow::Error {
+    let hint = match err.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EPERM) => {
+            " -- a seccomp or sandbox profile blocking that syscall is the usual cause; \
+             `receive.read_batch: 1` does not avoid it, this listener always makes the same call"
+        }
+        // `udp_abort` (`net/ipv4/udp.c`) is the one externally-triggerable fatal on this socket:
+        // it sets `sk_err` and `__udp_disconnect`s, reached from a `SOCK_DESTROY` netlink request.
+        // The socket really is gone -- unhashed, never to receive again -- so failing is correct,
+        // and a retry would read `EAGAIN` (`sock_error`'s `xchg` clears `sk_err`) and leave a
+        // silent zombie listener behind. Naming the cause is all that is left to do.
+        Some(libc::ECONNABORTED) => {
+            " -- the socket was destroyed out from under this listener (an `ss -K`, or another \
+             SOCK_DESTROY request naming it); it cannot receive again, so the process exits \
+             rather than pretending otherwise"
+        }
+        _ => "",
+    };
+    let addr = match socket.local_addr() {
+        Ok(addr) => addr.to_string(),
+        Err(_) => "an unknown address".to_string(),
+    };
+    anyhow::Error::new(err)
+        .context(format!("{READ_SYSCALL} on the listener socket bound to {addr}{hint}"))
 }
 
 /// Words of `u64` backing one `mmsghdr`, and one `iovec`, in [`BatchReader`]'s storage --
@@ -3155,6 +3206,121 @@ mod tests {
             counter(&events, "logit.input.datagrams"),
             1.0,
             "a truncated datagram is still a datagram -- it is delivered, so it is counted as one"
+        );
+    }
+
+    /// The fatal-error path, which before this test nothing covered at all: `read_loop`'s
+    /// `Err` break, its `queue.close()` on the way out, and the message an operator is left with.
+    ///
+    /// **A real, deterministic, unprivileged non-`EAGAIN` error, with no fault injection.** That
+    /// is harder than it sounds: every errno an unconnected UDP socket can produce on the receive
+    /// path is either unreachable (`bind_one`'s doc has the kernel citations) or needs privilege
+    /// (`ss -K`, i.e. `SOCK_DESTROY` → `ECONNABORTED`) or `strace -e inject=`. What does work is a
+    /// descriptor that is *readable but is not a socket*: a pipe whose write end has a byte in it
+    /// is immediately `EPOLLIN`, so `async_io` hands control to the closure on the first poll, and
+    /// `recvmmsg(2)` on it returns `ENOTSOCK` -- a genuine kernel error, first call, every time.
+    ///
+    /// This is also why the message must name the syscall rather than lean on `io::Error`'s own
+    /// text. Without [`describe_read_failure`] the whole report is `component 'statsd_in': Socket
+    /// operation on non-socket (os error 88)` -- and for the case that actually happens in the
+    /// field, a sandbox refusing the syscall, `Function not implemented (os error 38)`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket() {
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2(2)` writes two descriptors into the two-element array it is handed, and
+        // `fds` is exactly that. `O_NONBLOCK` is set here rather than with a second `fcntl`
+        // because tokio requires a non-blocking descriptor for `from_std`.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2(2) failed: {}", std::io::Error::last_os_error());
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // One byte, so the read end is readable and `async_io` proceeds straight to the closure
+        // instead of parking on a readiness that would never arrive.
+        // SAFETY: `write_fd` is a live descriptor from the `pipe2` above; the source is a
+        // one-byte buffer this frame owns and the length matches it exactly.
+        let written = unsafe { libc::write(write_fd, c"x".as_ptr().cast(), 1) };
+        assert_eq!(written, 1, "writing to the pipe failed: {}", std::io::Error::last_os_error());
+
+        // SAFETY: `read_fd` is a live, owned descriptor that this test never uses again by number
+        // -- `UdpSocket` takes sole ownership of it here and closes it exactly once, on drop. It
+        // is deliberately *not* a socket; that is the condition under test, and passing a
+        // non-socket descriptor is an `ENOTSOCK` at the syscall, not undefined behaviour.
+        let not_a_socket = unsafe { std::net::UdpSocket::from_raw_fd(read_fd) };
+        let socket = tokio::net::UdpSocket::from_std(not_a_socket)
+            .expect("tokio registers any pollable non-blocking descriptor");
+
+        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_loop(&socket, Arc::clone(&queue), Telemetry::default(), shutdown_rx, 64),
+        )
+        .await
+        .expect("a fatal read error must end the loop, not hang it")
+        .expect_err("recvmmsg(2) on a pipe is ENOTSOCK, which is fatal to the listener");
+
+        // SAFETY: `write_fd` is still the live descriptor `pipe2` returned; nothing else owns it
+        // and it is not used again after this.
+        unsafe { libc::close(write_fd) };
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(READ_SYSCALL),
+            "a fatal read must name the syscall an operator has to go looking for, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("listener socket"),
+            "and say which socket it was reading, got: {rendered}"
+        );
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error),
+            Some(libc::ENOTSOCK),
+            "the original errno must survive as the error's cause, not be flattened into a string"
+        );
+        assert!(
+            queue.pop().await.is_none(),
+            "a fatal read must still close the queue on the way out -- that is the only signal \
+             decode_loop has that nothing more will arrive"
+        );
+    }
+
+    /// The seccomp case, at the seam rather than through a sandbox: `ENOSYS`/`EPERM` is what
+    /// quinn#1947 and bun#42678 both hit, and the default message for it (`Function not
+    /// implemented (os error 38)`) tells an operator nothing at all. Forcing the real syscall to
+    /// return it needs `strace -e inject=recvmmsg:error=ENOSYS:when=1` (`script/unsafe-check
+    /// inject`, which is out of CI by design); what belongs *in* CI is that the mapping from that
+    /// errno to a message worth reading does not quietly disappear.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sandbox_blocked_syscall_is_named_along_with_why_read_batch_one_would_not_help() {
+        let socket = bind_ephemeral().await;
+        let addr = socket.local_addr().expect("a bound socket has an address");
+
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            let err = describe_read_failure(&socket, std::io::Error::from_raw_os_error(errno))
+                .to_string();
+            assert!(err.contains(READ_SYSCALL), "errno {errno}: must name the syscall, got: {err}");
+            assert!(
+                err.contains(&addr.to_string()),
+                "errno {errno}: must name the bound socket, got: {err}"
+            );
+            assert!(
+                err.contains("seccomp") && err.contains("read_batch: 1"),
+                "errno {errno}: must say what blocks the call and that the obvious config \
+                 workaround is not one, got: {err}"
+            );
+        }
+
+        // Every other errno gets the syscall and the address and nothing invented on top.
+        let plain = describe_read_failure(&socket, std::io::Error::from_raw_os_error(libc::EBADF))
+            .to_string();
+        assert!(plain.contains(READ_SYSCALL) && plain.contains(&addr.to_string()));
+        assert!(
+            !plain.contains("seccomp"),
+            "an unrelated errno must not be guessed at, got: {plain}"
         );
     }
 
