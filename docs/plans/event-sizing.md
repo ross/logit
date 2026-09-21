@@ -234,6 +234,42 @@ resource/scope group is 5 events).
 - **W3 — the arms**, under `crates/logit-bench/src/bakeoff/` beside `wire_mirror.rs`. P is small
   enough to build for real in `logit-core`; S and E through a const-generic mirror; K and R
   bench-only.
+- **W3b — bench-only arms.** Arms **C**, **E** and **K**, under
+  `crates/logit-bench/src/bakeoff/attr_arms/`, beside the native-wire-format bake-off and built to
+  its pattern: a local mirror of the shipped type, measured against it, with every simplification
+  stated in the mirror's own module doc. Nothing in `logit-core` changes.
+  - **C — the clone path**, an arm this plan did not originally have. W2 measured
+    `AttrMap::clone` at an order of magnitude more than its bytes cost, and W1 found the clone, not
+    the build, is what a fan-out pays. `clone_arms.rs` holds four candidate replacements for
+    `SmallVec`'s element-at-a-time clone — an exactly-sized write loop, a one-branch scalar clone,
+    a detected bitwise copy, and a per-map "every value is a scalar" flag — plus the floor and
+    measurement-shape controls needed to say whether the shipped number is real.
+  - **E — per-embedding capacity**: `thin.rs`'s `ThinMap`/`ThinValue`, a heap-only, exactly-sized
+    map held *inline* in a `Value` instead of `Value::Map(Box<AttrMap>)`, measured on the
+    pino-http nested record and on 1-map/4-map synthetics, and at `Scope`/`Resource` widths (0, 5,
+    17, 29). The const-generic `AttrMap<const N>` question is answered as an assessment — how many
+    signatures and crates it would ripple through — not an implementation.
+  - **K — a shared key-set plus a values vector**: `keyset.rs`'s `Arc<[Symbol]>` key-set, a
+    positional `Vec<Value>`, a learned bounded cache keyed on the arrival key *sequence*, and a
+    transition memo for the shape change a `set`/`remove` transform forces. Measured against arm
+    P's bulk build and today's sorted insert on build, clone, lookup, mutate and iterate, and on a
+    synthesized mixed-gateway stream (196 key-sets, top-1 9%, top-5 36%).
+  - **Kill criteria**, applied as registered: **K** must beat the append-then-sort bulk build by
+    **≥10% on the 12-attribute log's build + clone combined**, and hold up on the gateway shape;
+    **C** has none — it either explains W2's clone cost with a candidate fix or shows the number
+    was an artifact; **E** has none either, being a sizing assessment. W4 re-takes every timing on
+    the VM and W5 records the verdicts.
+  - `tests/attr_arms.rs` is the gate the timings are only read after: every arm must produce the
+    same sorted `(Symbol, Value)` sequence the shipped `AttrMap` does from the same input,
+    **duplicate keys included — last write wins** — alongside the layout pins, the per-arm
+    allocation and byte counts, and the two numbers the gateway distribution has to reproduce.
+    One finding from writing it belongs to arm P rather than here: a bulk build is only equivalent
+    to repeated `insert` if it sorts *stably* and collapses each run of equal keys to its **last**
+    entry, which `benches/size_vs_alloc.rs`'s simpler `append_then_sort` mirror does not do.
+  - Run it pinned, on the perf VM: `taskset -c 2 cargo bench -p logit-bench --bench attr_arms`.
+    The allocation counts come from `cargo nextest run -p logit-bench --test attr_arms
+    --no-capture`. **No timing number from either goes in this repository** (this plan's "Settled
+    decisions", `docs/design/performance.md` §0).
 - **W4 — the VM session.** `script/vm build <ref>` per real-binary arm, `script/perf run
   --logit-bin` / `compare` across every scenario class; summary into `docs/design/performance.md`.
 - **W5 — the ADR**, `docs/adr/event-sizing-and-allocation-strategy.md`: the decision and its
