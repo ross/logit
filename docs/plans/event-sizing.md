@@ -74,9 +74,14 @@ sorted by `Symbol`, binary-search lookup, positional insert — so building a k-
   loops `insert` (`logit_proto::native::value::read_attr_map_at` — while the metric list beside it
   *does* reserve, `native::record::read_record_list_into`); OTLP has `kvs.len()`; `csv` and `regex`
   know their width at construction; `json`/`logfmt` know `scratch.len()` at the merge.
-- Today: k ≤ 8 → 0 allocations; 9–16 → 1; 17–32 → 1 plus a growth realloc. Every parsed
-  structured log spills; wide spans and access logs chain. (w1 verifies smallvec 1.x's growth
-  policy before anything leans on these counts.)
+- Today: k ≤ 8 → 0 allocations; 9–16 → 1; 17–32 → 1 plus a growth realloc; 33–64 → 1 plus two.
+  Every parsed structured log spills; wide spans and access logs chain. **Verified in W1** rather
+  than inferred from smallvec's documentation
+  (`attr_map_spills_to_double_its_inline_capacity_then_reallocs`,
+  [`memory.md`](../design/memory.md) §1's ladder table): the spill goes to **twice** the inline
+  capacity, not to an exactly-sized buffer, and every doubling after it is a `realloc` — so the
+  `alloc` column is nearly blind to width past 9, which is the proxy problem "Target metric" below
+  describes, now with a number behind it.
 - **N is not paid per channel hop** — only the `EventBatch` handle moves. It is paid in the
   `Vec<Event>` buffer (cache density of every batch scan), in each copy-on-write
   `EventBatch::clone` (`memory.md` §3), and **everywhere `AttrMap` is embedded**: `Resource`,
@@ -150,13 +155,22 @@ resource/scope group is 5 events).
 ## Workstreams
 
 - **W0 — this plan.**
-- **W1 — fixtures and a baseline.** `crates/logit-bench/src/fixtures.rs` gains the six
-  survey-derived shapes (12-attribute flat JSON log, pino-http nested record, 16–17-attribute
-  server span, 30-field access log, 3-record collectd event, 17-attribute resource over a 5-event
-  batch), each citing the survey row it models. Divan benches for build, lookup, mutate, **clone**,
-  `drain_inbox`, `route_batch`, `retain_mut`, and native encode; `allocations.rs` pins at today's
-  constants; matching `perf/scenarios/*.yaml` through `generate_in`. Verifies smallvec's growth
-  policy first. Updates `memory.md` §2/§7.
+- **W1 — fixtures and a baseline. Landed.** `crates/logit-bench/src/fixtures.rs` gained the six
+  survey-derived shapes (12-attribute flat JSON log, pino-http nested record, 17-attribute server
+  span, 30-field access log, 3-record collectd event, 17-attribute resource over a 5-event batch),
+  each citing the survey row it models and each stating what is modelled rather than captured.
+  Divan benches for build, lookup (hit and miss), mutate, **clone**, a 1000-event scan, native
+  encode/decode, plus `process_batch` (the `retain_mut` path) and `route_batch` — `drain_inbox` is
+  reachable but returns only when its inbox closes, so it stays an allocation count in
+  `allocations.rs` rather than a bench. `allocations.rs` pins build/clone/encode/decode at today's
+  constants; `perf/scenarios/json-parse-{app-log,nested-log,access-log}.yaml` render the same
+  bodies through `generate_in`. smallvec's growth policy verified first (see above).
+  `memory.md` §1/§2/§7/§8 updated.
+  - Two results worth carrying into W2–W5: a spilled `AttrMap` clones in **one** allocation
+    whatever its width, so allocation count barely separates the 12-attribute and 30-attribute
+    logs; and the *nested* 10-attribute pino-http record costs **five** to build and five to clone,
+    more than either. The proxy this plan warns about inverts on measured shapes, not just in
+    principle.
 - **W2 — the unmeasured ratio.** A micro-bench of jemalloc alloc/free against an `Event` move at
   each candidate size; `script/perf flamegraph` on W1's scenarios for a current malloc / realloc /
   memmove / clone share; `perf stat` cache misses over a 1000-event batch scan. May prune arms.
