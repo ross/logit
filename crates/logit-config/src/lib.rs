@@ -3014,10 +3014,12 @@ pub struct ReceiveConfig {
     /// shutdown path only.
     ///
     /// `0` is rejected (graph rule 18 -- no datagram could ever be read); above `1024` is rejected
-    /// (graph rule 57 -- `UIO_MAXIOV`, the kernel's own ceiling on how many `iovec`s one vectored
-    /// I/O call may carry). A `read_batch` **larger than `max_datagrams`** is deliberately legal
-    /// and needs no rule: a batch that cannot fit in the whole queue is admitted item by item under
-    /// the configured `overflow` policy, exactly as a sequence of single pushes would have been.
+    /// (graph rule 57). `1024` is `UIO_MAXIOV`'s number, but the ceiling is `logit`'s own choice,
+    /// not a kernel limit: the kernel imposes no ceiling on how many messages one `recvmmsg(2)`
+    /// call may ask for, and what `1024` actually bounds is the slab above and the shutdown-path
+    /// loss below. A `read_batch` **larger than `max_datagrams`** is deliberately legal and needs
+    /// no rule: a batch that cannot fit in the whole queue is admitted item by item under the
+    /// configured `overflow` policy, exactly as a sequence of single pushes would have been.
     pub read_batch: usize,
 }
 
@@ -3052,10 +3054,17 @@ pub const fn default_read_batch() -> usize {
     64
 }
 
-/// The ceiling graph rule 57 enforces on `receive.read_batch`: `UIO_MAXIOV`, the kernel's own hard
-/// limit on how many `iovec`s a single vectored I/O call may carry, and so on `recvmmsg`'s `vlen`.
-/// A larger value would be clamped or refused by the kernel depending on call path; rejecting it at
-/// validation time turns that into a config error with a name attached.
+/// The ceiling graph rule 57 enforces on `receive.read_batch`.
+///
+/// **1024 is `UIO_MAXIOV`'s number, chosen by `logit`, not imposed by the kernel.** `UIO_MAXIOV`
+/// bounds `msg_iovlen` *within one* `msghdr` (`__copy_msghdr`, `net/socket.c`, returns `-EMSGSIZE`
+/// above it) and the UDP read path sets that to 1. There is no equivalent clamp on `recvmmsg`'s
+/// `vlen`: `do_recvmmsg` loops `while (datagrams < vlen)` with no ceiling, and the only
+/// `UIO_MAXIOV` clamp on a `vlen` anywhere in the kernel is `__sys_sendmmsg`'s, on the send side.
+/// What this ceiling really bounds is `logit`'s own cost -- the per-listener `read_batch x 65,507`
+/// slab, and how many datagrams a cancelled push can discard on the shutdown path -- so rejecting
+/// a larger value at validation time is a policy choice with a name attached, not a kernel limit
+/// being pre-empted. See `crates/logit-inputs/src/udp.rs`'s `MAX_READ_BATCH`.
 ///
 /// `pub` for the same reason [`default_handshake_timeout`] is: `logit_pipeline::graph` needs the
 /// number and already depends on this crate, so it imports it rather than keeping a second copy.

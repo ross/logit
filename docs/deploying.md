@@ -511,7 +511,9 @@ components:
 **Linux only, in effect.** `recvmmsg` is a Linux syscall; on any other target the read loop still
 takes one datagram per `recv_from` and this field is parsed, validated and then ignored, so one
 config file stays portable. (The decode-side batch it also sets applies everywhere.) `logit validate`
-rejects `0` and anything above `1024` — the kernel's own `UIO_MAXIOV` ceiling on a vectored I/O call.
+rejects `0` and anything above `1024`. That ceiling is `UIO_MAXIOV`'s number but `logit`'s own
+limit, not the kernel's: what it bounds is the per-listener slab above and how many datagrams a
+shutdown can discard mid-push, not anything `recvmmsg(2)` would refuse.
 
 **When raising it is worth anything: watch the mean fill.** Divide `logit.input.datagrams` by
 `logit.input.reads` and you get how many datagrams an average syscall actually returned.
