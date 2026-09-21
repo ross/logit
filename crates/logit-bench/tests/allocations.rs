@@ -4096,7 +4096,10 @@ fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
 /// | 3-record collectd event | 6 | 1 |
 ///
 /// A spilled `AttrMap` costs exactly **one** allocation to clone no matter how far past 8 it is
-/// -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer -- so the 30-attribute
+/// -- `AttrMap`'s hand-written `Clone` sizes the copy to `len` (a derived one went through
+/// smallvec's `reserve` and asked for the next power of two: 768 B for the 12-attribute map, 1536
+/// for the 30-attribute one; [`clone_of_a_spilled_attr_map_is_sized_to_len`] pins the bytes) -- so
+/// the 30-attribute
 /// access log and the 12-attribute log are indistinguishable by allocation count and differ only
 /// in bytes moved (1440 against 576, plus the 864-byte `Event` itself either way). What *does*
 /// move the number is nesting: the pino-http record's four boxed `Value::Map`s are four more
@@ -4109,6 +4112,22 @@ fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
 /// collectd events, `docs/design/data-shapes.md` §3 -- the only measured `MetricList` spill in the
 /// survey). The span's is its map, with no `events`/`links` `Vec`s to pay for, the exact
 /// complement of [`clone_span_event`].
+/// The bytes side of [`clone_survey_shapes`], which its allocation counts can't see: one
+/// allocation of exactly `len * 48` bytes, where a derived `Clone` asked smallvec's `reserve` for
+/// the next power of two -- 768 for 12 attributes, 1536 for 30.
+#[test]
+fn clone_of_a_spilled_attr_map_is_sized_to_len() {
+    for (label, event, expected_bytes) in [
+        ("12-attribute flat log", parsed_survey_event(fixtures::flat_json_log_event), 12 * 48),
+        ("30-attribute access log", parsed_survey_event(fixtures::access_log_event), 30 * 48),
+    ] {
+        drop(event.attributes.clone());
+        let (cloned, stats) = measure(|| event.attributes.clone());
+        assert_eq!(cloned.capacity(), event.attributes.len(), "{label}");
+        assert_eq!((stats.allocs, stats.reallocs, stats.bytes), (1, 0, expected_bytes), "{label}");
+    }
+}
+
 #[test]
 fn clone_survey_shapes() {
     expect_clone_allocs(

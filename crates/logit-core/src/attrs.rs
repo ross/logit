@@ -16,8 +16,24 @@ use std::cmp::Ordering;
 
 const INLINE_CAPACITY: usize = 8;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct AttrMap(SmallVec<[(Symbol, Value); INLINE_CAPACITY]>);
+
+/// Hand-written rather than derived, for one reason: a derived `Clone` is `SmallVec::clone`, which
+/// collects through `extend`, which sizes a spilled copy with `reserve` -- and smallvec's `reserve`
+/// rounds up to the next power of two. So cloning a 12-attribute map asked for 16 slots (768 B
+/// where 576 hold it) and a 17-attribute one for 32 (1536 B for 816), on every fan-out branch that
+/// copies an event. `reserve_exact` first makes `extend`'s own `reserve` a no-op: the same single
+/// allocation, sized to `len`. A map that fits inline reserves nothing either way. See
+/// `docs/design/memory.md` §1 and `docs/plans/event-sizing.md`.
+impl Clone for AttrMap {
+    fn clone(&self) -> Self {
+        let mut entries = SmallVec::new();
+        entries.reserve_exact(self.0.len());
+        entries.extend(self.0.iter().cloned());
+        Self(entries)
+    }
+}
 
 impl AttrMap {
     pub fn new() -> Self {
@@ -329,6 +345,18 @@ mod tests {
         }
         map.extend_unsorted(pairs.iter().map(|(k, v)| (*k, Value::I64(*v))));
         map
+    }
+
+    #[test]
+    fn a_clone_is_sized_to_its_length_not_the_next_power_of_two() {
+        for k in [1, INLINE_CAPACITY, 9, 12, 17, 30] {
+            let syms = probe_symbols(k);
+            let mut map = AttrMap::new();
+            map.extend_unsorted(syms.iter().enumerate().map(|(i, s)| (*s, Value::I64(i as i64))));
+            let cloned = map.clone();
+            assert_eq!(cloned, map);
+            assert_eq!(cloned.capacity(), k.max(INLINE_CAPACITY), "clone of {k} entries");
+        }
     }
 
     #[test]

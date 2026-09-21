@@ -273,6 +273,16 @@ resource/scope group is 5 events).
     12064). Allocation counts are unchanged everywhere, which is the point — the win is in the
     reallocation and capacity columns that `allocs` was always blind to. `type_sizes.rs` does not
     move: this arm changes no `size_of`.
+- **W3c — an exactly-sized `AttrMap::clone`. Landed.** W3b's clone arm found that a derived
+  `Clone` sizes a spilled copy through smallvec's `reserve` — the next power of two, so 768 B for
+  a 12-attribute map that needs 576 and 1536 for a 30-attribute one that needs 1440 — on every
+  fan-out branch that copies an event. (W1's baseline had called that buffer exactly-sized; it
+  wasn't, and the count-only pin couldn't tell.) `AttrMap` now has a hand-written `Clone` that
+  calls `reserve_exact(len)` first: the same one allocation, sized to `len`, pinned by bytes in
+  `clone_of_a_spilled_attr_map_is_sized_to_len`. This is invariant I2 applied to the copy rather
+  than the build. The per-entry cost W3b measured (an outlined ten-arm `Value::clone` and, at
+  realistic string shares, an atomic refcount bump per value) is untouched — that is the clone
+  arm's open question for W4, not this change.
 - **W4 — the VM session.** `script/vm build <ref>` per real-binary arm, `script/perf run
   --logit-bin` / `compare` across every scenario class; summary into `docs/design/performance.md`.
 - **W5 — the ADR**, `docs/adr/event-sizing-and-allocation-strategy.md`: the decision and its
