@@ -171,9 +171,66 @@ resource/scope group is 5 events).
     logs; and the *nested* 10-attribute pino-http record costs **five** to build and five to clone,
     more than either. The proxy this plan warns about inverts on measured shapes, not just in
     principle.
-- **W2 — the unmeasured ratio.** A micro-bench of jemalloc alloc/free against an `Event` move at
-  each candidate size; `script/perf flamegraph` on W1's scenarios for a current malloc / realloc /
-  memmove / clone share; `perf stat` cache misses over a 1000-event batch scan. May prune arms.
+- **W2 — the unmeasured ratio. Landed.** Three instruments, no production change:
+  - **`crates/logit-bench/benches/size_vs_alloc.rs`** — divan micro-benches isolating the ratio,
+    under **real jemalloc** installed as that bench binary's own `#[global_allocator]`
+    ([ADR `jemalloc-global-allocator`](../adr/jemalloc-global-allocator.md)), deliberately *not*
+    `benches/pipeline.rs`'s `divan::AllocProfiler` — that wraps the **system** allocator and counts
+    every request from inside the timed region, which is the right trade for an allocation-count
+    bench and the wrong one when the cost of an allocation is the question. So this file reports no
+    allocation column; those counts stay in `tests/allocations.rs`. Six groups: an alloc/free pair
+    at the sizes `AttrMap`'s ladder asks for (432/576/768/1440/1536/3072), same-thread and
+    **cross-thread in steady state** (allocated on one task's thread, freed on a sink's, which is
+    the real lifecycle); the 768→1536→3072 realloc ladder against one exact allocation; today's
+    sorted `insert` against an append-then-sort `Vec<(Symbol, Value)>` mirror at k = 9/12/17/30;
+    one `Event`-sized move at each candidate `size_of::<Event>()` (496…1632, a padded struct, not a
+    real `Event`); a 1000-event batch scan at each stride over 8 rotated batches, plus dropping and
+    cloning the batch buffer itself; and `AttrMap::clone` inline (8) against spilled (9, 12). Each
+    bench's module doc says what it isolates and what it can't.
+  - **`logit-perf flamegraph --folded PATH`** — tees `inferno-collapse-perf`'s output beside the
+    SVG, so a capture can be asked a second question without another `perf record`; and
+    **`perf/folded_share.py`**, which reports the share of samples whose stack contains a jemalloc,
+    memcpy, `AttrMap`/`SmallVec`, drop-glue, clone, interner, or `serde_json` frame. Containment,
+    counted once per stack, so the groups overlap and don't partition.
+  - **A `perf stat` recipe** for the batch scan, in the commands below.
+
+  **Reproducing on the perf VM** (`script/vm up`, then in the checkout there):
+
+  ```sh
+  # 1. the micro-benches, pinned to one core -- the numbers W4 records
+  taskset -c 2 cargo bench -p logit-bench --bench size_vs_alloc
+
+  # 2. share of samples under the allocator, per scenario
+  for s in json-parse-app-log json-parse-nested-log json-parse-access-log passthrough; do
+      script/perf flamegraph --scenario "$s" --folded "perf/results/$s.folded"
+  done
+  python3 perf/folded_share.py perf/results/*.folded
+  python3 perf/folded_share.py perf/results/passthrough.folded --explain alloc
+
+  # 3. cache misses over the 1000-event scan, at each stride. `--bench` is required: without it
+  #    divan runs its test mode and measures nothing. The counters cover divan's setup too --
+  #    see the caveat below.
+  BIN=$(ls -t target/release/deps/size_vs_alloc-* | grep -v '\.d$' | head -1)
+  for n in 496 864 1632; do
+      perf stat -e task-clock,cycles,instructions,cache-references,cache-misses,\
+  L1-dcache-loads,L1-dcache-load-misses -- "$BIN" --bench "touch_head::$n\$"
+  done
+  ```
+
+  Step 2 and step 3 both need the profiling image's capabilities (`crates/logit-perf/Dockerfile`,
+  `--cap-add SYS_ADMIN`, unconfined seccomp) — `script/perf flamegraph` arranges them; a bare
+  `perf stat` has to be run inside that image the same way. Azure's guest exposes no virtualized
+  PMU ([ADR `disposable-azure-perf-vm`](../adr/disposable-azure-perf-vm.md),
+  [`performance.md`](../design/performance.md) §5), so on the VM step 3 will fall back to software
+  events and the cache counters may read `<not supported>`; in that case the stride comparison has
+  to come from the micro-bench's own timings, not from counters.
+
+  **Two caveats W4 must carry forward.** `perf stat` measures the whole process, and divan's
+  per-stride setup (8×1000 elements) dominates it — attributing counters to the scan alone needs
+  `perf record -e cache-misses` plus symbol filtering. And the `memmove` column reads 0.00% on
+  every capture because LLVM inlines `Event`-sized copies into SIMD stores attributed to their
+  caller; the release binary never calls libc `memcpy`, so **the copy side of the ratio is
+  invisible to a flamegraph by construction** — which is the whole reason the micro-bench exists.
 - **W3 — the arms**, under `crates/logit-bench/src/bakeoff/` beside `wire_mirror.rs`. P is small
   enough to build for real in `logit-core`; S and E through a const-generic mirror; K and R
   bench-only.

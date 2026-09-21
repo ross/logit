@@ -1358,6 +1358,26 @@ because a cold call folds in one-time initialization and reports a number that n
 runner measures the runner. divan's `AllocProfiler` reports allocation counts alongside timings, so
 the two layers cross-check each other.
 
+**`crates/logit-bench/benches/size_vs_alloc.rs`** — the one bench file that answers a question the
+three layers above structurally can't: *what does an allocation cost, against what the bytes it
+saves cost?* ([ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)
+states that ratio as its premise and flags, in its own text, that nothing here has measured it;
+[`event-sizing.md`](../plans/event-sizing.md)'s W2 is the measurement.) It isolates a jemalloc
+alloc/free pair at the sizes `AttrMap`'s growth ladder asks for — same-thread and **cross-thread**,
+since a spilled buffer is built on a listener or transform task and freed on a sink's — the
+768→1536→3072 realloc ladder against one exact allocation, the O(k²) sorted build against
+append-then-sort, an `Event`-sized move and a 1000-event batch scan at every candidate
+`size_of::<Event>()`, and `AttrMap::clone` inline against spilled.
+
+It is the **only** bench target here that installs real jemalloc as its `#[global_allocator]`
+rather than a counting wrapper, and that is the point: `AllocProfiler` wraps the *system* allocator
+and counts every request from inside the timed region, which is exactly right for a bench whose
+output is a count and exactly wrong for one whose output is what a call to jemalloc costs. The
+trade is that this file reports no allocation column at all — an acceptable one, since allocation
+counts are allocator-independent and already pinned in `allocations.rs`. Its numbers are not
+recorded anywhere: this document and [`performance.md`](performance.md) both take recorded figures
+from the perf VM, and `event-sizing.md`'s W2 section names the commands that reproduce them there.
+
 One constraint worth knowing before adding benches: divan's `AllocProfiler` only counts allocations
 on threads it controls. Almost every bench here sidesteps the question entirely by calling
 decoders, transforms, and encoders **directly**, never touching the tokio runtime or the channels
