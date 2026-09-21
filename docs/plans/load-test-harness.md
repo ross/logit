@@ -94,8 +94,9 @@ widths of the same `json` parse, so a sizing arm can be read against the bimodal
 estimates scaled off `json-parse`'s by key count. **They have since been run** — the event-sizing
 bake-off (`docs/design/performance.md` §8) ran all three on `main`, median of six repeats — and none
 landed in the 5–10 s band: 10.9 s, 13.9 s, and 12.4 s respectively, all overshooting. Their counts
-still want lowering; a `--repeat 5`, retuned-count pass against this table's own protocol is the
-next thing owed to them, now with real wall-time data to retune from instead of a first estimate.
+were then lowered to 9M, 4.5M and 3M — each scaled to ~8 s from its measured wall time; a
+`--repeat 5` pass against this table's own protocol, at the new counts, is the next thing owed to
+them.
 
 Counts target roughly 5-10 seconds of wall time each. **Retuned 2026-09-20 for the disposable perf
 VM** (`docs/adr/disposable-azure-perf-vm.md`), the project's reference box — most scenarios already

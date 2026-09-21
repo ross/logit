@@ -24,13 +24,13 @@
 # (`json_parse_pino_http_nested_event`). Any sizing arm that improves flat width without touching
 # `Value::Map` should show up as this scenario moving least.
 #
-# The count targets docs/plans/load-test-harness.md's 5-10 s band and is a **first estimate**,
-# scaled off json-parse's 19M by this shape's key count -- it has never been run on the reference
-# VM, so it will want retuning the first time it is (docs/design/performance.md §1).
+# The count targets docs/plans/load-test-harness.md's 5-10 s band. The first estimate (8M, scaled
+# off json-parse's by key count) ran 13.9 s on the reference VM (docs/design/performance.md §8), so
+# this is that count scaled to ~8 s from the measured wall time -- not yet re-run at this value.
 components:
   gen:
     type: generate_in
-    count: 8000000
+    count: 4500000
     event:
       log: '{{"level":30,"time":1725091200123,"pid":4821,"hostname":"api-7c9f8d6b5-abcde","reqId":"req-8461","req":{{"method":"POST","url":"/api/v1/orders","headers":{{"host":"shop.example.com","content-type":"application/json","content-length":"842"}}}},"res":{{"statusCode":201,"headers":{{"content-type":"application/json","content-length":"57","vary":"Accept-Encoding"}}}},"responseTime":18,"msg":"request completed"}}'
       attributes:

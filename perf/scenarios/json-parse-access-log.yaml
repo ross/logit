@@ -26,13 +26,13 @@
 # two of those three allocations are one JSON-escaped value, PostgreSQL's habit of quoting the
 # constraint name in a violation message.
 #
-# The count targets docs/plans/load-test-harness.md's 5-10 s band and is a **first estimate**,
-# scaled off json-parse's 19M by this shape's key count -- it has never been run on the reference
-# VM, so it will want retuning the first time it is (docs/design/performance.md §1).
+# The count targets docs/plans/load-test-harness.md's 5-10 s band. The first estimate (5M, scaled
+# off json-parse's by key count) ran 12.4 s on the reference VM (docs/design/performance.md §8), so
+# this is that count scaled to ~8 s from the measured wall time -- not yet re-run at this value.
 components:
   gen:
     type: generate_in
-    count: 5000000
+    count: 3000000
     event:
       log: '{{"timestamp":"2026-09-07 06:52:01.123 UTC","user":"orders_app","dbname":"orders","pid":4821,"remote_host":"10.0.0.17","remote_port":54871,"session_id":"68bd2f41.12d5","line_num":142,"ps":"INSERT","session_start":"2026-09-07 06:40:11 UTC","vxid":"4/2841","txid":"918273","error_severity":"ERROR","state_code":"23505","message":"duplicate key value violates unique constraint \"orders_pkey\"","detail":"Key (id)=(12345) already exists.","hint":"Retry with a fresh identifier.","internal_query":"INSERT INTO orders (id) VALUES ($1)","internal_position":13,"context":"PL/pgSQL function place_order(integer) line 8 at SQL statement","statement":"SELECT place_order(12345)","cursor_position":8,"func_name":"_bt_check_unique","file_name":"nbtinsert.c","file_line_num":666,"application_name":"orders-api","backend_type":"client backend","query_id":-3491082746118273645,"leader_pid":4788}}'
       attributes:

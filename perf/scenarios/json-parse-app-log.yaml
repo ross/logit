@@ -25,13 +25,13 @@
 # nginx shape sits barely over the same line and logfmt-parse's 9 sits one slot over it. Read
 # against json-parse, this is the per-key parse cost at the width a real logging library produces.
 #
-# The count targets docs/plans/load-test-harness.md's 5-10 s band and is a **first estimate**,
-# scaled off json-parse's 19M by this shape's key count -- it has never been run on the reference
-# VM, so it will want retuning the first time it is (docs/design/performance.md §1).
+# The count targets docs/plans/load-test-harness.md's 5-10 s band. The first estimate (12M, scaled
+# off json-parse's by key count) ran 10.9 s on the reference VM (docs/design/performance.md §8), so
+# this is that count scaled to ~8 s from the measured wall time -- not yet re-run at this value.
 components:
   gen:
     type: generate_in
-    count: 12000000
+    count: 9000000
     event:
       log: '{{"time":"2026-09-07T06:52:01.123456789Z","level":"INFO","msg":"request completed","method":"POST","path":"/api/v1/orders","status":201,"duration_ms":18.4,"bytes":842,"remote_addr":"198.51.100.23","request_id":"c3f7a1e2-9b44-4f0a-8c2d-11f2a9d40abc","user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}}'
       attributes:

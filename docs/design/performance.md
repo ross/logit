@@ -1440,9 +1440,12 @@ every table above. Their actual `wall_s` (median of 6, `main` binary):
 | `json-parse-nested-log` | 8M | 13.9 s | No — overshoots by ~4 s |
 | `json-parse-access-log` | 5M | 12.4 s | No — overshoots by ~2.4 s |
 
-None of the three landed in the target band on `main` at their shipped counts; all three ran long,
-`json-parse-nested-log` most of all. The first estimates were too generous across the board and want
-lowering, not just retuning in either direction — a first real data point for the "the first session
+None of the three landed in the target band on `main` at the counts this session ran them at; all
+three ran long, `json-parse-nested-log` most of all. **Their shipped counts have since been lowered**
+— 12M → 9M, 8M → 4.5M, 5M → 3M, each scaled to ~8 s from the wall time above, and not yet re-run at
+the new value (CPU µs/event, which every table in this section reports, does not depend on the
+count). The first estimates were too generous across the board and wanted lowering, not just
+retuning in either direction — a first real data point for the "the first session
 that runs them should expect to retune them" line these scenarios' own YAML and
 `docs/plans/load-test-harness.md` already carried.
 
