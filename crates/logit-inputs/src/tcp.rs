@@ -920,7 +920,10 @@ impl AcceptQueueSampler {
                 );
                 // See `crate::udp::ReceiveBufferSampler::sample_once` for why a non-Linux build
                 // gets `debug` and everything else gets `warn`.
-                if matches!(err, sockstat::Unavailable::NotLinux) {
+                if matches!(
+                    err,
+                    sockstat::Unavailable::NotLinux | sockstat::Unavailable::NoDescriptor
+                ) {
                     self.diag.debug(message);
                 } else {
                     self.diag.warn(message);

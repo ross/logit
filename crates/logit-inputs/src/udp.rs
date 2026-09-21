@@ -1075,11 +1075,15 @@ impl ReceiveBufferSampler {
                      listener: {err}{hint}; logit.input.kernel.drops, \
                      logit.input.receive_buffer.used.bytes and .utilization will not be reported"
                 );
-                // A build that is simply not Linux can do nothing about this, and `internal`'s
-                // `logs:` setting captures `warn` into the pipeline by default -- so one line per
-                // listener at startup would be noise an operator cannot act on. Everything else
-                // is a real failure on a platform that should have worked.
-                if matches!(err, sockstat::Unavailable::NotLinux) {
+                // A build that is simply not Linux (or has no raw descriptors at all) can do
+                // nothing about this, and `internal`'s `logs:` setting captures `warn` into the
+                // pipeline by default -- so one line per listener at every startup would be noise
+                // an operator cannot act on. Everything else is a real failure on a platform that
+                // should have worked, and stays at `warn`.
+                if matches!(
+                    err,
+                    sockstat::Unavailable::NotLinux | sockstat::Unavailable::NoDescriptor
+                ) {
                     self.diag.debug(message);
                 } else {
                     self.diag.warn(message);
