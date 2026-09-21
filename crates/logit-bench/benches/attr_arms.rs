@@ -197,6 +197,31 @@ mod clone_c {
         }
     }
 
+    /// **What a clone of a map with (almost) nothing in it costs.** Every bench in this module
+    /// reads ~90 ns at width 2, which is more than two entries can possibly account for, so the
+    /// floor has to be measured rather than assumed: an empty map, a one-entry map, and -- as the
+    /// control -- a bare 384-byte copy of a plain array consumed in exactly the same shape.
+    ///
+    /// The gap between `empty` and `raw_copy_384` is what the harness and the 392-byte move cost;
+    /// whatever is left over the `by_width` numbers is the clone itself.
+    mod floor {
+        use super::*;
+
+        #[divan::bench(args = [0usize, 1, 2])]
+        fn empty_or_tiny(bencher: Bencher, width: usize) {
+            let map = mirror(width, Mix::Scalar);
+            bencher.bench_local(|| consume(black_box(&map).clone_baseline()));
+        }
+
+        /// A 384-byte `[u64; 48]`, cloned and consumed identically: no enum, no `Drop`, no
+        /// capacity check -- just the bytes an eight-entry inline `AttrMap` occupies.
+        #[divan::bench]
+        fn raw_copy_384(bencher: Bencher) {
+            let array = [0u64; 48];
+            bencher.bench_local(|| consume(*black_box(&array)));
+        }
+    }
+
     /// `Event::clone` on W1's six survey shapes -- the whole-event cost a fan-out really pays, of
     /// which the attribute map is one part. Nothing here is a mirror: these are the shipped types.
     mod event_clone {
