@@ -59,7 +59,7 @@ impl AttrMap {
         self.0.reserve_exact(additional);
     }
 
-    /// Inserts every pair in `pairs`, in **one** reservation and **one** sort, with exactly
+    /// Inserts every pair in `pairs`, in **at most one** allocation and **one** sort, with exactly
     /// [`AttrMap::insert_sym`]'s semantics: the map ends up sorted by [`Symbol`], and on a repeated
     /// key the last write wins -- whether the earlier write is another entry of `pairs` or an entry
     /// the map already held.
@@ -67,13 +67,20 @@ impl AttrMap {
     /// This is the bulk build every decoder and parser that knows its width should use. A
     /// `k`-attribute map built one [`AttrMap::insert_sym`] at a time moves O(k²) bytes, because
     /// each insert shifts the entries after its sorted position; appending and sorting once moves
-    /// O(k log k) and, with the reservation, takes exactly one allocation instead of a growth
-    /// chain. `pairs` need not be sorted, and generally is not: [`Symbol`] order is *local
-    /// interning* order, so nothing off a wire or out of a parser scratch arrives sorted here.
+    /// O(k log k) and, when the heap is needed at all, takes exactly one exactly-sized allocation
+    /// instead of a growth chain. `pairs` need not be sorted, and generally is not: [`Symbol`]
+    /// order is *local interning* order, so nothing off a wire or out of a parser scratch arrives
+    /// sorted here.
     ///
-    /// `pairs` must know its length ([`ExactSizeIterator`]) -- that length is the reservation. A
-    /// producer that cannot hand over an iterator (a decoder reading fallibly from a byte stream,
-    /// say) uses [`AttrMap::bulk_insert`] directly, which is what this is written over.
+    /// **A map that ends up within the inline capacity still allocates nothing**, however long
+    /// `pairs` claims to be -- the reservation happens at the moment of a genuine spill, not up
+    /// front. `pairs` is an upper bound on the final width, not a count of new keys: entries that
+    /// overwrite (each other, or what the map already held) cost no capacity at all.
+    ///
+    /// `pairs` must know its length ([`ExactSizeIterator`]) -- that length is what gets reserved
+    /// if a spill happens. A producer that cannot hand over an iterator (a decoder reading
+    /// fallibly from a byte stream, say) uses [`AttrMap::bulk_insert`] directly, which is what
+    /// this is written over.
     pub fn extend_unsorted<I>(&mut self, pairs: I)
     where
         I: IntoIterator<Item = (Symbol, Value)>,
@@ -86,20 +93,21 @@ impl AttrMap {
         }
     }
 
-    /// Opens a bulk build of `additional` more entries: reserves once, then takes them in any
-    /// order through [`BulkInsert::push`], and restores the sorted invariant when the returned
-    /// guard is dropped. [`AttrMap::extend_unsorted`] is the one-call form and the one to prefer;
-    /// this exists for a producer whose push loop can fail partway (`?` out of a decode) or whose
-    /// pairs don't come from a single iterator.
+    /// Opens a bulk build of up to `additional` more entries: takes them in any order through
+    /// [`BulkInsert::push`], reserves once if and when one of those pushes actually needs the
+    /// heap, and restores the sorted invariant when the returned guard is dropped.
+    /// [`AttrMap::extend_unsorted`] is the one-call form and the one to prefer; this exists for a
+    /// producer whose push loop can fail partway (`?` out of a decode) or whose pairs don't come
+    /// from a single iterator.
     ///
-    /// `additional` is an upper bound, not a promise: pushing fewer leaves the reservation unused,
-    /// pushing more falls back to ordinary amortized growth. The guard borrows the map, so no
-    /// caller can observe the unsorted intermediate state, and it finishes on `Drop`, so an early
-    /// return leaves a valid map behind.
+    /// `additional` is an upper bound, not a promise, and nothing is reserved on the strength of
+    /// it until a push finds the map full: pushing fewer, or pushing keys that overwrite rather
+    /// than append, costs nothing, and pushing more falls back to ordinary amortized growth. The
+    /// guard borrows the map, so no caller can observe the unsorted intermediate state, and it
+    /// finishes on `Drop`, so an early return leaves a valid map behind.
     pub fn bulk_insert(&mut self, additional: usize) -> BulkInsert<'_> {
-        self.0.reserve_exact(additional);
         let base = self.0.len();
-        BulkInsert { map: self, base, seen: 0 }
+        BulkInsert { map: self, base, seen: 0, remaining: additional }
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -188,7 +196,8 @@ pub struct BulkInsert<'a> {
     /// Length of the map when the build opened: entries below this are the already-sorted ones
     /// the incoming entries have to merge with (and can overwrite).
     base: usize,
-    /// A 128-bit membership filter over the keys pushed so far, `1 << (symbol % 128)`.
+    /// A 128-bit membership filter over the keys pushed into the **tail** so far,
+    /// `1 << (symbol % 128)`.
     ///
     /// Duplicate keys have to be resolved **before** the sort, because the sort is
     /// `sort_unstable_by_key` and so tells us nothing about which of two equal keys was pushed
@@ -202,15 +211,62 @@ pub struct BulkInsert<'a> {
     /// that overwrites in place. Duplicate keys are rare in real telemetry (a repeated field in
     /// one JSON object or logfmt line), so the scan is rare, and the filter is exact for any map
     /// whose keys happen to fall in distinct residues.
+    ///
+    /// It covers only the tail because a key the *head* already holds never reaches the tail --
+    /// [`BulkInsert::push`] overwrites it where it sits.
     seen: u128,
+    /// Entries the caller still says are coming, counting the one being pushed: `additional` at
+    /// open, decremented by every `push` whatever that push does. `len() + remaining` is therefore
+    /// a non-increasing **upper bound** on the map's final length, which is exactly the number
+    /// [`BulkInsert::push`] reserves at the moment it first needs the heap.
+    remaining: usize,
 }
 
 impl BulkInsert<'_> {
     /// Adds one entry. Order doesn't matter; a key already pushed in this build, or already in the
     /// map before it opened, is overwritten -- last write wins, exactly as with repeated
     /// [`AttrMap::insert_sym`] calls.
+    ///
+    /// Three things happen here rather than in `Drop`, and all three are load-bearing.
+    ///
+    /// **A key the map already held is overwritten in place**, before the tail is consulted. That
+    /// is what keeps the tail free of keys the head has: without it, an incoming run that merely
+    /// *re-states* attributes an event already carries would grow the map to `base + k` entries
+    /// and only collapse back at the end, spilling on the way for a result that fits inline. A
+    /// re-parse onto an already-parsed event is a real shape, not a contrived one.
+    ///
+    /// **The reservation is lazy.** `bulk_insert` reserves nothing; the heap is asked for only
+    /// when an append actually finds the map full, and then for `remaining` entries -- the whole
+    /// rest of the declared run in one `reserve_exact`, sized to `len() + remaining`. So a build
+    /// that ends up inside the inline capacity allocates nothing no matter what the caller
+    /// declared (`docs/plans/event-sizing.md`'s invariant I1), and one that genuinely spills still
+    /// takes a single exactly-sized buffer (I2). An eager `reserve_exact(additional)` broke I1 for
+    /// every caller whose `additional` is an upper bound rather than a count -- `regex`'s named
+    /// groups, a run that mostly overwrites -- which is what a review of the first version of this
+    /// found.
+    ///
+    /// **A hint that was too low just falls back to smallvec's own growth.** Once `remaining` hits
+    /// zero the reservation is skipped entirely and `push` grows the map the ordinary amortized
+    /// way, because the alternative -- `reserve_exact(1)` per entry -- is a `realloc` per entry.
+    /// `bulk_insert(0)` (Lua, which cannot get a table's hash-part length out of the VM) is the
+    /// deliberate case: it takes the sort and none of the sizing, which is exactly today's growth
+    /// behaviour.
     pub fn push(&mut self, key: Symbol, value: impl Into<Value>) {
         let value = value.into();
+        // Counting this entry: `map.len() + declared` is the run's upper-bound final length.
+        let declared = self.remaining;
+        self.remaining = declared.saturating_sub(1);
+
+        // Already in the map before this build opened: overwrite where it sits. The head is
+        // sorted and, being the map's own entries, holds each key at most once.
+        if self.base > 0 {
+            if let Ok(at) = self.map.0[..self.base].binary_search_by_key(&key, |(k, _)| *k) {
+                self.map.0[at].1 = value;
+                return;
+            }
+        }
+
+        // Already pushed into the tail by this build: same rule, one filter test away.
         let bit = 1u128 << (key.into_usize() & 127);
         if self.seen & bit != 0 {
             if let Some(slot) = self.map.0[self.base..].iter_mut().find(|(k, _)| *k == key) {
@@ -219,39 +275,25 @@ impl BulkInsert<'_> {
             }
         }
         self.seen |= bit;
+
+        if declared > 0 && self.map.0.len() == self.map.0.capacity() {
+            // Exactly the rest of the declared run, this entry included: one buffer of
+            // `len() + declared` entries, and no second one unless the hint was too low.
+            self.map.0.reserve_exact(declared);
+        }
         self.map.0.push((key, value));
     }
 }
 
 impl Drop for BulkInsert<'_> {
     fn drop(&mut self) {
-        let base = self.base;
-        if self.map.0.len() == base {
-            return; // nothing pushed
+        if self.map.0.len() == self.base {
+            return; // nothing appended -- either nothing was pushed, or it all overwrote
         }
-
-        // Entries pushed here win over entries the map already held, so an incoming key that
-        // collides with an existing one overwrites that slot's value and drops out of the tail.
-        // Walking the tail backwards keeps `swap_remove` honest: it pulls from the very end,
-        // which is always a position already visited.
-        if base > 0 {
-            let mut i = self.map.0.len();
-            while i > base {
-                i -= 1;
-                let key = self.map.0[i].0;
-                if let Ok(at) = self.map.0[..base].binary_search_by_key(&key, |(k, _)| *k) {
-                    let (_, value) = self.map.0.swap_remove(i);
-                    self.map.0[at].1 = value;
-                }
-            }
-            if self.map.0.len() == base {
-                return; // every incoming entry overwrote one already there; still sorted
-            }
-        }
-
-        // Every key is distinct now, so an unstable sort is fully determined -- there are no
-        // equal elements left for it to reorder. It allocates nothing, which `slice::sort` would
-        // not promise at these widths.
+        // Every key is distinct: the head held each of its own at most once, [`BulkInsert::push`]
+        // kept the tail free of both head keys and tail repeats, so there are no equal elements
+        // for an unstable sort to reorder and its result is fully determined. It allocates
+        // nothing, which `slice::sort` would not promise at these widths.
         self.map.0.sort_unstable_by_key(|(k, _)| *k);
     }
 }
@@ -348,6 +390,90 @@ mod tests {
         let mut rounded = AttrMap::new();
         rounded.reserve(12);
         assert_eq!(rounded.capacity(), 16, "`reserve` rounds to the next power of two");
+    }
+
+    /// The regression a review of the first version of this found: an eager
+    /// `reserve_exact(additional)` spilled a map that, built a key at a time, would have stayed
+    /// inline -- because `additional` is an upper bound for several callers (`regex`'s named
+    /// capture groups, any run that overwrites rather than appends), not a count of new keys.
+    #[test]
+    fn a_bulk_build_that_stays_inline_never_reserves() {
+        let syms = probe_symbols(10);
+
+        // A generous hint, one actual push, six entries already there: `regex` with a three-group
+        // pattern of which one participated.
+        let mut map = AttrMap::new();
+        for (i, s) in syms.iter().take(6).enumerate() {
+            map.insert_sym(*s, Value::I64(i as i64));
+        }
+        {
+            let mut bulk = map.bulk_insert(3);
+            bulk.push(syms[7], Value::I64(70));
+        }
+        assert_eq!(map.len(), 7);
+        assert_eq!(map.capacity(), INLINE_CAPACITY, "an unused hint must not spill the map");
+
+        // Every incoming key overwrites one already there, so the map does not grow at all.
+        let mut map = AttrMap::new();
+        for (i, s) in syms.iter().take(6).enumerate() {
+            map.insert_sym(*s, Value::I64(i as i64));
+        }
+        map.extend_unsorted(vec![
+            (syms[0], Value::I64(100)),
+            (syms[3], Value::I64(103)),
+            (syms[5], Value::I64(105)),
+        ]);
+        assert_eq!(map.len(), 6, "three overwrites, no new entries");
+        assert_eq!(map.capacity(), INLINE_CAPACITY, "overwrites must not spill the map");
+        assert_eq!(map.get_sym(syms[3]), Some(&Value::I64(103)));
+
+        // Three genuinely new keys onto the same six: one exactly-sized buffer of nine.
+        let mut map = AttrMap::new();
+        for (i, s) in syms.iter().take(6).enumerate() {
+            map.insert_sym(*s, Value::I64(i as i64));
+        }
+        map.extend_unsorted(vec![
+            (syms[6], Value::I64(106)),
+            (syms[7], Value::I64(107)),
+            (syms[8], Value::I64(108)),
+        ]);
+        assert_eq!(map.len(), 9);
+        assert_eq!(map.capacity(), 9, "one buffer, sized to the run");
+    }
+
+    /// A hint below the number of pushes is legal and just gives up the sizing: the map grows the
+    /// ordinary amortized way from the point the hint runs out, rather than taking a
+    /// `reserve_exact(1)` -- and so a `realloc` -- per entry. `bulk_insert(0)` is the deliberate
+    /// case (Lua, which cannot get a table's hash-part length out of the VM).
+    #[test]
+    fn a_hint_that_was_too_low_falls_back_to_ordinary_growth() {
+        let syms = probe_symbols(20);
+
+        let mut map = AttrMap::new();
+        {
+            let mut bulk = map.bulk_insert(0);
+            for (i, s) in syms.iter().enumerate() {
+                bulk.push(*s, Value::I64(i as i64));
+            }
+        }
+        assert_eq!(map.len(), 20);
+        assert_eq!(map.capacity(), 32, "smallvec's own doubling, 8 -> 16 -> 32");
+
+        // A hint that covers part of the run: the reservation it does make is still exact, and
+        // the rest doubles from there.
+        let mut map = AttrMap::new();
+        {
+            let mut bulk = map.bulk_insert(10);
+            for (i, s) in syms.iter().enumerate() {
+                bulk.push(*s, Value::I64(i as i64));
+            }
+        }
+        assert_eq!(map.len(), 20);
+        assert_eq!(
+            map.capacity(),
+            32,
+            "reserved exactly 10 at the spill, then smallvec's own next-power-of-two growth"
+        );
     }
 
     #[test]
@@ -454,6 +580,46 @@ mod tests {
             let expected_entries: Vec<(Symbol, &Value)> = expected.iter().collect();
             let actual_entries: Vec<(Symbol, &Value)> = actual.iter().collect();
             proptest::prop_assert_eq!(actual_entries, expected_entries);
+        }
+
+        /// The same equivalence through `bulk_insert` with an **arbitrary** hint -- far too low
+        /// (including 0), far too high, or right. The hint is a sizing input and nothing else: it
+        /// may not change a single entry or their order, at any width.
+        #[test]
+        fn a_bulk_build_matches_a_sequence_of_inserts_for_any_hint(
+            base_idx in proptest::collection::vec(0usize..40, 0..12),
+            pair_idx in proptest::collection::vec(0usize..40, 0..70),
+            hint in 0usize..120,
+        ) {
+            let syms = probe_symbols(40);
+            let base: Vec<(Symbol, i64)> =
+                base_idx.iter().enumerate().map(|(v, i)| (syms[*i], v as i64)).collect();
+            let pairs: Vec<(Symbol, i64)> = pair_idx
+                .iter()
+                .enumerate()
+                .map(|(v, i)| (syms[*i], 1000 + v as i64))
+                .collect();
+
+            let expected = by_repeated_insert(&base, &pairs);
+
+            let mut actual = AttrMap::new();
+            for (k, v) in &base {
+                actual.insert_sym(*k, Value::I64(*v));
+            }
+            {
+                let mut bulk = actual.bulk_insert(hint);
+                for (k, v) in &pairs {
+                    bulk.push(*k, Value::I64(*v));
+                }
+            }
+
+            let expected_entries: Vec<(Symbol, &Value)> = expected.iter().collect();
+            let actual_entries: Vec<(Symbol, &Value)> = actual.iter().collect();
+            proptest::prop_assert_eq!(actual_entries, expected_entries);
+            // Whatever the hint, a map that fits inline must not have reached the heap.
+            if actual.len() <= INLINE_CAPACITY {
+                proptest::prop_assert_eq!(actual.capacity(), INLINE_CAPACITY);
+            }
         }
     }
 
