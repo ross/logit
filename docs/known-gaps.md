@@ -79,7 +79,12 @@ already built that have a known, accepted rough edge.
     mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the same
     ground a corpus-driven fuzzer would, but needs nightly Rust to build at all
     (`docs/adr/containerized-development.md`'s stable-only toolchain), so real fuzz targets are
-    deferred, not built.
+    deferred, not built. [ADR `out-of-ci-unsafe-verification`](adr/out-of-ci-unsafe-verification.md)
+    carves out a throwaway nightly image for a different, narrower need (miri/`cargo-careful`/
+    fault injection over the codebase's raw-`libc` `unsafe`, not decoder fuzzing) and explicitly
+    defers `cargo-fuzz` again in its own "Alternatives considered" — the two gaps are related but
+    not the same one, and closing this one still means standing up `cargo-fuzz` targets, not just
+    pointing them at that image.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable** — graph
     validation's rule 17 rejects a `receive:` block on either (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace` with no config-level
