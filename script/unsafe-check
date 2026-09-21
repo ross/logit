@@ -39,6 +39,12 @@ MIRI_TARGETS=(
     "logit-inputs|parse_events"
 )
 
+# Every checkout binds at the same `/work`, so cargo's fingerprints match across branches: two
+# worktrees sharing one target volume can run each other's already-compiled test binaries. One
+# checkout at a time is fine on the default; a second, concurrent one sets
+# `UNSAFE_CHECK_TARGET_VOLUME` to a volume of its own.
+TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
+
 build_image() {
     ${DOCKER} build -q -t "${IMAGE}" -f tools/unsafe-check/Dockerfile tools/unsafe-check >/dev/null
 }
@@ -56,7 +62,7 @@ run_in_image() {
         -u 1000:1000 -w /work \
         -v "${ROOT}:/work:z" \
         -v logit_unsafe_check_cargo_home:/home/dev/.cargo \
-        -v logit_unsafe_check_target:/work/target \
+        -v "${TARGET_VOLUME}:/work/target" \
         -e CARGO_HOME=/home/dev/.cargo \
         -e CARGO_TARGET_DIR=/work/target \
         -e MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}" \
@@ -80,7 +86,7 @@ run_privileged_in_image() {
         -u 1000:1000 -w /work \
         -v "${ROOT}:/work:z" \
         -v logit_unsafe_check_cargo_home:/home/dev/.cargo \
-        -v logit_unsafe_check_target:/work/target \
+        -v "${TARGET_VOLUME}:/work/target" \
         -e CARGO_HOME=/home/dev/.cargo \
         -e CARGO_TARGET_DIR=/work/target \
         "${IMAGE}" "$@"
