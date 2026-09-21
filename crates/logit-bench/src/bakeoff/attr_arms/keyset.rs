@@ -254,18 +254,27 @@ impl KeySetCache {
     pub fn build(&mut self, scratch: Vec<(Symbol, Value)>) -> KeySetMap {
         self.clock += 1;
         let hash = hash_sequence(scratch.iter().map(|(k, _)| *k));
-        if let Some(entry) = self.entries.get_mut(&hash) {
-            // Verified, not assumed: a 64-bit collision would otherwise mis-key an event's values.
-            if entry.sequence.len() == scratch.len()
-                && entry.sequence.iter().zip(scratch.iter()).all(|(a, (b, _))| a == b)
-            {
-                entry.last_used = self.clock;
-                self.hits += 1;
-                let keys = Arc::clone(&entry.keys);
-                let distinct = entry.distinct;
-                let perm = entry.perm.clone();
-                return KeySetMap::place(keys, &perm, scratch, distinct);
+        // Verified, not assumed: a 64-bit collision would otherwise mis-key an event's values.
+        let hit = match self.entries.get_mut(&hash) {
+            Some(entry) => {
+                let same = entry.sequence.len() == scratch.len()
+                    && entry.sequence.iter().zip(scratch.iter()).all(|(a, (b, _))| a == b);
+                if same {
+                    entry.last_used = self.clock;
+                }
+                same
             }
+            None => false,
+        };
+        if hit {
+            // Borrowed, not cloned: the permutation is read in place, so a hit allocates nothing
+            // beyond the values vector itself. A `perm.clone()` here would put an allocation on
+            // arm K's hot path that the representation does not actually require.
+            let entry = &self.entries[&hash];
+            let map =
+                KeySetMap::place(Arc::clone(&entry.keys), &entry.perm, scratch, entry.distinct);
+            self.hits += 1;
+            return map;
         }
         self.misses += 1;
         let (keys, perm, distinct) = key_set_of(&scratch);

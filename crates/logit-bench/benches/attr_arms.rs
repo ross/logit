@@ -35,7 +35,7 @@ use logit_bench::bakeoff::attr_arms::shapes::{self, Mix};
 use logit_bench::bakeoff::attr_arms::thin;
 use logit_bench::fixtures;
 use logit_core::interner::{intern, Symbol};
-use logit_core::{AttrMap, Event, Value};
+use logit_core::{Event, Value};
 use logit_pipeline::Transform;
 
 /// The real allocator, unwrapped -- see this file's module doc.
@@ -265,20 +265,12 @@ mod embed_e {
     /// 4-map synthetics either side of it.
     const NESTED: [&str; 3] = ["pino", "1map", "4map"];
 
-    fn nested_today(shape: &str) -> AttrMap {
+    /// Interned once, outside every timed region -- see `thin::NestedKeys`.
+    fn nested_keys(shape: &str) -> thin::NestedKeys {
         match shape {
-            "pino" => thin::nested_today(Mix::Mostly),
-            "1map" => thin::synthetic_today(1, Mix::Mostly),
-            "4map" => thin::synthetic_today(4, Mix::Mostly),
-            other => unreachable!("unknown nested shape {other}"),
-        }
-    }
-
-    fn nested_thin(shape: &str) -> thin::ThinMap {
-        match shape {
-            "pino" => thin::nested_thin(Mix::Mostly),
-            "1map" => thin::synthetic_thin(1, Mix::Mostly),
-            "4map" => thin::synthetic_thin(4, Mix::Mostly),
+            "pino" => thin::pino_keys(),
+            "1map" => thin::synthetic_keys(1),
+            "4map" => thin::synthetic_keys(4),
             other => unreachable!("unknown nested shape {other}"),
         }
     }
@@ -289,38 +281,37 @@ mod embed_e {
 
         #[divan::bench(args = NESTED)]
         fn build_today(bencher: Bencher, shape: &str) {
-            // The keys are interned by the warm-up call; the timed region rebuilds the map.
-            let _warm = nested_today(shape);
-            bencher.bench_local(|| consume(nested_today(black_box(shape))));
+            let keys = nested_keys(shape);
+            bencher.bench_local(|| consume(thin::nested_today(black_box(&keys), Mix::Mostly)));
         }
 
         #[divan::bench(args = NESTED)]
         fn build_thin(bencher: Bencher, shape: &str) {
-            let _warm = nested_thin(shape);
-            bencher.bench_local(|| consume(nested_thin(black_box(shape))));
+            let keys = nested_keys(shape);
+            bencher.bench_local(|| consume(thin::nested_thin(black_box(&keys), Mix::Mostly)));
         }
 
         #[divan::bench(args = NESTED)]
         fn clone_today(bencher: Bencher, shape: &str) {
-            let map = nested_today(shape);
+            let map = thin::nested_today(&nested_keys(shape), Mix::Mostly);
             bencher.bench_local(|| consume(black_box(&map).clone()));
         }
 
         #[divan::bench(args = NESTED)]
         fn clone_thin(bencher: Bencher, shape: &str) {
-            let map = nested_thin(shape);
+            let map = thin::nested_thin(&nested_keys(shape), Mix::Mostly);
             bencher.bench_local(|| consume(black_box(&map).clone()));
         }
 
         #[divan::bench(args = NESTED)]
         fn drop_today(bencher: Bencher, shape: &str) {
-            let map = nested_today(shape);
+            let map = thin::nested_today(&nested_keys(shape), Mix::Mostly);
             bencher.with_inputs(|| map.clone()).bench_local_values(drop);
         }
 
         #[divan::bench(args = NESTED)]
         fn drop_thin(bencher: Bencher, shape: &str) {
-            let map = nested_thin(shape);
+            let map = thin::nested_thin(&nested_keys(shape), Mix::Mostly);
             bencher.with_inputs(|| map.clone()).bench_local_values(drop);
         }
 
@@ -328,8 +319,8 @@ mod embed_e {
         /// `Box` deref today against a `Vec` deref.
         #[divan::bench(args = NESTED)]
         fn lookup_today(bencher: Bencher, shape: &str) {
-            let map = nested_today(shape);
-            let (outer, inner) = nested_keys(shape);
+            let map = thin::nested_today(&nested_keys(shape), Mix::Mostly);
+            let (outer, inner) = lookup_pair(shape);
             bencher.bench_local(|| {
                 let found = black_box(&map).get_sym(black_box(outer));
                 match found {
@@ -341,8 +332,8 @@ mod embed_e {
 
         #[divan::bench(args = NESTED)]
         fn lookup_thin(bencher: Bencher, shape: &str) {
-            let map = nested_thin(shape);
-            let (outer, inner) = nested_keys(shape);
+            let map = thin::nested_thin(&nested_keys(shape), Mix::Mostly);
+            let (outer, inner) = lookup_pair(shape);
             bencher.bench_local(|| {
                 let found = black_box(&map).get_sym(black_box(outer));
                 match found {
@@ -355,7 +346,7 @@ mod embed_e {
         }
 
         /// The outer key of a nested map and one key inside it, for the lookup benches.
-        fn nested_keys(shape: &str) -> (Symbol, Symbol) {
+        fn lookup_pair(shape: &str) -> (Symbol, Symbol) {
             match shape {
                 "pino" => (intern("w3b.pino.req"), intern("w3b.pino.req.00")),
                 _ => (intern("w3b.syn.map.0"), intern("w3b.syn.m0.00")),
@@ -380,8 +371,8 @@ mod embed_e {
 
         #[divan::bench(args = EMBED_WIDTHS)]
         fn build_thin(bencher: Bencher, width: usize) {
-            let _warm = thin::flat_thin("e", width, Mix::Mostly);
-            bencher.bench_local(|| consume(thin::flat_thin("e", black_box(width), Mix::Mostly)));
+            let scratch = shapes::scratch("e", width, Mix::Mostly);
+            bencher.bench_local(|| consume(thin::thin_map(black_box(&scratch))));
         }
 
         #[divan::bench(args = EMBED_WIDTHS)]
@@ -392,7 +383,7 @@ mod embed_e {
 
         #[divan::bench(args = EMBED_WIDTHS)]
         fn clone_thin(bencher: Bencher, width: usize) {
-            let map = thin::flat_thin("e", width, Mix::Mostly);
+            let map = thin::thin_map(&shapes::scratch("e", width, Mix::Mostly));
             bencher.bench_local(|| consume(black_box(&map).clone()));
         }
     }
