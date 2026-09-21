@@ -1056,15 +1056,36 @@ impl ReceiveBufferSampler {
         if !self.enabled {
             return;
         }
-        let info = self.fd.and_then(sockstat::meminfo);
-        let Some(info) = info else {
-            self.enabled = false;
-            self.diag.warn(format_args!(
-                "the kernel's per-socket receive counters are not available for this listener -- \
-                 SO_MEMINFO needs Linux 4.12 or newer; logit.input.kernel.drops, \
-                 logit.input.receive_buffer.used.bytes and .utilization will not be reported"
-            ));
-            return;
+        let info = self.fd.ok_or(sockstat::Unavailable::NoDescriptor).and_then(sockstat::meminfo);
+        let info = match info {
+            Ok(info) => info,
+            Err(err) => {
+                self.enabled = false;
+                // What the kernel actually said, and the version hint *only* where it applies:
+                // `EBADF` here would mean a stale or reused descriptor -- a bug in logit, and the
+                // one cause an operator most needs to not see dressed up as "upgrade your kernel".
+                // `Unavailable::is_unsupported_option` is what draws that line.
+                let hint = if err.is_unsupported_option() {
+                    " (SO_MEMINFO needs Linux 4.12 or newer)"
+                } else {
+                    ""
+                };
+                let message = format_args!(
+                    "the kernel's per-socket receive counters are not available for this \
+                     listener: {err}{hint}; logit.input.kernel.drops, \
+                     logit.input.receive_buffer.used.bytes and .utilization will not be reported"
+                );
+                // A build that is simply not Linux can do nothing about this, and `internal`'s
+                // `logs:` setting captures `warn` into the pipeline by default -- so one line per
+                // listener at startup would be noise an operator cannot act on. Everything else
+                // is a real failure on a platform that should have worked.
+                if matches!(err, sockstat::Unavailable::NotLinux) {
+                    self.diag.debug(message);
+                } else {
+                    self.diag.warn(message);
+                }
+                return;
+            }
         };
         let dropped = self.drops.delta(info.drops);
         if dropped > 0 {

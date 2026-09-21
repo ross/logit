@@ -823,15 +823,33 @@ impl AcceptQueueSampler {
         if !self.enabled {
             return;
         }
-        let queue = self.fd.and_then(sockstat::listen_queue);
-        let Some((depth, backlog)) = queue else {
-            self.enabled = false;
-            self.diag.warn(format_args!(
-                "the kernel's accept-queue depth is not available for this listener -- \
-                 TCP_INFO's listener fields are Linux-only; logit.input.accept_queue.depth, \
-                 .limit and .utilization will not be reported"
-            ));
-            return;
+        let queue =
+            self.fd.ok_or(sockstat::Unavailable::NoDescriptor).and_then(sockstat::listen_queue);
+        let (depth, backlog) = match queue {
+            Ok(queue) => queue,
+            Err(err) => {
+                self.enabled = false;
+                // The real cause, and the platform claim only where it holds: `EBADF` or a
+                // listener that has left `LISTEN` are both about this socket, not about Linux.
+                let hint = if err.is_unsupported_option() {
+                    " (TCP_INFO's listener fields are Linux-only)"
+                } else {
+                    ""
+                };
+                let message = format_args!(
+                    "the kernel's accept-queue depth is not available for this listener: \
+                     {err}{hint}; logit.input.accept_queue.depth, .limit and .utilization will \
+                     not be reported"
+                );
+                // See `crate::udp::ReceiveBufferSampler::sample_once` for why a non-Linux build
+                // gets `debug` and everything else gets `warn`.
+                if matches!(err, sockstat::Unavailable::NotLinux) {
+                    self.diag.debug(message);
+                } else {
+                    self.diag.warn(message);
+                }
+                return;
+            }
         };
         self.telemetry.gauge("logit.input.accept_queue.depth", f64::from(depth), &[]);
         self.telemetry.gauge("logit.input.accept_queue.limit", f64::from(backlog), &[]);
