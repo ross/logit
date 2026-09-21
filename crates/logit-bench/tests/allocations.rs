@@ -3794,6 +3794,72 @@ fn re_interning_an_existing_string_is_free() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// AttrMap growth (docs/plans/event-sizing.md W1)
+// ---------------------------------------------------------------------------------------------
+
+/// `AttrMap`'s spill-and-grow ladder, pinned exactly -- the thing every sizing argument in
+/// [`docs/plans/event-sizing.md`](../../../docs/plans/event-sizing.md) rests on, and which until
+/// this test was **inferred** from smallvec 1.x's documented amortized doubling rather than
+/// measured here (`crates/logit-core/src/attrs.rs` pins the inline capacity of 8 and nothing else).
+///
+/// What it measures, per attribute count `k`, building one map a sorted `insert_sym` at a time:
+///
+/// | k | allocs | reallocs | heap bytes | capacity |
+/// |--:|--:|--:|--:|--:|
+/// | 1, 8 | 0 | 0 | 0 (inline) | 8 |
+/// | 9, 16 | 1 | 0 | 768 | 16 |
+/// | 17, 24, 32 | 1 | 1 | 1536 | 32 |
+/// | 33 | 1 | 2 | 3072 | 64 |
+///
+/// So: the 9th entry spills to a heap buffer of **twice the inline capacity**, not to an
+/// exactly-sized one, and every doubling after that is a `realloc` rather than a fresh `alloc` --
+/// which is why the alloc column stays at 1 all the way out and the growth chain only shows up in
+/// the realloc column this file counts separately (see the module doc). A 24-attribute map
+/// therefore holds 1536 bytes of heap for 1152 bytes of entries, on top of the 392 inline bytes it
+/// has already paid for and abandoned.
+///
+/// Capacity is read off `peak_live_bytes` rather than asked for: `AttrMap` exposes no `capacity`
+/// (nor `reserve`/`with_capacity` -- that absence is the plan's lead finding), and at 48 bytes per
+/// `(Symbol, Value)` entry (`crates/logit-core/tests/type_sizes.rs`) the live heap at the end of
+/// the region *is* `capacity * 48`. Nothing else allocates inside the measured region: the symbols
+/// are interned up front and the values are `I64`s.
+#[test]
+fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
+    let syms: Vec<logit_core::interner::Symbol> =
+        (0..33).map(|i| logit_core::interner::intern(&format!("growth.probe.k{i:02}"))).collect();
+
+    let build = |k: usize| {
+        measure(|| {
+            let mut map = AttrMap::new();
+            for (i, sym) in syms.iter().take(k).enumerate() {
+                map.insert_sym(*sym, Value::I64(i as i64));
+            }
+            map
+        })
+    };
+    drop(build(33)); // warm
+
+    // (k, allocs, reallocs, capacity)
+    for (k, allocs, reallocs, capacity) in [
+        (1usize, 0u64, 0u64, 8u64),
+        (8, 0, 0, 8),
+        (9, 1, 0, 16),
+        (16, 1, 0, 16),
+        (17, 1, 1, 32),
+        (24, 1, 1, 32),
+        (32, 1, 1, 32),
+        (33, 1, 2, 64),
+    ] {
+        let (map, stats) = build(k);
+        assert_eq!(map.len(), k);
+        expect_allocs(&format!("AttrMap: build {k} attributes"), stats, allocs);
+        assert_eq!(stats.reallocs, reallocs, "AttrMap: build {k} attributes -- realloc count");
+        let measured = if stats.peak_live_bytes == 0 { 8 } else { stats.peak_live_bytes / 48 };
+        assert_eq!(measured, capacity, "AttrMap: build {k} attributes -- capacity");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Native wire format (logit_proto::native)
 // ---------------------------------------------------------------------------------------------
 
