@@ -3993,9 +3993,11 @@ fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
 /// | 3-record collectd event | 6 | 1 |
 ///
 /// A spilled `AttrMap` costs exactly **one** allocation to clone no matter how far past 8 it is
-/// -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer -- so the 30-attribute
-/// access log and the 12-attribute log are indistinguishable by allocation count and differ only
-/// in bytes moved (1440 against 576, plus the 864-byte `Event` itself either way). What *does*
+/// -- smallvec clones `len` entries into one fresh buffer (sized by `reserve`, so to the next
+/// power of two: 768 bytes for 12 entries, 1536 for 30 -- not exactly, as a first draft of this
+/// comment said; `tests/attr_arms.rs` pins the bytes) -- so the 30-attribute access log and the
+/// 12-attribute log are indistinguishable by allocation count and differ only in entries copied
+/// (30 against 12, plus the 864-byte `Event` itself either way). What *does*
 /// move the number is nesting: the pino-http record's four boxed `Value::Map`s are four more
 /// allocations on a *narrower* event. An allocation-count-denominated sizing argument would rank
 /// these three shapes in an order the byte-movement one does not, which is the plan's point about

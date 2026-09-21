@@ -308,7 +308,7 @@ line — `crates/logit-bench/tests/allocations.rs`.
 | `json` parse 10-attribute nested pino-http record | **5** | 1 spill + **4 boxed `Value::Map`s** (`req{}`, `res{}` and the `headers{}` inside each). A *narrower* event than the row above and five times the allocations -- `Value::Map` is `Box<AttrMap>`, so every nested object pays the full 392-byte inline footprint again, whatever its width (§6 of `data-shapes.md`: "nested maps multiply whatever is chosen") |
 | `json` parse 30-attribute access log (PostgreSQL `jsonlog`) | **3** | + **2 reallocs** -- the only shipped shape whose map grows twice (8 → 16 → 32, §1's ladder). Only *one* of the three allocations is the map: the other two are a single JSON-escaped value, PostgreSQL quoting the constraint name in a violation message, which cannot be sliced zero-copy |
 | `Event::clone` (12-attribute flat log) | **1** | the spilled `AttrMap`, nothing else |
-| `Event::clone` (30-attribute access log) | **1** | **the same as the 12-attribute row** -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer, so a spilled map costs exactly one allocation however far past 8 it is. The two shapes differ only in bytes moved (1440 against 576, plus 864 for the `Event` either way): the clearest single demonstration that allocation count and copy cost rank these shapes differently |
+| `Event::clone` (30-attribute access log) | **1** | **the same as the 12-attribute row** -- smallvec clones `len` entries into one fresh buffer, so a spilled map costs exactly one allocation however far past 8 it is. That buffer is **not** exactly sized, as a first draft of this row claimed: `SmallVec::clone` collects through `extend`, whose `reserve` rounds up to the next power of two, so the 12-attribute clone asks for 768 bytes and this one for 1536 (`tests/attr_arms.rs`'s `clone_allocations_and_bytes_by_arm` pins it). An exactly-sized clone was built and measured CPU-neutral on the perf VM, and not adopted (ADR `event-sizing-and-allocation-strategy`). The two shapes differ in entries copied (30 against 12, plus 864 bytes for the `Event` either way): the clearest single demonstration that allocation count and copy cost rank these shapes differently |
 | `Event::clone` (10-attribute nested pino-http record) | **5** | 1 spill + 1 per boxed `Value::Map`. The narrowest of the three log shapes and by far the most expensive to clone |
 | `Event::clone` (17-attribute server span) | **1** | the spilled map alone -- the exact complement of the `span shape` row above, whose map stays inline and whose two allocations are its `events`/`links` `Vec`s. Measured spans carry neither: 76% of 114,551 demo spans had no events and **none** had a link (`data-shapes.md` §4) |
 | `Event::clone` (3-record collectd event, 6 attributes) | **1** | `MetricList`'s spill, not the map's: six attributes fit inline and three records do not. The only measured `MetricList` spill in the survey -- 17.4% of 16,590 collectd events carry 2 records, 0.4% carry 3 (`data-shapes.md` §3) |
@@ -1640,10 +1640,16 @@ separates a 12-attribute log from a 30-attribute one; and the *nested* shape, at
 five times more expensive to clone than either. An argument for item 12 denominated in allocations
 alone would rank those three shapes in an order bytes moved does not.
 
-12. **`AttrMap`'s inline capacity, increased rather than shrunk.** Would reduce spills on wider
-    shapes (the nginx config's 10 attributes, wide-JSON's 32), at the cost of a larger `AttrMap` —
-    and therefore `Event` — for every event, paid whether or not the wider shape is common in a
-    given deployment. Not a guess to make without the data.
+12. ~~**`AttrMap`'s inline capacity, increased rather than shrunk.**~~ **Measured; no change**
+    ([ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md),
+    `performance.md` §8). With [`data-shapes.md`](data-shapes.md) in hand the question was put to
+    the perf VM in both directions: N=16 buys the wide-log legs 3–10% and costs every narrow leg
+    6–18%; N=0 and N=4 cost the narrow legs 7–17%. Pre-sizing the spill instead — one exact
+    allocation, no growth chain — was built, and measured 8–17% *slower* end to end on `json`,
+    because real keys arrive in interning order (so per-key `insert_sym` is already an append) and
+    because reserving early lost to growing late for reasons not yet established. 8 stands, and the
+    growth ladder in §1 is what ships. The one lead left open is not `Event`'s map at all:
+    `aggregate` ran 18% faster at N=0, which is the `AttrMap` inside every `SeriesKey`.
 13. **`MetricList`'s inline capacity (currently 1).** Any event with 2+ metrics spills — always
     true for the nginx reference config (4 metrics) and for `kv_metrics` configurations generally,
     by design. Note the interaction with item 10 above: with `DdSketch` staying inlined,

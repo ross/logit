@@ -270,17 +270,40 @@ resource/scope group is 5 events).
     The allocation counts come from `cargo nextest run -p logit-bench --test attr_arms
     --no-capture`. **No timing number from either goes in this repository** (this plan's "Settled
     decisions", `docs/design/performance.md` §0).
-- **W4 — the VM session.** `script/vm build <ref>` per real-binary arm, `script/perf run
-  --logit-bin` / `compare` across every scenario class; summary into `docs/design/performance.md`.
-- **W5 — the ADR**, `docs/adr/event-sizing-and-allocation-strategy.md`: the decision and its
-  numbers, the arms that lost and why, I1–I3, an amendment note on
-  `minimize-allocations-over-event-size`, and the future-investigations list — `MetricList` N
-  (collectd: 17% of events carry 2), a queue/RSS ceiling against `size_of::<Event>()` and the
-  byte-denominated bounds, `Value`/string inlining, a `KeyCache` on the OTLP decode path, a
-  wire-level key-set dictionary for `logit_proto::native`, and the captures `data-shapes.md` §7
-  still wants. Closes `memory.md` §8 items 12–13; updates `data-shapes.md` §7 and `known-gaps.md`.
-- **W6+ — landing the chosen design**, with `type_sizes.rs`/`allocations.rs` constants and
-  `memory.md`'s tables changed in the same commits. Planned in detail after W5.
+- **W3a / W3c — arm P, built for real; and an exactly-sized `AttrMap::clone`. Built, measured,
+  not adopted.** `sizing/w3a` (#270) gave `AttrMap` `reserve`/`with_capacity` and a one-sort bulk
+  build behind a drop guard, adopted at `json`, `logfmt`/`kv`, `csv`, `regex`, the native decoder,
+  OTLP and the Lua table paths; an independent review found no correctness bug but did find that an
+  eager reservation spilled maps that fit inline, which became a lazy one. `sizing/w3c` (#272)
+  sized a cloned map to `len` rather than the next power of two. Neither survives W4; both PRs are
+  closed unmerged and stay the record of what was tried.
+- **W4 — the VM session. Done 2026-09-21.** `main`, the arm-P tree, and that tree at inline
+  capacity 0, 4 and 16, over ten scenarios, two interleaved rounds × 3 repeats; then four rounds
+  of A/B variants of `json`'s merge chasing what the first pass found. Recorded in
+  [`docs/design/performance.md`](../design/performance.md) §8. What it found:
+  - **Arm S is dead on both sides.** N=16 costs the narrow legs 6–18% (its registered kill
+    criterion was 5%); N=0 and N=4 cost `passthrough`/`fanout`/`route` 7–17%.
+  - **Arm P lost end to end**: 8–17% slower on the `json` scenarios, ~6% faster on
+    `logfmt-parse`, flat on `native-relay`. The micro-bench that made it the lead candidate fed
+    keys in a fixed unsorted order; real keys arrive in interning order — ascending `Symbol` order
+    for any source with a stable key order — so the per-key loop it replaced was already a run of
+    appends. And with the bulk machinery taken out of the picture entirely, *reserving up front*
+    still lost to smallvec's own late growth by 5–9%, exact or power-of-two alike. Unexplained; the
+    VM has no PMU.
+  - **The exactly-sized clone is CPU-neutral** (±0.6%).
+  - Arms C, E and K were re-taken on the VM as benches only. After arm P, a bench win is a reason
+    to prototype, not evidence.
+  - `aggregate` ran 18% / 8% faster at N=0 / N=4 — the one end-to-end result that points at a
+    win, and it points at the `AttrMap` embedded in `SeriesKey`, not at `Event`'s own.
+- **W5 — the ADR. Done:**
+  [ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md).
+  **Nothing changes**: N stays 8, maps are not pre-sized, allocation count is not a target in
+  itself, and [ADR `minimize-allocations-over-event-size`](../adr/minimize-allocations-over-event-size.md)'s
+  premise gets its first measured numbers. `memory.md` §8's two deferred sizing items close as
+  measured. Branch `sizing/w5` is cut from `sizing/w3b`, so the stack that lands is W0, W1, W2,
+  W3b, W5 — instruments, fixtures, the bench-only arms, and the decision — and no production code.
+- **W6 — not needed.** There is no chosen design to land. The `SeriesKey` lead, if pursued, is a
+  new stream with its own key: a real binary, the VM, then a decision.
 
 ## Verification
 
@@ -290,4 +313,4 @@ resource/scope group is 5 events).
 - W3/W4: every arm reports allocations/event, bytes/event, and ns/op for build, clone, and scan,
   per signal class; VM runs pinned and repeated; kill criteria applied as registered above.
 - W5: an independent, number-by-number fact-check of the ADR against W4's output — the survey's
-  own found ten wrong numbers in a careful draft.
+  own found ten wrong numbers in a careful draft. Done before the ADR was committed.
