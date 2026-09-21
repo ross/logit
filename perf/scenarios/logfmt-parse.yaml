@@ -17,7 +17,7 @@
 components:
   gen:
     type: generate_in
-    count: 7000000
+    count: 9500000
     event:
       log: 'level=info ts=2026-09-07T06:52:01Z caller=metrics.go:159 component=frontend org_id=fake latency=fast duration=12.3ms status=200 msg="query stats"'
 

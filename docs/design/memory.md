@@ -22,11 +22,16 @@ The measurements live in code, not just in this file: `crates/logit-core/tests/t
 quietly making this document wrong. If you change one of those numbers, change the matching table
 here in the same commit.
 
-> Numbers below were taken on x86-64 Linux, in the dev container, `bench` profile (`lto = true`,
-> `codegen-units = 1`), system allocator, on an otherwise-busy laptop. Timings are divan's
-> *fastest* column — the least noise-contaminated estimate available — and are useful for comparing
-> stages against each other, not as absolute throughput ceilings. Allocation counts are exact and
-> machine-independent.
+> Timing numbers below were taken on x86-64 Linux, in the dev container, `bench` profile
+> (`lto = true`, `codegen-units = 1`), system allocator, on the disposable perf VM
+> (`docs/adr/disposable-azure-perf-vm.md`: `Standard_F8as_v6`, 8 dedicated AMD EPYC 9V74 cores, SMT
+> off), `taskset -c 2`, 2026-09-20 — not, as earlier revisions of this document said, an
+> otherwise-busy laptop; see §2's own table preamble for why a single before/after delta against
+> the pre-2026-09-20 numbers isn't a clean hardware comparison (real code changes landed in
+> between too). Timings are divan's *fastest* column — the least noise-contaminated estimate
+> available — and are useful for comparing stages against each other, not as absolute throughput
+> ceilings. **Allocation counts are exact and machine-independent** — unaffected by any of this,
+> and not re-measured or changed by the 2026-09-20 refresh.
 
 ## 0. What these measurements can and can't tell you
 
@@ -294,28 +299,38 @@ And the corresponding times:
 
 | Stage | fastest | per event |
 |---|---:|---:|
-| `syslog_in` decode, 100 lines | 23.1 µs | 231 ns |
-| `statsd_in` decode, 100 lines | 33.2 µs | 332 ns |
-| `json` | 535 ns | 535 ns |
-| `kv_metrics` | 256 ns | 256 ns |
-| `keep` | 339 ns | 339 ns |
-| `aggregate` absorb | 581 ns | 581 ns |
-| **full ingest chain** | **2.08 µs** | ~481k lines/s/core |
-| `Event::clone` (nginx / statsd / distribution) | 228 / 87 / 51 ns | |
-| `stdio_out` encode, 100 events | 124 µs | 1.24 µs |
-| `influxdb_out` encode, 100 events | 159 µs | 1.59 µs |
-| `syslog_out` encode_into, 100 events | 41.5 µs | 415 ns |
-| `lua` (proxy / `to_table`) | 1.07 / 2.02 µs | |
+| `syslog_in` decode, 100 lines | 20.4 µs | 204 ns |
+| `statsd_in` decode, 100 lines | 40.1 µs | 401 ns |
+| `json` | 411 ns | 411 ns |
+| `kv_metrics` | 75.5 ns | 75.5 ns |
+| `keep` | 505 ns | 505 ns |
+| `aggregate` absorb | 891 ns | 891 ns |
+| **full ingest chain** | **2.17 µs** | ~461k lines/s/core |
+| `Event::clone` (nginx / statsd / distribution) | 316 / 126 / 97.1 ns | |
+| `stdio_out` encode, 100 events | 134.7 µs | 1.35 µs |
+| `influxdb_out` encode, 100 events | 257.1 µs | 2.57 µs |
+| `syslog_out` encode_into, 100 events | 82.4 µs | 824 ns |
+| `lua` (proxy / `to_table`) | 1.61 / 9.03 µs | |
 
-> Every row above comes from **one** `script/bench` run, deliberately: runs on a busier machine have
-> come out uniformly ~20% slower across every unchanged benchmark, so mixing rows across runs would
-> invent differences that aren't there. Compare rows within the table freely; treat absolute values
-> as this machine on this day. This table was refreshed once, in one sitting, after landing the
-> `json`/`statsd_in`/`stdio_out`/Lua-boundary fixes below -- every row reflects the current code.
-> The `syslog_out` row is one exception, added in a later, separate `script/bench` run rather
-> than refreshing the whole table again for one new row -- its allocation count is exact and
-> comparable regardless (deterministic, not machine-dependent), but don't read its wall-clock
-> figure as directly comparable to the others' down to the nanosecond, per this same caveat. The
+> Every row above comes from **one** `script/bench` run on the disposable perf VM
+> (`docs/adr/disposable-azure-perf-vm.md`: `Standard_F8as_v6`, 8 dedicated EPYC 9V74 cores, SMT
+> off), `taskset -c 2`, 2026-09-20, at the same commit this PR carries. **This table changed for
+> two reasons at once, not one: the machine changed (laptop → VM) and the code changed (real
+> optimizations landed in between — the interner key-cache and in-place `Transform::process`
+> work most visibly, which is most of why `kv_metrics` alone dropped 256 ns → 75.5 ns and `json`
+> 535 ns → 411 ns; `metrics-model-v2`'s TLV framing and later lossless-transit work are why
+> `influxdb_out`/`syslog_out`/`lua to_table` went the other way).** Reading any single row's delta
+> against the table this replaced as "the VM is N% faster/slower" would overclaim what changed —
+> some rows are a hardware story, some are a code story, most are both at once. What the "one
+> `script/bench` run" rule still buys is internal comparability: every row here is from the same
+> invocation, so comparing rows *within* this table (json vs. kv_metrics, stdio vs. influxdb) is
+> sound; comparing a row here against the pre-2026-09-20 table's same row is not, for either
+> reason above. `docs/design/performance.md`'s preamble carries the same two-changes-at-once
+> caveat for its own numbers. (The `syslog_out` row used to be a standing exception here, added in
+> a separate `script/bench` run rather than a full table refresh -- the 2026-09-20 VM refresh
+> folded it back into the same single run as every other row, so that particular caveat no longer
+> applies to it specifically; it's kept only as a footnote in case a future partial refresh
+> reintroduces the same shape.) The
 > `statsd_in` distribution/set-decode rows are a second such exception, added without a wall-clock
 > figure at all -- their allocation counts are what `crates/logit-bench/tests/allocations.rs`'s
 > `statsd_decode_one_distribution_line`/`statsd_decode_one_sampled_distribution_line`/
@@ -606,18 +621,23 @@ channel hop and the trait-object call, because both drive a **current-thread** r
 
 | Path | fastest | allocs |
 |---|---:|---:|
-| `process_batch` through `keep` | 431 ns | 0 |
-| `Fanout::send`+`recv`, 1 consumer | 190 ns | 0 |
-| `Fanout::send`+`recv`, 2 consumers | 458 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
-| `send_batch` through a no-op `Output` | 189 ns | 1 (the `async_trait` box) |
-| `send_batch` through a **failing** `Output` | 238 ns | 4 (matches the disabled-telemetry failure row above exactly) |
+| `process_batch` through `keep` | 525 ns | 0 |
+| `Fanout::send`+`recv`, 1 consumer | 210 ns | 0 |
+| `Fanout::send`+`recv`, 2 consumers | 630 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
+| `send_batch` through a no-op `Output` | 206 ns | 1 (the `async_trait` box) |
+| `send_batch` through a **failing** `Output` | 319 ns | 4 (matches the disabled-telemetry failure row above exactly) |
 
-`process_batch`'s row is a same-day pair, not a comparison across builds: the same session measured
-the pre-change, `out`-`Vec` shape at **469 ns / 1 alloc** and this one at **431 ns / 0** on the same
-pinned core (`taskset -c 2`, fastest of three, 2026-09-17), which is the ~8% the removed `Vec` and
-the removed per-event `Event` move are actually worth here. The 360 ns this row carried before was
-measured on an earlier build and box state and is not comparable to either number; every other row
-in the table is still that older measurement and was deliberately left alone.
+This table is from the same 2026-09-20 disposable-perf-VM `script/bench` run as §3's table above,
+`taskset -c 2` — allocation counts are unchanged (machine-independent by construction), but the
+timings are not comparable to the pre-2026-09-20 laptop measurements below, for the same
+two-changes-at-once reason §3's preamble gives. **The pinned-core, same-day `process_batch`
+before/after pair that motivated this table is still laptop history, not superseded**: the same
+2026-09-17 session measured the pre-change, `out`-`Vec` shape at **469 ns / 1 alloc** against a
+post-change **431 ns / 0** on the same pinned laptop core (`taskset -c 2`, fastest of three) — an
+~8% win from the removed `Vec` and the removed per-event `Event` move, a *relative* finding this
+session didn't re-derive on the VM and has no reason to expect has changed (the code path is
+untouched since). The 360 ns this row carried before that pair is from an even earlier build and
+box state and was never comparable to either number.
 
 ### Costing internal spans: the `Delivered` trade, measured
 
@@ -663,8 +683,8 @@ naive before/after comparison showed all three `runtime` benches (`fanout_send_o
 `fanout_send_two_consumers`, `process_batch_through_keep`) slower by a uniform ~40-50% with the
 prototype in place -- which would be a real finding, except `process_batch_through_keep` never
 touches `Delivered`/`Fanout` at all and moved by almost exactly the same percentage as the two that
-do. That's this doc's own "runs on a busier machine come out uniformly ~20% slower" caveat (§2)
-firing, not a cost of the change -- confirmed by re-running the *unmodified* prototype benches a
+do. That's this doc's own top-of-file caveat about cross-run timing noise firing, not a cost of the
+change -- confirmed by re-running the *unmodified* prototype benches a
 second time, which reproduced the original (pre-prototype) numbers almost exactly. Comparing
 benchmark timings across separate `script/bench` invocations remains unreliable, as already
 documented; a same-session, back-to-back comparison (not done here) is what a real decision should
@@ -847,7 +867,7 @@ it's the thing every change described below was built to never regress — inclu
 rounds of correcting an initial performance claim, per that section.
 
 For scale: the deep clone this section used to describe unconditionally (4 allocations, an 864-byte
-memcpy per event per extra branch, 228 ns, ~11% of the ingest chain) is still exactly what a
+memcpy per event per extra branch, 316 ns, ~15% of the ingest chain) is still exactly what a
 mutating branch pays when it has to.
 
 ### The `Arc<EventBatch>` copy-on-write change — done, and genuinely more subtle than first assumed
@@ -1213,17 +1233,20 @@ a ~4 MiB one. `docs/deploying.md`'s "Listener intake" section is where an operat
 `logit.input.datagrams / logit.input.reads` ratio that says whether raising it would buy anything at
 all.
 
-**Caveat, likely but not confirmed:** the figures above were measured in the dev container, where
-transparent huge pages are `madvise`/`never` and the "untouched pages are never faulted in" argument
-holds cleanly. A `read_batch` sweep on an Azure VM with THP set to `always`
-(`docs/design/performance.md` §7) instead found peak RSS *rising* with `read_batch` at 128/256 — an
-arithmetic fit against `read_batch × 65,507` bytes (4/8/16 MiB at 64/128/256) suggests that under
+**Caveat, confirmed:** the figures above were measured in the dev container, where transparent huge
+pages are `madvise`/`never` and the "untouched pages are never faulted in" argument holds cleanly.
+This section used to carry this as a hypothesis, based on a `read_batch` sweep on an Azure VM with
+THP set to `always` (`docs/design/performance.md` §7) that found peak RSS *rising* with
+`read_batch` at 128/256 — an arithmetic fit against `read_batch × 65,507` bytes suggested that under
 `THP=always`, touching one 4 KiB page per slot faults in the whole enclosing 2 MiB huge page, making
-the entire slab resident rather than just the touched pages. This is the likely explanation, not a
-confirmed one — it wants a same-box run with THP forced to `madvise`/`never` to isolate it — but the
-practical consequence is real either way: this section's "the slab is not resident" claim holds
-where THP is `madvise`/`never` (this dev container), and does not hold under `THP=always`, where the
-shipped default `read_batch: 64` can cost up to ~4 MiB of real resident memory per UDP listener.
+the entire slab resident rather than just the touched pages, but nothing had isolated THP as the
+cause directly. A same-box, same-binary repeat of that exact sweep with `transparent_hugepage`
+forced to `madvise` (`docs/design/performance.md` §7, 2026-09-20) closes the gap: peak RSS stays
+flat in a 14.4–16.8 MiB band across the *entire* `read_batch` range under `madvise`, with no rise at
+128/256 the way `THP=always` shows on the identical binary and scenario. The practical consequence
+is unchanged either way: this section's "the slab is not resident" claim holds where THP is
+`madvise`/`never` (this dev container), and does not hold under `THP=always`, where the shipped
+default `read_batch: 64` can cost up to ~4 MiB of real resident memory per UDP listener.
 
 ## 6. The allocator
 

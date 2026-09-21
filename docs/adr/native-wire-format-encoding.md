@@ -1,6 +1,6 @@
 ---
 created: 2026-09-08
-updated: 2026-09-08
+updated: 2026-09-20
 ---
 
 # Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive
@@ -105,54 +105,66 @@ much bigger operational problem than a few percent of throughput."*
 shapes (`NginxMixed`, the mixed reference workload, and `DistributionHeavy`, five distinct
 `DDSketch`-carrying metrics on one event) at batch sizes 1, 100, and 1000, one
 `script/bench wire_format` run (`docs/design/memory.md`'s own rule against mixing timings across
-runs, `dev` container, x86-64, `bench` profile).
+runs), on the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`: `Standard_F8as_v6`, 8
+dedicated EPYC 9V74 cores, SMT off), `taskset -c 2`, 2026-09-20. Like every other timing table this
+PR touches, this one reflects both a machine change (laptop → VM) and real code changes landed
+since the table was first measured — read the comparative *findings* below (which arm wins, by
+roughly how much) as the durable content, not the absolute microsecond figures against whatever
+this table showed before.
 
 Encode time, µs (`divan`'s *fastest* column):
 
 | Shape | Size | native | otlp | rkyv | postcard |
 |---|---:|---:|---:|---:|---:|
-| NginxMixed | 1 | 3.72 | 12.14 | 3.48 | 3.42 |
-| NginxMixed | 100 | 184.1 | 1182 | 143.3 | 137.9 |
-| NginxMixed | 1000 | 1906 | 13300 | 1492 | 1501 |
-| DistributionHeavy | 1 | 3.22 | 6.79 | 2.77 | 2.70 |
-| DistributionHeavy | 100 | 178.0 | 658.6 | 166.8 | 177.8 |
-| DistributionHeavy | 1000 | 1798 | 9027 | 1379 | 1616 |
+| NginxMixed | 1 | 2.75 | 7.93 | 2.24 | 2.16 |
+| NginxMixed | 100 | 158.0 | 799.0 | 85.4 | 79.4 |
+| NginxMixed | 1000 | 1581 | 8244 | 807.6 | 833.1 |
+| DistributionHeavy | 1 | 2.68 | 4.01 | 2.14 | 2.07 |
+| DistributionHeavy | 100 | 178.1 | 436.0 | 126.2 | 126.6 |
+| DistributionHeavy | 1000 | 1774 | 5183 | 1650 | 1258 |
 
 Decode time, µs, at size 100 (the only size decode was benched at):
 
 | Shape | native | otlp | rkyv | postcard |
 |---|---:|---:|---:|---:|
-| NginxMixed | 198.0 | 1811 | 171.9 | 205.6 |
-| DistributionHeavy | 226.1 | 893.9 | 203.3 | 261.5 |
+| NginxMixed | 133.2 | 1057 | 89.9 | 105.2 |
+| DistributionHeavy | 169.7 | 497.8 | 140.3 | 174.7 |
 
 Decode allocation count, at size 100:
 
 | Shape | native | otlp | rkyv | postcard |
 |---|---:|---:|---:|---:|
-| NginxMixed | 404 | 11824 | 2020 | 2020 |
-| DistributionHeavy | 604 | 7013 | 1914 | 1914 |
+| NginxMixed | 404 | 11914 | 1820 | 1820 |
+| DistributionHeavy | 604 | 7008 | 1914 | 1914 |
+
+`native`'s own counts are exactly unchanged from the table this replaced (404/604, deterministic
+and machine-independent as this whole category of number always is); `otlp`'s and `rkyv`/
+`postcard`'s shifted by real amounts (+90/-5 and -200/+0 respectively) — a code delta somewhere in
+the intervening six days of otlp and `bakeoff::wire_mirror` work, not measurement noise, though
+this ADR didn't chase down which specific change.
 
 Encoded bytes, uncompressed, `native` with lz4 alongside for reference:
 
 | Shape | Size | native | native+lz4 | otlp | rkyv | postcard |
 |---|---:|---:|---:|---:|---:|---:|
-| NginxMixed | 1 | 638 | 455 | 2013 | 1168 | 599 |
-| NginxMixed | 100 | 39248 | 614 | 196552 | 82744 | 37724 |
-| NginxMixed | 1000 | 390249 | 1995 | 1965052 | 824344 | 375225 |
-| DistributionHeavy | 1 | 480 | 347 | 1063 | 888 | 449 |
-| DistributionHeavy | 100 | 32358 | 478 | 103926 | 69000 | 31634 |
-| DistributionHeavy | 1000 | 322159 | 1616 | 1039026 | 688200 | 315135 |
+| NginxMixed | 1 | 616 | 461 | 1949 | 1756 | 555 |
+| NginxMixed | 100 | 36949 | 607 | 192924 | 135604 | 33027 |
+| NginxMixed | 1000 | 367250 | 1914 | 1929024 | 1352404 | 328228 |
+| DistributionHeavy | 1 | 541 | 378 | 1049 | 1724 | 472 |
+| DistributionHeavy | 100 | 38359 | 533 | 103912 | 146660 | 33637 |
+| DistributionHeavy | 1000 | 382160 | 1884 | 1039012 | 1464260 | 335138 |
 
 **Four findings, not the one this ADR's `wire-protocol.md` predecessor expected:**
 
-1. **OTLP loses decisively on every axis, not just fidelity.** 3-8× slower to encode (13.3 ms vs.
-   1.5-1.9 ms at 1000 events), 4-9× slower to decode, roughly 6-30× more bytes on the wire
-   uncompressed, and 5-8× more allocations on both directions. Combined with the fidelity gate's
+1. **OTLP loses decisively on every axis, not just fidelity.** Roughly 1.5-5× slower to encode
+   (8.2 ms vs. 1.6-1.8 ms at 1000 events — a narrower gap than this ADR first found, see the note
+   below), roughly 3-8× slower to decode, more bytes on the wire uncompressed at every size and
+   shape measured, and 5-8× more allocations on both directions. Combined with the fidelity gate's
    three disqualifying findings, there is no axis left on which "just use OTLP internally too" is
    competitive, for a wire-encoding difference this dense in repeated dictionary-eligible keys and
    protobuf's own per-field tag/varint overhead.
 2. **`native`, `rkyv`, and `postcard` are close enough to each other on *encode* time that the
-   difference is noise-level, not a deciding factor** (137.9-189.9 µs across all three at 100
+   difference is noise-level, not a deciding factor** (79.4-178.1 µs across all three at 100
    events, every shape). None of the three custom arms wins encode by a margin `wire-protocol.md`'s
    "a few percent of throughput" framing would call material.
 3. **`rkyv`'s headline zero-copy advantage does not materialize in the shape this pipeline would
@@ -160,13 +172,13 @@ Encoded bytes, uncompressed, `native` with lz4 alongside for reference:
    into `WireBatch`, then conversion to `EventBatch` — because that owned `Event` is what
    `logit_pipeline::Transform::process(&mut self, resource: &Arc<Resource>, event: Event)` and
    every other pipeline consumer actually needs; nothing downstream reads fields straight out of an
-   `ArchivedWireBatch`. Measured that way, `rkyv` decode is comparable to `native`'s (171-207 µs vs.
-   198-226 µs) — not the order-of-magnitude win zero-copy access promises, because this comparison
-   never exercises the zero-copy path at all. A design that kept data in archived form end-to-end
-   might realize that advantage; `logit`'s pipeline, built around owned `Event`s flowing through
-   `Transform`, structurally can't without a much larger redesign than this ADR is scoped to
-   evaluate.
-4. **Both `rkyv` and `postcard`'s decode allocation counts (1914-2020) run through
+   `ArchivedWireBatch`. Measured that way, `rkyv` decode is comparable to `native`'s (89.9-140.3 µs
+   vs. 133.2-169.7 µs) — not the order-of-magnitude win zero-copy access promises, because this
+   comparison never exercises the zero-copy path at all. A design that kept data in archived form
+   end-to-end might realize that advantage; `logit`'s pipeline, built around owned `Event`s flowing
+   through `Transform`, structurally can't without a much larger redesign than this ADR is scoped
+   to evaluate.
+4. **Both `rkyv` and `postcard`'s decode allocation counts (1820-1914) run through
    `WireBatch::into_event_batch()`, the same conversion either way — that intermediate mirror
    type, not the serialization format, is most of why they cost ~3-5× `native`'s decode allocations
    (404-604).** `native` decodes straight from bytes into `Event`/`AttrMap` with no intermediate
@@ -174,6 +186,15 @@ Encoded bytes, uncompressed, `native` with lz4 alongside for reference:
    `bytes-1`/`smallvec-1` remote-type wrappers `wire-protocol.md` originally worried about) would
    likely close some of this gap — but building that wrapper layer is exactly the complexity this
    ADR's Decision section explains `native` avoids paying for no proven benefit, given finding 3.
+
+**A note on finding 1's encode-time ratio narrowing (3-8× at first measurement, roughly 1.5-5× on
+the 2026-09-20 VM refresh):** this table has now been measured on two different machines running
+two different commits, six days apart, with real optimization work landing in between (the
+interner key-cache and in-place `Transform::process` work most visibly). Nothing about this ADR's
+*decision* changes — OTLP is still slower on every axis it was slower on before, `native` still
+wins the same argument for the same reasons — but the exact multiple is not a fixed physical
+constant to defend down to the decimal, and a future re-measurement moving it again would not by
+itself be a sign anything is wrong.
 
 **Compression ratios above are a synthetic-fixture ceiling, not a production estimate** — both
 fixtures repeat one event verbatim N times, which is closer to lz4's best case than real telemetry
