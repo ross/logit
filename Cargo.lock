@@ -973,6 +973,7 @@ dependencies = [
  "bytes",
  "cardinality-estimator",
  "lasso",
+ "proptest",
  "serde",
  "sketches-ddsketch",
  "smallvec",

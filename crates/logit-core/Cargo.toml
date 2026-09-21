@@ -29,3 +29,7 @@ tracing-subscriber.workspace = true
 # `Value`'s size, so the assertion is more legible naming it than hiding it behind `Value`.
 # An integration test can't reach a crate's ordinary dependencies, hence the restatement here.
 bytes.workspace = true
+# `attrs::tests` checks the bulk build against a loop of `insert_sym` over arbitrary key/value
+# sequences -- that equivalence is the whole contract, and enumerating the duplicate/ordering
+# cases by hand would only ever cover the ones someone thought of.
+proptest.workspace = true
