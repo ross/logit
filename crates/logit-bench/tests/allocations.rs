@@ -3799,6 +3799,323 @@ fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Survey-derived shapes (docs/design/data-shapes.md §7 follow-up 2, docs/plans/event-sizing.md W1)
+// ---------------------------------------------------------------------------------------------
+//
+// Today's numbers for the six shapes the data-shape survey asked for and nothing in this suite
+// sat at. They are a *baseline*, not a target: the sizing bake-off exists to change several of
+// them, and the only way to say whether an arm helped is to have had the number first. Each
+// fixture's own doc comment (`crates/logit-bench/src/fixtures.rs`) cites the survey row it models
+// and says what is modelled rather than captured.
+//
+// Three measurements per shape, the three `docs/design/data-shapes.md` §6 says the decision turns
+// on: **build** (through the real parser where one produces the shape), **clone** (§6: "Whether a
+// benchmark clones changes the answer" -- VRL's crossover moved from ~128 fields to ~16 once the
+// benchmark cloned), and a native **encode + decode** round trip, the one codec that reads an
+// exact attribute count off the wire and then cannot use it (`native/value.rs`'s
+// `read_attr_map_at`, against `native/record.rs`'s reserving `read_record_list_into`).
+
+/// The build half: `tail_in`'s one attribute plus [`fixtures::FLAT_JSON_LOG_BODY`]'s eleven JSON
+/// keys, merged by the real `json` transform into **12** -- the commonest measured log width
+/// (`docs/design/data-shapes.md` §5.3).
+///
+/// One allocation, and it is the `AttrMap` spill: the 12th attribute crosses the 8-slot inline
+/// capacity, which by [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`] costs one
+/// 768-byte buffer with room for 16. Nothing else on the path allocates -- every value is a
+/// zero-copy slice of the message `Bytes`, and `json`'s scratch and key cache are warm. This is
+/// the same "exactly one, for the spill" result `json_parse_one_event` reports at 10 attributes:
+/// the width between 9 and 16 is free of *further* allocations, which is precisely why the
+/// allocation count alone is the wrong proxy for what a wider map costs.
+#[test]
+fn json_parse_flat_json_log_event() {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut warm = fixtures::flat_json_log_event();
+    assert!(json.process(&resource, &mut warm), "json always forwards");
+    assert_eq!(warm.attributes.len(), 12);
+
+    let (event, stats) = measure(|| {
+        let mut event = fixtures::flat_json_log_event();
+        assert!(json.process(&resource, &mut event));
+        event
+    });
+    assert_eq!(event.attributes.len(), 12, "1 from tail_in + 11 JSON keys");
+    expect_allocs("json: parse 12-attribute flat log", stats, 1);
+}
+
+/// The nested shape, and the one that shows what `Value::Map` costs: **five** allocations for a
+/// 10-attribute event, against [`json_parse_flat_json_log_event`]'s one for twelve.
+///
+/// One is the map spill, as everywhere else. The other **four are the nested maps** -- `req{}`,
+/// `res{}` and the `headers{}` inside each -- because `Value::Map` is `Box<AttrMap>`
+/// (`crates/logit-core/src/value.rs`), so every nested object is a fresh 392-byte box whatever
+/// its width. `docs/design/data-shapes.md` §6's "nested maps multiply whatever is chosen" is this
+/// number: a pino-http leg pays four inline footprints per event on top of the event's own, and
+/// each of them scales 1:1 with any change to `AttrMap`'s inline capacity.
+#[test]
+fn json_parse_pino_http_nested_event() {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut warm = fixtures::pino_http_log_event();
+    assert!(json.process(&resource, &mut warm), "json always forwards");
+    assert_eq!(warm.attributes.len(), 10);
+
+    let (event, stats) = measure(|| {
+        let mut event = fixtures::pino_http_log_event();
+        assert!(json.process(&resource, &mut event));
+        event
+    });
+    assert_eq!(event.attributes.len(), 10, "1 from tail_in + 9 pino-http keys");
+    expect_allocs("json: parse 10-attribute nested pino-http log", stats, 5);
+}
+
+/// The widest log class in the survey, at 30 attributes: **three** allocations and, uniquely among
+/// these shapes, **two reallocations** -- the growth chain
+/// [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`] pins. The map spills at 9 (cap
+/// 16), grows to 32 at 17, and at 30 sits in a 1536-byte buffer holding 1440 bytes of entries,
+/// having moved the whole thing twice.
+///
+/// Two of the three allocations are not the map at all: PostgreSQL's error message quotes an
+/// identifier (`"orders_pkey"`), so that one value carries a JSON escape and cannot be sliced
+/// zero-copy out of the body the way every other value here is. That is a real property of the
+/// format rather than a fixture artifact -- a constraint-violation line always names the
+/// constraint -- and it is worth keeping visible: on the widest, highest-rate log class, the
+/// *attribute container* is one allocation of the three.
+#[test]
+fn json_parse_access_log_event() {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut warm = fixtures::access_log_event();
+    assert!(json.process(&resource, &mut warm), "json always forwards");
+    assert_eq!(warm.attributes.len(), 30);
+
+    let (event, stats) = measure(|| {
+        let mut event = fixtures::access_log_event();
+        assert!(json.process(&resource, &mut event));
+        event
+    });
+    assert_eq!(event.attributes.len(), 30, "1 from tail_in + PostgreSQL jsonlog's 29 keys");
+    expect_allocs("json: parse 30-attribute access log", stats, 3);
+    assert_eq!(stats.reallocs, 2, "the map grows 8 -> 16 -> 32 on the way to 30 entries");
+}
+
+/// Parses each of the three JSON-bodied survey shapes and clones the result, so every shape's
+/// per-branch fan-out cost is measured off the same starting event the build tests produce.
+fn parsed_survey_event(make: fn() -> logit_core::Event) -> logit_core::Event {
+    let resource = fixtures::resource();
+    let mut json = fixtures::json_parser();
+    let mut event = make();
+    assert!(json.process(&resource, &mut event), "json always forwards");
+    event
+}
+
+#[track_caller]
+fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
+    drop(event.clone());
+    let (cloned, stats) = measure(|| event.clone());
+    assert_eq!(cloned.attributes.len(), event.attributes.len());
+    expect_allocs(label, stats, expected);
+}
+
+/// What one extra fan-out branch costs for each survey shape -- the measurement
+/// `docs/design/data-shapes.md` §6 says a sizing benchmark must include, since VRL's own
+/// flat-versus-tree crossover moved from about 128 fields to about 16 once its benchmark cloned.
+///
+/// The spread is the finding, and it is not the spread the attribute counts predict:
+///
+/// | Shape | Attributes | `Event::clone` allocations |
+/// |---|--:|--:|
+/// | 12-attribute flat JSON log | 12 | 1 |
+/// | pino-http nested record | 10 | **5** |
+/// | 30-attribute access log | 30 | 1 |
+/// | 17-attribute server span | 17 | 1 |
+/// | 3-record collectd event | 6 | 1 |
+///
+/// A spilled `AttrMap` costs exactly **one** allocation to clone no matter how far past 8 it is
+/// -- smallvec clones `len`, not `capacity`, into one exactly-sized buffer -- so the 30-attribute
+/// access log and the 12-attribute log are indistinguishable by allocation count and differ only
+/// in bytes moved (1440 against 576, plus the 864-byte `Event` itself either way). What *does*
+/// move the number is nesting: the pino-http record's four boxed `Value::Map`s are four more
+/// allocations on a *narrower* event. An allocation-count-denominated sizing argument would rank
+/// these three shapes in an order the byte-movement one does not, which is the plan's point about
+/// the proxy inverting.
+///
+/// The collectd event is the one whose single allocation is not its attribute map: six attributes
+/// fit inline, and the allocation is `MetricList`'s spill past its one inline slot (17.4% of
+/// collectd events, `docs/design/data-shapes.md` §3 -- the only measured `MetricList` spill in the
+/// survey). The span's is its map, with no `events`/`links` `Vec`s to pay for, the exact
+/// complement of [`clone_span_event`].
+#[test]
+fn clone_survey_shapes() {
+    expect_clone_allocs(
+        "clone: 12-attribute flat log",
+        &parsed_survey_event(fixtures::flat_json_log_event),
+        1,
+    );
+    expect_clone_allocs(
+        "clone: nested pino-http log",
+        &parsed_survey_event(fixtures::pino_http_log_event),
+        5,
+    );
+    expect_clone_allocs(
+        "clone: 30-attribute access log",
+        &parsed_survey_event(fixtures::access_log_event),
+        1,
+    );
+    expect_clone_allocs("clone: 17-attribute server span", &fixtures::wide_server_span_event(), 1);
+    expect_clone_allocs(
+        "clone: 3-record collectd event",
+        &fixtures::collectd_three_record_event(),
+        1,
+    );
+}
+
+/// The batch-level pair: a five-event OpenTelemetry batch sharing a 17-attribute `Resource`
+/// (`docs/design/data-shapes.md` §3's median batch carrying §4's median resource).
+///
+/// **Six allocations, and none of them is the resource.** One is the batch's own `Vec<Event>`;
+/// the other five are the events' own maps, because the measured median OpenTelemetry log record
+/// carries **9** attributes -- one past the inline capacity, so every event on this leg spills by
+/// a single slot. The 17-attribute resource, the widest map in the survey and always spilled, is
+/// `Arc`-shared and costs a refcount bump (`crates/logit-core/src/event.rs`). That asymmetry is
+/// worth stating plainly before any sizing decision: the widest attribute set in the
+/// OpenTelemetry picture is the one place `AttrMap`'s capacity is nearly free, and the narrowest
+/// margin -- one slot -- is what five events per batch pay for.
+///
+/// Both halves are pinned because they are different code paths to the same number:
+/// `EventBatch::clone` directly, and `unwrap_batch` falling back to it on a contended
+/// `Delivered::Shared` (`docs/design/memory.md` §3's copy-on-write path, the shape a two-mutating-
+/// consumer fan-out always takes).
+#[test]
+fn clone_enriched_resource_batch() {
+    let batch = fixtures::enriched_resource_batch();
+    assert_eq!(batch.events.len(), 5);
+    assert_eq!(batch.resource.attributes.len(), 17);
+    assert_eq!(batch.events[0].attributes.len(), 9);
+    drop(batch.clone());
+
+    let (cloned, stats) = measure(|| batch.clone());
+    assert_eq!(cloned.events.len(), 5);
+    expect_allocs("clone: 5-event batch, 17-attr resource", stats, 6);
+
+    let shared = Arc::new(fixtures::enriched_resource_batch());
+    let contend = || {
+        let _keep_alive = Arc::clone(&shared);
+        unwrap_batch(Delivered::Shared(Arc::clone(&shared), BatchContext::default()))
+    };
+    drop(contend());
+    let (unwrapped, stats) = measure(contend);
+    assert_eq!(unwrapped.events.len(), 5);
+    expect_allocs("unwrap_batch: contended 5-event batch", stats, 6);
+}
+
+/// Encodes a one-event batch of `event` through `logit_proto::native` and decodes it back,
+/// asserting both halves' allocation counts and that the round trip preserved the attribute width.
+#[track_caller]
+fn expect_native_round_trip_allocs(
+    label: &str,
+    event: logit_core::Event,
+    encode_allocs: u64,
+    decode_allocs: u64,
+) {
+    let attributes = event.attributes.len();
+    let batch = EventBatch { resource: fixtures::resource(), scope: None, events: vec![event] };
+
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    drop(encoder.encode(&batch));
+    let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
+    expect_allocs(&format!("native: encode {label}"), stats, encode_allocs);
+
+    let mut decoder = logit_proto::native::NativeDecoder;
+    let mut warm = Vec::new();
+    drop(decoder.decode_into(framed.clone(), 0, &mut warm));
+
+    let mut events = Vec::new();
+    let (_, stats) =
+        measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attributes.len(), attributes, "{label}: round trip changed the width");
+    expect_allocs(&format!("native: decode {label}"), stats, decode_allocs);
+}
+
+/// A native round trip per survey shape. Encode and decode are pinned separately because they
+/// fail differently: the encoder's cost is per field written (it grows with width), while the
+/// decoder's is flat in width and is where the plan's lead finding lives --
+/// `read_attr_map_at` (`crates/logit-proto/src/native/value.rs`) reads the exact attribute count
+/// off the wire and then throws it away, because `AttrMap` has no `with_capacity`. A 30-attribute
+/// map is therefore rebuilt by 30 sorted inserts into a map that spills and reallocs twice on the
+/// way, which is the `reallocs` column below, not the `allocs` one.
+///
+/// | Shape | encode | decode |
+/// |---|--:|--:|
+/// | 12-attribute flat JSON log | 16 | 5 |
+/// | pino-http nested record | 24 | 9 |
+/// | 30-attribute access log | 24 | 5 |
+/// | 17-attribute server span | 20 | 5 |
+/// | 3-record collectd event | 20 | 5 |
+///
+/// Decode is 5 for every flat shape regardless of width -- one `Vec<Event>`, one map spill, and
+/// the frame's own buffers -- and 9 for the nested one, for `json`'s reason: four boxed
+/// `Value::Map`s. Encode tracks field count rather than attribute count: the span and the
+/// three-record collectd event both write more *structure* than the 12-attribute log.
+#[test]
+fn native_round_trip_survey_shapes() {
+    expect_native_round_trip_allocs(
+        "12-attribute flat log",
+        parsed_survey_event(fixtures::flat_json_log_event),
+        16,
+        5,
+    );
+    expect_native_round_trip_allocs(
+        "nested pino-http log",
+        parsed_survey_event(fixtures::pino_http_log_event),
+        24,
+        9,
+    );
+    expect_native_round_trip_allocs(
+        "30-attribute access log",
+        parsed_survey_event(fixtures::access_log_event),
+        24,
+        5,
+    );
+    expect_native_round_trip_allocs(
+        "17-attribute server span",
+        fixtures::wide_server_span_event(),
+        20,
+        5,
+    );
+    expect_native_round_trip_allocs(
+        "3-record collectd event",
+        fixtures::collectd_three_record_event(),
+        20,
+        5,
+    );
+}
+
+/// The batch round trip, where the 17-attribute `Resource` is on the wire rather than `Arc`-shared
+/// -- `logit_proto::native` writes it once per batch (`crates/logit-proto/src/native/`), so this
+/// is the one measurement in this section where the resource's own width is paid.
+#[test]
+fn native_round_trip_enriched_resource_batch() {
+    let batch = fixtures::enriched_resource_batch();
+    let mut encoder = logit_proto::native::NativeEncoder::default();
+    drop(encoder.encode(&batch));
+    let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
+    expect_allocs("native: encode 5-event batch, 17-attr resource", stats, 53);
+
+    let mut decoder = logit_proto::native::NativeDecoder;
+    let mut warm = Vec::new();
+    drop(decoder.decode_into(framed.clone(), 0, &mut warm));
+
+    let mut events = Vec::new();
+    let (_, stats) =
+        measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[0].attributes.len(), 9);
+    expect_allocs("native: decode 5-event batch, 17-attr resource", stats, 10);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Native wire format (logit_proto::native)
 // ---------------------------------------------------------------------------------------------
 
