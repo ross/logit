@@ -156,7 +156,9 @@ impl MirrorMap {
         self.0.iter().map(|(k, v)| (*k, v))
     }
 
-    /// **The shipped path**: `SmallVec`'s derived clone, which is `iter().cloned().collect()`.
+    /// **What shipped until `sizing/w3c`**: `SmallVec`'s own clone, which is
+    /// `iter().cloned().collect()` and sizes a spilled copy to the next power of two. The real
+    /// `AttrMap` now reserves exactly first; this mirror keeps the derived behaviour measurable.
     pub fn clone_baseline(&self) -> Self {
         Self(self.0.clone())
     }

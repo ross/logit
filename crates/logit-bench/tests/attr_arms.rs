@@ -372,10 +372,15 @@ fn build_allocations_by_arm() {
 /// What each arm allocates to **clone** one, and -- the finding this test exists for -- how many
 /// bytes it asks for.
 ///
-/// smallvec's `reserve` rounds `len + additional` up to the next power of two, and `Clone` goes
-/// through it, so cloning a 9- or 12-entry `AttrMap` asks for **16 × 48 = 768 bytes** and a 17- or
-/// 30-entry one for **32 × 48 = 1536**. `SmallVec::with_capacity` (which arm C's `clone_exact_loop`
-/// uses) goes through `reserve_exact` and asks for exactly what it needs.
+/// smallvec's `reserve` rounds `len + additional` up to the next power of two, and a derived
+/// `Clone` goes through it, so cloning a 9- or 12-entry map that way asks for **16 × 48 = 768
+/// bytes** and a 17- or 30-entry one for **32 × 48 = 1536**. `SmallVec::with_capacity` (which arm
+/// C's `clone_exact_loop` uses) goes through `reserve_exact` and asks for exactly what it needs.
+///
+/// That was the real `AttrMap`'s behaviour when this arm was written, and the finding became a
+/// production fix (`sizing/w3c`: a hand-written `Clone` that reserves exactly). So the derived
+/// behaviour is pinned here on the mirror's `clone_baseline`, which still *is* smallvec's own
+/// `Clone`, and the real `AttrMap` is pinned to the exact size alongside the arm that found it.
 #[test]
 fn clone_allocations_and_bytes_by_arm() {
     for width in shapes::WIDTHS {
@@ -385,8 +390,10 @@ fn clone_allocations_and_bytes_by_arm() {
         let keyset = KeySetMap::build_uncached(scratch.clone());
         drop((attr.clone(), mirror.clone_exact_loop(), keyset.clone()));
 
-        let (_, baseline) = measure(|| attr.clone());
-        report(&format!("clone attrmap w={width}"), baseline);
+        let (_, real) = measure(|| attr.clone());
+        report(&format!("clone attrmap w={width}"), real);
+        let (_, baseline) = measure(|| mirror.clone_baseline());
+        report(&format!("clone derived (mirror) w={width}"), baseline);
         let (_, exact) = measure(|| mirror.clone_exact_loop());
         report(&format!("clone exact-loop w={width}"), exact);
         let (_, detect) = measure(|| mirror.clone_detect_pod());
@@ -403,6 +410,7 @@ fn clone_allocations_and_bytes_by_arm() {
                 baseline.bytes
             );
             assert_eq!(exact.bytes, width as u64 * 48, "exactly `width` entries");
+            assert_eq!(real.bytes, exact.bytes, "the real `AttrMap::clone` is exact at w={width}");
         }
         // Arm K clones an `Arc` (free) plus a values vector (one allocation at any non-zero
         // width) -- where today's clone allocates only past the inline capacity.
