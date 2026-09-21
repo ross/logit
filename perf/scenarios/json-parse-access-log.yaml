@@ -1,0 +1,47 @@
+# The widest, highest-rate log class: generate_in renders a PostgreSQL `jsonlog` line with all
+# 29 of the format's keys present, `json` merges them onto tail_in's `log.file.path` for a
+# 30-attribute event, then null_out discards. docs/design/data-shapes.md §7 flags this class as
+# having no capture behind it at all -- access and audit logs run 15-34 fields at the highest event
+# rates in the survey and every row describing them is desk-counted. `tail_in` is already live
+# against exactly this format in demo/logit.yaml's `postgres_in`.
+#
+#   script/perf run --scenario json-parse-access-log
+#
+# `gen`'s `log:` template is `fixtures::POSTGRES_JSONLOG_BODY` from crates/logit-bench/src/fixtures.rs,
+# verbatim, and its one `log.file.path` attribute is what `tail_in` stamps on every line it reads
+# (crates/logit-inputs/src/tail/line.rs) -- so this scenario parses the exact shape
+# crates/logit-bench/tests/allocations.rs's `json_parse_access_log_event` already pins at the
+# component level, at the same total attribute width. `{{`/`}}` are logit_core::template's
+# brace-escape, needed because a JSON body is nothing but braces. No `{seq}` substitution, for
+# json-parse.yaml's reason: one representative line, parsed as fast as the runtime allows.
+#
+# No `kv_metrics` after the parse, following logfmt-parse.yaml rather than json-parse.yaml: this
+# scenario exists to isolate the parse at a *width*, and a metrics stage on top would fold its own
+# per-event cost into the comparison between these three.
+#
+# Why it exists alongside the other two: 30 attributes is the only shipped scenario whose AttrMap
+# *reallocs* -- it spills at 9 into a 16-slot buffer and grows again at 17 into a 32-slot one,
+# moving the whole map twice on the way (`json_parse_access_log_event` pins 3 allocations and 2
+# reallocations). It is also the shape where the attribute container is the minority of the cost:
+# two of those three allocations are one JSON-escaped value, PostgreSQL's habit of quoting the
+# constraint name in a violation message.
+#
+# The count targets docs/plans/load-test-harness.md's 5-10 s band and is a **first estimate**,
+# scaled off json-parse's 19M by this shape's key count -- it has never been run on the reference
+# VM, so it will want retuning the first time it is (docs/design/performance.md §1).
+components:
+  gen:
+    type: generate_in
+    count: 5000000
+    event:
+      log: '{{"timestamp":"2026-09-07 06:52:01.123 UTC","user":"orders_app","dbname":"orders","pid":4821,"remote_host":"10.0.0.17","remote_port":54871,"session_id":"68bd2f41.12d5","line_num":142,"ps":"INSERT","session_start":"2026-09-07 06:40:11 UTC","vxid":"4/2841","txid":"918273","error_severity":"ERROR","state_code":"23505","message":"duplicate key value violates unique constraint \"orders_pkey\"","detail":"Key (id)=(12345) already exists.","hint":"Retry with a fresh identifier.","internal_query":"INSERT INTO orders (id) VALUES ($1)","internal_position":13,"context":"PL/pgSQL function place_order(integer) line 8 at SQL statement","statement":"SELECT place_order(12345)","cursor_position":8,"func_name":"_bt_check_unique","file_name":"nbtinsert.c","file_line_num":666,"application_name":"orders-api","backend_type":"client backend","query_id":-3491082746118273645,"leader_pid":4788}}'
+      attributes:
+        log.file.path: /var/log/app/app.log
+
+  parsed:
+    type: json
+    sources: [gen]
+
+  out:
+    type: null_out
+    sources: [parsed]
