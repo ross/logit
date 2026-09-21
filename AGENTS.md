@@ -454,7 +454,12 @@ not a style preference:
   pipeline stage allocates and what `Event` costs to move, and both are enforced by tests:
   `crates/logit-core/tests/type_sizes.rs` asserts exact `size_of`s, and
   `crates/logit-bench/tests/allocations.rs` asserts exact allocation counts per stage. They're
-  exact equality on purpose. **When one fails, that's the test working** — decide whether the
+  exact equality on purpose. They are tripwires, not a score: the one attempt to *optimize* an
+  allocation count — pre-sizing `AttrMap`'s spill — won its micro-benchmark and ran 8–17% slower
+  end to end on `json`, so a sizing or allocation-strategy change needs a real binary measured per
+  signal class on the perf VM before it is believed
+  ([ADR `event-sizing-and-allocation-strategy`](docs/adr/event-sizing-and-allocation-strategy.md)).
+  **When one fails, that's the test working** — decide whether the
   change is worth it, then update the constant *and* `docs/design/memory.md`'s table in the same
   commit. Don't relax an assertion to a `<=` bound to make it pass; that removes the only thing
   stopping `Event` from quietly growing.
