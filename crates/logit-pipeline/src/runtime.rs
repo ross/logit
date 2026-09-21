@@ -46,10 +46,15 @@ const CHANNEL_CAPACITY: usize = 64;
 pub enum NodeSpec {
     /// `InputRuntimeConfig` mirrors `Output`'s own runtime knobs below: production call sites
     /// (`logit-cli::pipeline::build_spec`) derive `shutdown_grace` from the listener's `receive:`
-    /// block (`docs/adr/decoupled-listener-io.md`), defaulting to
-    /// `InputRuntimeConfig::default()` (`Duration::ZERO` -- cancel-by-drop immediately, ADR
-    /// 0013's original behaviour) for a listener with no `receive:` block; a test can pass a
-    /// short grace to keep a shutdown test fast.
+    /// block (`docs/adr/decoupled-listener-io.md`) through `input_runtime_config`, which every one
+    /// of them goes through -- so a listener whose config omits `receive:` gets
+    /// `ReceiveConfig::default()`'s **5 s**, not this struct's own `Duration::ZERO`.
+    /// `InputRuntimeConfig::default()` is reached only from tests, which use it (and other short
+    /// graces) to keep a shutdown test fast. The distinction matters: at `Duration::ZERO` the
+    /// backstop arm in `run_input` is ready the instant shutdown fires, so `select!`'s random
+    /// rotation cancels the listener by drop roughly half the time -- which is exactly the
+    /// cancel-by-drop-immediately behaviour ADR `service-lifecycle-and-output-retry` started
+    /// from, and exactly what production's 5 s exists to avoid.
     Input(Box<dyn Input + Send>, InputRuntimeConfig),
     /// The sink's own queue -- in memory or disk-backed (see `queue.rs`'s `SinkStoreConfig`) --
     /// plus its retry budget and shutdown grace (see `RetryConfig`/`WriteLoopConfig`). Production
