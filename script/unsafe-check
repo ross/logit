@@ -37,6 +37,11 @@ IMAGE=logit-unsafe-check:local
 # NET-12/TAIL-07 in the critical-sections inventory); nothing else in this script needs to change.
 MIRI_TARGETS=(
     "logit-inputs|parse_events"
+    # NET-11 (libc/w2): `sockstat`'s two reply parsers, split out of the `getsockopt` calls
+    # precisely so the branches no real kernel reaches are reachable at all. Pure -- they take an
+    # already-filled `[u32; 9]`/`libc::tcp_info` and a length -- so miri runs them, including the
+    # `mem::zeroed::<libc::tcp_info>()` the listen-queue test builds its input with.
+    "logit-pipeline|sockstat::tests::reply_parsing"
 )
 
 # Every checkout binds at the same `/work`, so cargo's fingerprints match across branches: two

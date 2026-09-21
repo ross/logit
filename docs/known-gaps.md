@@ -204,6 +204,21 @@ already built that have a known, accepted rough edge.
   The note this entry ended on still holds: almost nothing in the field does either in-process —
   syslog-ng, rsyslog, Telegraf and gostatsd all tell operators to run `netstat -su`/`ss -u`
   themselves — so this is ahead of the field rather than at parity with it.
+- **`ReceiveBufferSampler` still gauges a descriptor it captured at construction, rather than one
+  taken from the socket at each sample.** The TCP twin no longer does: `AcceptQueueSampler` reads
+  the fd off the `listener` argument it is already handed, which makes the socket being gauged and
+  the socket being accepted on the same socket by construction, closing a class where
+  `sampler.accept(&other_listener)` would compile and silently report the wrong socket's queue
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)'s
+  2026-09-21 amendment has the reasoning, including why `BorrowedFd<'_>` fixes the lifetime but not
+  the identity). The UDP sampler cannot be given the same treatment without changing
+  `sample_while`'s signature — that function holds the sampler and the read future, not the socket
+  — and the lifetime is in fact enforced today, indirectly: the combined future carries `&socket`
+  through its sibling `read_loop` arm, so the borrow checker will not let it outlive the socket.
+  There is one `ReceiveBufferSampler` per `read_loop_sampled` per socket and no way to reach a
+  second, so nothing is wrong now; it is the compiler not being asked to say so. Deliberately left
+  rather than fixed in passing, since it is a signature change to the function whose arm ordering
+  is load-bearing.
 - **A UDP sink's send failures are not counted by cause.** The receive side's kernel counters
   (directly above) have no useful send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 when
   sampled on a UDP socket, because a datagram is charged and uncharged inside one `sendmsg`, so a

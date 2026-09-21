@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 # Verification plan: critical sections inventory
@@ -211,7 +211,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-04](#net-04--udplistenerrun_until_shutdown-the-readdecode-two-future-select-and-double-poll-guard) | P1 | `UdpListener::run_until_shutdown`: the read/decode two-future select and double-poll guard | `crates/logit-inputs/src/udp.rs:305-363` | unreviewed |
 | [NET-09](#net-09--tcp-serve_connection-the-shared-next-byte-deadline-idle-close-policy-and-end-of-connection-flushes) | P1 | TCP `serve_connection`: the shared next-byte deadline, idle-close policy, and end-of-connection flushes | `crates/logit-inputs/src/tcp.rs:1264-1491` | unreviewed |
 | [NET-10](#net-10--tcp-accept-loop-connection-cap-permit-lifetime-per-connection-spawn-and-the-live-connections-gauge) | P1 | TCP accept loop: connection cap, permit lifetime, per-connection spawn, and the live-connections gauge | `crates/logit-inputs/src/tcp.rs:1077-1205` | unreviewed |
-| [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs:134-169` | unreviewed |
+| [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs` (`meminfo`/`listen_queue`) | findings → libc/w2 |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs:905-1086` | unreviewed |
 | [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs:312-321` | unreviewed |
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | unreviewed |
@@ -895,9 +895,11 @@ All line numbers verified against the worktree at
 ---
 
 ### NET-11 — `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter
-- **Location:** `crates/logit-pipeline/src/sockstat.rs:134-169` (`meminfo`), `205-245`
-  (`listen_queue`), `275-294` (`DropCounter`), `101-128` (`SockMeminfo::receive_utilization`),
-  `42-61` (`RawFd`/`fd_of` and the non-unix twins).
+- **Location:** `crates/logit-pipeline/src/sockstat.rs` — `meminfo`/`parse_meminfo`,
+  `listen_queue`/`parse_listen_queue`, `DropCounter`, `SockMeminfo::receive_utilization`,
+  `Unavailable`, the module-scope ABI `const _: () = assert!(…)` block, and `RawFd`/`fd_of` with
+  their non-unix twins. (Line numbers dropped: `libc/w2` moved everything in this file. The item
+  names are stable, the numbers were not.)
 - **What it does:** Two `unsafe` `libc::getsockopt` calls against a raw fd this process owns.
   `meminfo` reads up to 9 `u32`s, verifies the kernel wrote at least through `SK_MEMINFO_DROPS`, and
   returns five named fields. `listen_queue` zeroes a `libc::tcp_info`, reads it, verifies the reply
@@ -926,18 +928,57 @@ All line numbers verified against the worktree at
   - Both functions return `None` (never garbage) for a non-socket fd, a UDP fd passed to
     `listen_queue`, an established socket, and an old kernel.
   - `receive_utilization` may legitimately exceed 1.0 and must not be clamped.
-- **Observed concerns (unverified):** none spotted. The Linux-only twins, the length checks and the
-  state check are all present and tested against real sockets.
-- **Existing coverage:** `sockstat.rs` tests 300-410 (`the_first_sample_reports_its_absolute_value`,
+- **Observed concerns (unverified):** ~~none spotted. The Linux-only twins, the length checks and the
+  state check are all present and tested against real sockets.~~ Substantially right about the
+  `unsafe`, wrong about the coverage. Verified 2026-09-21 (see below): every ABI claim holds, but
+  two documented *mechanisms* were wrong, and three of the module's own branches were untested.
+  - **Confirmed, fixed:** both wrappers discarded `errno`, so an `EBADF` — a stale or reused
+    descriptor, the only cause that would be a real bug — was reported to the operator as "your
+    kernel is too old". They now return `Unavailable`, which carries the `io::Error`.
+  - **Confirmed, fixed:** `receive_utilization`'s doc explained readings above 1.0 as a
+    charge-then-uncharge race window. It is not a window: the kernel admits on the *pre-charge*
+    total and then charges the whole `truesize`, so a saturated queue settles at up to
+    `rcvbuf + truesize`. Checked in v5.10, v6.6 and v6.12 `__udp_enqueue_schedule_skb`. The "never
+    clamp" conclusion is unchanged and better supported.
+  - **Confirmed, fixed:** both length checks were unreachable on any kernel that has the option at
+    all, so neither they nor their constants were exercised by anything. Parsing is now split out
+    (`parse_meminfo`/`parse_listen_queue`) and unit-tested at the boundaries.
+  - **Confirmed, fixed:** nothing in the workspace read `wmem_alloc`/`sndbuf`, and nothing pinned
+    the `SK_MEMINFO_DROPS` index against an independently-produced number — a mutant landing on
+    `BACKLOG` (7) or `OPTMEM` (6) passed every test in the tree. Both closed, the second by the
+    `/proc/net/udp` cross-check.
+  - **Refuted:** nothing about the two `unsafe` blocks themselves. Every index, offset, constant,
+    `socklen_t` in/out contract and kernel-version claim checked out against UAPI headers.
+- **Existing coverage:** `sockstat.rs`'s own test module —
+  `the_first_sample_reports_its_absolute_value`,
   `a_wrap_past_u32_max_reports_the_true_delta_not_a_huge_one`,
-  `meminfo_reads_a_real_bound_udp_socket`, `meminfo_of_a_non_socket_fd_is_none`,
-  `listen_queue_reads_a_real_tcp_listener`, `listen_queue_of_a_connected_socket_is_none`,
-  `listen_queue_of_a_udp_socket_is_none`). Consumers' tests: `udp.rs:1866/1930/1979`,
-  `tcp.rs:3263/3303/3321`. ADR: `udp-intake-batching-and-socket-visibility`.
-- **Suggested verification approach:** targeted review against the kernel UAPI headers; a real-socket
-  test that cross-checks `logit.input.kernel.drops` against `/proc/net/udp`'s `drops` column under a
-  perf-VM `udp-statsd --verify` run; run the unit tests under an older kernel container to exercise
-  the short-reply path.
+  `meminfo_reads_a_real_bound_udp_socket`, `meminfo_of_a_non_socket_fd_reports_enotsock`,
+  `listen_queue_reads_a_real_tcp_listener`, `listen_queue_of_a_connected_socket_reports_the_state_it_saw`,
+  `listen_queue_of_a_udp_socket_reports_the_syscall_failure`, and (added by `libc/w2`)
+  `a_full_length_meminfo_reply_is_read_field_by_field`,
+  `a_meminfo_reply_short_of_the_drop_counter_is_refused`,
+  `the_listen_queue_is_read_only_from_a_listening_socket_with_both_fields_filled`,
+  `only_a_refused_option_is_reported_as_an_unsupported_one`. Consumers' tests: `udp.rs`'s sampler
+  block (including `the_kernels_drop_counter_agrees_with_proc_net_udp_to_the_packet`), `tcp.rs`'s
+  accept-queue block. ADR: `udp-intake-batching-and-socket-visibility`, plus its 2026-09-21
+  amendment.
+- **Suggested verification approach:** ~~targeted review against the kernel UAPI headers; a
+  real-socket test that cross-checks `logit.input.kernel.drops` against `/proc/net/udp`'s `drops`
+  column under a perf-VM `udp-statsd --verify` run; run the unit tests under an older kernel
+  container to exercise the short-reply path.~~ Done, except the older-kernel container — which is
+  now unnecessary: the short-reply paths are unit-testable directly, and no kernel that has the
+  options at all can produce one.
+- **Verified 2026-09-21** (at `libc/w0` `c063bc2`, parent `main` `af2ef65`): every invariant above
+  checked against primary sources rather than recalled — `include/uapi/linux/sock_diag.h`,
+  `include/uapi/linux/tcp.h`, `include/net/tcp_states.h`, `include/net/sock.h`, `net/core/sock.c`
+  (v4.11/v4.12/v6.12), `net/ipv4/udp.c` (v5.10/v6.6/v6.12), `net/ipv4/tcp.c` (v2.6.24),
+  `net/socket.c` and `net/ipv4/inet_connection_sock.c` (v6.12), and `libc` 0.2.189's gnu/musl/arch
+  modules. All hold. The findings are the four "confirmed, fixed" items above; the full citation
+  set, the `libc`-bump review notes (gnu's `tcp_info` omits the kernel's eighth `__u8` and relies
+  on `repr(C)` padding) and the reachable-errno enumeration are in the ADR's 2026-09-21 amendment.
+  Layout and index constants are now module-scope `const _: () = assert!(…)` tripwires, so a `libc`
+  bump that moves any of them is a build failure. `parse_meminfo`/`parse_listen_queue` are pure and
+  run under `miri` via `script/unsafe-check`; both `getsockopt` sites run under `cargo-careful`.
 - **Priority:** P1 — `unsafe` and hand-rolled, but both calls are read-only, bounded, well guarded,
   and a mistake degrades telemetry rather than the data path.
 
@@ -977,15 +1018,44 @@ All line numbers verified against the worktree at
   - `AcceptQueueSampler::accept` is cancellation-safe: losing the arm to `shutdown` costs at most one
     sample and never a connection (`TcpListener::accept` takes nothing off the queue unless it
     returns).
+  - *(TCP half, added by `libc/w2`)* The interval tick actually fires under a steady accept rate —
+    `AcceptQueueSampler::accept`'s loop turns once per accepted connection, so a timer rebuilt per
+    turn never comes due; and the socket gauged is the socket accepted on.
 - **Observed concerns (unverified):**
   - *Low confidence:* the coop-budget argument is specific to tokio's current 128-unit budget and to
     `Sleep::poll` calling `coop::poll_proceed` first. A tokio bump could change either; the pin is a
     behavioral test (`the_sampler_keeps_ticking_while_the_read_future_burns_its_whole_coop_budget`,
     `udp.rs:2121`) rather than a version assertion, which is the right shape but easy to miss in a
     bump review.
-  - *Low confidence:* `tcp.rs`'s sampler is biased-first "for uniformity" although the comment
+  - *Low confidence:* ~~`tcp.rs`'s sampler is biased-first "for uniformity" although the comment
     states either ordering is correct there — the uniformity argument is sound, but it means the
-    TCP listener pays a `Sleep::poll` per accept for no measured benefit.
+    TCP listener pays a `Sleep::poll` per accept for no measured benefit.~~ **Confirmed and worse
+    than stated, fixed in `libc/w2`** (TCP half only; the UDP half of this entry is `libc/w1`'s).
+    It was not a `Sleep::poll` per accept but a timer-wheel insert *and* a lock-taking cancel per
+    accept, on every stream listener in the process — tokio 1.53.1 registers a `Sleep`'s
+    `TimerEntry` lazily on first poll (`init` → `reregister`, driver lock) and cancels it on drop
+    (`PinnedDrop` → `cancel` → `clear_entry`, driver lock again, unconditionally). And the fresh
+    `sleep(interval)` re-anchored its deadline to `Instant::now()` every turn, so a listener
+    accepting faster than once per interval **never got an interval sample at all** — a real
+    cadence bug in exactly the busy-listener case the interval sample exists for, pinned now by
+    `a_steady_stream_of_accepts_does_not_starve_the_interval_tick` (it saw 20 samples for 20
+    accepts and zero ticks before the fix). One `Pin<Box<Sleep>>` per sampler, `reset()` only when
+    it fires. `biased;` and sample-before-each-accept are unchanged; the latter is now pinned by
+    `the_accept_queue_is_sampled_before_the_accept_not_after_it`, which nothing did before.
+  - *Confirmed, fixed in `libc/w2` (TCP half):* `ACCEPT_QUEUE_SAMPLE_INTERVAL`'s doc claimed the
+    sampler costs "one `getsockopt` per listener per second". It is that plus one per accepted
+    connection.
+  - *Confirmed, fixed in `libc/w2` (TCP half):* `the_kernel_accept_queue_gauges_are_reported_for_a_running_listener`
+    asserted `utilization` lives in `[0, 1]` against a real socket — false, since
+    `sk_acceptq_is_full` is strictly greater-than and a `listen(1)` socket settles at depth 2. It
+    did not flake as written (backlog in the hundreds) but was wrong as a statement about the
+    metric, and `internal-telemetry.md`'s row was off by one in the same way.
+  - *Confirmed (the fd), fixed differently than suggested:* the stored `fd` was never a lifetime
+    risk — the sampler is a local declared after the listener at all four call sites — but it made
+    `sampler.accept(&other_listener)` compile and silently gauge the wrong socket. `BorrowedFd<'_>`
+    would have fixed the lifetime, not the identity. The TCP sampler now reads the fd off the
+    `listener` argument at each sample; `ReceiveBufferSampler` keeps its stored fd
+    (`docs/known-gaps.md`).
 - **Existing coverage:** `udp.rs` tests `the_kernels_own_drops_and_receive_buffer_fill_are_reported`
   (1866), `a_full_receive_buffer_is_reported_as_used_bytes_and_a_utilization_ratio` (1930),
   `the_final_sample_reports_drops_that_happened_just_before_shutdown` (1979),
@@ -997,6 +1067,15 @@ All line numbers verified against the worktree at
 - **Suggested verification approach:** targeted review; re-run the coop-budget pin on every tokio
   bump; a perf-VM run at ~90% kernel loss confirming per-window `kernel.drops` still appear (the
   ADR's own measurement).
+- **Verified 2026-09-21, TCP half only** (at `libc/w0` `c063bc2`, parent `main` `af2ef65`; the UDP
+  half is `libc/w1`'s): `AcceptQueueSampler`, `ACCEPT_QUEUE_SAMPLE_INTERVAL` and the accept loop
+  checked against tokio 1.53.1's own `time/sleep.rs`, `runtime/time/entry.rs` and
+  `net/tcp/listener.rs`, and against `include/net/sock.h` / `net/ipv4/inet_connection_sock.c` at
+  v6.12 for the queue semantics. Cancel safety, the disabled-sampler no-timer rule, the
+  `accept_queue.limit` re-emission and the "losing the arm costs at most one sample" claim all
+  hold. The findings are the four confirmed items above; see the ADR's 2026-09-21 amendment for the
+  quoted tokio internals. `crate::udp::sample_while` was checked for the same timer problem and
+  deliberately left alone — its loop turns once per tick, not once per read.
 - **Priority:** P1 — telemetry-only, but this is the *evidence path* for every loss claim, and the
   arm-ordering bug it fixes was invisible until measured.
 

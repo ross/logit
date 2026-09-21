@@ -632,101 +632,116 @@ mod tests {
         assert!(matches!(err, Unavailable::Syscall(_)), "{err:?}");
     }
 
-    // ---- the reply parsers, where the branches no real kernel reaches live --------------------
-    //
-    // Both length checks below are unreachable on any kernel that supports the option at all (see
-    // `parse_meminfo`/`parse_listen_queue`'s own docs), which is exactly why they -- and the two
-    // constants they are written in terms of -- were free to be wrong before this.
+    /// The reply parsers, where the branches no real kernel reaches live -- and the one part of
+    /// this module `miri` can run, since nothing in here opens a socket. `script/unsafe-check
+    /// miri` filters on this module's path, so a test added here is picked up automatically and
+    /// one that needs a real fd must not be.
+    mod reply_parsing {
+        use super::*;
 
-    /// Every index read out of the `SO_MEMINFO` reply, pinned to a distinct sentinel so a swapped
-    /// or off-by-one index cannot pass. The real-socket test above can only ever see zeros in
-    /// four of the five slots.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_full_length_meminfo_reply_is_read_field_by_field() {
-        // Index:       0    1    2    3    4    5    6    7    8
-        let raw: [u32; 9] = [10, 11, 12, 13, 14, 15, 16, 17, 18];
-        let info = parse_meminfo(&raw, 36).expect("36 bytes is the full nine-field reply");
-        assert_eq!(
-            info,
-            SockMeminfo {
-                rmem_alloc: 10, // SK_MEMINFO_RMEM_ALLOC
-                rcvbuf: 11,     // SK_MEMINFO_RCVBUF
-                wmem_alloc: 12, // SK_MEMINFO_WMEM_ALLOC
-                sndbuf: 13,     // SK_MEMINFO_SNDBUF
-                drops: 18,      // SK_MEMINFO_DROPS -- *not* BACKLOG (17) or OPTMEM (16)
+        // ---- the reply parsers, where the branches no real kernel reaches live --------------------
+        //
+        // Both length checks below are unreachable on any kernel that supports the option at all (see
+        // `parse_meminfo`/`parse_listen_queue`'s own docs), which is exactly why they -- and the two
+        // constants they are written in terms of -- were free to be wrong before this.
+
+        /// Every index read out of the `SO_MEMINFO` reply, pinned to a distinct sentinel so a swapped
+        /// or off-by-one index cannot pass. The real-socket test above can only ever see zeros in
+        /// four of the five slots.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_full_length_meminfo_reply_is_read_field_by_field() {
+            // Index:       0    1    2    3    4    5    6    7    8
+            let raw: [u32; 9] = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+            let info = parse_meminfo(&raw, 36).expect("36 bytes is the full nine-field reply");
+            assert_eq!(
+                info,
+                SockMeminfo {
+                    rmem_alloc: 10, // SK_MEMINFO_RMEM_ALLOC
+                    rcvbuf: 11,     // SK_MEMINFO_RCVBUF
+                    wmem_alloc: 12, // SK_MEMINFO_WMEM_ALLOC
+                    sndbuf: 13,     // SK_MEMINFO_SNDBUF
+                    drops: 18,      // SK_MEMINFO_DROPS -- *not* BACKLOG (17) or OPTMEM (16)
+                }
+            );
+        }
+
+        /// The `needed` constant is `(SK_MEMINFO_DROPS + 1) * 4 = 36`, and both an off-by-one in it
+        /// and the deletion of the check itself are visible here.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_meminfo_reply_short_of_the_drop_counter_is_refused() {
+            let raw = [0u32; 9];
+            assert!(parse_meminfo(&raw, 36).is_ok(), "the exact length the kernel returns");
+            for len in [35, 32, 0] {
+                let err = parse_meminfo(&raw, len)
+                    .expect_err("a reply too short for the drop counter must be refused");
+                assert!(
+                    matches!(err, Unavailable::ShortReply { len: got, needed: 36 } if got == len as usize),
+                    "a {len}-byte reply must be refused, not read past: {err:?}"
+                );
             }
-        );
-    }
-
-    /// The `needed` constant is `(SK_MEMINFO_DROPS + 1) * 4 = 36`, and both an off-by-one in it
-    /// and the deletion of the check itself are visible here.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_meminfo_reply_short_of_the_drop_counter_is_refused() {
-        let raw = [0u32; 9];
-        assert!(parse_meminfo(&raw, 36).is_ok(), "the exact length the kernel returns");
-        for len in [35, 32, 0] {
-            let err = parse_meminfo(&raw, len)
-                .expect_err("a reply too short for the drop counter must be refused");
-            assert!(
-                matches!(err, Unavailable::ShortReply { len: got, needed: 36 } if got == len as usize),
-                "a {len}-byte reply must be refused, not read past: {err:?}"
-            );
         }
-    }
 
-    /// `tcp_info`'s two aliased fields, and the three ways the parse can refuse them.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_listen_queue_is_read_only_from_a_listening_socket_with_both_fields_filled() {
-        // SAFETY: `tcp_info` is a plain C struct of integers with no niches, so an all-zero bit
-        // pattern is a valid value of it -- the same reasoning `listen_queue` states before its
-        // own `getsockopt`.
-        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
-        info.tcpi_state = 10; // TCP_LISTEN
-        info.tcpi_unacked = 3; // depth
-        info.tcpi_sacked = 5; // backlog
+        /// `tcp_info`'s two aliased fields, and the three ways the parse can refuse them.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_listen_queue_is_read_only_from_a_listening_socket_with_both_fields_filled() {
+            // SAFETY: `tcp_info` is a plain C struct of integers with no niches, so an all-zero bit
+            // pattern is a valid value of it -- the same reasoning `listen_queue` states before its
+            // own `getsockopt`.
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            info.tcpi_state = 10; // TCP_LISTEN
+            info.tcpi_unacked = 3; // depth
+            info.tcpi_sacked = 5; // backlog
 
-        assert_eq!(
-            parse_listen_queue(&info, 32).expect("32 bytes reaches the end of tcpi_sacked"),
-            (3, 5),
-            "depth is tcpi_unacked and the ceiling is tcpi_sacked, in that order"
-        );
-        let err =
-            parse_listen_queue(&info, 31).expect_err("31 bytes stops one byte inside tcpi_sacked");
-        assert!(matches!(err, Unavailable::ShortReply { len: 31, needed: 32 }), "{err:?}");
-
-        // Every other TCP state means those fields are real segment counters. 1 is
-        // TCP_ESTABLISHED, 7 is TCP_CLOSE (what a `shutdown()` listener becomes), 11 is
-        // TCP_CLOSING -- the neighbour on the other side of TCP_LISTEN.
-        for state in [0u8, 1, 7, 9, 11] {
-            info.tcpi_state = state;
-            let err = parse_listen_queue(&info, 32)
-                .expect_err("only LISTEN aliases those fields onto the accept queue");
-            assert!(matches!(err, Unavailable::NotListening { state: s } if s == state), "{err:?}");
-        }
-    }
-
-    /// The one failure an operator must never be told is their kernel's fault.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn only_a_refused_option_is_reported_as_an_unsupported_one() {
-        let refused = Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT));
-        assert!(refused.is_unsupported_option(), "ENOPROTOOPT really is 'this kernel lacks it'");
-        assert!(Unavailable::NotLinux.is_unsupported_option());
-
-        for other in [
-            Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::EBADF)),
-            Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::ENOTSOCK)),
-            Unavailable::NoDescriptor,
-            Unavailable::ShortReply { len: 0, needed: 36 },
-            Unavailable::NotListening { state: 1 },
-        ] {
-            assert!(
-                !other.is_unsupported_option(),
-                "a stale descriptor is a bug in logit, not an old kernel: {other:?}"
+            assert_eq!(
+                parse_listen_queue(&info, 32).expect("32 bytes reaches the end of tcpi_sacked"),
+                (3, 5),
+                "depth is tcpi_unacked and the ceiling is tcpi_sacked, in that order"
             );
+            let err = parse_listen_queue(&info, 31)
+                .expect_err("31 bytes stops one byte inside tcpi_sacked");
+            assert!(matches!(err, Unavailable::ShortReply { len: 31, needed: 32 }), "{err:?}");
+
+            // Every other TCP state means those fields are real segment counters. 1 is
+            // TCP_ESTABLISHED, 7 is TCP_CLOSE (what a `shutdown()` listener becomes), 11 is
+            // TCP_CLOSING -- the neighbour on the other side of TCP_LISTEN.
+            for state in [0u8, 1, 7, 9, 11] {
+                info.tcpi_state = state;
+                let err = parse_listen_queue(&info, 32)
+                    .expect_err("only LISTEN aliases those fields onto the accept queue");
+                assert!(
+                    matches!(err, Unavailable::NotListening { state: s } if s == state),
+                    "{err:?}"
+                );
+            }
+        }
+
+        /// The one failure an operator must never be told is their kernel's fault.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn only_a_refused_option_is_reported_as_an_unsupported_one() {
+            let refused =
+                Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT));
+            assert!(
+                refused.is_unsupported_option(),
+                "ENOPROTOOPT really is 'this kernel lacks it'"
+            );
+            assert!(Unavailable::NotLinux.is_unsupported_option());
+
+            for other in [
+                Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::EBADF)),
+                Unavailable::Syscall(std::io::Error::from_raw_os_error(libc::ENOTSOCK)),
+                Unavailable::NoDescriptor,
+                Unavailable::ShortReply { len: 0, needed: 36 },
+                Unavailable::NotListening { state: 1 },
+            ] {
+                assert!(
+                    !other.is_unsupported_option(),
+                    "a stale descriptor is a bug in logit, not an old kernel: {other:?}"
+                );
+            }
         }
     }
 }

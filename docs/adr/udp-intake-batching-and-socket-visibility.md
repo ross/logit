@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 # UDP intake batching and socket visibility
@@ -774,3 +774,139 @@ read those first. Each bullet is something this record did not, or could not, sa
   sequences × both park orderings) — plus, end to end, W4's `overflow: block` /
   `max_datagrams: 4` / `read_batch: 64` / `batch_flush_interval: 0s` listener test, which fails
   against the pre-fix queue and passes against the merged one.
+
+## Amendment (2026-09-21): `sockstat` and the two samplers, verified against primary sources
+
+Added by `libc/w2`, the verification pass over NET-11 and the TCP half of NET-12
+([`docs/plans/critical-sections-inventory.md`](../plans/critical-sections-inventory.md)). Every
+claim here was checked against the kernel or `tokio` source named beside it, not recalled. Where it
+contradicts a sentence above, this section is the current record.
+
+### Kernel facts, with the versions they were checked at
+
+- **`SO_MEMINFO`'s floor is exactly Linux 4.12.** Present in v4.12 `net/core/sock.c`'s
+  `sock_getsockopt`, absent from v4.11. The option truncates rather than failing
+  (`len = min_t(unsigned int, len, sizeof(meminfo))`) and writes the truncated length back, so a
+  buffer of the wrong size is never an `EINVAL`.
+- **`SK_MEMINFO_VARS` is still 9** (`include/uapi/linux/sock_diag.h`, v6.12), in the order
+  `libc` 0.2.189 exports. UAPI enums only append, so a kernel that grows it truncates *its* copy to
+  our 36 bytes and the nine stable indices stay right. The `len < needed` branch in `parse_meminfo`
+  is therefore defensive and has never been reachable on a kernel that has the option at all —
+  which is precisely why it is now split out and unit-tested rather than left unexercised.
+- **`TCP_INFO`'s `LISTEN` aliasing goes back to v2.6.24**, verified in that tree's
+  `net/ipv4/tcp.c` `tcp_get_info` (`tcpi_unacked = sk->sk_ack_backlog`,
+  `tcpi_sacked = sk->sk_max_ack_backlog`); the early-return-with-comment form the code quotes is a
+  later refactor of the same behaviour. `struct tcp_info` was already 104 bytes there and has only
+  been appended to, so `parse_listen_queue`'s 32-byte check is defensive in the same way.
+  `TCP_LISTEN = 10` is the tenth entry of `include/net/tcp_states.h`'s enum, which starts at
+  `TCP_ESTABLISHED = 1` (v6.12).
+- **`depth` can exceed `backlog`, by exactly one, and this record's own "As built" bullet about
+  utilization needs the same correction.** `sk_acceptq_is_full` (`include/net/sock.h`, v6.12) is
+  `sk_ack_backlog > sk_max_ack_backlog` — strictly greater, with a standing kernel comment pointing
+  at commit 64a146513f8f for why it is not `>=` — and `sk_acceptq_added` runs afterwards, from
+  `inet_csk_reqsk_queue_add`, with no second test. A `listen(1)` socket settles at depth 2.
+  `accept_queue.utilization` is not clamped, and refusal begins *above* 1.0, not at it.
+- **`receive_buffer.utilization` above 1.0 is a settled state, not a race window.** The "As built"
+  bullet above describes a charge-then-uncharge race; that is not the mechanism. The kernel admits
+  a datagram whenever the *already-charged* total is at or below `sk_rcvbuf` and then charges its
+  whole `truesize` on top, so a saturated queue holds up to `rcvbuf + truesize` and reads over 1.0
+  for as long as it does. v5.10 and v6.6 `__udp_enqueue_schedule_skb` spell that as
+  `atomic_add_return` then a re-test against `size + rcvbuf` with an `uncharge_drop`; v6.12 spells
+  it as a pre-charge `atomic_read` compare with the `atomic_add` after it and no re-test (its
+  surviving `uncharge_drop` label is reached only when `udp_rmem_schedule` fails). Same admission
+  rule, same bound. The "never clamp" conclusion is unchanged and better supported than it was.
+- **`kernel.drops` and `/proc/net/udp`'s `drops` column are the same field**, on every kernel
+  checked including the per-NUMA rework on `master`: `sk_get_meminfo` does
+  `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)` and `udp4_format_sock` prints
+  `atomic_read(&sp->sk_drops)` as its last column (v6.12; `__ip6_dgram_sock_seq_show` the same for
+  udp6). That identity is now an automated equality test rather than the manual check
+  [`docs/plans/udp-intake.md`](../plans/udp-intake.md) recorded — and it is the only in-repo test
+  that pins the `SK_MEMINFO_DROPS` *index* against an independently-produced number.
+- **The signed-to-unsigned boundary is a non-event.** `sk_drops` is an `atomic_t` (signed `int`)
+  stored into a `u32` slot, bit-preserving on every Linux target, so userspace sees a plain
+  free-running 32-bit counter with no discontinuity at `INT_MAX`. `DropCounter::delta` subtracts in
+  `u32` and *then* widens, which is the only ordering that survives a wrap — widening first would
+  turn one into a four-billion spike.
+- **`listen(2)`'s backlog is clamped before it is stored**: `__sys_listen_socket` (`net/socket.c`,
+  v6.12) applies `net.core.somaxconn` before `__inet_listen_sk` writes `sk_max_ack_backlog`. So
+  `accept_queue.limit` really is "what `listen(2)` was given, after the clamp".
+
+### Sampling cadence: the mechanism, corrected
+
+The "Sampling cadence" section above says the wrapper holds "a 1 s `tokio::time::interval`". It
+does not, and never did — both samplers build a `tokio::time::sleep`. The distinction is not
+cosmetic on the TCP side, where the loop turns once per *accepted connection* as well as once per
+tick:
+
+- **A fresh `sleep(interval)` per loop turn re-anchors its deadline to `Instant::now()`**
+  (tokio 1.53.1 `Sleep::new_timeout`), so a listener accepting faster than once per interval pushed
+  the tick forward forever and the interval sample — the one that exists so a *busy* listener still
+  reports — never fired at all. `AcceptQueueSampler` now holds one `Pin<Box<Sleep>>` and `reset()`s
+  it only when it fires.
+- **That also removes a per-connection cost the old comment mis-stated.** With `biased;` the timer
+  arm is polled first every turn, and tokio 1.53.1 registers a `Sleep`'s `TimerEntry` lazily on
+  that first poll (`init` → `reregister`, which takes the timer driver lock) and cancels it on drop
+  (`PinnedDrop` → `cancel` → `clear_entry`, which takes the lock again — unconditionally; the
+  `might_be_registered()` check inside only gates the wheel removal). That was two lock round-trips
+  per accepted connection on every stream listener in the process. Re-polling one already-registered
+  `Sleep` is a single `Acquire` load instead.
+- **`crate::udp::sample_while` is left alone**, deliberately: its work arm is the whole `read_loop`,
+  which returns only on a fatal error or shutdown, so that loop turns once per *tick* and its
+  per-turn `sleep` is neither a cost nor a cadence problem. Its `biased;` ordering stays
+  load-bearing for the coop-budget reason that section already records.
+- `ACCEPT_QUEUE_SAMPLE_INTERVAL`'s own doc claimed "one `getsockopt` per listener per second". It
+  is that **plus** one per accepted connection, and says so now.
+
+### `libc`-bump review notes
+
+- `libc` 0.2.189 exports `SO_MEMINFO` for every Linux arch it supports and all nine
+  `SK_MEMINFO_*` indices; it exports no Linux `TCP_LISTEN`, which is why `sockstat` writes that
+  constant out. Confirmed as the "No new crate dependency either way" section claims.
+- **The gnu and musl `tcp_info` bindings already disagree about the struct's field count while
+  agreeing on its layout.** gnu omits the kernel's eighth `__u8`
+  (`tcpi_delivery_rate_app_limited`/`tcpi_fastopen_client_fail`) and lets `repr(C)` insert an
+  alignment byte in its place; musl names it. Both put `tcpi_unacked` at 24 and `tcpi_sacked` at
+  28, and `sockstat` never reads the byte in question — but a future reconciliation of the two is
+  exactly the kind of change that could move something silently, which is what the new module-scope
+  `const _: () = assert!(offset_of!(..))` tripwires exist to turn into a build failure.
+- gnu's `tcp_info` is also much longer than musl's (it carries post-v6.12 fields). Both are ≥ 32
+  bytes and both are safe as the `len` argument, because `do_tcp_getsockopt` truncates and writes
+  back the same way `SO_MEMINFO` does.
+
+### Reachable errnos, and what the samplers now say
+
+`getsockopt(SO_MEMINFO)` and `getsockopt(TCP_INFO)` can return `ENOPROTOOPT` (kernel < 4.12, or a
+sandbox that does not implement the option), `EBADF` and `ENOTSOCK`. `EFAULT` cannot happen — the
+buffer is a live stack array — and neither `EINTR` nor `ENOMEM` is reachable, because neither path
+sleeps or allocates. So latching the sampler off permanently on the first failure is correct for
+every reachable cause; there is no transient failure to be wrongly disabled by.
+
+What was wrong was the message. Both wrappers discarded `errno`, so `EBADF` — a stale or reused
+descriptor, the one cause that would be a bug in this process rather than a property of the machine
+— was reported to the operator as "SO_MEMINFO needs Linux 4.12 or newer". They now return
+`sockstat::Unavailable`, which carries the `io::Error`, and each sampler quotes it and appends the
+kernel-version suggestion only for `ENOPROTOOPT`. A non-Linux build reports at `debug` rather than
+`warn`: there is nothing an operator can do, and `internal`'s `logs:` setting captures warns into
+the pipeline by default, so it was one unactionable log event per listener at every startup.
+
+One `None` that was never a syscall failure is now named too: a listener that has been
+`shutdown(SHUT_RD)` leaves `LISTEN` (`inet_shutdown` → `tcp_disconnect` → `TCP_CLOSE`) and reports
+`Unavailable::NotListening`. Nothing here shuts a listener down today — all four accept loops drop
+theirs — but graceful listener drain would silently kill three gauges and, before this change,
+print a misleading platform warning while doing it.
+
+### Identity, not lifetime, was the fd risk
+
+`AcceptQueueSampler` captured the listener's descriptor at construction, which made the socket
+being gauged and the socket being accepted on two independent things that merely happened to
+agree: `sampler.accept(&other_listener)` compiled. A `BorrowedFd<'_>` field — the obvious fix —
+would have made the *lifetime* compiler-checked, and the lifetime was never in doubt (the sampler
+is a local declared after the listener at all four call sites, so it drops first on every path);
+it would not have fixed the identity, since two listeners can both outlive one sampler. The
+sampler now takes the descriptor from the `listener` argument at each sample, which makes them the
+same socket by construction and removes the stored fd entirely.
+
+`crate::udp::ReceiveBufferSampler` keeps its stored fd for now: `sample_while` does not hold the
+socket, so giving it the same treatment means changing that function's signature, and its borrow is
+already enforced indirectly (the combined future carries `&socket` through the sibling `read_loop`
+arm). Tracked in [`docs/known-gaps.md`](../known-gaps.md).
