@@ -223,13 +223,18 @@ impl Gateway {
         // Shares, in per-mille so the arithmetic is exact: the five-set head, then Zipf s=1 over
         // the tail, scaled to the remaining 640.
         let head = [90u32, 80, 70, 60, 60];
-        let tail_harmonic: f64 = (1..=(GATEWAY_SETS - head.len())).map(|r| 1.0 / r as f64).sum();
+        // The tail's ranks continue the head's rather than restarting at 1: a Zipf restarted at
+        // rank 1 would give its own top set ~11% of the stream, more than the head's 9%, and the
+        // "top-1" the test then measures would be a tail set. Continuing the ranks puts the tail's
+        // largest share at ~3%, comfortably under the head's smallest.
+        let tail_harmonic: f64 =
+            (1..=(GATEWAY_SETS - head.len())).map(|r| 1.0 / (r + head.len()) as f64).sum();
         let mut counts: Vec<usize> = Vec::with_capacity(GATEWAY_SETS);
         for share in head {
             counts.push(events * share as usize / 1000);
         }
         for rank in 1..=(GATEWAY_SETS - head.len()) {
-            let share = 0.640 / (rank as f64 * tail_harmonic);
+            let share = 0.640 / ((rank + head.len()) as f64 * tail_harmonic);
             // Every tail set appears at least once, so the cache really sees 196 distinct sets.
             counts.push(((events as f64 * share).round() as usize).max(1));
         }

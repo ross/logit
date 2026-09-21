@@ -118,108 +118,134 @@ pub fn thin_value(mix: shapes::Mix, i: usize) -> ThinValue {
     }
 }
 
-/// A flat map of `width` entries under `prefix`, built the way one is built today.
-pub fn flat_today(prefix: &str, width: usize, mix: shapes::Mix) -> AttrMap {
-    let scratch = shapes::scratch(prefix, width, mix);
-    let mut map = AttrMap::new();
-    for (k, v) in &scratch {
-        map.insert_sym(*k, v.clone());
+/// The thin mirror of [`shapes::attr_map`]: the same arrival-order scratch, built into a
+/// pre-sized [`ThinMap`]. Keys are already interned and values already built, so a timed region
+/// around this measures the map and nothing else.
+pub fn thin_map(scratch: &[(Symbol, Value)]) -> ThinMap {
+    let mut map = ThinMap::with_capacity(scratch.len());
+    for (i, (key, _)) in scratch.iter().enumerate() {
+        map.insert_sym(*key, thin_value_at(scratch, i));
     }
     map
 }
 
-/// [`flat_today`]'s thin counterpart, pre-sized (which is half of what the representation buys).
-pub fn flat_thin(prefix: &str, width: usize, mix: shapes::Mix) -> ThinMap {
-    let scratch = shapes::scratch(prefix, width, mix);
-    let mut map = ThinMap::with_capacity(scratch.len());
-    for (i, (k, _)) in scratch.iter().enumerate() {
-        map.insert_sym(*k, thin_value(mix, i));
+/// The scratch's `i`th value, converted. Split out so [`thin_map`] reads as the mirror of
+/// `shapes::attr_map`'s loop.
+fn thin_value_at(scratch: &[(Symbol, Value)], i: usize) -> ThinValue {
+    match &scratch[i].1 {
+        Value::Str(b) => ThinValue::Str(b.clone()),
+        Value::Bytes(b) => ThinValue::Bytes(b.clone()),
+        Value::I64(v) => ThinValue::I64(*v),
+        Value::U64(v) => ThinValue::U64(*v),
+        Value::F64(v) => ThinValue::F64(*v),
+        Value::Bool(v) => ThinValue::Bool(*v),
+        Value::Timestamp(v) => ThinValue::Timestamp(*v),
+        Value::Null => ThinValue::Null,
+        other => unreachable!("the flat shapes carry no {other:?}"),
     }
-    map
 }
 
 /// The nested widths `docs/design/data-shapes.md` §5.3 measured for pino-http: four maps, median
 /// width 3, depth 2.
 pub const NESTED_WIDTH: usize = 3;
 
-/// The pino-http record's post-`json` shape as it exists today: ten top-level attributes, two of
-/// which are `Value::Map`, each of those carrying a nested `headers` map -- **four boxed
-/// `AttrMap`s**, each one a full-size heap allocation for three entries.
-pub fn nested_today(mix: shapes::Mix) -> AttrMap {
+/// One nested group's interned keys: the attribute the map hangs off, the keys inside it, and --
+/// for the pino shape, which is two levels deep -- a `headers` map inside that.
+pub struct NestedGroup {
+    pub key: Symbol,
+    pub inner: Vec<Symbol>,
+    pub headers_key: Option<Symbol>,
+    pub headers: Vec<Symbol>,
+}
+
+/// Every key a nested fixture needs, interned once. Built outside the timed region, because
+/// `intern` is a hash and a shard lock and this arm is not measuring the interner.
+pub struct NestedKeys {
+    pub top: Vec<Symbol>,
+    pub groups: Vec<NestedGroup>,
+}
+
+/// The pino-http record's keys: eight scalars, two groups, each with a nested `headers` map.
+pub fn pino_keys() -> NestedKeys {
+    NestedKeys {
+        top: (0..8).map(|i| intern(&format!("w3b.pino.top.{i:02}"))).collect(),
+        groups: ["req", "res"]
+            .into_iter()
+            .map(|name| NestedGroup {
+                key: intern(&format!("w3b.pino.{name}")),
+                inner: (0..NESTED_WIDTH - 1)
+                    .map(|i| intern(&format!("w3b.pino.{name}.{i:02}")))
+                    .collect(),
+                headers_key: Some(intern(&format!("w3b.pino.{name}.headers"))),
+                headers: (0..NESTED_WIDTH)
+                    .map(|i| intern(&format!("w3b.pino.{name}.hdr.{i:02}")))
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// A synthetic record's keys: eight scalars and `maps` flat nested maps, so the per-map cost can be
+/// read as a slope either side of the measured record.
+pub fn synthetic_keys(maps: usize) -> NestedKeys {
+    NestedKeys {
+        top: (0..8).map(|i| intern(&format!("w3b.syn.top.{i:02}"))).collect(),
+        groups: (0..maps)
+            .map(|m| NestedGroup {
+                key: intern(&format!("w3b.syn.map.{m}")),
+                inner: (0..NESTED_WIDTH).map(|i| intern(&format!("w3b.syn.m{m}.{i:02}"))).collect(),
+                headers_key: None,
+                headers: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// The nested record as it exists today: every nested map a **boxed `AttrMap`**, a full-size heap
+/// allocation whatever the three entries it holds.
+pub fn nested_today(keys: &NestedKeys, mix: shapes::Mix) -> AttrMap {
     let mut root = AttrMap::new();
-    for i in 0..8 {
-        root.insert(&format!("w3b.pino.top.{i:02}"), shapes::value(mix, i));
+    for (i, key) in keys.top.iter().enumerate() {
+        root.insert_sym(*key, shapes::value(mix, i));
     }
-    for (slot, name) in ["req", "res"].into_iter().enumerate() {
+    for (slot, group) in keys.groups.iter().enumerate() {
         let mut inner = AttrMap::new();
-        for i in 0..NESTED_WIDTH - 1 {
-            inner.insert(&format!("w3b.pino.{name}.{i:02}"), shapes::value(mix, i));
+        for (i, key) in group.inner.iter().enumerate() {
+            inner.insert_sym(*key, shapes::value(mix, i));
         }
-        let mut headers = AttrMap::new();
-        for i in 0..NESTED_WIDTH {
-            headers.insert(&format!("w3b.pino.{name}.hdr.{i:02}"), shapes::value(mix, i + slot));
+        if let Some(headers_key) = group.headers_key {
+            let mut headers = AttrMap::new();
+            for (i, key) in group.headers.iter().enumerate() {
+                headers.insert_sym(*key, shapes::value(mix, i + slot));
+            }
+            inner.insert_sym(headers_key, Value::Map(Box::new(headers)));
         }
-        inner.insert(&format!("w3b.pino.{name}.headers"), Value::Map(Box::new(headers)));
-        root.insert(&format!("w3b.pino.{name}"), Value::Map(Box::new(inner)));
+        root.insert_sym(group.key, Value::Map(Box::new(inner)));
     }
     root
 }
 
-/// [`nested_today`]'s thin counterpart: the same ten attributes and the same four maps, each map
-/// exactly sized and held inline in its `ThinValue`.
-pub fn nested_thin(mix: shapes::Mix) -> ThinMap {
-    let mut root = ThinMap::with_capacity(10);
-    for i in 0..8 {
-        root.insert_sym(intern(&format!("w3b.pino.top.{i:02}")), thin_value(mix, i));
+/// [`nested_today`]'s thin counterpart: the same shape with each nested map exactly sized and held
+/// inline in its `ThinValue`.
+pub fn nested_thin(keys: &NestedKeys, mix: shapes::Mix) -> ThinMap {
+    let mut root = ThinMap::with_capacity(keys.top.len() + keys.groups.len());
+    for (i, key) in keys.top.iter().enumerate() {
+        root.insert_sym(*key, thin_value(mix, i));
     }
-    for (slot, name) in ["req", "res"].into_iter().enumerate() {
-        let mut inner = ThinMap::with_capacity(NESTED_WIDTH);
-        for i in 0..NESTED_WIDTH - 1 {
-            inner.insert_sym(intern(&format!("w3b.pino.{name}.{i:02}")), thin_value(mix, i));
+    for (slot, group) in keys.groups.iter().enumerate() {
+        let mut inner =
+            ThinMap::with_capacity(group.inner.len() + usize::from(group.headers_key.is_some()));
+        for (i, key) in group.inner.iter().enumerate() {
+            inner.insert_sym(*key, thin_value(mix, i));
         }
-        let mut headers = ThinMap::with_capacity(NESTED_WIDTH);
-        for i in 0..NESTED_WIDTH {
-            headers.insert_sym(
-                intern(&format!("w3b.pino.{name}.hdr.{i:02}")),
-                thin_value(mix, i + slot),
-            );
+        if let Some(headers_key) = group.headers_key {
+            let mut headers = ThinMap::with_capacity(group.headers.len());
+            for (i, key) in group.headers.iter().enumerate() {
+                headers.insert_sym(*key, thin_value(mix, i + slot));
+            }
+            inner.insert_sym(headers_key, ThinValue::Map(headers));
         }
-        inner.insert_sym(intern(&format!("w3b.pino.{name}.headers")), ThinValue::Map(headers));
-        root.insert_sym(intern(&format!("w3b.pino.{name}")), ThinValue::Map(inner));
-    }
-    root
-}
-
-/// A synthetic record with `maps` nested maps of [`NESTED_WIDTH`] entries among eight scalars --
-/// the 1-map and 4-map points either side of the measured record, so the per-map cost is a slope
-/// rather than one number.
-pub fn synthetic_today(maps: usize, mix: shapes::Mix) -> AttrMap {
-    let mut root = AttrMap::new();
-    for i in 0..8 {
-        root.insert(&format!("w3b.syn.top.{i:02}"), shapes::value(mix, i));
-    }
-    for m in 0..maps {
-        let mut inner = AttrMap::new();
-        for i in 0..NESTED_WIDTH {
-            inner.insert(&format!("w3b.syn.m{m}.{i:02}"), shapes::value(mix, i));
-        }
-        root.insert(&format!("w3b.syn.map.{m}"), Value::Map(Box::new(inner)));
-    }
-    root
-}
-
-/// [`synthetic_today`]'s thin counterpart.
-pub fn synthetic_thin(maps: usize, mix: shapes::Mix) -> ThinMap {
-    let mut root = ThinMap::with_capacity(8 + maps);
-    for i in 0..8 {
-        root.insert_sym(intern(&format!("w3b.syn.top.{i:02}")), thin_value(mix, i));
-    }
-    for m in 0..maps {
-        let mut inner = ThinMap::with_capacity(NESTED_WIDTH);
-        for i in 0..NESTED_WIDTH {
-            inner.insert_sym(intern(&format!("w3b.syn.m{m}.{i:02}")), thin_value(mix, i));
-        }
-        root.insert_sym(intern(&format!("w3b.syn.map.{m}")), ThinValue::Map(inner));
+        root.insert_sym(group.key, ThinValue::Map(inner));
     }
     root
 }
