@@ -946,6 +946,15 @@ Worked examples, one per shipped component:
   edge, so an `aggregate` downstream summarizes them like any other traffic. No `Diagnostics`:
   counting a shape cannot fail. See
   [ADR `shape-observer-component`](../adr/shape-observer-component.md).
+- `flatten` (`crates/logit-transforms/src/flatten.rs`): `logit.transform.values.flattened` (count
+  — one per leaf attribute written) and `logit.transform.values.unflattened{reason="max_depth"}`
+  (count — a source value the internal recursion-depth wall refused, written back whole and
+  unexpanded). Both **untagged**, unlike `keep_values`' `field`-tagged pair: under the default
+  `attributes: all` the source attribute name is data the operator doesn't control, and tagging by
+  it would mint an unbounded telemetry series from key-position data — exactly the property
+  `shape` above is built to avoid. `keep_values` may tag `field` only because its fields are
+  config-declared; `flatten`'s usually aren't. No `Diagnostics` — flattening an already-decoded
+  value can't fail. See [ADR `flatten-transform`](../adr/flatten-transform.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure

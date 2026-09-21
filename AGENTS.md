@@ -289,7 +289,21 @@ that property is the point, and it is what a reviewer should check first on any 
 ([ADR `shape-observer-component`](docs/adr/shape-observer-component.md),
 [examples/shape-tap.yaml](examples/shape-tap.yaml),
 [docs/plans/data-shape-survey.md](docs/plans/data-shape-survey.md) -- W1 of the survey this
-instrument exists to collect).
+instrument exists to collect). `flatten` is the newest real, implemented `ComponentKind`: an
+opt-in, operator-placed rewrite of a nested `Value::Map`/`Value::Array` attribute into flat,
+dot-joined keys (`foo.key`, `tags.0`, composing as `items.0.name`) -- closing the gap where
+`influxdb_out`, `statsd_out`, `prometheus_out`, `graphite_out`, and `collectd_out` each drop a
+nested attribute outright, since none of their wire formats has anywhere to put one. The event
+model itself still nests and every decoder still produces nesting (`json`, `otlp_in`, `syslog_in`'s
+`syslog.sd`, Lua) — nothing about decoding changes; `flatten` is a rewrite for the one pipeline leg
+that needs a flat shape, not a new codec-wide convention, and confronts head-on the three ADRs
+that previously rejected dotted flattening as *implicit* decoder/matcher behavior. A leaf is any
+non-container value or an empty `Map`/`Array`, so a source attribute is only ever removed once its
+leaves are written — `flatten` never deletes an attribute; last write wins on a key collision,
+silently, and there is deliberately no cap on how many keys one value can expand into beyond a
+fixed internal recursion-depth bound, a settled, documented (`docs/known-gaps.md`) gap rather than
+a guarded one. See [ADR `flatten-transform`](docs/adr/flatten-transform.md) and
+[examples/nested-json-to-influxdb.yaml](examples/nested-json-to-influxdb.yaml).
 
 ## Environment
 
@@ -473,7 +487,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

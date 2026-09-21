@@ -118,6 +118,10 @@ pub enum ComponentKind {
     // own fan-out branch, never in the flow it measures (docs/adr/shape-observer-component.md).
     Shape { interval: Duration, resource: ShapeResource, max_tracked_keys: usize,
             max_tracked_keysets: usize },
+    // Rewrites a nested Map/Array attribute into flat, dot-joined keys (foo.key, tags.0) -- an
+    // opt-in, operator-placed rewrite, never a decoder or sink behavior
+    // (docs/adr/flatten-transform.md). `attributes`/`resource` are each `all`/`none`/a named list.
+    Flatten { attributes: FlattenFields, resource: FlattenFields, arrays: FlattenArrays },
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
@@ -150,8 +154,8 @@ UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well afte
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`,
-`shape`, and any future native transform — take no suffix; there's only ever one direction for a transform
-to be.
+`shape`, `flatten`, and any future native transform — take no suffix; there's only ever one direction
+for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
 an optional flush interval (`docs/adr/aggregation-window-semantics.md`); `aggregate` requires
@@ -196,7 +200,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -723,6 +727,15 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     cumulative gauges are half of what `shape` is for, so an operator who doesn't want them removes
     the component. `shape`'s `interval` needs no rule of its own — it joins `aggregate`'s and
     `internal`'s in rule 9's `interval()` table.
+59. A `flatten` with `attributes: none` and `resource: none` together is rejected — rules
+    7/12/54's "can only ever be a no-op" instinct again. An empty named list on either field is
+    rejected, naming both keywords: write `none` to mean nothing, `all` to mean every nested
+    attribute. An empty field name within a named list is rejected — rules 19/20/54's reasoning;
+    a field name repeated within one named list is rejected too, the same no-op reasoning once
+    more. `attributes: all` (the default) and a field name containing `.` are both deliberately
+    legal — the former is the useful default, the latter names a literal attribute exactly as
+    rule 54's `keep_values` fields already may
+    ([ADR `flatten-transform`](../adr/flatten-transform.md)).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.
