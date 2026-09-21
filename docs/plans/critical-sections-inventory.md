@@ -422,7 +422,10 @@ All line numbers verified against the worktree at
   done, and the blocks were restructured into three named functions so that the two pure ones run
   under `miri` after all: "miri is not usable (real syscalls)" is true of the closure as a whole
   and false of its halves, which is the whole point of the split. `strace -e inject=` for the errno
-  paths (`script/unsafe-check inject`). **"Real-socket fault-injection test forcing `EINTR` (send a
+  paths, now a named, repeatable set (`script/unsafe-check inject-all`: `EINTR:when=2+3` retries
+  and loses nothing; `EPERM:when=3` stops on the third call with no retry and no spin;
+  `ENOSYS:when=1` makes exactly one traced call, which is the bun#42678 shape's absence).
+  **"Real-socket fault-injection test forcing `EINTR` (send a
   signal to the reading thread)" cannot work** — `EINTR` is unreachable on a non-blocking
   `recvmmsg`; only `strace -e inject=recvmmsg:error=EINTR` produces it. A readable *non-socket*
   descriptor (a pipe) does give a real, unprivileged, deterministic fatal errno with no injection

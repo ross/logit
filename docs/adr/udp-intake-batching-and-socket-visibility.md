@@ -960,8 +960,37 @@ ordinary CI. Alongside it, a `const` block asserts every layout fact the three f
 harvested fields lie inside one header). The fatal path now has a test too — a readable non-socket
 descriptor produces a real `ENOTSOCK` with no fault injection — and `describe_read_failure` gives it
 a message naming the syscall, the bound address, and, for `ENOSYS`/`EPERM`, the fact that
-`read_batch: 1` is not the workaround it looks like. What remains out of reach in CI: the injected
-errno sequences (`script/unsafe-check inject`) and a real `SOCK_DESTROY`.
+`read_batch: 1` is not the workaround it looks like. What remains out of reach in CI: a real
+`SOCK_DESTROY`.
+
+The injected errno sequences are out of CI but no longer ad hoc: `script/unsafe-check` carries an
+`INJECT_SCENARIOS` list and an `inject-all` subcommand, three scenarios, each with what it is
+expected to show written beside it. Run on 2026-09-21 against
+`a_two_hundred_datagram_burst_is_delivered_complete_and_in_order`:
+
+- `recvmmsg:error=EINTR:when=2+3` — **test passes.** The trace shows each injected `EINTR`
+  followed immediately by a successful `recvmmsg` returning 64, and all 200 datagrams delivered in
+  order. The retry arm works and loses nothing, which is the only way to exercise it at all.
+- `recvmmsg:error=EPERM:when=3` — **test fails, in the right shape.** Two full batches are read,
+  the third call is refused, and the process stops there: exactly one injected call in the trace,
+  no retry, no spin, no hang. (The test panics on its closed fanout rather than printing the
+  listener's error, so the message itself is pinned in CI instead.)
+- `recvmmsg:error=ENOSYS:when=1` — **test fails immediately**, with **one** traced `recvmmsg` and
+  nothing after it. bun#42678's failure mode is a refused call retried forever at 100% CPU; a
+  single traced call is the whole point of this scenario.
+
+The `EINTR` trace also happens to be an independent, kernel-side confirmation of what
+`build_headers` writes, since `strace` decodes the array it was handed:
+
+```
+recvmmsg(9, [{msg_hdr={msg_name=NULL, msg_namelen=0,
+              msg_iov=[{iov_base="msg-0", iov_len=65507}], msg_iovlen=1,
+              msg_controllen=0, msg_flags=0}, msg_len=5}, …],
+         64, MSG_DONTWAIT, NULL) = 64
+```
+
+— `vlen` 64, `MSG_DONTWAIT` alone (no `MSG_TRUNC`, no `MSG_WAITFORONE`), a NULL timeout, and every
+header with a one-entry `iov` of exactly `MAX_DATAGRAM_BYTES` and NULL name/control.
 
 ### Re-verify on a dependency bump
 

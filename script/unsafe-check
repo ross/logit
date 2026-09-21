@@ -65,12 +65,17 @@ INJECT_SCENARIOS=(
     # signal cannot produce it and only this can. EXPECT: the test still PASSES -- every datagram
     # delivered, because the arm retries the same call rather than failing.
     "udp-eintr-retry|recvmmsg:error=EINTR:when=2+3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
-    # A fatal errno mid-stream, after datagrams have already been read. EXPECT: the test FAILS, the
-    # listener returns `Err` promptly (no spin, no hang), the queue is closed on the way out, and
-    # the message names `recvmmsg(2)` and the bound socket.
+    # A fatal errno mid-stream, after datagrams have already been read. EXPECT: the test FAILS,
+    # having read two full batches first and then stopping *immediately* on the third call -- no
+    # retry, no spin, no hang; the strace shows exactly one injected `recvmmsg` and then the
+    # process exiting. The test panics on its now-closed fanout rather than printing the listener's
+    # error, so the *message* is not what this scenario checks -- that is pinned in CI by
+    # `a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket`.
     "udp-fatal-mid-stream|recvmmsg:error=EPERM:when=3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
     # The seccomp case: the syscall refused on the very first call (quinn#1947, bun#42678).
-    # EXPECT: the test FAILS immediately with the sandbox hint, and *not* with a CPU spin.
+    # EXPECT: the test FAILS, and the strace shows **one** `recvmmsg` and nothing after it -- the
+    # bun#42678 failure mode is a refused call retried forever at 100% CPU, so a single traced call
+    # is the whole point of the scenario.
     "udp-seccomp-first-call|recvmmsg:error=ENOSYS:when=1|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
 )
 
