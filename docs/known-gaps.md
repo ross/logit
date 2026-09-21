@@ -233,7 +233,9 @@ already built that have a known, accepted rough edge.
 - ~~**A UDP listener reads one datagram per syscall**~~ — **closed** on Linux
   ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
   `read_loop` (`logit-inputs::udp`) now takes up to `receive.read_batch` datagrams per `recvmmsg(2)`
-  call (default 64, ceiling `UIO_MAXIOV`), through `tokio::net::UdpSocket::async_io` — which is the
+  call (default 64, ceiling 1024 — `UIO_MAXIOV`'s number, but `logit`'s own limit on the slab and
+  the shutdown-path loss, not a kernel one; the kernel clamps no `vlen` on the receive side),
+  through `tokio::net::UdpSocket::async_io` — which is the
   raw-fd seam this entry said the work would need, and the same one
   `crates/logit-inputs/src/tail/watch.rs`'s `inotify` backend already uses. The `mmsghdr`/`iovec`
   arrays are rebuilt inside the readiness closure on every call over `Vec<u64>` backing storage, so
@@ -247,6 +249,34 @@ already built that have a known, accepted rough edge.
   **Linux only, and that is the whole of it.** `recvmmsg` is a Linux syscall with no portable
   equivalent worth a second implementation; every other target keeps the one-`recv_from`-per-datagram
   loop behind the same interface, and `read_batch` is documented as parsed-and-ignored there.
+- **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
+  a UDP listener always calls `recvmmsg(2)`; a seccomp profile (or an LSM) that refuses it returns
+  `ENOSYS`/`EPERM` on the very first call, which `read_loop` treats as fatal, so the listener fails
+  immediately and the process exits with the startup-failure code. That is the correct *shape* —
+  quinn hit the same wall on Android x86 (quinn#1947) and bun hit a worse one, where the refusal
+  produced no datagrams and a 100% CPU spin (bun#42678) — and since `libc/w1` the message names the
+  syscall, the bound socket, and the fact that `receive.read_batch: 1` will not help, instead of a
+  bare `Function not implemented (os error 38)`. What is **not** built is the other half of bun's
+  and quinn's answer: a one-shot `AtomicBool` latch that, on the first `ENOSYS`/`EPERM`, falls back
+  to per-datagram `recvmsg(2)` for the life of the process (quinn#2079's pattern for its own
+  `sendmsg` `EINVAL` fallback). That is a design decision, not an oversight — it means carrying a
+  second Linux read path forever, for an environment `logit` has never been reported to run in, and
+  a listener that silently runs `read_batch` times slower than its config asks for is arguably a
+  worse outcome than one that refuses to start. Revisit if a real deployment asks.
+- **`received_at`'s strict ordering survives a wall-clock *step* only within one read batch.**
+  `now_nanos()` is `SystemTime::now()`, deliberately: `received_at` is the event's wall-clock
+  timestamp and a monotonic instant could not be one. Within a batch the ordering does not depend
+  on the clock at all — one read gives `base`, and datagram `i` is stamped `base + i` — but across
+  two batches it does. A backwards `clock_settime` (chrony's `makestep`, an NTP correction after a
+  long outage, a VM suspend/restore or live migration) between them can move the clock back by far
+  more than the `≤ read_batch` nanoseconds of offset, at which point two datagrams in consecutive
+  batches can share a `received_at` — exactly the `(series, timestamp)` collision the `+ i` offset
+  exists to prevent (ADR `udp-intake-batching-and-socket-visibility`'s "One `received_at` per
+  syscall batch"). Consequences are bounded: `decode_loop`'s latency computation already clamps
+  with `.max(0)`, and `influxdb_out`'s `allocate_timestamp` disambiguates within an output batch by
+  design. Not closable from the listener: the fix would be a monotonic clock, which would be the
+  wrong timestamp. `every_datagram_in_a_batch_gets_its_own_received_at`'s doc comment states the
+  same distinction where the assertion is.
 - **One reader per UDP listener.** A single read loop is one core's worth of read capacity.
   `SO_REUSEPORT` lets multiple sockets share one port with the kernel load-balancing datagrams
   across them — gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener

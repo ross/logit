@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 # UDP intake batching and socket visibility
@@ -200,10 +200,19 @@ reasons:
   it's actually sampling.
 - **`read_loop`'s own two nested per-iteration `select!`s** (`recv_from` vs. `shutdown`, `queue.push`
   vs. `shutdown`) are genuine two-way races, and `tokio::select!` drops whichever future didn't win.
-  Adding a timer arm to either would cancel an in-flight `recv_from`/`push` on every ordinary tick —
-  silently dropping the very datagram the sampler exists to observe, exactly the loss this ADR
+  Adding a timer arm to the **push** one would cancel an in-flight `push_many` on every ordinary
+  tick — dropping whatever the reader was still holding, uncounted, exactly the loss this ADR
   elsewhere bounds to the shutdown path only (see "Cancellation of `push_many`" below). Sampling has
   to run *alongside* whatever `read_loop` is doing, never race it.
+
+  *(Corrected 2026-09-21: this bullet originally made the same claim about the **recv** arm —
+  "adding a timer arm to either would cancel an in-flight `recv_from`… silently dropping the very
+  datagram the sampler exists to observe" — and that half is wrong. It also contradicted the code's
+  own, correct, cancel-safety comment. `async_io` suspends only *before* it calls its closure, so a
+  cancelled read either never made the syscall or had already returned its datagrams; nothing is
+  consumed and discarded. See the amendment below. The architectural conclusion is unaffected: the
+  push half alone requires the wrapping loop, and a `select!` arm that resolves the whole race on
+  every tick would be wrong for `run_until_shutdown`'s one-shot `select!` regardless.)*
 
 **The sampler's `select!` is `biased` with the timer arm first, and W4 must not undo that.** The
 intuitive ordering is the other one — prefer the work, sample while idle — and it silences the
@@ -221,10 +230,13 @@ is a property of `read_loop` being one long-lived future that does not return be
 W4's `recvmmsg` rewrite of that loop inherits the constraint unchanged — `crate::udp::sample_while`
 carries the full reasoning, and a regression test that fails with the arms swapped pins it.
 
-A **guaranteed final sample** runs after the read loop exits (shutdown or fatal error), immediately
-before `read_loop_sampled` itself returns — the one thing no `select!`'s arm ordering already
-guarantees — so a short-lived process — the same concern ADR `load-test-harness` raised for
-`internal`'s own drain tick — doesn't lose its last interval of drop/buffer data.
+A **final sample** runs after the read loop exits (shutdown or fatal error), immediately before
+`read_loop_sampled` itself returns — the one thing no `select!`'s arm ordering already guarantees —
+so a short-lived process — the same concern ADR `load-test-harness` raised for `internal`'s own
+drain tick — doesn't lose its last interval of drop/buffer data. *(Amended 2026-09-21: this said
+"guaranteed", which is one word stronger than it is. It runs on every path `sample_while` itself
+returns on; a future that is **dropped** runs nothing, and `run_input`'s grace backstop drops this
+one when the grace expires. See the amendment below for why production never reaches that path.)*
 
 No config knob for the interval. Every other timer this codebase exposes as configuration
 (`aggregate`'s `interval`, `internal`'s `interval`) controls something an operator trades off
@@ -347,13 +359,20 @@ than just the touched pages — a same-box, THP-toggled repeat of the identical 
 different box's different finding. "The slab is not resident" is a claim about `madvise`/`never`
 specifically, confirmed on two different boxes now, not a universal one.
 
-**Ceiling 1024 = `UIO_MAXIOV`.** `recvmmsg` takes an array of `mmsghdr`, each wrapping an `iovec`;
-`UIO_MAXIOV` (1024 on Linux) is the kernel's hard limit on how many `iovec`s a single vectored I/O
-call can carry, enforced by `sendmsg`/`recvmsg`/`recvmmsg` alike. `read_batch` values above it would
-either be silently clamped by the kernel or rejected outright depending on call path — rejecting
-above 1024 at config-validation time (new graph rule 57, alongside rule 18's existing `read_batch: 0`
-rejection) turns a kernel-dependent runtime surprise into a config-time error with a name attached
-to it.
+**Ceiling 1024 = `UIO_MAXIOV`'s number.** *(Corrected 2026-09-21 — see the amendment below. The
+original text of this paragraph claimed `UIO_MAXIOV` was "the kernel's hard limit on how many
+`iovec`s a single vectored I/O call can carry, enforced by `sendmsg`/`recvmsg`/`recvmmsg` alike"
+and that a larger `read_batch` "would either be silently clamped by the kernel or rejected outright
+depending on call path". Both are false for this call. `UIO_MAXIOV` bounds `msg_iovlen` within one
+`msghdr` — `__copy_msghdr`, `net/socket.c`, returns `-EMSGSIZE` above it — and this read path sets
+`msg_iovlen` to 1. `do_recvmmsg` clamps no `vlen` at all; its loop is a plain
+`while (datagrams < vlen)`, and the only `UIO_MAXIOV` clamp on a `vlen` anywhere in the kernel is
+`__sys_sendmmsg`'s, on the send side.)* The number stays 1024 and the rule stays: what it bounds is
+`logit`'s own cost, not the kernel's tolerance — the `read_batch × 65,507`-byte slab each listener
+reserves (67 MB of address space at this ceiling) and how many datagrams a cancelled `push_many`
+can discard on the shutdown path. Rejecting above it at config-validation time (graph rule 57,
+alongside rule 18's existing `read_batch: 0` rejection) gives both costs a named ceiling rather
+than an unbounded one.
 
 **`read_batch` larger than `receive.max_datagrams` is deliberately legal, and there is no rule
 against it.** It looks like it should be one — a single read whose batch cannot fit in the whole
@@ -774,3 +793,182 @@ read those first. Each bullet is something this record did not, or could not, sa
   sequences × both park orderings) — plus, end to end, W4's `overflow: block` /
   `max_datagrams: 4` / `read_batch: 64` / `batch_flush_interval: 0s` listener test, which fails
   against the pre-fix queue and passes against the merged one.
+
+## Amendment: kernel- and tokio-cited facts behind the UDP read path (2026-09-21)
+
+`libc/w1` of the raw-`libc` verification workstream
+([`docs/plans/critical-sections-inventory.md`](../plans/critical-sections-inventory.md), NET-01 and
+the UDP half of NET-12) re-derived this record's runtime claims from primary sources rather than
+from reasoning about them. Most held; the ones that did not are corrected inline above, and the
+facts worth having written down — because nothing in the code could state them, and a future reader
+would otherwise have to rediscover them — are collected here.
+
+Sources: `torvalds/linux` master (`net/socket.c`, `net/ipv4/udp.c`, `net/ipv6/udp.c`,
+`net/core/datagram.c`, `net/ipv4/datagram.c`) and **tokio tag `tokio-1.53.1`**, the version pinned
+in `Cargo.lock`. Everything below was checked against those two on 2026-09-21.
+
+### `recvmmsg` cannot return `0`, so the spin the inventory feared does not exist
+
+`do_recvmmsg` (`net/socket.c`) loops `while (datagrams < vlen)` and ends
+`if (err == 0) return datagrams; if (datagrams == 0) return err;`. Every exit with `datagrams == 0`
+returns a negative `err`; every exit with a count returns a positive one. `vlen` is clamped to at
+least 1 twice over (`UdpListenerConfig::read_batch`, `BatchReader::new`), so `Ok(0)` is unreachable
+by construction — not merely unobserved. A zero-*length* datagram is still a datagram:
+`___sys_recvmsg` returns `0`, the `if (err < 0)` test is false, and `++datagrams` runs, which is
+exactly the case `BatchReader::read_batch`'s doc already describes delivering as an empty `Bytes`.
+
+### A mid-batch error is stashed and delivered one call late, and cannot drop the batch
+
+Also in `do_recvmmsg`: after at least one datagram has been received, a non-`EAGAIN` error does not
+discard them. The count is returned and the error is stashed —
+`if (err != -EAGAIN) { WRITE_ONCE(sock->sk->sk_err, -err); }` — for the *next* call to pick up
+through the `sock_error(sk)` check `do_recvmmsg` performs before its receive loop. So no
+already-received batch is ever lost to a late error, which answers NET-01's third observed concern
+directly. What is true, and was nowhere recorded, is that an errno can arrive one call after its
+cause. For this call shape the only stashable mid-batch errors are `EFAULT`-class ones from the
+copy-out, which require an invalid buffer. `recvmmsg(2)`'s own BUGS section adds that a stashed
+code can be overwritten by an unrelated network event before it is read.
+
+### Errno reachability on *this* socket, and why "everything but `EAGAIN` is fatal" is right
+
+The listener socket is never `connect(2)`ed, never sets `IP_RECVERR`/`IPV6_RECVERR`, and never has
+`shutdown(2)` called on it. Those three negatives are load-bearing and are now recorded at
+`bind_one` itself. From them:
+
+| errno | Reachable here? | Why |
+|---|---|---|
+| `EAGAIN`/`EWOULDBLOCK` | yes, constantly | the ordinary "nothing queued" answer; `async_io` clears readiness and waits |
+| `ECONNREFUSED`, `EHOSTUNREACH`, `ENETUNREACH`, `EPROTO`, PMTU `EMSGSIZE` | **no** | `udp_err` (`net/ipv4/udp.c`; `udpv6_err` identically) sets `sk_err` only when `IP_RECVERR` is set or `sk_state == TCP_ESTABLISHED`, and `sk_state` becomes that only in `__ip4_datagram_connect` |
+| `ENOBUFS`/`ENOMEM` | **no** | receive-buffer exhaustion is handled entirely on the softirq enqueue side: `__udp_enqueue_schedule_skb` returns `-ENOMEM` and its caller `__udp_queue_rcv_skb` bumps `UDP_MIB_RCVBUFERRORS`/`UDP_MIB_MEMERRORS` and drops the skb. Nothing surfaces to `recvmsg` — the strongest possible confirmation of this ADR's premise that `SO_MEMINFO` is the *only* way to see that loss |
+| `ENOTCONN` | **no** | `__skb_wait_for_more_packets`'s `-ENOTCONN` is gated on `connection_based(sk)`, i.e. `SOCK_SEQPACKET \|\| SOCK_STREAM` (`net/core/datagram.c`) |
+| `EINTR` | **no** | see below |
+| `EMSGSIZE` (caller bug) | only if `msg_iovlen > UIO_MAXIOV`; this path passes 1 | `__copy_msghdr`, `net/socket.c` |
+| `EBADF`, `ENOTSOCK`, `EINVAL`, `EFAULT` | only via a caller bug | permanent |
+| `EPERM`, `EACCES`, `ENOSYS` | yes, under seccomp or an LSM | permanent; first call, deterministic |
+| `ECONNABORTED` | **yes, externally triggerable** | `udp_abort` (`net/ipv4/udp.c`) sets `sk_err` and `__udp_disconnect`s, reached from a `SOCK_DESTROY` netlink request — i.e. `ss -K 'sport = :8125'` |
+
+Every reachable non-`EAGAIN` entry is permanent, which is what makes the fatal policy correct
+rather than merely convenient.
+
+**`EINTR` is unreachable, and the retry arm stays anyway.** The only source is `sock_intr_errno`
+inside `__skb_wait_for_more_packets`, which `__skb_recv_udp` reaches only through
+`while (timeo && …)`. `timeo` is zero twice over here: `MSG_DONTWAIT` is passed explicitly, and
+`____sys_recvmsg` ORs it in regardless for any `O_NONBLOCK` descriptor, which a tokio-registered
+socket always is. The arm is kept — it is what `quinn-udp` keeps for the same call, it costs one
+never-taken comparison per error, and it is the right behaviour the moment any of those
+preconditions changes — but its comment now says so, instead of implying a signal could produce it.
+NET-01's suggested verification ("send a signal to the reading thread") cannot work; forcing it
+takes `strace -e inject=recvmmsg:error=EINTR`.
+
+**`ss -K` killing a listener is intended behaviour, and a blanket retry must not be added.** The
+socket really is destroyed and unhashed, so it will never receive again; failing loudly (process
+exit code 2) is the honest outcome, and `describe_read_failure` now names the cause. The attractive
+hardening — "retry once on an unexpected errno before declaring it fatal" — is specifically wrong
+here: `sock_error`'s `xchg` clears `sk_err`, so the retry after a `udp_abort` returns `EAGAIN` and
+the listener sits on a dead socket forever, silently. A loud fatal beats a silent zombie.
+
+### Cancel-safety: the recv arm loses nothing; the push arm is where the loss is
+
+`Registration::async_io` (`tokio/src/runtime/io/registration.rs`) has exactly two suspension
+points — `self.readiness(interest).await?` and the `poll_fn(coop::poll_proceed).await` after it —
+and **both are strictly before** it calls the closure; once the closure returns anything but
+`WouldBlock` it returns in that same poll. So a `select!` that drops the read future either drops
+it before the syscall or never: the datagrams are already in `out` by the time the future could be
+dropped. This corrects two things. The "Sampling cadence" bullet above claimed that cancelling an
+in-flight `recv_from` "silently drops the very datagram the sampler exists to observe" — true of
+the **push** arm (`push_many`'s accepted prefix stays queued; the remainder is dropped uncounted,
+bounded by `read_batch`, shutdown path only) and false of the **recv** arm. And the code's own
+comment said `async_io` has "one `.await`"; it has two, and the second can genuinely return
+`Pending` on coop exhaustion. Neither weakens the guarantee — both awaits are pre-syscall — but a
+reader checking either statement against tokio would have found a discrepancy.
+
+### The coop-budget argument, and exactly what a tokio bump must re-check
+
+The conclusion in "Sampling cadence" stands, and the source makes it stronger; two of the three
+mechanisms it named were wrong. Four facts, all at `tokio-1.53.1`, all of which a version bump
+needs to re-verify:
+
+1. `task/coop/mod.rs`: `const fn initial() -> Budget { Budget(Some(128)) }`.
+2. `runtime/io/registration.rs`: a **successful** `async_io` spends one unit (`coop.made_progress()`
+   on the success arm); a **`WouldBlock`** one spends **zero**, because the `RestoreOnPending` guard
+   is dropped without `made_progress` and its `Drop` writes the pre-decrement budget back. The
+   original text said "every resource operation spends one: each `recv_from`, and each
+   `shutdown.wait_for`" — `watch::Receiver::wait_for` has no coop call on its path at all, and a
+   `WouldBlock` read spends nothing. Under a flood every read succeeds, so the budget does drain;
+   the conclusion is untouched, the mechanism was misdescribed.
+3. `time/sleep.rs`: `poll_elapsed` runs `let coop = ready!(crate::task::coop::poll_proceed(cx));`
+   before it consults the deadline or the timer entry — so a timer arm polled second finds a budget
+   of zero, returns `Pending` however far past its deadline, and is never even registered with the
+   timer driver.
+4. `macros/select.rs`: the generated `poll_fn` begins `ready!(poll_budget_available(cx))`, gating
+   on the budget **before any arm is polled at all**.
+
+`the_sampler_keeps_ticking_while_the_read_future_burns_its_whole_coop_budget` remains the pin, and
+is genuinely order-sensitive: with the arms reversed its `ticks` would be 0 against an assertion of
+`>= 3` of 6 windows.
+
+### The final sample runs on every path `sample_while` returns on — not on every path
+
+Corrected in "Sampling cadence" above. The one path that skips it is the whole future being
+*dropped*, which is what `run_input`'s grace backstop does when `shutdown_grace` expires
+(`logit_pipeline::runtime`). Production does not reach it: `read_loop` races `shutdown` in both of
+its own `select!`s and so returns within microseconds of the signal, long before a 5 s grace could
+fire, and `input_runtime_config` supplies `ReceiveConfig::default()`'s 5 s for every listener —
+including one whose config omits `receive:` entirely, since `ReceiveConfig` is itself
+serde-defaulted. `InputRuntimeConfig::default()`'s `Duration::ZERO` is reached only from tests, and
+there both arms are ready at once and `select!`'s rotation drops the listener roughly half the
+time. `runtime.rs`'s own comment claimed the ZERO default was what production used; that comment is
+corrected too.
+
+### `msg_len` under truncation, and the clamp that is deliberately dead
+
+`udp_recvmsg` (`net/ipv4/udp.c`; `udpv6_recvmsg` identically) sets `MSG_TRUNC` in the *output*
+`msg_flags` exactly when `copied < ulen`, and returns
+`err = copied; if (flags & MSG_TRUNC) err = ulen;` — the real length only when `MSG_TRUNC` was
+passed as an **input** flag, which this code never does. So this ADR's claim that "`msg_len` alone
+cannot detect it" is correct, and `read_batch`'s `.min(MAX_DATAGRAM_BYTES)` clamp is provably dead
+code, kept as defence in depth. The `debug_assert_eq!` beside it is what keeps that honest, and
+`an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives the truncating case through
+it in every test build. (`MSG_CTRUNC` is a different bit and cannot fire here — no cmsg options are
+enabled — so the flag test cannot confuse the two. The `csum_copy_err` path clears `MSG_TRUNC`
+before retrying, so a bad-checksum skb cannot leak a stale flag onto the next datagram.)
+
+### `READABLE | ERROR` is correct, and the liveness precondition beside it
+
+The wait mask matches what tokio's own `UdpSocket::recv_from` passes (`tokio/src/net/udp.rs`), and
+the tokio#5550 hazard class does not apply: `ScheduledIo::clear_readiness` excludes only
+`READ_CLOSED`/`WRITE_CLOSED` from what it clears, so `Ready::ERROR` *is* clearable. The real sharp
+edge is `Ready::READ_CLOSED`, which `Ready::from_interest` adds to any readable interest and which
+`clear_readiness` can never clear: were it ever set while the syscall kept returning `EAGAIN`,
+`async_io` would loop inside a single poll and — since its `WouldBlock` arm restores the coop
+budget — never yield, wedging the worker thread (open tokio issue #6971). It is unreachable only
+because `EPOLLRDHUP`/`EPOLLHUP` on this socket come from `sk->sk_shutdown`, which nothing sets
+without a `shutdown(2)` call on the fd. That is now written down at `bind_one` rather than left
+implicit.
+
+### Verification added, and what remains out of reach
+
+`BatchReader::read_batch`'s closure is split into three named pieces — `build_headers`,
+`recvmmsg_into`, `harvest_headers` — so that the two pure ones can be executed under `miri`, which
+has no shim for `recvmmsg` and so can never run the closure as a whole. `mod batch_reader_helpers`
+(six tests, `vlen ∈ {1, 2, 63, 64, 1024}`) covers slot disjointness and containment,
+`msg_iovlen == 1`, NULL name/control, full re-initialization after a simulated kernel writeback, the
+harvest's exact-`n` behaviour, and a write through each header's *own* stored `iov_base` pointer —
+the provenance chain production depends on. It is in `MIRI_TARGETS` (`script/unsafe-check`) and in
+ordinary CI. Alongside it, a `const` block asserts every layout fact the three functions rest on
+(alignment, per-slot capacity, the `size_of`-is-a-multiple-of-`align_of` stride, and that both
+harvested fields lie inside one header). The fatal path now has a test too — a readable non-socket
+descriptor produces a real `ENOTSOCK` with no fault injection — and `describe_read_failure` gives it
+a message naming the syscall, the bound address, and, for `ENOSYS`/`EPERM`, the fact that
+`read_batch: 1` is not the workaround it looks like. What remains out of reach in CI: the injected
+errno sequences (`script/unsafe-check inject`) and a real `SOCK_DESTROY`.
+
+### Re-verify on a dependency bump
+
+- **tokio**: the four coop facts above (budget 128; `async_io`'s two pre-closure awaits and its
+  `WouldBlock`-restores-budget arm; `poll_elapsed`'s `poll_proceed`-before-deadline; `select!`'s
+  `poll_budget_available`), `clear_readiness`'s exclusion list, `Ready::from_interest` adding
+  `READ_CLOSED`, and that `recv_from` still uses `READABLE | ERROR`.
+- **libc**: the `const` block in `crates/logit-inputs/src/udp.rs` is the tripwire — a change to
+  `mmsghdr`/`iovec`'s size, alignment or field offsets on any supported target is a compile error,
+  not a runtime surprise.
