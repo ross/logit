@@ -35,7 +35,7 @@ connection, and a central `logit_in` splitting them back apart
 Two costs are structural to this shape, not to the filters:
 
 - **Every branch pays for every event.** N filters each run `process` over the whole flow to keep
-  one N-th of it. The filter is cheap (1 allocation, ~360 ns per event, `docs/design/memory.md`),
+  one N-th of it. The filter is cheap (1 allocation, ~525 ns per event, `docs/design/memory.md`),
   but it's paid N times per event, and the else-branch is a chain of complements whose length
   grows with N.
 - **A fan-out with no `Output` branch clones the batch.** `Arc<EventBatch>` copy-on-write

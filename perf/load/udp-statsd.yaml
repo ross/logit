@@ -9,9 +9,11 @@ ring_datagrams: 8191
 model: statsd-app.yaml
 
 # Paced a few percent above what the receiver sustains, so the baseline sits in a small-but-non-zero
-# kernel-drop regime rather than at either extreme -- see perf/load/README.md's "Tuning". This mix
-# averages ~17.9 lines per datagram, so 90,000 datagrams/s is ~1.6M metrics/s offered.
-rate: 90000
+# kernel-drop regime rather than at either extreme -- see perf/load/README.md's "Tuning". Retuned
+# 2026-09-20 for the disposable perf VM (script/vm), the project's reference box: bisected on
+# current main to 2.31% kernel drop at this rate (perf/load/README.md's "Tuning" has the protocol).
+# This mix averages ~17.9 lines per datagram, so 82,000 datagrams/s is ~1.47M metrics/s offered.
+rate: 82000
 
 # Mixed, because datagram size is the axis that decides which half of the pipeline a number is
 # about. Weights: the single-line share is what an unbuffered client sends and what

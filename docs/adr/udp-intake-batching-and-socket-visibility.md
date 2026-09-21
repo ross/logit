@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-18
+updated: 2026-09-20
 ---
 
 # UDP intake batching and socket visibility
@@ -297,33 +297,37 @@ shape and the choice of 64 — that part is no longer a laptop-only claim.
 
 `read_batch` ∈ {1, 16, 32, 64, 128, 256}, `--repeat 3`, pinned `--pin-sender 0,1 --pin-child 2,3`,
 each value set on both scenarios at once, everything else held (see "Pinned runs only" and the
-`powersave` caveat below — the absolute µs/event figures in this table are still this laptop
-session's own, not re-taken on the VM, but the plateau shape and the choice of 64 are now confirmed
-independently, see above):
+`powersave` caveat below). **The table below is from the disposable perf VM**
+(`Standard_F8as_v6`, 2026-09-20), superseding the dev-laptop numbers this table used to carry — the
+plateau shape and the choice of 64 were already confirmed independently of the laptop
+(`docs/design/performance.md` §7); this is that same VM session's own dedicated re-run of this
+ADR's specific sweep, at the calibrated knee:
 
 | `read_batch` | **`udp-statsd-small`** µs/ev | fill | kernel drop % | max rcvbuf | | **`udp-statsd`** µs/ev | fill | kernel drop % | max rcvbuf |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | **1.718** | 1.0 | **3.65%** | **0.98** | | 0.663 | 1.0 | 0.44% | 0.39 |
-| 16 | 1.107 | 3.2 | 0.00% | 0.05 | | 0.660 | 11.9 | 0.74% | 0.39 |
-| 32 | 0.979 | 3.6 | 0.00% | 0.01 | | 0.652 | 18.5 | 0.34% | 0.47 |
-| **64** | **1.128** | **3.1** | **0.00%** | **0.03** | | **0.648** | **24.2** | **0.44%** | **0.26** |
-| 128 | 1.117 | 3.0 | 0.00% | 0.06 | | 0.660 | 26.8 | 0.35% | 0.26 |
-| 256 | 1.112 | 3.7 | 0.00% | 0.04 | | 0.654 | 24.3 | 0.63% | 0.25 |
+| 1 | **4.173** | 1.0 | **11.60%** | **1.00** | | 0.961 | 1.0 | 4.63% | 1.00 |
+| 16 | 3.410 | 3.7 | 0.00% | 0.01 | | 0.797 | 6.3 | 0.00% | 0.28 |
+| 32 | 3.618 | 3.5 | 0.00% | 0.01 | | 0.808 | 12.1 | 0.00% | 0.27 |
+| **64** | **3.486** | **4.0** | **0.00%** | **0.03** | | **0.795** | **7.6** | **0.00%** | **0.28** |
+| 128 | 3.386 | 4.2 | 0.00% | 0.01 | | 0.808 | 14.3 | 0.00% | 0.26 |
+| 256 | 3.315 | 3.2 | 0.00% | 0.02 | | 0.795 | 6.3 | 0.00% | 0.27 |
 
-Two things fall out of it. **The step is from 1 to "batched at all", not from 64 to 128.** On the
-single-datagram-per-packet scenario, `read_batch: 1` costs 1.72 µs/event, loses 3.65% of datagrams
-to the kernel and sits at 98% receive-buffer utilization; every value from 16 up delivers the whole
-paced load with a kernel drop rate of zero and a buffer that never gets above 6% full, at ~1.0-1.13
-µs/event. Between 16 and 256 the curve is flat — the 0.979 at 32 is a single low sample, not a
-trend, since 16, 64, 128 and 256 all land within 2% of each other.
+Two things fall out of it, unchanged in shape from the laptop version of this table. **The step is
+from 1 to "batched at all", not from 64 to 128.** On the single-datagram-per-packet scenario,
+`read_batch: 1` costs 4.17 µs/event, loses 11.6% of datagrams to the kernel and sits at 100%
+receive-buffer utilization; every value from 16 up delivers the whole paced load with a kernel
+drop rate of zero, at 3.3-3.6 µs/event within ordinary noise of each other. `udp-statsd` shows the
+same step, 0.96 µs/event and 4.6% loss at `read_batch: 1` down to a flat ~0.80 µs/event and zero
+loss from 16 upward.
 
-**And the `fill` column says why, which is the part worth carrying forward.** `fill` is
-`logit.input.datagrams / logit.input.reads`, the mean number of datagrams one syscall actually
-returned. On `udp-statsd-small` it is ~3 at every `read_batch` from 16 upward — at 760,000 datagrams
-a second the reader keeps up so comfortably that only about three datagrams are ever waiting when it
-asks. Raising the ceiling above the arrival burst cannot buy anything, which is exactly the shape
-the table shows. On `udp-statsd` (bigger, multi-line datagrams, more decode work per datagram) the
-fill climbs to ~24 and then plateaus there regardless of whether the ceiling is 64, 128 or 256.
+**The `fill` column is noisier on this box than the laptop's clean plateau, but the conclusion it
+supports is the same.** `fill` is `logit.input.datagrams / logit.input.reads`, the mean number of
+datagrams one syscall actually returned. On `udp-statsd-small` it holds in a narrow 3.2-4.2 band
+from `read_batch: 16` upward — consistent with the laptop's own ~3 finding, just with more
+run-to-run wobble at only 3 repeats each. On `udp-statsd` fill ranges 6.3-14.3 across the same span
+without a clean upward trend the way the laptop's ~24-then-plateau shape showed; either way, the
+practical reading is unchanged — raising the ceiling above the arrival burst cannot buy anything,
+and µs/event is flat regardless of exactly where `fill` lands within that noise.
 
 So 64 is chosen as the smallest power of two comfortably above both workloads' observed plateau,
 with the slab cost that implies (4 MiB of address space, a few hundred KiB resident — see below)
@@ -331,17 +335,17 @@ rather than the 16 MiB/64 MiB a higher default would ask every listener to reser
 knob still earns its place: a deployment whose fill sits pinned at 64 is telling its operator that
 its arrival bursts are larger than this default, and `docs/deploying.md` says so in those terms.
 
-**The slab is not resident, and the sweep is the proof — on this box.** `udp-statsd-small`'s peak
-RSS is **21.7 MiB at every one of `read_batch` 16, 32, 64, 128 and 256** — a sixteenfold change in
-the nominal size of the read slab (1 MiB to 16 MiB) with no movement in resident memory at all,
-because `vec![0u8; n]` under this codebase's jemalloc is a fresh zeroed mapping and a small
-datagram touches one 4 KiB page of each 65,507-byte slot. `docs/design/memory.md` §5 carries the
-direct probe alongside it. **This does not hold everywhere:** the same sweep repeated on an Azure
-VM with transparent huge pages set to `always` (`docs/design/performance.md` §7) found peak RSS
-rising noticeably at `read_batch` 128/256, likely (not yet confirmed) because touching one 4 KiB
-page per slot under `THP=always` faults in the whole enclosing 2 MiB huge page, making most of the
-slab resident rather than just the touched pages. "The slab is not resident" is a claim about this
-dev container's THP setting (`madvise`/`never`), not a universal one.
+**The slab is not resident under `madvise`/`never`, confirmed directly, not just on the dev
+container.** A dedicated repeat of this exact sweep with `transparent_hugepage` forced to `madvise`
+on the same VM (`docs/design/performance.md` §7) shows `udp-statsd-small`'s peak RSS flat in a
+14.4-16.8 MiB band across the *entire* `read_batch` range — no rise at 128/256 the way the default
+`THP=always` sweep above shows (34.1 → 39.2 → 47.6 MiB over the same range). `docs/design/
+memory.md` §5 carries the direct allocation-side probe alongside it. **This does not hold under
+`THP=always`, confirmed rather than merely likely now:** touching one 4 KiB page per slot under
+`THP=always` faults in the whole enclosing 2 MiB huge page, making most of the slab resident rather
+than just the touched pages — a same-box, THP-toggled repeat of the identical sweep, not a
+different box's different finding. "The slab is not resident" is a claim about `madvise`/`never`
+specifically, confirmed on two different boxes now, not a universal one.
 
 **Ceiling 1024 = `UIO_MAXIOV`.** `recvmmsg` takes an array of `mmsghdr`, each wrapping an `iovec`;
 `UIO_MAXIOV` (1024 on Linux) is the kernel's hard limit on how many `iovec`s a single vectored I/O

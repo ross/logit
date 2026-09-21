@@ -40,9 +40,9 @@ host_stream:
 **The revisit trigger this closes is a named one, not a hunch.** ADR `routing-by-condition-is-lua`
 decided `logit` ships no native predicate language and retired `ComponentKind::Filter`, but it
 named its own condition for reopening the question: *sustained central-collector throughput
-pressure*, with a measured cost table -- a Lua route costs 9 allocations/event and 1.07 µs/event,
+pressure*, with a measured cost table -- a Lua route costs 9 allocations/event and 1.61 µs/event,
 plus one dedicated OS thread **and** one LuaJIT VM per node; a native `Transform` costs 1
-allocation/event and 360 ns/event, an ordinary tokio task in the shared runtime. Fan-out-after-
+allocation/event and 525 ns/event, an ordinary tokio task in the shared runtime. Fan-out-after-
 `logit_in` is precisely the central-collector role that table is about, and the cost multiplies by
 branch count: every event reaching the listener is offered to all N branches, so an N-way split
 pays N filter evaluations, N OS threads, and N LuaJIT VMs for a job that is, in every case here, one

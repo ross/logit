@@ -9,6 +9,7 @@ record. See [Branches and PR titles](../../AGENTS.md#branches-and-pr-titles).
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Verification plan: critical sections inventory](critical-sections-inventory.md) | 2026-09-20 | 2026-09-20 |
 | [Enabling plan: a data-shape survey, and the `shape` component that measures it](data-shape-survey.md) | 2026-09-20 | 2026-09-20 |
 | [Enabling plan: UDP intake batching and socket visibility](udp-intake.md) | 2026-09-18 | 2026-09-18 |
 | [Enabling plan: Prometheus remote-write — receive on `prometheus_in`, send on `prometheus_out`](prometheus-remote-write.md) | 2026-09-17 | 2026-09-18 |

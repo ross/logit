@@ -168,62 +168,71 @@ helped, which is why all three are reported together.
 Each spec's `datagrams` and `rate`, and each scenario's `receive_buffer_bytes`, are set so a pinned
 release run takes **5–10 s** and the baseline sits in a regime with a **small, non-zero kernel drop
 rate** — the regime a later improvement has somewhere to move. A zero-drop baseline could not show
-one, and a saturated 95%-drop baseline is a regime nobody deploys in.
+one, and a saturated 95%-drop baseline is a regime nobody deploys in. Rates are calibrated against
+the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`), the project's reference box since
+2026-09-20 — `udp-statsd`/`udp-statsd-packed` are bisected there directly; `udp-statsd-small`'s
+rate is still its original laptop-tuned value, since the automated calibration on the VM never
+found a drop rate above ~0% within the range it searched (see that spec's own comment for why, and
+`docs/design/performance.md` §7 for the per-binary capacity numbers that explain it).
 
-The other extreme was measured before settling here. Pinned but **unpaced**, the sender outruns the
-receiver by 4–30×: `udp-statsd` dropped 95.8%, `udp-statsd-packed` 95.1% and `udp-statsd-small`
-76.2%, with wall times of 0.19–0.99 s — far too short to measure and far too lossy to be a regime
-anybody runs in. `rate` is therefore set a few percent above what the receiver sustains, per
-scenario, which both lengthens the run into the target band and puts the drop rate where it's
-useful.
+The other extreme was measured before settling here — on the original dev laptop, when these specs
+were first tuned. Pinned but **unpaced**, the sender outran the receiver by 4–30×: `udp-statsd`
+dropped 95.8%, `udp-statsd-packed` 95.1% and `udp-statsd-small` 76.2%, with wall times of
+0.19–0.99 s — far too short to measure and far too lossy to be a regime anybody runs in. The same
+qualitative shape holds on the VM (an unscaled `--rate-scale 1.0` still drops well above target on
+every scenario there too), which is why calibration remains necessary on the reference box, not
+just a laptop artifact. `rate` is set a few percent above what the receiver sustains, per scenario,
+which both lengthens the run into the target band and puts the drop rate where it's useful.
 
 **The drop rate is the tuning's sensitive number, not its robust one.** These specs are paced a few
 percent above capacity, so the drop rate is the *difference* between two nearly-equal rates and
-amplifies anything that moves either of them. Two measured examples, same specs, same commit, same
-pins:
+amplifies anything that moves either of them. This was first found on the laptop — a run taken
+while another build was going on the same machine turned `udp-statsd-small`'s 1.4% into 35%, and
+after ~90 minutes of continuous benchmarking the same scenario went from 3.1% to 12.4% (CPU
+µs/event up ~23%) as a laptop-class part settled into a lower sustained power state, confirmed by
+re-running the earlier commit and reproducing the later numbers. The reference VM removes the
+governor/thermal/battery half of this, but not all of it: last-level cache and memory bandwidth
+are still shared with other tenants on the physical host, and a new `script/vm up` may land on
+different hardware entirely (`docs/adr/disposable-azure-perf-vm.md`'s "Consequences" section) — so
+the same two rules still apply.
 
-- A run taken while another build was going on the same machine turned `udp-statsd-small`'s 1.4%
-  into 35%.
-- After ~90 minutes of continuous benchmarking, the same scenario went from 3.1% to 12.4% and
-  0.45% to 2.2% on `udp-statsd`, with CPU µs/event up ~23% — on a laptop-class part settling into a
-  lower sustained power state. Checked, not assumed: re-running the *earlier* commit right
-  afterwards reproduced the *later* numbers (0.677 vs 0.678 µs/event, 13.2% vs 12.4%), so it is the
-  box that moved, not the code.
-
-Two rules follow. Take a baseline on an idle, rested box; and **take a baseline and the delta it is
-compared against back to back in one sitting, interleaved** (parent, branch, parent, branch …) — a
-delta measured an hour after its baseline is measuring the machine as much as the change, and two
-unbroken blocks put one side on the cool half of the session and the other on the warm half.
-`compare` warns on a host/CPU-model mismatch for a related reason, but it cannot see this one.
+Two rules follow. Take a baseline on a freshly-provisioned, idle VM; and **take a baseline and the
+delta it is compared against back to back in one sitting, interleaved** (parent, branch, parent,
+branch …) — a delta measured an hour after its baseline is measuring the machine as much as the
+change, and two unbroken blocks put one side on the cool half of the session and the other on the
+warm half. `compare` warns on a host/CPU-model mismatch for a related reason, but it cannot see
+this one.
 
 ### Box state
 
-Before a run whose numbers are going to be written down anywhere:
+Before a run whose numbers are going to be written down anywhere, on the reference VM:
 
 | Check | Why | Where to look |
 |---|---|---|
-| On AC, not battery | Every absolute number is depressed on battery, and drifts as the run goes on | `/sys/class/power_supply/*/online` for the supply whose `type` is `Mains` (`ACAD` on this box, not `AC`) |
-| Governor is `performance`, not `powersave` | The single largest source of unexplained movement here | `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` |
-| Energy-performance preference is not a power-saving one | The finer knob under the governor | `…/cpu0/cpufreq/energy_performance_preference` |
-| Platform profile is not `low-power`, where the machine has one | Firmware-level cap under everything above | `/sys/firmware/acpi/platform_profile` — **absent on this box**, so don't expect it |
-| Thermal headroom: rested box, gaps between repeats, watch for a frequency drop | The 90-minute drift above is exactly this | `grep MHz /proc/cpuinfo` before and after |
-| Nothing else building | A concurrent `cargo build` turned 1.4% into 35% | `uptime`, `ps aux --sort=-%cpu` |
-| Sender and child pinned to distinct **fast physical** cores | See "Pinning" below | `lscpu -e`'s `MAXMHZ` column |
+| Nothing else running on the VM | The whole reason the VM exists — no other tenant of *ours*, no concurrent `script/*` work | `ps aux --sort=-%cpu`, `docker ps` |
+| Freshly provisioned this session, not left over from another | Last-level cache and memory bandwidth are still shared with other physical-host tenants; a fresh `up` is the closest thing to a controlled baseline | `script/vm status`'s "running for" |
+| Thermal/host-maintenance headroom: gaps between repeats | Azure hosts support live migration/memory-preserving maintenance mid-session, which can freeze the guest briefly (inflates wall-clock, not CPU time) | check the scheduled-events endpoint before a long run: `curl -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01'` |
+| Sender and child pinned to distinct physical cores | See "Pinning" below | `--pin-sender`/`--pin-child`, always |
 
-`logit-perf run` reads the first four best-effort and records them in the results file's preamble
-(`box_state`), printing a warning before the first scenario when the governor is `powersave` or the
-box is on battery — early enough to stop and fix it rather than discover it in the JSON afterwards.
-Anything it can't see is recorded as `null`: inside this repo's dev container the two `cpufreq`
-files and the mains supply are visible, and the ACPI platform profile is not.
+`logit-perf run` still reads governor/EPP/platform-profile/AC-power best-effort into the results
+file's preamble (`box_state`) — on this Azure guest, that comes back an **empty `{}`** on every
+result file, since the guest exposes none of the `cpufreq`/`power_supply` sysfs nodes those checks
+read. That's not a gap to work around; it's the isolation the VM is for — there is no governor to
+drift and no battery to run down. The laptop-era checklist this section used to carry (AC power,
+`performance` governor, energy-performance preference, ACPI platform profile, `grep MHz
+/proc/cpuinfo`) doesn't apply to a VM with none of those knobs exposed.
 
 `receive_buffer_bytes: 1MiB` on all three. Linux grants double what is requested, and clamps at
-`net.core.rmem_max` — **4 MiB in this dev container**, so 1 MiB is requested, 2 MiB is granted, and
-nothing is clamped. Re-tune if that sysctl differs on the machine you are running on;
-`logit.input.receive_buffer.bytes` in the run's own telemetry reports what was actually granted.
+`net.core.rmem_max` — **16 MiB by cloud-init default on the reference VM** (left at that default,
+not clamped down to match any particular container the way an earlier session did), so 1 MiB is
+requested, 2 MiB is granted, and nothing is clamped. Re-tune if that sysctl differs on the machine
+you are running on; `logit.input.receive_buffer.bytes` in the run's own telemetry reports what was
+actually granted.
 
-Retune whenever the receiver's own speed changes — which is exactly what the workstreams after this
-one do. The rule is: **`rate` stays fixed across a baseline/delta pair**, so the comparison isolates
-the change; it moves only when a new baseline is being established.
+Retune whenever the receiver's own speed changes — which is exactly what a workstream like
+`udp-intake-batching-and-socket-visibility` does. The rule is: **`rate` stays fixed across a
+baseline/delta pair**, so the comparison isolates the change; it moves only when a new baseline is
+being established.
 
 ## Self-checks
 
@@ -272,26 +281,32 @@ combination should fail, and a run of it that passes means the receiver got fast
 
 ## Pinning
 
-Not optional here. This dev box has heterogeneous cores (Zen 5 performance vs. Zen 5c efficiency),
-and an unpinned run lands on one kind or the other by scheduler luck, making every number bimodal
-by roughly 2×. `lscpu -e`'s `MAXMHZ` column is what tells them apart — on this box CPUs 0–3 and
-12–15 are the 5,158 MHz cores (four physical, plus their SMT siblings) and 4–11/16–23 are the
-3,289 MHz ones.
+Not optional, though the reason changed when the reference box did. On the original dev laptop
+(heterogeneous Zen 5 performance vs. Zen 5c efficiency cores), an unpinned run landed on one kind
+or the other by scheduler luck, making every number bimodal by roughly 2×. The reference VM's
+cores are identical, so that specific failure mode is gone — but pinning still matters, for a
+simpler reason: it keeps the sender and the measured child from contending for the same core's
+time, which would inflate both sides' numbers together and make a delta harder to trust.
 
 Every recorded `udp-statsd*` number states which CPUs it pinned to. The recorded baseline uses
-`--pin-sender 0,1 --pin-child 2,3`: four distinct fast *physical* cores, sender and child disjoint,
-so neither is ever competing with the other for a core and neither lands on an efficiency core.
-`--pin-child` is applied between `fork` and `exec`, so every thread the child ever creates inherits
-the mask — pinning after spawn would leave the threads created during startup on whatever CPU the
-scheduler picked.
+`--pin-sender 0,1 --pin-child 2,3`: two cores for the sender, two for the child, disjoint from each
+other, on the reference VM's 8-core `Standard_F8as_v6` (cores 4–7 sit free — headroom the earlier
+4-core session didn't have). `--pin-child` is applied between `fork` and `exec`, so every thread the
+child ever creates inherits the mask — pinning after spawn would leave the threads created during
+startup on whatever CPU the scheduler picked.
 
-## Portability notes from the Azure perf-VM session
+## Portability notes from the Azure perf-VM sessions
 
-- **Rates are hardware-specific and must be recalibrated per box.** The shipped specs' rates are
-  tuned against this dev laptop; an `Standard_F4as_v6` Azure VM's cores needed `--rate-scale`
-  0.49–0.83 (roughly half, and non-uniformly across scenarios) to reach the same 1–5% calibration
-  target this README's "Tuning" section describes. Don't assume a rate that's calibrated on one box
-  carries over to another — retune whenever the receiver's own speed changes, and that includes a
+- **Rates are hardware-specific and must be recalibrated per box.** The shipped `udp-statsd`/
+  `udp-statsd-packed` rates are now calibrated against the reference VM directly (2026-09-20,
+  bisected on current `main` to 2.31%/3.97% kernel drop respectively) rather than the original dev
+  laptop, closing the gap the first VM session (2026-09-18, `Standard_F4as_v6`, needed
+  `--rate-scale` 0.49–0.83 against the then-laptop-tuned rates) first found. `udp-statsd-small` is
+  the one exception, left at its original laptop value — the automated calibration on the VM never
+  found a drop rate above ~0% within the range it searched, meaning `recvmmsg`'s real capacity gain
+  for this scenario exceeds what a 3× search ceiling can even probe (`docs/design/performance.md`
+  §7's per-binary capacity table). Don't assume a rate calibrated on one box carries over to
+  another regardless — retune whenever the receiver's own speed changes, and that includes a
   change of *box*, not just a change of code.
 - **Give each ref its own `CARGO_TARGET_DIR` when building several for one comparison.** Building
   multiple refs' binaries under one shared target directory (even across separate source trees
@@ -299,5 +314,6 @@ scheduler picked.
   a later ref's freshly-extracted files against an earlier ref's build record, silently reusing the
   earlier binary under the later ref's label — caught only by comparing sha256 checksums, not by
   build output (the reused build reported `0.11s` and zero `Compiling` lines, which is itself a
-  tell). Use a distinct `CARGO_TARGET_DIR` per ref, and verify each binary's checksum before every
-  run, not just once at the start of a session.
+  tell). `script/vm build` now gives each git-ref source its own target directory by default,
+  closing this specific hazard; verifying each binary's checksum before every run remains good
+  practice regardless.
