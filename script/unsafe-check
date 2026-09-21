@@ -1,0 +1,217 @@
+#!/bin/bash
+# Usage: script/unsafe-check miri [cargo-miri-test args]
+#        script/unsafe-check careful [cargo-careful-test args]
+#        script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]
+#        script/unsafe-check all
+#        script/unsafe-check shell
+#        script/unsafe-check --help
+#
+# Out-of-CI, throwaway-image harness for verifying the repo's raw-`libc` `unsafe` code with
+# nightly-only tools (miri, `cargo-careful`) that never touch the stable toolchain
+# (`rust-toolchain.toml`, `Dockerfile.dev`, `script/cibuild`) -- see
+# `docs/adr/out-of-ci-unsafe-verification.md` for what each tool actually verifies and its limits,
+# and `docs/plans/critical-sections-inventory.md` for the inventory this exists to work through.
+# Deliberately NOT part of script/cibuild, for the same reason script/bench/script/perf aren't:
+# this needs a second, nightly image and (for `inject`) elevated container capabilities that have
+# no business in the ordinary edit/check/test loop.
+#
+# `miri` and `careful` exercise the pure/real-syscall halves of `crates/logit-inputs/src/udp.rs`
+# (`recvmmsg`), `crates/logit-pipeline/src/sockstat.rs` (`getsockopt`), and
+# `crates/logit-inputs/src/tail/watch.rs` (hand-rolled inotify) -- the codebase's only three
+# production raw-`libc` `unsafe` call sites. `inject` forces the errno paths (EINTR/EAGAIN/ENOSYS/
+# EINVAL) neither tool can reach on a real socket/fd on demand.
+
+set -euo pipefail
+SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
+source "${SCRIPT_PATH}/common.sh"
+
+IMAGE=logit-unsafe-check:local
+
+# The miri targets w0 ships -- the pure `inotify_event` parser tests in
+# `crates/logit-inputs/src/tail/watch.rs`'s `mod inotify::tests` (`docs/adr/
+# out-of-ci-unsafe-verification.md`'s "miri has no shims for recvmmsg/recvmsg/inotify" explains
+# why only the pure parsing logic, not the syscalls around it, is reachable this way).
+#
+# One "<package>|<libtest filter>" pair per line -- `miri` with no arguments of its own runs every
+# pair below in order. w1/w3 extend this list as their own pure helpers land (NET-01/NET-11/
+# NET-12/TAIL-07 in the critical-sections inventory); nothing else in this script needs to change.
+MIRI_TARGETS=(
+    "logit-inputs|parse_events"
+)
+
+build_image() {
+    ${DOCKER} build -q -t "${IMAGE}" -f tools/unsafe-check/Dockerfile tools/unsafe-check >/dev/null
+}
+
+# This worktree bound at /work explicitly (never a compose service, which could cross-mount
+# another checkout), plus this image's *own* named volumes for the cargo registry cache and build
+# artifacts -- never `logit_cargo_home`/`logit_target_cache`, the stable dev container's volumes.
+# Sharing the target dir would poison the stable toolchain's incremental build cache with nightly
+# artifacts; a fresh, never-before-used volume here is what lets Docker's own copy-up behavior
+# (`Dockerfile.dev`'s comment on `/work/target` has the mechanism) seed it from this image's own
+# baked toolchain and `cargo-careful`/`cargo-nextest` installs on first use, and cache registry
+# downloads across runs after that.
+run_in_image() {
+    ${DOCKER} run --rm \
+        -u 1000:1000 -w /work \
+        -v "${ROOT}:/work:z" \
+        -v logit_unsafe_check_cargo_home:/home/dev/.cargo \
+        -v logit_unsafe_check_target:/work/target \
+        -e CARGO_HOME=/home/dev/.cargo \
+        -e CARGO_TARGET_DIR=/work/target \
+        -e MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}" \
+        "${IMAGE}" "$@"
+}
+
+# `inject` alone needs a raw ptrace attach -- strace's fundamental mechanism, and the one thing
+# nothing else this script runs needs. Docker's default seccomp profile denies `ptrace(2)` outright
+# regardless of capabilities (jvns "Why strace doesn't work in Docker", moby#21051); `--cap-add
+# SYS_PTRACE` is the documented fix, and `--security-opt seccomp=unconfined` is the fallback this
+# function reaches for only if that alone isn't enough on a given host (see the `inject` case
+# below).
+run_privileged_in_image() {
+    local seccomp_arg=()
+    if [ "${UNSAFE_CHECK_SECCOMP_UNCONFINED:-0}" = "1" ]; then
+        seccomp_arg=(--security-opt seccomp=unconfined)
+    fi
+    ${DOCKER} run --rm \
+        --cap-add SYS_PTRACE \
+        "${seccomp_arg[@]}" \
+        -u 1000:1000 -w /work \
+        -v "${ROOT}:/work:z" \
+        -v logit_unsafe_check_cargo_home:/home/dev/.cargo \
+        -v logit_unsafe_check_target:/work/target \
+        -e CARGO_HOME=/home/dev/.cargo \
+        -e CARGO_TARGET_DIR=/work/target \
+        "${IMAGE}" "$@"
+}
+
+cmd_miri() {
+    build_image
+    if [ "$#" -gt 0 ]; then
+        run_in_image cargo miri test "$@"
+        return
+    fi
+    for target in "${MIRI_TARGETS[@]}"; do
+        local package="${target%%|*}"
+        local filter="${target#*|}"
+        echo "## miri: -p ${package} -- ${filter} ################################"
+        run_in_image cargo miri test -p "${package}" --lib -- "${filter}"
+    done
+}
+
+cmd_careful() {
+    build_image
+    if [ "$#" -gt 0 ]; then
+        run_in_image cargo careful test "$@"
+        return
+    fi
+    run_in_image cargo careful test -p logit-pipeline -p logit-inputs
+}
+
+# Builds the requested test binary, then runs it under strace with the given syscall fault
+# injected -- see the ADR's "strace -e inject=" section for why this is the only way to force
+# EINTR/EAGAIN/ENOSYS/EINVAL on demand against a real socket or fd. `<cargo test args>` is
+# whatever you'd hand to `cargo test` to select and filter one test binary (e.g. `-p logit-inputs
+# --lib a_two_hundred_datagram_burst`) -- everything but a single trailing bare filter token is
+# passed straight to `cargo test --no-run`; that one trailing token (if any) is what's handed to
+# the compiled binary directly afterward, since a libtest binary run standalone takes its filter
+# as a bare positional argument the same way `cargo test` does.
+cmd_inject() {
+    local spec="${1:-}"
+    if [ -z "${spec}" ]; then
+        echo "usage: script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]" >&2
+        exit 1
+    fi
+    shift
+    if [ "${1:-}" = "--" ]; then
+        shift
+    fi
+    local syscall="${spec%%:*}"
+
+    local cargo_args=("$@")
+    local filter=""
+    local i=0
+    while [ "${i}" -lt "${#cargo_args[@]}" ]; do
+        local a="${cargo_args[${i}]}"
+        case "${a}" in
+        -p | --package | --bin | --test)
+            i=$((i + 2))
+            continue
+            ;;
+        -*)
+            i=$((i + 1))
+            continue
+            ;;
+        *)
+            filter="${a}"
+            i=$((i + 1))
+            continue
+            ;;
+        esac
+    done
+
+    build_image
+    echo "## inject: tracing ${syscall}, injecting ${spec} #####################"
+    # `cargo test --no-run` prints one "Executable ... (path)" line per compiled test binary --
+    # the path is relative to /work, which is exactly what's needed to hand straight to
+    # `strace`/the binary inside the same container afterward. `tail -1`: this script's supported
+    # usage builds exactly one target (`--lib`/`--bin <name>`/`--test <name>`), so exactly one such
+    # line is expected; a `cargo_args` selecting more than one target isn't a shape this
+    # subcommand tries to support.
+    local build_output
+    build_output="$(run_in_image cargo test --no-run "${cargo_args[@]}" 2>&1)"
+    local binary
+    binary="$(printf '%s\n' "${build_output}" |
+        grep -E '^\s*Executable ' | tail -1 | sed -E 's/.*\(([^()]+)\)[[:space:]]*$/\1/')"
+    if [ -z "${binary}" ]; then
+        echo "error: could not find a compiled test binary in cargo's build output:" >&2
+        printf '%s\n' "${build_output}" >&2
+        exit 1
+    fi
+    run_privileged_in_image strace -f -e "trace=${syscall}" -e "inject=${spec}" -- \
+        "${binary}" ${filter:+"${filter}"} --test-threads=1
+}
+
+cmd_all() {
+    cmd_miri
+    cmd_careful
+}
+
+cmd_shell() {
+    build_image
+    run_in_image bash
+}
+
+usage() {
+    sed -n '2,7p' "${SCRIPT_PATH}/unsafe-check" | sed 's/^# \?//'
+}
+
+case "${1:-}" in
+miri)
+    shift
+    cmd_miri "$@"
+    ;;
+careful)
+    shift
+    cmd_careful "$@"
+    ;;
+inject)
+    shift
+    cmd_inject "$@"
+    ;;
+all)
+    cmd_all
+    ;;
+shell)
+    cmd_shell
+    ;;
+-h | --help | "")
+    usage
+    ;;
+*)
+    echo "unknown subcommand: ${1}" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
