@@ -1,6 +1,6 @@
 ---
 created: 2026-09-18
-updated: 2026-09-19
+updated: 2026-09-20
 ---
 
 # A disposable Azure VM for perf measurement: `up`/`down` only, no stop and no snapshot
@@ -99,17 +99,27 @@ every other subcommand uses -- files and tarballs in either direction, `pull` de
 `perf/results/` landing under `tmp/perf/vm/<timestamp>/` on the host, following the repo's existing
 "perf artifacts never enter the repo" rule.
 
-### The size, and why 4 vCPUs is 4 cores
+### The size, and why N vCPUs is N cores
 
-`Standard_F4as_v6`: 4 vCPU, 16 GiB, AMD EPYC 9004 (Genoa, up to 3.7 GHz boost). Verified via
+`Standard_F8as_v6`: 8 vCPU, 32 GiB, AMD EPYC 9004 (Genoa, up to 3.7 GHz boost). Verified via
 `az vm list-skus`: `vCPUsPerCore: 1` — SMT is disabled for this whole series, so every vCPU is a
 full physical core with no sibling thread to contend with. That single property is what the
-laptop's Zen 5 / Zen 5c split can't offer: four *identical* cores, not two kinds. Also verified:
+laptop's Zen 5 / Zen 5c split can't offer: identical cores, not two kinds. Also verified:
 `MaxResourceVolumeMB: 0` (no local temp disk — irrelevant here, nothing needs one),
 `EphemeralOSDiskSupported: False` (hence an ordinary managed OS disk, not an ephemeral one),
 `HyperVGenerations: V2` (gen2 image required), and `MemoryPreservingMaintenanceSupported: True`
-(see Consequences). 16 GiB over the 8 GiB `F4als_v6` variant costs $0.03/hr more and gives real
-headroom for a cold release build plus a warm `CARGO_HOME` and `target/`.
+(see Consequences).
+
+Sized at 8 rather than the original 4: the first recorded session found several scenarios
+core-starved on 4 — `json-parse-x3` (a generator plus three parallel parsers plus three sinks),
+`route`/`fanout` (a generator, a router or three sinks, on top of whatever the runtime itself
+reserves), and every driven `udp-statsd*` scenario, whose sender, measured child, and the
+`internal` telemetry leg the harness attaches all want a core of their own alongside
+`--pin-sender`/`--pin-child`. Doubling to 8 is the smallest step that gives each of those room
+without changing which topology gets measured. 32 GiB (following the 4 GiB/vCPU ratio the original
+16 GiB/4 vCPU choice set, itself $0.06/hr over the half-memory `F8als_v6` variant, matching the
+original pair's $0.03/hr gap scaled by vCPU count) gives headroom for a cold release build plus a
+warm `CARGO_HOME` and `target/`.
 
 Default region is **`westus2`** (Quincy, Washington — there is no Azure region physically in
 Oregon; this is the nearest Pacific-Northwest one). It's not privileged over `eastus`/`centralus`
@@ -315,14 +325,17 @@ set, and every subcommand prints the resolved subscription first.
   cross-session comparison should cross-check `logit-vm-metadata.txt`'s CPU model, microcode,
   kernel, and Azure image version first, and pin `LOGIT_VM_IMAGE` to an explicit version rather
   than `:latest` if it's going to recur.
-- **Pinning is deliberately not used.** `--pin-sender`/`--pin-child`-style flags don't exist on
-  `crates/logit-perf`'s CLI, and reserving a core with `taskset`/`--cpuset-cpus` would change what
-  gets measured: `crates/logit-cli`'s Tokio runtime sizes its worker pool from
+- **Pinning is used where it separates two processes, not to shrink one.** `--pin-sender`/
+  `--pin-child` (added alongside the `udp-statsd*` family, `crates/logit-perf`'s CLI) apply
+  `sched_setaffinity` to the load generator and the measured `logit` child respectively, between
+  `fork` and `exec`, so every recorded driven-scenario session pins them to distinct physical
+  cores. What's still deliberately avoided is reserving a core *out of* the measured process's own
+  set with `taskset`/`--cpuset-cpus`: `crates/logit-cli`'s Tokio runtime sizes its worker pool from
   `available_parallelism()`, so narrowing the CPU set narrows the pipeline's own worker count,
   measuring a different topology rather than a cleaner view of the same one. This VM's whole
-  reason to exist — four identical cores, nothing else running — is what makes reserving one
-  unnecessary; a `script/perf --cpuset-cpus` pass-through remains available future work if it
-  turns out to matter.
+  reason to exist — identical cores, nothing else running — is what makes that kind of reservation
+  unnecessary for a generated scenario; a `script/perf --cpuset-cpus` pass-through remains
+  available future work if it turns out to matter there too.
 - **`script/perf`'s host-side git-SHA computation is moot here, harmlessly.** It exists because a
   *worktree* checkout's `.git` file points outside the container's bind mount; the VM's clone is
   plain, so `.git` is a real directory inside the mount and would work either way. The host-side
@@ -351,7 +364,10 @@ set, and every subcommand prints the resolved subscription first.
   instead, which `-o tsv` does put on a single tab-separated line; re-verified against all three
   regions once fixed. There is no `--no-check-quota` escape hatch, since the bug is what needed
   fixing, not the check itself.
-- **Cost**: ~$0.305/hour running in `westus2` (VM $0.273 + 128 GiB Premium SSD ~$0.027 + the
-  static IP ~$0.005), $0 once `down` completes. The first real session (three refs, interleaved
-  pairs, a `read_batch` sweep) ran ~2h08m end to end -- well under a dollar -- which is the answer
-  to "is it worth spinning up" at a glance.
+- **Cost**: ~$0.305/hour running in `westus2` on the original 4-vCPU size (VM $0.273 + 128 GiB
+  Premium SSD ~$0.027 + the static IP ~$0.005), $0 once `down` completes. The first real session
+  (three refs, interleaved pairs, a `read_batch` sweep) ran ~2h08m end to end -- well under a
+  dollar -- which is the answer to "is it worth spinning up" at a glance. **Updated for the 8-vCPU
+  default** (2026-09-20, "The size, and why N vCPUs is N cores" above): ~$0.58/hour (VM $0.546 +
+  the same disk/IP ~$0.032), verified against the Azure retail-price API rather than doubled on
+  faith -- compute doubles with vCPU count, disk and IP don't.

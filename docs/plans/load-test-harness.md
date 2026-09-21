@@ -72,32 +72,37 @@ Lua a scenario needs — validated the same way every other example config is.
 
 | Scenario | Graph | Measures | Count | events/s (measured) |
 |---|---|---|---|---|
-| `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing | 20M | ~2.5M/s |
-| `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 7M | ~0.78M/s |
-| `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~2.8-3.6M/s |
-| `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.48-0.50M/s |
-| `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 20M | ~3.3M/s |
-| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.79-1.37M/s |
-| `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~0.83-1.24M/s |
-| `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 8M | ~0.97-1.57M/s |
-| `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.16M/s (median; see note) |
-| `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 20M | ~3.7M/s |
-| `logfmt-parse` | `generate_in` (logfmt line, `fixtures::LOGFMT_LINE`) → `logfmt` → `null_out` | The logfmt parse alone; nine interner probes per event until `logfmt` adopts `KeyCache` | 7M | ~1.8-2.0M/s |
-| `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` (no `kv_metrics`) | Three parsers contending on the process-wide interner at once, read against `json-parse` | 7M | ~0.6-1.5M/s (generated; each parsed 3×) |
+| `passthrough` | `generate_in` (6 attributes, no log) → `null_out` | Runtime floor: scheduling, channel hops, no parsing | 25M | ~3.58M/s |
+| `json-parse` | `generate_in` (JSON body) → `json` → `kv_metrics` → `null_out` | The parse-into-attributes path | 19M | ~2.07M/s |
+| `aggregate` | `generate_in` (distribution metric, `host: h{seq%1000}`) → `aggregate` (1s window) → `null_out` | Aggregation + flush-tick cost | 20M | ~3.09M/s |
+| `lua` | `generate_in` → `lua` (inline enrichment script) → `null_out` | The Lua hop and its event proxy | 4M | ~0.60M/s |
+| `fanout` | `passthrough`'s `generate_in` (same 6 attributes) → 3 × `null_out` | `Arc`-based fan-out to multiple sinks, read against `passthrough` | 25M | ~2.59M/s |
+| `native-relay` | `generate_in` → `logit_out` → `logit_in` → `null_out` (one graph, one process) | Native encode + decode + per-batch ack round trip | 7M | ~0.88M/s |
+| `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~1.23M/s |
+| `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 10M | ~1.41M/s |
+| `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.71M/s (median; see note) |
+| `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 25M | ~3.15M/s |
+| `logfmt-parse` | `generate_in` (logfmt line, `fixtures::LOGFMT_LINE`) → `logfmt` → `null_out` | The logfmt parse alone; nine interner probes per event until `logfmt` adopts `KeyCache` | 9.5M | ~1.60M/s |
+| `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` (no `kv_metrics`) | Three parsers contending on the process-wide interner at once, read against `json-parse` | 9.5M | ~1.44M/s (generated; each parsed 3×) |
 
-Counts target roughly 5-10 seconds of wall time each on the dev box; tuned against a first real
-`script/perf run --repeat 1 --profile release` pass per scenario, as recorded in this table, rather
-than fixed in advance. `native-relay` never self-exits (`logit_in` is a socket listener), so it's
-the scenario that exercises the harness's settle-then-SIGTERM path rather than the plain
-wait-for-exit path every other scenario takes.
+Counts target roughly 5-10 seconds of wall time each. **Retuned 2026-09-20 for the disposable perf
+VM** (`docs/adr/disposable-azure-perf-vm.md`), the project's reference box — most scenarios already
+sat in the target band at their original, dev-laptop-tuned counts and were left unchanged
+(`aggregate`, `buffered`, `encode-human-devnull`, `lua`, `native-relay`); `encode-native-devnull`,
+`json-parse`, `json-parse-x3`, `logfmt-parse`, and the `passthrough`/`fanout`/`route` trio (which
+share one count by design, so retuned together) needed raising. `native-relay` never self-exits
+(`logit_in` is a socket listener), so it's the scenario that exercises the harness's
+settle-then-SIGTERM path rather than the plain wait-for-exit path every other scenario takes.
 
-`events/s` above is the range (or single value) actually observed while tuning, not a formal
-benchmark result -- this machine was running other disk- and CPU-heavy `script/perf` work
-concurrently at tuning time, so most scenarios show some run-to-run spread. `buffered` is the
-outlier by far: real disk I/O (segment writes, periodic checkpoints) makes it far more sensitive to
-that contention than any in-memory scenario -- observed throughput ranged from roughly 16k to 790k
-events/s across repeated runs at the same count, a swing no other scenario came close to. Its count
-is tuned to the median of that spread (roughly 5-10s under typical, not worst-case, contention);
+`events/s` above is now a clean median from a real `--repeat 5` recorded run on an idle reference
+VM (`docs/design/performance.md` §1), not a range observed while tuning on a contended machine —
+this table used to carry the latter, from the dev-laptop tuning pass, with a caveat about
+concurrent `script/perf` work inflating the spread. `buffered` was the outlier by far under that
+old regime: real disk I/O (segment writes, periodic checkpoints) made it far more sensitive to
+contention than any in-memory scenario — observed throughput ranged from roughly 16k to 790k
+events/s across repeated runs at the same count on the laptop, a swing since resolved (a harness
+bug, not the box or the scenario — `docs/design/performance.md` §3 has the full account) and not
+reproduced at anywhere near that magnitude on the VM;
 expect its wall time to vary more than every other scenario's when re-run.
 
 `fanout`'s count was bumped again, 25M → 55M, after the first *solo, uncontended* recorded run
@@ -109,7 +114,9 @@ time. Every other scenario's original count held up under that same solo run.
 scenario exercising a router and `target`s; its numbers are in `performance.md` §1.
 
 `fanout` was then re-shaped on 2026-09-14 to generate `passthrough`'s exact six-attribute event
-at `passthrough`'s exact count (20M), rather than its original one-attribute event at 55M. The
+at `passthrough`'s exact count (20M then, 25M since the 2026-09-20 VM retune above — the two have
+moved together every time either has changed, by design), rather than its original one-attribute
+event at 55M. The
 original shape made `fanout` look cheaper per event than `passthrough` (0.466 vs 0.478 µs on the
 quiet run), which was read as the delivery path being cheap — it was actually a 6× lighter
 generator. Holding the event shape fixed, one consumer is cheaper than three in both directions

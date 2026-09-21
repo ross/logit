@@ -62,7 +62,8 @@ getting the image, running it, `logit validate` as a preflight, signal/restart b
 `crates/logit-perf`, `script/perf run|compare|attribute|flamegraph`) spawns the real release
 binary against `perf/scenarios/*.yaml` to measure throughput, CPU per event, and peak RSS, and to
 attribute time per pipeline node — see [ADR `load-test-harness`](docs/adr/load-test-harness.md) and
-[docs/design/performance.md](docs/design/performance.md) for the first recorded results.
+[docs/design/performance.md](docs/design/performance.md) for the recorded results, measured on the
+disposable perf VM ([ADR `disposable-azure-perf-vm`](docs/adr/disposable-azure-perf-vm.md)).
 
 ## Development
 

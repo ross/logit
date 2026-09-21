@@ -18,6 +18,14 @@ model: statsd-app.yaml
 # packed spec manages, which is exactly this scenario's point: the per-datagram fixed cost dominates
 # a payload this small. Paced a few percent above what the receiver sustains, for a small non-zero
 # kernel drop rate at baseline (perf/load/README.md's "Tuning").
+#
+# NOT retuned for the perf VM (2026-09-20), unlike the other two specs, and left at its
+# laptop-tuned value deliberately: the automated calibration bisection against current `main` never
+# found a drop rate above ~0% within its tested range (up to ~3x this rate), meaning `recvmmsg`
+# (ADR `udp-intake-batching-and-socket-visibility`) raised this scenario's real capacity well past
+# what this rate can even probe -- see `docs/design/performance.md` §7's per-binary capacity table
+# (w4's `udp-statsd-small` capacity measured at ~4x w2's). Retuning this spec properly needs a wider
+# bisection ceiling than the one used for the other two, not done this session.
 rate: 760000
 
 datagram_mix:

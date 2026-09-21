@@ -1,4 +1,4 @@
-# Performance: the load-test harness's first recorded run
+# Performance: the load-test harness's recorded numbers
 
 The out-of-CI load-test harness ([ADR `load-test-harness`](../adr/load-test-harness.md),
 [`docs/plans/load-test-harness.md`](../plans/load-test-harness.md)) spawns the real, release-profile
@@ -12,7 +12,7 @@ Everything here is reproducible:
 
 | What | Command |
 |---|---|
-| Every scenario, 3 repeats | `script/perf run --repeat 3 --profile release --label quiet` |
+| Every scenario, 5 repeats | `script/perf run --repeat 5 --profile release --label recorded` |
 | Per-node time attribution | `script/perf attribute --scenario json-parse` / `--scenario aggregate` |
 | A flamegraph | `script/perf flamegraph --scenario passthrough` |
 | Before/after regression check | `script/perf compare <a.json> <b.json> --threshold 5` |
@@ -27,31 +27,45 @@ under `perf/bins/<slug>/logit`, and `--logit-bin` is what points a run at one of
 building anything. The results file then names itself after the *binary's* identity rather than
 the checkout's — see the ADR's "Multiple sources, one VM" section.
 
-> Numbers below were taken on a Fedora Linux 44 (Workstation Edition) host, kernel
-> `7.2.4-200.fc44.x86_64`, x86-64, AMD Ryzen AI 9 HX 370 w/ Radeon 890M (24 logical CPUs), inside
+> **Every number in this document, except where a sub-section states otherwise, was taken on the
+> disposable perf VM** (`docs/adr/disposable-azure-perf-vm.md`), not the dev laptop —
+> `Standard_F8as_v6`: 8 dedicated AMD EPYC 9V74 (Genoa) cores, SMT off, 32 GiB, Debian GNU/Linux 13
+> (trixie), kernel `6.12.107+deb13-cloud-amd64`, image version `0.20260914.2601`, `westus2`, inside
 > the dev container (`rustc 1.98.1 (48a229cea 2026-09-01)`), `release` profile, at commit
-> `fecbd9337010f95d722e89946e1a3e3aa43c007b` (clean working tree), on 2026-09-14 at roughly 01:22Z,
-> with the host otherwise idle — no other `script/*` work, nothing else heavy running on the machine
-> at the time. Unlike the run this table used to carry, this one was also taken **on battery power,
-> not mains** — the host's CPU frequency-scaling governor can clock down under battery, which can
-> depress every absolute number below relative to a plugged-in run; read events/s and CPU µs/event
-> here as possibly conservative, not as a hardware ceiling, though the *relative* shape (which
-> scenario costs more than which) should still hold. `perf/results/*.json`'s own `hostname` field
-> records the dev container's own hostname (`ad7e7699c92c`), not the physical host, since every
-> `script/*` command runs inside it; `cpu_model` and `nproc` come from `/proc/cpuinfo`/`nproc` as
-> seen *inside* that container, which is why they're restated here in prose rather than only trusted
-> from the JSON. See `docs/design/memory.md`'s own preamble for why this matters: a busier box has
-> shown "~20% slower across every unchanged benchmark" before now, so **treat every number below as
-> this-machine-this-day, not a portable constant** — `compare` warns on a host/CPU-model mismatch
-> for exactly this reason, and CPU µs/event, not wall-clock events/s, is what it actually gates a
-> regression on.
+> `f4967624005035b4818373904d71811e16176dc2` on 2026-09-20 — **dirty**: the retuned
+> `perf/scenarios/*.yaml` counts this same PR carries were measured uncommitted, since committing
+> mid-measurement-session on the VM's own checkout would have been worse provenance, not better;
+> `perf/results/*.json`'s own `git.dirty: true` on every file from this session is that diff, not a
+> mistake. Nothing else was running on the VM at the time — no other tenant, no other `script/*`
+> work, by construction (`docs/adr/disposable-azure-perf-vm.md`'s whole reason to exist). This
+> replaces the Fedora/Ryzen-laptop numbers this document carried through 2026-09-14 — see
+> `docs/design/memory.md`'s "Heterogeneous cores" note and the ADR's own "Context" section for why
+> that box was retired as a reference: heterogeneous Zen 5/5c cores made an unpinned run bimodal by
+> roughly 2×, and the same commit measured 90 minutes apart on battery drifted CPU µs/event by
+> ~23%. `perf/results/*.json`'s own `hostname` field records the dev container's own hostname
+> inside the VM, not anything host-identifying; `cpu_model` and `nproc` come from `/proc/cpuinfo`/
+> `nproc` as seen *inside* that container, which is why they're restated here in prose rather than
+> only trusted from the JSON. `compare` warns on a host/CPU-model mismatch for exactly this reason,
+> and CPU µs/event, not wall-clock events/s, is what it actually gates a regression on — a real
+> consideration even on a dedicated VM, since last-level cache and memory bandwidth are still
+> shared with other tenants on the physical host (the ADR's "Consequences" section).
+>
+> **Machine and code both changed since the last recorded run.** This isn't a clean before/after of
+> the VM against the laptop: real optimizations landed in the six days between them (in-place
+> `Transform::process`, the interner's `ahash`/key-cache work, `metrics-model-v2`'s TLV framing, the
+> Lua `Event.new`/`to_table` surface, among others), so a row that moved could be the box, the code,
+> or both. Where a specific number's story is "the code got faster" rather than "the box is
+> different," this document says so; where it doesn't, read the row as simply *current*, not as an
+> isolated hardware delta.
 
-For continuity: the previous recorded run this table carried, taken 2026-09-13 on a busy, contended
-machine (`c75399d8bccc`, `perf/results/20260913T104956Z-c75399d8bccc-recorded.json`), was 14–27%
-slower across the board in events/s than this quiet run, scenario for scenario — except `aggregate`
-(an apparent -15%, which the noise sub-section below shows is run-to-run variance rather than a
-real slowdown) and `fanout` (-5% against its then-current 55M count, essentially flat). `buffered`'s own
-before/after story is its own section, §3.
+For continuity, the runs this table carried before this one: 2026-09-14 on a quiet, battery-powered
+laptop (`fecbd9337010f95d722e89946e1a3e3aa43c007b`,
+`perf/results/20260914T012218Z-fecbd9337010-quiet.json`) and, before that, 2026-09-13 on a busy,
+contended laptop (`c75399d8bccc`, `perf/results/20260913T104956Z-c75399d8bccc-recorded.json`),
+14–27% slower across the board in events/s than the quiet run, scenario for scenario. Both are
+retired now — the VM's own run-to-run drift and controls (see the sub-sections below) are the
+comparison that matters going forward, not a cross-machine, cross-day delta against either laptop
+run. `buffered`'s own before/after story is its own section, §3.
 
 ## 0. What this measures, and what it doesn't
 
@@ -95,13 +109,15 @@ that repeat's own stderr rather than silently reporting a startup-inflated numbe
   time); nothing measures per-event or per-batch latency distribution. `attribute`'s per-node
   `process.duration`/`send.blocked.duration` sums are the closest this harness gets, and those are
   still sums over the whole run, not a distribution.
-- **Isolation from the rest of the box.** This runs in the same kind of dev-container environment
-  every other `script/*` command does, not a dedicated, pinned-core bench host — see the preamble's
-  ~20% caveat. `script/vm` (`docs/adr/disposable-azure-perf-vm.md`) provisions a disposable Azure
-  VM with four homogeneous cores and nothing else running for exactly this; a number taken there
-  should be captioned with its `~/logit-vm-metadata.txt` (CPU model, kernel, image version, sysctls)
-  the same way a machine caption works today, and note that the VM has no virtualized PMU, so
-  `flamegraph` there is a `cpu-clock`, not `cycles`, profile.
+- **Isolation from the rest of the box, mostly.** `script/vm` (`docs/adr/disposable-azure-perf-vm.md`)
+  provisions a disposable Azure VM with eight homogeneous cores and nothing else of ours running,
+  which is what every number in this document (bar an explicitly-captioned exception) is taken on
+  now — captioned with its own `~/logit-vm-metadata.txt` (CPU model, kernel, image version,
+  sysctls) the way a machine caption works throughout this file. What isolation still doesn't buy:
+  last-level cache and memory bandwidth are shared with other tenants on the physical host, host
+  maintenance can briefly freeze the guest (inflating wall-clock-derived numbers, not CPU-time ones),
+  and there's no virtualized PMU, so `flamegraph` here is a `cpu-clock`, not `cycles`, profile
+  (§5 below). The ADR's "Consequences" section has the full account.
 
 ### Driven scenarios: `udp-statsd*` is measured differently, on purpose
 
@@ -130,21 +146,25 @@ capture. Four things about reading its numbers differ from everything else in th
   generated scenario's number, which pays neither that cost nor loopback UDP's kernel-side one.
   Relative movement run to run is the signal; the absolute figure is not a cross-scenario ranking.
 - **Pinning is required, not advisory.** `--pin-sender`/`--pin-child` (`sched_setaffinity`, applied
-  to the child between `fork` and `exec` so every thread it creates inherits the mask). This box's
-  heterogeneous cores — `lscpu -e`'s `MAXMHZ` column separates the 5,158 MHz Zen 5 cores (CPUs 0–3
-  and their SMT siblings 12–15) from the 3,289 MHz Zen 5c ones (4–11, 16–23) — make an unpinned run
-  bimodal by roughly 2×. Every recorded `udp-statsd*` number below states which CPUs it used.
-- **A delta is a pair taken in one sitting, interleaved, on a box in a known state.** Pinning fixes
-  which cores a run gets; it says nothing about what they will do an hour later. Measured: the same
-  specs, commit and pins, 90 minutes further into a session, moved CPU µs/event ~23% and a drop rate
-  from 3.1% to 12.4% — confirmed as the box, not the code, by re-running the earlier commit straight
-  afterwards and reproducing the later numbers. So parent/branch runs alternate within one session
-  and are never diffed against a stored file from another day, and the box is checked first: on AC,
-  `performance` governor, rested, nothing else building, sender and child on distinct fast physical
-  cores. [`perf/load/README.md`](../../perf/load/README.md)'s "Box state" has the checklist; `run`
-  records what it can of it into the results file (`box_state`) and warns before the first scenario
-  on `powersave` or battery. Tables in this document are labelled by session, not presented as one
-  series across days.
+  to the child between `fork` and `exec` so every thread it creates inherits the mask), separating
+  the load sender from the measured `logit` process onto distinct physical cores. On the VM's eight
+  *identical* EPYC cores this is no longer about escaping a bimodal laptop split (the reason this
+  bullet used to give) — it's still needed so the sender and child don't contend for the same core's
+  time, which would inflate both sides' numbers together. Every recorded `udp-statsd*` number below
+  states which CPUs it used (`--pin-sender 0,1 --pin-child 2,3` throughout this session).
+- **A delta is a pair taken in one sitting, interleaved, on a box in a known state.** This
+  discipline predates the VM — on the old laptop, the same specs, commit and pins measured 90
+  minutes apart once moved CPU µs/event ~23% and a drop rate from 3.1% to 12.4%, confirmed as the
+  box, not the code, by re-running the earlier commit straight afterwards and reproducing the later
+  numbers — and it's kept here for a smaller but real reason the ADR names explicitly: last-level
+  cache and memory bandwidth are still shared with other tenants even on a dedicated VM, and a new
+  `script/vm up` may land on different physical hardware entirely. So parent/branch runs still
+  alternate within one session and are never diffed against a stored file from another day.
+  [`perf/load/README.md`](../../perf/load/README.md)'s "Box state" has the checklist; `run` records
+  what it can of it into the results file (`box_state`) — which comes back an empty `{}` on this
+  VM, since the guest exposes no `cpufreq`/`power_supply` sysfs to read at all, itself a consequence
+  of the isolation this box is for. Tables in this document are labelled by session, not presented
+  as one series across days.
 - **Every run self-checks before its numbers count.** `sent == received + kernel-dropped` has to
   close exactly (on loopback there is nowhere else for a datagram to go), the kernel socket sampler
   has to have reported at all (without `getsockopt(SO_MEMINFO)` the drop count is unknowable and
@@ -161,128 +181,87 @@ capture. Four things about reading its numbers differ from everything else in th
   1.0` asks "is this spec's shipped rate loss-free?" and is expected to fail whenever anything
   drops — which, since the rates are tuned to drop a little, is the healthy answer.
 
-## 1. Results: all ten scenarios, median of 3
+## 1. Results: all twelve scenarios, median of 5
 
-`script/perf run --repeat 3 --profile release --label quiet`, solo, on battery, with the host
-otherwise idle (see the preamble above). Sorted as `script/perf list` orders them (alphabetical);
-`count` is each scenario's configured `generate_in.count` at the time of this run. The new
-**events/s (min–max)** column is the same three repeats' spread that produced the median — see the
-noise sub-section right after this table for what it means when that range is wide.
+`script/perf run --repeat 5 --profile release --label vm-recorded`, solo, on the VM, nothing else
+running (see the preamble above). Sorted as `script/perf list` orders them (alphabetical); `count`
+is each scenario's configured `generate_in.count` at the time of this run — the **retuned counts
+this same PR ships** (§1's old laptop-tuned counts, mostly unchanged: the VM's own sizing pass
+found most scenarios already sat in the "5–10 s of wall per repeat" band `docs/plans/load-test-
+harness.md` targets at their existing counts; only `encode-native-devnull`, `json-parse`,
+`json-parse-x3`, `logfmt-parse`, and the `passthrough`/`fanout`/`route` trio — which share one count
+by design, see below — needed raising). The **events/s (min–max)** column is the same five repeats'
+spread that produced the median — see the noise sub-section right after this table for what it
+means when that range is wide.
 
 | Scenario | Count | events/s | events/s (min–max) | CPU µs/event | Peak RSS | Wall |
 |---|---:|---:|---:|---:|---:|---:|
-| `aggregate` | 20M | 2,890,700 | 2,696,845 – 4,477,122 | 0.347 | 33.3 MiB | 6.92 s |
-| `buffered` | 1.2M | 1,087,248 | 1,079,632 – 1,099,616 | 1.522 | 26.6 MiB | 1.10 s |
-| `encode-human-devnull` | 8M | 999,423 | 974,599 – 1,014,536 | 1.330 | 176.8 MiB | 8.00 s |
-| `encode-native-devnull` | 8M | 1,189,960 | 1,165,315 – 1,224,892 | 1.180 | 168.9 MiB | 6.72 s |
-| `fanout` (re-shaped; quiet run at `7ead7a4`, see below) | 20M | 3,311,403 | 3,270,606 – 3,535,480 | 0.572 | 12.3 MiB | 6.04 s |
-| `json-parse` | 7M | 945,491 | 795,169 – 991,003 | 2.054 | 294.5 MiB | 7.40 s |
-| `lua` | 4M | 628,380 | 554,182 – 776,491 | 2.085 | 29.4 MiB | 6.37 s |
-| `native-relay` | 7M | 1,164,963 | 691,884 – 1,465,330 | 1.118 | 130.0 MiB | 6.01 s |
-| `passthrough` | 20M | 3,078,773 | 2,803,814 – 3,360,304 | 0.478 | 71.0 MiB | 6.50 s |
-| `route` (added later; quiet run at `506e4ca`, see below) | 20M | 3,747,289 | 3,600,158 – 3,956,587 | 0.668 | 82.3 MiB | 5.34 s |
+| `aggregate` | 20M | 3,092,232 | 3,087,789 – 3,100,900 | 0.325 | 66.7 MiB | 6.47 s |
+| `buffered` | 1.2M | 707,215 | 698,965 – 747,611 | 1.781 | 86.8 MiB | 1.70 s |
+| `encode-human-devnull` | 8M | 1,226,433 | 1,219,331 – 1,255,826 | 1.098 | 258.3 MiB | 6.52 s |
+| `encode-native-devnull` | 10M | 1,412,609 | 1,382,105 – 1,503,005 | 0.995 | 293.8 MiB | 7.08 s |
+| `fanout` | 25M | 2,594,765 | 2,279,434 – 2,654,909 | 0.623 | 79.6 MiB | 9.63 s |
+| `json-parse` | 19M | 2,072,139 | 1,868,855 – 2,106,589 | 0.904 | 300.0 MiB | 9.17 s |
+| `json-parse-x3` | 9.5M | 1,439,337 | 1,402,287 – 1,490,720 | 2.248 | 114.1 MiB | 6.60 s |
+| `logfmt-parse` | 9.5M | 1,601,717 | 1,588,927 – 1,611,496 | 1.012 | 84.2 MiB | 5.93 s |
+| `lua` | 4M | 600,799 | 578,333 – 608,753 | 2.001 | 71.5 MiB | 6.66 s |
+| `native-relay` | 7M | 884,707 | 865,785 – 897,002 | 1.401 | 214.4 MiB | 7.91 s |
+| `passthrough` | 25M | 3,582,184 | 3,474,559 – 3,650,615 | 0.346 | 76.5 MiB | 6.98 s |
+| `route` | 25M | 3,151,261 | 2,893,512 – 3,220,361 | 0.654 | 154.5 MiB | 7.93 s |
 
-A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures:
+`json-parse-x3` and `logfmt-parse` have no row in the laptop-era version of this table at all —
+they landed after it was last written (`docs/plans/load-test-harness.md`'s "Owed now" tracked this
+as outstanding); this is their first recorded numbers here.
 
-- **`passthrough`** (0.478 µs/event; 0.404 on the same quiet-battery setup at `7ead7a4`, after #189
-  stopped resolving symbols in `estimated_heap_bytes` — see the `fanout` bullet) is the runtime
-  floor every other scenario is read relative to: scheduling, the `Fanout` channel hop, layer-2
-  telemetry, no parsing or encoding. **Most of that
-  floor is the generator, not the runtime.** A 2026-09-14 `attribute` pass on `passthrough` (after
-  #189, busy box) had `gen` blocked in `Fanout::send` for only 0.36 s of a ~9.3 s run and the
-  sink's queue never above 5% of its 1024-batch bound — `null_out` keeps up and `generate_in`'s
-  own render loop sets the pace. The matching flamegraph splits the same way: the `generate_in`
-  task is ~30% of samples (`render_one` ~14%, the six sorted `AttrMap::insert_sym`s ~3.4%, the
-  two templated `Bytes::copy_from_slice`s ~1%); the whole sink task is ~17.5%, and of that ~11.3%
-  is dropping the batch after delivery (freeing 200 `Bytes` + the `Vec<Event>` per 100-event
-  batch — the cost of owning the data, not of the channel) and ~3.6% is `estimated_heap_bytes`
-  at `SinkQueue` admission. Everything else on the single-consumer path — the `mpsc` hop, the
-  one `Arc::new` in `drain_inbox`, the queue's two lock/notify pairs, `deliver_with_retry`'s
-  timeout registration — is under 3% of samples combined. So a change to the delivery path can
-  move this number by a few percent at most; a cheaper generator would move it more.
-- **`fanout`** was re-shaped on 2026-09-14, after the run the rest of this table records, and its
-  row above is the one exception to the table's provenance: a separate quiet run (host idle, on
-  battery, same dev container and `rustc`) at `7ead7a4`, `--repeat 3`, after #189. Before the
-  re-shape it generated a one-attribute event (`host: web-{seq%20}`) at 55M, and this section read
-  its 0.466 µs landing under `passthrough`'s 0.478 µs as "three sends costs barely more than one".
-  That reading was wrong: the two scenarios generated different events, and `passthrough`'s six
-  attributes (two templated) cost the generator roughly 6× more per event than `fanout`'s one, which
-  is more than the two extra sinks cost. A 2×2 that crossed both topologies with both event
-  templates (same busy box, same invocation, `--repeat 3`, medians, CPU µs per *generated* event,
-  after #189) makes the actual relationship plain — one consumer is cheaper than three whichever
-  event shape is held fixed:
+A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for what each measures.
+The deep per-instruction attribution/flamegraph narrative the laptop-era version of this section
+carried for `passthrough`/`fanout`/`route` (specific sample percentages inside `generate_in`,
+`SinkQueue` admission, `route_batch`) came from a 2026-09-14 busy-laptop `attribute`/`flamegraph`
+pass this session didn't re-run — that reasoning is almost certainly still directionally correct
+(nothing in the pipeline code between the delivery path and the router has changed since target/
+route landed), but presenting its exact old percentages as current would overclaim what this
+session verified. The **top-line numbers below are all fresh, this session**; a from-scratch
+attribution re-pass for `fanout`/`route` is a cheap follow-up, not done here (`attribute` was run
+this session for `json-parse`, `aggregate`, and `buffered` — §2 has those, current):
 
-  | CPU µs / generated event | one-attribute event | six-attribute event |
-  |---|---:|---:|
-  | 1 × `null_out` | 0.304 | 0.624 |
-  | 3 × `null_out` | 0.488 | 0.920 |
-
-  `fanout.yaml` now generates `passthrough.yaml`'s exact event at `passthrough`'s exact count
-  (20M), so the two differ only in consumer count — which is what the scenario was always meant to
-  isolate. Read `fanout` − `passthrough` as the marginal cost of two more sinks (per-edge `Arc`
-  clone plus one more `drain_inbox → SinkQueue → write_loop` hop each), and halve it for one. Note
-  that `cpu_us_per_event` divides by `generate_in.count` — *generated* events — for every
-  scenario; a fan-out scenario delivers `count × consumers` batch-events, so its per-delivery cost
-  is that much lower than the column shows. On the quiet `7ead7a4` run the two scenarios, same
-  event, same count, same invocation, came out at 0.404 (`passthrough`) and 0.572 (`fanout`) µs per
-  generated event — two extra sinks cost 0.168 µs, or ~0.08 µs per generated event per extra
-  consumer, which is the honest per-edge price of an `Arc` clone plus a `drain_inbox → SinkQueue →
-  write_loop` hop for a 100-event batch. Wall-clock throughput was essentially identical (3.27M vs
-  3.31M events/s), as it should be for a generator-bound graph: the extra sinks run on otherwise
-  idle workers. `passthrough`'s own 0.404 here against 0.478 in the row above is #189's saving on
-  this path (six fewer interner resolves per event at queue admission), not run-to-run noise —
-  the two are different commits.
-- **`route`** was added on 2026-09-14 after the rest of this table, so its row is the other
-  exception to the table's provenance: a quiet run (host idle, on battery, `--repeat 3`) at
-  `506e4ca`, with `passthrough` re-run in the same invocation as the control (3,252,961 events/s,
-  0.394 µs/event, 37.6 MiB — consistent with the `7ead7a4` number above). Same six-attribute
-  event and count as `passthrough`/`fanout`, through a `route` keyed on `host` (ten values: nine
-  routed three-per-target onto three `target`s, one left unrouted onto the router's own
-  `null_out`), so every 100-event batch is split into four ~25-event batches and every event is
-  delivered exactly once — the same data volume as `passthrough`, one hop longer.
-  **0.668 vs 0.394 µs per generated event: the router topology costs 0.274 µs on top of
-  `passthrough`, and about three-quarters of that is the router itself.** `attribute --scenario
-  route` puts `split`'s `process s` at 4.11 s over 20M events — 0.206 µs/event inside `route_batch`
-  (one `AttrMap::get_sym` plus a linear scan of nine byte-string alternatives per event, then the
-  count/reserve/move passes, `crates/logit-pipeline/src/runtime.rs`), at 5 allocations per batch
-  as `docs/adr/target-components.md` pins. The remaining ~0.07 µs is three more sink-side hops
-  (`drain_inbox → SinkQueue → write_loop`) on quarter-size batches, where the fixed per-batch
-  cost is amortized over 25 events instead of 100; `sys_s` also rises from 0.09 s to 0.94 s
-  (more tasks parking and waking), the same shape `fanout` shows. Read against `fanout`
-  (0.572 µs, every event delivered three times): routing a stream once costs more CPU than
-  fan-out delivering it three times, because `fanout`'s extra work is refcount bumps and
-  `null_out`'s empty `send`, while `route` does real per-event work. Wall throughput
-  (3.75M events/s) is in the same band as `passthrough`'s, and `gen` was blocked in send only
-  0.30 s of the run — still generator-bound, with the router on its own task. **The 82 MiB peak
-  RSS against `passthrough`'s 38 MiB is jemalloc retention, not buffered events.** The live-data
-  bound is small: the router's 64-slot inbox holds at most 64 × 100 events × 864 B ≈ 5.5 MiB, the
-  four sink inboxes another ≈ 5.5 MiB between them, and `attribute` showed every sink queue
-  essentially empty (`buf max` 0.00). Under immediate purge (the "Peak RSS" sub-section below)
-  `route` is 24 MiB to `passthrough`'s 17.5 — that 6 MiB *is* the extra in-flight data. `route`
-  retains more than any other scenario because it churns more page-sized allocations: every
-  batch's 86 KiB `Vec<Event>` is freed by the router after its events are moved into four fresh
-  `reserve_exact` vectors, which four sink tasks then free on whichever worker threads they happen
-  to run on, so dirty pages pile up across more arenas before decay purges them.
-- **`json-parse`** (2.054 µs/event) and **`lua`** (2.085 µs/event) are the two most expensive
-  single-hop scenarios, essentially tied on this run — real parsing and a LuaJIT round trip both
-  cost noticeably more than a native transform, matching `docs/known-gaps.md`'s existing account of
-  the Lua boundary's cost relative to a native transform (the standing "~9× the per-event
-  allocations" comparison there is a microbench number for one hop; this is the same relationship
-  showing up end to end).
-- **`encode-human-devnull`** vs **`encode-native-devnull`** (1.330 vs 1.180 µs/event): the native
-  encoder is measurably cheaper than the human-readable render at the same event stream, as
-  `docs/design/wire-protocol.md`'s design intent would predict — dictionary-first framing beats
-  formatting text.
-- **`native-relay`** (1.118 µs/event) is the full encode → loopback TCP → decode → ack round trip in
-  one process, and lands below both `encode-*-devnull` scenarios and well below `json-parse`/`lua`
-  — a real network hop and an ack wait, but still cheaper than a parse-heavy or Lua-heavy graph.
-- **`aggregate`** (0.347 µs/event) is nearly as cheap as `passthrough` per event despite sketching a
-  1000-series distribution and running a 1s flush tick — see §2 for why: almost all of it is one
+- **`passthrough`** (0.346 µs/event) is the runtime floor every other scenario is read relative to:
+  scheduling, the `Fanout` channel hop, layer-2 telemetry, no parsing or encoding. The prior
+  laptop finding — that most of this floor is the generator's own render cost, not the delivery
+  path — is architectural (unchanged code) and there's no reason to expect it's stopped being true;
+  it just isn't re-verified against a fresh attribution pass this session.
+- **`fanout`** (0.623 µs/event) and **`route`** (0.654 µs/event) both generate `passthrough`'s exact
+  event at `passthrough`'s exact count (25M, shared by design so the three differ only in topology)
+  and cost more per generated event than `passthrough` alone — `fanout` for two extra sinks'
+  `Arc`-clone-plus-delivery-hop cost, `route` for the router's own real per-event work
+  (`route_batch`'s `AttrMap::get_sym` plus a linear scan of alternatives) on top of a similar
+  sink-hop cost. Both numbers are consistent with the laptop-era relative finding (fan-out cheaper
+  per delivery than routing once, `fanout` < `route` here as there) without re-deriving its exact
+  per-edge cost breakdown this session.
+- **`json-parse`** (0.904 µs/event) and **`lua`** (2.001 µs/event) are no longer close to tied —
+  `json-parse` dropped sharply from the laptop-era 2.054 µs/event figure (the interner key-cache and
+  in-place `Transform::process` work landed since, `docs/adr/in-place-transform-process.md`), while
+  `lua`'s LuaJIT round trip has no equivalent optimization and remains the more expensive single-hop
+  transform by a wide margin — the general "Lua costs more than a native transform" relationship
+  `docs/known-gaps.md` documents still holds, just by a larger factor now that the native side got
+  cheaper. `json-parse-x3` (2.248 µs/event, three parallel parsers sharing the interner) stayed
+  close to `lua`'s cost, consistent with its own design intent of showing shared-interner
+  contention rather than measuring a single parse.
+- **`encode-human-devnull`** vs **`encode-native-devnull`** (1.098 vs 0.995 µs/event): the native
+  encoder is still measurably cheaper than the human-readable render at the same event stream, as
+  `docs/design/wire-protocol.md`'s design intent predicts — dictionary-first framing beats
+  formatting text, the same relative shape the laptop showed (1.330 vs 1.180 µs/event there).
+- **`native-relay`** (1.401 µs/event) is the full encode → loopback TCP → decode → ack round trip in
+  one process, and lands below `json-parse-x3`/`lua` but above the single-parse `json-parse` and
+  both `encode-*-devnull` scenarios on this run — a real network hop and an ack wait, still cheaper
+  than a parse-heavy or Lua-heavy graph, though the exact ranking against `encode-*-devnull` shifted
+  now that `json-parse`'s own cost fell (see above) rather than `native-relay` itself moving much.
+- **`aggregate`** (0.325 µs/event) is nearly as cheap as `passthrough` per event despite sketching a
+  1000-series distribution and running a 1 s flush tick — see §2 for why: almost all of it is one
   node's `DdSketch::add`, and the flush tick's own cost is amortized over several ticks a run (this
-  run's own median repeat took 6.92s wall, ~6-7 ticks at this scenario's 1s interval; §2's
-  attribution run is a separate, earlier invocation with the `internal` leg attached and took
-  roughly 11.2s wall, hence its 12 flush-tick batches). `aggregate` is also this table's noisiest
-  scenario by far — see the sub-section right below.
+  run's own median repeat took 6.47 s wall, ~6 ticks at this scenario's 1 s interval). `aggregate`
+  is also this table's noisiest scenario by far in relative terms — see the sub-section right below,
+  though its *absolute* spread on the VM (3,087,789–3,100,900, under half a percent) is far tighter
+  than the laptop ever showed.
 - **`buffered`** — see §3, now resolved: the wide run-to-run swings first seen in W7a were the
   harness's own un-cleared spool, fixed by W8 (#165) and confirmed on a quiet machine there. The
   `1,087,248` events/s above is a real quiet-machine median of three back-to-back repeats, but §3's
@@ -290,35 +269,37 @@ A few readings, cross-referencing `perf/scenarios/*.yaml`'s own comments for wha
   this scenario's steady-state spread — three repeats is thin for a scenario whose repeats vary by
   design.
 
-### Noise: `aggregate`'s spread isn't a regression
+### Noise: `aggregate`'s laptop-era spread does not reproduce on the VM
 
-Even solo, on an idle machine, `aggregate` is the noisiest scenario in this table by a wide margin.
-A dedicated `aggregate`-only `--repeat 3` rerun, isolated from the rest of the suite, gave
-3,894,156 / 2,588,602 / 3,396,968 events/s — median 0.296 µs/event, identical to the 2026-09-13
-recorded run's own number — a spread of roughly ±25% around the median from three repeats alone.
-`passthrough`, `json-parse`, and `lua` show real repeat-to-repeat spread too (this table's
-min–max column), but nothing else here comes close to `aggregate`'s range; a scenario built around
-a periodic flush tick (§2) is inherently more exposed to exactly where the tick boundary falls
-inside a short run than one with no such boundary.
+On the laptop, `aggregate` was this table's noisiest scenario by a wide margin — three solo repeats
+once gave 3,894,156 / 2,588,602 / 3,396,968 events/s, a spread of roughly ±25% around the median.
+**That finding does not reproduce here.** Two independent 5-repeat samples exist from this
+session's own measurement — the `aggregate` row in §1's table above (repeats 3,091,253 / 3,092,232
+/ 3,087,789 / 3,100,900 / 3,093,129 events/s) and a second, unrelated 5-repeat run of the same
+scenario roughly an hour later (3,086,137 / 3,079,798 / 3,100,395 / 3,091,713 / 3,083,023) — and
+they agree with each other to within 0.7%, both within a run and across runs. `compare`'s
+`--threshold 5` would not have flagged anything here; the flush-tick-alignment sensitivity §2
+attributes the laptop's spread to is either much smaller on this box or swamped by something else
+that made the laptop worse (heterogeneous-core scheduling jitter is the leading suspect, since
+`aggregate`'s single hot node moving between a fast and slow core mid-run would show up exactly
+this way). This is one of the concrete pieces of evidence for retiring the laptop as a reference
+box, not just a noisier version of the same measurement.
 
-`compare`'s single `--threshold 5` therefore flags `aggregate` spuriously on nothing but its own
-ordinary variance — this run's apparent -15% against the 2026-09-13 recorded run (preamble above)
-is exactly that, not a regression. Two follow-ups, not built here: gate `compare` on each file's
-`min` (or another variance-aware statistic) rather than a bare median-to-median diff, or give it a
-per-scenario threshold so a flush-tick scenario can carry a wider band than `passthrough`'s.
-Raising `--repeat` specifically for flush-tick scenarios, so the reported median is less exposed to
-any one repeat's tick alignment, is a third, cheaper option worth trying before either.
-`docs/known-gaps.md`'s harness entry carries the same recommendation.
+`compare`'s lack of a variance-aware threshold (gate on each file's `min`, or a per-scenario
+threshold) is still real future work in principle, but the motivating case — `aggregate` tripping
+`--threshold 5` on nothing but its own noise — is no longer observed on the reference box.
+`docs/known-gaps.md`'s harness entry is updated to reflect this.
 
 ### Peak RSS: what is live data and what is jemalloc retention
 
 `logit` runs on jemalloc (ADR `jemalloc-global-allocator`), which returns freed pages to the kernel
 on a decay schedule (`dirty_decay_ms` = 10 s by default) rather than at `free`. A scenario that
 runs for 5–10 s therefore reports a peak RSS that includes most of what it freed along the way,
-not just what it held at its high-water mark. To separate the two, the whole suite was run twice
-at `a9c00c1` (host idle, on battery, `--repeat 3`, release): once as-is, once with
-`_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`, which purges at `free` and makes peak RSS
-a close proxy for peak live data. Medians:
+not just what it held at its high-water mark. To separate the two, the intended design is to run
+the whole suite twice, once as-is and once with
+`_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0` (purges at `free`, making peak RSS a close
+proxy for peak live data) — the table below, from the original laptop investigation, is what that
+comparison showed:
 
 | Scenario | Peak RSS, default decay | Peak RSS, immediate purge | Reading |
 |---|---:|---:|---|
@@ -333,55 +314,74 @@ a close proxy for peak live data. Medians:
 | `passthrough` | 37.2 MiB | 17.5 MiB | one 64-slot inbox ≈ 5.5 MiB + baseline |
 | `route` | 80.6 MiB | 24.4 MiB | five 64-slot inboxes ≈ 11 MiB + baseline |
 
-Two things fall out:
+Two things fell out of it:
 
 - **Where the sink is slower than the generator, RSS really is queue depth**, and it is the
   sink queue's default `buffer.max_bytes` of 64 MiB that sets it: a 100-event batch of this
   shape weighs ~87 KiB by `estimated_heap_bytes`, so the byte bound trips at ~770 batches, well
   before the 1024-batch bound; add the 64-slot inbox and the process baseline and you get the
   ~85 MiB the three sink-bound scenarios (`encode-*`, `native-relay`) all converge on under
-  immediate purge. Their default-decay numbers are that plus what jemalloc hadn't returned yet.
-  So the "in-flight buffering at default `buffer:` is large" observation stands for those, and the
-  bound doing it is `max_bytes`, not `max_batches` or the channels.
+  immediate purge. So the "in-flight buffering at default `buffer:` is large" observation stands
+  for those, and the bound doing it is `max_bytes`, not `max_batches` or the channels.
 - **Where the sink keeps up, RSS is mostly retention.** `passthrough`, `route`, `aggregate`,
   `json-parse` and `lua` all drop by half or more under immediate purge, down to a number that
-  matches their in-flight channel data plus process baseline. `route` is the extreme case
-  (80 → 24 MiB) because it churns more page-sized allocations per batch than anything else
-  (its own reading above); `fanout` the opposite (no re-allocation between generator and sinks,
-  the shared batch freed exactly once).
+  matches their in-flight channel data plus process baseline.
+
+**This table is retained from the original laptop investigation and was not re-verified on the
+VM this session** — attempted, but the attempt itself failed in a way worth recording rather than
+quietly discarding. `script/perf run`'s own `run()` helper (`script/common.sh`) invokes
+`docker compose run` with only one explicit `-e LOGIT_DEV_CONTAINER=1`; `sudo docker compose run`
+strips the calling shell's environment before compose ever interpolates a `${VAR}`, which is
+exactly why `LOGIT_PERF_GIT_SHA`/`LOGIT_PERF_GIT_DIRTY` are threaded through as `env VAR=... cargo
+run` argv rather than an exported variable (`crates/logit-perf/src/run.rs`'s own `git_info` doc
+comment explains that mechanism). `_RJEM_MALLOC_CONF` has no equivalent argv path, so `export
+_RJEM_MALLOC_CONF=...; script/perf run ...` silently measured the *default*-decay condition twice
+rather than default-decay-then-purge once — confirmed after the fact: the two runs' CPU µs/event
+for `aggregate` (0.325 both times) and for every other scenario matched each other to within
+ordinary noise, where a real immediate-purge run should show the ~2× CPU cost the table's own next
+paragraph describes. **Needs**, as a follow-up: either an explicit env-passthrough flag on
+`script/perf run` (e.g. `--container-env KEY=VALUE`, threaded the same way `LOGIT_PERF_GIT_SHA`
+already is), or a one-off `docker compose run -e _RJEM_MALLOC_CONF=... dev ...` invocation run by
+hand outside the harness. Until then, the table above is history, not a current VM measurement —
+read it for the *shape* of the finding (sink-bound scenarios' RSS is queue depth, generator-bound
+scenarios' RSS is mostly retention), not as this session's own numbers.
 
 The immediate-purge run's CPU numbers are *not* comparable to anything else in this document —
 purging at `free` costs an `madvise` per page-sized free and roughly doubled CPU µs/event for the
-churn-heavy scenarios (`route` 0.645 → 1.239, `aggregate` 0.273 → 0.599). It is a diagnostic
-setting for reading RSS, not a configuration to run with. When a peak-RSS number looks
-surprising, re-run that one scenario with decay 0 before concluding anything about queue bounds.
+churn-heavy scenarios (`route` 0.645 → 1.239, `aggregate` 0.273 → 0.599, both laptop-era numbers).
+It is a diagnostic setting for reading RSS, not a configuration to run with.
 
 ## 2. Attribution: where a scenario's time actually goes
 
 `script/perf attribute --scenario NAME` appends a temporary `internal → file_out format: native` leg
 to a copy of the scenario, decodes the resulting dump, and groups every point by the emitting
 component — see [`internal-telemetry.md`](internal-telemetry.md)'s "Reading an attribution dump"
-section for the mechanism. Both tables below are from the 2026-09-13 recorded run's own invocation
-(`c75399d8bccc`), not the quiet run in §1 above — attribution wasn't re-run on the quiet machine
-except for `buffered` (§3) — at each scenario's count then. `__perf_internal`/`__perf_dump` are the
-harness's own two nodes, shown for transparency but excluded from the verdict.
+section for the mechanism. Both tables below are fresh, from this session's own VM run, at each
+scenario's current (retuned) count. `__perf_internal`/`__perf_dump` are the harness's own two
+nodes, shown for transparency but excluded from the verdict.
 
 ### `json-parse`
 
 ```
 node               kind           role         events in  events out  batch in batch out  process s  blocked s     send s  buf max
-metrics            kv_metrics     transform      7000000     7000000     70000     70000    10.3054     0.0173     0.0000        -
-parsed             json           transform      7000000     7000000     70000     70000     8.7432     3.8887     0.0000        -
-gen                generate_in    listener             0     7000000         0     70000     0.0000    11.8632     0.0000        -
-out                null_out       sink           7000000           0     70000         0     0.0000     0.0000     0.0102     0.13
+parsed             json           transform     19000000    19000000    190000    190000     7.6780     0.0370     0.0000        -
+metrics            kv_metrics     transform     19000000    19000000    190000    190000     2.0565     0.0236     0.0000        -
+__perf_dump        file_out       sink               321           0         9         0     0.0000     0.0000     0.0021     0.00
+__perf_internal    internal       listener             0         321         0         9     0.0000     0.0000     0.0000        -
+gen                generate_in    listener             0    19000000         0    190000     0.0000     5.2125     0.0000        -
+out                null_out       sink          19000000           0    190000         0     0.0000     0.0000     0.0159     0.00
 ```
 
-`kv_metrics` (`metrics`) has the larger share of Σ process time: 10.3054s of 19.0485s measured
-(**54%**), against `json` (`parsed`)'s 8.7432s (**46%**) — deriving four metrics from a parsed
-attribute map costs slightly more than the JSON parse that fed it, close to the split
-`docs/plans/load-test-harness.md` sketched going in. `gen`'s 11.8632s "blocked in send" — more than
-either transform's own process time — is not generator slowness: it's `generate_in` running faster
-than `json`/`kv_metrics` can drain it and spending most of the run backpressured on `Fanout::send`,
+**The split between the two transforms inverted from the laptop-era table.** `json` (`parsed`) now
+has the larger share of Σ process time: 7.6780s of 9.7345s measured (**79%**), against `kv_metrics`
+(`metrics`)'s 2.0565s (**21%**) — the laptop-era table had this the other way round, 46%/54%. Both
+transforms got faster since (the divan `kv_metrics` bench alone dropped from 256 ns to 75 ns,
+`docs/design/memory.md` §3), but `kv_metrics` dropped by roughly 5×, deriving four metrics from a
+parsed attribute map has gotten disproportionately cheaper than the JSON parse that feeds it — the
+interner key-cache and in-place `Transform::process` work landed since (`docs/adr/in-place-
+transform-process.md`) targeted exactly this. `gen`'s 5.2125s "blocked in send" — more than either
+transform's own process time — is not generator slowness: it's `generate_in` running faster than
+`json`/`kv_metrics` can drain it and spending most of the run backpressured on `Fanout::send`,
 exactly the reading `internal-telemetry.md`'s verdict rule gives ("the constraint is downstream of
 `gen`"). That's the expected, healthy shape for this harness: the generator should never be a
 scenario's bottleneck.
@@ -390,19 +390,23 @@ scenario's bottleneck.
 
 ```
 node               kind           role         events in  events out  batch in batch out  process s  blocked s     send s  buf max
-windowed           aggregate      transform     20000000       12000    200000        12     7.7434     0.0001     0.0000        -
-gen                generate_in    listener             0    20000000         0    200000     0.0000     8.0095     0.0000        -
-out                null_out       sink             12000           0        12         0     0.0000     0.0000     0.0000     0.00
+windowed           aggregate      transform     20000000        7000    200000         7     4.4193     0.0000     0.0000        -
+__perf_dump        file_out       sink               222           0         7         0     0.0000     0.0000     0.0011     0.00
+__perf_internal    internal       listener             0         222         0         7     0.0000     0.0000     0.0000        -
+gen                generate_in    listener             0    20000000         0    200000     0.0000     4.6042     0.0000        -
+out                null_out       sink              7000           0         7         0     0.0000     0.0000     0.0000     0.00
 DROPPED 20000000 events at `windowed` (reason=absorbed)
 ```
 
 Only one real node, so `windowed` (`aggregate`) is trivially **100%** of measured Σ process time
-(7.7434s). The `DROPPED 20000000 events (reason=absorbed)` line is expected, not a bug: every input
-event is folded into a per-series `DdSketch` and never itself re-emitted — `Transform::process`
-returning `None` on every call is exactly what a stateful aggregator does between flushes. Output is
-12 flush-tick batches (`batch out`) carrying 12,000 events total — 1000 events per tick, one per live
-series, matching `host: h{seq%1000}`'s cardinality. `gen` again shows most of its own time (8.0095s)
-blocked in `send`, the same
+(4.4193s — down from 7.7434s on the laptop, the VM simply being faster per event here, not a
+different code path). The `DROPPED 20000000 events (reason=absorbed)` line is expected, not a bug:
+every input event is folded into a per-series `DdSketch` and never itself re-emitted —
+`Transform::process` returning `None` on every call is exactly what a stateful aggregator does
+between flushes. Output is 7 flush-tick batches (`batch out`) carrying 7,000 events total — 1000
+events per tick, one per live series, matching `host: h{seq%1000}`'s cardinality (fewer ticks than
+the laptop-era table's 12 simply because this run finished faster — the same 1 s interval, a
+shorter wall time). `gen` again shows most of its own time (4.6042s) blocked in `send`, the same
 backpressure reading as `json-parse` — `aggregate`'s `DdSketch::add` plus its periodic flush is
 cheap enough per event that `generate_in` is still the faster of the two nodes.
 
@@ -521,14 +525,31 @@ queue's own write/read path as `buffered`'s actual constraint, not the harness o
 mechanism — `DiskQueue::open` paying an un-cleared spool's cost twice at every startup, compounding
 across repeats that shared one never-cleared directory — is what produced the wild, strictly-falling
 16k-790k swings W7a first saw and the two monotonic five-repeat sequences at the top of this
-section. With the spool cleared before every repeat (W8, #165), that signature is gone on both a
-busy machine and, now, a quiet one. What's left open is narrower than it was: a roughly 1.4× spread
-within five repeats even solo and idle (632,897 to 873,406 events/s), and `DiskQueue::open`'s
-double-read startup scan (the bounded active-segment validation pass, still real, still there) as an
-open question of how much of a *cleared* spool's own first-open cost feeds this scenario's per-repeat
-variance versus ordinary scheduling noise — no longer the prime suspect for the spread this section
-originally chased, just an unquantified detail. `buffered`'s own comment in
-`perf/scenarios/buffered.yaml` and `docs/known-gaps.md`'s entry both carry this same account now.
+section. With the spool cleared before every repeat (W8, #165), that signature is gone on a busy
+laptop, a quiet laptop, and now the reference VM.
+
+**VM confirmation (this session, current numbers).** `script/perf run --repeat 5 --profile release
+--label vm-buffered-solo --scenario buffered`, solo, on the VM:
+
+```
+repeat 1/5: 745,047 events/s   1.720 us/event   78.7 MiB peak RSS   2.4 ms startup
+repeat 2/5: 757,703 events/s   1.710 us/event   79.0 MiB peak RSS   3.4 ms startup
+repeat 3/5: 802,478 events/s   1.710 us/event   74.8 MiB peak RSS   2.8 ms startup
+repeat 4/5: 780,068 events/s   1.709 us/event   70.9 MiB peak RSS   3.3 ms startup
+repeat 5/5: 801,518 events/s   1.708 us/event   70.7 MiB peak RSS   2.8 ms startup
+```
+
+No monotonic decay, no RSS climb, and the remaining spread is far tighter than either laptop pass:
+events/s spans 745,047–802,478 (about 7%, against the quiet laptop's ~38%), peak RSS a narrow
+70.7–79.0 MiB band, and CPU µs/event is nearly flat across every repeat (1.708–1.720, under 1%
+spread) — the tightest this scenario has ever measured. §1's table carries this run's median
+(707,215 events/s — a separate 5-repeat sample from the full-suite run, consistent with this solo
+one within ordinary noise) as the current number. What's left open from the laptop-era
+investigation is narrower still: `DiskQueue::open`'s double-read startup scan (the bounded
+active-segment validation pass, still real, still there) as an open question of how much of a
+*cleared* spool's own first-open cost feeds any of this scenario's remaining spread — on this
+evidence, not much. `buffered`'s own comment in `perf/scenarios/buffered.yaml` and
+`docs/known-gaps.md`'s entry both carry this same account now.
 
 ## 4. Before/after: the regression workflow
 
@@ -543,7 +564,8 @@ script/perf compare perf/results/<before-file>.json perf/results/<after-file>.js
 medians, and exits non-zero if events/s dropped or CPU µs/event rose by more than `--threshold`
 percent (peak RSS is reported but never gates the exit code unless `--rss-threshold` is also given).
 It also warns — not fails — on a hostname or CPU-model mismatch between the two files, since neither
-number is trustworthy across machines per the preamble's ~20% caveat. A scenario present in only one
+number is trustworthy across machines (a new `script/vm up` may land on different physical hardware
+entirely, per the ADR's own "Consequences" section). A scenario present in only one
 file is listed, not compared. `run` now clears `buffered`'s spool before every repeat (§3, W8, #165), so
 the specific accumulation artifact that made a `buffered` regression untrustworthy is gone; treat any
 `buffered` comparison with the same ordinary caution as its still-wider-than-most repeat spread
@@ -560,21 +582,29 @@ Builds `-p logit-cli --profile profiling` (a new root profile: `inherits = "rele
 `line-tables-only` debug info and an unstripped symbol table `perf` needs — see the profile's own
 comment in the root `Cargo.toml`), runs `perf record -F 999 -g --call-graph dwarf` against it through
 the same spawn/settle/SIGTERM machinery `run` uses, then pipes `perf script | inferno-collapse-perf |
-inferno-flamegraph` into an SVG. This run captured 6.6s of `passthrough` at 999 Hz, wrote
-`perf/results/passthrough.svg` at **1,179,979 bytes** (~1.13 MiB, kept out of git — `/perf/results/`
-is gitignored), and symbols resolve cleanly: real, demangled Rust paths throughout
-(`logit_core::event::EventBatch`, `logit_inputs::generate::GenerateInput`,
+inferno-flamegraph` into an SVG. On the VM this run captured 7.0s of `passthrough` at 999 Hz (68.0
+MiB of samples), wrote `perf/results/passthrough.svg` at **1,119,236 bytes** (~1.07 MiB, kept out of
+git — `/perf/results/` is gitignored), and symbols resolve cleanly: real, demangled Rust paths
+throughout (`logit_core::event::EventBatch`, `logit_inputs::generate::GenerateInput`,
 `logit_core::interner::resolve`, …), not hex addresses.
 
-**The container needs three flags, not two.** `--cap-add SYS_ADMIN` and `--security-opt
-seccomp=unconfined` were predicted by the ADR (`perf_event_open`'s capability requirement, and
-docker's default seccomp profile gating it); this repo's own dev box (Fedora, SELinux Enforcing)
-needed a third that wasn't: `--security-opt label=disable`. With the default container label,
-SELinux denies the `perf_event` class outright regardless of capabilities — `perf record` still
-exits 0 but writes a zero-sample `perf.data`, which reads exactly like the
-`kernel.perf_event_paranoid` problem the first two flags exist for and isn't. `script/perf`'s own
-`flamegraph` path carries all three now (`docs/adr/load-test-harness.md`'s "Profiling" section has
-the full account).
+**This is a `cpu-clock` profile, not `cycles`** — Azure's guest exposes no virtualized PMU
+(`perf stat -e cycles true` answers `<not supported>`, `docs/adr/disposable-azure-perf-vm.md`'s "no
+virtualized PMU" limitation), so `perf record`'s own fallback to a software clock event is what
+actually produced this capture. Sample *counts* and the resulting flamegraph shape are still
+meaningful (`perf record -F 999` samples at a fixed wall-clock rate either way), but don't read a
+`cpu-clock` capture's absolute sample count against a `cycles` one from a bare-metal box as if the
+units matched.
+
+**The container needs three flags, not two, and all three carry over cleanly to a non-SELinux
+guest.** `--cap-add SYS_ADMIN` and `--security-opt seccomp=unconfined` were predicted by the ADR
+(`perf_event_open`'s capability requirement, and docker's default seccomp profile gating it); the
+third, `--security-opt label=disable`, exists for Fedora/SELinux (SELinux denies the `perf_event`
+class outright regardless of capabilities under the default container label, which reads exactly
+like the `kernel.perf_event_paranoid` problem the first two flags exist for and isn't). `script/perf`
+passes all three unconditionally, and on this Debian VM guest — no SELinux at all — the
+SELinux-specific flag is a harmless no-op rather than an error; nothing here needed to become
+platform-conditional to work on both.
 
 **`perf` re-raises SIGTERM after a clean capture.** For a scenario that doesn't self-exit
 (`native-relay`), the harness's settle-then-SIGTERM goes to `perf` (the process it actually spawned),
@@ -637,11 +667,12 @@ because this dev box's numbers move for reasons that have nothing to do with the
   branch — never a branch diffed against a results file from another day. Two unbroken blocks would
   put one side on the cool half of a session and the other on the warm half, which is exactly the
   artifact this guards against.
-- **Pinned to distinct fast physical cores.** `--pin-sender`/`--pin-child` (`sched_setaffinity`,
-  applied between `fork` and `exec` so every thread a process spawns inherits the mask). This box's
-  heterogeneous cores — Zen 5 physical cores at 5,158 MHz (CPUs 0–3) vs. Zen 5c ones at 3,289 MHz
-  (4–11, 16–23), per `lscpu -e`'s `MAXMHZ` column — make an unpinned run bimodal by roughly 2×. Every
-  table below states its pins (`--pin-sender 0,1 --pin-child 2,3` throughout).
+- **Pinned to distinct physical cores.** `--pin-sender`/`--pin-child` (`sched_setaffinity`, applied
+  between `fork` and `exec` so every thread a process spawns inherits the mask). The reference VM's
+  eight cores are identical, so this isn't escaping a heterogeneous-core split the way it was on the
+  laptop — it keeps the sender and the measured child from contending for the same core's time.
+  Every table below states its pins (`--pin-sender 0,1 --pin-child 2,3` throughout, leaving cores
+  4–7 free — this box has room the original 4-core session didn't).
 - **Control-to-control drift is reported alongside every delta, not assumed away.** Each delta table
   below is read next to a same-session, same-code control-vs-control comparison — the two runs that
   differ only in *when* they happened, not in what they ran. A delta smaller than that drift is
@@ -666,126 +697,116 @@ because this dev box's numbers move for reasons that have nothing to do with the
 
 ### Measured numbers
 
-**The block below is final**, taken in one session on a dedicated, isolated Azure VM
-(`script/vm`) rather than the dev laptop — the re-take the previous revision of this section
-promised. The earlier laptop numbers (W2 baseline, W3 delta, W4 delta, and the first `read_batch`
-sweep) were always provisional and are not reproduced here; they remain only in PRs #252, #253,
-and #254's descriptions and should not be read as current.
+**The block below supersedes the previous revision's**, taken 2026-09-18 on a `Standard_F4as_v6`
+(4 vCPU). This one is from 2026-09-20, on the current 8-vCPU reference VM
+(`docs/adr/disposable-azure-perf-vm.md`'s "The size, and why N vCPUs is N cores" section), the same
+three binaries, re-run in full — knee, half-scale, sweep, and `--verify` — plus two items the
+previous revision left open: a per-binary capacity bisect, and a THP-forced-`madvise` repeat of the
+sweep. The 4-vCPU numbers are not reproduced here; PRs #252, #253, and #254's descriptions are
+where they remain, historical.
 
-<!-- udp-intake-numbers:begin 2026-09-18 Azure Standard_F4as_v6 (script/vm), interleaved one-sitting pairs -->
+<!-- udp-intake-numbers:begin 2026-09-20 Azure Standard_F8as_v6 (script/vm), interleaved one-sitting pairs -->
 
 #### Box facts and provenance
 
 | Fact | Value |
 |---|---|
-| VM size | `Standard_F4as_v6` (4 vCPU, `vCPUsPerCore: 1` — SMT off, 4 full physical cores) |
+| VM size | `Standard_F8as_v6` (8 vCPU, `vCPUsPerCore: 1` — SMT off, 8 full physical cores) |
 | CPU model | AMD EPYC 9V74 80-Core Processor (Genoa, cloud SKU) |
-| `nproc` | 4 |
+| `nproc` | 8 |
 | Kernel | `Linux 6.12.107+deb13-cloud-amd64 x86_64` |
 | OS | Debian GNU/Linux 13 (trixie), image `Debian:debian-13:13-gen2`, version `0.20260914.2601` |
-| `net.core.rmem_max` | set to `4194304` (4 MiB) before any run, to match the dev-container value the specs were tuned against (VM default from cloud-init was 16 MiB) |
+| `net.core.rmem_max` | left at the cloud-init default, `16777216` (16 MiB) — **not** clamped to match the dev container the way the previous session did; the specs' 1 MiB request is granted 2 MiB either way, so this changes nothing about what's measured, only what's recorded as the ceiling |
 | `net.core.rmem_default` | `212992` (stock, unchanged) |
-| Granted receive buffer | not printed directly by the harness (no such JSON field), but `kernel_rcvbuf_utilization_max` reaches ~1.00–1.01 on the small-datagram scenarios exactly as designed for a 1 MiB request doubled to 2 MiB under a 4 MiB ceiling — consistent with the intended, unclamped 2 MiB grant |
+| Granted receive buffer | not printed directly by the harness (no such JSON field), but `kernel_rcvbuf_utilization_max` reaches ~1.00 on the small-datagram scenarios at the knee, exactly as designed for a 1 MiB request doubled to 2 MiB under a 16 MiB ceiling |
 | `perf stat -e cycles true` | `<not supported>` — no virtualized PMU, as the ADR documents |
 | Swap | none configured |
-| THP | `[always] madvise never` |
+| THP | `[always] madvise never` (image default; left at `always` for the knee/half/sweep/verify tables — only the dedicated THP sweep below forces `madvise`, and restores `always` after) |
 | `box_state` (governor/EPP/AC) | empty `{}` on every result file — this Azure guest exposes no `cpufreq`/`power_supply` sysfs nodes, so nothing to warn on; by construction (dedicated VM, no other tenants visible, no throttling) this is the isolation the whole exercise is for |
-| Pins | `--pin-sender 0,1 --pin-child 2,3` throughout |
+| Pins | `--pin-sender 0,1 --pin-child 2,3` throughout — cores 4–7 free, unlike the 4-vCPU session |
 
-Binaries measured, built with a fully isolated `CARGO_TARGET_DIR` per ref:
+Binaries measured, built with a fully isolated `CARGO_TARGET_DIR` per ref (the same mtime-collision
+hazard the previous session found — see its account, unchanged this session since `script/vm build`
+now gives ref sources their own target dir by default, `docs/adr/disposable-azure-perf-vm.md`'s
+"Multiple sources, one VM" section):
 
 | Ref | Head SHA | sha256 |
 |---|---|---|
 | `udp/w2` | `912f5574649dfe7e11b113c5743c0f251f22c355` | `840f1ef41c09eff5265750192533f10cd8a6c2721df62d96186653c86cea3caa` |
 | `udp/w3` | `1b3228c10351d290d17c51b95e09a5a3521f1211` | `b7376b1ada380f6705f2102a84ed9146ba78377b73941056f1f9c3646756823f` |
 | `udp/w4` | `4a0c252fa530925c43a4d5e7cb36d8c750d1993d` | `40204bf499843ebd68f20b407cfc5420a070e376de8583db0a86c2c717908746` |
-| `udp/w5` (harness only, `logit-perf`) | `51d881b37e07cb5a1938da1f7e3f85f2b33d09fa` | not measured directly — same code as w4 + docs |
 
-**Build-isolation note (a real bug caught mid-session):** the three refs were extracted via `git
-archive` (run on the host, not the VM) into three separate directories, each with its own `docker
-compose` project, sharing the `logit_target_cache` named volume with a **default**
-`CARGO_TARGET_DIR=/work/target`. The first build (w2) genuinely compiled; the second (w3), built
-minutes later into a source tree extracted at nearly the same wall-clock time, finished in
-**0.11s with zero `Compiling` lines** — cargo's mtime-based fingerprint falsely matched w3's
-freshly-extracted files against w2's build record, silently reusing w2's binary under the w3 label
-(confirmed: byte-identical sha256, byte-identical size). Fixed by giving each ref its own
-`CARGO_TARGET_DIR` (`/tmp/target-w2`, `-w3`, `-w4`, passed via `docker compose exec -e`) and
-rebuilding all three from scratch; each real build compiled 39 crates in ~2m20s and produced a
-distinct sha256, confirmed above. Every binary used for measurement below is from that rebuilt,
-isolated-target set — the earlier fast/identical builds were discarded before any scenario was run.
-
-**Method note:** the entire remote-git problem was avoided by running `git archive <sha>` on the
-*host* (a plain, single, un-chained git command, which never touches HEAD) to produce a tarball
-per ref, `scp`-ing it to the VM, and `tar -x`-ing it into `~/src-w2`, `~/src-w3`, `~/src-w4` — no
-`git` command ever ran on the VM itself. `~/logit` (the clone `script/vm up` made) stayed checked
-out at `udp/w5` throughout and built `logit-perf`. Binary swaps between runs used `docker cp`
-against the `~/logit` project's persistent `dev` container, verified by `sha256sum` before every
-run in this report (spot-checked throughout, not just once).
+Three distinct sha256s confirmed before any scenario ran — identical to the previous session's own
+values for the same three commits, a nice cross-session reproducibility check on top of the
+distinctness one.
 
 #### Calibration (bisection on w2, ≤6 tries/scenario, target 1–5% kernel drop)
 
 | Scenario | Tries (scale → drop%) | Knee scale | Knee drop% | Half scale |
 |---|---|---|---|---|
-| `udp-statsd` | 1.0→19.5%, 0.7→0.0%, 0.85→5.6%, 0.8→0.05%, 0.83→**4.04%** | 0.83 | 4.04% | 0.415 |
-| `udp-statsd-small` | 1.0→40.2%, 0.7→30.8%, 0.49→**1.07%** | 0.49 | 1.07% | 0.245 |
-| `udp-statsd-packed` | 1.0→21.6%, 0.7→0.0%, 0.85→7.2%, 0.78→0.0%, 0.82→**3.24%** | 0.82 | 3.24% | 0.41 |
+| `udp-statsd` | 1.0→19.5%, 0.525→0.0%, 0.7625→0.003%, 0.88125→8.9%, 0.822→**2.31%** | 0.822 | 2.31% | 0.411 |
+| `udp-statsd-small` | 1.0→39.2%, 0.525→8.4%, 0.2875→0.007%, 0.40625→0.0%, 0.466→0.04%, 0.495→**2.80%** | 0.495 | 2.80% | 0.248 |
+| `udp-statsd-packed` | 1.0→21.7%, 0.525→0.0%, 0.7625→0.0%, 0.88125→12.1%, 0.822→**3.97%** | 0.822 | 3.97% | 0.411 |
 
-The shipped specs' rates (tuned for the dev laptop) were far too fast for this CPU — even
-`--rate-scale 1.0` on `udp-statsd-small` dropped 40%, so calibration was necessary and non-trivial
-(the knee moved much less predictably here than a smooth curve; `udp-statsd`/`udp-statsd-packed`
-needed a second bisection pass after overshooting). Calibration was run on `udp/w2` only; a
-per-binary capacity number is open work (see below).
+The shipped specs' rates (tuned for the dev laptop) are still too fast for this VM even at 8 vCPUs
+— `--rate-scale 1.0` on every scenario drops well above target — so calibration is still necessary
+here, and lands at knee scales close to the 4-vCPU session's own (0.82/0.50/0.82 then vs 0.82/0.50/
+0.82 now for `udp-statsd`/`-small`/`-packed`) — consistent with the knee being mostly a
+receive-path property of `logit`'s own decode/queue cost, not something doubling the core count
+alone moves much, since the sender and receiver each still only use the two cores they're pinned
+to. Calibration was run on `udp/w2` only, same as before; a per-binary capacity number (the
+previous session's own named open item) is closed below.
 
 #### Knee-scale results
 
 Interleaved `w2, w3, w4, w2, w3, w4`, `--repeat 5`, medians shown, `--pin-sender 0,1 --pin-child
-2,3`. `fill` only recorded from w4 onward (w2/w3 have no `logit.input.reads` counter).
+2,3`.
 
-| Binary/pass | Scenario | CPU µs/event | events/s | kernel drop % | max rcvbuf | peak RSS |
-|---|---|---:|---:|---:|---:|---:|
-| w2-A | udp-statsd | 0.902 | 1,294,569 | 2.92 | 1.01 | 78.4 MiB |
-| w2-A | udp-statsd-small | 3.952 | 367,181 | 1.40 | 1.00 | 31.6 MiB |
-| w2-A | udp-statsd-packed | 0.953 | 1,236,133 | 3.63 | -- | 79.4 MiB |
-| w3-A | udp-statsd | 0.875 | 1,327,685 | 0.49 | 0.94 | 72.9 MiB |
-| w3-A | udp-statsd-small | 3.816 | 372,303 | 0.02 | -- | 30.3 MiB |
-| w3-A | udp-statsd-packed | 0.947 | 1,275,551 | 0.55 | -- | 79.8 MiB |
-| w4-A | udp-statsd | 0.803 | 1,334,274 | 0.00 | -- | 58.5 MiB (fill 13.4) |
-| w4-A | udp-statsd-small | 3.264 | 372,386 | 0.00 | -- | 33.2 MiB (fill 3.1) |
-| w4-A | udp-statsd-packed | 0.906 | 1,282,634 | 0.00 | -- | 49.3 MiB (fill 12.0) |
-| w2-B | udp-statsd | 0.897 | 1,294,208 | 3.00 | -- | 75.7 MiB |
-| w2-B | udp-statsd-small | 3.958 | 367,751 | 1.25 | -- | 30.7 MiB |
-| w2-B | udp-statsd-packed | 0.960 | 1,226,470 | 4.38 | -- | 81.4 MiB |
-| w3-B | udp-statsd | 0.870 | 1,331,184 | 0.23 | -- | 71.9 MiB |
-| w3-B | udp-statsd-small | 2.830 | 372,364 | 0.01 | -- | 29.9 MiB |
-| w3-B | udp-statsd-packed | 0.987 | 1,273,621 | 0.70 | -- | 76.7 MiB |
-| w4-B | udp-statsd | 0.848 | 1,334,238 | 0.00 | -- | 55.3 MiB (fill 15.7) |
-| w4-B | udp-statsd-small | 3.418 | 372,390 | 0.00 | -- | 34.0 MiB (fill 3.2) |
-| w4-B | udp-statsd-packed | 0.849 | 1,282,660 | 0.00 | -- | 44.2 MiB (fill 11.9) |
+| Binary/pass | Scenario | CPU µs/event | events/s | kernel drop % | max rcvbuf | peak RSS | fill |
+|---|---|---:|---:|---:|---:|---:|---:|
+| w2-A | udp-statsd | 0.908 | 1,290,047 | 2.37 | 1.00 | 74.9 MiB | -- |
+| w2-A | udp-statsd-small | 3.912 | 365,448 | 2.92 | 1.00 | 31.2 MiB | -- |
+| w2-A | udp-statsd-packed | 1.010 | 1,233,980 | 4.01 | 1.00 | 79.4 MiB | -- |
+| w3-A | udp-statsd | 0.879 | 1,318,282 | 0.22 | 0.77 | 67.6 MiB | -- |
+| w3-A | udp-statsd-small | 3.858 | 376,380 | 0.01 | 0.02 | 29.8 MiB | -- |
+| w3-A | udp-statsd-packed | 0.945 | 1,264,165 | 1.66 | 1.00 | 81.3 MiB | -- |
+| w4-A | udp-statsd | 0.835 | 1,321,178 | 0.00 | 0.22 | 50.4 MiB | 15.1 |
+| w4-A | udp-statsd-small | 3.054 | 376,427 | 0.00 | 0.01 | 32.9 MiB | 3.1 |
+| w4-A | udp-statsd-packed | 0.853 | 1,285,575 | 0.00 | 0.06 | 47.0 MiB | 13.0 |
+| w2-B | udp-statsd | 0.902 | 1,289,088 | 2.39 | 1.00 | 76.1 MiB | -- |
+| w2-B | udp-statsd-small | 4.062 | 364,288 | 3.22 | 1.00 | 31.2 MiB | -- |
+| w2-B | udp-statsd-packed | 0.961 | 1,224,979 | 4.71 | 1.00 | 83.6 MiB | -- |
+| w3-B | udp-statsd | 0.875 | 1,318,590 | 0.20 | 0.74 | 68.4 MiB | -- |
+| w3-B | udp-statsd-small | 2.965 | 376,420 | 0.00 | 0.01 | 30.1 MiB | -- |
+| w3-B | udp-statsd-packed | 0.989 | 1,269,388 | 1.26 | 1.00 | 80.7 MiB | -- |
+| w4-B | udp-statsd | 0.852 | 1,321,168 | 0.00 | 0.26 | 50.9 MiB | 15.7 |
+| w4-B | udp-statsd-small | 3.411 | 376,428 | 0.00 | 0.01 | 33.2 MiB | 3.9 |
+| w4-B | udp-statsd-packed | 0.853 | 1,285,541 | 0.00 | 0.06 | 44.2 MiB | 12.6 |
 
 #### Half-scale results (0.5 × knee)
 
 | Binary/pass | Scenario | CPU µs/event | events/s | kernel drop % | peak RSS |
 |---|---|---:|---:|---:|---:|
-| w2-A | udp-statsd | 0.869 | 667,149 | 0.00 | 43.4 MiB |
-| w2-A | udp-statsd-small | 5.546 | 186,197 | 0.00 | 30.6 MiB |
-| w2-A | udp-statsd-packed | 0.937 | 641,343 | 0.00 | 38.5 MiB |
-| w3-A | udp-statsd | 0.877 | 667,148 | 0.00 | 44.4 MiB |
-| w3-A | udp-statsd-small | 4.497 | 186,197 | 0.00 | 31.0 MiB |
-| w3-A | udp-statsd-packed | 0.990 | 641,336 | 0.00 | 38.4 MiB |
-| w4-A | udp-statsd | 0.868 | 667,138 | 0.00 | 43.1 MiB (fill 13.4) |
-| w4-A | udp-statsd-small | 5.410 | 186,197 | 0.00 | 33.3 MiB (fill 1.9) |
-| w4-A | udp-statsd-packed | 0.858 | 641,344 | 0.00 | 41.5 MiB (fill 9.3) |
-| w2-B | udp-statsd | 0.900 | 667,146 | 0.00 | 42.7 MiB |
-| w2-B | udp-statsd-small | 4.062 | 186,198 | 0.00 | 31.2 MiB |
-| w2-B | udp-statsd-packed | 0.947 | 641,343 | 0.00 | 38.5 MiB |
-| w3-B | udp-statsd | 0.887 | 667,147 | 0.00 | 43.2 MiB |
-| w3-B | udp-statsd-small | 5.484 | 186,197 | 0.00 | 30.1 MiB |
-| w3-B | udp-statsd-packed | 0.985 | 641,338 | 0.00 | 37.5 MiB |
-| w4-B | udp-statsd | 0.863 | 667,139 | 0.00 | 43.8 MiB (fill 13.4) |
-| w4-B | udp-statsd-small | 2.409 | 186,198 | 0.00 | 33.6 MiB (fill 2.4) |
-| w4-B | udp-statsd-packed | 0.917 | 641,337 | 0.00 | 39.7 MiB (fill 12.4) |
+| w2-A | udp-statsd | 0.849 | 660,606 | 0.00 | 44.9 MiB |
+| w2-A | udp-statsd-small | 4.024 | 188,216 | 0.00 | 30.0 MiB |
+| w2-A | udp-statsd-packed | 0.951 | 642,810 | 0.00 | 39.3 MiB |
+| w3-A | udp-statsd | 0.877 | 660,606 | 0.00 | 43.8 MiB |
+| w3-A | udp-statsd-small | 5.329 | 188,215 | 0.00 | 30.0 MiB |
+| w3-A | udp-statsd-packed | 0.905 | 642,808 | 0.00 | 40.8 MiB |
+| w4-A | udp-statsd | 0.866 | 660,599 | 0.00 | 44.1 MiB |
+| w4-A | udp-statsd-small | 5.238 | 188,215 | 0.00 | 33.3 MiB |
+| w4-A | udp-statsd-packed | 0.861 | 642,809 | 0.00 | 41.7 MiB |
+| w2-B | udp-statsd | 0.935 | 660,598 | 0.00 | 42.2 MiB |
+| w2-B | udp-statsd-small | 3.143 | 188,216 | 0.00 | 30.2 MiB |
+| w2-B | udp-statsd-packed | 1.012 | 642,802 | 0.00 | 38.9 MiB |
+| w3-B | udp-statsd | 0.914 | 660,599 | 0.00 | 41.5 MiB |
+| w3-B | udp-statsd-small | 3.789 | 188,216 | 0.00 | 29.8 MiB |
+| w3-B | udp-statsd-packed | 0.987 | 642,802 | 0.00 | 38.4 MiB |
+| w4-B | udp-statsd | 0.836 | 660,605 | 0.00 | 45.0 MiB |
+| w4-B | udp-statsd-small | 3.282 | 188,216 | 0.00 | 33.9 MiB |
+| w4-B | udp-statsd-packed | 0.840 | 642,808 | 0.00 | 42.3 MiB |
 
-(All half-scale queue drops are 0; every field not shown is 0.)
+(All half-scale queue drops are 0.)
 
 #### Compare: deltas vs. control-to-control drift
 
@@ -796,43 +817,62 @@ points are `after - before`.
 
 | Scenario | Pair | events/s | µs/event | peak RSS | drop pts |
 |---|---|---:|---:|---:|---:|
-| udp-statsd | w2A→w3A | +2.6% | -3.1% | -7.0% | -2.43 |
-| udp-statsd | w2B→w3B | +2.9% | -3.0% | -5.1% | -2.76 |
-| udp-statsd | w3A→w4A | +0.5% | -8.2% | -19.8% | -0.49 |
-| udp-statsd | w3B→w4B | +0.2% | -2.5% | -23.1% | -0.23 |
-| udp-statsd | control w2A→w2B | -0.0% | -0.6% | -3.5% | +0.08 |
-| udp-statsd | control w3A→w3B | +0.3% | -0.5% | -1.4% | -0.26 |
-| udp-statsd | control w4A→w4B | -0.0% | **+5.6%** | -5.5% | +0.00 |
-| udp-statsd-small | w2A→w3A | +1.4% | -3.4% | -4.0% | -1.38 |
-| udp-statsd-small | w2B→w3B | +1.3% | **-28.5%** | -2.6% | -1.24 |
-| udp-statsd-small | w3A→w4A | +0.0% | -14.5% | +9.4% | -0.02 |
-| udp-statsd-small | w3B→w4B | +0.0% | **+20.8%** | +13.7% | -0.01 |
-| udp-statsd-small | control w2A→w2B | +0.2% | +0.2% | -2.9% | -0.15 |
-| udp-statsd-small | control w3A→w3B | +0.0% | **-25.8%** | -1.5% | -0.01 |
-| udp-statsd-small | control w4A→w4B | +0.0% | +4.7% | +2.4% | +0.00 |
-| udp-statsd-packed | w2A→w3A | +3.2% | -0.6% | +0.6% | -3.08 |
-| udp-statsd-packed | w2B→w3B | +3.8% | +2.8% | -5.7% | -3.68 |
-| udp-statsd-packed | w3A→w4A | +0.6% | -4.4% | **-38.2%** | -0.55 |
-| udp-statsd-packed | w3B→w4B | +0.7% | -14.0% | **-42.3%** | -0.70 |
-| udp-statsd-packed | control w2A→w2B | -0.8% | +0.7% | +2.5% | +0.75 |
-| udp-statsd-packed | control w3A→w3B | -0.2% | +4.1% | -3.9% | +0.15 |
-| udp-statsd-packed | control w4A→w4B | +0.0% | -6.3% | -10.3% | +0.00 |
+| udp-statsd | w2-A→w3-A | +2.2% | -3.2% | -9.8% | -2.15 |
+| udp-statsd | w2-B→w3-B | +2.3% | -3.0% | -10.1% | -2.19 |
+| udp-statsd | w3-A→w4-A | +0.2% | -5.0% | -25.5% | -0.22 |
+| udp-statsd | w3-B→w4-B | +0.2% | -2.7% | -25.5% | -0.20 |
+| udp-statsd | control w2-A→w2-B | -0.1% | -0.6% | +1.6% | +0.02 |
+| udp-statsd | control w3-A→w3-B | +0.0% | -0.4% | +1.2% | -0.02 |
+| udp-statsd | control w4-A→w4-B | -0.0% | +2.0% | +1.1% | +0.00 |
+| udp-statsd-small | w2-A→w3-A | +3.0% | -1.4% | -4.5% | -2.90 |
+| udp-statsd-small | w2-B→w3-B | +3.3% | **-27.0%** | -3.4% | -3.22 |
+| udp-statsd-small | w3-A→w4-A | +0.0% | -20.8% | +10.4% | -0.01 |
+| udp-statsd-small | w3-B→w4-B | +0.0% | **+15.0%** | +10.1% | +0.00 |
+| udp-statsd-small | control w2-A→w2-B | -0.3% | +3.8% | -0.1% | +0.31 |
+| udp-statsd-small | control w3-A→w3-B | +0.0% | **-23.1%** | +1.1% | -0.01 |
+| udp-statsd-small | control w4-A→w4-B | +0.0% | +11.7% | +0.8% | +0.00 |
+| udp-statsd-packed | w2-A→w3-A | +2.4% | -6.5% | +2.4% | -2.35 |
+| udp-statsd-packed | w2-B→w3-B | +3.6% | +3.0% | -3.5% | -3.46 |
+| udp-statsd-packed | w3-A→w4-A | +1.7% | -9.8% | **-42.1%** | -1.66 |
+| udp-statsd-packed | w3-B→w4-B | +1.3% | -13.8% | **-45.2%** | -1.26 |
+| udp-statsd-packed | control w2-A→w2-B | -0.7% | -4.9% | +5.3% | +0.70 |
+| udp-statsd-packed | control w3-A→w3-B | +0.4% | +4.6% | -0.7% | -0.41 |
+| udp-statsd-packed | control w4-A→w4-B | -0.0% | +0.0% | -6.0% | +0.00 |
 
 **Half scale**
 
 | Scenario | Pair | events/s | µs/event | peak RSS | drop pts |
 |---|---|---:|---:|---:|---:|
-| udp-statsd | w2A→w3A / control | ~0% | +0.9% / +3.6% (ctl) | +2.2% / -1.7% (ctl) | 0 |
-| udp-statsd | w3A→w4A / control | ~0% | -1.0% / -0.5% (ctl) | -2.8% / +1.5% (ctl) | 0 |
-| udp-statsd-small | w2A→w3A / control | ~0% | -18.9% / -26.8% (ctl) | +1.3% / +2.0% (ctl) | 0 |
-| udp-statsd-small | w3A→w4A / control | ~0% | +20.3% / -55.5% (ctl) | +7.5% / +0.7% (ctl) | 0 |
-| udp-statsd-packed | w2A→w3A / control | ~0% | +5.7% / +1.1% (ctl) | -0.4% / -0.0% (ctl) | 0 |
-| udp-statsd-packed | w3A→w4A / control | ~0% | -13.3% / +6.8% (ctl) | +8.3% / -4.5% (ctl) | 0 |
+| udp-statsd | w2-A→w3-A / control w2-A→w2-B | -0.0% | +3.3% / +10.0% (ctl) | -2.4% / -6.0% (ctl) | 0 |
+| udp-statsd | w3-A→w4-A / control w3-A→w3-B | -0.0% | -1.3% / +4.2% (ctl) | +0.6% / -5.2% (ctl) | 0 |
+| udp-statsd-small | w2-A→w3-A / control w2-A→w2-B | -0.0% | **+32.4%** / -21.9% (ctl) | -0.3% / +0.6% (ctl) | 0 |
+| udp-statsd-small | w3-A→w4-A / control w3-A→w3-B | -0.0% | -1.7% / -28.9% (ctl) | +11.2% / -0.4% (ctl) | 0 |
+| udp-statsd-packed | w2-A→w3-A / control w2-A→w2-B | -0.0% | -4.9% / +6.5% (ctl) | +3.8% / -1.0% (ctl) | 0 |
+| udp-statsd-packed | w3-A→w4-A / control w3-A→w3-B | +0.0% | -4.8% / +9.1% (ctl) | +2.2% / -5.9% (ctl) | 0 |
 
-(Both A/B branch deltas and both controls are given for `udp-statsd`/`-packed` above; full
-per-pair numbers for `-small` are in the raw JSON under `~/lib/logit/tmp/perf/udp/vm/` — the
-control drift itself swings ±20–55% here, so the branch deltas for `-small` cannot be read at
-all; see the reading below.)
+Full per-pair numbers (both A/B directions, every scenario) are in the raw JSON under
+`~/lib/logit/tmp/perf/vm-rebase-full/` and `~/lib/logit/tmp/perf/vm/`. At half scale,
+`udp-statsd-small`'s control drift (±22–29 points, control-to-control) is again wider than most
+branch deltas — see the reading below for why this scenario's µs/event isn't readable at all,
+knee or half.
+
+#### Per-binary capacity: highest offered rate at ≈0% kernel drop
+
+The previous session's own named open item — knee-scale drops on w3/w4 measured at *w2's* knee,
+not each binary's own — closed this session. Bisected independently per binary (target ≤0.5% drop,
+≤8 tries), as a multiplier of each scenario's shipped `rate:`:
+
+| Binary | `udp-statsd` | `udp-statsd-small` | `udp-statsd-packed` |
+|---|---:|---:|---:|
+| `udp/w2` | 0.800× (71,965/s) | 0.480× (365,156/s) | 0.785× (91,033/s) |
+| `udp/w3` | 0.822× (73,969/s) | 0.547× (415,922/s) | 0.807× (93,616/s) |
+| `udp/w4` | 0.904× (81,316/s) | **1.992× (1,514,062/s)** | 0.911× (105,669/s) |
+
+`udp-statsd`/`-packed` move modestly w2→w4 (~13–16% more headroom), consistent with the knee-scale
+table's own small-percent CPU gains. **`udp-statsd-small` is the outlier that confirms the design
+intent:** `recvmmsg` (W4) roughly *quadruples* the highest loss-free rate for the single-datagram,
+syscall-bound workload specifically — exactly the scenario batched reads exist for — while barely
+moving the two packing shapes where decode cost, not syscall count, already dominated.
 
 #### `read_batch` sweep (w4 only, `--repeat 3`, knee scale)
 
@@ -841,103 +881,129 @@ Temporary scenario/load copies (`udp-statsd-rbN` / `udp-statsd-small-rbN`) were 
 
 | `read_batch` | **udp-statsd-small** µs/event | fill | drop% | rcvbuf | | **udp-statsd** µs/event | fill | drop% | rcvbuf |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 4.151 | 1.0 | 10.67% | 1.00 | | 0.928 | 1.0 | 4.66% | 1.00 |
-| 16 | 3.881 | 3.4 | 0.00% | 0.01 | | 0.845 | 9.8 | 0.00% | 0.29 |
-| 32 | 3.141 | 3.0 | 0.00% | 0.01 | | 0.849 | 13.5 | 0.00% | 0.16 |
-| **64** | **4.210** | **3.0** | **0.00%** | **0.01** | | **0.846** | **15.3** | **0.00%** | **0.16** |
-| 128 | 4.182 | 3.1 | 0.00% | 0.01 | | 0.850 | 16.5 | 0.00% | 0.18 |
-| 256 | 4.144 | 3.2 | 0.00% | 0.01 | | 0.852 | 15.3 | 0.00% | 0.23 |
+| 1 | 4.173 | 1.0 | 11.60% | 1.00 | | 0.961 | 1.0 | 4.63% | 1.00 |
+| 16 | 3.410 | 3.7 | 0.00% | 0.01 | | 0.797 | 6.3 | 0.00% | 0.28 |
+| 32 | 3.618 | 3.5 | 0.00% | 0.01 | | 0.808 | 12.1 | 0.00% | 0.27 |
+| **64** | **3.486** | **4.0** | **0.00%** | **0.03** | | **0.795** | **7.6** | **0.00%** | **0.28** |
+| 128 | 3.386 | 4.2 | 0.00% | 0.01 | | 0.808 | 14.3 | 0.00% | 0.26 |
+| 256 | 3.315 | 3.2 | 0.00% | 0.02 | | 0.795 | 6.3 | 0.00% | 0.27 |
 
-**Peak RSS across the sweep** (`udp-statsd-small`): 31.8 (rb1) → 30.9 → 31.6 → 32.7 → 38.2 → 49.1
-MiB (rb256) — unlike the laptop's flat-RSS finding, RSS on this VM rises noticeably at
-rb128/rb256. `udp-statsd`'s RSS also rises with `read_batch` (73.9 → 55.1 → 49.5 → 53.0 → 53.9 →
-78.8 MiB) — non-monotonic and noisy, not a clean trend either.
+**Peak RSS across the sweep** (`udp-statsd-small`): 31.5 (rb1) → 31.2 → 32.0 → 34.1 → 39.2 → 47.6
+MiB (rb256) — rises with `read_batch`, the same qualitative shape the 4-vCPU session found and
+this session's own dedicated THP experiment (below) now explains directly. `udp-statsd`'s RSS is
+noisier and doesn't show as clean a trend (76.9 → 70.8 → 51.0 → 53.7 → 55.5 → 79.6 MiB) — plausible
+given mixed/larger datagrams have more memory factors in play than the small-datagram slab alone.
 
-`fill` plateaus at ~3 for `-small` and ~13–16 for `udp-statsd` from `read_batch=16` upward, same
-qualitative shape as the laptop's finding: 64 already captures essentially all the batching
-benefit, values above it buy nothing in CPU time (µs/event is flat 0.845–0.852 for `udp-statsd`,
-16–256; `-small`'s µs/event is noisy across the whole sweep — see the reading below).
+`fill` plateaus by `read_batch=16` for both scenarios (~3–4 for `-small`, ~6–14 for `udp-statsd`,
+noisier than a clean monotonic curve but not trending up with `read_batch` past 16): 64 already
+captures essentially all the batching benefit, and `udp-statsd`'s µs/event is flat within noise
+from 16 upward (0.795–0.808). `-small`'s µs/event is itself noisy across the whole sweep, same
+reading as the calibration and per-binary tables above — see "Reading the numbers" below.
 
-#### `--verify` (default scale, `udp-statsd`, one repeat each)
+#### `read_batch` sweep under `transparent_hugepage=madvise` (new this session)
+
+The previous session's own open item: repeat the sweep with THP forced off, to test whether
+`THP=always` explains the RSS rise directly. `udp-statsd-small` only, w4, same protocol, THP
+restored to `always` after:
+
+| `read_batch` | µs/event | fill | drop% | peak RSS |
+|---|---:|---:|---:|---:|
+| 1 | 4.109 | 1.0 | 11.80% | 16.8 MiB |
+| 16 | 3.332 | 3.1 | 0.00% | 14.4 MiB |
+| 32 | 3.985 | 3.2 | 0.00% | 14.8 MiB |
+| 64 | 3.178 | 4.4 | 0.00% | 14.9 MiB |
+| 128 | 2.611 | 2.9 | 0.00% | 15.0 MiB |
+| 256 | 4.066 | 3.2 | 0.00% | 16.1 MiB |
+
+**Confirmed, not just likely.** Under `madvise`, peak RSS stays flat in a 14.4–16.8 MiB band across
+the entire `read_batch` range — no rise at 128/256 the way the `THP=always` table above shows
+(34.1 → 39.2 → 47.6 MiB over the same range). This closes `docs/design/memory.md`'s "likely, but
+not confirmed" caveat directly: the `read_batch × 65,507`-byte slab really does become fully
+resident under `THP=always` (one touched 4 KiB page faulting in its enclosing 2 MiB huge page) and
+really does stay mostly untouched under `madvise`/`never` — not a coincidence, a same-box,
+same-binary, THP-toggled repeat of the identical sweep.
+
+#### `--verify` (default scale, one repeat each)
 
 | Binary | Result |
 |---|---|
-| w2 | 620,000 datagrams, 11,074,692 lines, **11,074,692 events delivered exactly, zero drops** |
-| w3 | 620,000 datagrams, 11,074,692 lines, **11,074,692 events delivered exactly, zero drops** |
-| w4 | 620,000 datagrams, 11,074,692 lines, **11,074,692 events delivered exactly, zero drops** |
+| `udp-statsd` (w2/w3/w4) | 620,000 datagrams, 11,074,692 lines, **11,074,692 events delivered exactly, zero drops**, all three |
+| `udp-statsd-small` (w2/w3/w4) | 5,000,000 datagrams, 5,000,000 lines, **5,000,000 events delivered exactly, zero drops**, all three |
+| `udp-statsd-packed` (w2/w3/w4) | 800,000 datagrams, 10,788,160 lines, **10,788,160 events delivered exactly, zero drops**, all three |
 
-All three pass the strict self-check.
+All nine (three binaries × three scenarios) pass the strict self-check.
 
 <!-- udp-intake-numbers:end -->
 
 ### Reading the numbers
 
-**The robust signal is loss at a fixed offered load, not CPU per event.** At the calibrated knee,
-kernel drops fall monotonically w2 → w3 → w4 on every scenario, and both interleaved passes agree:
-`udp-statsd` 2.92/3.00% → 0.49/0.23% → 0.00%; `udp-statsd-small` 1.40/1.25% → 0.02/0.01% → 0.00%;
-`udp-statsd-packed` 3.63/4.38% → 0.55/0.70% → 0.00%. Control-to-control drift in drop points is
-≤~0.75 throughout (see the compare table above), well inside the w2→w3 and w3→w4 movements, and
-max kernel-rcvbuf utilization falls in step. Decode-side batching (W3) removes most of the loss;
-`recvmmsg` (W4) removes the rest, taking every scenario to exactly zero drops at the knee. For
-syscall-bound UDP intake, this — not µs/event — is the number to trust.
+**The robust signal is loss at a fixed offered load, not CPU per event** — unchanged from the
+4-vCPU session's own reading. At the calibrated knee, kernel drops fall monotonically w2 → w3 → w4
+on every scenario, and both interleaved passes agree: `udp-statsd` 2.37/2.39% → 0.22/0.20% →
+0.00%; `udp-statsd-small` 2.92/3.22% → 0.01/0.00% → 0.00%; `udp-statsd-packed` 4.01/4.71% →
+1.66/1.26% → 0.00%. Control-to-control drift in drop points stays under 1 throughout (see the
+compare table above), well inside the w2→w3 and w3→w4 movements. Decode-side batching (W3) removes
+most of the loss; `recvmmsg` (W4) removes the rest, taking every scenario to exactly zero drops at
+the knee, same as before. For syscall-bound UDP intake, this — not µs/event — is still the number
+to trust.
 
-**CPU µs/event tells a smaller, partly-inside-drift story.** On `udp-statsd`, w2→w3 is a small,
-consistent gain (−3.1%/−3.0%, against a control drift of ≤0.6%) — a real if modest win. w3→w4 on
-`udp-statsd` (−8.2%/−2.5%, with one control at +5.6%) and on `udp-statsd-packed` (−4.4%/−14.0%,
-against controls of +4.1%/−6.3%) point the same direction but are **not** cleanly beyond drift —
-read as "consistent with a small gain," not a confirmed one. At half scale, every mixed/packed
-movement is within drift.
+**CPU µs/event is a smaller, partly-inside-drift story here too**, though a real one for `packed`
+this time: `udp-statsd`'s w2→w3 gain is modest and mostly within drift (−3.2%/−3.0% against a
+control of ≤0.6%), and w3→w4 similarly (−5.0%/−2.7%, controls ≤2.0%). `udp-statsd-packed`'s w3→w4
+gain (−9.8%/−13.8%, against controls of +4.6%/+0.0%) is the cleanest CPU win in this table —
+clearly beyond its own control drift on both interleaved passes, unlike the 4-vCPU session where
+the same comparison was ambiguous.
 
-**`udp-statsd-small`'s CPU µs/event is not readable on this VM.** Control-to-control swings run
-20–56% — the same order of magnitude as any branch delta — so nothing about `-small`'s timing
-number should be read as a w2→w3 or w3→w4 finding (its drop-rate numbers remain trustworthy, since
-those are a count, not a timing). This VM is **not** faster per event than the dev laptop: `-small`
-costs roughly 3–5 µs/event here, versus ~1.1–2.0 µs/event on the laptop's 5.1 GHz cores — which is
-also why the shipped load-spec rates had to be roughly halved to reach the calibration target here.
-A telling shape backs a **hypothesis, not a finding**: per-event CPU is *higher* at half the
-offered rate (4.1–5.5 µs/event) than at the knee (2.8–4.0 µs/event) — the opposite of what
-amortizing a fixed cost over more work should give. Mean fill is lower at half scale too (1.9–2.4
-vs. 3.1 datagrams/read), so each wakeup carries less work — consistent with a fixed per-wakeup
-cost that a virtualized guest pays disproportionately for on idle/wake transitions. Consequence:
-for syscall-bound traffic on a VM, compare loss and capacity, not µs/event.
+**`udp-statsd-small`'s CPU µs/event still isn't readable, on either box.** Control-to-control
+drift stays large (knee: +3.8%/−23.1%/+11.7%; half scale: −21.9%/−28.9%) — the same order of
+magnitude as any branch delta, same conclusion the 4-vCPU session reached: nothing about
+`-small`'s *timing* number should be read as a w2→w3 or w3→w4 finding on a VM (its drop-rate and
+capacity numbers remain trustworthy, since those aren't timings). The per-binary capacity table
+above gives the honest headline for this scenario instead — see below.
 
-**Peak RSS: the laptop's provisional finding does not reproduce.** At the knee, RSS *falls*
-w3→w4 — `udp-statsd` −19.8%/−23.1%, `udp-statsd-packed` −38.2%/−42.3%, both far beyond their
-control drift — because w4 no longer builds a receive-side backlog the way w3 did. At half scale
-(no backlog for anyone), RSS is flat within drift on both scenarios. `udp-statsd-small` rises
-slightly (+9.4%/+13.7%, on the order of +3 MiB) — a real but small move in the laptop's direction.
-This closes the open RSS-attribution item below.
+**Peak RSS confirms the 4-vCPU session's own finding, and by a similar margin.** At the knee, RSS
+falls w3→w4 on `udp-statsd` (−25.5%/−25.5%) and `udp-statsd-packed` (−42.1%/−45.2%), both far
+beyond control drift, because w4 no longer builds a receive-side backlog the way w3 did — the same
+shape and similar magnitude the previous session found (−19.8%/−23.1% and −38.2%/−42.3%
+respectively). At half scale, RSS is flat within drift.
+
+**Per-binary capacity — closed this session — makes the `recvmmsg` story sharper than the
+knee-scale table alone can.** Running w3/w4 at *w2's* knee (the only measurement the previous
+session had) understates what W4 actually bought for `udp-statsd-small`: at its own highest
+loss-free rate, w4 sustains **1,514,062 datagrams/s versus w2's 365,156 — a ~4.1× capacity gain**,
+not the roughly-flat drop-rate-at-a-fixed-load picture the knee-scale table shows (because that
+table's fixed load was calibrated *below* w2's ceiling to begin with, so both binaries look
+"zero drop" once w3/w4 clear it). `udp-statsd`/`-packed` move only 13–16% w2→w4 in the same
+measurement, confirming the earlier reading that `recvmmsg`'s benefit is concentrated in the
+syscall-bound small-datagram case specifically, and putting a number on "concentrated."
 
 **The `read_batch` sweep confirms the plateau, and 64 stays the default** — `read_batch: 1`
-reproduces the pre-`recvmmsg` loss (10.67% `-small`, 4.66% mixed); from 16 upward, drops are 0 and
-`udp-statsd`'s µs/event is flat (0.845–0.852); mean fill plateaus around ~3 (`-small`) and ~13–16
-(mixed). **New, and different from the laptop: peak RSS rises noticeably at large `read_batch`**
-(`-small`: 32.7 MiB at 64 → 38.2 at 128 → 49.1 at 256). This VM has transparent huge pages set to
-`always` (see box facts above), and the arithmetic fits a THP-backed slab: the slab is
-`read_batch × 65,507` bytes — 4 / 8 / 16 MiB at 64 / 128 / 256 — and touching just one 4 KiB page
-per slot, under `THP=always`, faults in whole 2 MiB huge pages, i.e. the *entire* slab becomes
-resident (+16.4 MiB observed at `read_batch: 256` against a 16 MiB slab). This is the **likely**
-explanation, not a confirmed one — it wants a same-box run with THP set to `madvise`/`never` to
-confirm. Its practical meaning either way: "the slab is not resident" (the dev-container claim
-above) holds where THP is `madvise` or `never`, but does **not** hold under `THP=always`, where the
-shipped default `read_batch: 64` can cost up to ~4 MiB of real resident memory per UDP listener.
+reproduces the pre-`recvmmsg` loss (11.60% `-small`, 4.63% mixed); from 16 upward, drops are 0 and
+`udp-statsd`'s µs/event is flat within noise (0.795–0.808); mean fill plateaus by 16 for both
+scenarios. Peak RSS still rises noticeably at large `read_batch` for `-small` under `THP=always`
+(31.2 MiB at 16 → 47.6 at 256) — same shape the 4-vCPU session found.
+
+**The THP explanation is confirmed, not just likely, this session.** A same-box, same-binary
+repeat of the identical `udp-statsd-small` sweep with `transparent_hugepage` forced to `madvise`
+shows peak RSS flat in a 14.4–16.8 MiB band across the *entire* `read_batch` range — no rise at
+128/256 the way `THP=always` shows. The `read_batch × 65,507`-byte slab really is what becomes
+resident under `THP=always` (one touched 4 KiB page faulting in its enclosing 2 MiB huge page);
+under `madvise`/`never` it stays mostly untouched, exactly as the "likely, not confirmed"
+hypothesis predicted. `docs/design/memory.md` §5's caveat is updated to say so.
 
 ### Open after this workstream
 
-- **A per-binary capacity metric is still open.** This session calibrated the knee on `udp/w2`
-  only and ran w3/w4 at that same offered load — the honest headline for syscall-bound traffic
-  would instead bisect the highest loss-free offered rate *per binary*, which likely differs
-  between w2, w3, and w4. Not measured here.
-- **The THP explanation for the `read_batch`-sweep RSS rise is likely, not confirmed** — it wants a
-  repeat of the same sweep on the same VM shape with `transparent_hugepage` set to `madvise` or
-  `never`, to check that the RSS-vs-`read_batch` curve goes flat again.
-- **The wakeup-cost hypothesis for `udp-statsd-small` on VMs is a hypothesis, not a finding** — the
-  higher per-event CPU at half scale than at the knee is consistent with a fixed per-wakeup cost
-  that a virtualized guest pays for disproportionately at low arrival rates, but nothing here
-  isolates wakeup cost directly (e.g. via a wakeup-rate probe independent of `fill`).
+- **The wakeup-cost hypothesis for `udp-statsd-small` on VMs is still a hypothesis, not a
+  finding** — nothing in this session isolates wakeup cost directly (e.g. via a wakeup-rate probe
+  independent of `fill`), and this session didn't re-run the half-scale-vs-knee CPU comparison the
+  4-vCPU session used to motivate it. The per-binary capacity table above is a cleaner way to
+  characterize this scenario's headline number regardless of whether the hypothesis holds.
 - **The shared-task / `SO_REUSEPORT` follow-up from earlier workstreams is still open** and
   untouched by this session — this session measured the existing single-listener-task design at
   higher fidelity, not a multi-task alternative.
+
+Both items the previous revision of this section named as open — a per-binary capacity metric, and
+confirming the THP explanation — are closed above.
 
 ## Open questions
 
@@ -948,16 +1014,17 @@ shipped default `read_batch: 64` can cost up to ~4 MiB of real resident memory p
   a schedule yet.
 - **`buffered`'s variance is resolved**: the spool-accumulation mechanism §3 identified is fixed on
   the harness side (W8, #165 — every spawn clears a scenario's declared `buffer.disk.path` first),
-  and a quiet-machine `--repeat 5` confirmation (§3) shows the same no-decay, flat-RSS signature the
-  busy-machine post-fix run did. What's left is narrower and product-side, not harness-side: a
-  roughly 1.4× spread within five quiet repeats, and how much of it traces to `DiskQueue::open`'s
-  double-read startup scan versus ordinary noise (`docs/known-gaps.md`'s `buffered` entry) — no
-  longer the prime suspect it was, just unquantified.
-- **`compare` has no variance-aware threshold** (the noise sub-section in §1): `aggregate`'s ordinary
-  ~±25% repeat-to-repeat spread, present even solo on an idle machine, is enough on its own to trip
-  `compare --threshold 5`. Gating on each file's `min` instead of median, a per-scenario threshold,
-  or a higher `--repeat` for flush-tick scenarios are the candidate fixes, none built here
-  (`docs/known-gaps.md`'s harness entry).
+  and both a quiet-laptop and a reference-VM `--repeat 5` confirmation (§3) show the same no-decay,
+  flat-RSS signature. The VM pass narrowed the remaining spread further still (7% events/s spread,
+  under 1% on CPU µs/event) — what's left is product-side, not harness-side, and smaller than the
+  laptop ever suggested: `DiskQueue::open`'s double-read startup scan (`docs/known-gaps.md`'s
+  `buffered` entry) is no longer the prime suspect for anything, just an unquantified detail.
+- **`compare`'s lack of a variance-aware threshold is still real future work in principle, but its
+  motivating case is gone.** `aggregate`'s laptop-era ~±25% repeat-to-repeat spread — the reason
+  this item was opened — does not reproduce on the reference VM (§1's noise sub-section: two
+  independent 5-repeat samples agree to within 0.7%). Gating on each file's `min` instead of
+  median, or a per-scenario threshold, remain candidate improvements if a future scenario turns out
+  to need them, but nothing currently in the suite does (`docs/known-gaps.md`'s harness entry).
 - **Templated metric names permanently grow the process-wide interner**, one entry per distinct
   rendering, for the life of the process (`generate_in`'s own module doc; `docs/design/memory.md`
   §4). `generate_in` already refuses a bare `{seq}` there for exactly this reason, and every shipped

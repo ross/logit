@@ -10,8 +10,8 @@ already built that have a known, accepted rough edge.
   thread, and roughly 9× the per-event allocations of a native transform, because `logit` has no
   native predicate language** — a deliberate choice, not an oversight;
   [ADR `routing-by-condition-is-lua`](adr/routing-by-condition-is-lua.md) has the full account and
-  the measured numbers. Concretely: **9** allocations / **1.07 µs** per event through a `lua`
-  component versus **1** allocation / **360 ns** through a native `Transform`
+  the measured numbers. Concretely: **9** allocations / **1.61 µs** per event through a `lua`
+  component versus **1** allocation / **525 ns** through a native `Transform`
   (`docs/design/memory.md`), and one dedicated OS thread plus one LuaJIT VM per `lua` node
   (`crates/logit-pipeline/src/runtime.rs`'s `run_with_telemetry`) versus an ordinary tokio task.
   Fine at sidecar/host-agent volume — the delta is noise below roughly tens of thousands of
@@ -264,8 +264,12 @@ already built that have a known, accepted rough edge.
   that sharing (`docs/design/performance.md` §7), but a report-only experiment run alongside it, not
   shipped, found real headroom if it were split: spawning `decode_loop` onto its own task, pinned to
   cores 2, 3, 14, 15 (two fast physical cores plus their SMT siblings), against the same branch and
-  pins otherwise — **provisional, same laptop/battery/powersave caveat as every other number in this
-  entry**:
+  pins otherwise — **laptop-provisional, and not migrated to the reference VM**: the branch
+  (`udp/w4-scratch-spawn-experiment`) was local-only and report-only from the start, and the
+  2026-09-20 VM measurement session that replaced every other number in this document with current
+  VM figures didn't rebuild or re-run it (out of scope for that session; would need `script/vm
+  build` from a local directory source). Read the numbers below as this-laptop-that-day, same as
+  every pre-2026-09-20 figure this document used to carry uncaveated:
 
   | | single task | decode spawned |
   |---|---|---|
@@ -1685,18 +1689,15 @@ already built that have a known, accepted rough edge.
   "regression" on nothing but scheduling luck, and a real regression smaller than that scenario's
   noise floor can pass silently. `compare` already warns on a host/CPU-model mismatch between the
   two files; it has no equivalent warning for "this scenario's own repeats disagree by more than the
-  threshold you're gating on" — worth closing before this harness ever gates anything automatically,
-  not before ([ADR `load-test-harness`](adr/load-test-harness.md)'s "when the harness runs" open
-  question). Confirmed, quiet-machine evidence of exactly this failure mode:
-  [`docs/design/performance.md`](design/performance.md) §1's noise sub-section found `aggregate`
-  spreads roughly ±25% between repeats even solo on an idle machine (a dedicated `aggregate`-only
-  rerun reproduced it), while `passthrough`, `json-parse`, and `lua` stay far tighter on the same
-  run — so a single 5% threshold flags `aggregate` on nothing but its own ordinary variance.
-  Candidate fixes, none built: gate `compare` on each file's `min` (or another variance-aware
-  statistic) instead of a bare median-to-median diff, give it a per-scenario threshold so a
-  flush-tick scenario can carry a wider band than a steadier one, or raise `--repeat` specifically
-  for flush-tick scenarios so the reported median is less exposed to any one repeat's tick
-  alignment.
+  threshold you're gating on" — still a real gap in principle, but its own motivating case is gone.
+  On the laptop, [`docs/design/performance.md`](design/performance.md) §1's noise sub-section found
+  `aggregate` spreads roughly ±25% between repeats even solo on an idle machine, while
+  `passthrough`, `json-parse`, and `lua` stayed far tighter on the same run — so a single 5%
+  threshold flagged `aggregate` on nothing but its own ordinary variance. **That does not reproduce
+  on the disposable perf VM** (2026-09-20): two independent 5-repeat samples of `aggregate` agree
+  with each other to within 0.7%, both within one run and across runs an hour apart. Candidate
+  fixes remain unbuilt (gate `compare` on each file's `min`, or a per-scenario threshold) in case a
+  future scenario needs them, but nothing in the current suite does.
 - **`buffered`'s events/s was the least reproducible number this harness reported; the harness-side
   fix has landed (W8, #165) and is now confirmed on a quiet machine — resolved, with one
   product-side question left open, tracked below.**
@@ -1727,18 +1728,36 @@ already built that have a known, accepted rough edge.
   still no decay, no climb. `script/perf attribute --scenario buffered` on the same build put the
   constraint downstream of `gen` (the disk queue's own write/read path), not the harness: `gen` sent
   and `out` received all 1,200,000 events, `gen` spent 1.3959s blocked in `send`, and neither the
-  sink nor the listener show any process time of their own. **What remains open, narrower than
-  before:** a roughly 1.4× spread within five repeats even solo and idle (632,897 to 873,406
-  events/s), and whether `DiskQueue::open`'s still-unchanged double-read startup scan (the
-  active-segment validation pass, and the second pass counting what's left to replay against a
-  *cleared* spool's own first-open cost) accounts for any of it — a product-side item
-  (`crates/logit-pipeline/src/disk_queue.rs`) nobody has picked up, and no longer suspected as the
-  main cause of `buffered`'s variance the way it was before the quiet-machine confirmation.
+  sink nor the listener show any process time of their own. **A 2026-09-20 solo `--repeat 5` on the
+  disposable perf VM narrowed the remaining spread further still:** 745,047 → 757,703 → 802,478 →
+  780,068 → 801,518 events/s (1.720 → 1.710 → 1.710 → 1.709 → 1.708 µs/event), peak RSS a tight
+  70.7–79.0 MiB band — about 7% events/s spread and under 1% on CPU µs/event, the tightest this
+  scenario has ever measured. **What remains open, narrower than before:** whether
+  `DiskQueue::open`'s still-unchanged double-read startup scan (the active-segment validation pass,
+  and the second pass counting what's left to replay against a *cleared* spool's own first-open
+  cost) accounts for any of the remaining spread — a product-side item
+  (`crates/logit-pipeline/src/disk_queue.rs`) nobody has picked up, and, on the VM's own tighter
+  numbers, less consequential than it looked even on the quiet laptop.
 - **When and how the load-test harness runs in the ongoing development process is deliberately
   undecided.** [ADR `load-test-harness`](adr/load-test-harness.md)'s own "Open question" section:
   nightly, manually-triggered, gating a PR on a `compare --threshold` regression, or some other
   cadence entirely is real future work this effort didn't answer, not an oversight — the harness is
   built and runnable by hand, and nothing wires it into CI, a pre-merge gate, or a schedule yet.
+- **`RunReport.box_state` records nothing on the disposable perf VM.** `logit-perf run`'s
+  best-effort governor/EPP/platform-profile/AC-power probe (`crates/logit-perf/src/result.rs`)
+  comes back an empty `{}` on every Azure guest, since that sysfs surface doesn't exist there —
+  correct behavior for what it checks, but it means the results JSON that's now this project's
+  primary provenance record for every recorded number captures nothing about the box beyond
+  `hostname`/`cpu_model`/`nproc`. Now that the VM is the reference box (`docs/adr/disposable-azure-
+  perf-vm.md`), the reproducibility story would be stronger if `BoxState` also recorded THP setting
+  (`/sys/kernel/mm/transparent_hugepage/enabled`), `net.core.rmem_max`/`rmem_default`
+  (`/proc/sys/net/core/`), and vCPU topology (`vCPUsPerCore` — from IMDS, or `nproc` alongside
+  `/proc/cpuinfo`'s core-id fields) — every one of which turned out to change a finding this effort
+  measured (THP flips the `read_batch` RSS story; `rmem_max` decides whether a receive buffer
+  clamps). `compare` would then have something to warn on for these too, the same way it already
+  does for a hostname/CPU-model mismatch. Not built here — flagged as a real code change
+  (`crates/logit-perf/src/result.rs`'s `BoxState`, plus a `compare.rs` warning), out of scope for a
+  docs-only rewrite.
 
 - **`shape`'s cumulative gauges are since process start, not windowed.**
   `logit.shape.distinct_keys`, `.distinct_keysets`, `.keyset_share.top1`/`.top5` and
