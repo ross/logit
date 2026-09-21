@@ -283,8 +283,10 @@ mod realloc_chain {
     }
 }
 
-/// `AttrMap`'s sorted positional `insert` against append-then-sort, at the widths
-/// `docs/design/data-shapes.md` measured.
+/// `AttrMap`'s sorted positional `insert` against its bulk build (and against the bare `Vec`
+/// mirror W2 used to estimate that build before it existed), at the widths
+/// `docs/design/data-shapes.md` measured. Both paths stay reachable on purpose: `insert_sym` is
+/// still what a component setting one key at a time uses.
 mod build_shape {
     use super::*;
 
@@ -328,8 +330,44 @@ mod build_shape {
         });
     }
 
-    /// Arm **P**'s build, mirrored locally (no production change lands in this PR): reserve
-    /// exactly, push in arrival order, sort once. `sort_unstable_by_key` on `Symbol` is the same
+    /// Arm **P** as it actually shipped: `AttrMap::extend_unsorted`, which reserves exactly once,
+    /// appends in arrival order, and sorts once. This is the path `json`/`logfmt`/`csv`/`regex`,
+    /// the native decoder and the OTLP decoder all take now, so it is the one to read against
+    /// [`sorted_insert`] -- [`append_then_sort`] below is the bare `Vec` mirror W2 used to
+    /// estimate it before it existed, kept because it prices the sort without the duplicate
+    /// filter or the merge with an existing map.
+    #[divan::bench(args = WIDTHS)]
+    fn bulk_build(bencher: Bencher, width: usize) {
+        let keys = keys(width);
+        bencher.bench_local(|| {
+            let mut map = AttrMap::new();
+            map.extend_unsorted(
+                black_box(&keys).iter().enumerate().map(|(i, k)| (*k, Value::I64(i as i64))),
+            );
+            map
+        });
+    }
+
+    /// The same build onto a map that already holds one attribute -- `json` merging onto
+    /// `tail_in`'s `log.file.path`, which is the normal case rather than the edge one. The extra
+    /// work over [`bulk_build`] is the backwards collision pass over the incoming run; the
+    /// reservation still covers the whole final width.
+    #[divan::bench(args = WIDTHS)]
+    fn bulk_build_onto_populated(bencher: Bencher, width: usize) {
+        let keys = keys(width);
+        let existing = logit_core::interner::intern("log.file.path");
+        bencher.bench_local(|| {
+            let mut map = AttrMap::new();
+            map.insert_sym(existing, Value::I64(-1));
+            map.extend_unsorted(
+                black_box(&keys).iter().enumerate().map(|(i, k)| (*k, Value::I64(i as i64))),
+            );
+            map
+        });
+    }
+
+    /// The bare `Vec` mirror of arm P, from W2 -- reserve exactly, push in arrival order, sort
+    /// once, with no `AttrMap` around it. `sort_unstable_by_key` on `Symbol` is the same
     /// comparison `insert_sym`'s binary search makes, done O(k log k) times over entries that
     /// never move more than once.
     #[divan::bench(args = WIDTHS)]
