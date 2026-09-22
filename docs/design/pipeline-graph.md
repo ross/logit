@@ -122,6 +122,12 @@ pub enum ComponentKind {
     // opt-in, operator-placed rewrite, never a decoder or sink behavior
     // (docs/adr/flatten-transform.md). `attributes`/`resource` are each `all`/`none`/a named list.
     Flatten { attributes: FlattenFields, resource: FlattenFields, arrays: FlattenArrays },
+    // Normalizes a web server's access line, logged under raw OTel semconv names, into its
+    // conformant form plus a bounded derived set (user_agent.class, http.route, span.name, ...);
+    // placed between `json` and `trace_context` (docs/adr/http-access-normalization.md).
+    HttpAccess { routes: Vec<HttpRouteRule>, route_other: Option<String>,
+                 user_agent_rules: Vec<UserAgentRule>, max_length: BTreeMap<String, usize>,
+                 redact_query: Vec<String>, forwarded: Option<ForwardedConfig> },
     // Splits each row of a delimited line into positional attributes named by a configured
     // `columns` list (docs/adr/csv-positional-columns.md).
     Csv { columns: Vec<String>, delimiter: char },
@@ -154,7 +160,7 @@ UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well afte
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`,
-`shape`, `flatten`, and any future native transform — take no suffix; there's only ever one direction
+`shape`, `flatten`, `http_access`, and any future native transform — take no suffix; there's only ever one direction
 for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
@@ -200,7 +206,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -737,6 +743,20 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     legal — the former is the useful default, the latter names a literal attribute exactly as
     rule 54's `keep_values` fields already may
     ([ADR `flatten-transform`](../adr/flatten-transform.md)).
+60. `http_access`-specific validation
+    ([ADR `http-access-normalization`](../adr/http-access-normalization.md)). Every
+    `routes[].match` and `user_agent_rules[].match` must compile as a regex — rule 31's reasoning.
+    An empty `match`, `route`, `class`, `route_other`, or `redact_query` entry is rejected — rules
+    19/20/54's reasoning; an empty `match` would match every path and hide every rule after it.
+    Each `routes` entry must be exactly `builtin`, or `match` together with `route`: the error
+    names which half is missing or which extra key is present, which is why an entry is one flat
+    struct rather than an untagged enum (whose failure names no key). A repeated `builtin:` set is
+    rejected — the second can never match anything the first didn't. A `max_length` key must name
+    a field in `logit_config::CAPPED_FIELDS`, and the error lists them; a limit of `0` is rejected
+    — rules 9/15/18/58's impossible-bound shape. `forwarded: {trust: false}` is rejected in favour
+    of omitting the block, so "don't trust `X-Forwarded-For`" has one spelling. There is
+    deliberately **no** "nothing configured" clause: a bare `type: http_access` still coerces,
+    caps, derives, and classifies with the built-in tables.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

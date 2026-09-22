@@ -55,13 +55,13 @@ use logit_transforms::{
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
     Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
-    HasSignal as HasSignalTransform, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
-    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
-    Kv as KvTransform, KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform,
-    MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
-    Remove as RemoveTransform, Route as RouteTransform, Scale as ScaleTransform,
-    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
-    TraceContext as TraceContextTransform,
+    HasSignal as HasSignalTransform, HttpAccess as HttpAccessTransform, HttpAccessConfig,
+    InvalidUtf8 as TransformInvalidUtf8, JsonParser, Keep as KeepTransform,
+    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
+    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
+    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
+    Route as RouteTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
+    Shape as ShapeTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -709,6 +709,27 @@ fn build_spec(
                 to_flatten_arrays(*arrays),
             )
             .with_telemetry(telemetry.clone()),
+        )),
+        // The `?` is unreachable in practice: rule 60 already compiled every configured pattern,
+        // and the built-in ones are constants `http_access`'s own tests compile.
+        HttpAccess {
+            routes,
+            route_other,
+            user_agent_rules,
+            max_length,
+            redact_query,
+            forwarded,
+        } => NodeSpec::Transform(Box::new(
+            HttpAccessTransform::new(to_http_access_config(
+                routes,
+                route_other,
+                user_agent_rules,
+                max_length,
+                redact_query,
+                *forwarded,
+            ))?
+            .with_telemetry(telemetry.clone())
+            .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
         // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
         // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
@@ -1557,6 +1578,58 @@ fn to_flatten_fields(fields: &logit_config::FlattenFields) -> TransformFields {
             TransformFields::None
         }
         logit_config::FlattenFields::Named(names) => TransformFields::Named(names.clone()),
+    }
+}
+
+/// Converts `ComponentKind::HttpAccess`'s fields into the `logit_transforms::HttpAccessConfig`
+/// `HttpAccess::new` takes -- `logit-transforms` doesn't depend on `logit-config`
+/// (`docs/design/pipeline-graph.md`'s crate layout), same reasoning as [`to_allow_lists`]. This is
+/// also where `max_length` is *resolved*: `logit_config::CAPPED_FIELDS`' defaults with the
+/// config's overrides applied, so the transform receives one complete cap list and never needs to
+/// know the defaults itself (`docs/adr/http-access-normalization.md`).
+fn to_http_access_config(
+    routes: &[logit_config::HttpRouteRule],
+    route_other: &Option<String>,
+    user_agent_rules: &[logit_config::UserAgentRule],
+    max_length: &std::collections::BTreeMap<String, usize>,
+    redact_query: &[String],
+    forwarded: Option<logit_config::ForwardedConfig>,
+) -> HttpAccessConfig {
+    let routes = routes
+        .iter()
+        .map(|rule| match (rule.builtin, &rule.pattern, &rule.route) {
+            (Some(set), _, _) => logit_transforms::RouteRule::Builtin(match set {
+                logit_config::HttpRouteSet::Assets => logit_transforms::RouteSet::Assets,
+                logit_config::HttpRouteSet::WellKnown => logit_transforms::RouteSet::WellKnown,
+                logit_config::HttpRouteSet::Probes => logit_transforms::RouteSet::Probes,
+            }),
+            // Rule 60 guarantees every non-builtin rule carries both halves.
+            (None, pattern, route) => logit_transforms::RouteRule::Pattern {
+                pattern: pattern.clone().unwrap_or_default(),
+                route: route.clone().unwrap_or_default(),
+            },
+        })
+        .collect();
+    let user_agent_rules = user_agent_rules
+        .iter()
+        .map(|rule| logit_transforms::UaRule {
+            pattern: rule.pattern.clone(),
+            class: rule.class.clone(),
+        })
+        .collect();
+    let max_length = logit_config::CAPPED_FIELDS
+        .iter()
+        .map(|(field, default)| {
+            (field.to_string(), max_length.get(*field).copied().unwrap_or(*default))
+        })
+        .collect();
+    HttpAccessConfig {
+        routes,
+        route_other: route_other.clone(),
+        user_agent_rules,
+        max_length,
+        redact_query: redact_query.to_vec(),
+        trust_forwarded: forwarded.is_some_and(|f| f.trust),
     }
 }
 
@@ -3911,6 +3984,78 @@ mod tests {
             Some(&logit_core::Value::str("bar")),
             "attributes: all (the default) should have expanded the nested attribute"
         );
+    }
+
+    /// Runs the built transform against a raw access line rather than only checking the
+    /// `NodeSpec` variant -- proving the route rules, `route_other`, the `max_length` override,
+    /// and `forwarded` all reach `HttpAccess::new` through `to_http_access_config`, and that the
+    /// defaults from `logit_config::CAPPED_FIELDS` apply to every field not overridden.
+    #[test]
+    fn build_spec_builds_a_working_http_access_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::HttpAccess {
+                routes: vec![
+                    logit_config::HttpRouteRule {
+                        builtin: Some(logit_config::HttpRouteSet::Assets),
+                        ..Default::default()
+                    },
+                    logit_config::HttpRouteRule {
+                        builtin: None,
+                        pattern: Some("^/api/".to_string()),
+                        route: Some("/api".to_string()),
+                    },
+                ],
+                route_other: Some("/{other}".to_string()),
+                user_agent_rules: vec![],
+                max_length: std::collections::BTreeMap::from([("user.name".to_string(), 3)]),
+                redact_query: vec![],
+                forwarded: Some(logit_config::ForwardedConfig { trust: true }),
+            },
+        };
+        let NodeSpec::Transform(mut transform) =
+            build_spec("http", &component, Path::new(""), None).unwrap().0
+        else {
+            panic!("expected a Transform node");
+        };
+
+        let mut attrs = logit_core::AttrMap::new();
+        attrs.insert("http.request.line", logit_core::Value::str("GET /api/x HTTP/1.1"));
+        attrs.insert("http.response.status_code", logit_core::Value::str("503"));
+        attrs.insert("user.name", logit_core::Value::str("alexandra"));
+        attrs.insert("user_agent.original", logit_core::Value::str("x".repeat(300)));
+        attrs.insert("http-request-header-x-forwarded-for", logit_core::Value::str("192.0.2.1"));
+        let mut event = logit_core::Event::log(
+            0,
+            attrs,
+            logit_core::LogRecord {
+                message: logit_core::Value::str("msg"),
+                severity: None,
+                body_format: logit_core::BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+        let resource = Arc::new(logit_core::Resource::default());
+        assert!(transform.process(&resource, &mut event), "should forward the event");
+        let get = |key: &str| event.attributes.get(key).cloned();
+        assert_eq!(get("http.route"), Some(logit_core::Value::str("/api")));
+        assert_eq!(get("span.name"), Some(logit_core::Value::str("GET /api")));
+        assert_eq!(get("http.response.status_code"), Some(logit_core::Value::I64(503)));
+        assert_eq!(get("span.status"), Some(logit_core::Value::str("error")));
+        assert_eq!(get("user.name"), Some(logit_core::Value::str("ale")), "the override");
+        assert_eq!(
+            get("user_agent.original").and_then(|v| v.as_str().map(str::len)),
+            Some(256),
+            "the CAPPED_FIELDS default for every field not overridden"
+        );
+        assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "trusted");
     }
 
     /// `shape` also proves the `tap` tag's plumbing end to end: `build_spec` is handed the

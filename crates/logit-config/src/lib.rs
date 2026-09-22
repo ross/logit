@@ -193,6 +193,103 @@ pub struct ValueAllowList {
     pub other: Option<SetValue>,
 }
 
+/// One entry of `ComponentKind::HttpAccess`'s `routes` list: **exactly** a `builtin` set, or a
+/// `match` regex together with the literal `route` it assigns. One flat struct with three optional
+/// fields rather than an untagged enum, deliberately: serde's untagged failure is "did not match
+/// any variant" with no pointer at the offending key, whereas
+/// `crates/logit-pipeline/src/graph.rs` rule 60 can name exactly which half is missing or which
+/// extra key is present. The `match` pattern is tested (`is_match`, unanchored unless the pattern
+/// anchors itself) against the capped `url.path`; `route` is written verbatim -- never a capture
+/// group, so every `http.route` value comes from config. See
+/// `docs/adr/http-access-normalization.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRouteRule {
+    /// A named built-in route set, expanded in place at this position in the list.
+    #[serde(default)]
+    pub builtin: Option<HttpRouteSet>,
+    /// A regex over the capped `url.path`, compiled at validate time (rule 60).
+    #[serde(default, rename = "match")]
+    pub pattern: Option<String>,
+    /// The literal `http.route` value a matching `match` assigns.
+    #[serde(default)]
+    pub route: Option<String>,
+}
+
+/// The three built-in route sets an [`HttpRouteRule`] can name, each mapping to one fixed route
+/// value -- `/{asset}`, `/{well-known}`, `/{probe}`. The member patterns live in
+/// `logit-transforms`' `http_access` module; the sets and their route values are fixed by
+/// `docs/plans/http-access-normalization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpRouteSet {
+    /// Static files by extension (`.css`, `.js`, `.png`, `.woff2`, ...) -- `/{asset}`. No
+    /// `json`/`xml`/`txt`/`csv`: those are routinely API responses.
+    Assets,
+    /// `/.well-known/*`, `robots.txt`, `favicon.ico`, sitemaps and their kin --
+    /// `/{well-known}`.
+    WellKnown,
+    /// Health, readiness, and status endpoints (`/healthz`, `/readyz`, `/metrics`,
+    /// `/nginx_status`, ...) -- `/{probe}`.
+    Probes,
+}
+
+/// One entry of `ComponentKind::HttpAccess`'s `user_agent_rules`: a regex over the *uncapped*
+/// `user_agent.original` (the identifying token of a spoofed UA is often at its tail) and the
+/// literal `user_agent.class` it assigns. Tried in order, before the built-in table. A `class` of
+/// `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, exactly as the built-in
+/// classes do. Compiled at validate time by `crates/logit-pipeline/src/graph.rs` rule 60, which
+/// also rejects an empty `match` or `class`. See `docs/adr/http-access-normalization.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UserAgentRule {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub class: String,
+}
+
+/// `ComponentKind::HttpAccess`'s `forwarded` block. `trust: true` (the default once the block is
+/// present at all) overwrites `client.address` with the first hop of
+/// `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy list or hop
+/// count (`docs/known-gaps.md`). `trust: false` is rejected by
+/// `crates/logit-pipeline/src/graph.rs` rule 60 -- omit the block instead, so there is one
+/// spelling of "off". See `docs/adr/http-access-normalization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedConfig {
+    #[serde(default = "default_true")]
+    pub trust: bool,
+}
+
+/// [`ForwardedConfig::trust`]'s default.
+fn default_true() -> bool {
+    true
+}
+
+/// Every field `http_access` caps, with its default character limit -- the one source of truth
+/// `crates/logit-pipeline/src/graph.rs` rule 60 (which rejects a `max_length` key not listed
+/// here) and the transform (whose resolved cap list `logit-cli` builds from this plus the
+/// config's overrides) both read, so the two cannot disagree. Characters, not bytes: a cap cuts at
+/// a char boundary, so a capped `Value::Str` stays valid UTF-8. See
+/// `docs/adr/http-access-normalization.md`.
+pub const CAPPED_FIELDS: &[(&str, usize)] = &[
+    ("url.path", 256),
+    ("url.query", 256),
+    ("user_agent.original", 256),
+    ("http.request.header.referer", 256),
+    ("server.address", 253),
+    ("client.address", 128),
+    ("network.peer.address", 128),
+    ("http.request.header.x-forwarded-for", 128),
+    ("upstream.address", 128),
+    ("user.name", 128),
+    ("http.request.method_original", 32),
+    ("cache.status", 32),
+    ("url.scheme", 16),
+    ("network.protocol.version", 8),
+    ("http.termination_state", 8),
+];
+
 /// Which metric kind a [`GenerateMetric`] produces. Named after the three
 /// `logit_core::MetricKind`s a load-test scenario actually wants to exercise, not the full set:
 /// `Sum` for a counter, `Gauge` for a level, and `Distribution` for the sketch-merging path (as
@@ -1363,6 +1460,58 @@ pub enum ComponentKind {
         /// than structure. Under `skip` a *top-level* array attribute is left entirely untouched.
         #[serde(default)]
         arrays: FlattenArrays,
+    },
+    /// Normalizes a web server's access line, logged under raw OTel semconv attribute names, into
+    /// its conformant form -- composites (`http.request.line`, `url.original`) decomposed into
+    /// whichever atomic fields are absent, numerics coerced to integers (`"000"` becomes `0`),
+    /// durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`,
+    /// an unknown method rewritten to `_OTHER` with the raw
+    /// value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version,
+    /// semconv's sensitive `url.query` values redacted, every free-text field capped and
+    /// control-byte-cleaned -- plus a small, bounded derived set: `user_agent.class`,
+    /// `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror
+    /// `trace_context` resolves a span from. Placed between `json` and `trace_context`. Also
+    /// accepts every canonical name spelled with each `.` as `-` (`url-path`,
+    /// `http-request-header-x-forwarded-for`) for an emitter whose key grammar forbids dots
+    /// (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.
+    ///
+    /// Best-effort per field, never all-or-nothing and never a dropped event: a value that
+    /// doesn't parse is left exactly as it arrived and counted, while every other field is still
+    /// normalized. An absent field produces nothing -- no default `url.scheme`, no invented
+    /// route. Every field is optional: a bare `type: http_access` is meaningful (the built-in
+    /// user-agent table and the default caps still apply), so unlike `keep_values`/`flatten`
+    /// there is no "nothing configured" rejection. Validated by
+    /// `crates/logit-pipeline/src/graph.rs` rule 60. See `docs/adr/http-access-normalization.md`.
+    HttpAccess {
+        /// Ordered rules classifying the (capped) `url.path` into `http.route`, first match wins
+        /// -- each either a named built-in set or a regex paired with a *literal* route value,
+        /// never a capture, so the route set stays bounded by construction. See
+        /// [`HttpRouteRule`].
+        #[serde(default)]
+        routes: Vec<HttpRouteRule>,
+        /// The `http.route` written when no rule matches. Absent (the default) writes no route
+        /// at all, and `span.name` is the method alone.
+        #[serde(default)]
+        route_other: Option<String>,
+        /// Extra user-agent classes, tried in order *before* the built-in
+        /// scanner/tool/crawler/browser table -- the built-in table can be pre-empted, never
+        /// disabled. See [`UserAgentRule`].
+        #[serde(default)]
+        user_agent_rules: Vec<UserAgentRule>,
+        /// Per-field character limits overriding [`CAPPED_FIELDS`]' defaults. A key must name a
+        /// field in that list -- rule 60 rejects anything else, and a limit of `0`.
+        #[serde(default)]
+        max_length: std::collections::BTreeMap<String, usize>,
+        /// Extra `url.query` keys whose values are replaced with `REDACTED`, beyond semconv's
+        /// seven (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`, `X-Amz-Signature`,
+        /// `X-Amz-Credential`, `X-Amz-Security-Token`). Matched ASCII-case-insensitively.
+        #[serde(default)]
+        redact_query: Vec<String>,
+        /// Present only to opt in to overwriting `client.address` from the first hop of
+        /// `http.request.header.x-forwarded-for` -- off by default, since the header is
+        /// client-supplied. See [`ForwardedConfig`].
+        #[serde(default)]
+        forwarded: Option<ForwardedConfig>,
     },
     // `filter`/`rename`/`sample`/`throttle`/`dedup` used to live here too -- retired, not merely
     // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
@@ -4166,6 +4315,157 @@ mod tests {
                 assert_eq!(arrays, FlattenArrays::Skip);
             }
             other => panic!("expected Flatten, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_access_component_deserializes_with_every_field_defaulted() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "http_access", "sources": ["in"]}"#).unwrap();
+        match component.kind {
+            ComponentKind::HttpAccess {
+                routes,
+                route_other,
+                user_agent_rules,
+                max_length,
+                redact_query,
+                forwarded,
+            } => {
+                assert!(routes.is_empty());
+                assert_eq!(route_other, None);
+                assert!(user_agent_rules.is_empty());
+                assert!(max_length.is_empty());
+                assert!(redact_query.is_empty());
+                assert_eq!(forwarded, None);
+            }
+            other => panic!("expected HttpAccess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_access_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{
+                "type": "http_access",
+                "sources": ["in"],
+                "routes": [
+                    {"builtin": "probes"},
+                    {"builtin": "well_known"},
+                    {"match": "^/api/v1/users/\\d+$", "route": "/api/v1/users/{id}"}
+                ],
+                "route_other": "/{other}",
+                "user_agent_rules": [{"match": "MyMonitor/", "class": "tool"}],
+                "max_length": {"url.path": 512},
+                "redact_query": ["token"],
+                "forwarded": {}
+            }"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::HttpAccess {
+                routes,
+                route_other,
+                user_agent_rules,
+                max_length,
+                redact_query,
+                forwarded,
+            } => {
+                assert_eq!(
+                    routes,
+                    vec![
+                        HttpRouteRule {
+                            builtin: Some(HttpRouteSet::Probes),
+                            ..HttpRouteRule::default()
+                        },
+                        HttpRouteRule {
+                            builtin: Some(HttpRouteSet::WellKnown),
+                            ..HttpRouteRule::default()
+                        },
+                        HttpRouteRule {
+                            builtin: None,
+                            pattern: Some(r"^/api/v1/users/\d+$".to_string()),
+                            route: Some("/api/v1/users/{id}".to_string()),
+                        },
+                    ]
+                );
+                assert_eq!(route_other.as_deref(), Some("/{other}"));
+                assert_eq!(
+                    user_agent_rules,
+                    vec![UserAgentRule {
+                        pattern: "MyMonitor/".to_string(),
+                        class: "tool".to_string()
+                    }]
+                );
+                assert_eq!(max_length.get("url.path"), Some(&512));
+                assert_eq!(redact_query, vec!["token".to_string()]);
+                assert_eq!(
+                    forwarded,
+                    Some(ForwardedConfig { trust: true }),
+                    "an empty forwarded block defaults trust to true"
+                );
+            }
+            other => panic!("expected HttpAccess, got {other:?}"),
+        }
+    }
+
+    /// Both halves of a route rule parse into the one flat struct -- deciding which shape it is
+    /// (and rejecting a mix) is graph rule 60's job, not serde's, so the error can name the key.
+    #[test]
+    fn http_route_rule_accepts_a_mixed_shape_for_rule_60_to_reject() {
+        let rule: HttpRouteRule =
+            serde_json::from_str(r#"{"builtin": "assets", "match": "x"}"#).unwrap();
+        assert_eq!(rule.builtin, Some(HttpRouteSet::Assets));
+        assert_eq!(rule.pattern.as_deref(), Some("x"));
+        assert_eq!(rule.route, None);
+    }
+
+    #[test]
+    fn http_route_rule_rejects_an_unknown_key() {
+        let err = serde_json::from_str::<HttpRouteRule>(r#"{"matches": "x"}"#).unwrap_err();
+        assert!(err.to_string().contains("matches"), "{err}");
+    }
+
+    #[test]
+    fn http_route_set_uses_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<HttpRouteSet>(r#""well_known""#).unwrap(),
+            HttpRouteSet::WellKnown
+        );
+        assert_eq!(serde_json::to_string(&HttpRouteSet::Assets).unwrap(), r#""assets""#);
+        assert!(serde_json::from_str::<HttpRouteSet>(r#""WellKnown""#).is_err());
+    }
+
+    #[test]
+    fn user_agent_rule_requires_both_fields_and_rejects_unknown_keys() {
+        assert!(serde_json::from_str::<UserAgentRule>(r#"{"match": "x"}"#).is_err());
+        assert!(serde_json::from_str::<UserAgentRule>(r#"{"match": "x", "class": "c", "k": 1}"#)
+            .is_err());
+    }
+
+    #[test]
+    fn http_access_round_trips_through_serde() {
+        let kind = ComponentKind::HttpAccess {
+            routes: vec![HttpRouteRule {
+                builtin: Some(HttpRouteSet::Assets),
+                ..HttpRouteRule::default()
+            }],
+            route_other: Some("/{other}".to_string()),
+            user_agent_rules: vec![],
+            max_length: std::collections::BTreeMap::from([("user.name".to_string(), 16)]),
+            redact_query: vec![],
+            forwarded: Some(ForwardedConfig { trust: true }),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: ComponentKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn capped_fields_are_unique_and_nonzero() {
+        let mut seen = std::collections::HashSet::new();
+        for (field, cap) in CAPPED_FIELDS {
+            assert!(seen.insert(*field), "{field} listed twice");
+            assert!(*cap > 0, "{field} has a zero default cap");
         }
     }
 
