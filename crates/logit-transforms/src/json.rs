@@ -466,13 +466,16 @@ mod tests {
         event
     }
 
-    /// Whether a `logit.component.diagnostics{key=<key>}` point was mirrored into `registry` --
-    /// `Diagnostics::warn_throttled` counts every occurrence, throttled or not.
-    fn diagnostic_fired(registry: &Registry, key: &str) -> bool {
+    /// The `key` of every `logit.component.diagnostics` point mirrored into `registry` --
+    /// `Diagnostics::warn_throttled` counts every occurrence, throttled or not. `Registry::drain`
+    /// *takes* the buffered points, so a test drains exactly once and asserts both what fired
+    /// and what didn't against this one result; a second drain would always see nothing.
+    fn fired_diagnostics(registry: &Registry) -> Vec<String> {
         registry
             .drain(0)
             .iter()
-            .any(|e| e.attributes.get("key").and_then(|v| v.as_str()) == Some(key))
+            .filter_map(|e| e.attributes.get("key").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect()
     }
 
     fn default_resource() -> Arc<Resource> {
@@ -602,7 +605,9 @@ mod tests {
         let mut event = bytes_log_event(b"{\"ua\":\"caf\xe9 client\",\"status\":200}");
         assert!(parser.process(&resource, &mut event), "always forwards");
         assert!(event.attributes.is_empty(), "nothing parsed under Reject");
-        assert!(diagnostic_fired(&registry, "parse_failure"));
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
     }
 
     #[test]
@@ -622,8 +627,9 @@ mod tests {
             message_of(&event),
             &Value::Bytes(Bytes::from_static(b"{\"ua\":\"caf\xe9 client\",\"status\":200}"))
         );
-        assert!(diagnostic_fired(&registry, "invalid_utf8"));
-        assert!(!diagnostic_fired(&registry, "parse_failure"), "the retry succeeded");
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "parse_failure"), "the retry succeeded: {fired:?}");
     }
 
     /// The `Replace` retry is gated on the buffer actually being invalid UTF-8: a line that is
@@ -639,8 +645,9 @@ mod tests {
         let mut event = log_event(r#"{"a":}"#);
         assert!(parser.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
-        assert!(diagnostic_fired(&registry, "parse_failure"));
-        assert!(!diagnostic_fired(&registry, "invalid_utf8"));
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
     }
 
     /// Invalid UTF-8 *and* malformed JSON: the retry fails too, and the line reports the
@@ -656,8 +663,9 @@ mod tests {
         let mut event = bytes_log_event(b"{\"ua\":\"caf\xe9\",");
         assert!(parser.process(&resource, &mut event));
         assert!(event.attributes.is_empty());
-        assert!(diagnostic_fired(&registry, "parse_failure"));
-        assert!(!diagnostic_fired(&registry, "invalid_utf8"));
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
     }
 
     #[test]
