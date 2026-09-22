@@ -193,8 +193,8 @@ impl Watcher {
 }
 
 /// One operator-facing line for a failed `inotify_add_watch`, shared by the directory
-/// (`Tailer::reconcile_watches`) and file (`Tailer::open_tracked`) call sites so both read the
-/// same way under the one `watch_error` diagnostic key.
+/// (`Tailer::reconcile_watches`, diagnosed as `watch_dir_error` since it recurs every scan) and
+/// file (`Tailer::open_tracked`, the one-shot `watch_error`) call sites so both read the same way.
 ///
 /// `ENOSPC` gets a pointer at the host setting behind it, because the errno alone ("No space left
 /// on device") reads as a full disk and is not: `inotify_new_watch()` returns it from

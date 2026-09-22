@@ -995,17 +995,20 @@ work for every log line written anywhere on the host, selected or not — see [A
 
 - `logit.input.files.open` (gauge) — how many files this listener currently has open. Zero when a
   `docker_in` config's `containers:`/`discover:` selection matches nothing, or a `tail_in` config's
-  `paths:` glob matches no files yet — both silent by design (a directory that doesn't exist yet is
-  the ordinary "not there yet" case, retried next cycle), so this is the number to alert on if
-  "nothing is flowing" needs to be distinguished from "nothing to flow yet."
+  `paths:` glob matches no files yet — neither is an error (a directory that doesn't exist yet is
+  the ordinary "not there yet" case, retried next cycle; under `inotify`/`auto` the retry also
+  re-arms the directory watch and, while the directory is missing, counts a throttled
+  `watch_dir_error` diagnostic per scan), so this is the number to alert on if "nothing is
+  flowing" needs to be distinguished from "nothing to flow yet."
 - `logit.input.watch.wakes{source="inotify"|"poll"}` (count) — which wake source actually fired.
   This is the health signal for the low-latency path: `{source="inotify"}` flatlining while
   `{source="poll"}` carries on at `1/poll_interval` means discovery has silently reverted to
   polling — a watch that couldn't be registered, or the wake source itself having failed. Under
   `watch: poll` only the `poll` series ever increments, so alert on the `inotify` series going to
   zero only where you configured `inotify`/`auto`. Pair it with
-  `logit.component.diagnostics{key="watch_error"}`, which is incremented (and logged, throttled)
-  at the point of failure with the errno.
+  `logit.component.diagnostics{key="watch_error"}` (a file watch, or the wake source, failing —
+  once) and `{key="watch_dir_error"}` (a directory watch failing — once per scan until it
+  succeeds), each incremented (and logged, throttled) at the point of failure with the errno.
 - `logit.input.watch.watches` (gauge) — the size of the watch set this listener maintains: the
   watched directory, plus one entry per file currently open. Under `watch: poll` this counts the
   same set with zero real `inotify` descriptors behind it (`Watcher::watch_dir`/`watch_file` are

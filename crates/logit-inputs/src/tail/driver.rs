@@ -379,8 +379,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// the same `wd` (see `InotifyWatcher::watch_dir`).
     ///
     /// `watched_dirs` therefore records what is actually *armed*, not what was wanted: a
-    /// directory whose `watch_dir` failed is diagnosed (`watch_error`, carrying the errno), left
-    /// out of the set, and tried again on the next scan.
+    /// directory whose `watch_dir` failed is diagnosed (`watch_dir_error`, carrying the errno --
+    /// its own key, since it recurs every scan; see the call site), left out of the set, and
+    /// tried again on the next scan.
     fn reconcile_watches(&mut self, watcher: &mut super::watch::Watcher) {
         let desired: HashSet<PathBuf> =
             self.patterns.iter().map(|p| p.dir().to_path_buf()).collect();
@@ -394,8 +395,15 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     armed.insert(dir);
                 }
                 Err(err) => {
+                    // Its own throttle key, not `watch_error`: this fires on *every* scan for as
+                    // long as the directory is missing (a `paths:` whose directory does not exist
+                    // yet is ordinary, and lasts as long as it lasts), and `warn_throttled` logs
+                    // a key only at powers of two of its running count. Sharing the key would
+                    // let a missing directory push the count into the tens of thousands per day
+                    // and silence the one-shot `watch_error`s -- a per-file `ENOSPC`, the wake
+                    // source dying -- that an operator actually needs to see logged.
                     self.diag.warn_throttled(
-                        "watch_error",
+                        "watch_dir_error",
                         super::watch::watch_error_message(&dir, &err),
                     );
                 }
@@ -2431,7 +2439,7 @@ mod tests {
         );
         assert!(tailer.watched_dirs.is_empty(), "{:?}", tailer.watched_dirs);
         assert!(
-            diagnosed(&registry, "watch_error"),
+            diagnosed(&registry, "watch_dir_error"),
             "a directory that could not be watched must say so, not fail silently"
         );
 
