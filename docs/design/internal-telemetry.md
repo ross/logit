@@ -972,8 +972,11 @@ Worked examples, one per shipped component:
   `forwarded`), `.truncated{field}` (a value cut to its `max_length`), `.cleaned{field}` (a
   control byte replaced by `_`), `.invalid{field}` (present but unparseable, left as it arrived),
   `.redacted` (untagged; one per sensitive `url.query` value replaced), and
-  `.routed{outcome="rule"|"builtin"|"other"|"none"}` (once per event with a `url.path` — the
-  outcome, never the route value, which is operator-declared and unbounded in number). `field` is
+  `.routed{outcome="rule"|"builtin"|"other"|"none"|"kept"}` (once per event with a `url.path`,
+  or with a producer-sent `http.route`, which is `kept` — honoured, never re-matched; the tag is
+  the outcome, never the route value, which is operator-declared and unbounded in number).
+  `.derived{field}` fires only when `http_access` actually wrote the field: every derived
+  attribute is fill-only, so one the producer already sent is honoured and not counted. `field` is
   always the canonical dotted name. Three throttled `Diagnostics` keys, for genuine producer
   malformation only: `bad_request_line` (`http.request.line` isn't `METHOD TARGET PROTOCOL`),
   `bad_status`, and `bad_duration`. An absent field, an unknown method, an unclassifiable user

@@ -10,7 +10,7 @@ updated: 2026-09-22
 [ADR `http-access-normalization`](../adr/http-access-normalization.md) decides the shape: a new
 `http_access` transform that takes the raw, unnormalized attributes a web server logged under
 OTel semconv names and rewrites them, once and natively, into their conformant form plus a
-bounded set of derived attributes — replacing the per-server `map`/`log-format` logic every
+small set of derived attributes, filled in only where the producer left them out — replacing the per-server `map`/`log-format` logic every
 operator otherwise writes by hand. This plan is the build-out: what lands in which order, in
 which files, and how each piece is verified. Read the ADR first; this document repeats its
 consequences, not its reasoning.
@@ -27,7 +27,8 @@ and targeting its parent's branch, brought up to date with `git merge origin/mai
 | Placement | `json -> http_access -> trace_context`; the component only *emits* `span.name`/`span.status`/`span.duration_s`, `trace_context` lifts; never mints a trace id |
 | Failure model | Best-effort per field; `process` always returns `true`; a value that doesn't parse is left in place and counted `invalid{field}` (plus a throttled diagnostic for status/duration only) |
 | Derived set (v1) | `user_agent.class` (+ `user_agent.synthetic.type: bot`), `http.route`, `error.type`, `span.name`, `span.status` (never `ok`), `span.duration_s` mirror, `http.request.method_original`, and `client.address` from XFF under `forwarded: {trust: true}` |
-| Bounded outputs | Every `http.route`/`user_agent.class` value comes from config or the built-in table — never a capture |
+| Fill-only derivation | Every derived attribute (`http.route`, `span.name`, `span.status`, `error.type`, `user_agent.class`, `user_agent.synthetic.type`, the `span.duration_s` mirror) is written only when absent — a producer-sent value is honoured, never overridden, and there is no `overwrite:` option. The one exception is `forwarded: {trust: true}`, an explicit opt-in to *replace* `client.address`. Normalizing a value the producer did send (coercion, units, method/version, caps, cleaning, redaction) still applies |
+| Bounded outputs | Every `http.route`/`user_agent.class` value *this component writes* comes from config or the built-in table — never a capture; a producer's own values are the producer's, bounded by `keep_values` if needed |
 | Metrics | Not emitted; the doc ships the `kv_metrics` + `keep` block |
 | Caps | Per-field character limits from `CAPPED_FIELDS` (in `logit-config`), overridable via `max_length:`; control bytes in the capped prefix become `_` |
 | `json` | Gains `invalid_utf8: reject \| replace` (default `reject`); `replace` retries a failed parse on a `from_utf8_lossy` copy, failure path only |
@@ -175,19 +176,26 @@ own tests:
    on the capped prefix replace any byte `< 0x20` or `== 0x7F` with `_` (length-preserving, so
    `Value::Str`'s UTF-8 invariant is kept for free — `keep_values::lower`'s reasoning), allocating
    only when a byte actually changed; count `cleaned{field}`.
-8. **Classify.** `user_agent.class` on the *uncapped* value (the identifying token is often at the
-   tail of a spoofed UA): absent → nothing written; present but empty (`""`/`"-"`) → `none`;
-   else first matching rule, else `other`; `crawler`/`scanner` also write
-   `user_agent.synthetic.type = bot`. `http.route` on the *capped* `url.path`: first matching rule
-   (config rules and built-ins in config order), else `route_other`, else nothing; counted
+8. **Classify** — fill-only: a `user_agent.class` or `http.route` already present is honoured and
+   nothing is derived for it. `user_agent.class` on the *uncapped* value (the identifying token is
+   often at the tail of a spoofed UA): absent → nothing written; present but empty (`""`/`"-"`) →
+   `none`; else first matching rule, else `other`; `crawler`/`scanner` also write
+   `user_agent.synthetic.type = bot` (if absent, and only alongside a class this step wrote).
+   `http.route` on the *capped* `url.path`: a producer-sent route is kept and no rule is tried,
+   counted `routed{outcome=kept}`; otherwise first matching rule (config rules and built-ins in
+   config order), else `route_other`, else nothing; counted
    `routed{outcome=rule|builtin|other|none}` once per event that has a path.
-9. **Derive.** `error.type` = the status as a decimal string, 5xx only. `span.status` = `error`
-   for 5xx or 0, else `unset`. `span.name` from the lazily-filled table: `{M} {route}` or `{M}`,
-   `M` = `HTTP` when the method is `_OTHER`. `span.duration_s` = `http.request.duration_s` unless
-   a `span.duration*` is present, or both a `span.start*` and a `span.end*` are — a lone end
-   (nginx) and a lone start (HAProxy) both get the mirror. Under `trust_forwarded`, when
-   `http.request.header.x-forwarded-for` is present and non-empty, `client.address` = its first
-   comma-separated hop, ASCII-trimmed, `Bytes::slice`. Each counted `derived{field}`.
+9. **Derive** — fill-only: each attribute below is written only when absent. `error.type` = the
+   status as a decimal string, 5xx only. `span.status` = `error` for 5xx or 0, else `unset` (a
+   producer's own `ok` stays `ok`, even on a 5xx). `span.name` from the lazily-filled table:
+   `{M} {route}` or `{M}`, `M` = `HTTP` when the method is `_OTHER`; for a kept producer route,
+   `{M} {route}` is formatted per event (the one producer-route allocation). `span.duration_s` =
+   `http.request.duration_s` unless a `span.duration*` is present, or both a `span.start*` and a
+   `span.end*` are — a lone end (nginx) and a lone start (HAProxy) both get the mirror. Under
+   `trust_forwarded`, when `http.request.header.x-forwarded-for` is present and non-empty,
+   `client.address` = its first comma-separated hop, ASCII-trimmed, `Bytes::slice` — the one
+   deliberate *replacement*, since a server always logs a peer address. Each counted
+   `derived{field}` only when this component actually wrote it.
 
 Never touched: `traceparent`, `trace.*`, `span.id`, `span.parent_id`, `span.kind`,
 `span.start*`, `span.end*`, `event.log`, `event.metrics`, `event.span`, `event.timestamp`, the

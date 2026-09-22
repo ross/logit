@@ -1,6 +1,6 @@
 //! `http_access`: normalizes a web server's access line -- logged under raw OTel semconv attribute
-//! names, the standard name with the untouched value -- into its conformant form, plus a small,
-//! bounded set of derived attributes. See `docs/adr/http-access-normalization.md` for why the
+//! names, the standard name with the untouched value -- into its conformant form, plus a small
+//! set of derived attributes it fills in wherever the producer left them out. See `docs/adr/http-access-normalization.md` for why the
 //! work lives here rather than in a hundred lines of per-server `map` blocks, and
 //! `docs/plans/http-access-normalization.md` for the step list this module implements.
 //!
@@ -18,22 +18,39 @@
 //! that doesn't log the header, no fabricated route -- ADR
 //! `operator-declared-resource-attributes`' rule applied one component over.
 //!
-//! An existing `user_agent.class` is trusted and never recomputed: the user agent is classified
-//! on its uncapped, uncleaned value, which only the first pass ever sees, so a second pass over
-//! the same event keeps the first verdict rather than re-reading the capped/cleaned value. It
-//! also means a class set upstream (a `set` or Lua stage, or a producer that logs one itself)
-//! overrides the built-in and configured tables -- an operator override, by design.
+//! **It fills what is missing; a derived attribute the producer already sent is honoured.**
+//! Every derived attribute -- `http.route`, `span.name`, `span.status`, `error.type`,
+//! `user_agent.class`, `user_agent.synthetic.type`, and the `span.duration_s` mirror -- is
+//! written only when absent (by [`present`]'s rule), so whatever an operator chose to compute
+//! server-side (a real router's `http.route`, an application's own `span.status`) wins, and
+//! `http_access` is a safe drop-in on top of it. There is no `overwrite:` option. The one
+//! deliberate exception is `forwarded: {trust: true}`, an explicit opt-in to *replace*
+//! `client.address` with the first `X-Forwarded-For` hop (a server always logs a peer address,
+//! so fill-only would make the option a no-op). Normalizing a value the producer did send --
+//! coercion, unit conversion, method/version normalization, capping, cleaning, redaction -- is
+//! hardening, not overriding, and still applies.
 //!
-//! **Every classification value is bounded by construction**: `http.route`, `user_agent.class`,
-//! `span.name`, `span.status`, and `error.type` values all come from config, a built-in table, or
-//! a closed numeric range -- never from a capture of the input. That is the review question for
-//! any change here, the same one `shape`'s ADR asks: does any output value derive from the input?
+//! Fill-only also settles a second pass: the user agent is classified on its uncapped,
+//! uncleaned value, which only the first pass ever sees, and the class that pass wrote is
+//! present on the second, so the first verdict stands rather than one re-read from the
+//! capped/cleaned value.
+//!
+//! **The values this component itself writes are bounded**: every `http.route`,
+//! `user_agent.class`, `span.name`, `span.status`, and `error.type` it writes comes from config, a
+//! built-in table, or a closed numeric range -- never from a capture of the input -- save a
+//! `span.name` built around a producer-sent `http.route`, which is exactly as bounded as that
+//! route. A producer's derived values are the producer's; `keep_values` bounds them if needed.
+//! That is the review question for any change here, the same one `shape`'s ADR asks: does any
+//! value this component writes derive from the input?
 //!
 //! Allocation posture (`docs/design/memory.md`, pinned from a measurement in W4, not here): every
 //! constant output is `Bytes::from_static`, every substring a `Bytes::slice` of the value it came
 //! from, and every config-derived output a `Value` built once in [`HttpAccess::new`] and cloned by
-//! refcount. What allocates is what has to: a control-byte clean, a redaction, and the first use of
-//! each lazily-built `span.name`/`error.type` cell.
+//! refcount. What allocates is what has to: a control-byte clean, a redaction, the first use of
+//! each lazily-built `span.name`/`error.type` cell, and -- the one producer-route cost -- the
+//! `span.name` of an event whose producer sent its own `http.route` but no `span.name`,
+//! formatted as `{method} {route}` per event, since an arbitrary producer route has no pre-built
+//! cell.
 //!
 //! Stateless apart from those caches -- only `process` is overridden; `flush_interval`/`flush`
 //! keep the `Transform` trait's defaults, and there is no `map_resource`: the batch `Resource` is
@@ -528,7 +545,9 @@ impl Classifier {
     }
 }
 
-/// Where a matched route came from -- the `routed{outcome}` tag.
+/// Where a matched route came from -- the `routed{outcome}` tag's `rule`/`builtin`. The rest of
+/// its vocabulary is spelled in [`classify_route`]: `other` (`route_other`), `none` (no route),
+/// and `kept` (a producer-sent `http.route`, honoured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     Rule,
@@ -1134,14 +1153,15 @@ fn cap_and_clean(
 /// writes nothing (an absent header is silence); present but blank is `none`; a `Value::Bytes`
 /// UA (not UTF-8, so no regex can read it) is `other`.
 ///
-/// An existing `user_agent.class` (by [`present`]'s rule) is trusted and never recomputed. The
-/// first pass is the only one that ever sees the uncapped, uncleaned value -- step 7 then caps
-/// and cleans it in place -- so its verdict is the one to keep: re-classifying on a second pass
-/// would read the rewritten value and could flip the class (a tail token cut off by the cap, a
-/// control byte cleaned to `_`) while leaving the first pass's `user_agent.synthetic.type`
-/// behind. The same rule makes a class written upstream -- by a `set` or Lua stage, or logged by
-/// the producer itself -- an operator override of the table: it wins, and neither the class nor
-/// `user_agent.synthetic.type` is derived for that event.
+/// Fill-only, like every derived attribute: an existing `user_agent.class` (by [`present`]'s
+/// rule) is honoured and never recomputed. A class sent by the producer, or written upstream by a
+/// `set` or Lua stage, wins over the built-in and configured tables, and neither the class nor
+/// `user_agent.synthetic.type` is derived for that event -- `user_agent.synthetic.type` is only
+/// ever written alongside a class this component wrote, and only when absent itself. The same
+/// rule is what keeps a second pass stable: the first pass is the only one that ever sees the
+/// uncapped, uncleaned value -- step 7 then caps and cleans it in place -- so re-classifying would
+/// read the rewritten value and could flip the class (a tail token cut off by the cap, a control
+/// byte cleaned to `_`) while leaving the first pass's `user_agent.synthetic.type` behind.
 fn classify_user_agent(
     attrs: &mut AttrMap,
     keys: &Keys,
@@ -1159,24 +1179,43 @@ fn classify_user_agent(
     };
     attrs.insert_sym(keys.ua_class.sym, class.clone());
     count(telemetry, DERIVED, keys.ua_class.name);
-    if bot {
+    if bot && present(attrs, keys.ua_synthetic.sym).is_none() {
         attrs.insert_sym(keys.ua_synthetic.sym, classifier.bot.clone());
         count(telemetry, DERIVED, keys.ua_synthetic.name);
     }
 }
 
+/// What [`classify_route`] decided, which `span.name` is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Routed {
+    /// No route: no path, or a path that matched nothing with no `route_other`.
+    None,
+    /// This component wrote `http.route`; the `span.name` table column -- the rule's index, or
+    /// `rules.len()` for `route_other`.
+    Column(usize),
+    /// The producer sent its own `http.route`, which was honoured.
+    Kept,
+}
+
 /// Step 8, route half: `http.route` from the *capped* `url.path` -- first matching rule, else
-/// `route_other`, else nothing. Returns the `span.name` column: the rule's index,
-/// `rules.len()` for `route_other`, `None` for no route. Counted `routed{outcome}` once per event
-/// with a path; the tag is the outcome, never the route value, which is operator-declared and
-/// unbounded in number.
+/// `route_other`, else nothing -- written only when the producer didn't send one. A producer's
+/// `http.route` (by [`present`]'s rule) is honoured: no rule is even tried, nothing is written,
+/// and the event counts `routed{outcome="kept"}`. Otherwise counted `routed{outcome}` once per
+/// event with a path. The tag is the outcome, never the route value, which is operator-declared
+/// (or producer-sent) and unbounded in number.
 fn classify_route(
     attrs: &mut AttrMap,
     keys: &Keys,
     router: &Router,
     telemetry: &Telemetry,
-) -> Option<usize> {
-    let path = present(attrs, keys.url_path.sym)?;
+) -> Routed {
+    if present(attrs, keys.route.sym).is_some() {
+        telemetry.count(ROUTED, 1.0, &[("outcome", "kept")]);
+        return Routed::Kept;
+    }
+    let Some(path) = present(attrs, keys.url_path.sym) else {
+        return Routed::None;
+    };
     let hit = path
         .as_str()
         .and_then(|path| router.rules.iter().position(|(_, pattern, _)| pattern.is_match(path)));
@@ -1188,13 +1227,13 @@ fn classify_route(
         (None, Some(other)) => (other, router.rules.len(), "other"),
         (None, None) => {
             telemetry.count(ROUTED, 1.0, &[("outcome", "none")]);
-            return None;
+            return Routed::None;
         }
     };
     attrs.insert_sym(keys.route.sym, route.clone());
     telemetry.count(ROUTED, 1.0, &[("outcome", outcome)]);
     count(telemetry, DERIVED, keys.route.name);
-    Some(column)
+    Routed::Column(column)
 }
 
 // -- Step 9: derive -----------------------------------------------------------------------------
@@ -1208,27 +1247,47 @@ fn first_hop(xff: &Bytes) -> Bytes {
 }
 
 impl HttpAccess {
-    /// Step 9: `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
-    /// `unset` -- never `ok`, which semconv reserves for an explicit override), `span.name`
-    /// (`{method} {route}`, or the method alone), the `span.duration_s` mirror, and -- only under
-    /// `forwarded: {trust: true}`, since the header is client-supplied -- `client.address` from
-    /// the first XFF hop. Every value comes from a pre-built cell, a constant, or a slice.
-    fn derive(&mut self, attrs: &mut AttrMap, method: Option<usize>, route: Option<usize>) {
+    /// Step 9, each attribute written only when the producer didn't send it (by [`present`]'s
+    /// rule): `error.type` (the status, 5xx only), `span.status` (`error` for 5xx or `0`, else
+    /// `unset` -- never `ok`, which semconv reserves for an explicit override; a producer's own
+    /// `ok` is honoured, even on a 5xx), `span.name` (`{method} {route}`, or the method alone),
+    /// and the `span.duration_s` mirror. Then -- only under `forwarded: {trust: true}`, since the
+    /// header is client-supplied, and the one *replacement* this component makes --
+    /// `client.address` from the first XFF hop. Every value comes from a pre-built cell, a
+    /// constant, or a slice, except a `span.name` around a producer-sent `http.route`, which is
+    /// formatted per event.
+    fn derive(&mut self, attrs: &mut AttrMap, method: Option<usize>, route: Routed) {
         let keys = &self.keys;
         let telemetry = &self.telemetry;
         if let Some(&Value::I64(status)) = attrs.get_sym(keys.status.sym) {
             let server_error = (500..=599).contains(&status);
-            if server_error {
+            if server_error && present(attrs, keys.error_type.sym).is_none() {
                 attrs.insert_sym(keys.error_type.sym, self.error_types.get(status));
                 count(telemetry, DERIVED, keys.error_type.name);
             }
-            let span_status =
-                if server_error || status == 0 { &self.span_error } else { &self.span_unset };
-            attrs.insert_sym(keys.span_status.sym, span_status.clone());
-            count(telemetry, DERIVED, keys.span_status.name);
+            if present(attrs, keys.span_status.sym).is_none() {
+                let span_status =
+                    if server_error || status == 0 { &self.span_error } else { &self.span_unset };
+                attrs.insert_sym(keys.span_status.sym, span_status.clone());
+                count(telemetry, DERIVED, keys.span_status.name);
+            }
         }
-        if let Some(method) = method {
-            attrs.insert_sym(keys.span_name.sym, self.span_names.get(&self.router, method, route));
+        if let Some(method) = method.filter(|_| present(attrs, keys.span_name.sym).is_none()) {
+            let name = match route {
+                Routed::Column(column) => self.span_names.get(&self.router, method, Some(column)),
+                Routed::None => self.span_names.get(&self.router, method, None),
+                // A producer's route is an arbitrary string with no pre-built cell, so it is
+                // formatted here; a non-UTF-8 one can't be spelled into a name: the method alone.
+                Routed::Kept => match present(attrs, keys.route.sym).and_then(Value::as_str) {
+                    Some(route) => {
+                        let method =
+                            KNOWN_METHODS.get(method).copied().unwrap_or(SPAN_METHOD_OTHER);
+                        Value::str(format!("{method} {route}"))
+                    }
+                    None => self.span_names.get(&self.router, method, None),
+                },
+            };
+            attrs.insert_sym(keys.span_name.sym, name);
             count(telemetry, DERIVED, keys.span_name.name);
         }
         let (duration_s, _) = keys.durations[0][0];
@@ -2405,6 +2464,68 @@ mod tests {
         assert_eq!(get(&event, "user_agent.synthetic.type"), None);
     }
 
+    /// Every derived attribute is fill-only: whatever the producer (or an upstream stage) already
+    /// computed is honoured -- a real router's `http.route` even where a configured rule would
+    /// match, a producer's `ok` even on a 500 -- and `derived{field}` never fires for it.
+    #[test]
+    fn producer_sent_derived_fields_are_honoured() {
+        let config = HttpAccessConfig {
+            routes: vec![pattern("^/api/", "/api")],
+            route_other: Some("/{other}".to_string()),
+            ..config()
+        };
+        let (mut t, registry, _) = instrumented(config);
+        let sent = [
+            ("http.route", s("/api/users/{id}")),
+            ("span.name", s("users.show")),
+            ("span.status", s("ok")),
+            ("error.type", s("UpstreamTimeout")),
+            ("user_agent.class", s("internal")),
+            ("user_agent.synthetic.type", s("test")),
+        ];
+        let mut pairs = vec![
+            ("http.request.method", s("GET")),
+            ("url.path", s("/api/users/42")),
+            ("http.response.status_code", s("500")),
+            ("user_agent.original", s("Mozilla/5.0 (compatible; Googlebot/2.1)")),
+        ];
+        pairs.extend(sent.iter().cloned());
+        let event = run(&mut t, &pairs);
+        for (key, value) in &sent {
+            assert_eq!(get(&event, key), Some(value), "{key}");
+        }
+        assert_eq!(
+            get(&event, "http.response.status_code"),
+            Some(&Value::I64(500)),
+            "a sent value is still normalized"
+        );
+
+        let events = registry.drain(0);
+        for (key, _) in &sent {
+            assert_eq!(counter(&events, DERIVED, Some(("field", key))), 0.0, "{key}");
+        }
+        assert_eq!(counter(&events, ROUTED, Some(("outcome", "kept"))), 1.0);
+        assert_eq!(counter(&events, ROUTED, Some(("outcome", "rule"))), 0.0);
+
+        // A kept route with no `span.name` names the span from the producer's route.
+        let event = run(
+            &mut t,
+            &[
+                ("http.request.method", s("DELETE")),
+                ("url.path", s("/api/users/42")),
+                ("http.route", s("/api/users/{id}")),
+            ],
+        );
+        assert_eq!(get(&event, "http.route"), Some(&s("/api/users/{id}")));
+        assert_eq!(get(&event, "span.name"), Some(&s("DELETE /api/users/{id}")));
+        let event = run(&mut t, &[("http.request.method", s("BREW")), ("http.route", s("/pot"))]);
+        assert_eq!(get(&event, "span.name"), Some(&s("HTTP /pot")), "kept even with no path");
+        let events = registry.drain(0);
+        assert_eq!(counter(&events, ROUTED, Some(("outcome", "kept"))), 2.0);
+        assert_eq!(counter(&events, DERIVED, Some(("field", SPAN_NAME))), 2.0);
+        assert_eq!(counter(&events, DERIVED, Some(("field", ROUTE))), 0.0);
+    }
+
     #[test]
     fn a_metrics_only_event_is_untouched() {
         let mut attrs = AttrMap::new();
@@ -2473,6 +2594,7 @@ mod tests {
         let mut by_rule =
             build(HttpAccessConfig { routes: vec![pattern("^/x$", "/x")], ..config() });
         run(&mut by_rule, &[("url.path", s("/x"))]);
+        run(&mut by_rule, &[("url.path", s("/x")), ("http.route", s("/producer"))]);
 
         let events = registry.drain(0);
         let field = |name| Some(("field", name));
@@ -2499,7 +2621,7 @@ mod tests {
         assert_eq!(counter(&events, CLEANED, field(USER_AGENT)), 1.0);
         assert_eq!(counter(&events, INVALID, field(STATUS)), 1.0);
         assert_eq!(counter(&events, REDACTED_METRIC, None), 1.0);
-        for outcome in ["builtin", "other", "none", "rule"] {
+        for outcome in ["builtin", "other", "none", "rule", "kept"] {
             assert_eq!(counter(&events, ROUTED, Some(("outcome", outcome))), 1.0, "{outcome}");
         }
     }

@@ -236,10 +236,15 @@ overrides an atomic field you also sent — then removes the composite.
 | `http.request.line` | `METHOD TARGET PROTOCOL` (nginx's `$request`, Apache's `%r`) | Split into `http.request.method`, `url.path`/`url.query` (target split at the first `?`), and `network.protocol.version`. A line that isn't exactly three space-separated tokens is left in place, counted `invalid{field}`, and raises a throttled `bad_request_line` diagnostic. |
 | `url.original` | `/path?query` (nginx's `$request_uri`) | Split into `url.path`/`url.query` at the first `?`. **Always the raw request target, never a decoded path** — nginx: `$request_uri`, never `$uri`, which is normalized and can change mid-request (internal redirects, index files). |
 
-### Derived — don't send these
+### Derived — filled in only when you don't send them
 
-`http_access` writes these itself, always from config, a built-in table, or a closed numeric
-range — never from a capture of the input, so every value set is bounded by construction.
+`http_access` writes these only when the line doesn't already carry them. Send one yourself —
+because your server computed it for its own reasons, or because you prefer your router's real
+`http.route` to a regex bucket — and it is honoured as-is; leave it out and `http_access` derives
+it. What `http_access` derives comes from config, a built-in table, or a closed numeric range —
+never from a capture of the input — so its own values are bounded; yours are yours, and
+`keep_values` after this component bounds them if that matters. See "Doing some of it
+server-side" below.
 
 | Attribute | Where it comes from |
 |---|---|
@@ -252,10 +257,12 @@ range — never from a capture of the input, so every value set is bounded by co
 | `http.request.method_original` | The raw method, only when it fell outside the known set. |
 | `span.duration_s` | Mirrored from `http.request.duration_s` **unless** the line already states a span duration (any `span.duration*`) or states both a start and an end. A lone end (nginx's `$msec`) or a lone start (HAProxy's `request_date(us)`) is exactly what the mirror is for: without it, `trace_context` would borrow the event's receipt time for the missing bound. |
 
-Where a derivation applies, it overwrites what was there, with one exception: an existing
-`user_agent.class` is trusted and never recomputed. That makes a class written upstream — by a
-`set` or `lua` stage, or logged by the producer itself — an operator override of both tables; no
-`user_agent.synthetic.type` is derived for that event either.
+Every row above is fill-only: an existing value, whether the producer logged it or an upstream
+`set`/`lua` stage wrote it, is never recomputed, and a present `user_agent.class` also suppresses
+the `user_agent.synthetic.type` derivation. There is no option to make `http_access` overwrite
+them. The one field it does replace is `client.address`, and only under `forwarded: {trust: true}`
+(see below). Normalization of a value you *did* send — status to an integer, the cap, the clean,
+the redaction — applies regardless: that is hardening, not overriding.
 
 ### Server variables at a glance
 
@@ -973,8 +980,9 @@ access_keep:
     - user_agent.class
 ```
 
-`user_agent.class` isn't in semconv's set, but it is bounded by construction, so adding it costs
-at most a handful of series per route. [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+`user_agent.class` isn't in semconv's set, but when `http_access` derives it the value set is the
+table's (a class you send yourself is as bounded as you made it), so adding it costs at most a
+handful of series per route. [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
 runs this shape end to end.
 
 ## Cutover
@@ -1016,6 +1024,59 @@ table, never from a value. An absent field, an unknown method, an unclassifiable
 an unrouted path are normal traffic: counters only, never a diagnostic.
 
 Drop the old line once the new one lands where you expect and these counters look sane.
+
+## Doing some of it server-side
+
+A web server that classifies a request itself can act on the result before the line is ever
+logged — rate-limit by `user_agent.class`, route probes to a cheaper upstream, refuse a path
+bucket outright. Nothing here stops that: do whichever parts of the work you want on the server,
+log the result under the standard name, and `http_access` fills in the rest and hardens what you
+sent. This section is the shape of that work, in the order the component applies it, so you can
+pick the pieces worth doing at the edge; the exact rules live in
+`crates/logit-transforms/src/http_access.rs` and its tests (the built-in tables and the corpus of
+real user agents and paths they were checked against are `const`s there) for anyone who wants an
+exact match, which is rarely the goal.
+
+1. **Standard names.** Log the raw value under the semconv name from the field table above. This
+   is the one part that isn't optional, and it costs nothing: every server here lets you choose
+   the key.
+2. **Types.** A number as a bare JSON number where the server always writes one; quoted where it
+   may be unset (nginx's `escape=json` and `$status`'s `000` are the traps, see the quoting
+   section). `http_access` coerces either form, so this is about your own downstream readers.
+3. **Method and version.** semconv's known set (`CONNECT DELETE GET HEAD OPTIONS PATCH POST PUT
+   QUERY TRACE`, case-sensitive) with anything else as `_OTHER` plus the raw value in
+   `http.request.method_original`; `HTTP/1.1` → `1.1`, `HTTP/2.0` → `2`. Cheap in any config
+   language, and only worth doing server-side if something there keys off it.
+4. **Length caps and control bytes.** A cap per free-text field (`url.path`, `url.query`,
+   `user_agent.original`, the referer at 256; addresses at 128 — the `max_length` table has the
+   full list) and control bytes replaced. Server-side, this is where regex dialects bite: an nginx
+   `map` is PCRE matching *bytes*, so a `.{0,256}` cap can split a multi-byte character and a
+   `[[:print:]]` cap silently drops everything from the first non-ASCII byte; `http_access` caps by
+   characters. If you cap at the edge, prefer `[[:print:]]` and accept the truncation, or leave
+   capping to the pipeline.
+5. **Query redaction.** Replace the value of any sensitive key (semconv's `AWSAccessKeyId`,
+   `Signature`, `sig`, `X-Goog-Signature`, `X-Amz-Signature`, `X-Amz-Credential`,
+   `X-Amz-Security-Token`, plus your own) with `REDACTED` *before* any cap. Worth doing
+   server-side if the raw line is also written to a local file.
+6. **User-agent class.** An ordered table, first match wins, scanner → tool → crawler → browser,
+   with `none` for an empty header and `other` for no match; `crawler`/`scanner` also mean
+   `user_agent.synthetic.type: bot`. This is the derivation most often worth having at the edge,
+   because a rate limit or a block wants it there. Log it as `user_agent.class` and
+   `http_access` keeps yours; the order of the built-in table matters more than its members
+   (crawlers spoof `Mozilla/`, so `browser` must be last), and a `map` with `~*` arms in that order
+   is the nginx shape.
+7. **Route.** An ordered list of path patterns to literal route values, first match wins, with a
+   catch-all — the same three built-in ideas (`/{probe}`, `/{well-known}`, `/{asset}`) and your
+   own application routes. Log it as `http.route`. If your server *is* the router (an application
+   server, or a proxy with a route table), its real route template is better than any regex
+   bucket, and this is the single most valuable field to send yourself.
+8. **Span fields.** `span.status` (`error` for 5xx or a `0` status, otherwise `unset`, never
+   `ok`), `span.name` (`{method} {http.route}`, or the method alone), `error.type` (the status,
+   5xx only). Rarely worth doing server-side: nothing at the edge acts on them, and `http_access`
+   derives them from fields 3 and 7.
+
+The dividing line is simple: anything you want to *act on* at the server, compute there and log
+under the standard name; anything you only want in the data, leave to the pipeline.
 
 ## What it does not do
 

@@ -51,9 +51,9 @@ of a second component that would re-parse the same names.
 ## Decision
 
 **A new native transform, `http_access`.** It reads the raw, unnormalized attributes a web server
-logged under OTel semconv names, and rewrites them in place into their conformant form, adding a
-small, bounded set of derived attributes. It is placed by the operator between `json` (or
-whatever parsed the line) and `trace_context`:
+logged under OTel semconv names, rewrites each one it finds into its conformant form, and fills in
+whichever of a small set of derived attributes the line doesn't already carry. It is placed by
+the operator between `json` (or whatever parsed the line) and `trace_context`:
 
 ```
 syslog_in / docker_in / tail_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> aggregate -> sink
@@ -108,11 +108,33 @@ for a producer that doesn't log the header at all (an *empty* header is `none`; 
 silence), no fabricated route. This is `operator-declared-resource-attributes`' rule applied one
 component over.
 
-**Every classification value is bounded by construction.** `http.route` values come from config
-or the built-in table, never from a capture group; `user_agent.class` values come from the table.
-The component's output can be joined into an `aggregate` series key or a span name without a
-`keep_values` after it, and the ADR's review question is the same as `shape`'s: does any output
-value derive from the input? It must not.
+**It fills what is missing, and never overrides a derived field the producer already sent.**
+`http.route`, `user_agent.class`, `user_agent.synthetic.type`, `error.type`, `span.name`,
+`span.status`, and the `span.duration_s` mirror are each written only when absent (by the same
+absent rule as everything else: `""`, `-`, and null count as absent). Two audiences want this at
+once. The drop-in user sends raw fields and gets every derivation. The advanced user, who wants a
+route or a user-agent class *on the server* so it can drive a decision there — a rate limit, a
+block, a different upstream — computes it in the server's own config language, logs it under the
+standard name, and `http_access` honours it while still filling in everything they didn't bother
+with. The same rule makes a second pass over an event a no-op, and makes `http_access` safe to
+place on top of a pipeline that already carries the field from an upstream `set` or `lua` stage.
+There is deliberately no `overwrite:` option: a producer that logs a derived field under its
+standard name has made a decision, and a component silently reversing it is the failure mode this
+ADR exists to remove, not a feature.
+
+What `http_access` itself writes stays bounded by construction: an `http.route` it derives comes
+from config or the built-in table, never from a capture group, and a `user_agent.class` from the
+table. A producer's own value is the producer's — it is bounded by whatever bounded it there, and
+`keep_values` after `http_access` is the tool if that needs enforcing in the pipeline. The review
+question for any change here is therefore: does any value *this component writes* derive from the
+input? It must not. Normalizing a value the producer did send — coercing its status to an
+integer, capping its user agent, redacting its query — is not overriding; that hardening applies
+regardless, which is what makes the drop-in and the server-side shapes meet in the middle.
+
+The one deliberate overwrite is `client.address` under `forwarded: {trust: true}`: nginx and
+HAProxy always log the peer address, so a fill-only rule would make the option a no-op. It is
+gated behind an explicit operator statement about their own topology, and it replaces exactly one
+field with exactly one thing.
 
 **Best-effort per field, never all-or-nothing, and never a dropped event.** `trace_context` is
 all-or-nothing per event because it writes *identity* — a half-lifted trace id is a corrupt trace.
@@ -203,6 +225,13 @@ everywhere.
   failure is "did not match any variant" with no pointer to the offending key. One flat struct
   with optional `builtin`/`match`/`route` fields, validated by a graph rule to be exactly one
   shape, gives an operator an error that names what is wrong.
+- **Overwriting a producer-sent derived field, or an `overwrite:` option to do so.** Rejected.
+  The original draft of this ADR wrote every derived field unconditionally so that every value
+  was bounded by construction; that made `http_access` clobber a real router's `http.route` or a
+  server-side user-agent class, which is exactly the "the server may want to do some of this
+  itself" case the drop-in shape must coexist with. Fill-only costs nothing when the producer
+  sent nothing, and an option to reverse it would only ever be reached for by an operator who
+  should instead stop sending the field.
 - **Minting a trace id when no `traceparent` arrived.** Never — [ADR
   `trace-context-span-lifting`](trace-context-span-lifting.md)'s rejection stands. The edge that
   minted the request id is the only party that can mint the trace; nginx's `map $http_traceparent
@@ -249,7 +278,10 @@ everywhere.
   heuristic bucket classifier, not a parser (no `user_agent.name`/`.version`, and the built-in
   table cannot be disabled, only pre-empted); the percent-*decoded* form of a path is never
   produced, so route rules match the encoded form.
-- **Docs:** `docs/http-access-logs.md` is the operator-facing schema — the canonical field table,
+- **Docs:** `docs/http-access-logs.md` is the operator-facing schema for both audiences: it
+  states, in the order the component applies them, what the normalizations and derivations are
+  and which of them an advanced user might want to do server-side, and points at the source and
+  its corpus tests for anyone who wants an exact match — the canonical field table,
   start-versus-end timestamp semantics per server, unit suffixes, nginx `escape=json` quoting
   rules, the dashed-alias section with the HAProxy `%{+json}o` worked example, one copy-pasteable
   snippet per server, the `kv_metrics` + `keep` metrics block, and cutover advice.
