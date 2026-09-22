@@ -9,18 +9,26 @@ running `logit`, see [the nginx-side recipe](#the-nginx-side-recipe) below. If y
 
 ## Getting the image
 
-`script/image [tag]` builds the production runtime image from `Dockerfile` (not `Dockerfile.dev`,
-which is the contributor dev environment — [ADR `containerized-development`](adr/containerized-development.md)) and
-tags it `logit:<tag>` (default `local`):
+Pull it from GHCR:
+
+```sh
+docker pull ghcr.io/ross/logit:latest
+```
+
+`latest` is the only published tag — it's built and pushed by hand
+([ADR `publish-release-image-to-ghcr`](adr/publish-release-image-to-ghcr.md)), is amd64 only, and
+moves whenever someone dispatches that workflow. Treat it as "the current build," not a pin — don't
+rely on it staying the same image across two pulls a week apart.
+
+Or build it yourself: `script/image [tag]` builds the production runtime image from `Dockerfile`
+(not `Dockerfile.dev`, which is the contributor dev environment —
+[ADR `containerized-development`](adr/containerized-development.md)) and tags it `logit:<tag>`
+(default `local`):
 
 ```sh
 script/image        # -> logit:local
 script/image v0.1.0  # -> logit:v0.1.0
 ```
-
-There's no published image to pull yet — no registry push step exists in this repo today — so
-"build" is the operative word here, not "pull." Build it wherever you intend to run it, or push the
-result to your own registry.
 
 ## Running it
 
@@ -31,7 +39,7 @@ read-only bind mount, not baked into the image:
 docker run --rm \
   -v /path/to/config.yaml:/config.yaml:ro \
   -e INFLUXDB_TOKEN=... \
-  logit:local run /config.yaml
+  ghcr.io/ross/logit:latest run /config.yaml
 ```
 
 Secrets and deployment-specific values (a token, a URL, a bind address) go through `!env VAR_NAME`
@@ -47,7 +55,7 @@ Before restarting a running `logit` with a new config, validate the candidate fi
 docker run --rm \
   -v /path/to/new-config.yaml:/config.yaml:ro \
   -e INFLUXDB_TOKEN=... \
-  logit:local validate /config.yaml
+  ghcr.io/ross/logit:latest validate /config.yaml
 ```
 
 `validate` shares the exact same resolution and validation path `run` uses

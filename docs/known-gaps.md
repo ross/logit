@@ -1891,3 +1891,10 @@ already built that have a known, accepted rough edge.
   `key_bytes`/`value_bytes`/`nested_maps`. The per-batch cost `docs/design/memory.md` cares about
   is therefore only half visible — a 20-attribute resource of short enums and one of long ARNs and
   a nested label map read the same.
+
+- **The published `ghcr.io/ross/logit` image is `latest` only, amd64 only, unsigned, and
+  unattested.** No version tags (the workspace version is still a pre-release placeholder), no
+  arm64 build, no cosign signature, no SBOM, and nothing in CI builds or smoke-tests the production
+  `Dockerfile` beyond the manual `workflow_dispatch` publish itself
+  ([ADR `publish-release-image-to-ghcr`](adr/publish-release-image-to-ghcr.md)). All named as
+  deliberate follow-ups there, not oversights.

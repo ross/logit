@@ -22,6 +22,17 @@ InfluxDB, and real spans into Tempo, `logit` observing its own pipeline as all t
 [demo/README.md](demo/README.md) for what's flowing (everything) and the one thing still deferred
 by choice (`docs/known-gaps.md`).
 
+To run `logit` itself rather than the demo, pull the published image
+([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)):
+
+```sh
+docker pull ghcr.io/ross/logit:latest
+docker run --rm -v /path/to/config.yaml:/config.yaml:ro ghcr.io/ross/logit:latest run /config.yaml
+```
+
+`latest` is the only tag, amd64 only, and moves on demand rather than on a release schedule — see
+[docs/deploying.md](docs/deploying.md) for what that means and the full operator-facing story.
+
 **Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
 enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
 over UDP), `stdio_out`, `file_out` (a rotating file sink sharing `stdio_out`'s implementation,

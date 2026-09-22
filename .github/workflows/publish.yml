@@ -1,0 +1,28 @@
+name: Publish image
+
+# Manual only (docs/adr/publish-release-image-to-ghcr.md) -- nothing publishes on a push to main.
+# A human runs this from the Actions tab (or `gh workflow run "Publish image"`) when they want
+# `ghcr.io/ross/logit:latest` to move.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # No `container:`, unlike ci.yml's job -- this job needs the runner's own Docker daemon to
+    # build and push an image, which a job already running inside a container can't reach without
+    # docker-in-docker.
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DOCKER: docker
+      IMAGE_REPO: ghcr.io/ross/logit
+      IMAGE_PUSH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - run: ./script/image latest

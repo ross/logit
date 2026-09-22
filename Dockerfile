@@ -30,6 +30,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /work/target/release/logit /usr/local/bin/logit
 
+# GHCR reads org.opencontainers.image.source to link this package to the repo (package page
+# README, "inherit access" from the repo) -- docs/adr/publish-release-image-to-ghcr.md. No
+# .image.version: the workspace version (Cargo.toml) is a pre-release placeholder, and stamping it
+# here would imply a release process that doesn't exist yet.
+LABEL org.opencontainers.image.title="logit" \
+      org.opencontainers.image.description="A logging/metrics/tracing multiplexer" \
+      org.opencontainers.image.source="https://github.com/ross/logit" \
+      org.opencontainers.image.licenses="MIT"
+
 # Only effective when the target config sets `admin.bind` (docs/plans/operator-surface.md,
 # docs/deploying.md) -- `logit ready` exits 1 with nothing listening otherwise, same as a
 # genuinely unready process would. Exec form, naming the binary explicitly: HEALTHCHECK's exec
