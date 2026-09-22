@@ -329,6 +329,22 @@
 //!     no-op reasoning once more. `attributes: all` (the default) and a field name containing `.`
 //!     are both deliberately legal -- the former is the useful default, the latter names a literal
 //!     attribute exactly as rule 54's `keep_values` fields already may.
+//! 60. `http_access`-specific validation (`docs/adr/http-access-normalization.md`): every
+//!     `routes[].match` and `user_agent_rules[].match` must compile as a regex, rule 31's
+//!     reasoning -- a pattern `build_spec` would only discover at startup is a run-time surprise
+//!     validation exists to prevent; an empty `match`, `route`, `class`, `route_other`, or
+//!     `redact_query` entry is rejected, rules 19/20/54's reasoning (an empty `route`/`class`/
+//!     `route_other` would write an empty, meaningless label; an empty `match` matches every path
+//!     and hides every rule after it); each `routes` entry must be exactly `builtin` or
+//!     `match` + `route`, the error naming which half is missing or which extra key is present --
+//!     the reason that entry is one flat struct rather than an untagged enum; a repeated
+//!     `builtin:` set is rejected, since the second can never match anything the first didn't;
+//!     a `max_length` key must name a field in `logit_config::CAPPED_FIELDS` (the error lists
+//!     them), since a cap on a field this component never caps can only ever be a no-op, and a
+//!     limit of `0` is rejected, rules 9/15/18/58's impossible-bound shape; and `forwarded:
+//!     {trust: false}` is rejected in favour of omitting the block, so "don't trust XFF" has one
+//!     spelling. There is deliberately **no** "nothing configured" clause: a bare
+//!     `type: http_access` still coerces, caps, derives, and classifies with the built-in tables.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -424,6 +440,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Regex { .. }
         | Shape { .. }
         | Flatten { .. }
+        | HttpAccess { .. }
         | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
@@ -485,6 +502,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Regex { .. } => "regex",
         Shape { .. } => "shape",
         Flatten { .. } => "flatten",
+        HttpAccess { .. } => "http_access",
         Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
@@ -584,6 +602,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Regex { .. }
             | ComponentKind::Shape { .. }
             | ComponentKind::Flatten { .. }
+            | ComponentKind::HttpAccess { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -2849,6 +2868,131 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 60: `http_access`-specific validation (`docs/adr/http-access-normalization.md`). Every
+    // pattern is compiled here, rule 31's reasoning; the empties are rules 19/20/54's; a route
+    // rule's shape is checked here rather than by serde because an untagged enum's failure names
+    // no key, which is the whole reason `HttpRouteRule` is one flat struct. No "nothing
+    // configured" clause: a bare `http_access` is meaningful.
+    for (id, component) in &components {
+        if let ComponentKind::HttpAccess {
+            routes,
+            route_other,
+            user_agent_rules,
+            max_length,
+            redact_query,
+            forwarded,
+        } = &component.kind
+        {
+            let compile = |what: &str, pattern: &str| -> anyhow::Result<()> {
+                if pattern.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': an http_access {what} 'match' must not be empty -- it \
+                         would match everything and hide every rule after it"
+                    );
+                }
+                ::regex::Regex::new(pattern).map(drop).map_err(|err| {
+                    anyhow::anyhow!(
+                        "component '{id}': http_access {what} 'match' {pattern:?} is not a valid \
+                         regex: {err}"
+                    )
+                })
+            };
+            let mut builtins = std::collections::HashSet::new();
+            for (index, rule) in routes.iter().enumerate() {
+                let logit_config::HttpRouteRule { builtin, pattern, route } = rule;
+                match (builtin, pattern, route) {
+                    (Some(set), None, None) => {
+                        if !builtins.insert(*set) {
+                            anyhow::bail!(
+                                "component '{id}': http_access routes[{index}] repeats 'builtin: \
+                                 {}' -- the second can never match anything the first didn't",
+                                match set {
+                                    logit_config::HttpRouteSet::Assets => "assets",
+                                    logit_config::HttpRouteSet::WellKnown => "well_known",
+                                    logit_config::HttpRouteSet::Probes => "probes",
+                                }
+                            );
+                        }
+                    }
+                    (Some(_), Some(_), _) => anyhow::bail!(
+                        "component '{id}': http_access routes[{index}] has both 'builtin' and \
+                         'match' -- a rule is exactly one of 'builtin', or 'match' with 'route'"
+                    ),
+                    (Some(_), None, Some(_)) => anyhow::bail!(
+                        "component '{id}': http_access routes[{index}] has both 'builtin' and \
+                         'route' -- a built-in set carries its own route value; drop 'route'"
+                    ),
+                    (None, Some(pattern), Some(route)) => {
+                        compile(&format!("routes[{index}]"), pattern)?;
+                        if route.is_empty() {
+                            anyhow::bail!(
+                                "component '{id}': http_access routes[{index}] 'route' must not \
+                                 be empty -- it would write an empty http.route"
+                            );
+                        }
+                    }
+                    (None, Some(_), None) => anyhow::bail!(
+                        "component '{id}': http_access routes[{index}] has 'match' but no \
+                         'route' -- name the literal http.route a matching path gets"
+                    ),
+                    (None, None, Some(_)) => anyhow::bail!(
+                        "component '{id}': http_access routes[{index}] has 'route' but no \
+                         'match' -- add the regex over url.path that selects it"
+                    ),
+                    (None, None, None) => anyhow::bail!(
+                        "component '{id}': http_access routes[{index}] is empty -- a rule is \
+                         exactly one of 'builtin', or 'match' with 'route'"
+                    ),
+                }
+            }
+            if route_other.as_deref() == Some("") {
+                anyhow::bail!(
+                    "component '{id}': http_access 'route_other' must not be empty -- omit it to \
+                     write no route for an unmatched path"
+                );
+            }
+            for (index, rule) in user_agent_rules.iter().enumerate() {
+                compile(&format!("user_agent_rules[{index}]"), &rule.pattern)?;
+                if rule.class.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': http_access user_agent_rules[{index}] 'class' must not \
+                         be empty -- it would write an empty user_agent.class"
+                    );
+                }
+            }
+            for (field, limit) in max_length {
+                if !logit_config::CAPPED_FIELDS.iter().any(|(name, _)| name == field) {
+                    let valid: Vec<&str> =
+                        logit_config::CAPPED_FIELDS.iter().map(|(name, _)| *name).collect();
+                    anyhow::bail!(
+                        "component '{id}': http_access 'max_length' names '{field}', which \
+                         http_access never caps -- valid keys: {}",
+                        valid.join(", ")
+                    );
+                }
+                if *limit == 0 {
+                    anyhow::bail!(
+                        "component '{id}': http_access 'max_length' for '{field}' is 0 -- that \
+                         would empty the field on every event; remove the attribute downstream \
+                         instead"
+                    );
+                }
+            }
+            if redact_query.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "component '{id}': an http_access 'redact_query' entry must not be empty -- \
+                     it could never name a real query key"
+                );
+            }
+            if forwarded.is_some_and(|f| !f.trust) {
+                anyhow::bail!(
+                    "component '{id}': http_access 'forwarded: {{trust: false}}' is the default \
+                     -- omit the block instead"
+                );
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
@@ -3277,7 +3421,7 @@ mod tests {
     }
 
     fn json() -> ComponentKind {
-        ComponentKind::Json { skip_to_brace: false }
+        ComponentKind::Json { skip_to_brace: false, invalid_utf8: Default::default() }
     }
 
     fn logfmt() -> ComponentKind {
@@ -5076,6 +5220,247 @@ mod tests {
             ("out", vec!["flat"], sink()),
         ]));
         assert!(err.contains("repeats"), "got: {err}");
+    }
+
+    /// A bare `http_access` -- every field defaulted.
+    fn http_access_defaults() -> ComponentKind {
+        ComponentKind::HttpAccess {
+            routes: vec![],
+            route_other: None,
+            user_agent_rules: vec![],
+            max_length: std::collections::BTreeMap::new(),
+            redact_query: vec![],
+            forwarded: None,
+        }
+    }
+
+    /// Runs `edit` against a default `http_access`, resolves it in an `in -> http -> out`
+    /// chain, and returns the rule-60 error.
+    fn http_access_err(edit: impl FnOnce(&mut ComponentKind)) -> String {
+        let mut kind = http_access_defaults();
+        edit(&mut kind);
+        expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("http", vec!["in"], kind),
+            ("out", vec!["http"], sink()),
+        ]))
+    }
+
+    fn route_rule(
+        builtin: Option<logit_config::HttpRouteSet>,
+        pattern: Option<&str>,
+        route: Option<&str>,
+    ) -> logit_config::HttpRouteRule {
+        logit_config::HttpRouteRule {
+            builtin,
+            pattern: pattern.map(str::to_string),
+            route: route.map(str::to_string),
+        }
+    }
+
+    fn set_routes(routes: Vec<logit_config::HttpRouteRule>) -> impl FnOnce(&mut ComponentKind) {
+        move |kind| {
+            if let ComponentKind::HttpAccess { routes: r, .. } = kind {
+                *r = routes;
+            }
+        }
+    }
+
+    /// Rule 60 has no "nothing configured" clause: a bare `http_access` is meaningful.
+    #[test]
+    fn a_bare_http_access_validates_as_a_transform() {
+        let graph = resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("http", vec!["in"], http_access_defaults()),
+            ("out", vec!["http"], sink()),
+        ]))
+        .expect("a bare http_access is not a no-op");
+        assert_eq!(graph.components["http"].role(), Role::Transform);
+        assert_eq!(graph.components["http"].kind_name(), "http_access");
+    }
+
+    #[test]
+    fn a_fully_configured_http_access_validates() {
+        use logit_config::{ForwardedConfig, HttpRouteSet, UserAgentRule};
+        let kind = ComponentKind::HttpAccess {
+            routes: vec![
+                route_rule(Some(HttpRouteSet::Probes), None, None),
+                route_rule(Some(HttpRouteSet::Assets), None, None),
+                route_rule(None, Some("^/$"), Some("/")),
+            ],
+            route_other: Some("/{other}".to_string()),
+            user_agent_rules: vec![UserAgentRule {
+                pattern: "MyMonitor/".to_string(),
+                class: "tool".to_string(),
+            }],
+            max_length: std::collections::BTreeMap::from([("url.path".to_string(), 512)]),
+            redact_query: vec!["token".to_string()],
+            forwarded: Some(ForwardedConfig { trust: true }),
+        };
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("http", vec!["in"], kind),
+            ("out", vec!["http"], sink()),
+        ]))
+        .expect("should resolve");
+    }
+
+    /// Rule 60 (a), route half.
+    #[test]
+    fn an_http_access_route_with_an_uncompilable_match_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, Some("(unclosed"), Some("/"))]));
+        assert!(err.contains("routes[0]") && err.contains("not a valid regex"), "{err}");
+    }
+
+    /// Rule 60 (a), user-agent half.
+    #[test]
+    fn an_http_access_user_agent_rule_with_an_uncompilable_match_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { user_agent_rules, .. } = kind {
+                user_agent_rules.push(logit_config::UserAgentRule {
+                    pattern: "[z-a]".to_string(),
+                    class: "tool".to_string(),
+                });
+            }
+        });
+        assert!(err.contains("user_agent_rules[0]") && err.contains("not a valid regex"), "{err}");
+    }
+
+    /// Rule 60 (b): an empty `match`.
+    #[test]
+    fn an_http_access_empty_match_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, Some(""), Some("/"))]));
+        assert!(err.contains("'match' must not be empty"), "{err}");
+    }
+
+    /// Rule 60 (b): an empty `route`.
+    #[test]
+    fn an_http_access_empty_route_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, Some("^/$"), Some(""))]));
+        assert!(err.contains("'route' must not be empty"), "{err}");
+    }
+
+    /// Rule 60 (b): an empty `class`.
+    #[test]
+    fn an_http_access_empty_class_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { user_agent_rules, .. } = kind {
+                user_agent_rules.push(logit_config::UserAgentRule {
+                    pattern: "x".to_string(),
+                    class: String::new(),
+                });
+            }
+        });
+        assert!(err.contains("'class' must not be empty"), "{err}");
+    }
+
+    /// Rule 60 (b): an empty `route_other`.
+    #[test]
+    fn an_http_access_empty_route_other_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { route_other, .. } = kind {
+                *route_other = Some(String::new());
+            }
+        });
+        assert!(err.contains("'route_other' must not be empty"), "{err}");
+    }
+
+    /// Rule 60 (b): an empty `redact_query` entry.
+    #[test]
+    fn an_http_access_empty_redact_query_entry_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { redact_query, .. } = kind {
+                redact_query.push(String::new());
+            }
+        });
+        assert!(err.contains("'redact_query' entry must not be empty"), "{err}");
+    }
+
+    /// Rule 60 (c): `builtin` and `match` together.
+    #[test]
+    fn an_http_access_route_with_builtin_and_match_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(
+            Some(logit_config::HttpRouteSet::Assets),
+            Some("x"),
+            Some("/x"),
+        )]));
+        assert!(err.contains("both 'builtin' and 'match'"), "{err}");
+    }
+
+    /// Rule 60 (c): `builtin` and `route` together.
+    #[test]
+    fn an_http_access_route_with_builtin_and_route_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(
+            Some(logit_config::HttpRouteSet::Assets),
+            None,
+            Some("/x"),
+        )]));
+        assert!(err.contains("both 'builtin' and 'route'"), "{err}");
+    }
+
+    /// Rule 60 (c): `match` without `route`.
+    #[test]
+    fn an_http_access_route_with_match_but_no_route_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, Some("^/$"), None)]));
+        assert!(err.contains("has 'match' but no 'route'"), "{err}");
+    }
+
+    /// Rule 60 (c): `route` without `match`.
+    #[test]
+    fn an_http_access_route_with_route_but_no_match_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, None, Some("/"))]));
+        assert!(err.contains("has 'route' but no 'match'"), "{err}");
+    }
+
+    /// Rule 60 (c): an entry with nothing in it.
+    #[test]
+    fn an_http_access_empty_route_rule_is_rejected() {
+        let err = http_access_err(set_routes(vec![route_rule(None, None, None)]));
+        assert!(err.contains("routes[0] is empty"), "{err}");
+    }
+
+    /// Rule 60 (d).
+    #[test]
+    fn an_http_access_repeated_builtin_is_rejected() {
+        let err = http_access_err(set_routes(vec![
+            route_rule(Some(logit_config::HttpRouteSet::Assets), None, None),
+            route_rule(None, Some("^/$"), Some("/")),
+            route_rule(Some(logit_config::HttpRouteSet::Assets), None, None),
+        ]));
+        assert!(err.contains("routes[2] repeats 'builtin: assets'"), "{err}");
+    }
+
+    /// Rule 60 (e): the error lists the valid keys.
+    #[test]
+    fn an_http_access_max_length_for_an_uncapped_field_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { max_length, .. } = kind {
+                max_length.insert("url.paths".to_string(), 10);
+            }
+        });
+        assert!(err.contains("'url.paths'") && err.contains("valid keys: url.path,"), "{err}");
+    }
+
+    /// Rule 60 (f).
+    #[test]
+    fn an_http_access_zero_max_length_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { max_length, .. } = kind {
+                max_length.insert("url.path".to_string(), 0);
+            }
+        });
+        assert!(err.contains("'url.path' is 0"), "{err}");
+    }
+
+    /// Rule 60 (g).
+    #[test]
+    fn an_http_access_forwarded_trust_false_is_rejected() {
+        let err = http_access_err(|kind| {
+            if let ComponentKind::HttpAccess { forwarded, .. } = kind {
+                *forwarded = Some(logit_config::ForwardedConfig { trust: false });
+            }
+        });
+        assert!(err.contains("omit the block instead"), "{err}");
     }
 
     #[test]

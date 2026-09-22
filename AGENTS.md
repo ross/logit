@@ -306,7 +306,27 @@ leaves are written — `flatten` never deletes an attribute; last write wins on 
 silently, and there is deliberately no cap on how many keys one value can expand into beyond a
 fixed internal recursion-depth bound, a settled, documented (`docs/known-gaps.md`) gap rather than
 a guarded one. See [ADR `flatten-transform`](docs/adr/flatten-transform.md) and
-[examples/nested-json-to-influxdb.yaml](examples/nested-json-to-influxdb.yaml).
+[examples/nested-json-to-influxdb.yaml](examples/nested-json-to-influxdb.yaml). `http_access` is
+the newest real, implemented `ComponentKind`: a web server logs its access line under raw OTel
+semconv attribute names with the untouched value (`url.original`, `http.response.status_code`,
+`user_agent.original`, plus a few `logit`-own names -- `http.request.line`, the unit-suffixed
+`http.request.duration_{s,ms,us}`, `upstream.*`), and `http_access`, placed once between `json`
+and `trace_context`, does everything the hundred lines of per-server `map` blocks used to:
+decomposes the composites, coerces numerics (nginx's `"000"` status to `0`), merges durations
+into `_s`, normalizes method (`_OTHER` plus `http.request.method_original`) and protocol version,
+redacts semconv's sensitive query keys before capping every free-text field per
+`CAPPED_FIELDS`, then derives a bounded set -- `user_agent.class` from an ordered regex table,
+`http.route` from operator `routes:` plus three built-in sets, `error.type`, `span.name`,
+`span.status` (never `ok`), and a `span.duration_s` mirror `trace_context` resolves a span from.
+Every derived value comes from config or a built-in table, never a capture; best-effort per field,
+never a dropped event; it emits no metrics (a stock `kv_metrics` + `keep` does). Every canonical
+name is also accepted with each `.` replaced by `-` (`http-response-status_code`, only the dots
+change), a fixed alias table for HAProxy's `%{+json}o`, whose item names can't contain a dot --
+which is how `demo/haproxy/haproxy.cfg` now logs. `json` gained `invalid_utf8: replace` alongside
+it, retrying a parse that failed on invalid UTF-8 (nginx's `escape=json` passes high bytes raw) on
+a lossy copy, failure path only. See [ADR `http-access-normalization`](docs/adr/http-access-normalization.md),
+[docs/http-access-logs.md](docs/http-access-logs.md) (the operator-facing schema, with a snippet
+per server), and [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml).
 
 ## Environment
 
@@ -496,7 +516,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

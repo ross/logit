@@ -89,11 +89,18 @@ straight to Loki — no relay service in between,
 stages also mint a real `SpanRecord` on the same event** (`span:`,
 `../docs/adr/trace-context-span-lifting.md`) — the access line's own start/end/duration become a
 server span, so those two tiers get a real trace span from their existing log line, no new
-telemetry SDK required. Those spans are filtered out and sent to Tempo (see below); the log side of
-the same event continues on to the metrics leg — nginx's own chain adds a `scale` step first,
-converting `request_time` from seconds to milliseconds so it shares a measurement and a unit with
-haproxy's already-millisecond `%Tr` (`../docs/adr/scale-transform.md`) — before each tier's own
-`kv_metrics` (`nginx_metrics`/`haproxy_metrics`) fans into a shared `keep` → `aggregate` →
+telemetry SDK required. Both tiers log raw OTel semconv attribute names (haproxy's dashed, since
+`%{+json}o` can't write a `.`), and an `http_access` stage ahead of each `trace_context`
+(`haproxy_http`/`nginx_http`, `../docs/adr/http-access-normalization.md`) normalizes them and
+derives a bounded `http.route` from a shared `routes:` block — so **the server spans are named
+`GET /work`, `GET /{probe}` (`/health`), `GET /{asset}` (`/graph.svg`), `GET /`, `GET /boom`, and
+`GET /{other}` (`/missing`)**, never the raw path, and on both the `haproxy` and `nginx` services
+alike. Their `span.status` follows semconv: **error** on a 5xx (`/boom`, `/work`'s occasional
+`503`), and **unset — not `ok`** — on anything else, a `404` included, so a TraceQL `{status=ok}`
+finds none of them. Those spans are filtered out and sent to Tempo (see below); the log side of
+the same event continues on to the metrics leg — `http_access` has already put both tiers'
+durations in seconds (`http.request.duration_s`), so no `scale` step sits in either chain any more
+— before each tier's own `kv_metrics` (`nginx_metrics`/`haproxy_metrics`) fans into a shared `keep` → `aggregate` →
 `influxdb_out` tail, told apart in InfluxDB by the `service.name` tag each tier's `set` already
 stamped. `logit` also observes its own pipeline via `internal`
 (`../docs/design/internal-telemetry.md`) into that same InfluxDB bucket *and*, as real spans, over
@@ -152,8 +159,8 @@ the chain partway rather than from the front door, and the resulting `nginx` ser
 `logit`-minted, from the same Docker json-file log) becomes a genuine subtree under `app`'s own
 `requests` CLIENT span rather than a second top-level branch. Two honest side effects worth
 knowing rather than being surprised by: `nginx`'s `web.requests` counter now runs roughly double
-`haproxy`'s (it serves this inner hop too), and its `host` tag gains a second value — `nginx`
-itself, from `proxy_set_header Host $host` on a request whose `Host` genuinely is `nginx`.
+`haproxy`'s (it serves this inner hop too), and its `server.address` tag gains a second value —
+`nginx` itself, from `proxy_set_header Host $host` on a request whose `Host` genuinely is `nginx`.
 `traffic`'s own loop (`compose.yaml`) drives all of this — weighted toward `/work`, since a
 guaranteed `500` on every cycle would swamp the dashboard's error panel.
 

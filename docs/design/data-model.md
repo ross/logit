@@ -268,6 +268,21 @@ shape section). These are read locally from the sibling `config.v2.json` at open
 container, never re-read afterward — a `docker rename` after that point is a known gap
 ([docs/known-gaps.md](../known-gaps.md)).
 
+### HTTP access-log names
+
+The canonical table of HTTP attribute names — the OTel semconv names a web server's access line
+is logged under, `logit`'s own composites and proxy fields, and what `http_access` does to each —
+is [`docs/http-access-logs.md`](../http-access-logs.md), not this document
+([ADR `http-access-normalization`](../adr/http-access-normalization.md)). Its one overlap with the
+trace/span table above: `http_access` *emits* `span.name` (`{method} {route}`), `span.status`
+(`error` for a 5xx or `0` status, `unset` otherwise, never `ok`), and `span.duration_s`
+(mirrored from the request duration unless the line already states a span duration, or both a
+start and an end), which `trace_context` then reads exactly as documented above. `http_access`
+also accepts every trace/span name in that table spelled with each `.` replaced by `-`
+(`trace-id`, `span-parent_id`, `span-start_us`) and renames it to the dotted spelling, for
+emitters whose key grammar forbids a dot (HAProxy's `%{+json}o`); `trace_context` itself only
+ever reads the dotted names, so the dashed spelling works only with `http_access` ahead of it.
+
 ## Record types
 
 The three record types an event can independently carry ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) —

@@ -12,6 +12,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | ADR | Created | Updated |
 |---|---|---|
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-09-22 |
+| [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
 | [Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change](out-of-ci-unsafe-verification.md) | 2026-09-21 | 2026-09-21 |
 | [`flatten`: dotted-key expansion as an opt-in, operator-placed transform](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Event sizing: `AttrMap`'s inline capacity stays 8, and attribute maps are not pre-sized](event-sizing-and-allocation-strategy.md) | 2026-09-21 | 2026-09-21 |
@@ -56,7 +57,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-09-21 |
 | [`trace_context` grows a `span:` block, and a native `traceparent` parser](trace-context-span-lifting.md) | 2026-09-04 | 2026-09-18 |
 | [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-09-14 |
-| [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-09-03 |
+| [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-09-22 |
 | [`LogRecord` gains a native application trace/span reference](log-record-trace-context.md) | 2026-09-03 | 2026-09-18 |
 | [Operator-declared resource attributes: a `set` transform, not a per-input config field](operator-declared-resource-attributes.md) | 2026-09-03 | 2026-09-15 |
 | [`otlp_out`/`otlp_in` gzip: client never accepts a compressed response, server bounds decompressed size](otlp-compression-and-decompression-bounds.md) | 2026-09-03 | 2026-09-03 |
@@ -80,7 +81,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | [`kv_metrics`: skip rules, numeric coercion, and no `tags:` field](kv-metrics-semantics.md) | 2026-08-30 | 2026-08-30 |
 | [Configuration: a component graph, not inputs/outputs/pipelines](component-graph-configuration.md) | 2026-08-29 | 2026-09-13 |
 | [`aggregate` transform: tumbling windows, pass-through, and the flush-tick contract](aggregation-window-semantics.md) | 2026-08-29 | 2026-09-15 |
-| [`json` transform: structured attributes, additive, pass-through on failure](json-parsing-into-attributes.md) | 2026-08-29 | 2026-08-30 |
+| [`json` transform: structured attributes, additive, pass-through on failure](json-parsing-into-attributes.md) | 2026-08-29 | 2026-09-22 |
 | [Secrets in config: a general `!env` YAML tag, not per-field `*_env` indirection](env-yaml-tag.md) | 2026-08-29 | 2026-08-30 |
 | [Preserving `Value` variant identity across a Lua round-trip](lua-value-identity-preservation.md) | 2026-08-29 | 2026-08-29 |
 | [Configuration: YAML with a generated JSON Schema](config-yaml-jsonschema.md) | 2026-08-28 | 2026-09-11 |

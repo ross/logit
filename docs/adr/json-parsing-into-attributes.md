@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-08-30
+updated: 2026-09-22
 ---
 
 # `json` transform: structured attributes, additive, pass-through on failure
@@ -128,3 +128,19 @@ and behaves exactly as the additive design above already implies**: `json` only 
 completely unaffected, whether the log half parses successfully or not. No new code path was needed
 for this — see `a_log_event_that_also_carries_a_metric_is_parsed_and_keeps_its_metric`
 (`crates/logit-transforms/src/json.rs`) for the regression test proving it.
+
+## Amendment (2026-09-22): an opt-in `invalid_utf8: replace`
+
+`json` has always treated a message that is not valid UTF-8 as a parse failure: `serde_json`
+rejects the string, the event passes through untouched, and one throttled `parse_failure` is
+counted. That stays the default (`invalid_utf8: reject`). [ADR
+`http-access-normalization`](http-access-normalization.md) adds the alternative, `replace`: on the
+failure path only, a buffer that `std::str::from_utf8` rejects is copied with every invalid
+sequence replaced by U+FFFD and parsed again, counted and diagnosed once under the key
+`invalid_utf8` (the same key `csv` already uses for its own UTF-8 gate). A line that is valid
+UTF-8 but malformed JSON is never retried, and a retry that fails too reports the ordinary
+`parse_failure`. Nothing changes for a line that parses as it arrived, so `json`'s allocation
+pins in `docs/design/memory.md` are unaffected. Every `Value::Str` a retry produces is a slice of
+the repaired copy, never of the original bytes, which is what keeps `Str`'s valid-UTF-8 invariant
+intact. The case it exists for is nginx's `escape=json`, which passes bytes `>= 0x80` through raw
+— one client with a Latin-1 `User-Agent` otherwise loses the whole access line.

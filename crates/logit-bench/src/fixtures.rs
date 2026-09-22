@@ -32,8 +32,8 @@ use logit_proto::prometheus::{PrometheusDecoder, PrometheusEncoder};
 use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
-    JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec, Normalize, RegexParser, Set,
-    Shape,
+    HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec,
+    Normalize, RegexParser, RouteRule, RouteSet, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -2066,4 +2066,177 @@ pub fn enriched_resource_batch() -> EventBatch {
         scope: None,
         events: (0..5).map(otlp_log_record_event).collect(),
     }
+}
+
+// -------------------------------------------------------------------------------------------
+// http_access (docs/adr/http-access-normalization.md)
+// -------------------------------------------------------------------------------------------
+
+/// One realistic nginx access line, shaped as the JSON `examples/nginx/nginx.conf` will carry
+/// after hacc/w5 -- semconv attribute names, straight off the wire, with a mix of atomic and
+/// composite fields exercising most of `http_access`'s steps at once: a raw `url.original`
+/// (composite), a string-encoded status and a bare-numeric one side by side, an `_s`-suffixed
+/// duration already in its target unit, an upstream leg, a real W3C `traceparent`, and a real
+/// Chrome desktop User-Agent (`http_access.rs`'s corpus-verified browser row). Values are
+/// hand-written, not captured -- no field depends on a running nginx.
+pub const HTTP_ACCESS_SEMCONV_LINE: &str = concat!(
+    r#"{"http.request.method":"GET","#,
+    r#""url.original":"/api/v1/orders?page=2&limit=20","#,
+    r#""url.scheme":"https","#,
+    r#""network.protocol.version":"HTTP/1.1","#,
+    r#""http.response.status_code":"200","#,
+    r#""http.response.body.size":612,"#,
+    r#""http.request.size":348,"#,
+    r#""http.request.duration_s":0.084,"#,
+    r#""server.address":"api.example.com","#,
+    r#""client.address":"203.0.113.42","#,
+    r#""user_agent.original":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36","#,
+    r#""http.request.header.referer":"https://example.com/dashboard","#,
+    r#""upstream.address":"10.0.0.5:8080","#,
+    r#""upstream.status":"200","#,
+    r#""upstream.duration_s":"0.012","#,
+    r#""traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","#,
+    r#""span.end_s":"1758000000.123"}"#
+);
+
+/// [`HTTP_ACCESS_SEMCONV_LINE`] with every key in its dashed spelling (`url-original`,
+/// `http-response-status_code`, ...) -- same values, same order -- for
+/// [`http_access_dashed_event`]. `traceparent` has no `.` to dash, so it's unchanged; it isn't one
+/// of `http_access`'s own names anyway (`trace_context` reads it directly).
+pub const HTTP_ACCESS_DASHED_LINE: &str = concat!(
+    r#"{"http-request-method":"GET","#,
+    r#""url-original":"/api/v1/orders?page=2&limit=20","#,
+    r#""url-scheme":"https","#,
+    r#""network-protocol-version":"HTTP/1.1","#,
+    r#""http-response-status_code":"200","#,
+    r#""http-response-body-size":612,"#,
+    r#""http-request-size":348,"#,
+    r#""http-request-duration_s":0.084,"#,
+    r#""server-address":"api.example.com","#,
+    r#""client-address":"203.0.113.42","#,
+    r#""user_agent-original":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36","#,
+    r#""http-request-header-referer":"https://example.com/dashboard","#,
+    r#""upstream-address":"10.0.0.5:8080","#,
+    r#""upstream-status":"200","#,
+    r#""upstream-duration_s":"0.012","#,
+    r#""traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","#,
+    r#""span-end_s":"1758000000.123"}"#
+);
+
+/// [`HTTP_ACCESS_SEMCONV_LINE`] with `user_agent.original` carrying one raw control byte (a JSON
+/// `\u0001` escape, so `json` decodes it into a real `0x01` byte, not the two-character text
+/// `\u0001`) -- the one case `http_access`'s step 7 clean can't slice, for
+/// [`http_access_event_with_control_byte`].
+pub const HTTP_ACCESS_CONTROL_BYTE_LINE: &str = concat!(
+    r#"{"http.request.method":"GET","#,
+    r#""url.original":"/api/v1/orders?page=2&limit=20","#,
+    r#""url.scheme":"https","#,
+    r#""network.protocol.version":"HTTP/1.1","#,
+    r#""http.response.status_code":"200","#,
+    r#""http.response.body.size":612,"#,
+    r#""http.request.size":348,"#,
+    r#""http.request.duration_s":0.084,"#,
+    r#""server.address":"api.example.com","#,
+    r#""client.address":"203.0.113.42","#,
+    r#""user_agent.original":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36\u0001","#,
+    r#""http.request.header.referer":"https://example.com/dashboard","#,
+    r#""upstream.address":"10.0.0.5:8080","#,
+    r#""upstream.status":"200","#,
+    r#""upstream.duration_s":"0.012","#,
+    r#""traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","#,
+    r#""span.end_s":"1758000000.123"}"#
+);
+
+/// [`HTTP_ACCESS_SEMCONV_LINE`], already parsed: a bare log event whose message is the fixture
+/// line, run through the real [`JsonParser`] exactly once, the way a real
+/// `syslog_in -> json -> http_access` pipeline would hand `http_access` its input -- so every
+/// string-valued attribute is a zero-copy `Bytes` slice of the JSON body, not a freshly built
+/// `Value::str`.
+pub fn http_access_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    let mut event = Event::log(
+        1_758_000_000,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(HTTP_ACCESS_SEMCONV_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    );
+    assert!(json_parser().process(&resource(), &mut event), "fixture line must parse as JSON");
+    event
+}
+
+/// [`http_access_event`]'s twin, parsed from [`HTTP_ACCESS_DASHED_LINE`] instead -- every field
+/// under its dashed alias, for measuring `http_access`'s de-alias step
+/// (`http_access_normalizes_a_dashed_line_warm`).
+pub fn http_access_dashed_event() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    let mut event = Event::log(
+        1_758_000_000,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(HTTP_ACCESS_DASHED_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    );
+    assert!(json_parser().process(&resource(), &mut event), "fixture line must parse as JSON");
+    event
+}
+
+/// [`http_access_event`]'s twin, parsed from [`HTTP_ACCESS_CONTROL_BYTE_LINE`] instead -- the one
+/// `user_agent.original` byte `http_access`'s cap-and-clean step must rewrite
+/// (`http_access_cleans_a_control_byte`).
+pub fn http_access_event_with_control_byte() -> Event {
+    static MESSAGE: OnceLock<Bytes> = OnceLock::new();
+    let mut event = Event::log(
+        1_758_000_000,
+        AttrMap::new(),
+        LogRecord {
+            message: Value::Str(cached_message(HTTP_ACCESS_CONTROL_BYTE_LINE, &MESSAGE)),
+            severity: None,
+            body_format: BodyFormat::Raw,
+            trace: None,
+            event_name: None,
+            observed_timestamp: 0,
+            dropped_attributes_count: 0,
+        },
+    );
+    assert!(json_parser().process(&resource(), &mut event), "fixture line must parse as JSON");
+    event
+}
+
+/// `http_access` at the demo's configuration: the two builtin route sets, two operator patterns
+/// (`/work`, `/`), a catch-all `route_other`, and the full `logit_config::CAPPED_FIELDS` cap list
+/// -- `logit-bench` depends on `logit-config` (its `Cargo.toml`), unlike `logit-transforms`
+/// itself, so this resolves caps the same way `logit-cli`'s `to_http_access_config` does, straight
+/// off the real defaults rather than a copy. Nothing else configured: no user-agent rules, no
+/// extra `redact_query`, `trust_forwarded: false`.
+pub fn http_access() -> HttpAccess {
+    let config = HttpAccessConfig {
+        routes: vec![
+            RouteRule::Builtin(RouteSet::Probes),
+            RouteRule::Builtin(RouteSet::Assets),
+            RouteRule::Pattern { pattern: "^/work$".to_string(), route: "/work".to_string() },
+            RouteRule::Pattern { pattern: "^/$".to_string(), route: "/".to_string() },
+        ],
+        route_other: Some("/{other}".to_string()),
+        user_agent_rules: vec![],
+        max_length: logit_config::CAPPED_FIELDS
+            .iter()
+            .map(|(field, cap)| (field.to_string(), *cap))
+            .collect(),
+        redact_query: vec![],
+        trust_forwarded: false,
+    };
+    HttpAccess::new(config).expect("fixture patterns should compile")
 }

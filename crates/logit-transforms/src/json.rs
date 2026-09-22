@@ -28,6 +28,7 @@ pub struct JsonParser {
     /// after the object closes. Off by default: the whole line is assumed to be the JSON data,
     /// and trailing non-whitespace after it is a parse failure.
     skip_to_brace: bool,
+    invalid_utf8: InvalidUtf8,
     diag: Diagnostics,
     /// Scratch buffer the top-level object's key/value pairs are parsed into, reused across
     /// events instead of a fresh `AttrMap` built by `deserialize` on every call (mirroring
@@ -46,14 +47,35 @@ pub struct JsonParser {
     keys: KeyCache,
 }
 
+/// Mirrors `logit_config::JsonInvalidUtf8` -- `logit-transforms` deliberately doesn't depend on
+/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the same
+/// pattern `keep_values::Normalize` follows. What [`JsonParser`] does with a message that is not
+/// valid UTF-8; see `docs/adr/http-access-normalization.md` for why `Replace` exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InvalidUtf8 {
+    /// The parse fails and the event passes through untouched -- the strict behaviour `json` has
+    /// always had.
+    #[default]
+    Reject,
+    /// Retry a failed parse on a copy with every invalid sequence replaced by U+FFFD. Failure
+    /// path only: a message that parses as it arrived never pays for the check or the copy.
+    Replace,
+}
+
 impl JsonParser {
     pub fn new(skip_to_brace: bool) -> Self {
         Self {
             skip_to_brace,
+            invalid_utf8: InvalidUtf8::Reject,
             diag: Diagnostics::default(),
             scratch: Vec::new(),
             keys: KeyCache::new(),
         }
+    }
+
+    pub fn with_invalid_utf8(mut self, invalid_utf8: InvalidUtf8) -> Self {
+        self.invalid_utf8 = invalid_utf8;
+        self
     }
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
@@ -97,6 +119,35 @@ impl Transform for JsonParser {
             parse_object_prefix(&body, &mut self.scratch, &mut self.keys)
         } else {
             parse_object(&body, &mut self.scratch, &mut self.keys)
+        };
+        // `Replace` costs nothing until a parse has already failed: only then is the buffer
+        // checked, and only a buffer that really is invalid UTF-8 is copied and retried. The
+        // repaired copy is a fresh `Bytes`, so every zero-copy `Value::Str` the retry produces
+        // borrows *it* rather than the original message (`borrowed_str_bytes`) -- which is what
+        // keeps `Value::Str`'s valid-UTF-8 invariant intact: nothing minted here can point back
+        // into the bytes that failed. A second failure means the line was malformed in some
+        // other way too and falls through to the ordinary `parse_failure` path below.
+        let parsed = match parsed {
+            Err(_)
+                if self.invalid_utf8 == InvalidUtf8::Replace
+                    && std::str::from_utf8(&body).is_err() =>
+            {
+                self.scratch.clear();
+                let repaired = Bytes::from(String::from_utf8_lossy(&body).into_owned());
+                let retried = if self.skip_to_brace {
+                    parse_object_prefix(&repaired, &mut self.scratch, &mut self.keys)
+                } else {
+                    parse_object(&repaired, &mut self.scratch, &mut self.keys)
+                };
+                if retried.is_ok() {
+                    self.diag.warn_throttled(
+                        "invalid_utf8",
+                        "message is not valid UTF-8; parsed after replacing invalid sequences with U+FFFD",
+                    );
+                }
+                retried
+            }
+            other => other,
         };
         match parsed {
             Ok(()) => {
@@ -383,6 +434,7 @@ fn collect_attrmap<'de, A: MapAccess<'de>>(
 mod tests {
     use super::*;
     use logit_core::interner::{self, intern, resolve};
+    use logit_core::Registry;
     use logit_core::{BodyFormat, LogRecord, MetricKind, MetricRecord, SpanEvent, SpanKind};
     use logit_core::{SpanRecord, SpanStatus};
 
@@ -404,6 +456,26 @@ mod tests {
 
     fn message_of(event: &Event) -> &Value {
         &event.log.as_ref().expect("event should carry a log").message
+    }
+
+    /// A log whose message is raw bytes rather than a `Str` -- what `syslog_in` hands over for a
+    /// datagram whose MSG isn't valid UTF-8 (`crates/logit-inputs/src/syslog.rs`).
+    fn bytes_log_event(message: &'static [u8]) -> Event {
+        let mut event = log_event("");
+        event.log.as_mut().unwrap().message = Value::Bytes(Bytes::from_static(message));
+        event
+    }
+
+    /// The `key` of every `logit.component.diagnostics` point mirrored into `registry` --
+    /// `Diagnostics::warn_throttled` counts every occurrence, throttled or not. `Registry::drain`
+    /// *takes* the buffered points, so a test drains exactly once and asserts both what fired
+    /// and what didn't against this one result; a second drain would always see nothing.
+    fn fired_diagnostics(registry: &Registry) -> Vec<String> {
+        registry
+            .drain(0)
+            .iter()
+            .filter_map(|e| e.attributes.get("key").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect()
     }
 
     fn default_resource() -> Arc<Resource> {
@@ -518,6 +590,91 @@ mod tests {
         assert!(parser.process(&resource, &mut event), "log events pass through");
         assert!(event.attributes.is_empty());
         assert_eq!(message_of(&event), &Value::str(r#"{"a":}"#));
+    }
+
+    /// nginx's `escape=json` passes bytes >= 0x80 through raw, so a Latin-1 `User-Agent` puts
+    /// a lone 0xE9 (`é`) inside a JSON string. Under the default `Reject` that is a parse failure
+    /// for the whole line, exactly as before this field existed.
+    #[test]
+    fn invalid_utf8_inside_a_string_is_rejected_by_default() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("json", "json", "transform");
+        let mut parser = JsonParser::new(false)
+            .with_diagnostics(Diagnostics::new("json").with_telemetry(telemetry));
+        let resource = default_resource();
+        let mut event = bytes_log_event(b"{\"ua\":\"caf\xe9 client\",\"status\":200}");
+        assert!(parser.process(&resource, &mut event), "always forwards");
+        assert!(event.attributes.is_empty(), "nothing parsed under Reject");
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
+    }
+
+    #[test]
+    fn invalid_utf8_replace_parses_the_line_with_the_bad_byte_replaced() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("json", "json", "transform");
+        let mut parser = JsonParser::new(false)
+            .with_invalid_utf8(InvalidUtf8::Replace)
+            .with_diagnostics(Diagnostics::new("json").with_telemetry(telemetry));
+        let resource = default_resource();
+        let mut event = bytes_log_event(b"{\"ua\":\"caf\xe9 client\",\"status\":200}");
+        assert!(parser.process(&resource, &mut event), "always forwards");
+        assert_eq!(attr(&event, "ua"), Some(&Value::str("caf\u{FFFD} client")));
+        assert_eq!(attr(&event, "status"), Some(&Value::U64(200)));
+        // The message itself is left exactly as it arrived -- only `attributes` is written.
+        assert_eq!(
+            message_of(&event),
+            &Value::Bytes(Bytes::from_static(b"{\"ua\":\"caf\xe9 client\",\"status\":200}"))
+        );
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "parse_failure"), "the retry succeeded: {fired:?}");
+    }
+
+    /// The `Replace` retry is gated on the buffer actually being invalid UTF-8: a line that is
+    /// valid UTF-8 but malformed JSON takes the ordinary `parse_failure` path with no retry.
+    #[test]
+    fn invalid_utf8_replace_does_not_retry_a_valid_utf8_parse_failure() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("json", "json", "transform");
+        let mut parser = JsonParser::new(false)
+            .with_invalid_utf8(InvalidUtf8::Replace)
+            .with_diagnostics(Diagnostics::new("json").with_telemetry(telemetry));
+        let resource = default_resource();
+        let mut event = log_event(r#"{"a":}"#);
+        assert!(parser.process(&resource, &mut event));
+        assert!(event.attributes.is_empty());
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
+    }
+
+    /// Invalid UTF-8 *and* malformed JSON: the retry fails too, and the line reports the
+    /// ordinary parse failure rather than claiming a repair it didn't make.
+    #[test]
+    fn invalid_utf8_replace_falls_through_to_parse_failure_when_the_json_is_also_broken() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("json", "json", "transform");
+        let mut parser = JsonParser::new(false)
+            .with_invalid_utf8(InvalidUtf8::Replace)
+            .with_diagnostics(Diagnostics::new("json").with_telemetry(telemetry));
+        let resource = default_resource();
+        let mut event = bytes_log_event(b"{\"ua\":\"caf\xe9\",");
+        assert!(parser.process(&resource, &mut event));
+        assert!(event.attributes.is_empty());
+        let fired = fired_diagnostics(&registry);
+        assert!(fired.iter().any(|k| k == "parse_failure"), "{fired:?}");
+        assert!(!fired.iter().any(|k| k == "invalid_utf8"), "{fired:?}");
+    }
+
+    #[test]
+    fn invalid_utf8_replace_works_with_skip_to_brace() {
+        let mut parser = JsonParser::new(true).with_invalid_utf8(InvalidUtf8::Replace);
+        let resource = default_resource();
+        let mut event = bytes_log_event(b"INFO {\"k\":\"\xff\"} trailing");
+        assert!(parser.process(&resource, &mut event));
+        assert_eq!(attr(&event, "k"), Some(&Value::str("\u{FFFD}")));
     }
 
     #[test]

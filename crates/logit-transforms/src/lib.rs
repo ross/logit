@@ -5,14 +5,15 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, and `route` are implemented (`rename`/
-//! `filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
+//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, and `route` are
+//! implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
 //! `docs/adr/routing-by-condition-is-lua.md`).
 
 mod aggregate;
 mod attributes;
 mod csv;
 mod flatten;
+mod http_access;
 mod json;
 mod keep;
 mod keep_values;
@@ -33,7 +34,8 @@ pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use flatten::{Arrays, Fields, Flatten};
-pub use json::JsonParser;
+pub use http_access::{HttpAccess, HttpAccessConfig, RouteRule, RouteSet, UaRule};
+pub use json::{InvalidUtf8, JsonParser};
 pub use keep::{Keep, Remove};
 pub use keep_values::{ClampConfig, KeepValues, Normalize};
 pub use kv_metrics::{KvMetrics, MetricSpec};
@@ -249,7 +251,9 @@ mod value_matches_tests {
 mod chained_pipeline_test {
     use super::*;
     use logit_core::interner::resolve;
-    use logit_core::{AttrMap, BodyFormat, Event, LogRecord, MetricKind, Resource, Value};
+    use logit_core::{
+        AttrMap, BodyFormat, Event, LogRecord, MetricKind, Resource, SpanKind, SpanStatus, Value,
+    };
     use logit_pipeline::Transform;
     use std::sync::Arc;
     use std::time::Duration;
@@ -258,9 +262,9 @@ mod chained_pipeline_test {
     /// aggregate` chain fed one synthetic nginx-shaped log event produces correctly-tagged
     /// counter/gauge/distribution metrics and nothing else -- specifically, that the tags
     /// surviving into `aggregate`'s `SeriesKey` are exactly what `keep` named, that `scale`'s
-    /// unit conversion (seconds -> milliseconds, matching `demo/logit.yaml`'s `nginx_scale`) has
-    /// already happened by the time `kv_metrics` reads `request_time`, and that a junk `host` --
-    /// exactly the reference example's motivating case
+    /// unit conversion (seconds -> milliseconds) has already happened by the time `kv_metrics`
+    /// reads `request_time`, and that a junk `host` -- exactly the reference example's motivating
+    /// case
     /// (`docs/adr/value-allowlist-cardinality-clamp.md`) -- collapses into one `other`-tagged
     /// series rather than a series of its own. This is what proves `keep`'s documented placement
     /// ahead of `aggregate` (`crate::keep`'s module doc comment,
@@ -395,6 +399,235 @@ mod chained_pipeline_test {
                     }
                     other => panic!("expected Distribution, got {other:?}"),
                 },
+                other => panic!("unexpected series name: {other}"),
+            }
+        }
+    }
+
+    /// The `http_access` workstream's end-to-end chain (`docs/plans/http-access-normalization.md`'s
+    /// W6): `json -> http_access -> trace_context -> kv_metrics -> keep -> aggregate`, with
+    /// `http_access` configured exactly as `demo/logit.yaml`'s `nginx_http` and `keep` holding
+    /// exactly `demo/logit.yaml`'s `trimmed` list. Proves the three claims the demo rests on: the
+    /// normalized semconv attributes (an *integer* `http.response.status_code`, a *config-derived*
+    /// `http.route`, a *classified* `user_agent.class`) are what survive into `aggregate`'s series
+    /// tags; `trace_context` mints its span *named by* `http_access` (`GET /{other}`, never the raw
+    /// path, and never the `span:` block's fallback) with semconv's `Unset` status on a `200`, not
+    /// `Ok`; and the request duration `kv_metrics` reads is already seconds, with no `scale` stage
+    /// anywhere in the chain.
+    #[test]
+    fn json_http_access_trace_context_kv_metrics_keep_aggregate_chain_produces_semconv_series_and_a_named_span(
+    ) {
+        let resource = Arc::new(Resource::default());
+
+        // `crates/logit-bench/src/fixtures.rs`'s `HTTP_ACCESS_SEMCONV_LINE`, copied verbatim (this
+        // crate can't depend on `logit-bench`): one realistic nginx access line shaped as
+        // `examples/nginx/nginx.conf`'s `access_semconv` log_format -- semconv attribute names,
+        // straight off the wire, a string-encoded status, an `_s` duration already in its target
+        // unit, an upstream leg, a real W3C `traceparent`, and a real Chrome desktop User-Agent.
+        // Values are hand-written, not captured -- no field depends on a running nginx.
+        let raw = concat!(
+            r#"{"http.request.method":"GET","#,
+            r#""url.original":"/api/v1/orders?page=2&limit=20","#,
+            r#""url.scheme":"https","#,
+            r#""network.protocol.version":"HTTP/1.1","#,
+            r#""http.response.status_code":"200","#,
+            r#""http.response.body.size":612,"#,
+            r#""http.request.size":348,"#,
+            r#""http.request.duration_s":0.084,"#,
+            r#""server.address":"api.example.com","#,
+            r#""client.address":"203.0.113.42","#,
+            r#""user_agent.original":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36","#,
+            r#""http.request.header.referer":"https://example.com/dashboard","#,
+            r#""upstream.address":"10.0.0.5:8080","#,
+            r#""upstream.status":"200","#,
+            r#""upstream.duration_s":"0.012","#,
+            r#""traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","#,
+            r#""span.end_s":"1758000000.123"}"#
+        );
+        // Receipt time at the line's own `span.end_s`, so `trace_context`'s skew window accepts it.
+        let receipt = 1_758_000_000_123_000_000;
+        let mut event = Event::log(
+            receipt,
+            AttrMap::new(),
+            LogRecord {
+                message: Value::str(raw),
+                severity: None,
+                body_format: BodyFormat::Raw,
+                trace: None,
+                event_name: None,
+                observed_timestamp: 0,
+                dropped_attributes_count: 0,
+            },
+        );
+
+        let mut json = JsonParser::new(false);
+        assert!(json.process(&resource, &mut event), "json always forwards");
+        assert_eq!(
+            event.attributes.get("http.response.status_code"),
+            Some(&Value::str("200")),
+            "the producer's status arrives as a string -- http_access is what makes it an integer"
+        );
+
+        // http_access, configured as `demo/logit.yaml`'s `nginx_http` (and `haproxy_http`).
+        let pattern = |pattern: &str, route: &str| RouteRule::Pattern {
+            pattern: pattern.to_string(),
+            route: route.to_string(),
+        };
+        let mut http = HttpAccess::new(HttpAccessConfig {
+            routes: vec![
+                RouteRule::Builtin(RouteSet::Probes),
+                RouteRule::Builtin(RouteSet::Assets),
+                pattern("^/$", "/"),
+                pattern("^/work$", "/work"),
+                pattern("^/boom$", "/boom"),
+                pattern("^/inner$", "/inner"),
+            ],
+            route_other: Some("/{other}".to_string()),
+            max_length: vec![("url.path".to_string(), 256), ("server.address".to_string(), 253)],
+            ..HttpAccessConfig::default()
+        })
+        .expect("the demo's route patterns compile");
+        assert!(http.process(&resource, &mut event), "http_access always forwards");
+        assert_eq!(event.attributes.get("http.response.status_code"), Some(&Value::I64(200)));
+        assert_eq!(event.attributes.get("url.path"), Some(&Value::str("/api/v1/orders")));
+        assert_eq!(
+            event.attributes.get("http.route"),
+            Some(&Value::str("/{other}")),
+            "no demo route matches an API path, so route_other's literal applies"
+        );
+        assert_eq!(event.attributes.get("user_agent.class"), Some(&Value::str("browser")));
+        assert_eq!(event.attributes.get("network.protocol.version"), Some(&Value::str("1.1")));
+
+        // trace_context, as `examples/nginx-to-influxdb.yaml`'s `nginx_trace`: the convention
+        // field names, a server span, and `mint_id` since the line carries only the inbound
+        // `traceparent` (whose span id is this span's *parent*, never its own).
+        let mut trace = TraceContext::new(
+            "trace.id".to_string(),
+            Some("span.id".to_string()),
+            Some("trace.flags".to_string()),
+            false,
+        )
+        .with_span(SpanLift {
+            mint_id: true,
+            name: "http.request".to_string(),
+            kind: SpanKind::Server,
+            max_skew: Duration::from_secs(3600),
+        });
+        assert!(trace.process(&resource, &mut event), "trace_context always forwards");
+        let span = event.span.as_ref().expect("trace_context should have minted a span");
+        assert_eq!(
+            span.name,
+            Value::str("GET /{other}"),
+            "http_access's span.name wins over the span: block's fallback"
+        );
+        assert_eq!(span.status, SpanStatus::Unset, "a 200 is unset, not ok, per semconv");
+        assert_eq!(span.kind, SpanKind::Server);
+        assert_eq!(span.parent_span_id, Some([0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]));
+        assert_eq!(span.end_timestamp, receipt, "span.end_s is the line's own end");
+        assert_eq!(
+            event.timestamp,
+            receipt - 84_000_000,
+            "the start is end minus the span.duration_s http_access mirrored from the request"
+        );
+        for consumed in ["span.name", "span.status", "span.duration_s", "span.end_s", "traceparent"]
+        {
+            assert_eq!(event.attributes.get(consumed), None, "{consumed} should be consumed");
+        }
+
+        // kv_metrics, as `demo/logit.yaml`'s `nginx_metrics`: the semconv field names, the duration
+        // already in seconds.
+        let spec = |name: &str, field: Option<&str>, unit: Option<&str>| MetricSpec {
+            name: name.to_string(),
+            field: field.map(str::to_string),
+            unit: unit.map(str::to_string),
+        };
+        let mut kv = KvMetrics::new(
+            vec![
+                spec("web.requests", None, None),
+                spec("web.bytes_sent", Some("http.response.body.size"), None),
+            ],
+            vec![],
+            vec![
+                spec("web.request_time", Some("http.request.duration_s"), Some("s")),
+                spec("web.upstream_time", Some("upstream.duration_s"), Some("s")),
+            ],
+        );
+        assert!(kv.process(&resource, &mut event), "kv_metrics always forwards");
+        assert_eq!(event.metrics.len(), 4, "two counters and two distributions");
+
+        // keep, as `demo/logit.yaml`'s `trimmed`. `http.termination_state` is HAProxy-only, so
+        // absent here -- the other seven survive.
+        let trimmed = [
+            "server.address",
+            "http.request.method",
+            "http.response.status_code",
+            "http.route",
+            "network.protocol.version",
+            "url.scheme",
+            "user_agent.class",
+            "http.termination_state",
+        ];
+        let mut keep = Keep::new(trimmed.iter().map(|f| f.to_string()).collect());
+        assert!(keep.process(&resource, &mut event), "keep always forwards");
+        let expected_tags = [
+            ("server.address", Value::str("api.example.com")),
+            ("http.request.method", Value::str("GET")),
+            ("http.response.status_code", Value::I64(200)),
+            ("http.route", Value::str("/{other}")),
+            ("network.protocol.version", Value::str("1.1")),
+            ("url.scheme", Value::str("https")),
+            ("user_agent.class", Value::str("browser")),
+        ];
+        let mut expected = AttrMap::new();
+        for (key, value) in &expected_tags {
+            expected.insert(key, value.clone());
+        }
+        assert_eq!(event.attributes, expected, "exactly the seven present semconv tags survive");
+
+        // aggregate: every metric is absorbed; the log+span remainder is forwarded on its own.
+        let mut agg = Aggregator::new(Duration::from_secs(10));
+        assert!(agg.process(&resource, &mut event), "the log+span remainder should be forwarded");
+        assert!(event.metrics.is_empty(), "every metric should have been absorbed");
+        assert!(event.span.is_some(), "the span rides on untouched");
+
+        let flushed = agg.flush(receipt + 10_000_000_000);
+        assert_eq!(flushed.len(), 1, "one resource group");
+        let (_, _, events) = &flushed[0];
+        assert_eq!(events.len(), 4, "four distinct series -- nothing else");
+        for (series_event, _links) in events {
+            assert_eq!(
+                series_event.attributes, expected,
+                "every series' tags are exactly the normalized semconv set"
+            );
+            assert_eq!(series_event.metrics.len(), 1);
+            let record = &series_event.metrics[0];
+            let median = |kind: &MetricKind| match kind {
+                MetricKind::Distribution(sketch) => {
+                    assert_eq!(sketch.count(), 1);
+                    sketch.quantile(0.5).expect("single-sample sketch has a median")
+                }
+                other => panic!("expected Distribution, got {other:?}"),
+            };
+            match resolve(record.name) {
+                "web.requests" => assert!(
+                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 1.0)
+                ),
+                "web.bytes_sent" => assert!(
+                    matches!(record.kind, MetricKind::Sum(logit_core::Sum { value: v, .. }) if v == 612.0)
+                ),
+                "web.request_time" => {
+                    let q = median(&record.kind);
+                    assert!((q - 0.084).abs() < 0.001, "got {q}: seconds, not milliseconds");
+                    assert_eq!(record.unit.map(resolve), Some("s"));
+                }
+                "web.upstream_time" => {
+                    let q = median(&record.kind);
+                    assert!(
+                        (q - 0.012).abs() < 0.001,
+                        "got {q}: the quoted upstream time, coerced"
+                    );
+                    assert_eq!(record.unit.map(resolve), Some("s"));
+                }
                 other => panic!("unexpected series name: {other}"),
             }
         }

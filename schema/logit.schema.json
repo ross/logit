@@ -738,6 +738,15 @@
             "type"
           ],
           "properties": {
+            "invalid_utf8": {
+              "description": "What to do with a message that is not valid UTF-8: `reject` (the default -- the parse fails and the event passes through untouched) or `replace` (retry on a copy with every invalid sequence replaced by U+FFFD). See [`JsonInvalidUtf8`].",
+              "default": "reject",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonInvalidUtf8"
+                }
+              ]
+            },
             "skip_to_brace": {
               "description": "Skip everything before the first `{` and parse from there -- for lines with a non-JSON prefix (`2026-08-29 INFO {\"a\":1}`). Off by default: the whole line is assumed to be the JSON data.",
               "default": false,
@@ -1377,6 +1386,75 @@
               "enum": [
                 "flatten"
               ]
+            }
+          }
+        },
+        {
+          "description": "Normalizes a web server's access line, logged under raw OTel semconv attribute names, into its conformant form -- composites (`http.request.line`, `url.original`) decomposed into whichever atomic fields are absent, numerics coerced to integers (`\"000\"` becomes `0`), durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`, an unknown method rewritten to `_OTHER` with the raw value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's sensitive `url.query` values redacted, every free-text field capped and control-byte-cleaned -- plus a small, bounded derived set: `user_agent.class`, `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror `trace_context` resolves a span from. Placed between `json` and `trace_context`. Also accepts every canonical name spelled with each `.` as `-` (`url-path`, `http-request-header-x-forwarded-for`) for an emitter whose key grammar forbids dots (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.\n\nBest-effort per field, never all-or-nothing and never a dropped event: a value that doesn't parse is left exactly as it arrived and counted, while every other field is still normalized. An absent field produces nothing -- no default `url.scheme`, no invented route. Every field is optional: a bare `type: http_access` is meaningful (the built-in user-agent table and the default caps still apply), so unlike `keep_values`/`flatten` there is no \"nothing configured\" rejection. Validated by `crates/logit-pipeline/src/graph.rs` rule 60. See `docs/adr/http-access-normalization.md`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "forwarded": {
+              "description": "Present only to opt in to overwriting `client.address` from the first hop of `http.request.header.x-forwarded-for` -- off by default, since the header is client-supplied. See [`ForwardedConfig`].",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ForwardedConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "max_length": {
+              "description": "Per-field character limits overriding [`CAPPED_FIELDS`]' defaults. A key must name a field in that list -- rule 60 rejects anything else, and a limit of `0`.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "format": "uint",
+                "minimum": 0.0
+              }
+            },
+            "redact_query": {
+              "description": "Extra `url.query` keys whose values are replaced with `REDACTED`, beyond semconv's seven (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`, `X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`). Matched ASCII-case-insensitively.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "route_other": {
+              "description": "The `http.route` written when no rule matches. Absent (the default) writes no route at all, and `span.name` is the method alone.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "routes": {
+              "description": "Ordered rules classifying the (capped) `url.path` into `http.route`, first match wins -- each either a named built-in set or a regex paired with a *literal* route value, never a capture, so the route set stays bounded by construction. See [`HttpRouteRule`].",
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/HttpRouteRule"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "http_access"
+              ]
+            },
+            "user_agent_rules": {
+              "description": "Extra user-agent classes, tried in order *before* the built-in scanner/tool/crawler/browser table -- the built-in table can be pre-empted, never disabled. See [`UserAgentRule`].",
+              "default": [],
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/UserAgentRule"
+              }
             }
           }
         },
@@ -2325,6 +2403,17 @@
         }
       ]
     },
+    "ForwardedConfig": {
+      "description": "`ComponentKind::HttpAccess`'s `forwarded` block. `trust: true` (the default once the block is present at all) overwrites `client.address` with the first hop of `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy list or hop count (`docs/known-gaps.md`). `trust: false` is rejected by `crates/logit-pipeline/src/graph.rs` rule 60 -- omit the block instead, so there is one spelling of \"off\". See `docs/adr/http-access-normalization.md`.",
+      "type": "object",
+      "properties": {
+        "trust": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "GenerateEvent": {
       "description": "The event template [`ComponentKind::GenerateIn`] renders per generated event. Every field defaults, so an omitted `event:` block generates the cheapest event there is: a timestamp, the configured resource, and nothing else -- which is exactly what a \"runtime floor\" scenario wants to measure.\n\n`log` and every value in `attributes` (and [`GenerateMetric::name`]) are **templates**: `{seq}` renders the generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the knob that gives a scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal brace, which a JSON log body needs (`docs/plans/load-test-harness.md`, `logit_core::template`). A field with no placeholder in it is rendered **once**, at construction, and the resulting bytes are cloned onto every event -- a refcount bump, not a copy -- so placeholders are for cardinality, never decoration: each one costs a rendering and a copy per event.",
       "type": "object",
@@ -2440,6 +2529,67 @@
         "udp"
       ]
     },
+    "HttpRouteRule": {
+      "description": "One entry of `ComponentKind::HttpAccess`'s `routes` list: **exactly** a `builtin` set, or a `match` regex together with the literal `route` it assigns. One flat struct with three optional fields rather than an untagged enum, deliberately: serde's untagged failure is \"did not match any variant\" with no pointer at the offending key, whereas `crates/logit-pipeline/src/graph.rs` rule 60 can name exactly which half is missing or which extra key is present. The `match` pattern is tested (`is_match`, unanchored unless the pattern anchors itself) against the capped `url.path`; `route` is written verbatim -- never a capture group, so every `http.route` value comes from config. See `docs/adr/http-access-normalization.md`.",
+      "type": "object",
+      "properties": {
+        "builtin": {
+          "description": "A named built-in route set, expanded in place at this position in the list.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HttpRouteSet"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "match": {
+          "description": "A regex over the capped `url.path`, compiled at validate time (rule 60).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "description": "The literal `http.route` value a matching `match` assigns.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpRouteSet": {
+      "description": "The three built-in route sets an [`HttpRouteRule`] can name, each mapping to one fixed route value -- `/{asset}`, `/{well-known}`, `/{probe}`. The member patterns live in `logit-transforms`' `http_access` module; the sets and their route values are fixed by `docs/plans/http-access-normalization.md`.",
+      "oneOf": [
+        {
+          "description": "Static files by extension (`.css`, `.js`, `.png`, `.woff2`, ...) -- `/{asset}`. No `json`/`xml`/`txt`/`csv`: those are routinely API responses.",
+          "type": "string",
+          "enum": [
+            "assets"
+          ]
+        },
+        {
+          "description": "`/.well-known/*`, `robots.txt`, `favicon.ico`, sitemaps and their kin -- `/{well-known}`.",
+          "type": "string",
+          "enum": [
+            "well_known"
+          ]
+        },
+        {
+          "description": "Health, readiness, and status endpoints (`/healthz`, `/readyz`, `/metrics`, `/nginx_status`, ...) -- `/{probe}`.",
+          "type": "string",
+          "enum": [
+            "probes"
+          ]
+        }
+      ]
+    },
     "InternalLogs": {
       "description": "[`ComponentKind::Internal`]'s `logs` field -- see its own doc comment.",
       "oneOf": [
@@ -2464,6 +2614,14 @@
             "off"
           ]
         }
+      ]
+    },
+    "JsonInvalidUtf8": {
+      "description": "`ComponentKind::Json`'s `invalid_utf8` field: what the parser does with a message that is not valid UTF-8. `Reject` (the default) is the strict behaviour `json` has always had -- the parse fails, the event passes through untouched, one throttled `parse_failure` diagnostic. `Replace` retries a failed parse on a copy with every invalid sequence replaced by U+FFFD, on the failure path only, so a valid line's cost is unchanged. The case it exists for: nginx's `escape=json` passes bytes >= 0x80 through raw, so one client sending a Latin-1 `User-Agent` loses the whole access line -- the one failure `http_access` can't reach from behind `json`. See `docs/adr/http-access-normalization.md`.",
+      "type": "string",
+      "enum": [
+        "reject",
+        "replace"
       ]
     },
     "MatchMode": {
@@ -3022,6 +3180,23 @@
           "type": "string"
         }
       }
+    },
+    "UserAgentRule": {
+      "description": "One entry of `ComponentKind::HttpAccess`'s `user_agent_rules`: a regex over the *uncapped* `user_agent.original` (the identifying token of a spoofed UA is often at its tail) and the literal `user_agent.class` it assigns. Tried in order, before the built-in table. A `class` of `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, exactly as the built-in classes do. Compiled at validate time by `crates/logit-pipeline/src/graph.rs` rule 60, which also rejects an empty `match` or `class`. See `docs/adr/http-access-normalization.md`.",
+      "type": "object",
+      "required": [
+        "class",
+        "match"
+      ],
+      "properties": {
+        "class": {
+          "type": "string"
+        },
+        "match": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "ValueAllowList": {
       "description": "One field's clamp, under `ComponentKind::KeepValues`'s `resource`/`attributes` maps.",

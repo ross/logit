@@ -21,7 +21,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"nginx\")\n  |> group(columns: [\"http.response.status_code\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
         }
       ]
     },
@@ -36,7 +36,7 @@
         {
           "refId": "A",
           "datasource": { "type": "influxdb", "uid": "influxdb" },
-          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")\n  |> group(columns: [\"status\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
+          "query": "from(bucket: \"metrics\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"web.requests\")\n  |> filter(fn: (r) => r._field == \"value\")\n  |> filter(fn: (r) => r[\"service.name\"] == \"haproxy\")\n  |> group(columns: [\"http.response.status_code\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)"
         }
       ]
     },
@@ -44,10 +44,10 @@
       "id": 2,
       "type": "timeseries",
       "title": "web.request_time (nginx, p50 / p99)",
-      "description": "Milliseconds, not seconds -- nginx_scale (demo/logit.yaml) converts nginx's own $request_time before nginx_metrics ever reads it, so this shares a unit and a measurement with haproxy's panel beside it.",
+      "description": "Seconds -- nginx_http (http_access, demo/logit.yaml) hands nginx_metrics $request_time as http.request.duration_s, the same quantity and unit haproxy_http derives from HAProxy's %Ta, so this shares a measurement with haproxy's panel beside it.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
@@ -60,10 +60,10 @@
       "id": 14,
       "type": "timeseries",
       "title": "web.request_time (haproxy, p50 / p99)",
-      "description": "HAProxy's %Tr is native milliseconds, so haproxy_metrics needs no scale step -- unlike nginx's panel beside it, this reads request_time_ms directly.",
+      "description": "Seconds -- HAProxy logs %Ta in milliseconds as http-request-duration_ms, and haproxy_http (http_access, demo/logit.yaml) converts it to http.request.duration_s, the same quantity and unit as nginx's panel beside it.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
-      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",

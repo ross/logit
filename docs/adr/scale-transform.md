@@ -1,6 +1,6 @@
 ---
 created: 2026-09-03
-updated: 2026-09-03
+updated: 2026-09-22
 ---
 
 # `scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`
@@ -87,3 +87,16 @@ silent per-field skip is documented behavior, not a failure worth a throttled di
   `scale` (read-modify-write in place, skip on failure). Each is documented in its own ADR; there is
   no unifying "attribute-mutation" trait, since each one's failure/skip semantics differ enough that
   a shared abstraction would need per-variant escape hatches anyway.
+
+## Amendment (2026-09-22): the demo no longer exercises `scale`
+
+`demo/logit.yaml`'s `nginx_scale` -- this ADR's motivating case, converting nginx's `request_time`
+from seconds to milliseconds so it could share `web.request_time` with HAProxy's millisecond timer
+-- is gone. Both tiers now log raw semconv fields and run through `http_access`
+([ADR `http-access-normalization`](http-access-normalization.md)), which converts every duration to
+its `_s` spelling in seconds itself, so the two tiers reach `kv_metrics` already agreeing on a unit
+and there is nothing left for `scale` to reconcile. Nothing about `scale` itself changes: it is
+still the answer for a named numeric attribute in the wrong unit that no normalizer owns, and its
+own tests and `crates/logit-transforms/src/lib.rs`'s `logfmt -> scale -> kv_metrics -> keep ->
+aggregate` chain still cover it -- the demo just isn't meant to stay exhaustive over every
+component.

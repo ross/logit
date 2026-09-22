@@ -1207,6 +1207,118 @@ fn flatten_pino_http_event_cold_key_cache() {
     expect_allocs("flatten: pino-http shape, cold KeyCache (first event)", stats, 12);
 }
 
+// -- http_access (docs/adr/http-access-normalization.md) ----------------------------------------
+
+/// A metric-only event, matching `http_access`'s own contract exactly (`process`'s doc comment):
+/// "an event with no log passes through untouched". Warmed on a real conforming line first, so the
+/// number pinned here is the steady-state no-op cost, not a cold first call's.
+#[test]
+fn http_access_ignores_an_event_with_no_log() {
+    let mut ha = fixtures::http_access();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::statsd_event();
+    assert!(event.log.is_none(), "fixture must be metric-only, or this measures the wrong thing");
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    expect_allocs("http_access: ignores an event with no log", stats, 0);
+}
+
+/// The reference shape: a fully conforming semconv line, warm component (every lazily-built
+/// `span.name`/`error.type` cell already filled, every alias/cap key already interned).
+#[test]
+fn http_access_normalizes_a_conforming_line_warm() {
+    let mut ha = fixtures::http_access();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("http.request.method"), Some(&Value::str("GET")));
+    assert_eq!(event.attributes.get("span.name"), Some(&Value::str("GET /{other}")));
+    expect_allocs("http_access: normalize a conforming line, warm", stats, 0);
+}
+
+/// The same line through a brand-new component -- no warm-up call at all. **Not** the
+/// `span.name`/`error.type` lazy cells this module's own doc comment names (isolated: with no
+/// `url.path` and no `user_agent.original` present, this exact line costs 0 -- the `span.name`
+/// cell for "no route" is `static_str(method)`, not a `format!`, so it never allocates even cold).
+/// The whole 228 is the `regex` crate's own per-compiled-pattern, per-thread lazy cache
+/// (`regex-automata`'s pooled `Cache`, built by the *first* `is_match`/`captures_read` against a
+/// given `Regex` on a given thread, then reused for free) -- not anything `http_access.rs` does:
+/// this fixture's UA matches `browser`, the last of the four built-in rules, so
+/// `classify_user_agent` tries all four before matching (176 allocs, confirmed in isolation); the
+/// path matches none of the four route rules, so `classify_route` also tries all four plus builds
+/// the `span.name` cell's one `format!`+`shared()` pair (52 allocs, confirmed in isolation:
+/// 176 + 52 = 228). `docs/adr/http-access-normalization.md`'s "Scanned with `is_match`, which
+/// allocates nothing" claim holds for the *warm* case the row below pins -- this row is what a
+/// process pays exactly once per compiled pattern, not per event.
+#[test]
+fn http_access_normalizes_a_conforming_line_cold() {
+    let mut ha = fixtures::http_access();
+    let resource = fixtures::resource();
+
+    let mut event = fixtures::http_access_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("http.request.method"), Some(&Value::str("GET")));
+    expect_allocs("http_access: normalize a conforming line, cold", stats, 228);
+}
+
+/// [`fixtures::http_access_dashed_event`]: the same line, every key in its dashed alias --
+/// `dealias` renames each one before step 1 ever runs, so the rest of the pipeline sees the exact
+/// same dotted attributes as the warm conforming-line case above.
+#[test]
+fn http_access_normalizes_a_dashed_line_warm() {
+    let mut ha = fixtures::http_access();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_dashed_event();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    assert_eq!(event.attributes.get("http.request.method"), Some(&Value::str("GET")));
+    assert_eq!(event.attributes.get("span.name"), Some(&Value::str("GET /{other}")));
+    expect_allocs("http_access: normalize a dashed line, warm", stats, 0);
+}
+
+/// [`fixtures::http_access_event_with_control_byte`]: the same conforming line, except
+/// `user_agent.original` carries one raw `0x01` byte -- step 7's cap-and-clean is the one path
+/// that isn't free, since it must copy the value into `scratch` to blank the control byte out.
+///
+/// **Two, not one**, warmed only on a clean line as above: this component's `scratch: Vec<u8>`
+/// starts at `Vec::new()` (`HttpAccess::new`) and the clean warm-up event never takes the dirty
+/// branch (no control byte, no redacted query key), so `scratch` reaches this call still at
+/// capacity 0. `cap_and_clean`'s dirty arm then pays for two separate things: `scratch.extend`
+/// growing that Vec's backing buffer from nothing (a real `alloc`, not a `realloc` -- there is no
+/// prior allocation to grow), and the final `Bytes::copy_from_slice(scratch)` copying it out into
+/// the new, exact-size `Value`. Confirmed by isolation: pre-warming `scratch` with one earlier
+/// dirty pass drops this to exactly **1** -- the steady-state cost the module doc's "one exact-size
+/// copy" describes, once any prior event in the process has ever taken this branch.
+#[test]
+fn http_access_cleans_a_control_byte() {
+    let mut ha = fixtures::http_access();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::http_access_event();
+    ha.process(&resource, &mut warm);
+
+    let mut event = fixtures::http_access_event_with_control_byte();
+    let (forwarded, stats) = measure(|| ha.process(&resource, &mut event));
+    assert!(forwarded, "http_access always forwards");
+    let ua = event
+        .attributes
+        .get("user_agent.original")
+        .and_then(Value::as_str)
+        .expect("user_agent.original should still be a Str");
+    assert!(!ua.contains('\u{1}'), "the control byte should have been cleaned");
+    expect_allocs("http_access: cleans a control byte", stats, 2);
+}
+
 /// `shape` is the one transform here that deliberately *doesn't* aim for zero
 /// ([ADR `shape-observer-component`](../../../docs/adr/shape-observer-component.md)): a
 /// measurement event carries a dozen-odd metric records, so it always spills `MetricList`'s single
