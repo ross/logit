@@ -67,13 +67,15 @@ nightly-built artifact) would be just as wrong. Subcommands:
   real-fd test suites (not a special subset) since `cargo careful`'s whole point is real syscalls
   under a debug-assertion std.
 - **`inject <strace-inject-spec> [-- <cargo test args>]`** — builds the named test binary via
-  `cargo test --no-run --message-format=json`, reads the compiled artifact path back out of that
-  JSON stream, and runs it under `strace -f -e trace=<syscall> -e inject=<spec>`, where `<syscall>`
-  is derived from the spec's own leading `syscallname:...` shape. This is the one subcommand that
-  needs `--cap-add SYS_PTRACE` (Docker's default seccomp profile denies `ptrace(2)` outright
-  regardless of capabilities — see "What each tool verifies" below) and, on some hosts,
-  `--security-opt seccomp=unconfined` on top (`UNSAFE_CHECK_SECCOMP_UNCONFINED=1` in the
-  environment opts into it; see "Running it" for which this repo's own dev box needed).
+  `cargo test --no-run`, takes the compiled artifact's path from the `Executable ... (path)` line
+  cargo prints for it (cargo's human status output, deliberately: it keeps the script free of a
+  JSON parser on the host, and a change to that line breaks the run loudly rather than subtly),
+  and runs it under `strace -f -e trace=<syscall> -e inject=<spec>`, where `<syscall>` is derived
+  from the spec's own leading `syscallname:...` shape. This is the one subcommand that needs
+  `--cap-add SYS_PTRACE` (Docker's default profile drops `CAP_SYS_PTRACE` — see "What each tool
+  verifies" below) and, on some hosts, `--security-opt seccomp=unconfined` on top
+  (`UNSAFE_CHECK_SECCOMP_UNCONFINED=1` in the environment opts into it; see "Running it" for which
+  this repo's own dev box needed).
 - **`all`** — `miri` then `careful`, both at their defaults.
 - **`shell`** — an interactive shell in the image, for anything the three subcommands above don't
   cover directly.
@@ -107,12 +109,16 @@ as they really run.
 fail with a chosen errno — the only tool of the three that can put `EINTR`/`EAGAIN`/`ENOSYS`/
 `EINVAL` in front of `recvmmsg`, `getsockopt`, or the inotify calls *on demand*, rather than hoping
 a real kernel condition happens to occur during a test run. In Docker this needs `--cap-add
-SYS_PTRACE` — strace's fundamental mechanism is a `ptrace(2)` attach, which Docker's default
-seccomp profile denies outright regardless of capabilities granted (a well-documented gap: Julia
-Evans's "Why strace doesn't work in Docker," and `moby#21051`) — and on some docker/kernel/seccomp
-combinations, `--security-opt seccomp=unconfined` on top of the capability.
+SYS_PTRACE` — strace's fundamental mechanism is a `ptrace(2)` attach, and Docker's default
+capability set drops `CAP_SYS_PTRACE`. Older docker/libseccomp/kernel combinations went further
+and blocked the syscall itself in the default seccomp profile regardless of capabilities (the
+well-documented gap in Julia Evans's "Why strace doesn't work in Docker" and `moby#21051`, closed
+in Docker 19.03 for kernels ≥ 4.8, where the profile allows `ptrace` once the capability is
+granted); on such a host `--security-opt seccomp=unconfined` is needed on top of the capability,
+which is what the `UNSAFE_CHECK_SECCOMP_UNCONFINED=1` escape hatch is for. This repo's own dev box
+needed the capability alone.
 
-### Alternatives considered
+## Alternatives considered
 
 - **Nightly in `Dockerfile.dev`.** Rejected outright — this is precisely what ADR
   `containerized-development` already ruled out, and it would mean every contributor's ordinary
