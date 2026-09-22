@@ -18,6 +18,12 @@
 //! that doesn't log the header, no fabricated route -- ADR
 //! `operator-declared-resource-attributes`' rule applied one component over.
 //!
+//! An existing `user_agent.class` is trusted and never recomputed: the user agent is classified
+//! on its uncapped, uncleaned value, which only the first pass ever sees, so a second pass over
+//! the same event keeps the first verdict rather than re-reading the capped/cleaned value. It
+//! also means a class set upstream (a `set` or Lua stage, or a producer that logs one itself)
+//! overrides the built-in and configured tables -- an operator override, by design.
+//!
 //! **Every classification value is bounded by construction**: `http.route`, `user_agent.class`,
 //! `span.name`, `span.status`, and `error.type` values all come from config, a built-in table, or
 //! a closed numeric range -- never from a capture of the input. That is the review question for
@@ -1092,12 +1098,24 @@ fn cap_and_clean(
 /// runs this before step 7 -- the identifying token of a spoofed UA is often at its tail. Absent
 /// writes nothing (an absent header is silence); present but blank is `none`; a `Value::Bytes`
 /// UA (not UTF-8, so no regex can read it) is `other`.
+///
+/// An existing `user_agent.class` (by [`present`]'s rule) is trusted and never recomputed. The
+/// first pass is the only one that ever sees the uncapped, uncleaned value -- step 7 then caps
+/// and cleans it in place -- so its verdict is the one to keep: re-classifying on a second pass
+/// would read the rewritten value and could flip the class (a tail token cut off by the cap, a
+/// control byte cleaned to `_`) while leaving the first pass's `user_agent.synthetic.type`
+/// behind. The same rule makes a class written upstream -- by a `set` or Lua stage, or logged by
+/// the producer itself -- an operator override of the table: it wins, and neither the class nor
+/// `user_agent.synthetic.type` is derived for that event.
 fn classify_user_agent(
     attrs: &mut AttrMap,
     keys: &Keys,
     classifier: &Classifier,
     telemetry: &Telemetry,
 ) {
+    if present(attrs, keys.ua_class.sym).is_some() {
+        return;
+    }
     let (class, bot) = match attrs.get_sym(keys.user_agent.sym) {
         None | Some(Value::Null) => return,
         Some(Value::Str(bytes)) if is_blank(bytes) => (&classifier.none, false),
@@ -1978,6 +1996,54 @@ mod tests {
         let mut twice = once.clone();
         assert!(t.process(&Arc::new(Resource::default()), &mut twice));
         assert_eq!(twice, once);
+    }
+
+    /// The UA is classified before step 7 caps and cleans it, so a second pass sees a rewritten
+    /// value. These two shapes classify differently before and after the rewrite; the existing
+    /// class is trusted, so the second pass changes neither it nor `user_agent.synthetic.type`.
+    #[test]
+    fn a_second_pass_keeps_the_first_user_agent_verdict() {
+        let long = format!("Mozilla/5.0 {} sqlmap/1.7", "x".repeat(300));
+        for (ua, class) in [
+            // The tab is the `\b` boundary `\bbot\b` needs; cleaned to `_` it is a word byte.
+            ("Foo\tbot", "crawler"),
+            // The identifying token sits past the 256-char cap; capped, only `Mozilla/` is left.
+            (long.as_str(), "scanner"),
+        ] {
+            let mut t = bare();
+            let once = run(&mut t, &[("user_agent.original", s(ua))]);
+            assert_eq!(get(&once, "user_agent.class"), Some(&s(class)), "{ua:?}");
+            assert_eq!(get(&once, "user_agent.synthetic.type"), Some(&s("bot")), "{ua:?}");
+            assert_ne!(
+                get(&once, "user_agent.original"),
+                Some(&s(ua)),
+                "step 7 rewrote the value: {ua:?}"
+            );
+            let mut twice = once.clone();
+            assert!(t.process(&Arc::new(Resource::default()), &mut twice));
+            assert_eq!(get(&twice, "user_agent.class"), get(&once, "user_agent.class"), "{ua:?}");
+            assert_eq!(
+                get(&twice, "user_agent.synthetic.type"),
+                get(&once, "user_agent.synthetic.type"),
+                "{ua:?}"
+            );
+            assert_eq!(twice, once, "{ua:?}");
+        }
+    }
+
+    /// A class already on the event -- from an upstream `set`/Lua stage or the producer itself --
+    /// is an operator override: kept as-is, with no `user_agent.synthetic.type` derived.
+    #[test]
+    fn an_existing_user_agent_class_overrides_the_table() {
+        let event = run(
+            &mut bare(),
+            &[
+                ("user_agent.original", s("Mozilla/5.0 (compatible; Googlebot/2.1)")),
+                ("user_agent.class", s("internal")),
+            ],
+        );
+        assert_eq!(get(&event, "user_agent.class"), Some(&s("internal")));
+        assert_eq!(get(&event, "user_agent.synthetic.type"), None);
     }
 
     #[test]
