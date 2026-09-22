@@ -1,8 +1,12 @@
 #!/bin/bash
-# Usage: script/image [tag]
+# Usage: IMAGE_REPO=<repo> IMAGE_PUSH=1 script/image [tag]
 # Builds the production runtime image (Dockerfile, not Dockerfile.dev) -- what a consumer builds
-# or pulls to actually run `logit` (docs/plans/nginx-integration.md, workstream B). Tags the
-# result `logit:<tag>` (default: `local`).
+# or pulls to actually run `logit` (docs/plans/nginx-integration.md, workstream B;
+# docs/adr/publish-release-image-to-ghcr.md). Tags the result `<IMAGE_REPO>:<tag>` (default repo
+# `logit`, default tag `local`), and pushes it too when IMAGE_PUSH=1 -- e.g., after a
+# `docker login ghcr.io`:
+#
+#   IMAGE_REPO=ghcr.io/ross/logit IMAGE_PUSH=1 script/image latest
 #
 # Builds directly against $DOCKER, not through the `run` helper in common.sh -- `run` executes
 # inside the dev container (or CI's equivalent image), and this needs to invoke the host's Docker
@@ -13,6 +17,12 @@ SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
 TAG="${1:-local}"
+IMAGE_REPO="${IMAGE_REPO:-logit}"
 
-${DOCKER} build -f Dockerfile -t "logit:${TAG}" .
-echo "Built logit:${TAG}"
+${DOCKER} build -f Dockerfile -t "${IMAGE_REPO}:${TAG}" .
+echo "Built ${IMAGE_REPO}:${TAG}"
+
+if [ -n "${IMAGE_PUSH:-}" ]; then
+    ${DOCKER} push "${IMAGE_REPO}:${TAG}"
+    echo "Pushed ${IMAGE_REPO}:${TAG}"
+fi

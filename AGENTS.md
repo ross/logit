@@ -36,7 +36,10 @@ groups into attributes, replacing a `lua` component in `demo/logit.yaml`'s postg
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) exercises the syslog/InfluxDB
 side together against a real nginx (`examples/nginx/`), and
 [docs/deploying.md](docs/deploying.md) is the operator-facing doc for running any of this outside
-the dev stack. `examples/` is contributor-facing fixtures the dev stack (`script/server`) runs
+the dev stack. The release image is now published to `ghcr.io/ross/logit:latest`, pushed by hand
+via `workflow_dispatch` rather than on every merge
+([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)). `examples/` is
+contributor-facing fixtures the dev stack (`script/server`) runs
 against, kept real because other things in the repo depend on them (`compose.yaml`'s `nginx`
 service, `crates/logit-bench/src/fixtures.rs`'s `NGINX_SYSLOG_LINE`) — `demo/` is the answer to
 "let me see this work" for anyone else, a self-contained `docker compose up` against the release
