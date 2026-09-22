@@ -308,9 +308,10 @@
 //!     endpoint's own scheme and a block under `http://` could only ever be ignored.
 //! 57. A datagram listener's `receive.read_batch` above `1024` is rejected
 //!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
-//!     `vlen`, and `1024` is `UIO_MAXIOV`, the kernel's own hard ceiling on how many `iovec`s any
-//!     one vectored I/O call may carry -- above it the kernel clamps or refuses depending on call
-//!     path, a runtime surprise whose cause is nowhere near the config that set it. Rule 18 owns
+//!     `vlen`, and `1024` is `UIO_MAXIOV`'s number -- but the ceiling is `logit`'s, not the
+//!     kernel's: `do_recvmmsg` clamps no `vlen` at all (`UIO_MAXIOV` bounds `msg_iovlen` within
+//!     one `msghdr`, which the read path sets to 1). What it bounds is the per-listener receive
+//!     slab and the shutdown-path loss, both of which grow linearly with it. Rule 18 owns
 //!     the `0` end. A `read_batch` *larger than* `max_datagrams` is deliberately legal: `push_many`
 //!     has a defined answer for a batch bigger than the whole queue, so a rule against it would
 //!     only refuse a configuration that works.
@@ -2744,12 +2745,16 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 57: a datagram listener's `receive.read_batch` may not exceed `UIO_MAXIOV`
+    // Rule 57: a datagram listener's `receive.read_batch` may not exceed `MAX_READ_BATCH`
     // (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
-    // `vlen`, and `UIO_MAXIOV` (1024) is the kernel's hard ceiling on how many `iovec`s any one
-    // vectored I/O call may carry -- a larger value is clamped or refused by the kernel depending
-    // on call path, which is a runtime surprise whose cause is nowhere near the config that set
-    // it. Rejected here instead, with the kernel's own name for the limit in the message.
+    // `vlen`, and `1024` is `UIO_MAXIOV`'s number -- but `logit` chose it, the kernel did not
+    // impose it. `UIO_MAXIOV` bounds `msg_iovlen` *within one* `msghdr` (`__copy_msghdr`,
+    // `net/socket.c`), which the UDP read path sets to 1; `do_recvmmsg`'s own loop is a plain
+    // `while (datagrams < vlen)` with no clamp, and the only `UIO_MAXIOV` clamp on a `vlen`
+    // anywhere is `__sys_sendmmsg`'s, on the send side. So a larger value would be honoured, not
+    // refused -- what it would cost is a bigger per-listener slab (`read_batch x 65,507` bytes of
+    // address space) and a wider shutdown-path loss. Rejected here so those two costs have a
+    // named ceiling rather than an unbounded one.
     //
     // Rule 18 owns the other end (`read_batch: 0`), the same split the two rules already have for
     // `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
@@ -2763,8 +2768,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if is_datagram_listener(&component.kind) && component.receive.read_batch > MAX_READ_BATCH {
             anyhow::bail!(
                 "component '{id}': 'receive.read_batch' is {} -- at most {MAX_READ_BATCH} \
-                 (UIO_MAXIOV, the kernel's own ceiling on how many messages one recvmmsg(2) call \
-                 may carry)",
+                 (UIO_MAXIOV's number: the ceiling logit puts on this listener's receive slab and \
+                 on how many datagrams a shutdown can discard mid-push)",
                 component.receive.read_batch
             );
         }
@@ -5989,8 +5994,10 @@ mod tests {
         assert!(err.contains("read_batch"), "got: {err}");
     }
 
-    /// Rule 57: above `UIO_MAXIOV` the kernel clamps or refuses depending on call path, so the
-    /// config is rejected with the kernel's own name for the limit in the message.
+    /// Rule 57: above `MAX_READ_BATCH` the per-listener slab and the shutdown-path loss both grow
+    /// without a named bound, so the config is rejected -- with `UIO_MAXIOV` in the message,
+    /// because that is where the number comes from even though the kernel imposes no such limit
+    /// on `recvmmsg`'s `vlen` (see the rule's own comment).
     #[test]
     fn a_listeners_read_batch_above_uio_maxiov_is_rejected() {
         let err = expect_err(cfg_with_receive(vec![
@@ -6007,8 +6014,8 @@ mod tests {
         assert!(err.contains("UIO_MAXIOV"), "got: {err}");
     }
 
-    /// The boundary itself is legal -- `UIO_MAXIOV` is the largest `vlen` the kernel accepts, not
-    /// the first one it rejects.
+    /// The boundary itself is legal: `MAX_READ_BATCH` is the largest `read_batch` this rule
+    /// accepts, not the first one it rejects.
     #[test]
     fn a_listeners_read_batch_of_exactly_uio_maxiov_validates_fine() {
         let graph = resolve(cfg_with_receive(vec![
