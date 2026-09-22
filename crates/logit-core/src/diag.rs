@@ -94,6 +94,16 @@ impl Diagnostics {
         tracing::warn!(target: "logit", component = %self.component_id, "{msg}");
     }
 
+    /// Reports unconditionally, at `debug`, carrying `component` but no `key` -- the level for
+    /// something the operator can do precisely nothing about, and which therefore should not
+    /// reach either the terminal or (via `internal`'s `logs:` setting, `warn` by default) the
+    /// pipeline in the ordinary course of running. The per-socket kernel counters being absent on
+    /// a non-Linux build is the case it exists for: one line per listener, at startup, every
+    /// startup, about a platform property.
+    pub fn debug(&self, msg: impl Display) {
+        tracing::debug!(target: "logit", component = %self.component_id, "{msg}");
+    }
+
     /// Reports unconditionally, at `info`, carrying `component` and `key` -- for a lifecycle
     /// message a component itself owns (a listener's bound address, a file rotated), which is
     /// rare enough to need no throttling but structured enough to want a stable `key`.

@@ -274,11 +274,8 @@ impl Input for LogitInput {
         // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented -- same future,
         // same cancellation safety against the `shutdown` arm below (see `AcceptQueueSampler::
         // accept`'s own doc), plus `logit.input.accept_queue.depth`/`.utilization`.
-        let mut accept_queue = crate::tcp::AcceptQueueSampler::new(
-            &listener,
-            self.telemetry.clone(),
-            self.diag.clone(),
-        );
+        let mut accept_queue =
+            crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
 
         loop {
             let (stream, _peer) = tokio::select! {

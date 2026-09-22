@@ -2,6 +2,7 @@
 # Usage: script/unsafe-check miri [cargo-miri-test args]
 #        script/unsafe-check careful [cargo-careful-test args]
 #        script/unsafe-check inject <strace-inject-spec> [-- <cargo test args>]
+#        script/unsafe-check inject-all
 #        script/unsafe-check all
 #        script/unsafe-check shell
 #        script/unsafe-check --help
@@ -27,16 +28,29 @@ source "${SCRIPT_PATH}/common.sh"
 
 IMAGE=logit-unsafe-check:local
 
-# The miri targets w0 ships -- the pure `inotify_event` parser tests in
-# `crates/logit-inputs/src/tail/watch.rs`'s `mod inotify::tests` (`docs/adr/
-# out-of-ci-unsafe-verification.md`'s "miri has no shims for recvmmsg/recvmsg/inotify" explains
-# why only the pure parsing logic, not the syscalls around it, is reachable this way).
+# The miri targets -- the pure halves of the raw-`libc` code, which is all miri can ever reach
+# (`docs/adr/out-of-ci-unsafe-verification.md`'s "miri has no shims for recvmmsg/recvmsg/inotify"
+# explains why only the parsing/pointer logic, not the syscalls around it, is runnable this way):
+#
+#   parse_events            the pure `inotify_event` parser in `crates/logit-inputs/src/tail/
+#                           watch.rs`'s `mod inotify::tests` (w0).
+#   batch_reader_helpers    `build_headers`/`harvest_headers` in `crates/logit-inputs/src/udp.rs`
+#                           -- the `mmsghdr`/`iovec` construction and the post-syscall harvest,
+#                           split out of `BatchReader::read_batch`'s closure precisely so a
+#                           provenance checker can execute them (NET-01, w1).
 #
 # One "<package>|<libtest filter>" pair per line -- `miri` with no arguments of its own runs every
-# pair below in order. w1/w3 extend this list as their own pure helpers land (NET-01/NET-11/
-# NET-12/TAIL-07 in the critical-sections inventory); nothing else in this script needs to change.
+# pair below in order. Later workstreams extend this list as their own pure helpers land
+# (NET-11/NET-12/TAIL-07 in the critical-sections inventory); nothing else in this script needs to
+# change.
 MIRI_TARGETS=(
     "logit-inputs|parse_events"
+    "logit-inputs|batch_reader_helpers"
+    # NET-11 (libc/w2): `sockstat`'s two reply parsers, split out of the `getsockopt` calls
+    # precisely so the branches no real kernel reaches are reachable at all. Pure -- they take an
+    # already-filled `[u32; 9]`/`libc::tcp_info` and a length -- so miri runs them, including the
+    # `mem::zeroed::<libc::tcp_info>()` the listen-queue test builds its input with.
+    "logit-pipeline|sockstat::tests::reply_parsing"
 )
 
 # Every checkout binds at the same `/work`, so cargo's fingerprints match across branches: two
@@ -44,6 +58,31 @@ MIRI_TARGETS=(
 # checkout at a time is fine on the default; a second, concurrent one sets
 # `UNSAFE_CHECK_TARGET_VOLUME` to a volume of its own.
 TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
+
+# The named fault injections, one "<label>|<strace inject spec>|<cargo test args>" per line --
+# `inject-all` runs every one in order. These are the errno paths no test can reach on a real
+# socket (`docs/adr/out-of-ci-unsafe-verification.md`), so unlike MIRI_TARGETS they are **not** all
+# expected to pass: two of the three deliberately force a fatal error and the run is a success when
+# the failure is the clean, named one. What each proves is in the comment beside it; the ADR
+# `udp-intake-batching-and-socket-visibility` amendment records the results.
+INJECT_SCENARIOS=(
+    # The EINTR retry arm in `BatchReader::read_batch`. Unreachable on a non-blocking socket, so a
+    # signal cannot produce it and only this can. EXPECT: the test still PASSES -- every datagram
+    # delivered, because the arm retries the same call rather than failing.
+    "udp-eintr-retry|recvmmsg:error=EINTR:when=2+3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
+    # A fatal errno mid-stream, after datagrams have already been read. EXPECT: the test FAILS,
+    # having read two full batches first and then stopping *immediately* on the third call -- no
+    # retry, no spin, no hang; the strace shows exactly one injected `recvmmsg` and then the
+    # process exiting. The test panics on its now-closed fanout rather than printing the listener's
+    # error, so the *message* is not what this scenario checks -- that is pinned in CI by
+    # `a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket`.
+    "udp-fatal-mid-stream|recvmmsg:error=EPERM:when=3|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
+    # The seccomp case: the syscall refused on the very first call (quinn#1947, bun#42678).
+    # EXPECT: the test FAILS, and the strace shows **one** `recvmmsg` and nothing after it -- the
+    # bun#42678 failure mode is a refused call retried forever at 100% CPU, so a single traced call
+    # is the whole point of the scenario.
+    "udp-seccomp-first-call|recvmmsg:error=ENOSYS:when=1|-p logit-inputs --lib a_two_hundred_datagram_burst_is_delivered_complete_and_in_order"
+)
 
 build_image() {
     ${DOCKER} build -q -t "${IMAGE}" -f tools/unsafe-check/Dockerfile tools/unsafe-check >/dev/null
@@ -179,6 +218,25 @@ cmd_inject() {
         "${binary}" ${filter:+"${filter}"} --test-threads=1
 }
 
+# Every scenario in INJECT_SCENARIOS, in order. Deliberately does not stop at the first non-zero
+# exit: two of the three scenarios are *expected* to make their test fail, and what matters is the
+# shape of that failure, which the operator reads off the output. `set -e` would otherwise end the
+# run at the first one.
+cmd_inject_all() {
+    build_image
+    for scenario in "${INJECT_SCENARIOS[@]}"; do
+        local label="${scenario%%|*}"
+        local rest="${scenario#*|}"
+        local spec="${rest%%|*}"
+        local args="${rest#*|}"
+        echo
+        echo "===== inject scenario: ${label} ====================================="
+        # shellcheck disable=SC2086 # `args` is a deliberate word-split argument list
+        cmd_inject "${spec}" -- ${args} || echo "## ${label}: exited non-zero (read the output \
+above: for a fatal-errno scenario that is the expected shape, not a regression)"
+    done
+}
+
 cmd_all() {
     cmd_miri
     cmd_careful
@@ -190,7 +248,7 @@ cmd_shell() {
 }
 
 usage() {
-    sed -n '2,7p' "${SCRIPT_PATH}/unsafe-check" | sed 's/^# \?//'
+    sed -n '2,8p' "${SCRIPT_PATH}/unsafe-check" | sed 's/^# \?//'
 }
 
 case "${1:-}" in
@@ -205,6 +263,9 @@ careful)
 inject)
     shift
     cmd_inject "$@"
+    ;;
+inject-all)
+    cmd_inject_all
     ;;
 all)
     cmd_all
