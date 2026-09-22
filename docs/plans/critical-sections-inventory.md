@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-21
 ---
 
 # Verification plan: critical sections inventory
@@ -214,7 +214,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [NET-11](#net-11--sockstat-raw-getsockoptso_meminfo--getsockopttcp_info-and-the-wrapping-drop-counter) | P1 | `sockstat`: raw `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` and the wrapping drop counter | `crates/logit-pipeline/src/sockstat.rs:134-169` | unreviewed |
 | [NET-12](#net-12--the-two-kernel-samplers-coop-budget-arm-ordering-self-disable-and-the-guaranteed-final-sample) | P1 | The two kernel samplers: coop-budget arm ordering, self-disable, and the guaranteed final sample | `crates/logit-inputs/src/udp.rs:905-1086` | unreviewed |
 | [TAIL-06](#tail-06--shutdown-ordering-and-final-flush-of-held-state) | P1 | Shutdown ordering and final flush of held state | `crates/logit-inputs/src/tail/driver.rs:312-321` | unreviewed |
-| [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | unreviewed |
+| [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | findings → libc/w3 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs:229-321` | unreviewed |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs:325-346` | unreviewed |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | unreviewed |
@@ -1422,19 +1422,22 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   blocked final send.
 
 ### TAIL-07 — Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area
-- **Location:** `crates/logit-inputs/src/tail/watch.rs:236-501` (`mod inotify`). The `unsafe`
-  sites, exhaustively: `:332-334` `inotify_add_watch`, `:348-350` `inotify_rm_watch`, `:402-410`
-  `libc::read` inside `AsyncFd::try_io`, `:425` `inotify_init1`, `:431` `OwnedFd::from_raw_fd`,
-  `:456-458` `ptr::read_unaligned` of `libc::inotify_event`. (Plus one test-only `write_unaligned`
-  at `:519-521`.) Masks at `:258-270`; bookkeeping at `:278-293`; `parse_events` at `:443-501`.
+- **Location:** `crates/logit-inputs/src/tail/watch.rs`, `mod inotify` (`:337-` after `libc/w3`;
+  the line refs below are the post-`libc/w3` ones, since the module roughly doubled in size).
+  The `unsafe` sites, exhaustively — still six, unchanged in kind: `:515` `inotify_add_watch`,
+  `:531` `inotify_rm_watch`, `:648` `libc::read` inside `AsyncFd::try_io`, `:688`
+  `inotify_init1`, `:692` `OwnedFd::from_raw_fd`, `:740` `ptr::read_unaligned` of
+  `libc::inotify_event`. (Plus test-only `write_unaligned` at `:859`/`:874` and a `pipe2` in the
+  dead-fd test.) Masks at `:405-419`; bookkeeping at `:428-`; `parse_events` at `:724-`.
 - **What it does:** Opens one non-blocking, cloexec inotify fd wrapped in `tokio::io::unix::AsyncFd`;
   registers `DIR_MASK` watches on pattern directories and `FILE_MASK` (`IN_MODIFY`) watches on each
   open file; reads raw event batches into a reused 64 KiB buffer and decodes them into
   `Wake::{Discover,Data,Overflow}`, purging a watch descriptor on `IN_IGNORED`.
 - **Why sensitive:** unsafe/syscall (six sites); untrusted-input in the parsing sense (the buffer
   is kernel-supplied but is walked with manual offset arithmetic and an unaligned struct read);
-  concurrency (fd ownership across `AsyncFd`); accounting (`wd` reuse — a stale map entry
-  misattributes a later unrelated watch).
+  concurrency (fd ownership across `AsyncFd`); accounting (~~`wd` reuse — a stale map entry
+  misattributes a later unrelated watch~~ — refuted, see below; the real accounting hazard was a
+  reverse index that outlived its descriptor).
 - **Invariants to verify:**
   - `parse_events`' loop arithmetic never reads out of bounds: header check at `:450`, name check
     at `:460-462`, advance at `:499`; `event.len` is attacker-irrelevant but must still be handled
@@ -1452,20 +1455,52 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   - A short `read` that splits an event across two reads: does the kernel guarantee this can't
     happen for a buffer ≥ one event? The `break` at `:461` silently discards the remainder if it
     ever does.
-- **Observed concerns (unverified):**
-  - `next_wake` returns `std::future::pending()` forever if `AsyncFd::readable()` errors
-    (`:391-396`) — inotify then silently stops with no diagnostic and no counter; only the poll
-    tick keeps the listener alive. Degradation is invisible to an operator. High confidence.
-  - A read error other than would-block is swallowed with an empty arm (`:415`) and loops straight
-    back to `readable()`; if the condition is persistent this is a busy loop. Medium confidence.
-  - `logit.input.watch.watches` counts *intended* watches (`driver.rs:418-423`), not live kernel
-    descriptors, so a leak in `watches`/the kernel would not show up in telemetry. Documented in
-    `internal-telemetry.md:790-797`; noting it because it removes the obvious leak detector.
-- **Existing coverage:** `watch.rs:503-689` — nine tests, including two real-fd integration tests
+- **Observed concerns (verified 2026-09-21 — see below):**
+  - ~~`next_wake` returns `std::future::pending()` forever if `AsyncFd::readable()` errors
+    (`:391-396`)~~ — **CONFIRMED and fixed.** It did, silently. Reachable only on runtime
+    shutdown (tokio's `Registration::readiness` returns `Err(gone())` solely when
+    `ev.is_shutdown`), so benign as liveness, but invisible as observability.
+  - ~~A read error other than would-block is swallowed with an empty arm (`:415`)… this is a busy
+    loop~~ — **CONFIRMED, and worse than "busy":** tokio's `AsyncFdReadyGuard::try_io` clears
+    cached readiness *only* on `WouldBlock`, and `AsyncFd::readable()`'s path
+    (`Registration::readiness` → `ScheduledIo::readiness`) carries no `coop::poll_proceed` budget
+    check, so the loop never returns `Ready` *or* `Pending` — the driver's whole task wedges,
+    taking the poll, flush and checkpoint ticks with it. Demonstrated live: reverting the fix made
+    `a_watcher_whose_fd_reads_as_broken_dies_once_and_then_parks` run past 600s without even its
+    own `tokio::time::timeout` firing. Both arms now retire the wake source as `Wake::Dead`.
+  - ~~`logit.input.watch.watches` counts *intended* watches~~ — **CONFIRMED**, and
+    `docs/deploying.md` asserted the opposite ("Under `inotify`/`auto` the two coincide"), now
+    corrected. A failed directory watch no longer inflates it; a draining file whose inode is gone
+    and an aliased directory still do. The leak detector it removes is replaced by
+    `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping`, which reads
+    `/proc/self/fdinfo/<inotify fd>`.
+  - **Not listed here, and the top finding: a pattern directory was armed exactly once, ever.**
+    `reconcile_watches` (`driver.rs:334-346`) armed only the set difference and recorded
+    `watched_dirs = desired` regardless of the syscall's result; `Tailer::patterns` never mutates,
+    so every later scan iterated two empty differences. Missing at `bind`, deleted-and-recreated,
+    or renamed-away all lost the watch permanently. Two independent further causes: `watch_dir`'s
+    `by_path` short-circuit against an entry `IN_IGNORED` never purged, and no `IN_MOVE_SELF` in
+    `DIR_MASK`. All three verified by reverting each fix separately and watching the new tests
+    fail.
+  - **Refuted, and worth not re-litigating:** *`wd` reuse* — the kernel allocates cyclically from
+    1 (`idr_alloc_cyclic`, v3.10 commit `a66c04b4534f`) and before that with a `*last_wd + 1`
+    cursor that never wrapped, so reuse needs a process to cycle `1..INT_MAX` (`inotify(7)` BUGS);
+    "a stale map entry misattributes a later unrelated watch" is not a practical concern on any
+    kernel, and the purge earns its place by bounding the maps instead. *Unbounded `pending`
+    growth* — `next_wake` reads only when `pending` is empty, so it is bounded at
+    `EVENT_BUF_BYTES / 16` = 4096 entries at all times. *Overflow losing tracked files' writes* —
+    `Wake::Overflow` rescans and `drain` (unconditional after every `select!` iteration) re-reads
+    every tracked file in the same iteration. *inotify-rs#156 (one read per readiness edge)* —
+    does not apply: tokio's readiness is cached and cleared only by a `WouldBlock` `try_io`, which
+    is level-trigger emulation, so the `loop { readable().await; try_io(..) }` shape is correct
+    (verified in tokio 1.53.1 `io/async_fd.rs`, `runtime/io/registration.rs`).
+- **Existing coverage (as surveyed):** `watch.rs:503-689` — **ten** tests, not nine (the survey
+  undercounted by one), including two real-fd integration tests
   (`inotify_watcher_watch_dir_wakes_discover_on_a_child_file_created` :635,
   `inotify_watcher_watch_file_wakes_data_on_its_own_write` :653) and
   `parse_events_purges_an_ignored_watch_and_emits_no_wake_for_it` (:593). Driver-level:
   `under_inotify_*` tests at `driver.rs:1811`, `:1878`, `:1916` and `docker.rs:1513`, `:1573`.
+  **Now 34** across `tail::watch` (28 in the `inotify` submodule), plus four new driver-level ones.
 - **Suggested verification approach:** targeted review of the six `unsafe` blocks against
   `inotify(7)`; miri is not applicable (real syscalls) but `parse_events` alone is pure and could
   be fuzzed with arbitrary byte buffers; an fd/watch-leak soak test (`ls /proc/self/fd`,
@@ -1473,6 +1508,30 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
 - **Priority:** P1 — the only `unsafe` in the area, but memory-safety-wise it is small, well
   commented, and the parse half is unit-tested; failure mode is mostly degraded wakes rather than
   corruption.
+- **Verified 2026-09-21 @`c063bc2` (parent `main` @`af2ef65`), branch `libc/w3`.** All six
+  `unsafe` sites reviewed against v6.12 `fs/notify/inotify/inotify_user.c`,
+  `inotify_fsnotify.c`, `include/linux/fsnotify.h`, `inotify(7)`/`inotify_add_watch(2)`/
+  `inotify_rm_watch(2)`, and tokio 1.53.1's `AsyncFd`/`Registration`/`ScheduledIo` — every kernel
+  or tokio claim now in a comment was fetched from the source, not recalled, and the guarantees
+  relied on are written down in [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s
+  2026-09-21 amendment. **Invariants I1–I6 as worded:** I1 holds on 64-bit and was a real 32-bit
+  hardening gap (`event.len as usize` widening a `u32`), now closed with `checked_add`; I2 holds,
+  and `size_of`/`align_of`/every field offset of `libc::inotify_event` is now a const assertion;
+  I3 holds (no `Drop` impl, nothing calls `rm_watch` from drop glue, and tokio's `AsyncFd::drop`
+  discards its deregister result and never calls `Handle::current()`); **I4 was broken** — the
+  `IN_IGNORED` purge covered `watches` only, and `by_path` was not even passed to `parse_events`;
+  I5 holds (`open_tracked` returns early on both rebind branches before `watch_file`, and
+  `reap_drained` removes from `self.files` before `unwatch`); I6 holds — the kernel never returns
+  a partial event. The test fixture `raw_event` was **kernel-infidel** (padding to 4, and `len == 4`
+  for a nameless event where the kernel emits 0), which is why the mutant that advances by
+  `header_len` alone survived every test; it now reproduces `round_event_name_len` exactly.
+  Coverage added: a mixed named/nameless multi-event buffer, both fit-check boundaries, an
+  overflowing `len`, `IN_IGNORED` ORed with another bit, a seeded truncation/bit-flip/inflated-len
+  sweep (`parse_events_survives_seeded_truncation_and_bit_flips`, in the style of
+  `logit-proto/tests/robustness.rs`, miri-friendly via `cfg!(miri)`), the three directory re-arm
+  scenarios against a real fd, a `with_init`-over-a-pipe test for the dead-fd arm, and the
+  `/proc/self/fdinfo` watch-leak soak. `script/unsafe-check`'s existing `logit-inputs|parse_events`
+  filter matches every new pure test by name, so `MIRI_TARGETS` needed no change.
 
 ### TAIL-08 — The runtime `select!`: wake routing, timers, and cancellation safety
 - **Location:** `crates/logit-inputs/src/tail/driver.rs:229-321` (`run_until_shutdown`), `:96-103`
