@@ -797,11 +797,9 @@ fn read_listen_queue(listener: &TokioTcpListener) -> Result<(u32, u32), sockstat
 }
 
 impl AcceptQueueSampler {
-    pub(crate) fn new(
-        _listener: &TokioTcpListener,
-        telemetry: Telemetry,
-        diag: Diagnostics,
-    ) -> Self {
+    /// Takes no listener: the socket this gauges is whichever one is handed to [`Self::accept`],
+    /// by design -- see [`Self::read_queue`].
+    pub(crate) fn new(telemetry: Telemetry, diag: Diagnostics) -> Self {
         Self { read_queue: read_listen_queue, telemetry, diag, enabled: true, tick: None }
     }
 
@@ -1197,8 +1195,7 @@ impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
         // same cancellation safety against the `shutdown` arm below, plus the kernel accept-queue
         // gauges -- see `AcceptQueueSampler`'s own doc for why this loop cannot observe them
         // itself and why an interval sample is needed alongside the per-accept one.
-        let mut accept_queue =
-            AcceptQueueSampler::new(&listener, self.telemetry.clone(), self.diag.clone());
+        let mut accept_queue = AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         loop {
             let (stream, _peer) = tokio::select! {
                 accepted = accept_queue.accept(&listener) => accepted?,
@@ -3405,8 +3402,7 @@ mod tests {
     #[tokio::test]
     async fn an_accept_queue_sampler_that_cannot_read_the_queue_disables_itself() {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
-        let mut sampler =
-            AcceptQueueSampler::new(&listener, Telemetry::default(), Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(Telemetry::default(), Diagnostics::default());
         // The non-Linux shape: `sockstat` has no counters to report on this platform.
         sampler.read_queue = |_| Err(sockstat::Unavailable::NotLinux);
 
@@ -3426,7 +3422,7 @@ mod tests {
         let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
         let addr = listener.local_addr().expect("a bound listener has an address");
-        let mut sampler = AcceptQueueSampler::new(&listener, telemetry, Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(telemetry, Diagnostics::default());
         sampler.read_queue = |_| Err(sockstat::Unavailable::NotLinux);
 
         let client = tokio::spawn(async move { TcpStream::connect(addr).await });
@@ -3491,7 +3487,7 @@ mod tests {
             .expect("a nonblocking listening socket is a valid tokio listener");
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("syslog_in", "syslog_in", "listener");
-        let mut sampler = AcceptQueueSampler::new(&listener, telemetry, Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(telemetry, Diagnostics::default());
 
         // Poll rather than sleep a fixed time: two loopback handshakes are quick, but "quick" is
         // not a guarantee worth flaking over.
@@ -3562,8 +3558,7 @@ mod tests {
 
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
         let addr = listener.local_addr().expect("a bound listener has an address");
-        let mut sampler =
-            AcceptQueueSampler::new(&listener, Telemetry::default(), Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(Telemetry::default(), Diagnostics::default());
         sampler.read_queue = |_| {
             SAMPLES.fetch_add(1, Ordering::SeqCst);
             Ok((0, 1))
@@ -3599,8 +3594,7 @@ mod tests {
         SAMPLES.store(0, Ordering::SeqCst);
 
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
-        let mut sampler =
-            AcceptQueueSampler::new(&listener, Telemetry::default(), Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(Telemetry::default(), Diagnostics::default());
         sampler.read_queue = |_| {
             SAMPLES.fetch_add(1, Ordering::SeqCst);
             Ok((0, 1))
@@ -3645,8 +3639,7 @@ mod tests {
 
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.expect("should bind loopback");
         let addr = listener.local_addr().expect("a bound listener has an address");
-        let mut sampler =
-            AcceptQueueSampler::new(&listener, Telemetry::default(), Diagnostics::default());
+        let mut sampler = AcceptQueueSampler::new(Telemetry::default(), Diagnostics::default());
         sampler.read_queue = |_| {
             SAMPLES.fetch_add(1, Ordering::SeqCst);
             Ok((0, 1))

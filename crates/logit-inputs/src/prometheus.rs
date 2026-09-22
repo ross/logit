@@ -1257,11 +1257,8 @@ impl Input for PrometheusReceiver {
         // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented: the same
         // `accept()` this loop already awaited, plus `logit.input.accept_queue.depth`/
         // `.utilization` sampled before each accept and once a second while waiting for one.
-        let mut accept_queue = crate::tcp::AcceptQueueSampler::new(
-            &listener,
-            self.telemetry.clone(),
-            self.diag.clone(),
-        );
+        let mut accept_queue =
+            crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         loop {
             let (stream, peer) = accept_queue.accept(&listener).await?;
 
