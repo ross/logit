@@ -124,11 +124,14 @@ const DURATIONS: [[(&str, f64); 4]; 4] = [
 /// The index of the unsuffixed, integer-nanosecond form within each `DURATIONS` row.
 const NANOS_FORM: usize = 3;
 
-/// The span timing a line may carry itself -- any one of these present means `trace_context`
-/// already has what it needs, and `span.duration_s` is not mirrored from the request duration.
-/// `span.end*` is deliberately absent: an nginx line's lone `span.end_s` is exactly the case the
-/// mirror exists for, turning it into a resolvable `(end - duration, end)` pair.
-const SPAN_TIMING: [&str; 9] = [
+/// The span timing a line may carry itself, in three groups: the duration forms, the start
+/// forms, the end forms (`SPAN_DURATION_FORMS`/`SPAN_START_FORMS`/`SPAN_END_FORMS` index them).
+/// `span.duration_s` is mirrored from the request duration unless the line already states a
+/// duration, or states both a start and an end -- the two shapes `trace_context` can resolve on
+/// its own. A lone end (nginx's `$msec`) and a lone start (HAProxy's `request_date(us)`) are
+/// exactly what the mirror exists for: `trace_context` would otherwise borrow the event's receipt
+/// time for the missing bound, ending a HAProxy span a syslog hop late.
+const SPAN_TIMING: [&str; 14] = [
     "span.duration",
     "span.duration_us",
     "span.duration_ms",
@@ -138,7 +141,15 @@ const SPAN_TIMING: [&str; 9] = [
     "span.start_ms",
     "span.start_s",
     "span.start_rfc3339",
+    "span.end",
+    "span.end_us",
+    "span.end_ms",
+    "span.end_s",
+    "span.end_rfc3339",
 ];
+const SPAN_DURATION_FORMS: std::ops::Range<usize> = 0..4;
+const SPAN_START_FORMS: std::ops::Range<usize> = 4..9;
+const SPAN_END_FORMS: std::ops::Range<usize> = 9..14;
 
 /// Names this component only caps or passes through, listed so they get a dashed alias too.
 const PASSTHROUGH: [&str; 8] = [
@@ -155,20 +166,10 @@ const PASSTHROUGH: [&str; 8] = [
 /// `docs/design/data-model.md`'s trace/timing names that `trace_context` reads and this
 /// component never touches -- aliased anyway, because `http_access` runs *before*
 /// `trace_context`, which then stays dotted-only (the ADR's dashed-alias decision).
-/// (`span.name`/`span.status`/`span.duration_s` and the `span.start*`/`span.duration*` forms are
+/// (`span.name`/`span.status`/`span.duration_s` and every `span.{start,end,duration}*` form are
 /// listed above, since this component reads or writes them.)
-const TRACE_NAMES: [&str; 10] = [
-    "trace.id",
-    "trace.flags",
-    "span.id",
-    "span.parent_id",
-    "span.kind",
-    "span.end",
-    "span.end_us",
-    "span.end_ms",
-    "span.end_s",
-    "span.end_rfc3339",
-];
+const TRACE_NAMES: [&str; 5] =
+    ["trace.id", "trace.flags", "span.id", "span.parent_id", "span.kind"];
 
 /// Semconv's known methods, compared case-sensitively (semconv's own rule: `get` is not `GET`).
 /// Their order is the row order of the `span.name` table.
@@ -1198,7 +1199,12 @@ impl HttpAccess {
         }
         let (duration_s, _) = keys.durations[0][0];
         if let Some(duration @ Value::F64(_)) = attrs.get_sym(duration_s.sym) {
-            if !keys.span_timing.iter().any(|key| present(attrs, key.sym).is_some()) {
+            let has = |forms: std::ops::Range<usize>| {
+                keys.span_timing[forms].iter().any(|key| present(attrs, key.sym).is_some())
+            };
+            let already_timed =
+                has(SPAN_DURATION_FORMS) || (has(SPAN_START_FORMS) && has(SPAN_END_FORMS));
+            if !already_timed {
                 let duration = duration.clone();
                 attrs.insert_sym(keys.span_duration_s.sym, duration);
                 count(telemetry, DERIVED, keys.span_duration_s.name);
@@ -1842,15 +1848,24 @@ mod tests {
         assert_eq!(get(&event, "error.type"), Some(&s("503")), "the cached cell again");
     }
 
+    /// A lone end (nginx) and a lone start (HAProxy) both get the mirror -- without it
+    /// `trace_context` borrows receipt time for the missing bound. A stated duration, or a
+    /// start *and* an end, is a span `trace_context` can already resolve, so nothing is added.
     #[test]
-    fn the_request_duration_is_mirrored_only_when_the_line_carries_no_span_timing() {
-        let event = run(
-            &mut bare(),
-            &[("http.request.duration_s", Value::F64(0.25)), ("span.end_s", s("1700000000.5"))],
-        );
-        assert_eq!(get(&event, "span.duration_s"), Some(&Value::F64(0.25)), "a lone end: mirrored");
+    fn the_request_duration_is_mirrored_unless_the_line_already_states_a_resolvable_span() {
+        for lone in ["span.end_s", "span.start_us", "span.start_rfc3339"] {
+            let event = run(
+                &mut bare(),
+                &[("http.request.duration_s", Value::F64(0.25)), (lone, s("1700000000.5"))],
+            );
+            assert_eq!(
+                get(&event, "span.duration_s"),
+                Some(&Value::F64(0.25)),
+                "a lone {lone}: mirrored"
+            );
+        }
 
-        for timing in ["span.start_us", "span.duration_ms", "span.duration_s"] {
+        for timing in ["span.duration_ms", "span.duration", "span.duration_s"] {
             let event = run(
                 &mut bare(),
                 &[("http.request.duration_ms", Value::I64(250)), (timing, Value::I64(7))],
@@ -1861,6 +1876,16 @@ mod tests {
                 "{timing} present: not mirrored"
             );
         }
+
+        let event = run(
+            &mut bare(),
+            &[
+                ("http.request.duration_ms", Value::I64(250)),
+                ("span.start_us", Value::I64(1_700_000_000_000_000)),
+                ("span.end_us", Value::I64(1_700_000_000_250_000)),
+            ],
+        );
+        assert_eq!(get(&event, "span.duration_s"), None, "a start and an end: not mirrored");
     }
 
     #[test]
