@@ -252,7 +252,8 @@ already built that have a known, accepted rough edge.
 - **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
   a UDP listener always calls `recvmmsg(2)`; a seccomp profile (or an LSM) that refuses it returns
   `ENOSYS`/`EPERM` on the very first call, which `read_loop` treats as fatal, so the listener fails
-  immediately and the process exits with the startup-failure code. That is the correct *shape* —
+  immediately and the process exits with the runtime-failure code (`2`, not the bind-time `1`: the
+  socket bound fine, and the first read is what fails). That is the correct *shape* —
   quinn hit the same wall on Android x86 (quinn#1947) and bun hit a worse one, where the refusal
   produced no datagrams and a 100% CPU spin (bun#42678) — and since `libc/w1` the message names the
   syscall, the bound socket, and the fact that `receive.read_batch: 1` will not help, instead of a
