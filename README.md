@@ -50,9 +50,12 @@ Tempo in the demo above, and
 `trace_id` ([ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md),
 [docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `json`, `csv`, `kv_metrics`,
 `keep`, `remove`, `set`, `trace_context`, `scale`, `logfmt`, `kv` (the de-facto `key=value`
-parsers, [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), and `flatten`
-(dotted-key expansion of a nested attribute, [ADR `flatten-transform`](docs/adr/flatten-transform.md))
-have joined `aggregate` as implemented native transforms —
+parsers, [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), `flatten`
+(dotted-key expansion of a nested attribute, [ADR `flatten-transform`](docs/adr/flatten-transform.md)),
+and `http_access` (a web server's access line, logged under raw OTel semconv names, normalized
+and given a bounded route/user-agent/span-name set,
+[ADR `http-access-normalization`](docs/adr/http-access-normalization.md),
+[docs/http-access-logs.md](docs/http-access-logs.md)) have joined `aggregate` as implemented native transforms —
 `trace_context`'s opt-in `span:` block turns an access log line into a real span on the same event
 ([ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)). `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
@@ -64,7 +67,8 @@ one partition pass in place of a filter per branch ([ADR `target-components`](do
 building from source — [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) and
 [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) are contributor-facing fixtures
 `script/server [config]` runs against the local dev stack below (the latter against a real nginx,
-see [docs/deploying.md](docs/deploying.md) for its nginx-side recipe). See
+see [docs/deploying.md](docs/deploying.md) for its nginx-side recipe and
+[docs/http-access-logs.md](docs/http-access-logs.md) for the access-log schema). See
 [ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md)
 for `aggregate`'s windowing semantics. Any field on any component can pull its value from the
 environment with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
@@ -140,7 +144,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd, syslog, otlp, tail (tail_in/docker_in)
   logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
-  logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv, flatten
+  logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv, flatten, http_access
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
   logit-perf        dev-only: the out-of-CI load-test harness binary (script/perf)

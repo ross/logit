@@ -999,6 +999,15 @@ already built that have a known, accepted rough edge.
   unbounded series in `aggregate` and in InfluxDB. `examples/nginx-to-influxdb.yaml`'s `bounded`
   component (`keep_values`, `docs/adr/value-allowlist-cardinality-clamp.md`) now clamps `host` to
   the two real vhosts ahead of `aggregate`, folding anything else into one `other`-tagged series.
+
+  **Narrowed again on 2026-09-22:** the *length* half is now bounded by default too. The lean
+  format is `access_semconv` now, logging `$host` as `server.address`, and `http_access`
+  ([ADR `http-access-normalization`](adr/http-access-normalization.md)) caps `server.address` at
+  253 characters (`max_length: {server.address: 253}`, `CAPPED_FIELDS`' default) however large the
+  `Host` header was — so an over-long value can no longer reach a tag or a span attribute at full
+  size, whatever let it past nginx. `bounded` clamps `server.address` rather than `host`. The
+  truncation finding above is unchanged: the cap runs after `json` has parsed the line, so a
+  datagram already truncated in transit still fails `json` exactly as described.
 - **Internal telemetry ([internal-telemetry.md](design/internal-telemetry.md),
   [ADR `internal-telemetry-as-pipeline-events`](adr/internal-telemetry-as-pipeline-events.md)) covers metrics only** — the
   framework (the `internal` component, the per-component buffer, the emit API) is built to extend,
@@ -1898,3 +1907,82 @@ already built that have a known, accepted rough edge.
   `Dockerfile` beyond the manual `workflow_dispatch` publish itself
   ([ADR `publish-release-image-to-ghcr`](adr/publish-release-image-to-ghcr.md)). All named as
   deliberate follow-ups there, not oversights.
+
+- **Closed (2026-09-22): an nginx access line carrying invalid UTF-8 was lost whole — at `json`,
+  not at `syslog_in`.** nginx's `escape=json` escapes `"`, `\`, and control bytes but passes bytes
+  `>= 0x80` through raw, so a Latin-1 `User-Agent`, or a percent-*decoded* path logged via `$uri`,
+  puts invalid UTF-8 into an otherwise valid-looking JSON line. `syslog_in` never dropped such a
+  line: it decodes the MSG as `Value::Bytes` (the non-UTF-8 MSG entry above). `json`'s strict
+  parse was what failed it — one throttled `parse_failure`, the event passed through with none of
+  its fields — which is the one failure `http_access` can't reach from behind `json`. `json` now
+  takes `invalid_utf8: replace` ([ADR `http-access-normalization`](adr/http-access-normalization.md)):
+  a parse that failed on invalid UTF-8 is retried on a copy with every invalid sequence replaced by
+  U+FFFD, on the failure path only, and a rescued line reports `logit.component.diagnostics
+  {key="invalid_utf8"}`. Still true: the default stays `reject`, so a pipeline has to opt in; the
+  replacement is lossy (the original bytes don't survive); and `docs/http-access-logs.md` tells
+  nginx users to log `$request_uri`, never `$uri`, which removes the decoded-path source but not a
+  client's own non-ASCII header bytes.
+
+- **`http_access` has no per-server presets** (2026-09-22). It never learns a server's native
+  variable names: an operator writes the mapping onto the canonical names in the server's own
+  log-format language, with `docs/http-access-logs.md` as the reference
+  ([ADR `http-access-normalization`](adr/http-access-normalization.md)'s rejected `preset: nginx`).
+  Caddy and Traefik are the two servers whose JSON key names can't be chosen at all; for them the
+  doc's recipe is a `lua` rename stage (Caddy with a `flatten` ahead of it), which costs a Lua VM
+  per worker and a few allocations per event — `logit` has no native rename component (`set` only
+  stamps constants). A native rename, or a preset, becomes worth building if either server turns
+  out to matter.
+
+- **`http_access`'s `forwarded: {trust: true}` is all-or-nothing** (2026-09-22). It overwrites
+  `client.address` with the *first* hop of `http.request.header.x-forwarded-for`, with no
+  trusted-proxy list and no hop count. Behind one proxy you control that sets the header, that's
+  right; behind several, or behind one that appends to a client-supplied header, the first hop is
+  whatever the client wrote. Picking the right hop needs to know which proxies are yours (the
+  `set_real_ip_from`/`real_ip_recursive` shape nginx's own realip module has), which is config this
+  component doesn't carry yet.
+
+- **`http_access`'s route rules are regex-only, and matched O(rules) per event with no prefilter**
+  (2026-09-22). Each `routes:` entry is a regex (or a built-in set, itself one regex) tried in list
+  order until one matches — no path-template syntax (`/users/:id`), no prefix trie, no `RegexSet`
+  prefilter. For the handful of rules a real deployment has this is noise next to `json`'s own
+  parse; for dozens of rules on a busy tier it is linear in the rule count on every unmatched path,
+  which is exactly the scanner traffic that falls through to `route_other`. A `script/perf`
+  scenario to find where it starts to matter hasn't been written.
+
+- **`http_access`'s user-agent table is a heuristic bucket classifier, not a parser** (2026-09-22).
+  It writes one of `scanner`/`tool`/`crawler`/`browser`/`other`/`none` (or a configured class),
+  never `user_agent.name`/`user_agent.version`. The built-in table can be pre-empted by
+  `user_agent_rules:` (tried first) or by an upstream `user_agent.class`, which `http_access` trusts
+  as-is, but it can't be turned off. And it only sees what the client sent: nikto 2.6.1+ defaults
+  to a browser UA from its own bundled list, nuclei randomizes a real browser UA for ordinary HTTP
+  requests, and Nessus uses a real Chrome UA matching the scan host's platform, so their
+  unconfigured traffic classifies `browser`, not `scanner`, however the table is tuned. The
+  `scanner` row only catches a scanner that identifies itself.
+
+- **`http_access` never percent-decodes a path** (2026-09-22). `http.route` is matched against the
+  capped `url.path` exactly as it arrived, so a route rule matches the encoded form only: `/api/x`
+  and `/%61pi/x` are two different paths to it, and the second may land in `route_other`.
+  Decoding safely (overlong sequences, encoded `/`, invalid UTF-8 after decoding) is real code, and
+  doing it would also change the recommended `url.original` contract of "the raw request target".
+
+- **A non-UTF-8 value reaching `http_access` is capped in bytes and never classified**
+  (2026-09-22). A field that arrives as `Value::Bytes` — possible from any stage that keeps raw
+  bytes, a `lua` stage writing a string that isn't valid UTF-8 among them — has no text to run a
+  regex over. It is still capped (by byte length, not characters) and control-byte cleaned, but
+  a bytes `user_agent.original` classifies `other` and a bytes `url.path` gets `route_other` (or no
+  route). Best-effort, visible, and counted like any other field; just never matched.
+
+- **The built-in `crawler` pattern trades `\bbot\b`'s precision for bare `bot/`'s recall**
+  (2026-09-22). `\bbot\b` alone misses every crawler whose token runs the word into `Bot/`
+  (`DotBot/1.2`, `Discordbot/2.0`, `YandexMobileBot/3.0`), and the long tail of unlisted crawlers
+  mostly looks like that. So bare `bot/` sits beside it (`\bbot/` would add nothing, since a `/`
+  is always a word boundary), at the cost of classifying anything with `bot/` mid-word as a crawler
+  — `UptimeRobot/2.0` was the one false positive in the corpus, and is caught first by `tool`. A
+  product whose name ends in `bot` and isn't a crawler will be called one; a `user_agent_rules:`
+  entry pre-empts it.
+
+- **Not a gap, a consequence: an nginx line with no `$http_user_agent` gets no
+  `user_agent.class`** (2026-09-22). An absent header writes no class, by `http_access`'s absent
+  rule — an absent header is silence, not `none` (which is what a logged-but-empty header gets).
+  `demo/nginx/nginx.conf`'s format doesn't log the user agent, so the demo's nginx events carry no
+  class while its HAProxy events do. Log `"user_agent.original":"$http_user_agent"` to get one.

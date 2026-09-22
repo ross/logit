@@ -1645,27 +1645,33 @@ never has more than one frame outstanding), and `logit_in`'s shutdown grace is f
 
 ## The nginx-side recipe
 
-Concrete, working reference config lives in this repo: [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf)
-(the `access_log`/`log_format` directives) and
-[`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml) (the `logit` side —
-`syslog_in` → `json` → `kv_metrics` → `keep` → `aggregate` → `influxdb_out`, plus `stdio_out` for
-visibility). Point at those directly rather than re-deriving the log-format syntax here; this
-section is the operational notes around using them against a real nginx, not a restatement of their
-contents.
+The schema — which attribute name each nginx variable is logged under, the quoting rules, what
+`http_access` does to each field, and the equivalent snippet for Apache, HAProxy, Varnish, Squid,
+Envoy, Caddy, and Traefik — lives in [`docs/http-access-logs.md`](http-access-logs.md). The
+working reference config is [`examples/nginx/nginx.conf`](../examples/nginx/nginx.conf) (its
+`access_semconv` `log_format`) with [`examples/nginx-to-influxdb.yaml`](../examples/nginx-to-influxdb.yaml)
+(`syslog_in` → `json` → `http_access` → `trace_context` → `kv_metrics` → `keep` → `keep_values` →
+`aggregate` → `influxdb_out`, plus `stdio_out` for visibility). This section is only the
+operational notes around running that against a real nginx.
+
+Two fixes from that doc are worth repeating here because they fail silently. `$status` must be
+quoted (`"http.response.status_code":"$status"`): nginx can log a literal `000` on an abnormal
+termination, and an unquoted `000` is invalid JSON that loses the whole line. And the `json`
+component in front of `http_access` should set `invalid_utf8: replace`, since `escape=json` passes
+bytes `>= 0x80` through raw and one Latin-1 `User-Agent` otherwise fails the entire line's parse.
 
 ### Which directives to add
 
-Two `log_format`s and two `access_log` lines per `server {}` block, as in
-`examples/nginx/nginx.conf`: a lean, `escape=json` format containing exactly the fields your
-`kv_metrics` component reads, sent over syslog/UDP —
+One `access_log` line per `server {}` block pointing the `access_semconv` format at `logit` over
+syslog/UDP —
 
 ```nginx
-access_log syslog:server=<logit-host>:5140,tag=nginx_access,nohostname access_json_syslog;
+access_log syslog:server=<logit-host>:5140,tag=nginx_access,nohostname access_semconv;
 ```
 
-— and, during cutover, the existing verbose stdout format left in place alongside it as a second
-`access_log` line (nginx allows more than one per block). `error_log` needs no change: it stays
-nginx's own non-JSON format, out of scope here.
+— and, during cutover, the existing access log left in place as a second `access_log` line (nginx
+allows more than one per block). `error_log` needs no change: it stays nginx's own non-JSON
+format, out of scope here.
 
 ### Why keep the existing stdout destination during cutover
 

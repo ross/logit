@@ -96,8 +96,10 @@ fallback; `error.type` (the status code, 5xx only); `span.status` (`error` for 5
 otherwise `unset` — never `ok`, which semconv reserves for an explicit override and today's
 configs write wrongly for every non-5xx response); `span.name` (`{method} {route}`, or `{method}`
 alone when no route matched, `HTTP` in place of `_OTHER`); and `span.duration_s` mirrored from
-`http.request.duration_s` when the event carries no span timing of its own, which is what turns
-an nginx line's lone `span.end_s` into a resolvable `(end − duration, end)` pair. Under an
+`http.request.duration_s` unless the event already states a span duration, or both a start and
+an end — the two shapes `trace_context` resolves on its own. A lone end (nginx's `$msec`) and a
+lone start (HAProxy's `request_date(us)`) both get the mirror, which is what turns each into a
+resolvable pair instead of a span with receipt time borrowed for its missing bound. Under an
 explicit `forwarded: {trust: true}`, `client.address` is overwritten from the first hop of
 `http.request.header.x-forwarded-for`; off by default because the header is client-supplied.
 

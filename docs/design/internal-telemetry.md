@@ -962,6 +962,30 @@ Worked examples, one per shipped component:
   `shape` above is built to avoid. `keep_values` may tag `field` only because its fields are
   config-declared; `flatten`'s usually aren't. No `Diagnostics` — flattening an already-decoded
   value can't fail. See [ADR `flatten-transform`](../adr/flatten-transform.md).
+- `http_access` (`crates/logit-transforms/src/http_access.rs`): seven counters, every tag from a
+  closed, `&'static` table, never an observed value — `logit.transform.http_access.normalized
+  {field}` (a field rewritten into its conformant form: a dashed alias renamed, a composite
+  decomposed, a numeric coerced, a duration converted, a method or version normalized, a leading
+  `?` stripped), `.derived{field}` (a field written from config or a built-in table:
+  `user_agent.class`, `user_agent.synthetic.type`, `http.route`, `error.type`, `span.name`,
+  `span.status`, `span.duration_s`, `http.request.method_original`, `client.address` under
+  `forwarded`), `.truncated{field}` (a value cut to its `max_length`), `.cleaned{field}` (a
+  control byte replaced by `_`), `.invalid{field}` (present but unparseable, left as it arrived),
+  `.redacted` (untagged; one per sensitive `url.query` value replaced), and
+  `.routed{outcome="rule"|"builtin"|"other"|"none"}` (once per event with a `url.path` — the
+  outcome, never the route value, which is operator-declared and unbounded in number). `field` is
+  always the canonical dotted name. Three throttled `Diagnostics` keys, for genuine producer
+  malformation only: `bad_request_line` (`http.request.line` isn't `METHOD TARGET PROTOCOL`),
+  `bad_status`, and `bad_duration`. An absent field, an unknown method, an unclassifiable user
+  agent, and an unrouted path are normal traffic and get counters only. See
+  [ADR `http-access-normalization`](../adr/http-access-normalization.md) and
+  [`docs/http-access-logs.md`](../http-access-logs.md).
+- `json` (`crates/logit-transforms/src/json.rs`): no counters, three throttled `Diagnostics`
+  keys — `parse_failure` (the message isn't a JSON object; the event passes through with its
+  attributes untouched), `no_brace` (`skip_to_brace: true` and no `{` anywhere), and
+  `invalid_utf8` (only under `invalid_utf8: replace`: a parse that failed on invalid UTF-8
+  succeeded on the lossy retry — the line was rescued, not lost; a retry that also fails reports
+  `parse_failure` instead). See [ADR `json-parsing-into-attributes`](../adr/json-parsing-into-attributes.md).
 - `stdio_out`/`file_out` (`StreamOutput`, `crates/logit-outputs/src/stdio.rs`): both built on the
   same sink (ADR `rotating-file-output`), so both share `logit.output.batch.bytes` — direct parity
   with `influxdb_out`'s own batch-bytes metric. A write error still propagates as a hard failure

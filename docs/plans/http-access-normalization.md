@@ -101,8 +101,9 @@ kind sketch, and roles table.
 On the existing `Err(err)` arm only: if `invalid_utf8 == Replace` and `std::str::from_utf8(&body)`
 fails, build `Bytes::from(String::from_utf8_lossy(&body).into_owned())`, re-run the same
 `parse_object`/`parse_object_prefix` against it (the zero-copy `Str` slices then borrow that
-owned buffer, which is fine — it lives as long as they do), count
-`logit.transform.json.utf8_replaced`, and `warn_throttled("invalid_utf8", …)`. A second failure
+owned buffer, which is fine — it lives as long as they do), and `warn_throttled("invalid_utf8",
+…)` — the `Diagnostics` bridge counts every occurrence as
+`logit.component.diagnostics{key="invalid_utf8"}`, so there is no separate counter. A second failure
 falls through to the existing `parse_failure` path. The happy path is untouched, so the existing
 allocation pins for `json` do not move.
 
@@ -182,8 +183,9 @@ own tests:
    `routed{outcome=rule|builtin|other|none}` once per event that has a path.
 9. **Derive.** `error.type` = the status as a decimal string, 5xx only. `span.status` = `error`
    for 5xx or 0, else `unset`. `span.name` from the lazily-filled table: `{M} {route}` or `{M}`,
-   `M` = `HTTP` when the method is `_OTHER`. `span.duration_s` = `http.request.duration_s` only
-   when no `span.duration*` and no `span.start*` is present. Under `trust_forwarded`, when
+   `M` = `HTTP` when the method is `_OTHER`. `span.duration_s` = `http.request.duration_s` unless
+   a `span.duration*` is present, or both a `span.start*` and a `span.end*` are — a lone end
+   (nginx) and a lone start (HAProxy) both get the mirror. Under `trust_forwarded`, when
    `http.request.header.x-forwarded-for` is present and non-empty, `client.address` = its first
    comma-separated hop, ASCII-trimmed, `Bytes::slice`. Each counted `derived{field}`.
 
@@ -238,7 +240,7 @@ un-configured traffic classifies `browser`, not `scanner`, regardless of table t
 `$upstream_*` quoted, `traceparent` raw. `access_json_full` unchanged. `demo/nginx/nginx.conf`:
 propagation maps kept (this tier forwards the `traceparent` it logs), `$span_status` deleted,
 semconv keys, quoted `$status`. `demo/haproxy/haproxy.cfg`: `%{+json}o` with dashed keys
-(`%(url-path)[var(txn.path)]`, `%(http-response-status-code:sint)ST`,
+(`%(url-path)[var(txn.path)]`, `%(http-response-status_code:sint)ST`,
 `%(http-request-duration_ms:sint)Ta`, `%(span-start_us:sint)[request_date(us)]`,
 `upstream-connect_ms` ← `%Tc`, `upstream-header_ms` ← `%Tr`, extras as `haproxy_timer_*_ms`); new
 `txn.query`/`txn.ua` vars; the `txn.span_status` rules deleted. Every spelling verified with
