@@ -1,7 +1,7 @@
 # The nginx reference example (docs/plans/nginx-integration.md, workstream F): proves
-# syslog_in -> json -> kv_metrics -> keep -> keep_values -> aggregate -> influxdb_out (plus
-# stdio_out for visibility) against a real nginx (examples/nginx/), end to end in this repo's own
-# dev stack.
+# syslog_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> keep_values ->
+# aggregate -> influxdb_out (plus stdio_out for visibility) against a real nginx
+# (examples/nginx/), end to end in this repo's own dev stack.
 #
 # This is a contributor-facing fixture, not the recommended starting point for trying `logit` --
 # it exists because root compose.yaml's `nginx` service and crates/logit-bench/src/fixtures.rs's
@@ -20,7 +20,10 @@
 #                          nginx_json (json)          <- merges the JSON body into attributes
 #                              |
 #                              v
-#                         nginx_trace (trace_context)  <- lifts trace.id/span.id onto LogRecord.trace
+#                          nginx_http (http_access)   <- normalizes the raw semconv fields, derives
+#                              |                          http.route/user_agent.class/span.name
+#                              v                          (docs/adr/http-access-normalization.md)
+#                         nginx_trace (trace_context)  <- lifts the traceparent onto LogRecord.trace
 #                              |                           and mints a real span on the same event
 #                              v                           (docs/adr/trace-context-span-lifting.md)
 #                          nginx_metrics (kv_metrics) <- adds metrics to the same event
@@ -29,21 +32,21 @@
 #             stdio_out              trimmed (keep)   <- drops   nginx_spans (keep_signals: [traces])
 #                                          |             high-cardinality        |
 #                                          v             attrs                   v
-#                                  bounded (keep_values) <- clamps $host    span_tap (stdio_out)
-#                                          |                to the two
-#                                          v                real vhosts
+#                                  bounded (keep_values) <- clamps           span_tap (stdio_out)
+#                                          |                server.address
+#                                          v                to the two real vhosts
 #                                    windowed (aggregate)
 #                                          |
 #                                          v
 #                                     influx_out
 #
-# `nginx.conf`'s lean `access_json_syslog` log_format is sized to carry exactly the fields
-# `nginx_metrics` reads below plus the trace/span convention `nginx_trace` reads -- see that
-# file's comments and docs/known-gaps.md for what happens to the one field it can't bound ($host)
-# on a pathologically oversized Host header. `bounded` (below) closes the *cardinality* half of
-# that same gap: nginx serves exactly two vhosts, but `$host` itself is attacker-controlled, so
-# without a clamp a stuffed Host header would explode both `aggregate`'s series count and the
-# InfluxDB tag it becomes (docs/adr/value-allowlist-cardinality-clamp.md).
+# `nginx.conf`'s lean `access_semconv` log_format logs raw OTel semconv attribute names with the
+# untouched value -- nothing capped, coerced, or classified there; that's `nginx_http`'s job
+# (docs/adr/http-access-normalization.md), which caps `server.address` ($host) at 253 characters
+# however large the Host header was. `bounded` (below) closes the *cardinality* half of that same
+# gap: nginx serves exactly two vhosts, but `$host` itself is attacker-controlled, so without a
+# clamp a stuffed Host header would explode both `aggregate`'s series count and the InfluxDB tag
+# it becomes (docs/adr/value-allowlist-cardinality-clamp.md).
 components:
   nginx_in:
     type: syslog_in
@@ -64,19 +67,43 @@ components:
     type: json
     sources: [nginx_identity]
 
-  # Lifts the access line's own trace.id/span.id onto LogRecord.trace and, via the `span:` block,
-  # mints a real SpanRecord on the same event -- start/end/duration come from `span.end_s`/
-  # `span.duration_s` (docs/design/data-model.md's "Well-known attribute names";
-  # docs/adr/trace-context-span-lifting.md's "Producer timing model" is why nginx's fields pair
-  # this way, not `span.start_s`). `keep_source` left at its default `false`: the consumed
-  # attributes (including the raw `traceparent`) are removed so `nginx_metrics`/`trimmed` below
-  # see exactly the fields they did before this stage existed.
+  # Turns the line's raw semconv fields into their conformant form: `http.response.status_code`
+  # to an integer, `url.original` split into a capped `url.path`/`url.query` (sensitive query
+  # values redacted), `user_agent.class` from the built-in table, and -- from `routes:` below --
+  # a bounded `http.route`, which is what names the span `nginx_trace` mints (`span.name: GET
+  # /{asset}`, never the raw path) and sets its `span.status` (error on a 5xx or a `000`, unset
+  # otherwise, per semconv). It also mirrors `http.request.duration_s` into `span.duration_s`,
+  # which pairs with the line's own `span.end_s`. Every `http.route` value comes from this config
+  # or a built-in set, never from the path itself: an unmatched path is `route_other`'s literal
+  # `/{other}`, one series, however many distinct paths a scanner tries
+  # (docs/adr/http-access-normalization.md).
+  nginx_http:
+    type: http_access
+    sources: [nginx_json]
+    routes:
+      - builtin: probes
+      - builtin: assets
+      - match: '^/$'
+        route: /
+    route_other: /{other}
+
+  # Lifts the access line's inbound `traceparent` onto LogRecord.trace and, via the `span:` block,
+  # mints a real SpanRecord on the same event -- start/end/duration come from `span.end_s` and the
+  # `span.duration_s` `nginx_http` mirrored (docs/design/data-model.md's "Well-known attribute
+  # names"; docs/adr/trace-context-span-lifting.md's "Producer timing model" is why nginx's fields
+  # pair this way, not `span.start_s`). `mint_id: true` because nginx no longer mints a span id of
+  # its own -- the `$request_id` `map` is gone from `nginx.conf`, and neither vhost forwards a new
+  # `traceparent`, so nothing outside `logit` ever needs to know this span's id. `name:` is only a
+  # fallback now: `nginx_http` wrote `span.name`, which wins. `keep_source` left at its default
+  # `false`: the consumed attributes (including the raw `traceparent`) are removed so
+  # `nginx_metrics`/`trimmed` below never see them.
   nginx_trace:
     type: trace_context
-    sources: [nginx_json]
+    sources: [nginx_http]
     span:
       kind: server
       name: http.request
+      mint_id: true
 
   nginx_metrics:
     type: kv_metrics
@@ -84,13 +111,13 @@ components:
     counters:
       - name: nginx.requests # +1 per event
       - name: nginx.bytes_sent
-        field: body_bytes_sent
+        field: http.response.body.size
     distributions:
       - name: nginx.request_time
-        field: request_time
+        field: http.request.duration_s
         unit: s
       - name: nginx.upstream_response_time
-        field: upstream_response_time # empty ("-" outside escape=json) on a non-proxied request -> silently skipped
+        field: upstream.duration_s # empty on a non-proxied request -> silently skipped
         unit: s
 
   tap:
@@ -112,27 +139,39 @@ components:
     sources: [nginx_spans]
 
   # `keep` before `aggregate`, not after -- otherwise `aggregate`'s SeriesKey would key a series
-  # per request on every syslog.* attribute (syslog.timestamp is unique per line), exploding both
-  # cardinality and per-window memory. `host`/`request_method`/`status` are exactly the tags the
-  # verification step checks for -- nothing else, especially no syslog.* attribute, should
-  # survive.
+  # per request on every syslog.* attribute (syslog.timestamp is unique per line) and on
+  # `url.path`/`client.address`, exploding both cardinality and per-window memory. The list is
+  # semconv's own low-cardinality attribute set for `http.server.request.duration` plus
+  # `user_agent.class` -- each one bounded, either by construction (`http.route`,
+  # `user_agent.class`, a normalized method, an integer status) or by `bounded` below
+  # (`server.address`). Nothing else, especially no syslog.* attribute, should survive.
   trimmed:
     type: keep
     sources: [nginx_metrics]
-    fields: [host, request_method, status]
+    fields:
+      [
+        server.address,
+        http.request.method,
+        http.response.status_code,
+        http.route,
+        network.protocol.version,
+        url.scheme,
+        user_agent.class,
+      ]
 
   # `keep` bounds which keys reach `aggregate`'s SeriesKey; this bounds which *values* do.
-  # `request_method`/`status` are closed sets, but `host` is nginx's `$host` -- the client's Host
-  # header, unbounded and attacker-controlled. `nginx.conf` serves exactly two vhosts, so anything
-  # else is junk and belongs in one bucket rather than its own series. `normalize: [lower]` is
-  # belt-and-braces here (nginx already lowercases `$host` itself) and would be load-bearing for
-  # any other syslog client feeding this listener, which is why the allow-list doesn't just rely
-  # on nginx's own behavior.
+  # Every other surviving field is a closed set, but `server.address` is nginx's `$host` -- the
+  # client's Host header, capped in length by `nginx_http` but still unbounded in value and
+  # attacker-controlled. `nginx.conf` serves exactly two vhosts, so anything else is junk and
+  # belongs in one bucket rather than its own series. `normalize: [lower]` is belt-and-braces
+  # here (nginx already lowercases `$host` itself) and would be load-bearing for any other syslog
+  # client feeding this listener, which is why the allow-list doesn't just rely on nginx's own
+  # behavior.
   bounded:
     type: keep_values
     sources: [trimmed]
     attributes:
-      host:
+      server.address:
         normalize: [lower]
         allow: [static.local, proxy.local]
         other: other

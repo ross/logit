@@ -2,9 +2,10 @@
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
 # docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
 # docs/plans/operator-surface.md).
-# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + regex + trace_context +
-# scale + kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out, OTLP/gRPC out,
-# plus `internal` observing the pipeline itself (ADR `internal-telemetry-as-pipeline-events`, ADR
+# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + regex + http_access +
+# trace_context + kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out,
+# OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
+# `internal-telemetry-as-pipeline-events`, ADR
 # `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses five real
 # tiers: haproxy -> nginx -> app -> postgres, plus an async worker over Redis
 # (demo/compose.yaml's `traffic` service drives the first three; docs/plans/demo-tracing-stack.md's
@@ -37,9 +38,11 @@
 #   `nginx_identity`/`nginx_json` as if they were access lines.
 #
 #   haproxy --syslog/UDP:5140--> haproxy_in -> haproxy_identity (set) -> haproxy_json (json)
+#                                                               -> haproxy_http (http_access)
 #                                                                              |
 #   nginx   --stdout--> json-file --tail(docker_in)--> nginx_in -> nginx_stdout (lua, drops
 #                                       stderr) -> nginx_identity (set) -> nginx_json (json)
+#                                                               -> nginx_http (http_access)
 #                                                                              |
 #   demo-app --syslog/UDP:5142--> app_in    -> app_identity     (set) -> app_json     (json)
 #                                                                              |
@@ -55,7 +58,9 @@
 #                                                                 |             from the same line
 #                                                                 |             (docs/adr/
 #                                                                 |             trace-context-
-#                                                                 |             span-lifting.md)
+#                                                                 |             span-lifting.md),
+#                                                                 |             named by
+#                                                                 |             *_http's route
 #                                       +-------------------------+---------------------+
 #                                       v                         v                     v
 #                              stdout (stdio_out)      logs_only (keep_signals: [logs])  |
@@ -68,9 +73,6 @@
 #                                                                             app_trace/worker_trace carry no span)
 #                                                                                         |
 #          haproxy_trace                       nginx_trace                               |
-#                |                                   |                                   |
-#                |                                   v                                   |
-#                |                          nginx_scale (scale)  <- request_time: s -> ms |
 #                |                                   |                                   |
 #                v                                   v                                   |
 #       haproxy_metrics (kv_metrics)         nginx_metrics (kv_metrics)                   |
@@ -283,10 +285,68 @@ components:
     type: json
     sources: [postgres_identity]
 
+  # Both web tiers now log raw OTel semconv attribute names with the untouched value
+  # (demo/haproxy/haproxy.cfg, demo/nginx/nginx.conf) -- nothing capped, coerced, or classified at
+  # the producer; `http_access` does all of it here (docs/adr/http-access-normalization.md):
+  # `http.response.status_code` to an integer, nginx's `url.original` split into `url.path`/
+  # `url.query`, both tiers' durations to `_s` seconds, `user_agent.class` from the built-in table
+  # (haproxy only -- nginx's line doesn't log the header, and an absent header gets no class), and
+  # a bounded `http.route` from `routes:` below -- which is what names each tier's span `GET /work`
+  # rather than a bare `http.request`, and sets `span.status` (error on a 5xx, unset otherwise, per
+  # semconv -- never `ok`). HAProxy can't write a dotted key through `%{+json}o` (`.` isn't legal
+  # in its `%(name)` item), so its line arrives dashed (`http-response-status_code`) and
+  # `haproxy_http` de-aliases it to the dotted spelling before anything else runs -- nothing
+  # downstream ever sees a dashed key.
+  #
+  # One `routes:` block, copied verbatim between the two, sized to demo/compose.yaml's `traffic`
+  # loop (`/`, `/health`, `/graph.svg`, `/missing`, `/work`, `/boom`) plus `/inner`, the nginx hop
+  # `/work` calls back into (demo/app/pages/views.py). The built-in `probes`/`assets` sets name
+  # `/health` and `/graph.svg` (and the index page's own `/architecture.svg`/`/telemetry.js`)
+  # `/{probe}`/`/{asset}`; the app's real routes are each listed literally; `/missing` -- a 404
+  # with no route behind it -- falls through to `route_other`'s literal `/{other}`, the one bucket
+  # every scanner-shaped path lands in too. Every value comes from this config or a built-in set,
+  # never from the path itself, so the route set (and so the span-name set, and the `http.route`
+  # tag `trimmed` keeps below) stays bounded however many distinct paths arrive.
+  haproxy_http:
+    type: http_access
+    sources: [haproxy_json]
+    routes:
+      - builtin: probes
+      - builtin: assets
+      - match: '^/$'
+        route: /
+      - match: '^/work$'
+        route: /work
+      - match: '^/boom$'
+        route: /boom
+      - match: '^/inner$'
+        route: /inner
+    route_other: /{other}
+  nginx_http:
+    type: http_access
+    sources: [nginx_json]
+    routes:
+      - builtin: probes
+      - builtin: assets
+      - match: '^/$'
+        route: /
+      - match: '^/work$'
+        route: /work
+      - match: '^/boom$'
+        route: /boom
+      - match: '^/inner$'
+        route: /inner
+    route_other: /{other}
+
   # Lifts each tier's trace.id/span.id/trace.flags (or an inbound `traceparent`, parsed natively
   # as of `docs/adr/trace-context-span-lifting.md`) onto `LogRecord.trace`. `haproxy_trace`/
   # `nginx_trace` additionally mint a real `SpanRecord` on the same event via `span:` -- an access
   # line's own start/end/duration attributes become a span whose start replaces `event.timestamp`.
+  # Their `name:` is only a fallback now: `haproxy_http`/`nginx_http` wrote `span.name` (`GET
+  # /work`, `GET /{probe}`, ...) and `span.status`, and an event attribute always wins over the
+  # block's default. Neither sets `mint_id`: both tiers log the span id they forwarded downstream
+  # in their own outbound `traceparent` (haproxy's `span-id`, nginx's `$request_id`-derived
+  # `span.id`), and minting a different one here would orphan the next hop's span.
   # `app_trace` carries no `span:` block: `app`'s request span is already real
   # (opentelemetry-instrumentation-django), so lifting one from its access log would be a second,
   # redundant span for the same request rather than a useful one. `keep_source` left at its
@@ -295,13 +355,13 @@ components:
   # `trace_id`-shaped attribute can't collide with Loki's *native* trace_id structured metadata.
   haproxy_trace:
     type: trace_context
-    sources: [haproxy_json]
+    sources: [haproxy_http]
     span:
       kind: server
       name: http.request
   nginx_trace:
     type: trace_context
-    sources: [nginx_json]
+    sources: [nginx_http]
     span:
       kind: server
       name: http.request
@@ -435,35 +495,37 @@ components:
     sources: [browser_in]
     signals: [traces]
 
-  # nginx's JSON field names (host/request_method/status/body_bytes_sent/request_time) are
-  # unchanged from before workstream A. `request_time` still arrives in SECONDS here -- `scale`
-  # converts it to milliseconds below, right before `nginx_metrics` reads it, so the attribute
-  # itself (and everything else that might read it, `stdout`/`loki_out` included) keeps meaning
-  # "seconds"; only the metrics branch sees the converted value.
-  nginx_scale:
-    type: scale
-    sources: [nginx_trace]
-    fields:
-      request_time: 1000 # seconds -> milliseconds, to match haproxy's %Tr below
-
+  # No `nginx_scale` here any more: it used to convert nginx's `request_time` from seconds to
+  # milliseconds to match haproxy's own millisecond timer, but `http_access` now converts both
+  # tiers' durations to `http.request.duration_s` itself (the unit is only ever in the name), so
+  # there is nothing left to reconcile. `scale` is no longer exercised by this demo -- the demo
+  # isn't meant to stay exhaustive over every component (docs/adr/scale-transform.md's
+  # 2026-09-22 amendment).
+  #
   # Both tiers share the `web.*` measurement names below and are told apart by the `service.name`
-  # tag `*_identity` already stamped (Grafana panels filter on it) -- see
-  # docs/adr/scale-transform.md for why `request_time` needed `scale` first to make that safe.
-  # `web.bytes_sent` is the one name shared despite meaning slightly different things per tier:
-  # HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total bytes written to the client, headers
-  # included; nginx's `$body_bytes_sent` is body only. Neither tier's panel ever compares the two
-  # directly, so sharing the name is fine -- just not exact.
+  # tag `*_identity` already stamped (Grafana panels filter on it) -- safe because `http_access`
+  # hands both the same quantity in the same unit. `web.bytes_sent` is the one name shared despite
+  # meaning slightly different things per tier: HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total
+  # bytes written to the client, headers included (`http.response.size`); nginx's
+  # `$body_bytes_sent` is body only (`http.response.body.size`). Neither tier's panel ever compares
+  # the two directly, so sharing the name is fine -- just not exact.
   nginx_metrics:
     type: kv_metrics
-    sources: [nginx_scale]
+    sources: [nginx_trace]
     counters:
       - name: web.requests # +1 per event
       - name: web.bytes_sent
-        field: body_bytes_sent
+        field: http.response.body.size
     distributions:
       - name: web.request_time
-        field: request_time
-        unit: ms # nginx_scale already converted it
+        field: http.request.duration_s
+        unit: s
+      # nginx-only: HAProxy logs its connect and response-header timers (`upstream.connect_s`/
+      # `upstream.header_s`) but no whole upstream duration, so `haproxy_metrics` has nothing to
+      # pair this with.
+      - name: web.upstream_time
+        field: upstream.duration_s
+        unit: s
 
   haproxy_metrics:
     type: kv_metrics
@@ -471,7 +533,7 @@ components:
     counters:
       - name: web.requests
       - name: web.bytes_sent
-        field: bytes_sent
+        field: http.response.size
     # A process-wide gauge (HAProxy's own concurrent-connection count), not a per-request value --
     # it rides on this event's request/response tags the same way every other field here does, so
     # it lands as one series per tag combination holding the last value seen each window. A panel
@@ -481,18 +543,34 @@ components:
         field: conns_active
     distributions:
       - name: web.request_time
-        field: request_time_ms
-        unit: ms
+        field: http.request.duration_s # HAProxy's %Ta, converted from `_ms` by haproxy_http
+        unit: s
 
   # Before `aggregate`, not after -- otherwise its SeriesKey would key a series per request on
-  # `request_id` (or now, `trace.id`/`span.id`) alone. `host`/`request_method`/`status` are the
-  # tags meant to survive from both tiers; `termination_state` is HAProxy-only (absent on nginx
-  # events, so it's simply not a tag there). The trace/span attributes never reach here at all --
-  # `haproxy_trace`/`nginx_trace` already removed them (`keep_source: false`, above).
+  # `url.path`/`client.address` alone. The list is semconv's own low-cardinality attribute set for
+  # `http.server.request.duration` plus `user_agent.class`, each bounded by `http_access` (a route
+  # or class from config or a built-in table, a normalized method, an integer status);
+  # `server.address` is the Host header, unclamped here since the traffic generator only ever
+  # sends one -- `examples/nginx-to-influxdb.yaml`'s `bounded` is the worked `keep_values` clamp
+  # for it. `http.termination_state` is HAProxy-only (absent on nginx events, so it's simply not a
+  # tag there), and a field a tier doesn't log at all (nginx's line carries no `url.scheme`,
+  # `network.protocol.version`, or user agent) is likewise just absent. The trace/span attributes
+  # never reach here at all -- `haproxy_trace`/`nginx_trace` already removed them (`keep_source:
+  # false`, above).
   trimmed:
     type: keep
     sources: [nginx_metrics, haproxy_metrics]
-    fields: [host, request_method, status, termination_state]
+    fields:
+      [
+        server.address,
+        http.request.method,
+        http.response.status_code,
+        http.route,
+        network.protocol.version,
+        url.scheme,
+        user_agent.class,
+        http.termination_state,
+      ]
 
   windowed:
     type: aggregate
