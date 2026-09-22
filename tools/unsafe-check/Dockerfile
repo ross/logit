@@ -45,7 +45,15 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
 
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/home/${USERNAME}/.cargo
-ENV PATH=${CARGO_HOME}/bin:${RUSTUP_HOME}/bin:${PATH}
+# `cargo install`ed tools go under `TOOLS_ROOT`, not `${CARGO_HOME}/bin`: `script/unsafe-check`
+# mounts a named volume over `/home/dev/.cargo` at runtime, and Docker seeds that volume from the
+# image only the first time it is created -- after that the volume wins, so a tool installed into
+# `~/.cargo/bin` would keep running at whatever version the volume was first seeded with, no
+# matter how many times the pin below is bumped and the image rebuilt (the same trap
+# `crates/logit-perf/Dockerfile` documents for `inferno`). This prefix is baked into the image and
+# on no volume, so a rebuilt image is what runs.
+ENV TOOLS_ROOT=/opt/unsafe-check
+ENV PATH=${TOOLS_ROOT}/bin:${CARGO_HOME}/bin:${RUSTUP_HOME}/bin:${PATH}
 
 # Date-pinned nightly, not a floating `nightly` -- the whole point of `docs/adr/out-of-ci-
 # unsafe-verification.md` is a *repeatable* check; a floating channel would mean "miri passed" or
@@ -63,7 +71,8 @@ ARG NIGHTLY_DATE=2026-09-01
 # back up without this override. `RUSTUP_TOOLCHAIN` sits above both `rust-toolchain.toml` and
 # `rustup default` in rustup's own override precedence, which is exactly what's needed here.
 ENV RUSTUP_TOOLCHAIN=nightly-${NIGHTLY_DATE}
-RUN mkdir -p ${RUSTUP_HOME} ${CARGO_HOME} && chown -R ${USER_UID}:${USER_GID} ${RUSTUP_HOME} ${CARGO_HOME}
+RUN mkdir -p ${RUSTUP_HOME} ${CARGO_HOME} ${TOOLS_ROOT} \
+    && chown -R ${USER_UID}:${USER_GID} ${RUSTUP_HOME} ${CARGO_HOME} ${TOOLS_ROOT}
 USER ${USERNAME}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
         --default-toolchain "nightly-${NIGHTLY_DATE}" \
@@ -80,14 +89,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 # careful` drives under the hood) needs one.
 ARG CARGO_CAREFUL_VERSION=0.4.10
 RUN --mount=type=cache,id=logit-unsafe-check-cargo-registry,target=/home/dev/.cargo/registry,sharing=locked,uid=1000,gid=1000 \
-    cargo install cargo-careful --version ${CARGO_CAREFUL_VERSION} --locked
+    cargo install cargo-careful --version ${CARGO_CAREFUL_VERSION} --locked --root ${TOOLS_ROOT}
 
 # `cargo-nextest`, matching `Dockerfile.dev`'s pinned version -- optional per the CLI's own help
 # (nothing in `script/unsafe-check` requires it), carried along so a `nextest`-flavored invocation
 # someone hands to `careful`/`inject` works the same way it does in the ordinary dev container.
 ARG CARGO_NEXTEST_VERSION=0.9.144
 RUN --mount=type=cache,id=logit-unsafe-check-cargo-registry,target=/home/dev/.cargo/registry,sharing=locked,uid=1000,gid=1000 \
-    cargo install cargo-nextest --version ${CARGO_NEXTEST_VERSION} --locked
+    cargo install cargo-nextest --version ${CARGO_NEXTEST_VERSION} --locked --root ${TOOLS_ROOT}
 
 # Pre-create the mount point for `logit_unsafe_check_target`, owned by the dev user -- Docker
 # initializes a fresh named volume from whatever already exists at its mount point in the image,

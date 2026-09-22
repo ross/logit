@@ -109,11 +109,11 @@ run_in_image() {
 }
 
 # `inject` alone needs a raw ptrace attach -- strace's fundamental mechanism, and the one thing
-# nothing else this script runs needs. Docker's default seccomp profile denies `ptrace(2)` outright
-# regardless of capabilities (jvns "Why strace doesn't work in Docker", moby#21051); `--cap-add
-# SYS_PTRACE` is the documented fix, and `--security-opt seccomp=unconfined` is the fallback this
-# function reaches for only if that alone isn't enough on a given host (see the `inject` case
-# below).
+# nothing else this script runs needs. Docker's default capability set drops `CAP_SYS_PTRACE`, so
+# `--cap-add SYS_PTRACE` is the fix; `--security-opt seccomp=unconfined` is the fallback this
+# function reaches for only on a host whose older docker/libseccomp/kernel combination also blocks
+# the syscall in the default seccomp profile (jvns "Why strace doesn't work in Docker", moby#21051
+# -- closed in Docker 19.03; see the `inject` case below).
 run_privileged_in_image() {
     local seccomp_arg=()
     if [ "${UNSAFE_CHECK_SECCOMP_UNCONFINED:-0}" = "1" ]; then
