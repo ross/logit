@@ -123,9 +123,18 @@ struct TrackedFile<D> {
     /// wherever the file stops being tracked (`Tailer::reap_drained`) -- `None` under
     /// `WatchMode::Poll`, or if the `inotify_add_watch` call itself failed (non-fatal; the file
     /// is still tailed, just relying on `poll_interval` alone for it, same as `watch: poll`
-    /// always does). Never re-registered on a rebind (`open_tracked`'s "same inode, new name"
-    /// branch): an `inotify` watch follows the inode, not the path, so a rename needs no change
-    /// to it at all.
+    /// always does -- diagnosed `watch_error` at that point, not swallowed). Never re-registered
+    /// on a rebind (`open_tracked`'s "same inode, new name" branch): an `inotify` watch follows
+    /// the inode, not the path, so a rename needs no change to the *kernel* watch at all.
+    ///
+    /// It does leave the watcher's own recorded path stale, though, and that is only benign
+    /// because of something outside this struct: the rotated-away inode's later `IN_MODIFY`
+    /// arrives as a `Wake::Data` under its **old** name, which `on_data_wake` resolves through a
+    /// `by_path` entry the replacement may already own. That is a no-op today (the stale-inode
+    /// check returns early before the reconciling `scan`, and the same check `scan` runs anyway
+    /// after it), and the bytes are read regardless because `drain` round-robins every tracked
+    /// file after every loop iteration whatever woke it. A refactor that made draining
+    /// wake-driven would break that coupling, not this field.
     watch: Option<super::watch::WatchId>,
 }
 
@@ -270,24 +279,44 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
             match outcome {
                 Outcome::Shutdown => break,
-                Outcome::Wake(wake) => {
-                    self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", "inotify")]);
-                    match wake {
-                        // The one file this wake names had its content change -- no `scan`, just
-                        // a truncation check for that file; `drain` (always called below) reads
-                        // whatever new bytes are actually there.
-                        super::watch::Wake::Data(path) => self.on_data_wake(&path).await,
-                        // Something appeared or departed under a watched directory (`root`, for
-                        // `docker_in`) -- only a full `scan` can tell what.
-                        super::watch::Wake::Discover(_) => self.scan(false, &mut watcher).await,
-                        super::watch::Wake::Overflow => {
-                            self.telemetry.count("logit.input.watch.overflows", 1.0, &[]);
-                            self.scan(false, &mut watcher).await;
-                        }
+                Outcome::Wake(wake) => match wake {
+                    // The one file this wake names had its content change -- no `scan`, just
+                    // a truncation check for that file; `drain` (always called below) reads
+                    // whatever new bytes are actually there.
+                    super::watch::Wake::Data(path) => {
+                        self.count_wake("inotify");
+                        self.on_data_wake(&path).await;
                     }
-                }
+                    // Something appeared or departed under a watched directory (`root`, for
+                    // `docker_in`) -- only a full `scan` can tell what.
+                    super::watch::Wake::Discover(_) => {
+                        self.count_wake("inotify");
+                        self.scan(false, &mut watcher).await;
+                    }
+                    super::watch::Wake::Overflow => {
+                        self.count_wake("inotify");
+                        self.telemetry.count("logit.input.watch.overflows", 1.0, &[]);
+                        self.scan(false, &mut watcher).await;
+                    }
+                    // The wake source itself gave up (at most once per process -- the watcher
+                    // parks afterwards rather than resolving again). Deliberately *not* counted
+                    // as an `inotify` wake: `watch.wakes{source="inotify"}` flatlining while
+                    // `{source="poll"}` carries on is precisely the signal an operator alerts on
+                    // for this, and counting the death as a wake would blunt its own edge. The
+                    // loop carries on unchanged: the poll tick and `drain` below were always the
+                    // backstop, so this is a latency regression, not a data one.
+                    super::watch::Wake::Dead(reason) => {
+                        self.diag.warn_throttled(
+                            "watch_error",
+                            format!(
+                                "the inotify wake source is no longer usable; discovery falls \
+                                 back to poll_interval alone: {reason}"
+                            ),
+                        );
+                    }
+                },
                 Outcome::Poll => {
-                    self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", "poll")]);
+                    self.count_wake("poll");
                     next_poll = tokio::time::Instant::now() + self.config.poll_interval;
                     self.scan(false, &mut watcher).await;
                 }
@@ -320,27 +349,59 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         Ok(())
     }
 
+    /// Which wake source actually fired. `inotify` flatlining while `poll` carries on is the one
+    /// externally visible signal that the low-latency path has stopped working
+    /// (`docs/deploying.md`'s "What to watch").
+    fn count_wake(&self, source: &'static str) {
+        self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", source)]);
+    }
+
     /// Brings the set of watched directories in line with what the patterns currently reach --
-    /// `watch_dir` on anything newly present, `unwatch_dir` on anything gone. Called at the top
-    /// of every `scan`, before discovery. For `docker_in` this is just `root`
-    /// (`PathPattern::dir`) -- Docker's per-container state directories are direct children of
-    /// it, so watching `root` alone already catches a container arriving or leaving; the log file
-    /// appearing a moment later inside an already-existing container directory rides
-    /// `poll_interval` instead, exactly like a rotation or a `config.v2.json` change
+    /// `unwatch_dir` on anything gone, then `watch_dir` on **every** directory they reach, not
+    /// just newly-appearing ones. Called at the top of every `scan`, before discovery. For
+    /// `docker_in` this is just `root` (`PathPattern::dir`) -- Docker's per-container state
+    /// directories are direct children of it, so watching `root` alone already catches a
+    /// container arriving or leaving; the log file appearing a moment later inside an
+    /// already-existing container directory rides `poll_interval` instead, exactly like a
+    /// rotation or a `config.v2.json` change
     /// (`docs/adr/docker-container-identity-and-minimal-watches.md`). A no-op under
-    /// `WatchMode::Poll` (both `Watcher` methods are), and effectively a no-op for `tail_in`,
-    /// whose one pattern's `dir()` never changes -- the existing `by_path` short-circuit in
-    /// `InotifyWatcher::watch_dir` makes the repeat call free.
+    /// `WatchMode::Poll` (both `Watcher` methods are).
+    ///
+    /// **Re-arming unconditionally is the point, not redundancy.** Arming only the set difference
+    /// made every failure permanent: `self.patterns` is assigned once in [`Tailer::new`] and
+    /// never mutated, so the difference is empty from the second `scan` onwards and a directory
+    /// that was missing at `bind` (a log volume mounted after start, an app that creates its own
+    /// log directory), or that was deleted and recreated, or renamed away, never got another
+    /// chance -- discovery in it silently fell back to `poll_interval` for the life of the
+    /// process, under a mode whose documented contract is the opposite of silent degradation.
+    /// Re-arming every scan costs one `inotify_add_watch(2)` per pattern directory per scan --
+    /// one directory, for both kinds -- and the kernel makes the common case a no-op returning
+    /// the same `wd` (see `InotifyWatcher::watch_dir`).
+    ///
+    /// `watched_dirs` therefore records what is actually *armed*, not what was wanted: a
+    /// directory whose `watch_dir` failed is diagnosed (`watch_error`, carrying the errno), left
+    /// out of the set, and tried again on the next scan.
     fn reconcile_watches(&mut self, watcher: &mut super::watch::Watcher) {
         let desired: HashSet<PathBuf> =
             self.patterns.iter().map(|p| p.dir().to_path_buf()).collect();
-        for dir in desired.difference(&self.watched_dirs) {
-            let _ = watcher.watch_dir(dir); // same ignore-the-error policy the startup loop used
-        }
         for dir in self.watched_dirs.difference(&desired) {
             watcher.unwatch_dir(dir);
         }
-        self.watched_dirs = desired;
+        let mut armed = HashSet::with_capacity(desired.len());
+        for dir in desired {
+            match watcher.watch_dir(&dir) {
+                Ok(()) => {
+                    armed.insert(dir);
+                }
+                Err(err) => {
+                    self.diag.warn_throttled(
+                        "watch_error",
+                        super::watch::watch_error_message(&dir, &err),
+                    );
+                }
+            }
+        }
+        self.watched_dirs = armed;
     }
 
     /// Discovers matched files, opens newly-seen ones, and reconciles rotation/truncation/
@@ -409,12 +470,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
         // The watched directory (0 or 1 -- `watched_dirs.len()`, not a hardcoded 1: `Watcher::
-        // Poll` reconciles the same set without ever calling `inotify_add_watch`, but the count
-        // here is "what `reconcile_watches` currently wants watched," not "what actually has a
-        // live kernel watch") plus one entry per currently-open file that actually has one
-        // (`None` under `Poll`, or on a failed `inotify_add_watch` -- see `TrackedFile::watch`'s
-        // doc comment) -- this is the number that makes "the watch set stays proportional to
-        // what's tailed, not to what's running on the host" checkable from outside.
+        // Poll` reconciles the same set without ever calling `inotify_add_watch`, and a
+        // directory whose arm failed is left out of the set entirely) plus one entry per
+        // currently-open file that actually has one (`None` under `Poll`, or on a failed
+        // `inotify_add_watch` -- see `TrackedFile::watch`'s doc comment) -- this is the number
+        // that makes "the watch set stays proportional to what's tailed, not to what's running
+        // on the host" checkable from outside.
+        //
+        // Still the *intended* set rather than the live kernel one, and the gap is narrower than
+        // it was but real: a `Draining` file whose inode is already gone has had its descriptor
+        // purged by `IN_IGNORED` while `TrackedFile::watch` still holds the number, and two
+        // spellings of one directory alias a single kernel watch. `docs/deploying.md` says so;
+        // `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping` is what pins the
+        // watcher's own maps against `/proc/self/fdinfo`.
         let file_watches = self.files.values().filter(|f| f.watch.is_some()).count();
         self.telemetry.gauge(
             "logit.input.watch.watches",
@@ -607,7 +675,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // Registered before the file is inserted into `self.files` -- a failed
         // `inotify_add_watch` is non-fatal (`Watcher::watch_file`'s own doc comment), leaving
         // this file to rely on `poll_interval` alone for its data wakes, same as `watch: poll`.
-        let watch = watcher.watch_file(&path);
+        // Non-fatal, but not invisible: at scale the likely cause is `ENOSPC` against
+        // `fs.inotify.max_user_watches`, which turns a low-latency tailer into a polling one one
+        // file at a time with nothing but this line to say so. Not retried either -- the watch is
+        // registered exactly once per tracked inode, when it is opened
+        // (`docs/known-gaps.md`).
+        let watch = match watcher.watch_file(&path) {
+            Ok(watch) => watch,
+            Err(err) => {
+                self.diag
+                    .warn_throttled("watch_error", super::watch::watch_error_message(&path, &err));
+                None
+            }
+        };
         let batching = self.config.batching;
         let tracked = TrackedFile {
             path: path.clone(),
@@ -2265,5 +2345,219 @@ mod tests {
         let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12);
         assert!(msg.contains("from an offset of 4096 bytes to 12"), "{msg}");
         assert!(!msg.contains("offset of 0 bytes"));
+    }
+
+    // -- the pattern directory's own watch: armed on every scan, not once
+    //    (`docs/plans/critical-sections-inventory.md`, TAIL-07) --------------------------------
+
+    /// A `Tailer` and a real `inotify` `Watcher` driven directly, rather than through
+    /// `run_until_shutdown`. Direct on purpose: every test below turns on what a *second* `scan`
+    /// leaves armed, and under the 30s `poll_interval` these configure (long enough that only
+    /// `inotify` could explain any promptness) a second scan would otherwise never happen inside
+    /// the test's own lifetime.
+    #[cfg(target_os = "linux")]
+    fn inotify_tailer(
+        pattern: PathPattern,
+        registry: &Registry,
+    ) -> (Tailer<LineDecoder, LineFactory>, crate::tail::watch::Watcher) {
+        let diag = Diagnostics::new("tail_in")
+            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"));
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.watch = WatchMode::Inotify;
+        config.poll_interval = Duration::from_secs(30);
+        let tailer = Tailer::new(vec![pattern], LineFactory, config)
+            .with_telemetry(registry.telemetry_for("tail_in", "tail_in", "listener"))
+            .with_diagnostics(diag);
+        let watcher =
+            crate::tail::watch::Watcher::new(WatchMode::Inotify, &mut Diagnostics::default())
+                .expect("inotify should be available in the dev container");
+        (tailer, watcher)
+    }
+
+    /// Whether a `Diagnostics` key was reported at all -- `warn_throttled` counts
+    /// `logit.component.diagnostics{key}` on every occurrence, not just the ones it logs.
+    #[cfg(target_os = "linux")]
+    fn diagnosed(registry: &Registry, key: &str) -> bool {
+        registry.drain(0).into_iter().any(|event| {
+            event
+                .metrics
+                .iter()
+                .any(|m| logit_core::interner::resolve(m.name) == "logit.component.diagnostics")
+                && event.attributes.get("key").and_then(|v| v.as_str()) == Some(key)
+        })
+    }
+
+    /// Proves a directory's watch is *live*, not merely recorded: a file created in it must
+    /// produce that directory watch's own `Wake::Discover`, off this watcher's real fd. A watch
+    /// that was never (re-)armed produces nothing at all, so this times out rather than
+    /// mis-reporting. Tolerates a few leading wakes left over from whatever churn the test just
+    /// did to the directory itself.
+    #[cfg(target_os = "linux")]
+    async fn expect_discover(watcher: &mut crate::tail::watch::Watcher, path: &Path) {
+        std::fs::write(path, b"hello\n").unwrap();
+        let want = crate::tail::watch::Wake::Discover(path.to_path_buf());
+        for _ in 0..8 {
+            let wake = tokio::time::timeout(Duration::from_secs(3), watcher.next_wake())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("no wake for {}; the directory watch is not live", path.display())
+                });
+            if wake == want {
+                return;
+            }
+        }
+        panic!("never saw {want:?} among this watcher's wakes");
+    }
+
+    /// A pattern directory that doesn't exist when the listener starts -- a log volume mounted
+    /// after the process, an application that creates its own log directory -- must be armed once
+    /// it appears, not written off. Arming only the newly-desired set made this permanent: the
+    /// failed `inotify_add_watch` was recorded as watched anyway and never retried, so discovery
+    /// in that directory silently ran at `poll_interval` for the life of the process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn under_inotify_a_pattern_directory_missing_at_bind_is_armed_once_it_exists() {
+        let dir = scratch_dir("inotify-late-dir");
+        let sub = dir.join("sub"); // deliberately not created yet
+        let registry = Registry::new();
+        let (mut tailer, mut watcher) =
+            inotify_tailer(PathPattern::new(sub.join("*.log")), &registry);
+
+        tailer.scan(true, &mut watcher).await;
+        assert_eq!(
+            watcher.tracked_watch_count(),
+            0,
+            "there is nothing to watch yet -- and nothing may be recorded as watched either"
+        );
+        assert!(tailer.watched_dirs.is_empty(), "{:?}", tailer.watched_dirs);
+        assert!(
+            diagnosed(&registry, "watch_error"),
+            "a directory that could not be watched must say so, not fail silently"
+        );
+
+        std::fs::create_dir_all(&sub).unwrap();
+        tailer.scan(false, &mut watcher).await;
+
+        assert_eq!(watcher.tracked_watch_count(), 1, "the directory exists now; arm it");
+        assert!(tailer.watched_dirs.contains(&sub));
+        expect_discover(&mut watcher, &sub.join("app.log")).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The redeploy shape: the watched directory is removed and recreated (a volume recreate, a
+    /// tmpfs remount, `logrotate`'s `olddir` applied to the directory itself). The new inode is a
+    /// new watch, and reaching it needed two independent fixes -- re-arming on every scan, and
+    /// purging the reverse index on `IN_IGNORED` so the re-arm is not short-circuited by a
+    /// descriptor the kernel already invalidated. Either one alone leaves this dead.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn under_inotify_a_watched_directory_deleted_and_recreated_is_rearmed() {
+        let dir = scratch_dir("inotify-dir-recreated");
+        let registry = Registry::new();
+        let (mut tailer, mut watcher) =
+            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
+
+        tailer.scan(true, &mut watcher).await;
+        assert_eq!(watcher.tracked_watch_count(), 1);
+        expect_discover(&mut watcher, &dir.join("first.log")).await;
+
+        // No `.await` between the two: the driver cannot observe the gap, exactly as a real
+        // redeploy's `rm -rf` + `mkdir` is over before anything reacts to it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        tailer.scan(false, &mut watcher).await;
+        assert_eq!(watcher.tracked_watch_count(), 1, "the replacement must be watched");
+        assert!(tailer.watched_dirs.contains(&dir));
+        expect_discover(&mut watcher, &dir.join("second.log")).await;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other way a directory stops being the directory at that path: a rename. The kernel
+    /// sends no `IN_IGNORED` for it -- the watch stays perfectly valid on the moved inode -- so
+    /// without `IN_MOVE_SELF` in `DIR_MASK` nothing even reports it, and the watch quietly
+    /// follows the old directory under a name it no longer has.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn under_inotify_a_watched_directory_renamed_away_and_replaced_is_rearmed() {
+        let parent = scratch_dir("inotify-dir-renamed");
+        let dir = parent.join("live");
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = Registry::new();
+        let (mut tailer, mut watcher) =
+            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
+
+        tailer.scan(true, &mut watcher).await;
+        expect_discover(&mut watcher, &dir.join("first.log")).await;
+
+        std::fs::rename(&dir, parent.join("live.old")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        tailer.scan(false, &mut watcher).await;
+        assert_eq!(watcher.tracked_watch_count(), 1, "one watch, on the new directory");
+        expect_discover(&mut watcher, &dir.join("second.log")).await;
+
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// The leak detector `logit.input.watch.watches` can't be, since it counts the *intended*
+    /// watch set. Twenty rotate-and-delete cycles, then the kernel's own answer
+    /// (`/proc/self/fdinfo/<inotify fd>` carries one `inotify wd:` line per live watch) checked
+    /// against this watcher's bookkeeping and against what the driver believes it holds. A `wd`
+    /// left behind in `watches` after its inode is gone, or a kernel watch never released, shows
+    /// up here as a mismatch that grows with the cycle count.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping() {
+        let dir = scratch_dir("inotify-watch-leak");
+        let registry = Registry::new();
+        let (mut tailer, mut watcher) =
+            inotify_tailer(PathPattern::new(dir.join("*.log")), &registry);
+        let (fanout, _rx) = recording_fanout(256);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let path = dir.join("app.log");
+
+        tailer.scan(true, &mut watcher).await;
+
+        for i in 0..20 {
+            std::fs::write(&path, format!("line {i}\n")).unwrap();
+            tailer.scan(false, &mut watcher).await;
+            tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+
+            // Rotate it out of the pattern's reach (`*.log` never matches `app.log.1`), drain and
+            // reap it, then delete the rotated inode outright -- one watch registered and one
+            // released per cycle, plus one `IN_IGNORED` the kernel queues on the way out.
+            std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+            tailer.scan(false, &mut watcher).await;
+            tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
+            std::fs::remove_file(dir.join("app.log.1")).unwrap();
+        }
+
+        let fd = watcher.inotify_fd().expect("inotify mode has an fd");
+        let fdinfo = match std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) {
+            Ok(contents) => contents,
+            Err(err) => {
+                println!("skipping: cannot read /proc/self/fdinfo here ({err})");
+                return;
+            }
+        };
+        let live = fdinfo.lines().filter(|line| line.starts_with("inotify wd:")).count();
+
+        let file_watches = tailer.files.values().filter(|f| f.watch.is_some()).count();
+        let expected = tailer.watched_dirs.len() + file_watches;
+        assert_eq!(
+            watcher.tracked_watch_count(),
+            expected,
+            "the watcher's own map must hold exactly the directory and the still-open files"
+        );
+        assert_eq!(
+            live, expected,
+            "after 20 rotate-and-delete cycles the kernel still holds {live} watches for \
+             {expected} the driver knows about:\n{fdinfo}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
