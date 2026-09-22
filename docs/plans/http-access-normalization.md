@@ -191,22 +191,27 @@ Never touched: `traceparent`, `trace.*`, `span.id`, `span.parent_id`, `span.kind
 `span.start*`, `span.end*`, `event.log`, `event.metrics`, `event.span`, `event.timestamp`, the
 batch `Resource` (no `map_resource`). No `keep_source`.
 
-Built-in tables (finalized in W3 against a 57-UA/~30-path corpus of real, sourced strings — the
+Built-in tables (finalized in W3 against a 62-UA/18-path corpus of real, sourced strings — the
 member lists below are what shipped, not the placeholder W2 carried; see that PR's tests and doc
 comments for the full hand-traced justification of each token):
 
 | Table | Order / value | Pattern (`is_match`) |
 |---|---|---|
 | UA `scanner` | 1, `(?i)` | `nmap\|masscan\|zgrab\|nikto\|sqlmap\|dirbuster\|gobuster\|ffuf\|fuzz faster u fool\|feroxbuster\|wpscan\|nuclei\|acunetix\|nessus\|qualys\|openvas\|censysinspect\|internetmeasurement\|expanse\|paloaltonetworks\|leakix\|shodan` |
-| UA `tool` | 2, `(?i)` | `curl/\|wget/\|libwww-perl\|python-requests\|python-urllib\|aiohttp\|httpie\|go-http-client\|okhttp\|apache-httpclient\|^java/\|axios/\|node-fetch\|guzzlehttp\|postmanruntime\|insomnia\|reqwest/\|k6/\|wrk/\|jmeter\|kube-probe\|prometheus/\|blackbox-exporter\|elb-healthchecker\|googlehc\|telegraf/\|vector/\|chrome-lighthouse` |
-| UA `crawler` | 3, `(?i)` | `\bbot\b\|\bbot/\|spider\|crawler\|slurp\|scrapy\|googlebot\|bingbot\|yandexbot\|baiduspider\|duckduckbot\|facebookexternalhit\|twitterbot\|linkedinbot\|slackbot\|applebot\|petalbot\|semrushbot\|ahrefsbot\|mj12bot\|ccbot\|gptbot\|chatgpt-user\|claudebot\|perplexitybot\|amazonbot\|bytespider\|feedfetcher` |
+| UA `tool` | 2, `(?i)` | `curl/\|wget/\|libwww-perl\|python-requests\|python-urllib\|aiohttp\|httpie\|go-http-client\|okhttp\|apache-httpclient\|^java/\|axios/\|node-fetch\|guzzlehttp\|postmanruntime\|insomnia\|reqwest/\|k6/\|wrk/\|jmeter\|kube-probe\|prometheus/\|blackbox-exporter\|elb-healthchecker\|googlehc\|telegraf/\|vector/\|chrome-lighthouse\|uptimerobot` |
+| UA `crawler` | 3, `(?i)` | `\bbot\b\|bot/\|spider\|crawler\|slurp\|scrapy\|googlebot\|bingbot\|yandex\|baiduspider\|duckduckbot\|facebookexternalhit\|twitterbot\|linkedinbot\|slackbot\|applebot\|petalbot\|semrushbot\|ahrefsbot\|mj12bot\|ccbot\|gptbot\|chatgpt-user\|claudebot\|perplexitybot\|amazonbot\|bytespider\|feedfetcher` |
 | UA `browser` | 4 (last: crawlers spoof `Mozilla/`), `(?i)` | `mozilla/\|opera/\|dalvik/\|safari/\|msie \|trident/` |
 | route `probes` → `/{probe}` | case-sensitive | `^/(-/(healthy\|ready)\|health\|healthz\|healthcheck\|livez\|readyz\|ready\|ping\|status\|_status\|up\|metrics\|_metrics\|stats\|nginx_status\|server-status\|haproxy_status\|version\|_version)/?$` |
 | route `well_known` → `/{well-known}` | case-sensitive | `^/(\.well-known/.*\|robots\.txt\|favicon\.ico\|sitemap[^/]*\.xml(\.gz)?\|humans\.txt\|security\.txt\|apple-touch-icon[^/]*\.png\|browserconfig\.xml\|manifest\.json\|manifest\.webmanifest\|crossdomain\.xml\|ads\.txt\|app-ads\.txt)$` |
 | route `assets` → `/{asset}` | no `json`/`xml`/`txt`/`csv` — routinely API responses; `(?i)` | `\.(css\|js\|mjs\|cjs\|map\|png\|jpe?g\|gif\|webp\|avif\|svg\|ico\|bmp\|tiff?\|woff2?\|ttf\|otf\|eot\|heic\|heif\|docx\|xlsx\|pptx\|apk\|ipa\|mp4\|m4v\|webm\|mov\|mp3\|m4a\|ogg\|oga\|opus\|wav\|flac\|pdf\|zip\|gz\|tgz\|bz2\|xz\|7z\|rar\|wasm)$` |
 
-`\bbot\b` rather than `bot\b` because `bot\b` matches phone models like `CUBOT`; `\bbot/` (not
-bare `bot/`) for the same reason, since `UptimeRobot/2.0` contains `bot/` mid-word. `^java/` is
+`\bbot\b` rather than `bot\b` because `bot\b` matches phone models like `CUBOT`; bare `bot/` is kept
+alongside it, not `\bbot/` (a `/` is always a word boundary, so `\bbot/` adds nothing), because it
+is what catches a `...Bot/<version>` token with no boundary before it (`DotBot/1.2`,
+`Discordbot/2.0`, `YandexMobileBot/3.0`) -- `CUBOT` still falls through, with no `/` after it. Its
+one false positive, `UptimeRobot/2.0`, is a synthetic monitor, so `uptimerobot` sits in `tool`,
+which is checked first. `yandex`, not `yandexbot`, because most of Yandex's robots
+(`YandexImages`, `YandexMetrika`, `YandexFavicons`, ...) carry no `bot` token. `^java/` is
 anchored (Java's `HttpURLConnection` sends exactly `Java/<version>` as the whole string);
 `blackbox-exporter` is hyphenated (the exporter's real format since v0.28.0); `chrome-lighthouse`
 moved from `crawler` to `tool` (a synthetic audit tool, not a content crawler); `fuzz faster u
@@ -276,7 +281,7 @@ lists, plus the corrected `$uri`/invalid-UTF-8 entry and a narrowing of the `$ho
 | W0 | `hacc/w0: ADR and plan for native HTTP access-log normalization` | This plan, the ADR, both index rows | links resolve |
 | W1 | `hacc/w1: json — opt-in invalid_utf8: replace` | `json.rs`, `JsonInvalidUtf8`, registry, schema, tests, a paragraph in `json-parsing-into-attributes.md` | `script/check`; `json`'s allocation pins unchanged; a Latin-1 byte parses under `replace` and fails under `reject` |
 | W2 | `hacc/w2: http_access — config, graph rule 60, and the transform` | config types + `CAPPED_FIELDS`; rule 60; `http_access.rs` with every step and the alias table (placeholder minimal UA/route patterns); `lib.rs`; registry + converter; schema; `pipeline-graph.md` | `script/check`; `script/schema` no diff; one unit test per contract (composites; `000`; durations and `_s`-wins; `_OTHER` + original; version; `?` strip; each sensitive key; multi-byte char-boundary cap; control byte → `_` at unchanged length; absent-vs-empty UA; first-match routes and config-beats-builtin; no `route_other` → no route, method-only name; `HTTP …` for `_OTHER`; status 500/0/200/404 → `span.status`; `error.type` 5xx only; duration mirror on and off; XFF ignored by default, first hop when trusted; every dashed alias round-trips and dotted wins; metrics-only event untouched; `log`/`metrics`/`span`/`timestamp`/`Resource` untouched; idempotent; every counter fires); config round-trips; one graph test per rule-60 clause plus "a bare `http_access` validates"; `build_spec_builds_a_working_http_access_transform` |
-| W3 | `hacc/w3: http_access — the built-in UA and route tables` | The full regex tables; corpus tests over ~40 real UA strings and ~30 real paths with provenance comments; negatives (`CUBOT`, a spoofed `Mozilla/…Googlebot`, `/orders.json`) | tests |
+| W3 | `hacc/w3: http_access — the built-in UA and route tables` | The full regex tables; corpus tests over 62 real UA strings and 18 real paths with provenance comments; negatives (`CUBOT`, a spoofed `Mozilla/…Googlebot`, `/orders.json`) | tests |
 | W4 | `hacc/w4: http_access — allocation pins and the memory table` | `fixtures.rs` (`const HTTP_ACCESS_SEMCONV_LINE` with provenance, `http_access_event()`, `http_access()`), `allocations.rs` (non-HTTP event; conforming line warm; conforming line cold; a line needing a clean), `docs/design/memory.md` rows | numbers pinned from a measurement |
 | W5 | `hacc/w5: the nginx and haproxy log formats become raw semconv fields` | the three producer configs | `nginx -t`/`haproxy -c`; a captured live line per producer in the PR |
 | W6 | `hacc/w6: the example and demo pipelines run http_access` | the two `logit.yaml`s; `chained_pipeline_test` | `script/validate`; `every_shipped_config_loads_and_validates`; `logit graph`; the end-to-end runs below |

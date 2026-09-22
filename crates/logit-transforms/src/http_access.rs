@@ -182,12 +182,18 @@ const SPAN_METHOD_OTHER: &str = "HTTP";
 
 /// `(class, pattern)`, in priority order -- a UA claiming both `Mozilla/` and `bot` is a crawler,
 /// which is why `browser` comes last and why this is an ordered scan, not a `RegexSet` (the ADR's
-/// Alternatives). Corpus-verified against 57 real, sourced UA strings (W3,
+/// Alternatives). Corpus-verified against 62 real, sourced UA strings (W3,
 /// `docs/plans/http-access-normalization.md`); the corpus and the hand-traced regex analysis
 /// behind every change below live in that workstream's research notes. `\bbot\b` rather than
-/// `bot\b` because the latter matches phone models like `CUBOT`; `\bbot/` (not bare `bot/`), for
-/// the same reason -- `UptimeRobot/2.0` contains `bot/` mid-word (`Ro-bot/2.0`) and isn't a
-/// crawler. `^java/` is anchored: Java's `HttpURLConnection` sends exactly `Java/<version>` as
+/// `bot\b` because the latter matches phone models like `CUBOT`. Bare `bot/` stays alongside it,
+/// deliberately *not* `\bbot/`: a `/` is always a word boundary, so `\bbot/` matches nothing
+/// `\bbot\b` doesn't, and the bare form is what catches a `...Bot/<version>` token with no
+/// boundary before it (`DotBot/1.2`, `Discordbot/2.0`, `YandexMobileBot/3.0`). `CUBOT` still
+/// falls through, having no `/` after it. The one false positive bare `bot/` has, UptimeRobot's
+/// `UptimeRobot/2.0` (`Ro-bot/2.0`), is a synthetic monitor, so `uptimerobot` lives in `tool`,
+/// which is checked first. `yandex`, not `yandexbot`: Yandex runs a family of robots
+/// (`YandexImages`, `YandexMetrika`, `YandexFavicons`, `YandexVideo`, ...) on the page the
+/// corpus cites, and only some of them carry a `bot` token. `^java/` is anchored: Java's `HttpURLConnection` sends exactly `Java/<version>` as
 /// the whole UA string, so an anchored match is strictly safer than a bare `java/`, which could
 /// also fire on a JVM version fragment embedded in an unrelated UA. `blackbox-exporter` is
 /// hyphenated -- the Blackbox Exporter's real wire format since v0.28.0; the underscored spelling
@@ -207,11 +213,11 @@ const BUILTIN_UA_RULES: [(&str, &str); 4] = [
     ),
     (
         "tool",
-        r"(?i)curl/|wget/|libwww-perl|python-requests|python-urllib|aiohttp|httpie|go-http-client|okhttp|apache-httpclient|^java/|axios/|node-fetch|guzzlehttp|postmanruntime|insomnia|reqwest/|k6/|wrk/|jmeter|kube-probe|prometheus/|blackbox-exporter|elb-healthchecker|googlehc|telegraf/|vector/|chrome-lighthouse",
+        r"(?i)curl/|wget/|libwww-perl|python-requests|python-urllib|aiohttp|httpie|go-http-client|okhttp|apache-httpclient|^java/|axios/|node-fetch|guzzlehttp|postmanruntime|insomnia|reqwest/|k6/|wrk/|jmeter|kube-probe|prometheus/|blackbox-exporter|elb-healthchecker|googlehc|telegraf/|vector/|chrome-lighthouse|uptimerobot",
     ),
     (
         "crawler",
-        r"(?i)\bbot\b|\bbot/|spider|crawler|slurp|scrapy|googlebot|bingbot|yandexbot|baiduspider|duckduckbot|facebookexternalhit|twitterbot|linkedinbot|slackbot|applebot|petalbot|semrushbot|ahrefsbot|mj12bot|ccbot|gptbot|chatgpt-user|claudebot|perplexitybot|amazonbot|bytespider|feedfetcher",
+        r"(?i)\bbot\b|bot/|spider|crawler|slurp|scrapy|googlebot|bingbot|yandex|baiduspider|duckduckbot|facebookexternalhit|twitterbot|linkedinbot|slackbot|applebot|petalbot|semrushbot|ahrefsbot|mj12bot|ccbot|gptbot|chatgpt-user|claudebot|perplexitybot|amazonbot|bytespider|feedfetcher",
     ),
     ("browser", r"(?i)mozilla/|opera/|dalvik/|safari/|msie |trident/"),
 ];
@@ -223,7 +229,7 @@ const UA_OTHER: &str = "other";
 const UA_NONE: &str = "none";
 
 /// `(set, pattern, route value)`. The three route values are fixed by the plan; the member lists
-/// are corpus-verified against ~30 real paths (W3, `docs/plans/http-access-normalization.md`).
+/// are corpus-verified against 18 real paths (W3, `docs/plans/http-access-normalization.md`).
 /// `probes` and `well_known` are matched case-sensitively, unlike `assets`: a file extension's
 /// casing is conventionally meaningless (`LOGO.PNG` is unambiguously a PNG), but a probe/
 /// well-known path is a protocol- or convention-mandated literal (`robots.txt` is always
@@ -1763,7 +1769,7 @@ mod tests {
         assert_eq!(capped.len(), 256, "and still capped afterwards");
     }
 
-    // -- W3 corpus: 57 real, sourced UA strings, each verified against a vendor doc, the
+    // -- W3 corpus: 62 real, sourced UA strings, each verified against a vendor doc, the
     // project's own source code, or well-corroborated captured-traffic write-ups (never
     // invented) -- `docs/plans/http-access-normalization.md`'s W3 row. Expected classes are
     // under the *final* `BUILTIN_UA_RULES` above, not the placeholder table W2 shipped; two
@@ -1804,6 +1810,11 @@ mod tests {
         // CORRECTED: real format is hyphenated since v0.28.0, not `blackbox_exporter` --
         // https://github.com/prometheus/blackbox_exporter/releases (v0.28.0 changelog)
         ("Blackbox-Exporter/0.28.0", "tool"),
+        // UptimeRobot's monitor, which contains `bot/` mid-word (`Ro-bot/2.0`) and so would be a
+        // `crawler` under bare `bot/` -- `uptimerobot` in `tool` claims it first, in both the
+        // bare and the Mozilla-prefixed form -- https://uptimerobot.com/help/
+        ("Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)", "tool"),
+        ("UptimeRobot/2.0", "tool"),
         // -- Crawlers / bots --
         // Google's own crawler docs (desktop Googlebot) --
         // https://developers.google.com/search/docs/crawling-indexing/google-common-crawlers
@@ -1822,6 +1833,18 @@ mod tests {
         ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "crawler"),
         // https://yandex.com/support/webmaster/en/robot-workings/user-agent.html
         ("Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)", "crawler"),
+        // Same page -- no `bot` token anywhere (`yandex.com/bots` has no boundary after `bot`),
+        // so `yandex`, not `yandexbot`, is what catches it
+        ("Mozilla/5.0 (compatible; YandexImages/3.0; +http://yandex.com/bots)", "crawler"),
+        // https://moz.com/help/moz-procedures/crawlers/dotbot -- `Bot/` with no word boundary
+        // before it (`Dot-Bot/1.2`), which only bare `bot/` catches
+        (
+            "Mozilla/5.0 (compatible; DotBot/1.2; +https://opensiteexplorer.org/dotbot; help@moz.com)",
+            "crawler",
+        ),
+        // Discord's link-preview fetcher, self-identifying with its own URL; corroborated
+        // across independent trackers -- `bot/` with no boundary before it, as `DotBot`
+        ("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)", "crawler"),
         // https://duckduckgo.com/duckduckgo-help-pages/results/duckduckbot
         ("DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)", "crawler"),
         // https://developers.facebook.com/docs/sharing/webmasters/crawler
@@ -1908,7 +1931,7 @@ mod tests {
         // Android's built-in HTTP stack default -- https://user-agents.net/applications/dalvik
         ("Dalvik/2.1.0 (Linux; U; Android 8.1.0; Pixel XL Build/OPP6.171019.012)", "browser"),
         // Real captured CUBOT-brand phone UA -- https://user-agents.net/string/mozilla-5-0-linux-android-7-0-cubot-magic-applewebkit-537-36-khtml-like-gecko-chrome-87-0-4280-101-mobile-safari-537-36 --
-        // `\bbot\b` and `\bbot/` both fail (no boundary before "B" in "CUBOT"; no "/" right
+        // `\bbot\b` and `bot/` both fail (no boundary before "B" in "CUBOT"; no "/" right
         // after it either), falling through crawler to browser
         (
             "Mozilla/5.0 (Linux; Android 7.0; CUBOT MAGIC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Mobile Safari/537.36",
@@ -1992,7 +2015,7 @@ mod tests {
         for (ua, class) in UA_CORPUS {
             let event = run(&mut t, &[("user_agent.original", s(ua))]);
             let synthetic = get(&event, "user_agent.synthetic.type").and_then(Value::as_str);
-            let want_bot = matches!(*class, "crawler" | "scanner");
+            let want_bot = is_bot_class(class);
             assert_eq!(
                 synthetic,
                 want_bot.then_some("bot"),
