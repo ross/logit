@@ -79,7 +79,12 @@ already built that have a known, accepted rough edge.
     mutation suite (truncation, bit flips, inflated lengths, over-depth nesting) covers the same
     ground a corpus-driven fuzzer would, but needs nightly Rust to build at all
     (`docs/adr/containerized-development.md`'s stable-only toolchain), so real fuzz targets are
-    deferred, not built.
+    deferred, not built. [ADR `out-of-ci-unsafe-verification`](adr/out-of-ci-unsafe-verification.md)
+    carves out a throwaway nightly image for a different, narrower need (miri/`cargo-careful`/
+    fault injection over the codebase's raw-`libc` `unsafe`, not decoder fuzzing) and explicitly
+    defers `cargo-fuzz` again in its own "Alternatives considered" — the two gaps are related but
+    not the same one, and closing this one still means standing up `cargo-fuzz` targets, not just
+    pointing them at that image.
   - **`logit_in`'s and `internal`'s shutdown grace is fixed at 5s, not operator-tunable** — graph
     validation's rule 17 rejects a `receive:` block on either (neither is a datagram or tail
     listener), so both always get `ReceiveConfig::default().shutdown_grace` with no config-level
@@ -199,6 +204,21 @@ already built that have a known, accepted rough edge.
   The note this entry ended on still holds: almost nothing in the field does either in-process —
   syslog-ng, rsyslog, Telegraf and gostatsd all tell operators to run `netstat -su`/`ss -u`
   themselves — so this is ahead of the field rather than at parity with it.
+- **`ReceiveBufferSampler` still gauges a descriptor it captured at construction, rather than one
+  taken from the socket at each sample.** The TCP twin no longer does: `AcceptQueueSampler` reads
+  the fd off the `listener` argument it is already handed, which makes the socket being gauged and
+  the socket being accepted on the same socket by construction, closing a class where
+  `sampler.accept(&other_listener)` would compile and silently report the wrong socket's queue
+  ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)'s
+  2026-09-21 amendment has the reasoning, including why `BorrowedFd<'_>` fixes the lifetime but not
+  the identity). The UDP sampler cannot be given the same treatment without changing
+  `sample_while`'s signature — that function holds the sampler and the read future, not the socket
+  — and the lifetime is in fact enforced today, indirectly: the combined future carries `&socket`
+  through its sibling `read_loop` arm, so the borrow checker will not let it outlive the socket.
+  There is one `ReceiveBufferSampler` per `read_loop_sampled` per socket and no way to reach a
+  second, so nothing is wrong now; it is the compiler not being asked to say so. Deliberately left
+  rather than fixed in passing, since it is a signature change to the function whose arm ordering
+  is load-bearing.
 - **A UDP sink's send failures are not counted by cause.** The receive side's kernel counters
   (directly above) have no useful send-side twin: `SO_MEMINFO`'s `wmem_alloc` is ~always 0 when
   sampled on a UDP socket, because a datagram is charged and uncharged inside one `sendmsg`, so a
@@ -228,7 +248,9 @@ already built that have a known, accepted rough edge.
 - ~~**A UDP listener reads one datagram per syscall**~~ — **closed** on Linux
   ([ADR `udp-intake-batching-and-socket-visibility`](adr/udp-intake-batching-and-socket-visibility.md)).
   `read_loop` (`logit-inputs::udp`) now takes up to `receive.read_batch` datagrams per `recvmmsg(2)`
-  call (default 64, ceiling `UIO_MAXIOV`), through `tokio::net::UdpSocket::async_io` — which is the
+  call (default 64, ceiling 1024 — `UIO_MAXIOV`'s number, but `logit`'s own limit on the slab and
+  the shutdown-path loss, not a kernel one; the kernel clamps no `vlen` on the receive side),
+  through `tokio::net::UdpSocket::async_io` — which is the
   raw-fd seam this entry said the work would need, and the same one
   `crates/logit-inputs/src/tail/watch.rs`'s `inotify` backend already uses. The `mmsghdr`/`iovec`
   arrays are rebuilt inside the readiness closure on every call over `Vec<u64>` backing storage, so
@@ -242,6 +264,35 @@ already built that have a known, accepted rough edge.
   **Linux only, and that is the whole of it.** `recvmmsg` is a Linux syscall with no portable
   equivalent worth a second implementation; every other target keeps the one-`recv_from`-per-datagram
   loop behind the same interface, and `read_batch` is documented as parsed-and-ignored there.
+- **No runtime `recvmmsg(2)` → `recvmsg(2)` fallback when a sandbox blocks the syscall.** On Linux
+  a UDP listener always calls `recvmmsg(2)`; a seccomp profile (or an LSM) that refuses it returns
+  `ENOSYS`/`EPERM` on the very first call, which `read_loop` treats as fatal, so the listener fails
+  immediately and the process exits with the runtime-failure code (`2`, not the bind-time `1`: the
+  socket bound fine, and the first read is what fails). That is the correct *shape* —
+  quinn hit the same wall on Android x86 (quinn#1947) and bun hit a worse one, where the refusal
+  produced no datagrams and a 100% CPU spin (bun#42678) — and since `libc/w1` the message names the
+  syscall, the bound socket, and the fact that `receive.read_batch: 1` will not help, instead of a
+  bare `Function not implemented (os error 38)`. What is **not** built is the other half of bun's
+  and quinn's answer: a one-shot `AtomicBool` latch that, on the first `ENOSYS`/`EPERM`, falls back
+  to per-datagram `recvmsg(2)` for the life of the process (quinn#2079's pattern for its own
+  `sendmsg` `EINVAL` fallback). That is a design decision, not an oversight — it means carrying a
+  second Linux read path forever, for an environment `logit` has never been reported to run in, and
+  a listener that silently runs `read_batch` times slower than its config asks for is arguably a
+  worse outcome than one that refuses to start. Revisit if a real deployment asks.
+- **`received_at`'s strict ordering survives a wall-clock *step* only within one read batch.**
+  `now_nanos()` is `SystemTime::now()`, deliberately: `received_at` is the event's wall-clock
+  timestamp and a monotonic instant could not be one. Within a batch the ordering does not depend
+  on the clock at all — one read gives `base`, and datagram `i` is stamped `base + i` — but across
+  two batches it does. A backwards `clock_settime` (chrony's `makestep`, an NTP correction after a
+  long outage, a VM suspend/restore or live migration) between them can move the clock back by far
+  more than the `≤ read_batch` nanoseconds of offset, at which point two datagrams in consecutive
+  batches can share a `received_at` — exactly the `(series, timestamp)` collision the `+ i` offset
+  exists to prevent (ADR `udp-intake-batching-and-socket-visibility`'s "One `received_at` per
+  syscall batch"). Consequences are bounded: `decode_loop`'s latency computation already clamps
+  with `.max(0)`, and `influxdb_out`'s `allocate_timestamp` disambiguates within an output batch by
+  design. Not closable from the listener: the fix would be a monotonic clock, which would be the
+  wrong timestamp. `every_datagram_in_a_batch_gets_its_own_received_at`'s doc comment states the
+  same distinction where the assertion is.
 - **One reader per UDP listener.** A single read loop is one core's worth of read capacity.
   `SO_REUSEPORT` lets multiple sockets share one port with the kernel load-balancing datagrams
   across them — gostatsd's `--max-readers` (default `min(8, NumCPU)`), rsyslog's per-listener
@@ -1468,6 +1519,29 @@ already built that have a known, accepted rough edge.
 - **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only** — every other platform runs
   `watch: poll` unconditionally regardless of config, and an explicit `watch: inotify` is a startup
   error rather than a silent downgrade.
+- **A *file* watch that fails to register is never retried for that file.** `Watcher::watch_file`
+  is called exactly once per tracked inode, when `Tailer::open_tracked` opens it; a failure there
+  (realistically `ENOSPC` against `fs.inotify.max_user_watches` on a host tailing many files) is
+  diagnosed `watch_error` with the errno and leaves that one file relying on `poll_interval` for
+  its data wakes — exactly what `watch: poll` does — until it is rotated or re-opened. The
+  *directory* watch is the one that self-heals: it is re-armed on every `scan`
+  ([ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-21
+  amendment). Retrying per file would mean re-attempting one syscall per unwatched file per scan
+  with nothing to suggest the limit has moved; the diagnostic is what points at the sysctl instead.
+- **Two spellings of one directory (a symlink, a `.` component) share a single kernel watch, and
+  `logit.input.watch.watches` counts them twice.** `inotify_add_watch` follows symlinks and the
+  desired set is keyed on the configured path string, so `paths: [/var/log/app/*.log,
+  /srv/app/logs/*.log]` over a symlink registers one watch and reports two. Harmless — a
+  `Wake::Discover` may name the other spelling, whose payload the driver discards before rescanning
+  anyway, and the `IN_IGNORED` purge drops both entries together — but the gauge over-reports, and
+  `docs/deploying.md`'s "What to watch" says so. Normalizing the desired set (or passing
+  `IN_DONT_FOLLOW`) would change which paths a config can name, which is a config-surface decision,
+  not a bug fix.
+- **`parse_events` discards the rest of a `read` buffer after a malformed event**, rather than
+  attempting to resynchronize. Unreachable from a real inotify fd (the kernel never returns a
+  partial event, and `len` is always 0 or a multiple of 16 — both now pinned in the ADR), and
+  acceptable because the poll tick and the unconditional `drain` reconcile whatever a discarded
+  event would have said.
 - **`docker_in`'s timestamps are the one deliberate exception among the tailing decoders to
   "stamp receipt time."** It uses the json-file envelope's own `time` field (the daemon's
   same-host clock) instead, since replaying a backlog (`read_from: beginning`, or a fresh

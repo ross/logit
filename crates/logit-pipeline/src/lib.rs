@@ -8,6 +8,13 @@
 //! inversion is what avoids a circular dependency: this crate needs to be buildable without
 //! knowing about any concrete input/output/transform kind.
 
+// This crate carries `sockstat.rs`'s `getsockopt` calls, one of the codebase's three raw-`libc`
+// production `unsafe` call sites -- see `docs/adr/out-of-ci-unsafe-verification.md`. Denied at
+// the crate level, not promoted to `[workspace.lints]`: see `logit-inputs/src/lib.rs`'s matching
+// comment for why a workspace-wide deny doesn't land cleanly (`logit-bench`/`logit-perf` fallout).
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 pub mod accumulator;
 pub mod disk_queue;
 pub mod fanout;

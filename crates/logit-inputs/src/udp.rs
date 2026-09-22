@@ -153,11 +153,22 @@ impl UdpListenerConfig {
 /// in this codebase or in any mainstream kernel's UDP path supports them.)
 const MAX_DATAGRAM_BYTES: usize = 65_507;
 
-/// The largest `receive.read_batch` this driver accepts: `UIO_MAXIOV`, the kernel's hard ceiling
-/// on how many `iovec`s one vectored I/O call may carry, and so on `recvmmsg`'s `vlen`. Graph rule
-/// 57 rejects a larger value at config-validation time (`logit_config::MAX_READ_BATCH`, the same
-/// number -- `logit-inputs` deliberately does not depend on `logit-config`, the same duplication
+/// The largest `receive.read_batch` this driver accepts. Graph rule 57 rejects a larger value at
+/// config-validation time (`logit_config::MAX_READ_BATCH`, the same number -- `logit-inputs`
+/// deliberately does not depend on `logit-config`, the same duplication
 /// [`UdpListenerConfig::default`] already carries against `ReceiveConfig::default`).
+///
+/// **The number is `UIO_MAXIOV`'s, but the limit is ours, not the kernel's.** It is tempting to
+/// write that `UIO_MAXIOV` bounds `recvmmsg`'s `vlen`; it does not. `UIO_MAXIOV` bounds
+/// `msg_iovlen` *within one* `msghdr` -- `__copy_msghdr` (`net/socket.c`) returns `-EMSGSIZE`
+/// above it -- and [`build_headers`] sets `msg_iovlen` to 1. There is no `vlen` clamp on the
+/// receive side at all: `do_recvmmsg`'s loop is a plain `while (datagrams < vlen)`, and the only
+/// `UIO_MAXIOV` clamp on a `vlen` anywhere is `__sys_sendmmsg`'s (`if (vlen > UIO_MAXIOV) vlen =
+/// UIO_MAXIOV;`), on the *send* side. What 1024 actually bounds is this crate's own two costs: the
+/// `vlen * MAX_DATAGRAM_BYTES` slab [`BatchReader::new`] reserves (67 MB of address space at this
+/// ceiling), and how many datagrams a cancelled `push_many` can discard on the shutdown path. Both
+/// are ours to choose; 1024 is a round number comfortably past any measured plateau
+/// (ADR `udp-intake-batching-and-socket-visibility`'s sweep) rather than an ABI boundary.
 pub const MAX_READ_BATCH: usize = 1024;
 
 /// The three `decode_loop` needs to build and drive a [`BatchAccumulator`] -- split out from
@@ -444,6 +455,39 @@ struct Bound {
 /// but never joined would sit there looking healthy and receive nothing forever.
 ///
 /// A unicast `addr` binds exactly as it always has.
+///
+/// **Three things this function deliberately never does, all of them load-bearing elsewhere.**
+/// They are negatives, so nothing in the code says them; they are recorded here because each one
+/// is a single line away and each would break something several files from this one.
+///
+/// - **Never `connect(2)`.** `udp_err` (`net/ipv4/udp.c`; `udpv6_err`, `net/ipv6/udp.c`, is
+///   identical) gates ICMP error delivery on `if (!inet_test_bit(RECVERR, sk)) { if (!harderr ||
+///   sk->sk_state != TCP_ESTABLISHED) goto out; }`, and `sk_state` only becomes `TCP_ESTABLISHED`
+///   in `__ip4_datagram_connect` (`net/ipv4/datagram.c`). Unconnected and without `IP_RECVERR`,
+///   therefore, no ICMP unreachable can ever set `sk_err` on this socket -- which is what makes
+///   `ECONNREFUSED`/`EHOSTUNREACH`/`ENETUNREACH`/`EPROTO`/PMTU `EMSGSIZE` unreachable at
+///   [`BatchReader::read_batch`], and so what makes "every errno but `EAGAIN` is fatal" the right
+///   policy there rather than a hasty one.
+/// - **Never `IP_RECVERR`/`IPV6_RECVERR`.** It is the obvious idea -- it is the *other* way to see
+///   ICMP-reported loss, next to the `SO_MEMINFO` counters this listener does sample -- and it
+///   takes the `else` branch of the gate quoted above, which sets `sk_err` with **no**
+///   `TCP_ESTABLISHED` check. Enabling it would make this listener killable by any host that can
+///   provoke an ICMP unreachable toward it, since the next `recvmmsg` would return that error and
+///   `read_loop` treats a non-`EAGAIN` errno as fatal. Any future change here needs an answer for
+///   that first.
+/// - **Never `shutdown(2)`.** `Ready::READ_CLOSED` is in this listener's wait mask (tokio's
+///   `Ready::from_interest` adds it whenever the interest is readable) and `clear_readiness` can
+///   never clear it (`runtime/io/scheduled_io.rs` subtracts it from the clearable mask by name).
+///   If it were ever set while `recvmmsg` kept returning `EAGAIN`, `async_io`'s loop would spin
+///   *inside a single poll* -- and, because its `WouldBlock` arm restores the coop budget, never
+///   yield -- wedging the worker thread: no sampler tick, no shutdown observation, and
+///   `run_input`'s backstop unable to help because it is in the same task. That is open tokio
+///   issue #6971. It is unreachable here only because `EPOLLRDHUP`/`EPOLLHUP` on a UDP socket come
+///   from `sk->sk_shutdown`, which nothing sets without a `shutdown(2)` call on this fd, and
+///   nothing in `logit` makes one on a listener socket.
+///
+/// Verified against `torvalds/linux` master and tokio tag `tokio-1.53.1`, 2026-09-21; see ADR
+/// `udp-intake-batching-and-socket-visibility`'s amendment of that date.
 fn bind_one(
     addr: std::net::SocketAddr,
     receive_buffer_bytes: Option<u64>,
@@ -572,7 +616,7 @@ async fn read_loop(
             _ = shutdown.wait_for(|&due| due) => break Ok(()),
         };
         if let Err(err) = read {
-            break Err(err.into());
+            break Err(describe_read_failure(socket, err));
         }
         let bytes: usize = batch.iter().map(|datagram| datagram.bytes.len()).sum();
         telemetry.count("logit.input.reads", 1.0, &[]);
@@ -590,6 +634,123 @@ async fn read_loop(
     queue.close();
     result
 }
+
+/// The syscall [`BatchReader::read_batch`] takes datagrams off the socket with, by name -- for the
+/// one message an operator ever sees it in, the fatal error [`read_loop`] stops on.
+#[cfg(target_os = "linux")]
+const READ_SYSCALL: &str = "recvmmsg(2)";
+#[cfg(not(target_os = "linux"))]
+const READ_SYSCALL: &str = "recvfrom(2)";
+
+/// Turns a fatal read error into something an operator can act on.
+///
+/// Without this the only context added on the way out is `run_input`'s
+/// `.with_context(|| format!("component '{id}'"))` (`logit_pipeline::runtime`), so a sandbox that
+/// blocks the syscall reports `component 'statsd_in': Function not implemented (os error 38)` --
+/// no syscall named, no socket named, nothing to search for. That is the same failure quinn#1947
+/// and bun#42678 both hit (a seccomp profile refusing `recvmmsg`); `logit` at least fails cleanly
+/// rather than spinning, which is the part bun had to fix, but the message was no more useful than
+/// theirs was. `recvmmsg(2)` is unconditional on Linux, so the obvious operator response -- drop
+/// `receive.read_batch` to 1 -- does not help, and the hint says so rather than leaving it to be
+/// discovered. There is deliberately no runtime `recvmmsg` -> `recvmsg` fallback latch
+/// (quinn#2079's pattern); that is an open design decision, not an oversight -- see
+/// `docs/known-gaps.md`.
+///
+/// The bound address comes from `getsockname(2)` via `local_addr`, not from the configured `bind:`
+/// string: it is the address actually in use (a `:0` port resolved, or whichever candidate won
+/// [`bind_first_available`]'s fallthrough), and it costs one syscall on a path that is about to
+/// terminate the listener anyway.
+fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) -> anyhow::Error {
+    // Matched on `ErrorKind`, not `libc::E*`: `libc` is a Linux-only dependency of this crate and
+    // this function is shared with the `recv_from` twin, so it has to build without it. std's Unix
+    // mapping (`sys/pal/unix/mod.rs`, `decode_error_kind`) is `ENOSYS` -> `Unsupported`,
+    // `EPERM`/`EACCES` -> `PermissionDenied`, `ECONNABORTED` -> `ConnectionAborted`.
+    let hint = match err.kind() {
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied => {
+            " -- a seccomp or sandbox profile blocking that syscall is the usual cause; \
+             `receive.read_batch: 1` does not avoid it, this listener always makes the same call"
+        }
+        // `udp_abort` (`net/ipv4/udp.c`) is the one externally-triggerable fatal on this socket:
+        // it sets `sk_err` and `__udp_disconnect`s, reached from a `SOCK_DESTROY` netlink request.
+        // The socket really is gone -- unhashed, never to receive again -- so failing is correct,
+        // and a retry would read `EAGAIN` (`sock_error`'s `xchg` clears `sk_err`) and leave a
+        // silent zombie listener behind. Naming the cause is all that is left to do.
+        std::io::ErrorKind::ConnectionAborted => {
+            " -- the socket was destroyed out from under this listener (an `ss -K`, or another \
+             SOCK_DESTROY request naming it); it cannot receive again, so the process exits \
+             rather than pretending otherwise"
+        }
+        _ => "",
+    };
+    let addr = match socket.local_addr() {
+        Ok(addr) => addr.to_string(),
+        Err(_) => "an unknown address".to_string(),
+    };
+    anyhow::Error::new(err)
+        .context(format!("{READ_SYSCALL} on the listener socket bound to {addr}{hint}"))
+}
+
+/// Words of `u64` backing one `mmsghdr`, and one `iovec`, in [`BatchReader`]'s storage --
+/// see that type's doc for why the element type is `u64` rather than the C struct itself.
+///
+/// `div_ceil`, not a plain divide: nothing in the ABI *promises* either size is a multiple of 8
+/// (both are, on every Linux target this builds for), and rounding up can only ever over-allocate.
+/// Note what this does **not** buy, since it is easy to misread as buying it: the stride
+/// [`build_headers`] and [`harvest_headers`] walk is `hdrs.add(i)`, i.e. `size_of::<mmsghdr>()`,
+/// *not* the `HDR_WORDS * 8` bytes reserved per slot, so a size that were not a multiple of the
+/// alignment would misalign slot 1 however much was allocated. That case is impossible for a
+/// language-level reason rather than an ABI one -- Rust guarantees `size_of::<T>()` is a multiple
+/// of `align_of::<T>()` -- and the const block below asserts it anyway.
+#[cfg(target_os = "linux")]
+const HDR_WORDS: usize = std::mem::size_of::<libc::mmsghdr>().div_ceil(8);
+
+/// [`HDR_WORDS`]'s `iovec` twin; that constant's doc covers both.
+#[cfg(target_os = "linux")]
+const IOV_WORDS: usize = std::mem::size_of::<libc::iovec>().div_ceil(8);
+
+/// Every layout fact [`build_headers`], [`recvmmsg_into`] and [`harvest_headers`] rest on, checked
+/// against whatever `libc` says these two structs look like on the target actually being built.
+///
+/// A `const` block, so each of these is a hard compile error rather than a runtime surprise on a
+/// target whose `mmsghdr` is shaped differently than this code assumes -- the same tripwire
+/// discipline `crates/logit-core/tests/type_sizes.rs` applies to `Event`, and the reason
+/// `libc`'s own CI validates these structs against real headers with `ctest`.
+#[cfg(target_os = "linux")]
+const _: () = {
+    // **Alignment.** `mmsghdr`/`iovec` are 8-aligned on every target this compiles for, which is
+    // what makes a `u64` buffer valid storage for them. `Vec<u64>` allocates through
+    // `Layout::array::<u64>()`, whose alignment is `align_of::<u64>()`, so `as_mut_ptr()` is
+    // exactly that aligned -- and these two asserts are the whole of the guarantee, since the
+    // point of the `u64` element type is that the compiler cannot check the cast for us.
+    assert!(std::mem::align_of::<libc::mmsghdr>() <= std::mem::align_of::<u64>());
+    assert!(std::mem::align_of::<libc::iovec>() <= std::mem::align_of::<u64>());
+    // **Capacity.** The words reserved per slot hold a whole struct, so slot `i` of a
+    // `vlen * HDR_WORDS`-word buffer is wholly inside it for every `i < vlen`.
+    assert!(HDR_WORDS * 8 >= std::mem::size_of::<libc::mmsghdr>());
+    assert!(IOV_WORDS * 8 >= std::mem::size_of::<libc::iovec>());
+    // **Stride.** `hdrs.add(i)`/`iovs.add(i)` step by `size_of`, so every slot after the first is
+    // aligned only if `size_of` is a multiple of `align_of`. Guaranteed by the language; asserted
+    // because it is the one thing `div_ceil` above does *not* protect against.
+    assert!(
+        std::mem::size_of::<libc::mmsghdr>().is_multiple_of(std::mem::align_of::<libc::mmsghdr>())
+    );
+    assert!(std::mem::size_of::<libc::iovec>().is_multiple_of(std::mem::align_of::<libc::iovec>()));
+    // **Harvest.** The two fields [`harvest_headers`] reads back out of a header the kernel wrote
+    // lie wholly inside that header (and so inside its reserved `HDR_WORDS * 8` bytes), and are
+    // two distinct fields rather than one aliased under two names.
+    assert!(
+        std::mem::offset_of!(libc::mmsghdr, msg_len) + std::mem::size_of::<libc::c_uint>()
+            <= std::mem::size_of::<libc::mmsghdr>()
+    );
+    assert!(
+        std::mem::offset_of!(libc::mmsghdr, msg_hdr.msg_flags) + std::mem::size_of::<libc::c_int>()
+            <= std::mem::size_of::<libc::mmsghdr>()
+    );
+    assert!(
+        std::mem::offset_of!(libc::mmsghdr, msg_len)
+            != std::mem::offset_of!(libc::mmsghdr, msg_hdr.msg_flags)
+    );
+};
 
 /// The Linux read half: one `recvmmsg(2)` per [`BatchReader::read_batch`] call, up to
 /// `read_batch` datagrams at a time.
@@ -655,18 +816,12 @@ struct BatchReader {
 
 #[cfg(target_os = "linux")]
 impl BatchReader {
-    /// Words of `u64` backing one `mmsghdr` / one `iovec`. `div_ceil`, not a plain divide: nothing
-    /// in the ABI *promises* either size is a multiple of 8 (both are, on every Linux target this
-    /// builds for), and rounding up can only ever over-allocate.
-    const HDR_WORDS: usize = std::mem::size_of::<libc::mmsghdr>().div_ceil(8);
-    const IOV_WORDS: usize = std::mem::size_of::<libc::iovec>().div_ceil(8);
-
     fn new(read_batch: usize) -> Self {
         let vlen = read_batch.clamp(1, MAX_READ_BATCH);
         Self {
             slots: vec![0u8; vlen * MAX_DATAGRAM_BYTES],
-            hdr_words: vec![0u64; vlen * Self::HDR_WORDS],
-            iov_words: vec![0u64; vlen * Self::IOV_WORDS],
+            hdr_words: vec![0u64; vlen * HDR_WORDS],
+            iov_words: vec![0u64; vlen * IOV_WORDS],
             lens: vec![0u32; vlen],
             flags: vec![0i32; vlen],
             truncated: 0,
@@ -706,22 +861,21 @@ impl BatchReader {
     /// **A truncated datagram is delivered too**, as far as it was copied, and counted -- see
     /// [`BatchReader::truncated`] and this type's own doc.
     ///
-    /// **Cancellation loses nothing.** The one `.await` is `async_io`'s readiness wait; the
-    /// syscall and everything after it run synchronously in the poll that wait resolves in, so a
-    /// `select!` that drops this future either drops it before the syscall or not at all -- the
-    /// same guarantee `recv_from`'s own cancel-safety rests on.
+    /// **Cancellation loses nothing.** `async_io` suspends in exactly two places
+    /// (`Registration::async_io`, `tokio/src/runtime/io/registration.rs`, tag `tokio-1.53.1`: the
+    /// `self.readiness(interest).await?` and the `poll_fn(coop::poll_proceed).await` that follows
+    /// it), and **both are strictly before** it calls the closure; once the closure returns
+    /// anything but `WouldBlock`, `async_io` returns in that same poll without suspending again.
+    /// The syscall and everything after it therefore run synchronously in one poll, so a `select!`
+    /// that drops this future either drops it before the syscall or not at all -- the same
+    /// guarantee `recv_from`'s own cancel-safety rests on, and for the same reason, since
+    /// `recv_from` is the same `async_io` call with a different closure.
     async fn read_batch(
         &mut self,
         socket: &tokio::net::UdpSocket,
         out: &mut Vec<Datagram>,
     ) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd;
-
-        // `mmsghdr`/`iovec` are 8-aligned on every target this compiles for, which is what makes
-        // a `u64` buffer valid storage for them. Checked here rather than assumed, since the
-        // whole point of the `u64` element type is that the compiler cannot check it for us.
-        const _: () = assert!(std::mem::align_of::<libc::mmsghdr>() <= std::mem::align_of::<u64>());
-        const _: () = assert!(std::mem::align_of::<libc::iovec>() <= std::mem::align_of::<u64>());
 
         let fd = socket.as_raw_fd();
         let vlen = self.vlen;
@@ -738,64 +892,56 @@ impl BatchReader {
         // the poller, and an arm that never wakes is how that turns into a stalled listener.
         let received = socket
             .async_io(tokio::io::Interest::READABLE | tokio::io::Interest::ERROR, || {
-                // SAFETY (this whole block): `iov_words`/`hdr_words` are live allocations of at
-                // least `vlen * IOV_WORDS` / `vlen * HDR_WORDS` `u64`s, aligned at least as
-                // strictly as the C structs written into them (asserted above), so each cast
-                // pointer is valid for `vlen` aligned writes of its element type. `slots` is a
-                // live allocation of exactly `vlen * MAX_DATAGRAM_BYTES` bytes, so slot `i` is
-                // wholly inside it. Nothing else aliases any of the three while this closure runs
-                // -- they are borrowed exclusively by it. Every `mmsghdr` starts zeroed (a valid
-                // value: null pointers and zero lengths throughout) before its two fields are set,
-                // so `msg_name`/`msg_control` are NULL with zero lengths, which is what tells the
-                // kernel not to report a source address or any ancillary data.
-                let iovs = iov_words.as_mut_ptr().cast::<libc::iovec>();
-                let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
-                let base = slots.as_mut_ptr();
-                for i in 0..vlen {
-                    unsafe {
-                        iovs.add(i).write(libc::iovec {
-                            iov_base: base.add(i * MAX_DATAGRAM_BYTES).cast::<libc::c_void>(),
-                            iov_len: MAX_DATAGRAM_BYTES,
-                        });
-                        let mut hdr: libc::mmsghdr = std::mem::zeroed();
-                        hdr.msg_hdr.msg_iov = iovs.add(i);
-                        hdr.msg_hdr.msg_iovlen = 1;
-                        hdrs.add(i).write(hdr);
-                    }
-                }
+                // Rebuilt on every call of this `FnMut` (`async_io` may call it more than once,
+                // clearing readiness between `WouldBlock`s), so every pointer the kernel is handed
+                // is derived fresh from a live allocation within this same call -- there is no
+                // stale-provenance window across calls, and no raw pointer outlives the closure.
+                build_headers(slots, MAX_DATAGRAM_BYTES, iov_words, hdr_words, vlen);
                 loop {
-                    // SAFETY: `hdrs` points at `vlen` initialized `mmsghdr`s (written
-                    // immediately above), each describing one distinct, wholly-owned slot of
-                    // `slots`; the kernel writes only into those slots and into each header's
-                    // `msg_len`. The timeout argument is NULL -- "no timeout" -- which is the
-                    // only value that is sound to pass from here, since a `timespec` would have
-                    // to outlive a call this closure cannot see the end of.
-                    let n = unsafe {
-                        libc::recvmmsg(
-                            fd,
-                            hdrs,
-                            vlen as libc::c_uint,
-                            libc::MSG_DONTWAIT,
-                            std::ptr::null_mut(),
-                        )
-                    };
+                    // SAFETY: `build_headers` immediately above wrote `vlen` fully-initialized
+                    // `mmsghdr`s into `hdr_words`, each with a one-entry `iov` describing one
+                    // distinct, wholly-owned `MAX_DATAGRAM_BYTES` slot of `slots` -- which is
+                    // borrowed exclusively by this closure and not reborrowed anywhere between
+                    // that call and this one, so those `iov_base` pointers are still live. That
+                    // is exactly `recvmmsg_into`'s stated precondition.
+                    let n = unsafe { recvmmsg_into(fd, hdr_words, vlen) };
                     if n >= 0 {
-                        for (i, len) in lens.iter_mut().take(n as usize).enumerate() {
-                            // SAFETY: `i < n <= vlen`, and the kernel filled `msg_len` and
-                            // `msg_hdr.msg_flags` on each of the first `n` headers -- the array
-                            // itself is the one written above.
-                            *len = unsafe { (*hdrs.add(i)).msg_len };
-                            flags[i] = unsafe { (*hdrs.add(i)).msg_hdr.msg_flags };
-                        }
+                        harvest_headers(hdr_words, n as usize, lens, flags);
                         return Ok(n as usize);
                     }
                     let err = std::io::Error::last_os_error();
                     if err.raw_os_error() == Some(libc::EINTR) {
-                        continue; // a signal, not a condition -- retry the same call
+                        // Unreachable on this socket, kept deliberately. `__skb_recv_udp`
+                        // (`net/ipv4/udp.c`) only reaches the sleeping path -- the sole source of
+                        // `sock_intr_errno`'s `EINTR` (`__skb_wait_for_more_packets`,
+                        // `net/core/datagram.c`) -- through `while (timeo && ...)`, and `timeo`
+                        // is zero here twice over: `MSG_DONTWAIT` is passed explicitly, and
+                        // `____sys_recvmsg` (`net/socket.c`) ORs it in anyway for any `O_NONBLOCK`
+                        // fd, which a tokio-registered socket always is. So this arm costs one
+                        // never-taken comparison and buys the same defence `quinn-udp`'s
+                        // `retry_if_interrupted` keeps for the same call -- cheap insurance
+                        // against a future blocking caller, a different socket type, or a kernel
+                        // that stops short-circuiting. Forcing it takes
+                        // `strace -e inject=recvmmsg:error=EINTR`; a signal cannot produce it.
+                        continue;
                     }
                     // `EAGAIN`/`EWOULDBLOCK` already arrive as `ErrorKind::WouldBlock`, which is
                     // exactly the signal `async_io` needs to clear readiness and wait again.
-                    // Every other errno is fatal to the listener, precisely as `recv_from`'s was.
+                    // Every other errno is fatal to the listener. That is the right call because
+                    // every errno this socket can actually produce is permanent, not transient:
+                    // the ICMP-derived ones everyone reaches for a retry over
+                    // (`ECONNREFUSED`/`EHOSTUNREACH`/`ENETUNREACH`/`EPROTO`, PMTU `EMSGSIZE`) are
+                    // unreachable here at all -- `udp_err` (`net/ipv4/udp.c`) leaves `sk_err`
+                    // alone unless `IP_RECVERR` is set or the socket is `TCP_ESTABLISHED`, and
+                    // this one is neither (see `bind_one`) -- and `ENOBUFS` never surfaces on the
+                    // receive path, since receive-buffer exhaustion is charged and dropped in
+                    // softirq by `__udp_queue_rcv_skb`. What is left is `EBADF`/`ENOTSOCK`/
+                    // `EINVAL`/`EFAULT` (caller bugs), `EPERM`/`ENOSYS` (seccomp or an LSM), and
+                    // `ECONNABORTED` from `udp_abort` -- an `ss -K`/`SOCK_DESTROY` on this socket,
+                    // which unhashes it for good. Retrying any of them is worse than failing:
+                    // `sock_error`'s `xchg` clears `sk_err`, so a retry after `udp_abort` reads
+                    // `EAGAIN` and the listener sits on a dead socket forever, silently. See
+                    // ADR `udp-intake-batching-and-socket-visibility`'s 2026-09-21 amendment.
                     return Err(err);
                 }
             })
@@ -804,10 +950,17 @@ impl BatchReader {
         let base = now_nanos();
         self.truncated = 0;
         for i in 0..received {
-            // The kernel never reports having copied more than the `iov_len` it was given; a
-            // longer datagram is reported through `MSG_TRUNC` instead (below), with `msg_len`
-            // still the copied length. Clamped anyway so a hostile or broken value can only ever
-            // shorten the slice, never index past the slot.
+            // Dead code, on purpose. `udp_recvmsg` (`net/ipv4/udp.c`, and `udpv6_recvmsg`
+            // identically) computes `err = copied; if (flags & MSG_TRUNC) err = ulen;` -- it
+            // reports the *real* datagram length only when `MSG_TRUNC` is passed as an **input**
+            // flag, which `recvmmsg_into` does not do (it passes `MSG_DONTWAIT` alone). So
+            // `msg_len` is always the copied length, `<= iov_len = MAX_DATAGRAM_BYTES`, and a
+            // longer datagram is signalled through the *output* `msg_flags` instead (below).
+            // Kept as defence in depth so a hostile or broken value could only ever shorten the
+            // slice, never index past the slot; the `debug_assert_eq!` below is what keeps the
+            // claim honest, and it runs in every test build --
+            // `an_oversized_ipv6_datagram_is_delivered_truncated_and_counted` drives exactly the
+            // truncating case through it.
             let len = (self.lens[i] as usize).min(MAX_DATAGRAM_BYTES);
             debug_assert_eq!(
                 self.lens[i] as usize, len,
@@ -837,6 +990,158 @@ impl BatchReader {
     /// Per call, not cumulative.
     fn truncated(&self) -> u64 {
         self.truncated
+    }
+}
+
+/// Writes `vlen` `iovec`s into `iov_words` and `vlen` `mmsghdr`s into `hdr_words`, header `i`
+/// describing slot `i` of `slots` -- the `[i * slot_bytes, (i + 1) * slot_bytes)` byte range --
+/// through a one-entry `iov`. Every header is fully re-initialized, so a previous call's kernel
+/// writeback is overwritten rather than carried forward.
+///
+/// **Why this is its own function.** It is the half of [`BatchReader::read_batch`]'s closure that
+/// is pure: no syscall, no fd, nothing but pointer arithmetic over three caller-owned buffers. That
+/// is what makes it reachable under `miri`, which has no shim for `recvmmsg` and so can never
+/// execute the closure as a whole (`docs/adr/out-of-ci-unsafe-verification.md`). The pointer
+/// provenance, the stride, the slot disjointness and the zero-initialization are the whole of what
+/// `NET-01` is a P0 for, and all of it lives here where a tool can see it. `script/unsafe-check
+/// miri` runs `mod batch_reader_helpers` against it.
+///
+/// **Why `mem::zeroed()` + two field assignments, not a struct literal.** rust-`libc`'s musl
+/// `msghdr` carries private `__pad1`/`__pad2` fields a struct literal cannot set
+/// (rust-lang/libc#2344), and an unzeroed pad is libuv#3419's spurious `EMSGSIZE`. Zeroing also
+/// leaves `msg_name`/`msg_namelen`/`msg_control`/`msg_controllen` NULL/0, which is what tells the
+/// kernel to report neither a source address nor any ancillary data -- and what makes the
+/// `msg_flags`/`msg_controllen` the kernel writes back per call (`____sys_recvmsg`,
+/// `net/socket.c`) inert, since they are overwritten here before anything could read them.
+///
+/// Panics rather than trusting its caller: the three length preconditions are the ones that would
+/// otherwise be undefined behaviour, and checking them costs three comparisons per *batch*.
+#[cfg(target_os = "linux")]
+#[inline]
+fn build_headers(
+    slots: &mut [u8],
+    slot_bytes: usize,
+    iov_words: &mut [u64],
+    hdr_words: &mut [u64],
+    vlen: usize,
+) {
+    assert!(
+        vlen.checked_mul(slot_bytes).is_some_and(|need| slots.len() >= need),
+        "slots must hold vlen ({vlen}) slots of {slot_bytes} bytes, got {}",
+        slots.len()
+    );
+    assert!(
+        vlen.checked_mul(IOV_WORDS).is_some_and(|need| iov_words.len() >= need),
+        "iov_words must hold vlen ({vlen}) iovecs of {IOV_WORDS} words, got {}",
+        iov_words.len()
+    );
+    assert!(
+        vlen.checked_mul(HDR_WORDS).is_some_and(|need| hdr_words.len() >= need),
+        "hdr_words must hold vlen ({vlen}) mmsghdrs of {HDR_WORDS} words, got {}",
+        hdr_words.len()
+    );
+
+    let iovs = iov_words.as_mut_ptr().cast::<libc::iovec>();
+    let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+    let base = slots.as_mut_ptr();
+    for i in 0..vlen {
+        // SAFETY: the asserts above establish that `iov_words`/`hdr_words` are live allocations of
+        // at least `vlen * IOV_WORDS` / `vlen * HDR_WORDS` `u64`s and that `slots` is at least
+        // `vlen * slot_bytes` bytes, so for every `i < vlen`: `iovs.add(i)`/`hdrs.add(i)` are
+        // in-bounds and valid for one aligned write of their element type (alignment and the
+        // `size_of`-multiple-of-`align_of` stride are both asserted in this module's `const _`
+        // block, and `Vec<u64>`/a `&mut [u64]` derived from one is `align_of::<u64>()`-aligned),
+        // and `base.add(i * slot_bytes)` is in bounds with `slot_bytes` bytes behind it. The three
+        // buffers are borrowed exclusively here, so nothing aliases them for the duration. Writing
+        // an `mmsghdr` whose only non-zero fields are a valid `msg_iov` and `msg_iovlen = 1`
+        // leaves a fully valid value in every field.
+        unsafe {
+            iovs.add(i).write(libc::iovec {
+                iov_base: base.add(i * slot_bytes).cast::<libc::c_void>(),
+                iov_len: slot_bytes,
+            });
+            let mut hdr: libc::mmsghdr = std::mem::zeroed();
+            hdr.msg_hdr.msg_iov = iovs.add(i);
+            hdr.msg_hdr.msg_iovlen = 1;
+            hdrs.add(i).write(hdr);
+        }
+    }
+}
+
+/// The syscall, and nothing else -- a thin shim between [`build_headers`] and
+/// [`harvest_headers`] so that the two halves either side of it stay pure and therefore
+/// `miri`-runnable. Returns `recvmmsg`'s own return value: `>= 0` is a datagram count, `-1` means
+/// consult `errno`.
+///
+/// The timeout argument is NULL ("no timeout"), which is the only value sound to pass from here:
+/// a `timespec` would have to outlive a call this shim cannot see the end of. It is also the value
+/// that side-steps `recvmmsg(2)`'s documented timeout bug (BUGS: the timeout is only checked
+/// *after* a datagram arrives), and `MSG_WAITFORONE` is deliberately not passed -- it is a no-op
+/// alongside `MSG_DONTWAIT`.
+///
+/// # Safety
+///
+/// `hdr_words` must hold at least `vlen` initialized `mmsghdr`s exactly as [`build_headers`]
+/// writes them: each with a valid one-entry `msg_iov` pointing at a live, writable, exclusively
+/// owned buffer of at least `iov_len` bytes, and NULL `msg_name`/`msg_control`. The kernel writes
+/// through those pointers and into each header's `msg_len`/`msg_flags`, so every one of them must
+/// still be live when this is called. `fd` need not be valid -- a bad descriptor is `EBADF`, not
+/// undefined behaviour -- but the buffers must be.
+#[cfg(target_os = "linux")]
+#[inline]
+unsafe fn recvmmsg_into(fd: std::os::fd::RawFd, hdr_words: &mut [u64], vlen: usize) -> libc::c_int {
+    let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+    // SAFETY: the caller guarantees `hdrs` points at `vlen` initialized `mmsghdr`s describing live,
+    // exclusively-owned buffers (this function's `# Safety` section); `hdr_words` is borrowed
+    // exclusively here, so nothing else aliases the array while the kernel writes into it.
+    unsafe {
+        libc::recvmmsg(fd, hdrs, vlen as libc::c_uint, libc::MSG_DONTWAIT, std::ptr::null_mut())
+    }
+}
+
+/// Lifts the `msg_len` and `msg_hdr.msg_flags` the kernel wrote into the first `n` headers of
+/// `hdr_words` out into `lens`/`flags`, and touches nothing beyond `n`.
+///
+/// The header array's contents are meaningless to anything outside [`BatchReader::read_batch`]'s
+/// closure -- they hold raw pointers, which is exactly what the `Vec<u64>` storage exists to keep
+/// out of a `Send` future -- so the two numbers worth keeping are copied into plain integer
+/// buffers here, and the headers are then free to be rebuilt from scratch on the next call.
+///
+/// Pure, for the same reason [`build_headers`] is: under `miri` a test plays the kernel's part by
+/// writing into the same headers through the same pointer type, and this reads back exactly what
+/// was written.
+///
+/// Panics if `n` exceeds any of the three buffers. The kernel cannot return more than the `vlen`
+/// it was given, so this is unreachable; it is an assert rather than a silent `take(n)` because a
+/// count that large would mean the ABI assumption underneath all of this had broken, and that
+/// should be loud.
+#[cfg(target_os = "linux")]
+#[inline]
+fn harvest_headers(hdr_words: &mut [u64], n: usize, lens: &mut [u32], flags: &mut [i32]) {
+    assert!(
+        n.checked_mul(HDR_WORDS).is_some_and(|need| hdr_words.len() >= need),
+        "hdr_words must hold n ({n}) mmsghdrs of {HDR_WORDS} words, got {}",
+        hdr_words.len()
+    );
+    assert!(
+        lens.len() >= n && flags.len() >= n,
+        "lens ({}) and flags ({}) must each hold n ({n}) entries",
+        lens.len(),
+        flags.len()
+    );
+
+    let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+    for (i, (len, flag)) in lens.iter_mut().zip(flags.iter_mut()).take(n).enumerate() {
+        // SAFETY: `i < n`, and the assert above establishes `hdr_words` holds at least `n`
+        // `mmsghdr`-sized slots, so `hdrs.add(i)` is in bounds and aligned (this module's `const _`
+        // block asserts the alignment and the stride). The caller's contract is that the first `n`
+        // headers were initialized by `build_headers` and then written by the kernel; both fields
+        // read here lie wholly inside one header (also asserted in that block) and are plain
+        // integers, so every byte of each is initialized either way.
+        unsafe {
+            *len = (*hdrs.add(i)).msg_len;
+            *flag = (*hdrs.add(i)).msg_hdr.msg_flags;
+        }
     }
 }
 
@@ -921,12 +1226,25 @@ const KERNEL_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// resumes exactly where it was and nothing is cancelled. (Cancelling and restarting `read_loop`
 /// here would drop a datagram per tick; it is never dropped and re-created.)
 ///
-/// **The final sample is guaranteed.** Drops in the last fraction of a second before a fatal
-/// socket error or a shutdown are as real as any other, and with a one-second interval they are
-/// the likeliest ones to exist at all -- a listener usually stops *because* something went wrong.
-/// So the sampler runs once more after `read_loop` has returned, before this function forwards
-/// that result. The socket is still open at that point (it is owned by `run_until_shutdown`, which
-/// outlives this future), so the counters are still readable.
+/// **The final sample runs on every path [`sample_while`] itself returns on.** Drops in the last
+/// fraction of a second before a fatal socket error or a shutdown are as real as any other, and
+/// with a one-second interval they are the likeliest ones to exist at all -- a listener usually
+/// stops *because* something went wrong. So the sampler runs once more after `read_loop` has
+/// returned, before this function forwards that result. The socket is still open at that point (it
+/// is owned by `run_until_shutdown`, which outlives this future), so the counters are still
+/// readable.
+///
+/// It is **not** unconditional, and the difference is worth stating precisely rather than leaving
+/// "guaranteed" to be read as more than it is. There is exactly one path that skips it: a future
+/// that is *dropped* runs nothing, and `run_input`'s grace backstop
+/// (`logit_pipeline::runtime`, the `shutdown_grace_expired` arm of its `select!`) drops this whole
+/// future when the grace expires. Production never reaches it -- `read_loop` races `shutdown` in
+/// both of its own `select!`s, so it returns within microseconds of the signal and the final
+/// sample lands long before the grace could, and `input_runtime_config` supplies
+/// `ReceiveConfig::default()`'s 5 s rather than `InputRuntimeConfig::default()`'s
+/// `Duration::ZERO`. At `Duration::ZERO`, which tests do construct, both arms are ready at once
+/// and `select!`'s random rotation drops this future roughly half the time. See ADR
+/// `udp-intake-batching-and-socket-visibility`'s 2026-09-21 amendment.
 ///
 /// **Once the sampler has disabled itself, no timer is armed at all** and this is exactly
 /// [`read_loop`]. That is the other half of `sockstat`'s "report once and stop asking": a listener
@@ -962,15 +1280,40 @@ async fn read_loop_sampled(
 ///
 /// **The timer arm comes first, and that ordering is load-bearing.** The intuitive order is the
 /// other one -- prefer the work, treat the sample as something to do while idle -- and it is
-/// wrong, for a reason that is invisible until you measure it. `tokio` gives each task a
-/// cooperative-scheduling budget of 128 units per poll, and every resource operation spends one:
-/// each `recv_from`, and each `shutdown.wait_for`, inside `read_loop`. Under the overload this
-/// sampler exists to report, `read_loop` never parks for a real reason -- there is always another
-/// datagram -- so the only way it returns `Pending` is by running that budget to zero. `Sleep`'s
-/// own poll opens with `coop::poll_proceed` (`tokio/src/time/sleep.rs`), so a timer arm polled
-/// *after* the read arm finds a budget of zero and returns `Pending` with its deadline long since
-/// past. The next wake re-polls in the same order with the same result, forever: **a `Pending`
-/// caused by the coop budget is not a park, and an arm placed behind one never runs.**
+/// wrong, for a reason that is invisible until you measure it.
+///
+/// The mechanism, stated against the version this is pinned to -- **`tokio-1.53.1`**, and every
+/// one of the four facts below has to be re-checked on a bump, which is what this paragraph is
+/// for:
+///
+/// 1. A task's cooperative-scheduling budget starts at **128** units per poll
+///    (`task/coop/mod.rs`, `const fn initial() -> Budget { Budget(Some(128)) }`).
+/// 2. A **successful** `async_io` spends one of them (`runtime/io/registration.rs`:
+///    `coop.made_progress()` on the success arm). A `WouldBlock` one spends **zero** -- it drops
+///    the `RestoreOnPending` guard without calling `made_progress`, and that guard's `Drop` writes
+///    the pre-decrement budget back. So the budget drains exactly under the flood this sampler
+///    exists to report, where every read succeeds and `read_loop` never parks for a real reason:
+///    the only way it returns `Pending` is by running the budget to zero.
+/// 3. `Sleep`'s poll consults coop **before** its deadline (`time/sleep.rs`, `poll_elapsed`:
+///    `let coop = ready!(crate::task::coop::poll_proceed(cx));` ahead of any use of the deadline
+///    or the timer entry). So a timer arm polled *after* the read arm finds a budget of zero and
+///    returns `Pending` however far past its deadline it is -- and, never having reached the timer
+///    driver, is not even registered to be woken by it. The next wake re-polls in the same order
+///    with the same result, forever.
+/// 4. `select!` itself gates on the budget before polling **any** arm (`macros/select.rs`:
+///    `ready!(poll_budget_available(cx))` is the first thing its generated `poll_fn` does), so the
+///    whole `select!` below is subject to (3) as a unit, not just the sleep inside it.
+///
+/// **A `Pending` caused by the coop budget is not a park, and an arm placed behind one never
+/// runs.** With the timer arm first the budget is intact when `Sleep::poll` runs, it finds the
+/// deadline unmet, and its own `RestoreOnPending` rolls the decrement back before the read arm
+/// burns the budget to zero -- so the sleep is registered with the timer driver on every poll and
+/// the tick lands on time.
+///
+/// Two things the earlier wording of this comment got wrong, recorded so they are not
+/// reintroduced: a `WouldBlock` `async_io` does **not** spend a unit (see 2), and
+/// `watch::Receiver::wait_for` -- `read_loop`'s other arm -- has no coop call on its path at all,
+/// so neither is part of why the budget drains. The read side's *successful* `recvmmsg` is.
 ///
 /// Measured on a release build, eight senders flooding one listener for 10 s at roughly 90% kernel
 /// loss: with the read arm first, 0 of 10 one-second windows carried `kernel.drops` or the buffer
@@ -1013,7 +1356,9 @@ where
 ///
 /// Disables itself for good on the first failed read: `SO_MEMINFO` either exists for a socket or
 /// it never will (an older kernel, a non-Linux build), so retrying it every second would be a
-/// syscall per second forever in exchange for nothing. One `warn` says so, once.
+/// syscall per second forever in exchange for nothing. One diagnostic says so, once: a `warn`
+/// quoting the OS error when a Linux kernel refused the read, `debug` when the build has no such
+/// counters to begin with (non-Linux, or no raw descriptor) -- see `sample_once`.
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
     /// descriptors at all, where [`logit_pipeline::sockstat`] reports nothing anyway. Safe to
@@ -1054,15 +1399,40 @@ impl ReceiveBufferSampler {
         if !self.enabled {
             return;
         }
-        let info = self.fd.and_then(sockstat::meminfo);
-        let Some(info) = info else {
-            self.enabled = false;
-            self.diag.warn(format_args!(
-                "the kernel's per-socket receive counters are not available for this listener -- \
-                 SO_MEMINFO needs Linux 4.12 or newer; logit.input.kernel.drops, \
-                 logit.input.receive_buffer.used.bytes and .utilization will not be reported"
-            ));
-            return;
+        let info = self.fd.ok_or(sockstat::Unavailable::NoDescriptor).and_then(sockstat::meminfo);
+        let info = match info {
+            Ok(info) => info,
+            Err(err) => {
+                self.enabled = false;
+                // What the kernel actually said, and the version hint *only* where it applies:
+                // `EBADF` here would mean a stale or reused descriptor -- a bug in logit, and the
+                // one cause an operator most needs to not see dressed up as "upgrade your kernel".
+                // `Unavailable::is_unsupported_option` is what draws that line.
+                let hint = if err.is_unsupported_option() {
+                    " (SO_MEMINFO needs Linux 4.12 or newer)"
+                } else {
+                    ""
+                };
+                let message = format_args!(
+                    "the kernel's per-socket receive counters are not available for this \
+                     listener: {err}{hint}; logit.input.kernel.drops, \
+                     logit.input.receive_buffer.used.bytes and .utilization will not be reported"
+                );
+                // A build that is simply not Linux (or has no raw descriptors at all) can do
+                // nothing about this, and `internal`'s `logs:` setting captures `warn` into the
+                // pipeline by default -- so one line per listener at every startup would be noise
+                // an operator cannot act on. Everything else is a real failure on a platform that
+                // should have worked, and stays at `warn`.
+                if matches!(
+                    err,
+                    sockstat::Unavailable::NotLinux | sockstat::Unavailable::NoDescriptor
+                ) {
+                    self.diag.debug(message);
+                } else {
+                    self.diag.warn(message);
+                }
+                return;
+            }
         };
         let dropped = self.drops.delta(info.drops);
         if dropped > 0 {
@@ -1909,10 +2279,13 @@ mod tests {
         assert!(used >= 0.0, "a fill level is never negative, got {used}");
         // The pairing the metric's whole meaning depends on: both terms come from the same
         // `SO_MEMINFO` read, so the ratio is exactly the one the kernel itself tests. No upper
-        // bound of 1.0 on it, deliberately -- the kernel charges an arriving packet's `truesize`
-        // and *then* tests the total against the ceiling, so a sample taken mid-drop legitimately
-        // reads a little over 1.0 (observed at 1.17 against a real flood), and asserting
-        // `<= 1.0` would be a flake waiting to happen. See `SockMeminfo::receive_utilization`.
+        // bound of 1.0 on it, deliberately -- the kernel admits a datagram whenever the
+        // *already-charged* total is at or below the ceiling and then charges the whole of its
+        // `truesize` on top, so a saturated queue settles at up to `rcvbuf + truesize` and reads
+        // over 1.0 for as long as it stays there (observed at 1.17 against a real flood).
+        // Asserting `<= 1.0` would be a flake waiting to happen. See
+        // `SockMeminfo::receive_utilization`, which has both kernel generations' spelling of that
+        // same admission rule.
         assert!(
             (utilization - used / granted).abs() < 1e-9,
             "utilization must be `used.bytes / receive_buffer.bytes`, not a ratio against the \
@@ -1957,6 +2330,111 @@ mod tests {
             (utilization - used / granted).abs() < 1e-9,
             "utilization must be `used.bytes / receive_buffer.bytes`"
         );
+    }
+
+    /// This module's headline claim, checked against the number an operator would check it
+    /// against: **`logit.input.kernel.drops` is the same counter `/proc/net/udp`'s `drops` column
+    /// prints**, to the packet, on the same socket at the same moment.
+    ///
+    /// `logit_pipeline::sockstat`'s module doc asserts this identity ("`SK_MEMINFO_DROPS` is the
+    /// same `sk->sk_drops` that procfs's `drops` column prints, so the two agree by
+    /// construction") and `docs/plans/udp-intake.md` recorded checking it as a manual step. It is
+    /// neither manual nor approximate: both sides read the same field --
+    /// `sk_get_meminfo` (`net/core/sock.c`) does `mem[SK_MEMINFO_DROPS] = atomic_read(&sk->sk_drops)`
+    /// and `udp4_format_sock` (`net/ipv4/udp.c`) prints `atomic_read(&sp->sk_drops)` as its last
+    /// column, both verified at v6.12 -- so this is an equality, not a threshold.
+    ///
+    /// It is also the only test in the tree that pins the `SK_MEMINFO_DROPS` *index* against
+    /// something other than itself. A mutant that read `SK_MEMINFO_BACKLOG` (7) or
+    /// `SK_MEMINFO_OPTMEM` (6) instead still reports "some number" and still passes every
+    /// nonzero-drops assertion elsewhere; only an equality against an independently-produced
+    /// figure catches it.
+    ///
+    /// **Ordering.** The blast finishes before anything is read, and nothing else sends to this
+    /// socket, so `sk_drops` is frozen by the time the comparison runs. The socket is still open
+    /// throughout -- procfs only lists live sockets, and the row is found by the socket's own
+    /// inode (`/proc/self/fd/<fd>` reads back as `socket:[<inode>]`), not by address, which is
+    /// what makes it unambiguous even with another test's loopback socket bound nearby.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_kernels_drop_counter_agrees_with_proc_net_udp_to_the_packet() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut diag = Diagnostics::default();
+        let (socket, _group) =
+            bind_socket("127.0.0.1:0", Some(TINY_RECEIVE_BUFFER), &telemetry, &mut diag)
+                .await
+                .expect("binding an ephemeral port should succeed");
+        let addr = socket.local_addr().expect("a bound socket has an address");
+
+        // The blaster is awaited to completion, so nothing is still in flight below.
+        blast(addr, OVERRUN_DATAGRAMS).await;
+
+        let Some(procfs_drops) = proc_net_udp_drops(&socket) else {
+            println!("skipping: /proc/net/udp is not readable in this environment");
+            return;
+        };
+
+        let mut sampler =
+            ReceiveBufferSampler::new(&socket, telemetry.clone(), Diagnostics::default());
+        sampler.sample_once();
+        assert!(sampler.enabled, "SO_MEMINFO is available on this kernel -- test premise");
+
+        // A third, independent reading: straight off the fd, bypassing the sampler entirely.
+        let direct = logit_pipeline::sockstat::meminfo(
+            logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor"),
+        )
+        .expect("SO_MEMINFO on a socket this process just opened");
+
+        let reported = kernel_drops(&registry.drain(0));
+        assert!(
+            procfs_drops > 0,
+            "the flood must have overrun a {TINY_RECEIVE_BUFFER}-byte buffer"
+        );
+        assert_eq!(
+            reported, procfs_drops as f64,
+            "logit.input.kernel.drops must equal /proc/net/udp's drops column for this socket \
+             exactly -- it is literally the same sk_drops field"
+        );
+        assert_eq!(
+            u64::from(direct.drops),
+            procfs_drops,
+            "and so must a direct SO_MEMINFO read, which is what rules out the counter's \
+             first-sample arithmetic hiding an index mistake"
+        );
+    }
+
+    /// This socket's `drops` column in `/proc/net/udp[6]`, found by inode. `None` if procfs is
+    /// unreadable or the row is not there (neither is something this code could be blamed for).
+    ///
+    /// The row layout is fixed by `udp4_format_sock`'s `seq_printf` (`net/ipv4/udp.c`, and
+    /// `__ip6_dgram_sock_seq_show` in `net/ipv6/datagram.c` for udp6, which prints the same
+    /// columns with wider addresses): whitespace-separated, `sl` is field 0, `inode` is field 9
+    /// and `drops` is field 12 and last. `tx_queue:rx_queue` and `tr:tm->when` are each one
+    /// colon-joined field, which is what makes the count come out at 13 rather than 15.
+    #[cfg(target_os = "linux")]
+    fn proc_net_udp_drops(socket: &UdpSocket) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+
+        // `/proc/self/fd/<fd>` is a symlink that reads back as `socket:[<inode>]` -- the inode
+        // procfs's socket tables key on. Cheaper and safer than an `fstat`, and no `unsafe`.
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).ok()?;
+        let link = link.to_str()?;
+        let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+
+        for table in ["/proc/net/udp", "/proc/net/udp6"] {
+            let Ok(contents) = std::fs::read_to_string(table) else {
+                continue;
+            };
+            for row in contents.lines().skip(1) {
+                let fields: Vec<&str> = row.split_whitespace().collect();
+                if fields.len() < 13 || fields[9] != inode {
+                    continue;
+                }
+                return fields[12].parse().ok();
+            }
+        }
+        None
     }
 
     /// The guarantee `read_loop_sampled` adds on top of its interval: drops that happen in the
@@ -2156,6 +2634,388 @@ mod tests {
         );
     }
 
+    // -- the pure halves of the `recvmmsg` closure (`miri`'s only way in) ------------------------
+
+    /// `NET-01`'s P0 artifact: everything about [`build_headers`]/[`harvest_headers`] that a
+    /// pointer-provenance checker can see, exercised with no syscall anywhere in reach.
+    ///
+    /// **Why this module exists at all.** `miri` has no shim for `recvmmsg(2)` and none for any
+    /// socket call, so [`BatchReader::read_batch`] as a whole is permanently out of its reach
+    /// (`docs/adr/out-of-ci-unsafe-verification.md`). Splitting the closure into build / syscall /
+    /// harvest puts every one of the pointer decisions -- the `u64`-storage cast, the
+    /// `size_of`-strided `add(i)`, the slot arithmetic, the re-initialization, and the read-back of
+    /// two fields the kernel wrote through a pointer derived from the same borrow -- on the two
+    /// sides `miri` *can* execute. `script/unsafe-check miri` runs exactly this module; the tests
+    /// below are ordinary `cargo test` tests too, so a regression fails in CI even for someone who
+    /// never runs the nightly harness.
+    ///
+    /// **The kernel's part is played by the tests themselves**, writing through a `*mut
+    /// libc::mmsghdr` derived from the same `&mut [u64]` the syscall shim would derive its own
+    /// from -- which is the aliasing question worth asking under Stacked/Tree Borrows, and the one
+    /// production actually relies on.
+    #[cfg(target_os = "linux")]
+    mod batch_reader_helpers {
+        use super::super::{build_headers, harvest_headers, HDR_WORDS, IOV_WORDS};
+        use super::MAX_DATAGRAM_BYTES;
+
+        /// Every `vlen` worth checking: both ends of the clamp [`BatchReader::new`] applies
+        /// (`1` and [`MAX_READ_BATCH`]), the default `read_batch` of 64 and the value just below
+        /// it (so an off-by-one in the loop bound shows up as a missing or extra header rather
+        /// than as a boundary case that happens to line up), and `2` as the smallest `vlen` where
+        /// slot disjointness means anything at all.
+        const VLENS: [usize; 5] = [1, 2, 63, 64, 1024];
+
+        /// The per-slot size the helper tests use where the *real* one would only make them slow:
+        /// `1024 * MAX_DATAGRAM_BYTES` is a 67 MB zeroed slab, which is nothing to a release
+        /// binary that `mmap`s it once and faults in a few pages, and a great deal to an
+        /// interpreter tracking every byte's initialization state. Nothing in
+        /// [`build_headers`] is sensitive to the *value*: it is a stride and a length, passed as a
+        /// parameter precisely so a test can vary it. `slot_bytes_matching_production` below runs
+        /// the same construction at the real `MAX_DATAGRAM_BYTES`, so the production stride is
+        /// covered too, just not crossed with the largest `vlen` under `miri`.
+        const SMALL_SLOT: usize = 64;
+
+        /// One header's fields, read back out of the `u64` storage exactly the way the kernel
+        /// would see them -- through a `*mut libc::mmsghdr` derived from `hdr_words`, following
+        /// `msg_iov` into the separate `iovec` array rather than re-deriving that array's pointer
+        /// from `iov_words`.
+        ///
+        /// Following the stored pointer, rather than recomputing where it *should* point, is the
+        /// point: it is the one read that fails if the provenance `build_headers` hands the kernel
+        /// has been invalidated by the time the kernel would use it. Which is also why nothing
+        /// here may touch `iov_words` or `slots` again -- a reborrow of either would pop exactly
+        /// the tag under test, in the test rather than in production.
+        struct HeaderView {
+            iov_base: usize,
+            iov_len: usize,
+            msg_iovlen: usize,
+            msg_name: usize,
+            msg_namelen: u32,
+            msg_control: usize,
+            msg_controllen: usize,
+            msg_len: u32,
+            msg_flags: i32,
+        }
+
+        // `msg_iovlen`/`msg_controllen` are `size_t` in rust-`libc`'s `linux-gnu` `msghdr` and
+        // narrower integers in some of its other target definitions -- which is the whole reason
+        // this file never builds an `msghdr` by struct literal. The casts below are that
+        // portability, not redundancy, even where clippy can see through them on *this* target.
+        #[allow(clippy::unnecessary_cast)]
+        fn view(hdr_words: &mut [u64], vlen: usize) -> Vec<HeaderView> {
+            let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+            (0..vlen)
+                .map(|i| {
+                    // SAFETY: `i < vlen` and `hdr_words` holds `vlen * HDR_WORDS` words, so
+                    // `hdrs.add(i)` is in bounds and aligned. `build_headers` initialized every
+                    // one of these headers, and its `msg_iov` points into a live `iovec` array
+                    // that this function deliberately does not reborrow.
+                    unsafe {
+                        let hdr = &*hdrs.add(i);
+                        let iov = &*hdr.msg_hdr.msg_iov;
+                        HeaderView {
+                            iov_base: iov.iov_base as usize,
+                            iov_len: iov.iov_len,
+                            msg_iovlen: hdr.msg_hdr.msg_iovlen as usize,
+                            msg_name: hdr.msg_hdr.msg_name as usize,
+                            msg_namelen: hdr.msg_hdr.msg_namelen,
+                            msg_control: hdr.msg_hdr.msg_control as usize,
+                            msg_controllen: hdr.msg_hdr.msg_controllen as usize,
+                            msg_len: hdr.msg_len,
+                            msg_flags: hdr.msg_hdr.msg_flags,
+                        }
+                    }
+                })
+                .collect()
+        }
+
+        /// What `recvmmsg(2)` writes back into the first `n` headers, and nothing this code ever
+        /// looks at: `msg_len` and `msg_hdr.msg_flags` are what [`harvest_headers`] reads, and
+        /// `msg_namelen`/`msg_controllen` are written back by `____sys_recvmsg` (`net/socket.c`)
+        /// on every call -- deliberately given nonsense values here so that a
+        /// [`build_headers`] that failed to re-zero a header would be caught by the
+        /// re-initialization test rather than silently agreeing.
+        fn play_kernel(hdr_words: &mut [u64], n: usize, lens: &[u32], flags: &[i32]) {
+            let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+            for i in 0..n {
+                // SAFETY: `i < n <= vlen` and `hdr_words` holds `vlen * HDR_WORDS` words, so
+                // `hdrs.add(i)` is in bounds and aligned; `build_headers` initialized it, so every
+                // field is a live, valid value to assign over. This is the same pointer type,
+                // derived from the same borrow, that `recvmmsg_into` hands the kernel.
+                unsafe {
+                    (*hdrs.add(i)).msg_len = lens[i];
+                    (*hdrs.add(i)).msg_hdr.msg_flags = flags[i];
+                    (*hdrs.add(i)).msg_hdr.msg_namelen = 0xDEAD;
+                    (*hdrs.add(i)).msg_hdr.msg_controllen = 0xBEEF;
+                }
+            }
+        }
+
+        /// Fresh, correctly-sized backing buffers for one `vlen`, exactly as `BatchReader::new`
+        /// allocates them.
+        fn buffers(vlen: usize, slot_bytes: usize) -> (Vec<u8>, Vec<u64>, Vec<u64>) {
+            (
+                vec![0u8; vlen * slot_bytes],
+                vec![0u64; vlen * IOV_WORDS],
+                vec![0u64; vlen * HDR_WORDS],
+            )
+        }
+
+        /// Asserts the whole of what a freshly-built header array must look like: a one-entry
+        /// `iov` per header, pointing at that header's own slot and no other, every slot wholly
+        /// inside the slab, every slot exactly `slot_bytes` long, and no address, control buffer
+        /// or returned length carried over from anywhere.
+        fn assert_freshly_built(views: &[HeaderView], slab: (usize, usize), slot_bytes: usize) {
+            let (slab_start, slab_len) = slab;
+            let mut seen: Vec<(usize, usize)> = Vec::with_capacity(views.len());
+            for (i, v) in views.iter().enumerate() {
+                assert_eq!(v.msg_iovlen, 1, "header {i} must describe exactly one iovec");
+                assert_eq!(v.iov_len, slot_bytes, "header {i}'s slot must be a whole slot long");
+                assert_eq!(
+                    v.iov_base,
+                    slab_start + i * slot_bytes,
+                    "header {i} must point at slot {i}, not at some other slot"
+                );
+                assert!(
+                    v.iov_base >= slab_start && v.iov_base + v.iov_len <= slab_start + slab_len,
+                    "header {i}'s slot [{}, {}) must be wholly inside the slab [{slab_start}, {})",
+                    v.iov_base,
+                    v.iov_base + v.iov_len,
+                    slab_start + slab_len
+                );
+                assert_eq!(v.msg_name, 0, "header {i} must ask for no source address");
+                assert_eq!(v.msg_namelen, 0, "header {i} must ask for no source address");
+                assert_eq!(v.msg_control, 0, "header {i} must ask for no ancillary data");
+                assert_eq!(v.msg_controllen, 0, "header {i} must ask for no ancillary data");
+                assert_eq!(v.msg_len, 0, "header {i} must start with no returned length");
+                assert_eq!(v.msg_flags, 0, "header {i} must start with no returned flags");
+                seen.push((v.iov_base, v.iov_base + v.iov_len));
+            }
+            for (i, a) in seen.iter().enumerate() {
+                for (j, b) in seen.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        a.1 <= b.0 || b.1 <= a.0,
+                        "slots {i} [{}, {}) and {j} [{}, {}) overlap",
+                        a.0,
+                        a.1,
+                        b.0,
+                        b.1
+                    );
+                }
+            }
+        }
+
+        /// The construction half, at every `vlen` the clamp can produce.
+        #[test]
+        fn every_header_describes_its_own_slot_and_asks_for_nothing_else() {
+            for vlen in VLENS {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                let slab = (slots.as_ptr() as usize, slots.len());
+
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+
+                let views = view(&mut hdr_words, vlen);
+                assert_eq!(views.len(), vlen);
+                assert_freshly_built(&views, slab, SMALL_SLOT);
+            }
+        }
+
+        /// The same construction at the real per-slot size, so the production stride
+        /// (`MAX_DATAGRAM_BYTES`, not [`SMALL_SLOT`]) is covered rather than only the parameter.
+        ///
+        /// `1024` is excluded under `miri` alone, and only for cost: a 67 MB zeroed slab is a
+        /// single `mmap` to a real binary and per-byte bookkeeping to an interpreter. Nothing
+        /// about the arithmetic differs between 64 slots and 1024 of them that
+        /// [`every_header_describes_its_own_slot_and_asks_for_nothing_else`] does not already
+        /// cover at 1024 with a smaller stride.
+        #[test]
+        fn slot_bytes_matching_production() {
+            #[cfg(miri)]
+            let vlens: &[usize] = &[1, 2, 63, 64];
+            #[cfg(not(miri))]
+            let vlens: &[usize] = &VLENS;
+
+            for &vlen in vlens {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, MAX_DATAGRAM_BYTES);
+                let slab = (slots.as_ptr() as usize, slots.len());
+
+                build_headers(&mut slots, MAX_DATAGRAM_BYTES, &mut iov_words, &mut hdr_words, vlen);
+
+                let views = view(&mut hdr_words, vlen);
+                assert_freshly_built(&views, slab, MAX_DATAGRAM_BYTES);
+            }
+        }
+
+        /// The property the whole "rebuild the arrays on every call" design rests on: whatever the
+        /// kernel left behind in a header is gone after the next [`build_headers`], so the
+        /// writeback `____sys_recvmsg` performs on `msg_flags`/`msg_controllen` can never be read
+        /// as if it belonged to the *next* call's datagram.
+        #[test]
+        fn a_rebuild_after_a_kernel_writeback_fully_reinitialises_every_header() {
+            for vlen in VLENS {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                let slab = (slots.as_ptr() as usize, slots.len());
+
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+                let lens: Vec<u32> = (0..vlen).map(|i| (i as u32) + 7).collect();
+                let flags: Vec<i32> = (0..vlen).map(|_| libc::MSG_TRUNC).collect();
+                play_kernel(&mut hdr_words, vlen, &lens, &flags);
+
+                // Exactly what the closure does on its next `FnMut` call: same buffers, same
+                // arguments, no clearing in between.
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+
+                let views = view(&mut hdr_words, vlen);
+                assert_freshly_built(&views, slab, SMALL_SLOT);
+            }
+        }
+
+        /// The harvest half: exactly the first `n` entries are written, with exactly the values
+        /// the kernel put in the headers, and nothing past `n` is touched.
+        #[test]
+        fn harvest_copies_the_first_n_headers_and_nothing_past_them() {
+            const UNTOUCHED_LEN: u32 = 0xA5A5_A5A5;
+            const UNTOUCHED_FLAG: i32 = 0x5A5A_5A5A;
+
+            for vlen in VLENS {
+                // Every interesting `n` for this `vlen`: none at all, one, one short of the whole
+                // batch, and the whole batch.
+                for n in [0, 1, vlen.saturating_sub(1), vlen] {
+                    let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                    build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+
+                    let written_lens: Vec<u32> =
+                        (0..vlen).map(|i| ((i * 13) % SMALL_SLOT) as u32).collect();
+                    // Alternating, so a harvest that read the wrong header's flags (or the same
+                    // header's twice) cannot pass by accident.
+                    let written_flags: Vec<i32> =
+                        (0..vlen).map(|i| if i % 2 == 0 { libc::MSG_TRUNC } else { 0 }).collect();
+                    play_kernel(&mut hdr_words, n, &written_lens, &written_flags);
+
+                    let mut lens = vec![UNTOUCHED_LEN; vlen];
+                    let mut flags = vec![UNTOUCHED_FLAG; vlen];
+                    harvest_headers(&mut hdr_words, n, &mut lens, &mut flags);
+
+                    for i in 0..n {
+                        assert_eq!(
+                            lens[i], written_lens[i],
+                            "vlen {vlen}, n {n}: msg_len {i} must come back exactly"
+                        );
+                        assert_eq!(
+                            flags[i], written_flags[i],
+                            "vlen {vlen}, n {n}: msg_flags {i} must come back exactly"
+                        );
+                    }
+                    for i in n..vlen {
+                        assert_eq!(
+                            lens[i], UNTOUCHED_LEN,
+                            "vlen {vlen}, n {n}: entry {i} is past the batch and must be untouched"
+                        );
+                        assert_eq!(
+                            flags[i], UNTOUCHED_FLAG,
+                            "vlen {vlen}, n {n}: entry {i} is past the batch and must be untouched"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The full provenance chain, end to end and in production's own order: build the headers,
+        /// then write into each slot *through the `iov_base` pointer the header carries* (which is
+        /// what the kernel does, and the only thing in this file that depends on that pointer
+        /// still being usable after [`build_headers`] has returned), harvest the lengths, and only
+        /// then read the slab back through an ordinary borrow.
+        ///
+        /// Under Stacked/Tree Borrows this is the test that fails if the slab pointer's tag is
+        /// invalidated between construction and use -- which is precisely why nothing between the
+        /// `build_headers` call and the last write touches `slots` or `iov_words` at all. Reading
+        /// `slots` afterwards is a fresh borrow and pops those tags, which is fine: by then the
+        /// "kernel" is done.
+        #[test]
+        fn writing_through_each_headers_own_iov_lands_in_that_headers_own_slot() {
+            for vlen in VLENS {
+                let (mut slots, mut iov_words, mut hdr_words) = buffers(vlen, SMALL_SLOT);
+                build_headers(&mut slots, SMALL_SLOT, &mut iov_words, &mut hdr_words, vlen);
+
+                let hdrs = hdr_words.as_mut_ptr().cast::<libc::mmsghdr>();
+                for i in 0..vlen {
+                    // SAFETY: `i < vlen`, so `hdrs.add(i)` is an in-bounds, aligned, initialized
+                    // header. Its `msg_iov` points at a live `iovec` whose `iov_base` addresses
+                    // `iov_len` writable bytes of the slab -- the exact contract `build_headers`
+                    // establishes for the kernel, exercised here by the one writer that can
+                    // actually be observed under `miri`. One byte per slot is enough to pin the
+                    // slot the pointer resolves to; writing the whole slot would only be slower.
+                    unsafe {
+                        let iov = *(*hdrs.add(i)).msg_hdr.msg_iov;
+                        assert_eq!(iov.iov_len, SMALL_SLOT);
+                        iov.iov_base.cast::<u8>().write((i % 251) as u8 + 1);
+                    }
+                }
+                let lens: Vec<u32> = vec![1; vlen];
+                let flags: Vec<i32> = vec![0; vlen];
+                play_kernel(&mut hdr_words, vlen, &lens, &flags);
+
+                let mut harvested_lens = vec![0u32; vlen];
+                let mut harvested_flags = vec![0i32; vlen];
+                harvest_headers(&mut hdr_words, vlen, &mut harvested_lens, &mut harvested_flags);
+                assert!(harvested_lens.iter().all(|&len| len == 1));
+
+                for i in 0..vlen {
+                    let start = i * SMALL_SLOT;
+                    assert_eq!(
+                        slots[start],
+                        (i % 251) as u8 + 1,
+                        "the byte written through header {i}'s iov must land at the head of slot {i}"
+                    );
+                    assert!(
+                        slots[start + 1..start + SMALL_SLOT].iter().all(|&b| b == 0),
+                        "and nothing else in slot {i} may be disturbed"
+                    );
+                }
+            }
+        }
+
+        /// Both helpers refuse a buffer too small for the `vlen`/`n` they are handed, rather than
+        /// writing or reading past it. Unreachable from [`BatchReader::read_batch`], whose buffers
+        /// are sized once from the same `vlen`, and cheap enough (three comparisons per batch, not
+        /// per datagram) to keep as the thing that makes these two functions safe to call at all.
+        #[test]
+        fn a_buffer_too_small_for_the_batch_panics_rather_than_overrunning() {
+            fn must_panic(name: &str, case: impl FnOnce()) {
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+                assert!(caught.is_err(), "{name}: an undersized buffer must panic");
+            }
+
+            must_panic("slots", || {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                s.truncate(4 * SMALL_SLOT - 1);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+            });
+            must_panic("iov_words", || {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                i.truncate(4 * IOV_WORDS - 1);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+            });
+            must_panic("hdr_words", || {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                h.truncate(4 * HDR_WORDS - 1);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+            });
+            must_panic("harvest past the headers", || {
+                let (mut s, mut i, mut h) = buffers(4, SMALL_SLOT);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 4);
+                let (mut lens, mut flags) = (vec![0u32; 8], vec![0i32; 8]);
+                harvest_headers(&mut h, 5, &mut lens, &mut flags);
+            });
+            must_panic("harvest past the outputs", || {
+                let (mut s, mut i, mut h) = buffers(8, SMALL_SLOT);
+                build_headers(&mut s, SMALL_SLOT, &mut i, &mut h, 8);
+                let (mut lens, mut flags) = (vec![0u32; 4], vec![0i32; 4]);
+                harvest_headers(&mut h, 8, &mut lens, &mut flags);
+            });
+        }
+    }
+
     // -- batched reads (`BatchReader`, `read_batch`) --------------------------------------------
 
     /// Every counter point named `name` in `events`, summed -- counts drain as deltas, so a total
@@ -2349,10 +3209,24 @@ mod tests {
     /// `Encoder::encode`, so it cannot help across an output-batch boundary a read batch straddles.
     /// `base + i` is what keeps them distinct, for the cost of no extra clock read at all.
     ///
-    /// Asserted strictly increasing across the *whole* burst, not just within one batch. Within a
-    /// batch that holds by construction; across batches it holds because the next batch's `base` is
-    /// read after the previous batch's copies have already run, which takes microseconds against
-    /// offsets of at most `read_batch` nanoseconds.
+    /// **What is guaranteed, and what this assertion actually rests on.** *Within* one batch,
+    /// strict increase holds by construction: every datagram is stamped `base + i` from one clock
+    /// read, so the ordering cannot depend on the clock at all. *Across* batches it does not hold
+    /// by construction, because `now_nanos()` is `SystemTime::now()` -- the **wall** clock, which
+    /// is the right choice here (`received_at` is the event's wall-clock timestamp, and a
+    /// monotonic instant could not be one) but which can step backwards. A `clock_settime`
+    /// correction, chrony's `makestep`, or a VM suspend/restore between two batches can move it
+    /// back by far more than the `<= read_batch` nanoseconds of offset the `+ i` adds, and two
+    /// datagrams in consecutive batches could then share a `received_at` -- the very collision the
+    /// offset exists to prevent. Tracked in `docs/known-gaps.md`; not closable from here.
+    ///
+    /// The assertion below is nonetheless not flaky in any way worth tightening. It would take a
+    /// backwards step landing inside the sub-millisecond window this 200-datagram loopback burst
+    /// occupies, on the machine running the test suite; a forward step cannot break it at all.
+    /// Narrowing the assertion to within-batch windows would cost the cross-batch coverage --
+    /// which is what caught the "one stamp per syscall" shape in the first place -- to insure
+    /// against something that has never been observed here, so the claim is stated honestly rather
+    /// than the test weakened.
     #[tokio::test]
     async fn every_datagram_in_a_batch_gets_its_own_received_at() {
         const BURST: usize = 200;
@@ -2471,6 +3345,121 @@ mod tests {
             counter(&events, "logit.input.datagrams"),
             1.0,
             "a truncated datagram is still a datagram -- it is delivered, so it is counted as one"
+        );
+    }
+
+    /// The fatal-error path, which before this test nothing covered at all: `read_loop`'s
+    /// `Err` break, its `queue.close()` on the way out, and the message an operator is left with.
+    ///
+    /// **A real, deterministic, unprivileged non-`EAGAIN` error, with no fault injection.** That
+    /// is harder than it sounds: every errno an unconnected UDP socket can produce on the receive
+    /// path is either unreachable (`bind_one`'s doc has the kernel citations) or needs privilege
+    /// (`ss -K`, i.e. `SOCK_DESTROY` → `ECONNABORTED`) or `strace -e inject=`. What does work is a
+    /// descriptor that is *readable but is not a socket*: a pipe whose write end has a byte in it
+    /// is immediately `EPOLLIN`, so `async_io` hands control to the closure on the first poll, and
+    /// `recvmmsg(2)` on it returns `ENOTSOCK` -- a genuine kernel error, first call, every time.
+    ///
+    /// This is also why the message must name the syscall rather than lean on `io::Error`'s own
+    /// text. Without [`describe_read_failure`] the whole report is `component 'statsd_in': Socket
+    /// operation on non-socket (os error 88)` -- and for the case that actually happens in the
+    /// field, a sandbox refusing the syscall, `Function not implemented (os error 38)`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_fatal_read_error_closes_the_queue_and_names_the_syscall_and_the_socket() {
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2(2)` writes two descriptors into the two-element array it is handed, and
+        // `fds` is exactly that. `O_NONBLOCK` is set here rather than with a second `fcntl`
+        // because tokio requires a non-blocking descriptor for `from_std`.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2(2) failed: {}", std::io::Error::last_os_error());
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // One byte, so the read end is readable and `async_io` proceeds straight to the closure
+        // instead of parking on a readiness that would never arrive.
+        // SAFETY: `write_fd` is a live descriptor from the `pipe2` above; the source is a
+        // one-byte buffer this frame owns and the length matches it exactly.
+        let written = unsafe { libc::write(write_fd, c"x".as_ptr().cast(), 1) };
+        assert_eq!(written, 1, "writing to the pipe failed: {}", std::io::Error::last_os_error());
+
+        // SAFETY: `read_fd` is a live, owned descriptor that this test never uses again by number
+        // -- `UdpSocket` takes sole ownership of it here and closes it exactly once, on drop. It
+        // is deliberately *not* a socket; that is the condition under test, and passing a
+        // non-socket descriptor is an `ENOTSOCK` at the syscall, not undefined behaviour.
+        let not_a_socket = unsafe { std::net::UdpSocket::from_raw_fd(read_fd) };
+        let socket = tokio::net::UdpSocket::from_std(not_a_socket)
+            .expect("tokio registers any pollable non-blocking descriptor");
+
+        let queue = test_queue(OverflowPolicy::DropOldest, 10);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_loop(&socket, Arc::clone(&queue), Telemetry::default(), shutdown_rx, 64),
+        )
+        .await
+        .expect("a fatal read error must end the loop, not hang it")
+        .expect_err("recvmmsg(2) on a pipe is ENOTSOCK, which is fatal to the listener");
+
+        // SAFETY: `write_fd` is still the live descriptor `pipe2` returned; nothing else owns it
+        // and it is not used again after this.
+        unsafe { libc::close(write_fd) };
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(READ_SYSCALL),
+            "a fatal read must name the syscall an operator has to go looking for, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("listener socket"),
+            "and say which socket it was reading, got: {rendered}"
+        );
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error),
+            Some(libc::ENOTSOCK),
+            "the original errno must survive as the error's cause, not be flattened into a string"
+        );
+        assert!(
+            queue.pop().await.is_none(),
+            "a fatal read must still close the queue on the way out -- that is the only signal \
+             decode_loop has that nothing more will arrive"
+        );
+    }
+
+    /// The seccomp case, at the seam rather than through a sandbox: `ENOSYS`/`EPERM` is what
+    /// quinn#1947 and bun#42678 both hit, and the default message for it (`Function not
+    /// implemented (os error 38)`) tells an operator nothing at all. Forcing the real syscall to
+    /// return it needs `strace -e inject=recvmmsg:error=ENOSYS:when=1` (`script/unsafe-check
+    /// inject`, which is out of CI by design); what belongs *in* CI is that the mapping from that
+    /// errno to a message worth reading does not quietly disappear.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sandbox_blocked_syscall_is_named_along_with_why_read_batch_one_would_not_help() {
+        let socket = bind_ephemeral().await;
+        let addr = socket.local_addr().expect("a bound socket has an address");
+
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            let err = describe_read_failure(&socket, std::io::Error::from_raw_os_error(errno))
+                .to_string();
+            assert!(err.contains(READ_SYSCALL), "errno {errno}: must name the syscall, got: {err}");
+            assert!(
+                err.contains(&addr.to_string()),
+                "errno {errno}: must name the bound socket, got: {err}"
+            );
+            assert!(
+                err.contains("seccomp") && err.contains("read_batch: 1"),
+                "errno {errno}: must say what blocks the call and that the obvious config \
+                 workaround is not one, got: {err}"
+            );
+        }
+
+        // Every other errno gets the syscall and the address and nothing invented on top.
+        let plain = describe_read_failure(&socket, std::io::Error::from_raw_os_error(libc::EBADF))
+            .to_string();
+        assert!(plain.contains(READ_SYSCALL) && plain.contains(&addr.to_string()));
+        assert!(
+            !plain.contains("seccomp"),
+            "an unrelated errno must not be guessed at, got: {plain}"
         );
     }
 

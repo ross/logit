@@ -709,10 +709,11 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     `http://` could only ever be ignored.
 57. A datagram listener's `receive.read_batch` above `1024` is rejected
     ([ADR `udp-intake-batching-and-socket-visibility`](../adr/udp-intake-batching-and-socket-visibility.md)).
-    `read_batch` is `recvmmsg(2)`'s `vlen`, and `1024` is `UIO_MAXIOV`, the kernel's own hard
-    ceiling on how many `iovec`s any one vectored I/O call may carry — above it the kernel clamps
-    or refuses depending on call path, which is a runtime surprise whose cause is nowhere near the
-    config that set it. Rule 18 owns the `0` end, the same split those two rules already have for
+    `read_batch` is `recvmmsg(2)`'s `vlen`, and `1024` is `UIO_MAXIOV`'s number — but the ceiling
+    is `logit`'s, not the kernel's: `do_recvmmsg` clamps no `vlen` at all (`UIO_MAXIOV` bounds
+    `msg_iovlen` within one `msghdr`, which this read path sets to 1). What it bounds is the
+    per-listener receive slab and the shutdown-path loss, both linear in it.
+    Rule 18 owns the `0` end, the same split those two rules already have for
     `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
     **legal**: `push_many` has a defined answer for a batch bigger than the whole queue (evict or
     block per policy, per item, exactly as a sequence of single `push` calls would have), so a rule

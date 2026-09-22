@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-09-17
+updated: 2026-09-21
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -85,6 +85,15 @@ currently exists, so a container's own subdirectory — where its log file actua
 moment after the directory itself does — is watched as soon as it exists, and unwatched again once
 it's gone.
 
+**Superseded in part (2026-09-17/2026-09-21):** the two sentences above about what the backend
+watches predate two later records and should be read through them. Per-file `FILE_MASK` watches
+exist and a `Wake::Data` deliberately does *not* `scan`
+([ADR `docker-container-identity-and-minimal-watches`](docker-container-identity-and-minimal-watches.md)),
+so "watches whole directories, not individual files" and "only ever triggers the same full `scan`"
+are both out of date; `PathPattern::watch_dirs` no longer exists either (`PathPattern::dir`, one
+directory per pattern, is what `reconcile_watches` calls). The amendment below covers what
+"reconciled on every `scan`" now actually means.
+
 **Superseded (2026-09-17):** `docker_in`'s per-container directory watches are gone — see
 [ADR `docker-container-identity-and-minimal-watches`](docker-container-identity-and-minimal-watches.md).
 On a host running many containers, any one of them writing a log line woke a full `scan`
@@ -94,6 +103,80 @@ container's directory appearing or disappearing, since those directories are dir
 `root`) plus one watch per file `docker_in` actually has open; a log file's own first appearance
 inside an existing container directory, rotation, and `config.v2.json` changes all move to the
 poll tick instead.
+
+**Amendment (2026-09-21): the directory watch is re-armed on every `scan`, and the kernel
+guarantees it leans on are now written down.** The deep-dive verification of TAIL-07
+(`docs/plans/critical-sections-inventory.md`) found that "reconciled on every `scan`" was not what
+the code did. `reconcile_watches` armed only `desired.difference(&watched_dirs)` and then recorded
+`watched_dirs = desired` regardless of whether the syscall had succeeded; since `Tailer::patterns`
+is assigned once in `Tailer::new` and never mutated, that difference is empty from the second scan
+onwards, so **`watch_dir` was called exactly once per pattern directory, ever**. A directory
+missing at `bind`, deleted and recreated, or renamed away therefore lost its watch permanently and
+discovery there fell back to `poll_interval` for the life of the process — silently, under the one
+mode whose stated contract is that degradation is *not* silent. Two further guards made the same
+condition unrecoverable even if the call had been repeated: `watch_dir` short-circuited on a
+`by_path` entry that `IN_IGNORED` never purged, and `DIR_MASK` carried no `IN_MOVE_SELF`, so a
+rename produced no event at all.
+
+Every pattern directory is now armed on **every** `scan`; `watched_dirs` records what is armed
+rather than what was wanted; a failure is diagnosed (`watch_error`, with the errno) and retried on
+the next scan. The kernel facts this rests on, each verified against v6.12
+`fs/notify/inotify/inotify_user.c` and `inotify(7)` rather than assumed:
+
+- **A repeat `inotify_add_watch` on a live inode is cheap and safe.** The mark is looked up by
+  inode (`inotify_update_existing_watch` → `fsnotify_find_inode_mark`), so it returns the *same*
+  `wd`; with `IN_MASK_ADD` absent the mask is rewritten under `spin_lock(&fsn_mark->lock)`, and
+  re-arming with an identical mask leaves `old_mask == new_mask`, skipping even
+  `fsnotify_recalc_mask`. No event is emitted, no `IN_IGNORED`, no second watch. Cost is one
+  syscall per pattern directory per scan — and every kind has exactly one (`PathPattern::dir`:
+  `tail_in`'s `paths:` parent, `docker_in`'s `root`).
+- **A `read` never returns a partial event.** `get_one_event` refuses an event larger than the
+  remaining buffer (`if (event_size > count) return ERR_PTR(-EINVAL);`) *before* dequeuing it, and
+  `inotify_read` turns that into a short read whenever anything was already copied
+  (`if (start != buf && ret != -EFAULT) ret = buf - start;`). The `EINVAL` therefore only surfaces
+  on the first event of a read — which makes the read buffer's lower bound
+  (`sizeof(struct inotify_event) + NAME_MAX + 1`, the size `inotify(7)` itself prescribes) a
+  liveness property, now asserted at compile time.
+- **`len` is 0 or a multiple of 16.** `round_event_name_len` returns 0 for a nameless event and
+  `roundup(name_len + 1, sizeof(struct inotify_event))` otherwise, NUL-padded. The test fixture
+  now reproduces exactly that; it previously padded to 4 and gave nameless events `len == 4`,
+  which is why a decoder that forgot to advance past a name passed every test.
+- **The kernel coalesces identical consecutive unread events**, and signals a dropped queue with a
+  single `IN_Q_OVERFLOW` event carrying `wd == -1` — handled before the watch map is ever
+  consulted, and answered with a full rescan.
+- **`IN_MOVE_SELF` arrives nameless and leaves the watch valid.** `fsnotify_move` calls
+  `fsnotify_inode(source, FS_MOVE_SELF)` with `NULL` dir and name, nothing destroys the mark (so
+  no `IN_IGNORED` follows), and `inotify_handle_inode_event` explicitly masks `IN_ISDIR` back out
+  of `IN_MOVE_SELF`/`IN_DELETE_SELF` ("inotify never reported IN_ISDIR with those events"). A
+  rename *across filesystems* is not this case — that is `IN_DELETE_SELF` + `IN_IGNORED`.
+- **`wd` values are not recycled in practice.** `idr_alloc_cyclic(idr, i_mark, 1, 0, GFP_NOWAIT)`
+  since v3.10 (commit `a66c04b4534f`), and a `*last_wd + 1` cursor that never wrapped before that:
+  reuse requires cycling all of `1..INT_MAX`, the caveat `inotify(7)`'s BUGS section describes.
+  The `IN_IGNORED` purge is worth doing to keep the maps bounded and the reverse index honest, not
+  to race a recycled descriptor — the earlier comment claiming otherwise is corrected.
+
+**Contrast with coreutils bug#26363, honestly.** That bug was a *hang*: `tail -F` blocked in
+`read()` on an inotify fd that would never deliver again, fixed in coreutils 8.28 by watching for
+`IN_DELETE_SELF` and reverting to polling. `logit` cannot hang that way and never could: the poll
+tick is unconditional and `drain` runs after every loop iteration whatever woke it, so every defect
+in this area is a latency-and-observability defect, not a data-loss one. The one exception was
+`next_wake`'s non-would-block read arm, which would have wedged the driver's whole task rather
+than merely spinning (tokio clears cached readiness only on `WouldBlock`, and `AsyncFd::readable`'s
+path has no cooperative-budget check); that arm now retires the wake source once and parks, leaving
+the listener exactly where `watch: poll` always is.
+
+**Aliasing is benign and self-correcting.** `inotify_add_watch` follows symlinks and the desired
+set is keyed on the path string, so two spellings of one directory (a symlink, a `.` component)
+produce two `desired` entries resolving to one inode and therefore one `wd`. Both `by_path` entries
+map to it, `watches[wd]` holds whichever was armed last, and a `Wake::Discover` may name the other
+spelling — harmless, because the driver discards the payload and rescans. `logit.input.watch.watches`
+over-counts such a pair, which `docs/deploying.md` now says. The `IN_IGNORED` purge removes *every*
+path that resolved to the dead `wd`, so the pair cannot outlive the watch it shares.
+
+**`unwatch_dir` is kept as unreachable code, deliberately.** Nothing calls it today, for the same
+reason the difference-based arm was empty; it stays because `reconcile_watches` is only correct
+with it should the pattern set ever become mutable, and it is covered by a unit test rather than by
+any production path.
 
 ### Rotation and truncation: identity by `(dev, ino)`
 
