@@ -661,8 +661,12 @@ const READ_SYSCALL: &str = "recvfrom(2)";
 /// [`bind_first_available`]'s fallthrough), and it costs one syscall on a path that is about to
 /// terminate the listener anyway.
 fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) -> anyhow::Error {
-    let hint = match err.raw_os_error() {
-        Some(libc::ENOSYS) | Some(libc::EPERM) => {
+    // Matched on `ErrorKind`, not `libc::E*`: `libc` is a Linux-only dependency of this crate and
+    // this function is shared with the `recv_from` twin, so it has to build without it. std's Unix
+    // mapping (`sys/pal/unix/mod.rs`, `decode_error_kind`) is `ENOSYS` -> `Unsupported`,
+    // `EPERM`/`EACCES` -> `PermissionDenied`, `ECONNABORTED` -> `ConnectionAborted`.
+    let hint = match err.kind() {
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied => {
             " -- a seccomp or sandbox profile blocking that syscall is the usual cause; \
              `receive.read_batch: 1` does not avoid it, this listener always makes the same call"
         }
@@ -671,7 +675,7 @@ fn describe_read_failure(socket: &tokio::net::UdpSocket, err: std::io::Error) ->
         // The socket really is gone -- unhashed, never to receive again -- so failing is correct,
         // and a retry would read `EAGAIN` (`sock_error`'s `xchg` clears `sk_err`) and leave a
         // silent zombie listener behind. Naming the cause is all that is left to do.
-        Some(libc::ECONNABORTED) => {
+        std::io::ErrorKind::ConnectionAborted => {
             " -- the socket was destroyed out from under this listener (an `ss -K`, or another \
              SOCK_DESTROY request naming it); it cannot receive again, so the process exits \
              rather than pretending otherwise"
