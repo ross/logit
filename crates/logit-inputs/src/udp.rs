@@ -1356,7 +1356,9 @@ where
 ///
 /// Disables itself for good on the first failed read: `SO_MEMINFO` either exists for a socket or
 /// it never will (an older kernel, a non-Linux build), so retrying it every second would be a
-/// syscall per second forever in exchange for nothing. One `warn` says so, once.
+/// syscall per second forever in exchange for nothing. One diagnostic says so, once: a `warn`
+/// quoting the OS error when a Linux kernel refused the read, `debug` when the build has no such
+/// counters to begin with (non-Linux, or no raw descriptor) -- see `sample_once`.
 struct ReceiveBufferSampler {
     /// The listener socket's descriptor, captured once. `None` only on a platform with no raw
     /// descriptors at all, where [`logit_pipeline::sockstat`] reports nothing anyway. Safe to

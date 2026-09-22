@@ -470,8 +470,9 @@ point every datagram passes through:
 | `logit.input.kernel.drops` | count | datagrams the kernel discarded before `recv_from` could return them (`SO_MEMINFO`'s `SK_MEMINFO_DROPS`, the same number `/proc/net/udp`'s `drops` column shows for this socket). A delta between samples; not emitted when it is zero |
 
 The last three are Linux-only (`logit_pipeline::sockstat`, `getsockopt(SO_MEMINFO)`, Linux 4.12+)
-and are simply absent elsewhere, with one `warn` on the first failed read saying so, after which the
-listener stops sampling — and stops arming the interval timer — for the rest of its run. They are sampled
+and are simply absent elsewhere, with one diagnostic on the first failed read saying so — a `warn`
+quoting the OS error on a Linux kernel that refused the read, `debug` on a non-Linux build, where
+there was never anything to read — after which the listener stops sampling — and stops arming the interval timer — for the rest of its run. They are sampled
 once a second for as long as the read loop runs, plus **once more after it stops** — a listener
 usually stops *because* something went wrong, and the drops in the last second before it did are
 the ones most worth having.
