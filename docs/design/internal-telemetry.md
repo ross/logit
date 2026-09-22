@@ -803,7 +803,10 @@ Worked examples, one per shipped component:
   driver is trying to track), `renamed` (a same-inode rebind following a *file* rename —
   `docker_in`'s own `container_renamed`, below, is a different thing: the same file, a new
   identity), `checkpoint_error` (loading or writing the checkpoint file itself), `watch_error`
-  (`auto` falling back to polling, or a directory watch that failed), and, `docker_in` only,
+  (`auto` falling back to polling; a directory watch that failed, carrying the errno and retried on
+  every later `scan`; a *file* watch that failed, which is not retried — the file is still tailed,
+  just at `poll_interval`; or the `inotify` wake source itself becoming unusable, after which the
+  listener runs poll-only), and, `docker_in` only,
   `metadata_error` (`config.v2.json` missing or unparseable — degrades to a `container.id`-only
   resource rather than refusing to tail; a missing file is retried on every poll tick, one that
   exists but wouldn't parse on its next stat change, since the stat cache caches a failed read the

@@ -1473,6 +1473,29 @@ already built that have a known, accepted rough edge.
 - **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only** — every other platform runs
   `watch: poll` unconditionally regardless of config, and an explicit `watch: inotify` is a startup
   error rather than a silent downgrade.
+- **A *file* watch that fails to register is never retried for that file.** `Watcher::watch_file`
+  is called exactly once per tracked inode, when `Tailer::open_tracked` opens it; a failure there
+  (realistically `ENOSPC` against `fs.inotify.max_user_watches` on a host tailing many files) is
+  diagnosed `watch_error` with the errno and leaves that one file relying on `poll_interval` for
+  its data wakes — exactly what `watch: poll` does — until it is rotated or re-opened. The
+  *directory* watch is the one that self-heals: it is re-armed on every `scan`
+  ([ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s 2026-09-21
+  amendment). Retrying per file would mean re-attempting one syscall per unwatched file per scan
+  with nothing to suggest the limit has moved; the diagnostic is what points at the sysctl instead.
+- **Two spellings of one directory (a symlink, a `.` component) share a single kernel watch, and
+  `logit.input.watch.watches` counts them twice.** `inotify_add_watch` follows symlinks and the
+  desired set is keyed on the configured path string, so `paths: [/var/log/app/*.log,
+  /srv/app/logs/*.log]` over a symlink registers one watch and reports two. Harmless — a
+  `Wake::Discover` may name the other spelling, whose payload the driver discards before rescanning
+  anyway, and the `IN_IGNORED` purge drops both entries together — but the gauge over-reports, and
+  `docs/deploying.md`'s "What to watch" says so. Normalizing the desired set (or passing
+  `IN_DONT_FOLLOW`) would change which paths a config can name, which is a config-surface decision,
+  not a bug fix.
+- **`parse_events` discards the rest of a `read` buffer after a malformed event**, rather than
+  attempting to resynchronize. Unreachable from a real inotify fd (the kernel never returns a
+  partial event, and `len` is always 0 or a multiple of 16 — both now pinned in the ADR), and
+  acceptable because the poll tick and the unconditional `drain` reconcile whatever a discarded
+  event would have said.
 - **`docker_in`'s timestamps are the one deliberate exception among the tailing decoders to
   "stamp receipt time."** It uses the json-file envelope's own `time` field (the daemon's
   same-host clock) instead, since replaying a backlog (`read_from: beginning`, or a fresh

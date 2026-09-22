@@ -996,14 +996,26 @@ work for every log line written anywhere on the host, selected or not — see [A
   `paths:` glob matches no files yet — both silent by design (a directory that doesn't exist yet is
   the ordinary "not there yet" case, retried next cycle), so this is the number to alert on if
   "nothing is flowing" needs to be distinguished from "nothing to flow yet."
+- `logit.input.watch.wakes{source="inotify"|"poll"}` (count) — which wake source actually fired.
+  This is the health signal for the low-latency path: `{source="inotify"}` flatlining while
+  `{source="poll"}` carries on at `1/poll_interval` means discovery has silently reverted to
+  polling — a watch that couldn't be registered, or the wake source itself having failed. Under
+  `watch: poll` only the `poll` series ever increments, so alert on the `inotify` series going to
+  zero only where you configured `inotify`/`auto`. Pair it with
+  `logit.component.diagnostics{key="watch_error"}`, which is incremented (and logged, throttled)
+  at the point of failure with the errno.
 - `logit.input.watch.watches` (gauge) — the size of the watch set this listener maintains: the
   watched directory, plus one entry per file currently open. Under `watch: poll` this counts the
   same set with zero real `inotify` descriptors behind it (`Watcher::watch_dir`/`watch_file` are
   no-ops in that mode) — it reflects the *intended* watch set, not live kernel watches, so a `poll`
   config still shows the directory held even though nothing is actually registered. Under
-  `inotify`/`auto` the two coincide. Either way, proportional to what's actually being tailed, not
-  to how much any of it writes — the number that makes "the watch set stays minimal" checkable
-  from outside.
+  `inotify`/`auto` the two are close but do not strictly coincide: a directory whose watch failed
+  is left out of the set entirely (and diagnosed), but a file that is draining after its inode was
+  deleted still counts one while the kernel has already released the descriptor, and two spellings
+  of the same directory (a symlink, say) count two against one real watch. The exact live count is
+  the kernel's own — one `inotify wd:` line per watch in `/proc/self/fdinfo/<the inotify fd>`.
+  Either way, proportional to what's actually being tailed, not to how much any of it writes — the
+  number that makes "the watch set stays minimal" checkable from outside.
 - `logit.input.watch.overflows` (count) — the `inotify` event queue overflowed; the driver responds
   with a full rescan rather than losing track of what changed, but a sustained nonzero rate means
   `poll_interval` is doing more of the real work than the wake source is.
