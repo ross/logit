@@ -51,9 +51,10 @@ runners don't support docker-in-docker out of the box.
 ## Consequences
 - `latest` is mutable and carries no version — it is explicitly not something to pin a deployment
   to. Adding real version tags is a named follow-up, not a promise this ADR makes.
-- The first push creates the GHCR package **private** by default; making it public is a one-time
-  manual step in the repo's GitHub package settings, outside anything this workflow or script can
-  do. `docs/deploying.md` shouldn't claim the image is pullable until that's done.
+- The package inherited this repo's own public visibility on its first push — GHCR packages linked
+  to a public repo via `org.opencontainers.image.source` are public from the start, no manual
+  visibility flip needed. (Confirmed against the actual first publish, 2026-09-22 — a private repo
+  would need that step instead.)
 - amd64-only means an Apple Silicon (or other arm64) user gets emulation or has to build locally
   via `script/image`.
 - Nothing in CI builds or smoke-tests the production `Dockerfile` outside of this manual publish —
