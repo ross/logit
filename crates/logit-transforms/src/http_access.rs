@@ -182,21 +182,36 @@ const SPAN_METHOD_OTHER: &str = "HTTP";
 
 /// `(class, pattern)`, in priority order -- a UA claiming both `Mozilla/` and `bot` is a crawler,
 /// which is why `browser` comes last and why this is an ordered scan, not a `RegexSet` (the ADR's
-/// Alternatives). The member lists are placeholders W3 finalizes against a corpus; the classes and
-/// their order are fixed. `\bbot\b` rather than `bot\b` because the latter matches phone models
-/// like `CUBOT`.
+/// Alternatives). Corpus-verified against 57 real, sourced UA strings (W3,
+/// `docs/plans/http-access-normalization.md`); the corpus and the hand-traced regex analysis
+/// behind every change below live in that workstream's research notes. `\bbot\b` rather than
+/// `bot\b` because the latter matches phone models like `CUBOT`; `\bbot/` (not bare `bot/`), for
+/// the same reason -- `UptimeRobot/2.0` contains `bot/` mid-word (`Ro-bot/2.0`) and isn't a
+/// crawler. `^java/` is anchored: Java's `HttpURLConnection` sends exactly `Java/<version>` as
+/// the whole UA string, so an anchored match is strictly safer than a bare `java/`, which could
+/// also fire on a JVM version fragment embedded in an unrelated UA. `blackbox-exporter` is
+/// hyphenated -- the Blackbox Exporter's real wire format since v0.28.0; the underscored spelling
+/// this table used to carry never matched any real version of the exporter. `chrome-lighthouse`
+/// lives in `tool`, not `crawler`: Chrome Lighthouse is a synthetic page-audit tool, the same
+/// bucket as k6/wrk/JMeter, not a content-indexing crawler. `fuzz faster u fool` is ffuf's actual
+/// default `User-Agent` (`Fuzz Faster U Fool v<version>`) -- that string contains no "ffuf"
+/// substring anywhere, so the bare `ffuf` token alone is invisible to ffuf's own default traffic.
+/// **Known limitation, not a regex bug**: nikto (2.6.1+), nuclei, and Nessus all spoof a real
+/// browser `User-Agent` by default (nikto and nuclei pick one at random; Nessus mirrors the scan
+/// host's own browser), so their un-configured traffic classifies `browser`, not `scanner`, no
+/// matter how this table is tuned -- see the corpus notes for the confirmed vendor sources.
 const BUILTIN_UA_RULES: [(&str, &str); 4] = [
     (
         "scanner",
-        r"(?i)nmap|masscan|zgrab|nikto|sqlmap|dirbuster|gobuster|ffuf|feroxbuster|wpscan|nuclei|acunetix|nessus|qualys|openvas|censysinspect|internetmeasurement|expanse|leakix|shodan|paloaltonetworks",
+        r"(?i)nmap|masscan|zgrab|nikto|sqlmap|dirbuster|gobuster|ffuf|fuzz faster u fool|feroxbuster|wpscan|nuclei|acunetix|nessus|qualys|openvas|censysinspect|internetmeasurement|expanse|paloaltonetworks|leakix|shodan",
     ),
     (
         "tool",
-        r"(?i)curl/|wget/|libwww-perl|python-requests|python-urllib|aiohttp|httpie|go-http-client|okhttp|apache-httpclient|java/|axios/|node-fetch|guzzlehttp|postmanruntime|insomnia|reqwest/|k6/|wrk/|jmeter|kube-probe|prometheus/|blackbox_exporter|elb-healthchecker|googlehc|telegraf|vector/",
+        r"(?i)curl/|wget/|libwww-perl|python-requests|python-urllib|aiohttp|httpie|go-http-client|okhttp|apache-httpclient|^java/|axios/|node-fetch|guzzlehttp|postmanruntime|insomnia|reqwest/|k6/|wrk/|jmeter|kube-probe|prometheus/|blackbox-exporter|elb-healthchecker|googlehc|telegraf/|vector/|chrome-lighthouse",
     ),
     (
         "crawler",
-        r"(?i)\bbot\b|bot/|spider|crawler|slurp|scrapy|googlebot|bingbot|yandex|baiduspider|duckduckbot|facebookexternalhit|twitterbot|linkedinbot|slackbot|applebot|petalbot|semrushbot|ahrefsbot|mj12bot|ccbot|gptbot|chatgpt-user|claudebot|perplexitybot|amazonbot|bytespider|feedfetcher|lighthouse",
+        r"(?i)\bbot\b|\bbot/|spider|crawler|slurp|scrapy|googlebot|bingbot|yandexbot|baiduspider|duckduckbot|facebookexternalhit|twitterbot|linkedinbot|slackbot|applebot|petalbot|semrushbot|ahrefsbot|mj12bot|ccbot|gptbot|chatgpt-user|claudebot|perplexitybot|amazonbot|bytespider|feedfetcher",
     ),
     ("browser", r"(?i)mozilla/|opera/|dalvik/|safari/|msie |trident/"),
 ];
@@ -208,22 +223,35 @@ const UA_OTHER: &str = "other";
 const UA_NONE: &str = "none";
 
 /// `(set, pattern, route value)`. The three route values are fixed by the plan; the member lists
-/// are W3's to finalize. `assets` carries no `json`/`xml`/`txt`/`csv` -- those are routinely API
-/// responses, and routing an API endpoint to `/{asset}` would hide it.
+/// are corpus-verified against ~30 real paths (W3, `docs/plans/http-access-normalization.md`).
+/// `probes` and `well_known` are matched case-sensitively, unlike `assets`: a file extension's
+/// casing is conventionally meaningless (`LOGO.PNG` is unambiguously a PNG), but a probe/
+/// well-known path is a protocol- or convention-mandated literal (`robots.txt` is always
+/// lowercase by spec, `/healthz` always lowercase by k8s convention) -- treating `/ROBOTS.TXT` as
+/// the same resource risks silently absorbing a genuinely different (and typically 404) route.
+/// `probes` adds `-/(healthy|ready)` for Prometheus's and Alertmanager's own Management API
+/// (`/-/healthy`, `/-/ready` -- neither fits the table's existing "single segment" shape, hence
+/// the separate leading alternative). `well_known` adds `manifest.webmanifest` alongside
+/// `manifest.json` -- the same PWA-metadata family, just the newer W3C-recommended extension.
+/// `assets` gains `.heic`/`.heif` (Apple's default photo format since iOS 11), `.docx`/`.xlsx`/
+/// `.pptx` (binary Office documents, the same "static/binary download" rationale as the existing
+/// `.pdf`/`.zip`), and `.apk`/`.ipa` (direct-download mobile app packages); it still carries no
+/// `json`/`xml`/`txt`/`csv` -- those are routinely API responses, and routing an API endpoint to
+/// `/{asset}` would hide it.
 const BUILTIN_ROUTE_SETS: [(RouteSet, &str, &str); 3] = [
     (
         RouteSet::Probes,
-        r"(?i)^/(health|healthz|healthcheck|livez|readyz|ready|ping|status|_status|up|metrics|_metrics|stats|nginx_status|server-status|haproxy_status|version|_version)/?$",
+        r"^/(-/(healthy|ready)|health|healthz|healthcheck|livez|readyz|ready|ping|status|_status|up|metrics|_metrics|stats|nginx_status|server-status|haproxy_status|version|_version)/?$",
         "/{probe}",
     ),
     (
         RouteSet::WellKnown,
-        r"(?i)^/(\.well-known/.*|robots\.txt|favicon\.ico|sitemap[^/]*\.xml(\.gz)?|humans\.txt|security\.txt|apple-touch-icon[^/]*\.png|browserconfig\.xml|manifest\.json|crossdomain\.xml|ads\.txt|app-ads\.txt)$",
+        r"^/(\.well-known/.*|robots\.txt|favicon\.ico|sitemap[^/]*\.xml(\.gz)?|humans\.txt|security\.txt|apple-touch-icon[^/]*\.png|browserconfig\.xml|manifest\.json|manifest\.webmanifest|crossdomain\.xml|ads\.txt|app-ads\.txt)$",
         "/{well-known}",
     ),
     (
         RouteSet::Assets,
-        r"(?i)\.(css|js|mjs|cjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|mp4|m4v|webm|mov|mp3|m4a|ogg|oga|opus|wav|flac|pdf|zip|gz|tgz|bz2|xz|7z|rar|wasm)$",
+        r"(?i)\.(css|js|mjs|cjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?|woff2?|ttf|otf|eot|heic|heif|docx|xlsx|pptx|apk|ipa|mp4|m4v|webm|mov|mp3|m4a|ogg|oga|opus|wav|flac|pdf|zip|gz|tgz|bz2|xz|7z|rar|wasm)$",
         "/{asset}",
     ),
 ];
@@ -1733,6 +1761,289 @@ mod tests {
         assert_eq!(get(&event, "user_agent.class"), Some(&s("crawler")));
         let capped = get(&event, "user_agent.original").and_then(Value::as_str).unwrap();
         assert_eq!(capped.len(), 256, "and still capped afterwards");
+    }
+
+    // -- W3 corpus: 57 real, sourced UA strings, each verified against a vendor doc, the
+    // project's own source code, or well-corroborated captured-traffic write-ups (never
+    // invented) -- `docs/plans/http-access-normalization.md`'s W3 row. Expected classes are
+    // under the *final* `BUILTIN_UA_RULES` above, not the placeholder table W2 shipped; two
+    // entries (`ffuf`'s real default, `blackbox_exporter`'s real spelling) are corrections the
+    // corpus found in that placeholder, and two more (a nikto default, `l9explore`) are
+    // documented, accepted gaps -- the corpus's own conclusion, not a table this PR can fix.
+    const UA_CORPUS: &[(&str, &str)] = &[
+        // -- Tools / HTTP clients --
+        // curl's default UA is `curl/` + libcurl version --
+        // https://everything.curl.dev/http/modify/user-agent.html
+        ("curl/8.22.0", "tool"),
+        // GNU Wget's `SET_USER_AGENT` -- https://github.com/mirror/wget/blob/master/src/http.c
+        ("Wget/1.21.3", "tool"),
+        // `requests`'s `default_user_agent()` -- https://github.com/psf/requests
+        ("python-requests/2.34.2", "tool"),
+        // Hardcoded Go constant -- https://github.com/golang/go/blob/master/src/net/http/request.go
+        ("Go-http-client/1.1", "tool"),
+        // OkHttp's `BridgeInterceptor` -- https://github.com/square/okhttp/issues/5969
+        ("okhttp/4.10.0", "tool"),
+        // axios (Node only) -- https://github.com/axios/axios (lib/adapters/http.js)
+        ("axios/1.20.0", "tool"),
+        // node-fetch v3's default when the caller hasn't set one --
+        // https://github.com/node-fetch/node-fetch (src/request.js)
+        ("node-fetch", "tool"),
+        // k6's `"k6/%s (https://k6.io/)"` --
+        // https://github.com/grafana/k6/blob/master/js/modules/k6/http/request.go
+        ("k6/2.3.0 (https://k6.io/)", "tool"),
+        // kubelet's own probe UA -- https://kubernetes.io/docs/concepts/workloads/pods/probes/
+        ("kube-probe/1.35", "tool"),
+        // Fixed literal, AWS docs --
+        // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html
+        ("ELB-HealthChecker/2.0", "tool"),
+        // Fixed literal, Google Cloud docs --
+        // https://docs.cloud.google.com/load-balancing/docs/health-check-logging
+        ("GoogleHC/1.0", "tool"),
+        // `version.PrometheusUserAgent()` -- https://github.com/prometheus/prometheus/blob/main/scrape/scrape.go
+        ("Prometheus/3.14.0", "tool"),
+        // CORRECTED: real format is hyphenated since v0.28.0, not `blackbox_exporter` --
+        // https://github.com/prometheus/blackbox_exporter/releases (v0.28.0 changelog)
+        ("Blackbox-Exporter/0.28.0", "tool"),
+        // -- Crawlers / bots --
+        // Google's own crawler docs (desktop Googlebot) --
+        // https://developers.google.com/search/docs/crawling-indexing/google-common-crawlers
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/119.0.6045.214 Safari/537.36",
+            "crawler",
+        ),
+        // Same source (Googlebot Smartphone variant) -- deliberate edge case: browser-shaped
+        // *and* crawler-tokened, crawler wins because it's checked first
+        (
+            "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.214 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "crawler",
+        ),
+        // Bing's 2022 UA announcement --
+        // https://blogs.bing.com/webmaster/april-2022/Announcing-user-agent-change-for-Bing-crawler-bingbot
+        ("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "crawler"),
+        // https://yandex.com/support/webmaster/en/robot-workings/user-agent.html
+        ("Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)", "crawler"),
+        // https://duckduckgo.com/duckduckgo-help-pages/results/duckduckbot
+        ("DuckDuckBot/1.1; (+http://duckduckgo.com/duckduckbot.html)", "crawler"),
+        // https://developers.facebook.com/docs/sharing/webmasters/crawler
+        (
+            "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+            "crawler",
+        ),
+        // Widely-cited bare token, corroborated across independent trackers
+        ("Twitterbot/1.0", "crawler"),
+        // https://api.slack.com/robots
+        ("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)", "crawler"),
+        // https://support.apple.com/en-us/119829
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)",
+            "crawler",
+        ),
+        // https://ahrefs.com/robot/
+        ("Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)", "crawler"),
+        // https://www.semrush.com/bot/
+        ("Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)", "crawler"),
+        // No official ByteDance docs page; consistently captured across independent trackers
+        // (datadome.co, chrisleverseo.com, agentgrade.com)
+        (
+            "Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Bytespider; spider-feedback@bytedance.com)",
+            "crawler",
+        ),
+        // https://developers.openai.com/api/docs/bots
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.4; +https://openai.com/gptbot",
+            "crawler",
+        ),
+        // Same OpenAI docs page
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot",
+            "crawler",
+        ),
+        // Anthropic's Claude Help Center; string corroborated via secondary aggregators
+        // (seroundtable.com, chrisleverseo.com)
+        (
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+            "crawler",
+        ),
+        // -- Browsers / device clients --
+        // https://www.whatismybrowser.com/guides/the-latest-user-agent/chrome
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+            "browser",
+        ),
+        // Same source; Chrome's UA-reduction policy freezes the device/OS tokens
+        (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.8010.49 Mobile Safari/537.36",
+            "browser",
+        ),
+        // https://www.whatismybrowser.com/guides/the-latest-user-agent/firefox
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0",
+            "browser",
+        ),
+        // https://www.whatismybrowser.com/guides/the-latest-user-agent/safari
+        (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_8_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15",
+            "browser",
+        ),
+        // Same source (iPhone Safari)
+        (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_8 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1",
+            "browser",
+        ),
+        // https://www.whatismybrowser.com/guides/the-latest-user-agent/edge
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.4234.48",
+            "browser",
+        ),
+        // https://www.whatismybrowser.com/guides/the-latest-user-agent/opera -- no literal
+        // `opera/` substring (modern Chromium Opera identifies as `OPR/`); still browser via
+        // `mozilla/`+`safari/`
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 OPR/137.0.0.0",
+            "browser",
+        ),
+        // https://www.useragentstring.com/Internet%20Explorer11.0_id_19877.php -- matches via
+        // `trident/`, not `msie ` (IE11 dropped the MSIE token)
+        ("Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; AS; rv:11.0) like Gecko", "browser"),
+        // Android's built-in HTTP stack default -- https://user-agents.net/applications/dalvik
+        ("Dalvik/2.1.0 (Linux; U; Android 8.1.0; Pixel XL Build/OPP6.171019.012)", "browser"),
+        // Real captured CUBOT-brand phone UA -- https://user-agents.net/string/mozilla-5-0-linux-android-7-0-cubot-magic-applewebkit-537-36-khtml-like-gecko-chrome-87-0-4280-101-mobile-safari-537-36 --
+        // `\bbot\b` and `\bbot/` both fail (no boundary before "B" in "CUBOT"; no "/" right
+        // after it either), falling through crawler to browser
+        (
+            "Mozilla/5.0 (Linux; Android 7.0; CUBOT MAGIC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Mobile Safari/537.36",
+            "browser",
+        ),
+        // -- Constructed edge cases (the prompt's own required negatives, not vendor strings) --
+        ("", "none"),
+        ("-", "none"),
+        ("SomeCustomAgent/1.0", "other"),
+        // -- Scanners / recon tools --
+        // nmap NSE's `http.lua` default -- https://github.com/nmap/nmap/blob/master/nselib/http.lua
+        ("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)", "scanner"),
+        // masscan's `--banners` HTTP module --
+        // https://github.com/robertdavidgraham/masscan/blob/master/src/proto-http.c
+        ("ivre-masscan/1.3 https://github.com/robertdavidgraham/", "scanner"),
+        // zgrab2's HTTP module default -- https://github.com/zmap/zgrab2/blob/master/modules/http/scanner.go
+        ("Mozilla/5.0 zgrab/0.x", "scanner"),
+        // nikto's older, still-supported self-identifying template --
+        // https://github.com/sullo/nikto/wiki/Config-Variables
+        ("Mozilla/5.00 (Nikto/2.5.0) (Evasions:none) (Test:map_codes)", "scanner"),
+        // sqlmap's `lib/core/settings.py` template --
+        // https://github.com/sqlmapproject/sqlmap/blob/master/lib/core/settings.py
+        ("sqlmap/1.6.12#stable (https://sqlmap.org)", "scanner"),
+        // Legacy OWASP DirBuster's `Config.java` literal --
+        // https://github.com/KajanM/DirBuster/blob/master/src/com/sittinglittleduck/DirBuster/Config.java
+        (
+            "DirBuster-1.0-RC1 (http://www.owasp.org/index.php/Category:OWASP_DirBuster_Project)",
+            "scanner",
+        ),
+        // gobuster's `helpers.go` template -- https://github.com/OJ/gobuster/blob/master/libgobuster/helpers.go
+        ("gobuster/3.8.2", "scanner"),
+        // CORRECTED: ffuf's real default (`pkg/runner/simple.go`) contains no "ffuf" substring
+        // at all -- https://github.com/ffuf/ffuf/blob/master/pkg/runner/simple.go
+        ("Fuzz Faster U Fool v2.1.0", "scanner"),
+        // feroxbuster's `config/utils.rs` template --
+        // https://github.com/epi052/feroxbuster/blob/main/src/config/utils.rs
+        ("feroxbuster/2.11.0", "scanner"),
+        // WPScan's `lib/wpscan/browser.rb` template --
+        // https://github.com/wpscanteam/wpscan/blob/master/lib/wpscan/browser.rb
+        ("WPScan v4.1.0 (https://wpscan.com/wordpress-security-scanner)", "scanner"),
+        // Greenbone GVM/OpenVAS's `user_agent.c` --
+        // https://github.com/greenbone/openvas-scanner/blob/main/misc/user_agent.c
+        ("Mozilla/5.0 [en] (X11, U; OpenVAS-VT 22.4.0)", "scanner"),
+        // Censys's own opt-out documentation -- https://docs.censys.com/docs/opt-out-of-data-collection
+        ("Mozilla/5.0 (compatible; CensysInspect/1.1; +https://about.censys.io/)", "scanner"),
+        // Corroborated captured-traffic write-ups -- https://news.ycombinator.com/item?id=40056848
+        // -- matches both `expanse` and (via the trailing email domain) `paloaltonetworks`
+        (
+            "Expanse, a Palo Alto Networks company, searches across the global IPv4 space multiple times per day to identify customers' presences on the Internet. If you would like to be excluded from our scans, please send IP addresses/domains to: scaninfo@paloaltonetworks.com",
+            "scanner",
+        ),
+        // LeakIX's current self-identification, matches via `leakix.net` -- https://isc.sans.edu/diary/28910
+        ("Mozilla/5.0 (l9scan/2.0; +https://leakix.net)", "scanner"),
+        // ACCEPTED GAP: LeakIX's *older* self-identification, no URL and no "leakix" substring
+        // at all -- matches nothing in any table, misclassifies as `other`; same source as above
+        ("l9explore/1.2.2", "other"),
+        // ACCEPTED GAP: nikto 2.6.1+ no longer self-identifies by default -- it picks a real
+        // browser UA from its own bundled list --
+        // https://github.com/sullo/nikto/blob/main/program/plugins/nikto_core.plugin -- this
+        // exact string is byte-for-byte indistinguishable from real Chrome traffic, so it
+        // classifies `browser`, not `scanner`, no matter how the table is tuned
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.6280.45 Safari/537.36",
+            "browser",
+        ),
+    ];
+
+    #[test]
+    fn the_ua_corpus_classifies_as_the_final_tables_intend() {
+        let mut t = bare();
+        for (ua, want) in UA_CORPUS {
+            let event = run(&mut t, &[("user_agent.original", s(ua))]);
+            let got = get(&event, "user_agent.class").and_then(Value::as_str);
+            assert_eq!(got, Some(*want), "UA {ua:?}: expected class {want:?}, got {got:?}");
+        }
+    }
+
+    #[test]
+    fn the_ua_corpus_marks_bot_synthetic_type_exactly_for_crawlers_and_scanners() {
+        let mut t = bare();
+        for (ua, class) in UA_CORPUS {
+            let event = run(&mut t, &[("user_agent.original", s(ua))]);
+            let synthetic = get(&event, "user_agent.synthetic.type").and_then(Value::as_str);
+            let want_bot = matches!(*class, "crawler" | "scanner");
+            assert_eq!(
+                synthetic,
+                want_bot.then_some("bot"),
+                "UA {ua:?} (class {class}): synthetic.type"
+            );
+        }
+    }
+
+    // -- W3 corpus: real paths against the final `BUILTIN_ROUTE_SETS`, run with no
+    // `route_other` so an unmatched path shows as `None`.
+    const PATH_CORPUS: &[(&str, Option<&str>)] = &[
+        ("/healthz", Some("/{probe}")),
+        ("/healthz/", Some("/{probe}")),
+        // the corpus's `/health?x=1` -- the query is never part of `url.path`, so the matcher
+        // only ever sees `/health`
+        ("/health", Some("/{probe}")),
+        // Prometheus's/Alertmanager's own Management API
+        ("/-/healthy", Some("/{probe}")),
+        ("/-/ready", Some("/{probe}")),
+        ("/.well-known/acme-challenge/xyz", Some("/{well-known}")),
+        ("/robots.txt", Some("/{well-known}")),
+        ("/sitemap-index.xml.gz", Some("/{well-known}")),
+        ("/manifest.webmanifest", Some("/{well-known}")),
+        ("/static/app.abc123.js", Some("/{asset}")),
+        ("/img/logo.PNG", Some("/{asset}")),
+        ("/fonts/a.woff2", Some("/{asset}")),
+        ("/photo.heic", Some("/{asset}")),
+        ("/report.docx", Some("/{asset}")),
+        ("/app.apk", Some("/{asset}")),
+        // `.json` is deliberately excluded -- routinely an API response
+        ("/api/v1/orders.json", None),
+        ("/download/report.pdf", Some("/{asset}")),
+        // an application route, not a probe -- the probes table is a full-string match only
+        ("/status/42", None),
+    ];
+
+    #[test]
+    fn the_path_corpus_routes_as_the_final_tables_intend() {
+        let mut t = routed(
+            vec![
+                RouteRule::Builtin(RouteSet::Probes),
+                RouteRule::Builtin(RouteSet::WellKnown),
+                RouteRule::Builtin(RouteSet::Assets),
+            ],
+            None,
+        );
+        for (path, want) in PATH_CORPUS {
+            let event = run(&mut t, &[("url.path", s(path))]);
+            let got = get(&event, "http.route").and_then(Value::as_str);
+            assert_eq!(got, *want, "path {path:?}: expected {want:?}, got {got:?}");
+        }
     }
 
     fn routed(routes: Vec<RouteRule>, other: Option<&str>) -> HttpAccess {

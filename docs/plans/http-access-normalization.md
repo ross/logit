@@ -191,21 +191,33 @@ Never touched: `traceparent`, `trace.*`, `span.id`, `span.parent_id`, `span.kind
 `span.start*`, `span.end*`, `event.log`, `event.metrics`, `event.span`, `event.timestamp`, the
 batch `Resource` (no `map_resource`). No `keep_source`.
 
-Built-in tables (W3; the doc reproduces them):
+Built-in tables (finalized in W3 against a 57-UA/~30-path corpus of real, sourced strings — the
+member lists below are what shipped, not the placeholder W2 carried; see that PR's tests and doc
+comments for the full hand-traced justification of each token):
 
-| Table | Order / value | Pattern (all `(?i)`, `is_match`) |
+| Table | Order / value | Pattern (`is_match`) |
 |---|---|---|
-| UA `scanner` | 1 | `nmap\|masscan\|zgrab\|nikto\|sqlmap\|dirbuster\|gobuster\|ffuf\|feroxbuster\|wpscan\|nuclei\|acunetix\|nessus\|qualys\|openvas\|censysinspect\|internetmeasurement\|expanse\|leakix\|shodan\|paloaltonetworks` |
-| UA `tool` | 2 | `curl/\|wget/\|libwww-perl\|python-requests\|python-urllib\|aiohttp\|httpie\|go-http-client\|okhttp\|apache-httpclient\|java/\|axios/\|node-fetch\|guzzlehttp\|postmanruntime\|insomnia\|reqwest/\|k6/\|wrk/\|jmeter\|kube-probe\|prometheus/\|blackbox_exporter\|elb-healthchecker\|googlehc\|telegraf\|vector/` |
-| UA `crawler` | 3 | `\bbot\b\|bot/\|spider\|crawler\|slurp\|scrapy\|googlebot\|bingbot\|yandex\|baiduspider\|duckduckbot\|facebookexternalhit\|twitterbot\|linkedinbot\|slackbot\|applebot\|petalbot\|semrushbot\|ahrefsbot\|mj12bot\|ccbot\|gptbot\|chatgpt-user\|claudebot\|perplexitybot\|amazonbot\|bytespider\|feedfetcher\|lighthouse` |
-| UA `browser` | 4 (last: crawlers spoof `Mozilla/`) | `mozilla/\|opera/\|dalvik/\|safari/\|msie \|trident/` |
-| route `probes` → `/{probe}` | | `^/(health\|healthz\|healthcheck\|livez\|readyz\|ready\|ping\|status\|_status\|up\|metrics\|_metrics\|stats\|nginx_status\|server-status\|haproxy_status\|version\|_version)/?$` |
-| route `well_known` → `/{well-known}` | | `^/(\.well-known/.*\|robots\.txt\|favicon\.ico\|sitemap[^/]*\.xml(\.gz)?\|humans\.txt\|security\.txt\|apple-touch-icon[^/]*\.png\|browserconfig\.xml\|manifest\.json\|crossdomain\.xml\|ads\.txt\|app-ads\.txt)$` |
-| route `assets` → `/{asset}` | no `json`/`xml`/`txt`/`csv` — routinely API responses | `\.(css\|js\|mjs\|cjs\|map\|png\|jpe?g\|gif\|webp\|avif\|svg\|ico\|bmp\|tiff?\|woff2?\|ttf\|otf\|eot\|mp4\|m4v\|webm\|mov\|mp3\|m4a\|ogg\|oga\|opus\|wav\|flac\|pdf\|zip\|gz\|tgz\|bz2\|xz\|7z\|rar\|wasm)$` |
+| UA `scanner` | 1, `(?i)` | `nmap\|masscan\|zgrab\|nikto\|sqlmap\|dirbuster\|gobuster\|ffuf\|fuzz faster u fool\|feroxbuster\|wpscan\|nuclei\|acunetix\|nessus\|qualys\|openvas\|censysinspect\|internetmeasurement\|expanse\|paloaltonetworks\|leakix\|shodan` |
+| UA `tool` | 2, `(?i)` | `curl/\|wget/\|libwww-perl\|python-requests\|python-urllib\|aiohttp\|httpie\|go-http-client\|okhttp\|apache-httpclient\|^java/\|axios/\|node-fetch\|guzzlehttp\|postmanruntime\|insomnia\|reqwest/\|k6/\|wrk/\|jmeter\|kube-probe\|prometheus/\|blackbox-exporter\|elb-healthchecker\|googlehc\|telegraf/\|vector/\|chrome-lighthouse` |
+| UA `crawler` | 3, `(?i)` | `\bbot\b\|\bbot/\|spider\|crawler\|slurp\|scrapy\|googlebot\|bingbot\|yandexbot\|baiduspider\|duckduckbot\|facebookexternalhit\|twitterbot\|linkedinbot\|slackbot\|applebot\|petalbot\|semrushbot\|ahrefsbot\|mj12bot\|ccbot\|gptbot\|chatgpt-user\|claudebot\|perplexitybot\|amazonbot\|bytespider\|feedfetcher` |
+| UA `browser` | 4 (last: crawlers spoof `Mozilla/`), `(?i)` | `mozilla/\|opera/\|dalvik/\|safari/\|msie \|trident/` |
+| route `probes` → `/{probe}` | case-sensitive | `^/(-/(healthy\|ready)\|health\|healthz\|healthcheck\|livez\|readyz\|ready\|ping\|status\|_status\|up\|metrics\|_metrics\|stats\|nginx_status\|server-status\|haproxy_status\|version\|_version)/?$` |
+| route `well_known` → `/{well-known}` | case-sensitive | `^/(\.well-known/.*\|robots\.txt\|favicon\.ico\|sitemap[^/]*\.xml(\.gz)?\|humans\.txt\|security\.txt\|apple-touch-icon[^/]*\.png\|browserconfig\.xml\|manifest\.json\|manifest\.webmanifest\|crossdomain\.xml\|ads\.txt\|app-ads\.txt)$` |
+| route `assets` → `/{asset}` | no `json`/`xml`/`txt`/`csv` — routinely API responses; `(?i)` | `\.(css\|js\|mjs\|cjs\|map\|png\|jpe?g\|gif\|webp\|avif\|svg\|ico\|bmp\|tiff?\|woff2?\|ttf\|otf\|eot\|heic\|heif\|docx\|xlsx\|pptx\|apk\|ipa\|mp4\|m4v\|webm\|mov\|mp3\|m4a\|ogg\|oga\|opus\|wav\|flac\|pdf\|zip\|gz\|tgz\|bz2\|xz\|7z\|rar\|wasm)$` |
 
-`\bbot\b` rather than `bot\b` because `bot\b` matches phone models like `CUBOT`. The exact
-member lists are W3's to finalize against a corpus; the classes, their order, and the three
-route values are fixed here.
+`\bbot\b` rather than `bot\b` because `bot\b` matches phone models like `CUBOT`; `\bbot/` (not
+bare `bot/`) for the same reason, since `UptimeRobot/2.0` contains `bot/` mid-word. `^java/` is
+anchored (Java's `HttpURLConnection` sends exactly `Java/<version>` as the whole string);
+`blackbox-exporter` is hyphenated (the exporter's real format since v0.28.0); `chrome-lighthouse`
+moved from `crawler` to `tool` (a synthetic audit tool, not a content crawler); `fuzz faster u
+fool` was added because ffuf's actual default UA contains no "ffuf" substring at all. `probes` and
+`well_known` are matched case-sensitively, not `(?i)`, because a probe/well-known path is a
+protocol- or convention-mandated literal (unlike a file extension, whose casing is conventionally
+meaningless); `probes` gained `-/(healthy|ready)` for Prometheus's/Alertmanager's Management API,
+`well_known` gained `manifest.webmanifest`, and `assets` gained `.heic`/`.heif`,
+`.docx`/`.xlsx`/`.pptx`, and `.apk`/`.ipa`. **Known limitation, not fixable by regex**: nikto
+(2.6.1+), nuclei, and Nessus all spoof a real browser `User-Agent` by default, so their
+un-configured traffic classifies `browser`, not `scanner`, regardless of table tuning.
 
 ### `crates/logit-cli/src/pipeline.rs` (W2)
 
