@@ -55,12 +55,13 @@ use logit_transforms::{
     DropProvenance as DropProvenanceTransform, DropSignals as DropSignalsTransform,
     Fields as TransformFields, Flatten as FlattenTransform,
     HasAttributes as HasAttributesTransform, HasProvenance as HasProvenanceTransform,
-    HasSignal as HasSignalTransform, JsonParser, Keep as KeepTransform,
-    KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
-    KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
-    Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
-    Shape as ShapeTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    HasSignal as HasSignalTransform, InvalidUtf8 as TransformInvalidUtf8, JsonParser,
+    Keep as KeepTransform, KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform,
+    Kv as KvTransform, KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform,
+    MatchMode as TransformMatchMode, Normalize as TransformNormalize, RegexParser,
+    Remove as RemoveTransform, Route as RouteTransform, Scale as ScaleTransform,
+    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -604,8 +605,9 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone()),
         )),
-        Json { skip_to_brace } => NodeSpec::Transform(Box::new(
+        Json { skip_to_brace, invalid_utf8 } => NodeSpec::Transform(Box::new(
             JsonParser::new(*skip_to_brace)
+                .with_invalid_utf8(to_invalid_utf8(*invalid_utf8))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
         )),
         Csv { columns, delimiter } => NodeSpec::Transform(Box::new(
@@ -1555,6 +1557,16 @@ fn to_flatten_fields(fields: &logit_config::FlattenFields) -> TransformFields {
             TransformFields::None
         }
         logit_config::FlattenFields::Named(names) => TransformFields::Named(names.clone()),
+    }
+}
+
+/// Converts `logit-config`'s `JsonInvalidUtf8` (`ComponentKind::Json`'s `invalid_utf8` field) into
+/// the `logit_transforms::InvalidUtf8` `JsonParser::with_invalid_utf8` takes -- same reasoning as
+/// [`to_allow_lists`].
+fn to_invalid_utf8(mode: logit_config::JsonInvalidUtf8) -> TransformInvalidUtf8 {
+    match mode {
+        logit_config::JsonInvalidUtf8::Reject => TransformInvalidUtf8::Reject,
+        logit_config::JsonInvalidUtf8::Replace => TransformInvalidUtf8::Replace,
     }
 }
 
@@ -3255,7 +3267,7 @@ mod tests {
             sources: vec!["in".to_string()],
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
-            kind: ComponentKind::Json { skip_to_brace: true },
+            kind: ComponentKind::Json { skip_to_brace: true, invalid_utf8: Default::default() },
         };
         assert!(matches!(
             build_spec("parse", &component, Path::new(""), None).unwrap().0,

@@ -2661,7 +2661,10 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 targets: Vec::new(),
-                kind: ComponentKind::Json { skip_to_brace: false },
+                kind: ComponentKind::Json {
+                    skip_to_brace: false,
+                    invalid_utf8: Default::default(),
+                },
             },
         );
         components.insert(
@@ -3223,7 +3226,10 @@ mod tests {
                 receive: logit_config::ReceiveConfig::default(),
                 sources: vec!["in".to_string()],
                 targets: Vec::new(),
-                kind: ComponentKind::Json { skip_to_brace: false },
+                kind: ComponentKind::Json {
+                    skip_to_brace: false,
+                    invalid_utf8: Default::default(),
+                },
             },
         );
         components.insert(
@@ -7264,7 +7270,12 @@ mod tests {
                 ComponentKind::Lua { script: String::new(), interval: None },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
-            ("watcher", vec!["a"], vec![], ComponentKind::Json { skip_to_brace: false }),
+            (
+                "watcher",
+                vec!["a"],
+                vec![],
+                ComponentKind::Json { skip_to_brace: false, invalid_utf8: Default::default() },
+            ),
         ]);
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -8284,7 +8295,12 @@ mod tests {
                 },
             ),
             ("a", vec![], vec![], ComponentKind::Target {}),
-            ("watcher", vec!["a"], vec![], ComponentKind::Json { skip_to_brace: false }),
+            (
+                "watcher",
+                vec!["a"],
+                vec![],
+                ComponentKind::Json { skip_to_brace: false, invalid_utf8: Default::default() },
+            ),
         ]);
 
         let (tx, rx) = std::sync::mpsc::channel();

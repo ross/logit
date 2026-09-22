@@ -738,6 +738,15 @@
             "type"
           ],
           "properties": {
+            "invalid_utf8": {
+              "description": "What to do with a message that is not valid UTF-8: `reject` (the default -- the parse fails and the event passes through untouched) or `replace` (retry on a copy with every invalid sequence replaced by U+FFFD). See [`JsonInvalidUtf8`].",
+              "default": "reject",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/JsonInvalidUtf8"
+                }
+              ]
+            },
             "skip_to_brace": {
               "description": "Skip everything before the first `{` and parse from there -- for lines with a non-JSON prefix (`2026-08-29 INFO {\"a\":1}`). Off by default: the whole line is assumed to be the JSON data.",
               "default": false,
@@ -2464,6 +2473,14 @@
             "off"
           ]
         }
+      ]
+    },
+    "JsonInvalidUtf8": {
+      "description": "`ComponentKind::Json`'s `invalid_utf8` field: what the parser does with a message that is not valid UTF-8. `Reject` (the default) is the strict behaviour `json` has always had -- the parse fails, the event passes through untouched, one throttled `parse_failure` diagnostic. `Replace` retries a failed parse on a copy with every invalid sequence replaced by U+FFFD, on the failure path only, so a valid line's cost is unchanged. The case it exists for: nginx's `escape=json` passes bytes >= 0x80 through raw, so one client sending a Latin-1 `User-Agent` loses the whole access line -- the one failure `http_access` can't reach from behind `json`. See `docs/adr/http-access-normalization.md`.",
+      "type": "string",
+      "enum": [
+        "reject",
+        "replace"
       ]
     },
     "MatchMode": {

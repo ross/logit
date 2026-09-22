@@ -3277,7 +3277,7 @@ mod tests {
     }
 
     fn json() -> ComponentKind {
-        ComponentKind::Json { skip_to_brace: false }
+        ComponentKind::Json { skip_to_brace: false, invalid_utf8: Default::default() }
     }
 
     fn logfmt() -> ComponentKind {

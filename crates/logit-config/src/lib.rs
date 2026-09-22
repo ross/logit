@@ -135,6 +135,22 @@ pub enum NormalizeStep {
     Lower,
 }
 
+/// `ComponentKind::Json`'s `invalid_utf8` field: what the parser does with a message that is not
+/// valid UTF-8. `Reject` (the default) is the strict behaviour `json` has always had -- the parse
+/// fails, the event passes through untouched, one throttled `parse_failure` diagnostic. `Replace`
+/// retries a failed parse on a copy with every invalid sequence replaced by U+FFFD, on the
+/// failure path only, so a valid line's cost is unchanged. The case it exists for: nginx's
+/// `escape=json` passes bytes >= 0x80 through raw, so one client sending a Latin-1 `User-Agent`
+/// loses the whole access line -- the one failure `http_access` can't reach from behind `json`.
+/// See `docs/adr/http-access-normalization.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonInvalidUtf8 {
+    #[default]
+    Reject,
+    Replace,
+}
+
 /// `ComponentKind::Flatten`'s `attributes`/`resource` fields: which top-level attributes to
 /// expand. `#[serde(untagged)]`: a bare `all`/`none` picks the blanket mode
 /// ([`FlattenKeyword`]), a sequence names literal top-level attribute names explicitly --
@@ -990,6 +1006,11 @@ pub enum ComponentKind {
         /// assumed to be the JSON data.
         #[serde(default)]
         skip_to_brace: bool,
+        /// What to do with a message that is not valid UTF-8: `reject` (the default -- the parse
+        /// fails and the event passes through untouched) or `replace` (retry on a copy with every
+        /// invalid sequence replaced by U+FFFD). See [`JsonInvalidUtf8`].
+        #[serde(default)]
+        invalid_utf8: JsonInvalidUtf8,
     },
     /// Splits a log record's message as one CSV row, merging the named columns into the event's
     /// attributes -- the delimiter-separated sibling of `Json`. See
@@ -3581,7 +3602,10 @@ mod tests {
         let component: Component =
             serde_json::from_str(r#"{"type": "json", "sources": ["in"]}"#).unwrap();
         match component.kind {
-            ComponentKind::Json { skip_to_brace } => assert!(!skip_to_brace),
+            ComponentKind::Json { skip_to_brace, invalid_utf8 } => {
+                assert!(!skip_to_brace);
+                assert_eq!(invalid_utf8, JsonInvalidUtf8::Reject, "strict by default");
+            }
             other => panic!("expected Json, got {other:?}"),
         }
     }
@@ -3592,9 +3616,31 @@ mod tests {
             serde_json::from_str(r#"{"type": "json", "sources": ["in"], "skip_to_brace": true}"#)
                 .unwrap();
         match component.kind {
-            ComponentKind::Json { skip_to_brace } => assert!(skip_to_brace),
+            ComponentKind::Json { skip_to_brace, .. } => assert!(skip_to_brace),
             other => panic!("expected Json, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn json_component_invalid_utf8_replace_deserializes_and_round_trips() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "json", "sources": ["in"], "invalid_utf8": "replace"}"#,
+        )
+        .unwrap();
+        match &component.kind {
+            ComponentKind::Json { invalid_utf8, .. } => {
+                assert_eq!(*invalid_utf8, JsonInvalidUtf8::Replace)
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+        let json = serde_json::to_string(&component).unwrap();
+        assert!(json.contains(r#""invalid_utf8":"replace""#), "round-trips as snake_case: {json}");
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "json", "sources": ["in"], "invalid_utf8": "lossy"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("reject") && err.contains("replace"), "names the choices: {err}");
     }
 
     /// `structured_data` is additive: an existing `syslog_out` config that predates this field

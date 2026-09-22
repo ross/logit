@@ -33,7 +33,7 @@ pub use aggregate::{AggregateTemporality, Aggregator, Distributions, Sets};
 pub use attributes::{DropAttributes, HasAttributes};
 pub use csv::CsvParser;
 pub use flatten::{Arrays, Fields, Flatten};
-pub use json::JsonParser;
+pub use json::{InvalidUtf8, JsonParser};
 pub use keep::{Keep, Remove};
 pub use keep_values::{ClampConfig, KeepValues, Normalize};
 pub use kv_metrics::{KvMetrics, MetricSpec};
