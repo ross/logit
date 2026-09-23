@@ -5,9 +5,11 @@
 //! `docs/design/pipeline-graph.md`'s "Node kinds" section). `aggregate`, `json`, `csv`,
 //! `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`,
 //! `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`,
-//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, and `route` are
-//! implemented (`rename`/`filter`/`sample`/`throttle`/`dedup` were retired rather than landing --
-//! `docs/adr/routing-by-condition-is-lua.md`).
+//! `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, and
+//! `route` are implemented (`rename`/`filter`/`throttle`/`dedup` were retired rather than landing
+//! -- `docs/adr/routing-by-condition-is-lua.md`; `sample` was retired with them and returned as a
+//! native kind once *consistent* sampling turned out to be something `lua` can't express --
+//! `docs/adr/consistent-sampling-component.md`).
 
 mod aggregate;
 mod attributes;
@@ -22,6 +24,7 @@ mod logfmt;
 mod provenance;
 mod regex;
 mod route;
+mod sample;
 mod scale;
 mod set;
 mod shape;
@@ -43,6 +46,7 @@ pub use logfmt::{Kv, Logfmt};
 pub use provenance::{DropProvenance, HasProvenance};
 pub use regex::RegexParser;
 pub use route::Route;
+pub use sample::{Sample, SampleField, SampleKey, SampleMissing, SampleOverride};
 pub use scale::Scale;
 pub use set::Set;
 pub use shape::{Shape, DEFAULT_MAX_TRACKED_KEYS, DEFAULT_MAX_TRACKED_KEYSETS};
