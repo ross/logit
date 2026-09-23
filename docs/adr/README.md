@@ -39,7 +39,7 @@ New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created`
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
 | [statsd/DogStatsD egress: dialect, transport, packing, and the v1 metric-kind deferral](statsd-output.md) | 2026-09-10 | 2026-09-14 |
 | [Lossless like-protocol transit: the internal model is a superset of every supported wire protocol](lossless-transit.md) | 2026-09-10 | 2026-09-13 |
-| [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-09-10 |
+| [Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour](browser-tracing-sdk.md) | 2026-09-10 | 2026-09-23 |
 | [OTLP/JSON decoding: hand-written against `serde_json::Value`, not generated](otlp-json-decoding.md) | 2026-09-10 | 2026-09-10 |
 | [Provenance filtering is two transform components, combining has_attributes' and has_signal's shapes](provenance-filtering-components.md) | 2026-09-10 | 2026-09-10 |
 | [Batch provenance (`origin`/`previous`) carried on `Delivered`, stamped by `Fanout`](batch-provenance-on-delivered.md) | 2026-09-10 | 2026-09-10 |
