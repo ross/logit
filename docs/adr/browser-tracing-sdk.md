@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-10
+updated: 2026-09-23
 ---
 
 # Browser tracing: the real OTel-JS SDK, `addLink` for sub-resources, and living with document-load's parent (not link) behaviour
@@ -47,7 +47,7 @@ assumed:
    `haproxy`'s real access-line span, in a different trace, and that target span was independently
    confirmed to exist by querying Tempo directly for it.
 
-3. **`documentLoad` is a PARENT of the server span, not a link -- contradicting this repo's own
+3. **`documentLoad` is a CHILD of the server span, not linked to it -- contradicting this repo's own
    prior (spec-correct) expectation.** `browser-tracing.md` argued the causal edge should be a
    link, since the server's own span has already ended by the time the browser can report
    anything. Checked directly against `instrumentation-document-load@0.67.0`'s
@@ -92,7 +92,7 @@ one `fetch()` call (`/work`, same-origin through HAProxy) doesn't need it.
 
 - `docker compose up --build` needs npm registry access now, alongside PyPI/crates.io/apt --
   flagged in `demo/app/Dockerfile`'s header comment and `demo/README.md`.
-- The `documentLoad` -> server-span edge in Tempo is a parent, not a link, for as long as
+- `documentLoad` is a child of the server span in Tempo, not a link, for as long as
   `instrumentation-document-load` ships it that way -- a future upstream change (or a documented
   workaround) could flip this; nothing in this repo depends on it being a link today.
 - `resourceFetch` spans for anything logit-fronted (the bundle itself, the two SVGs) carry a real,

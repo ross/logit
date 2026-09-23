@@ -1,9 +1,10 @@
-"""The one background task this demo has -- enqueued by `pages/views.py`'s `work`, run by the
-`worker` service, not any gunicorn worker (`docs/plans/demo-richer-traces.md` workstream D).
-Deliberately ordinary: a brief sleep, one DB write, one log line -- the point isn't the work
-itself, it's that this task's real Celery CONSUMER span (opentelemetry-instrumentation-celery,
-`demoproj/telemetry.py`) lands under the same trace as the request that enqueued it, arriving in
-Tempo seconds after that request's own response has already gone back to the client.
+"""The demo's one background task, enqueued by `pages/views.py`'s `work` and run by the
+`worker` service, not a gunicorn worker (`docs/plans/demo-richer-traces.md`).
+
+Deliberately ordinary: a brief sleep, one DB write, one log line. The point is that this task's
+real Celery CONSUMER span (opentelemetry-instrumentation-celery, `demoproj/telemetry.py`) lands
+under the same trace as the request that enqueued it, arriving in Tempo seconds after that
+request's response has gone back to the client.
 """
 
 import logging
@@ -13,19 +14,19 @@ import time
 from demoproj.celery import app
 from pages.models import WorkRecord
 
-# A plain, explicitly-configured logger (`demoproj/settings.py`'s `LOGGING`) -- not Celery's own
-# `get_task_logger`, whose records feed Celery's own root-logger setup by default (a different,
-# harder-to-predict path than every other tier's logger in this demo takes). `propagate: False`
-# there keeps this on the same footing as `pages/middleware.py`'s `demoapp.access`: one handler,
-# one destination, no Celery-internal console output mixed in.
+# A plain, explicitly configured logger (`demoproj/settings.py`'s `LOGGING`), not Celery's
+# `get_task_logger`, whose records feed Celery's root-logger setup by default (a different,
+# harder-to-predict path than every other logger in this demo takes). `propagate: False` there
+# keeps this on the same footing as `pages/middleware.py`'s `demoapp.access`: one handler, one
+# destination, no Celery-internal console output mixed in.
 worker_logger = logging.getLogger("demoapp.worker")
 
 
 @app.task(name="pages.background_work")
 def background_work():
     started = time.monotonic()
-    # Jittered, the same reasoning `pages/views.py`'s `work` already gives its own sleep -- real
-    # latency spread, not a fixed number, on the span this produces.
+    # Jittered, like `pages/views.py`'s `work` sleep, so the span this produces shows real
+    # latency spread rather than a fixed number.
     time.sleep(random.uniform(0.1, 0.6))
 
     record = WorkRecord.objects.create()
