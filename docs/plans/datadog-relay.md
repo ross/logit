@@ -29,9 +29,10 @@ only to Datadog URLs; a relay under any other URL receives v2); Remote Configura
 telemetry proxying (acknowledged, counted, not forwarded).
 
 Stream key **`dd`**: branches `dd/w0`…`dd/w8`, stacked as the workstream table says. PR stack
-only: nothing is merged by this workstream; Ross directs merging. The ADR
-(`docs/adr/datadog-agent-and-intake-relay.md`) is written in W1, after the sketch spike settles
-the one decision the codec depends on, and this plan's proposed decisions become its text.
+only: nothing is merged by this workstream; Ross directs merging. The decisions are recorded in
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) (W1), written
+once the sketch spike settled the one decision the codec depends on; the design sections below
+are the build-out of that record.
 
 Settled with Ross (2026-09-23): both stand-in directions are in scope; receive side first, because
 the decoders fix the attribute vocabulary the encoders mirror; the Agent-API pair is
@@ -162,7 +163,7 @@ The event model already carries every Datadog field either in a typed field or i
 | metric `gauge` | `Gauge` | lossless |
 | `resources` of type `host` | `host.name` attribute; any other resource type → `datadog.resources` array | lossless |
 | `unit`, `source_type_name`, `metadata.origin` | `MetricRecord.unit`; `datadog.source_type_name`; `datadog.origin.*` | lossless |
-| `dogsketch` bins | `Distribution(DdSketch)`, exact only if `DdSketch`'s bin mapping equals the Agent's. Today it's `sketches-ddsketch` with `Config::defaults()` (alpha 0.01) and no bin iteration (`crates/logit-core/src/metric.rs:307`) | **gap: §4, W1** |
+| `dogsketch` bins | `Distribution(DdSketch)` under `Mapping::agent`, bin-for-bin (§4, landed in W1) | lossless |
 | distribution points (raw values) | `Samples` | lossless |
 | Agent-side `s`/`h`/`ms` semantics | `aggregate` plus a sink; nothing emits the Agent's `.avg`/`.count`/`.median`/`.95percentile`/`.max` set today | a documented recipe, not a codec gap (§7) |
 | log `message`, `status`, `timestamp`, `hostname`, `service`, `ddsource`, `ddtags` | `LogRecord.message`; `severity` plus the raw `status`; `Event::timestamp`; the rest verbatim as attributes, `ddtags` `k:v` pairs expanded the way DogStatsD tags are | lossless |
@@ -172,7 +173,7 @@ The event model already carries every Datadog field either in a typed field or i
 | span `error`, `meta`, `metrics`, `meta_struct`, `_sampling_priority_v1`, `_dd.*` | `status: Error`; attributes verbatim as `Str`/`F64`/`Bytes` | lossless |
 | OTel-only span fields (`kind`, `status: Ok`, `trace_state`, typed attributes) | — | Datadog can't carry them; `datadog_trace_out` counts them, a row in `known-gaps.md`'s cross-protocol table |
 | chunk `priority`, `origin`, `droppedTrace`, chunk `tags`; `TracerPayload` `languageName`, `languageVersion`, `tracerVersion`, `runtimeID`, `containerID`, `appVersion`, `tags`; `AgentPayload` `hostName`, `env`, `agentVersion`, `targetTPS`, `errorTPS`, `rareSamplerEnabled` | chunk fields as `datadog.chunk.*` attributes on every span of the chunk; tracer fields as `datadog.tracer.*` on the batch `Resource` (one batch per `TracerPayload`); Agent fields as `datadog.agent.*` on the `Resource` | lossless; a batch boundary per `TracerPayload` is the "batching" normalization |
-| APM stats (`StatsPayload`, and tracers' `/v0.6/stats`) | one metric event per bucket group: `Sum` `datadog.stats.hits`/`errors`/`top_level_hits` (delta, weighted), `Distribution` `datadog.stats.ok_summary`/`error_summary` decoded from the on-wire DDSketch, group keys (`service`, `name`, `resource`, `span.type`, `span.kind`, `http.status_code`, `synthetics`, peer tags, …) and payload keys (`env`, `version`, `container.id`, `datadog.tracer.lang`, …) as attributes, `Event::timestamp` = bucket start, `datadog.stats.bucket_duration` | lossless if `DdSketch` decodes the wire's own gamma (`from_java_bytes` exists; §4) |
+| APM stats (`StatsPayload`, and tracers' `/v0.6/stats`) | one metric event per bucket group: `Sum` `datadog.stats.hits`/`errors`/`top_level_hits` (delta, weighted), `Distribution` `datadog.stats.ok_summary`/`error_summary` decoded from the on-wire DDSketch, group keys (`service`, `name`, `resource`, `span.type`, `span.kind`, `http.status_code`, `synthetics`, peer tags, …) and payload keys (`env`, `version`, `container.id`, `datadog.tracer.lang`, …) as attributes, `Event::timestamp` = bucket start, `datadog.stats.bucket_duration` | lossless: `DdSketch` keeps the wire's own mapping (`Mapping::logarithmic`, §4) |
 | OTel-origin span through the native protocol | needs Datadog semantics synthesized: `service`/`resource`/`type`, `_top_level`, priority, and stats | not in this stack (§14); `otlp_out` carries OTel-origin spans |
 | events, service checks | `statsd.event.*`, `statsd.service_check.*` (settled) | lossless |
 | timestamps: metrics in seconds, 1 h/10 min window; logs 18 h; checks 10 min | ns in the model; `datadog_out` drops and counts `stale` before sending | permitted normalization plus a counter |
@@ -213,9 +214,9 @@ the Agent itself is going away.
 
 ## Design
 
-Each item is a proposed decision for the W1 ADR, and names the workstream that builds it.
+Each item is a decision the ADR records, and names the workstream that builds it.
 
-### 1. Two new lossless pairs (W1 ADR, W2)
+### 1. Two new lossless pairs (W2)
 
 `datadog_in -> datadog_out` (the intake API) and `datadog_trace_in -> datadog_trace_out` (the
 Agent's APM API) join the six pairs in [ADR `lossless-transit`](../adr/lossless-transit.md),
@@ -267,25 +268,36 @@ The HTTP server driver behind `otlp_in`/`prometheus_in` (`crates/logit-inputs/sr
 `TlsClientConfig`/`TlsServerConfig`; the `TcpListener` driver for the Unix stream transport;
 graph rules 55 and 56 as the precedent for the mode and endpoint validation (new rules 62+).
 
-### 4. Sketch compatibility (W1)
+### 4. Sketch compatibility (W1, settled)
 
-Make `logit_core::metric::DdSketch` bin-identical to the Agent's mapping (gamma 1.015625,
-`min = 1e-9`, the Agent's bias, 4,096-bin collapsing, int16 keys), so an Agent's sketch relays
-exactly and `aggregate`'s output can be sent to Datadog as native sketches, the highest-fidelity
-path for timers and `d`. Try `sketches-ddsketch`'s `Config::new` first; if its key rounding
-differs from the Agent's, hand-roll the store in `logit-core` (mergeable, small). Consequences:
-tighter accuracy (0.78% relative), bin iteration exposed, `type_sizes.rs` and
-[`memory.md`](../design/memory.md) tripwires updated in the same commit, native-wire sketch bytes
-change (pre-release). If the spike rejects this, the fallback is re-binning at the codec edge,
-recorded as a bounded-error normalization, and the sketch row above moves to `known-gaps.md`.
+`logit_core::sketch::DdSketch` is hand-rolled and carries its bin mapping
+(`crates/logit-core/src/sketch.rs`, ADR §3). The spike found `sketches-ddsketch` a dead end
+rather than a near miss: it keys by `floor(log_γ(v))` where the Agent rounds to even and adds a
+bias (they differ for every value whose `frac(log_γ)` is at least 0.5, as Datadog's own
+`+0.5`-offset shim in `pkg/util/quantile/ddsketch.go` documents), it has no hook to apply that
+offset, it exposes no bins, and its `to_java_bytes` is a third format, neither the Agent's
+`dogsketch` nor the DDSketch protobuf. So:
 
-Datadog uses two DDSketch mappings. Metrics sketches (`pkg/util/quantile`) carry no parameters
-on the wire, so only bin-identical relay is exact. APM stats sketches (`sketches-go`, gamma
-1.0202, the same value as `sketches-ddsketch`'s `Config::defaults()`) carry their mapping in
-the protobuf, so `DdSketch::from_java_bytes` decodes them today and `to_java_bytes` re-encodes
-them with whatever mapping `DdSketch` ends up using. The spike must keep the stats path decoding
-any gamma; whether the intake accepts a stats sketch with a gamma other than 1.0202 is UNVERIFIED
-and W7 checks it.
+- `Mapping::agent` (the default) is the Agent's `Config.Default()`: γ = 1.015625, `bias = 1 -
+  floor(log_γ(1e-9))`, magnitudes under `f64(1)` in the zero bin, int16 keys with 32767 as ∞,
+  collapse-lowest at 4,096 bins. Its key vectors are ported from the Agent's `config_test.go`
+  and its collapse vector from `store_test.go`.
+- `Mapping::logarithmic(gamma, index_offset, bin_limit)` is `sketches-go`'s mapping, what a
+  decoded APM stats sketch keeps, with the mapping on the wire. Counts are `f64` throughout.
+- Bins, the zero count, and the summary are public (`positive_bins`, `negative_bins`,
+  `zero_count`, `min`/`max`/`sum`/`stats_exact`), and `from_parts` rebuilds a sketch from decoded
+  parts, deriving a summary when the wire carries none; W2's `dogsketch` and DDSketch-protobuf
+  codecs are built on these.
+- A merge across mappings re-bins by representative value, a bounded-error normalization.
+- Quantiles are the bin center at the rank, whose `1 - 1/√γ` (0.78%) bound the Agent documents,
+  not the Agent's own `Sketch.Quantile` interpolation (ADR, alternatives).
+- `size_of::<DdSketch>()` is 128 (was 176); `MetricKind` stays 176, bounded by `Samples`. The
+  native wire's `Distribution` payload is `DdSketch::to_bytes`, a versioned form of the parts
+  above. Every allocation tripwire held unchanged (the first bin `Vec` reserves the same 1 KiB
+  the old crate's chunk did).
+
+Still UNVERIFIED for W7: whether the intake accepts a stats sketch whose gamma isn't 1.0202 (a
+relayed stats sketch keeps its own, so only a locally aggregated one would send another).
 
 ### 5. Compression (W3, W5)
 
@@ -400,7 +412,7 @@ the OTel-direct topology is `otlp_out`.
 | # | PR | Size | Depends on |
 |---|---|---|---|
 | W0 | This plan and its index row | S | — |
-| W1 | `DdSketch` Agent-compatible mapping spike; ADR `datadog-agent-and-intake-relay` (§1–§13 with §4 settled); `lossless-transit` amendment; ADR index row; bin iteration; tripwires | M | W0 |
+| W1 | **Landed** (`dd/w1`). Hand-rolled `DdSketch` with the Agent and logarithmic mappings, bins exposed, `sketches-ddsketch` removed, tripwires and wire doc updated; ADR `datadog-agent-and-intake-relay`; `lossless-transit` amendment; ADR index row. | M | W0 |
 | W2a | `logit_proto::datadog`: vendored protos, msgpack, series v1/v2, sketches, logs, events, check_run; fixed-point tests over hand-written vectors | L | W1 |
 | W2b | Traces codec: `AgentPayload` protobuf, `StatsPayload`/`ClientStatsPayload` msgpack, the msgpack v0.4/v0.5/v0.7 span forms; id, chunk, tracer, and stats mapping | M | W2a |
 | W3 | `datadog_in`: intake receiver, zstd decode, graph rules, schema | M | W2b |
@@ -416,7 +428,8 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-23):** W0 written, nothing landed.
+**Status (2026-09-23):** W0 (#309) and W1 complete on their stacked branches, nothing merged
+to `main`; W1 targets `dd/w0` and retargets to `main` once it merges.
 
 ## Verification
 

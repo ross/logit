@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-13
+updated: 2026-09-23
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -198,3 +198,15 @@ closing it.
 over TCP or UDP), the model mapping, the restricted pickle codec, and the permitted normalizations,
 and [`docs/plans/graphite-carbon-relay.md`](../plans/graphite-carbon-relay.md) for the workstreams
 closing it.
+
+## Amendment: a seventh and an eighth like pair (2026-09-23)
+
+`datadog_in -> datadog_out` (Datadog's intake API) and `datadog_trace_in -> datadog_trace_out`
+(the Datadog Agent's APM API) are the seventh and eighth like-protocol pairs in scope under this
+ADR, alongside `statsd`, `otlp`, `syslog`, `prometheus`, `collectd`, and `graphite`. See
+[ADR `datadog-agent-and-intake-relay`](datadog-agent-and-intake-relay.md) for the two protocols,
+the `datadog.*` attribute convention, the Datadog-mapped `DdSketch` that makes sketch relay
+bin-for-bin, and why traces relay over the Agent's protocol rather than OTLP, and
+[`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) for the workstreams closing them and
+their permitted normalizations (a batch boundary per `TracerPayload`; `avg` recomputed from
+`sum`/`cnt`; Datadog's own name and tag sanitization).
