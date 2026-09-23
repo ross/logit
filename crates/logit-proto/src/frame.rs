@@ -4,8 +4,8 @@
 //!
 //! A frame is the unit both the wire and a file agree on: `write_frame`/`read_frame` work
 //! identically writing to a `TcpStream` or appending to a file, which is what lets a durable
-//! buffer and a socket write share one encoder (`docs/design/wire-protocol.md`'s "logit-to-logit"
-//! and on-disk goals are the same format, not two).
+//! buffer and a socket write share one encoder (`docs/design/wire-protocol.md`: the `logit_in`/
+//! `logit_out` connection and the on-disk formats are the same format, not two).
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
