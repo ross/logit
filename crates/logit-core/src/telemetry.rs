@@ -104,27 +104,14 @@ pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 /// hop, a dropped one dropped at every hop, without any node ever telling another its answer.
 /// Same shape as OTel's `TraceIdRatioBased` sampler.
 ///
-/// The top 53 bits of the low 8 `trace_id` bytes, not all 64: `rate * 2f64.powi(64)` loses
-/// precision near 1.0, which would reject traces it should keep. 53 bits is `f64`'s
-/// exact-integer range, so the comparison below is exact, not an approximation of one.
+/// The low 8 `trace_id` bytes, big-endian, straight into [`crate::sampling::keep`] (the top 53
+/// bits of them against `rate * 2^53` -- that fn's doc says why 53) with no hash: these are
+/// `logit`'s own pipeline trace ids, random by construction and never an application's. The
+/// `sample` transform hashes its key instead, so the two reach different verdicts for the same 16
+/// bytes on purpose (`docs/adr/consistent-sampling-component.md`).
 pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool {
-    // `!(rate < 1.0)` rather than `rate >= 1.0` -- also catches NaN (every comparison against NaN
-    // is false, so `rate < 1.0` is false and this branch is taken): keep everything rather than
-    // silently drop everything on a malformed rate. Graph validation (rule 16,
-    // `crates/logit-pipeline/src/graph.rs`) is what actually rejects a NaN/out-of-range config
-    // value before this is ever called with one in practice; the negated comparison is what makes
-    // this fn's own behavior correct even if that guarantee is ever bypassed (a direct caller, a
-    // future one), so it's kept as-is rather than rewritten to a `partial_cmp` form that would
-    // lose the "NaN falls through to `true`" property clippy's lint can't see is deliberate here.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(rate < 1.0) {
-        return true;
-    }
-    if rate <= 0.0 {
-        return false;
-    }
     let x = u64::from_be_bytes(trace_id[8..16].try_into().expect("8 bytes"));
-    (x >> 11) < (rate * (1u64 << 53) as f64) as u64
+    crate::sampling::keep(x, rate)
 }
 
 #[derive(Clone, Debug)]

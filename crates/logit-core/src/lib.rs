@@ -6,6 +6,10 @@
 pub mod diag;
 pub mod interner;
 pub mod provenance;
+/// Consistent sampling's shared compare and its frozen key hash -- see the module's own doc
+/// comment. Namespaced like `template`, no flattened re-exports: `sampling::keep` and
+/// `sampling::hash_value` read better at a call site than bare `keep`/`hash_value` would.
+pub mod sampling;
 pub mod telemetry;
 /// `{name}` placeholder templates -- see the module's own doc comment. Deliberately left as a
 /// namespaced module with no flattened re-exports here: `Template`/`Segment`/`Compiled` are

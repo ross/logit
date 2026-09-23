@@ -44,6 +44,13 @@ lz4_flex = { version = "0.14", default-features = false, features = ["safe-encod
 # `crc32fast` already pulls in transitively; hardware-accelerated on x86-64/aarch64 with a pure-Rust
 # software fallback, no C dependency.
 crc32c = "0.6"
+# XXH64 for `logit_core::sampling` -- the hash `sample` keys its keep/drop verdict on
+# (`docs/adr/consistent-sampling-component.md`). Pure Rust, MIT, no C dependency; only the
+# `xxhash64` algorithm is built (no `std`, no `random`/`rand`, no XXH3). The version is part of
+# the frozen sampling contract, not just a build input: two `logit` binaries in one topology must
+# hash a key identically, so a release that changed XXH64's output would be a wire-breaking change
+# -- the pinned vectors in `crates/logit-core/src/sampling.rs` are what would catch one.
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 smallvec = { version = "1", features = ["union"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
