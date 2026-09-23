@@ -583,7 +583,8 @@ All line numbers verified against the worktree at
   `service-lifecycle-and-output-retry`.
 - **Suggested verification approach:** targeted review; optionally a loom/shuttle model of the
   close/park/wake handshake between the two halves (they share one task today, so loom adds little
-  until the known-gaps "split onto two tasks" work lands).
+  unless `decode_loop` moves onto its own task; see the "A UDP listener's read and decode loops
+  share one task" entry in [`docs/known-gaps.md`](../known-gaps.md#udp-intake)).
 - **Priority:** P1 — correct today and well documented, but it is the hinge the whole listener's
   shutdown ordering swings on.
 
@@ -868,7 +869,8 @@ All line numbers verified against the worktree at
     (the terminator-already-buffered, `Fatal` arm) returns *without* clearing `buf`, so those bytes
     are discarded uncounted. Worth checking against the "FIN and RST agree" claim.
   - *Documented:* a connection still within its idle budget at shutdown holds things open until the
-    grace backstop — `docs/known-gaps.md` lines ~85-99.
+    grace backstop — [`docs/known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering)'s
+    "`otlp_in` can hold the graph open past shutdown" entry.
 - **Existing coverage:** `tcp.rs` tests 2295-3262: `a_clean_close_flushes_whatever_is_accumulated`
   (2375), `an_abrupt_close_with_a_buffered_partial_frame_counts_it_truncated` (2562),
   `shutdown_mid_message_counts_the_buffered_partial_frame` (2600),
@@ -1325,10 +1327,10 @@ All line numbers verified against the worktree at
 
 Area: `crates/logit-inputs/src/tail/{driver,watch,checkpoint,line,pattern,mod}.rs`,
 `crates/logit-inputs/src/docker.rs`.
-Governing ADRs: [`docs/adr/file-tailing-and-docker-json-logs.md`](../../../../../docs/adr/file-tailing-and-docker-json-logs.md)
-and its partial supersession [`docs/adr/docker-container-identity-and-minimal-watches.md`](../../../../../docs/adr/docker-container-identity-and-minimal-watches.md).
-Telemetry contract: `docs/design/internal-telemetry.md:782-815`. Documented deliberate gaps:
-`docs/known-gaps.md:1423-1490`.
+Governing ADRs: [`docs/adr/file-tailing-and-docker-json-logs.md`](../adr/file-tailing-and-docker-json-logs.md)
+and its partial supersession [`docs/adr/docker-container-identity-and-minimal-watches.md`](../adr/docker-container-identity-and-minimal-watches.md).
+Telemetry contract: [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-and-docker_in).
+Documented deliberate gaps: [`docs/known-gaps.md`](../known-gaps.md#file-tailing-and-docker-logs).
 
 Third-party crates actually in play here: `tokio` (fs, `AsyncFd`, `select!`, `watch`), `bytes`,
 `serde`/`serde_json` (checkpoint file, `config.v2.json`, json-file envelope), and **`libc` only**
@@ -1541,9 +1543,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     then treats it as missing (`:89-95`) and **every file falls back to `read_from`, whose default
     is `End`** — i.e. the corrupt-checkpoint path fails towards *silent loss* of everything written
     while down, not towards duplication. The ADR's "strictly duplicates, never loss" claim
-    (`file-tailing-and-docker-json-logs.md:136-144`) does not cover this case. High confidence the
+    ([`file-tailing-and-docker-json-logs.md`](../adr/file-tailing-and-docker-json-logs.md#checkpoints-optional-written-on-an-interval-only-when-dirty)) does not cover this case. High confidence the
     fsync is absent; medium on how often it matters. Compare `disk_queue.rs`, which does fsync
-    (`known-gaps.md:145-149`).
+    ([`known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering)).
   - **Blocking I/O in an `async fn`.** `write_checkpoint` is `async` but performs `std::fs::write`
     + `rename` synchronously on the runtime worker; likewise `CheckpointStore::load` inside
     `bind()`. Low severity, high confidence.
@@ -1810,7 +1812,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   no path reached this scan via a generation counter.
 - **Why sensitive:** accounting/bookkeeping (the `Arc` identity *is* the batch boundary);
   data-loss (a de-selection closes a live file); untrusted-input (`config.v2.json` is an
-  undocumented daemon-internal format — `known-gaps.md:1485-1490`); custom (stat-cache protocol,
+  undocumented daemon-internal format — [`known-gaps.md`](../known-gaps.md#file-tailing-and-docker-logs)); custom (stat-cache protocol,
   generation eviction, image-ref splitting).
 - **Invariants to verify:**
   - An unchanged `config.v2.json` costs exactly one `stat` per container per scan and no read.
@@ -1887,7 +1889,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`logit.component.receive.flushed{reason}`), `checkpoint.rs:149`
   (`logit.input.checkpoint.writes`); diagnostics keys throughout.
 - **What it does:** The only externally visible account of what this listener read, dropped, and
-  rotated. Contract documented at `docs/design/internal-telemetry.md:782-815`.
+  rotated. Contract documented at [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-and-docker_in).
 - **Why sensitive:** accounting (these counters are how an operator detects the loss modes the
   other entries describe); hot-path (two counter calls per line at `:712-713`).
 - **Invariants to verify:**
@@ -1923,7 +1925,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   is on `docker_in`'s per-line path — it belongs to whoever surveys `logit-core`, but a panic or
   overflow there lands on this data path.
 - **Overlap with the UDP-intake area:** `libc` is shared between `tail/watch.rs`'s inotify backend
-  and `udp.rs`'s `recvmmsg`/`sockstat` work (`known-gaps.md:233` cross-references them); whoever
+  and `udp.rs`'s `recvmmsg`/`sockstat` work ([`known-gaps.md`](../known-gaps.md#udp-intake)'s closed `recvmmsg` entry cross-references them); whoever
   reviews `unsafe` should do both together.
 - **Runtime-side dependency:** `shutdown_grace` is enforced by `crates/logit-pipeline/src/runtime.rs:345`
   and `:548-563`, not by this driver — the "what is lost when the grace expires mid-flush" question
@@ -2140,7 +2142,7 @@ surveyor's.
   `a_fully_consumed_segment_is_deleted_once_commit_crosses_it` (`:1620`),
   `the_cursor_rolls_forward_when_a_segment_the_reader_caught_up_to_later_rotates_away` (`:1748`). Nothing asserts
   fsync happened. ADR: `docs/adr/disk-backed-sink-buffer.md` ("Durability"); gap:
-  `docs/known-gaps.md:144-149` (accepted power-loss window).
+  [`docs/known-gaps.md`](../known-gaps.md#native-wire-format-logit_inlogit_out-and-buffering) (accepted power-loss window).
 - **Suggested verification approach:** `strace -e trace=fdatasync,fsync,openat,renameat,ftruncate` on a real run to
   confirm the ordering matches the ADR; a power-loss simulation (`dm-flakey` or a qemu drive with write-cache
   reordering) to confirm only the active segment's tail can be lost.
@@ -2410,7 +2412,7 @@ surveyor's.
   `a_failed_reopen_is_classified_clean_so_the_batch_is_retried_rather_than_dropped` (`:938`),
   `max_files_three_keeps_exactly_the_active_file_and_two_rotated_ones` (`:719`),
   `max_files_one_truncates_in_place_rather_than_ever_creating_a_dot_1` (`:744`). ADR:
-  `docs/adr/rotating-file-output.md`; gaps: `docs/known-gaps.md:874-902`.
+  `docs/adr/rotating-file-output.md`; gaps: [`docs/known-gaps.md`](../known-gaps.md#file-stdio-and-influxdb-sinks).
 - **Suggested verification approach:** kill -9 injection at each of {rename to staging, each cascade rename, the
   oldest unlink, the re-open} followed by a restart, asserting no retained file is lost or duplicated; a bound on
   `max_files` (graph rule) if the syscall-storm concern is confirmed.
@@ -4189,7 +4191,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
     `docs/known-gaps.md` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
   - `logit.input.samples` counts *series* here and *wire samples* in bind mode — a documented
-    known-gaps row ("one counter name with two units on one kind"). **Context.**
+    gap ([`docs/known-gaps.md`](../known-gaps.md#prometheus)'s "`logit.input.samples` means two
+    different things depending on `prometheus_in`'s mode"). **Context.**
 - **Existing coverage:** in-file `crates/logit-inputs/src/prometheus.rs:1909-2384` (dialect
   selection, 4xx/5xx classes, timeout, oversize, refused connection, resource identity, URL
   redaction, `Accept` header, two targets in one tick, telemetry classes, TLS trusted/untrusted
@@ -4344,7 +4347,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   seed not rebuilt on an identical re-declaration, the entry's own `Arc` preserved, and
   `a_request_before_the_watermark_does_not_sweep` (`:3953`, via the `#[cfg(test)] sweeps` counter
   at `:874-875`). ADR `prometheus-remote-write` ("The receiver is stateless; 1.0 typing waits for
-  a bounded metadata cache"); `docs/known-gaps.md:1521-1566`.
+  a bounded metadata cache"); [`docs/known-gaps.md`](../known-gaps.md#prometheus).
 - **Suggested verification approach:** a loom or plain-threads stress test hammering `seed`/`learn`
   from N threads with overlapping and disjoint family sets, asserting
   `families.len() <= max_families` and gauge agreement at quiescence; a test that seeds a family
@@ -4727,7 +4730,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
   - both final casts (`whole as i64`, `sub_nanos as i64`) saturate rather than wrap for a timestamp near/past `i64`'s range (documented as intentional/Rust `as` semantics; confirm no wrapping path was reintroduced)
   - non-finite metric *values* are rejected symmetrically in `push_datapoint` (decode.rs:274-283)
 - **Observed concerns (unverified):** none spotted — behavior is deliberate and cross-referenced against carbon's real `MetricLineReceiver`/`TaggedSeries.parse` semantics in comments (e.g. `parse_tags`, decode.rs:299-340, reproduces "last value wins" for duplicate tag keys to match CPython's `dict`-based parser). Low-confidence note: float-equality sentinel comparisons are a classic review flag; here it's textually justified, so likely fine but worth a verifier's explicit sign-off.
-- **Existing coverage:** `decode.rs` has a `#[cfg(test)] mod tests` (not read in full this pass). `crates/logit-proto/tests/robustness.rs:562-573` (plaintext byte-truncation/bit-flip survival). `crates/logit-proto/tests/graphite_fixed_point.rs` round-trips including a large-timestamp fixed point (~line 163) and proptest generators. ADR `graphite-carbon-relay.md`; `docs/known-gaps.md` (~lines 1184-1190) documents the deliberate lossy rows (multi-value skip, Sum temporality drop, non-finite drop, no metadata channel, 255-byte path limit) — not surprises, accepted normalizations.
+- **Existing coverage:** `decode.rs` has a `#[cfg(test)] mod tests` (not read in full this pass). `crates/logit-proto/tests/robustness.rs:562-573` (plaintext byte-truncation/bit-flip survival). `crates/logit-proto/tests/graphite_fixed_point.rs` round-trips including a large-timestamp fixed point (~line 163) and proptest generators. ADR `graphite-carbon-relay.md`; [`docs/known-gaps.md`](../known-gaps.md#cross-protocol-mappings)'s `encode (Graphite)` rows document the deliberate lossy cases (multi-value skip, Sum temporality drop, non-finite drop, no metadata channel, 255-byte path limit) — not surprises, accepted normalizations.
 - **Suggested verification approach:** targeted code review of the timestamp split-arithmetic against a table of known-tricky `f64` values (sub-second fractions near precision boundaries, values near year-2038/2262 i64-nanosecond overflow); bias the existing proptest generators toward these boundary values.
 - **Priority:** P1 — untrusted input parsing with real edge-case density (float sentinels, precision-sensitive arithmetic, lossless-roundtrip claims), heavily tested already.
 
@@ -4920,7 +4923,7 @@ socket/driver glue and the native wire format are out of scope (other surveys co
 - **What it does:** OTLP's `AnyValue` protobuf message is recursive by design (a value can itself be an array or map of more `AnyValue`s). This hand-written JSON decoder — chosen over a `pbjson`-generated one specifically because OTLP's JSON deviates from proto3 JSON's bytes-as-base64 rule for trace/span ids (ADR `otlp-json-decoding`) — mirrors that recursive shape as ordinary Rust function-call recursion: `any_value` calls itself once per array element and once per kvlist entry, for every level of nesting a sender's JSON declares, with **no explicit depth counter or cap anywhere in this file**.
 - **Why sensitive:** untrusted-input (an `otlp_in` HTTP/JSON request body from any network sender, potentially unauthenticated), custom (hand-rolled per ADR, not generated), recursion (the exact "recursion depth" risk category this survey's brief calls out by name), and — the key comparison point — this codebase demonstrably already treats exactly this bug class as serious elsewhere: `crates/logit-proto/tests/robustness.rs` has a dedicated `decode_batch_rejects_value_nesting_past_the_depth_cap` test for the native wire format's recursive `Value::Array`/`Value::Map`, and `graphite::pickle` enforces `MAX_PICKLE_DEPTH` on open `MARK`s for the identical reason — both exist specifically to stop a crafted, deeply-nested payload from stack-overflowing the process. `any_value` has no analogous cap of its own.
 - **Invariants to verify:**
-  - whether `serde_json::from_slice::<serde_json::Value>` (the very first parse, before `any_value` ever runs) has built-in recursion-depth protection that transitively bounds how deep the resulting `Value` tree — and therefore `any_value`'s own recursion over it — can ever be. `serde_json` is understood (and `docs/known-gaps.md`'s own unrelated CBOR-exploration note, ~line 820, independently states the same belief: "`json`'s `serde_json`-based [reader] inherits [a recursion bound] for free") to enforce a default recursion limit; this survey confirmed no `unbounded_depth`/`disable_recursion_limit` feature is enabled anywhere in the workspace's `Cargo.toml` files, which is consistent with that protection being intact — **but this was reasoned about, not empirically reproduced with an actual deeply-nested payload against a running `otlp_in` listener**, and is exactly the kind of assumption a verification session should confirm by construction rather than inherit on faith.
+  - whether `serde_json::from_slice::<serde_json::Value>` (the very first parse, before `any_value` ever runs) has built-in recursion-depth protection that transitively bounds how deep the resulting `Value` tree — and therefore `any_value`'s own recursion over it — can ever be. `serde_json` is understood (and [`docs/known-gaps.md`](../known-gaps.md#http-access-logs-nginx-haproxy-and-http_access)'s own unrelated HAProxy CBOR entry independently states the same belief: "`json`'s `serde_json`-based [reader] inherits [a recursion bound] for free") to enforce a default recursion limit; this survey confirmed no `unbounded_depth`/`disable_recursion_limit` feature is enabled anywhere in the workspace's `Cargo.toml` files, which is consistent with that protection being intact — **but this was reasoned about, not empirically reproduced with an actual deeply-nested payload against a running `otlp_in` listener**, and is exactly the kind of assumption a verification session should confirm by construction rather than inherit on faith.
   - if the `serde_json` limit does hold, what depth it actually permits (commonly cited as ~128) and whether that's small enough to guarantee no stack overflow regardless of available stack size, or merely small enough in practice today.
   - whether the equivalent *protobuf*-path `AnyValue` decoding (`crates/logit-proto/src/otlp/common.rs`, not read in depth in this pass) has the same recursive shape with no depth cap — `prost`'s own generated decode may or may not impose a limit independently of anything in this crate; if it doesn't, the protobuf path could be exposed even if the JSON path is protected by `serde_json`'s limit, since the two paths are decoded by entirely different code.
   - `hex_bytes`/`hex_decode` (mod.rs:250-280), read alongside this entry: correctly rejects odd-length hex, non-hex-digit bytes, and any length not exactly matching `expected_len` (16 for trace ids, 8 for span ids), with no out-of-bounds indexing (`hex_decode`'s `bytes[i+1]` access is safe because the odd-length check precedes it and the loop advances by exactly 2) — a clean contrast case showing this file's *other* logic is carefully bounds-checked, which sharpens rather than dulls the concern about the one recursive function having no analogous cap.
@@ -4984,7 +4987,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - `resolve` panicking (`interner.rs:31-33`) plus `Symbol: Copy` means the documented retrofit cost is real; nothing enforces the "symbols are eternal" premise at a type level. Medium confidence this is exactly as documented, not worse.
   - Sorted-`Symbol` iteration order being insertion-order-dependent is stated as "deterministic" in `attrs.rs:85-88`; it is deterministic *within* a process run but not across two processes that interned in different orders. Worth confirming no codec's fixed-point property (lossless-transit) depends on it. Medium confidence this is fine (codecs sort by name), but it is not argued anywhere I found.
-- **Existing coverage:** `crates/logit-core/src/interner.rs:148-222` (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs:29` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and `docs/known-gaps.md:499-545` ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
+- **Existing coverage:** `crates/logit-core/src/interner.rs:148-222` (5 unit tests, all `KeyCache`-focused); `crates/logit-core/tests/type_sizes.rs:29` (`symbol_is_a_niche_optimized_u32`). Governed by `docs/design/memory.md` §4 and [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner) ("The attribute/metric-name interner never frees" — documented, accepted, not a surprise).
 - **Suggested verification approach:** targeted review of every `resolve` call site for a symbol that could have come from outside this process; a long-run soak (`json`/`otlp_in` against high-key-cardinality input) watching `interner::len()` and RSS; a contention microbench of `intern` across N worker threads.
 - **Priority:** P1 — documented and accepted gap, but it is global mutable state on the hottest path and the panic-on-unknown-symbol contract is load-bearing.
 
@@ -5055,7 +5058,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - The `merge` panic above. High confidence the reasoning in the doc comment (`metric.rs:350-355`, "the mismatched-config failure case can't-actually-happen") does **not** account for the `from_java_bytes` decode path; medium-to-high confidence it is genuinely reachable, contingent on what the upstream decoder does with the config. This is the single most actionable item in this area.
   - `from_java_bytes`'s doc (`metric.rs:397-400`) says it "Fails only on a genuinely malformed blob" — it says nothing about a well-formed blob with a non-default config, which is exactly the gap.
-- **Existing coverage:** `crates/logit-core/src/metric.rs:1223-1338` — `add_weighted` × {1, large, 0}, the relative-error-bound test, `sum` exactness across merge and across a java-bytes round trip, and the `PartialEq`-via-bytes test. No test constructs a non-default-config blob. Governed by `docs/design/data-model.md` ("metric kinds must stay mergeable"), `docs/adr/aggregation-window-semantics.md`, `docs/known-gaps.md:373-397`.
+- **Existing coverage:** `crates/logit-core/src/metric.rs:1223-1338` — `add_weighted` × {1, large, 0}, the relative-error-bound test, `sum` exactness across merge and across a java-bytes round trip, and the `PartialEq`-via-bytes test. No test constructs a non-default-config blob. Governed by `docs/design/data-model.md` ("metric kinds must stay mergeable"), `docs/adr/aggregation-window-semantics.md`, [`docs/known-gaps.md`](../known-gaps.md#statsd) ("Sample-rate extrapolation").
 - **Suggested verification approach:** read the pinned `sketches-ddsketch` 0.4 source for `from_java_bytes`/`merge`/`Config`; if the config round-trips, write a test that decodes a foreign-config blob and merges it, then change `merge` to return a `Result` (or force a re-sketch on decode). Separately, proptest merge associativity/commutativity and the error bound.
 - **Priority:** **P0** — a reachable panic on the main data path from peer-supplied bytes, in custom glue whose safety argument has a hole.
 
@@ -5076,7 +5079,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Observed concerns (unverified):**
   - The hand-mirrored `pub(crate)` constants and the assumption about serde's allocation strategy are two independent silent-breakage vectors on a dependency bump; only the first has a guard test. Medium confidence this is the weakest link.
   - `PartialEq` is insertion-order-dependent (`metric.rs:544-551`) — documented, but if any equality assertion outside this module compares HLLs built in different orders it will be flaky. Low confidence anything does.
-- **Existing coverage:** `crates/logit-core/src/metric.rs:1404-1653` — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in `docs/known-gaps.md:49-64`.
+- **Existing coverage:** `crates/logit-core/src/metric.rs:1404-1653` — empty estimate, accuracy on 1k distinct members, merge-is-union, byte round trips, truncated input, independently-decoded byte identity, fixed point for every representation, bad representation tags, non-power-of-two member counts (the UB pinning test), over-max array count, HLL count off-by-one, and `hll_slice_len_matches_upstream_constant`. Documented in [`docs/known-gaps.md`](../known-gaps.md#event-model-and-interner).
 - **Suggested verification approach:** **run the HLL tests under Miri and ASan specifically** (this is the one place in the area where UB is the documented failure mode); fuzz `from_bytes` with arbitrary bytes; proptest merge as a set-union law; add a guard test that pins serde's `with_capacity`-from-`size_hint` behaviour if one can be written.
 - **Priority:** **P0** — untrusted bytes feeding a codec whose stated purpose is preventing UB in a dependency, with version-pinned constants mirrored by hand.
 
@@ -5092,7 +5095,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `SAMPLES_INLINE = 19` still keeps `size_of::<MetricKind>() == 176` (pinned).
   - The `MAX_WEIGHT` clamp is applied consistently with `crates/logit-inputs/src/statsd.rs`'s own `MAX_SAMPLE_WEIGHT` (the doc says W3 folded one into the other — confirm there is now one constant, not two).
 - **Observed concerns (unverified):** none spotted; the NaN reasoning is explicit and tested.
-- **Existing coverage:** `crates/logit-core/src/metric.rs:1348-1402` (`samples_new_defaults_sample_rate_to_one`, `samples_weight_is_never_zero_and_is_clamped`, `sketch_of_a_nan_rate_samples_still_counts_every_value`, `sketch_weights_values_by_sample_rate`); `crates/logit-core/tests/type_sizes.rs:226`. Governed by `docs/known-gaps.md:373-397`, `docs/adr/lossless-transit.md`.
+- **Existing coverage:** `crates/logit-core/src/metric.rs:1348-1402` (`samples_new_defaults_sample_rate_to_one`, `samples_weight_is_never_zero_and_is_clamped`, `sketch_of_a_nan_rate_samples_still_counts_every_value`, `sketch_weights_values_by_sample_rate`); `crates/logit-core/tests/type_sizes.rs:226`. Governed by [`docs/known-gaps.md`](../known-gaps.md#statsd) ("Sample-rate extrapolation"), `docs/adr/lossless-transit.md`.
 - **Suggested verification approach:** proptest `weight()` over arbitrary `f64` bit patterns.
 - **Priority:** P1 — numeric edge handling on untrusted input, well argued and tested but easy to regress.
 
@@ -5150,7 +5153,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - `Timer`/`SpanGuard` recording on `Drop` at a cancelled `.await` (documented at `:292-299`) doesn't corrupt any counter that must reconcile — only distribution shape.
   - A disabled or unsampled guard allocates nothing and reads no clock (`:243-246`).
 - **Observed concerns (unverified):** none spotted. The 53-bit choice, the NaN arm and the monotonic-end derivation are each argued in-file with a test.
-- **Existing coverage:** `crates/logit-core/src/telemetry.rs:968+`, including `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start` and the `CLOCK_OVERRIDE` machinery. Governed by `docs/adr/internal-span-emission-and-deterministic-sampling.md`, `docs/design/internal-telemetry.md` ("Spans"). Open items tracked at `docs/known-gaps.md:1014-1024` (listener span window is `send`-only; Lua `flush()` gets a link-less root) — documented, not surprises.
+- **Existing coverage:** `crates/logit-core/src/telemetry.rs:968+`, including `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start` and the `CLOCK_OVERRIDE` machinery. Governed by `docs/adr/internal-span-emission-and-deterministic-sampling.md`, `docs/design/internal-telemetry.md` ("Spans"). Open items tracked in [`docs/known-gaps.md`](../known-gaps.md#internal-telemetry-and-self-logging) (listener span window is `send`-only; Lua `flush()` gets a link-less root) — documented, not surprises.
 - **Suggested verification approach:** statistical test of `trace_is_sampled` over many random ids at several rates; property test that two independently-constructed registries agree on every id.
 - **Priority:** P1 — custom numeric sampling whose whole value is cross-process agreement.
 
@@ -5230,7 +5233,7 @@ the telemetry buffers are `std::collections::HashMap`.
 - **Why sensitive:** unsafe/ffi (the whole Rust↔LuaJIT boundary; `PhantomData<*const ()>` is the only thing enforcing one-VM-per-worker), untrusted-input (the script is operator-supplied but arbitrary), script-triggered unbounded work, concurrency (the `!Send` marker is a hard constraint from the VM, per `AGENTS.md`).
 - **Invariants to verify:**
   - **The sandbox is actually closed.** `loadfile`/`dofile` were reachable despite `StdLib::TABLE|STRING|MATH` (reproduced in review, `:48-53`). Re-audit the full `_G` of a constructed worker for anything else that reaches the host: `os`, `io`, `debug`, `require`, `package`, `collectgarbage`, `newproxy`, `rawset`/`rawget` on protected tables, and LuaJIT's `ffi`/`jit`/`bit` in particular. Confirm `ffi` is genuinely absent, not merely not-requested.
-  - **There is no instruction-count or memory limit.** Nothing here sets an `mlua` hook, a debug hook, or `Lua::set_memory_limit`. A script with `while true do end` hangs its worker thread forever; a script that accumulates a table across `flush()` calls grows the VM without bound (`used_memory()` at `:324-326` is *observation*, not a limit, and nothing appears to read it). Verify whether the per-`lua`-node dedicated OS thread (`docs/known-gaps.md:9-15`) bounds the blast radius to that node, and whether shutdown can still proceed.
+  - **There is no instruction-count or memory limit.** Nothing here sets an `mlua` hook, a debug hook, or `Lua::set_memory_limit`. A script with `while true do end` hangs its worker thread forever; a script that accumulates a table across `flush()` calls grows the VM without bound (`used_memory()` at `:324-326` is *observation*, not a limit, and nothing appears to read it). Verify whether the per-`lua`-node dedicated OS thread ([`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)) bounds the blast radius to that node, and whether shutdown can still proceed.
   - A panic inside a Rust callback cannot unwind through the Lua C frames (mlua catches these, but confirm for the `.expect()`s in `LogProxy::with_log`/`SpanProxy::with_span`).
   - `PhantomData<*const ()>` is present and nothing `unsafe impl Send`s around it.
   - `events_from_table` rejects a non-sequence table (the `{[2] = event}` silently-empty bug at `:396-400`) and an empty table means zero events.
@@ -5321,7 +5324,7 @@ the telemetry buffers are `std::collections::HashMap`.
   - No other Lua-reachable path interns an arbitrary script string without a guard — `Event.new` and the `MetricProxy`/`LogProxy` `__newindex` `name`/`unit`/`description`/`event_name` writes do exactly that (`proxy.rs:683,1228,1237,1252`, `construct.rs:302,1248`).
   - `read_tags` rejects reserved keys before interning them.
 - **Observed concerns (unverified):** the guard here is thorough while the equivalent interning in `proxy.rs`/`construct.rs` has no `is_enabled`-style gate and no documented hazard note. Consistent with the interner's global "accepted" posture, but the asymmetry is worth a deliberate decision. Medium confidence.
-- **Existing coverage:** `crates/logit-script/src/telemetry.rs:147+`. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, `docs/known-gaps.md:1062-1074`.
+- **Existing coverage:** `crates/logit-script/src/telemetry.rs:147+`. Governed by `docs/adr/lua-authored-telemetry-cardinality.md`, `docs/design/lua-api.md`, [`docs/known-gaps.md`](../known-gaps.md#internal-telemetry-and-self-logging).
 - **Priority:** P1 — a documented, deliberately accepted leak path whose guards must all stay in the right order.
 
 ---
@@ -5416,9 +5419,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
     within one window.
 - **Observed concerns (unverified):** none spotted in the hashing/equality logic itself; the
   absence of any bound on `self.groups.len()` (as opposed to `max_retained_series` for series) is
-  worth a deliberate look -- is it actually true that a non-`Fanout`-shared, per-input resource
-  `Arc` (`docs/known-gaps.md`'s "per-edge resource `Arc` proliferation" entry) can make this list
-  grow within a single window in a real topology, not just synthetically?
+  worth a deliberate look -- can a real topology, not just a synthetic one, present enough distinct
+  `(resource, scope)` values within a single window to grow this list?
 - **Existing coverage:** `aggregate.rs` tests `distinct_tag_sets_stay_distinct_series`,
   `identical_multi_valued_array_tags_fold_into_one_series`,
   `multi_valued_array_tags_differing_only_in_element_order_stay_two_series`,
@@ -5874,7 +5876,8 @@ processing is synchronous CPU work called from the node runtime in `logit-pipeli
   `csv`/`logfmt`'s `Bytes::slice`) goes through safe `bytes::Bytes` APIs plus ordinary pointer
   *arithmetic for comparison only* (never dereferenced), not raw unsafe slicing.
 - **`docs/known-gaps.md` already documents** the aggregate-retention-on-by-default memory-growth
-  change, the "delta after eviction/restart resolves against zero" behavior, and the
+  change, the "A delta after eviction (the cardinality cap) or after a process restart resolves
+  against 0.0" behavior ([its "statsd" section](../known-gaps.md#statsd)), and the
   `cardinality-estimator` 1.0.3 allocation-layout bug workaround -- none of these were re-reported
   above as surprises; they're deliberate, tracked gaps, cited here only as context a verifier
   should already know going in.
@@ -6111,7 +6114,7 @@ Test-module boundaries (everything below the marker is `#[cfg(test)]`): `statsd.
     confidence this is intended; worth confirming the counters make it legible.
   - `is_message_too_large` is duplicated verbatim in four files (`statsd.rs:2283`,
     `syslog.rs:1758`, `graphite.rs:533`, `collectd.rs:270`) with a Linux-only errno 90 and an
-    `ErrorKind::InvalidInput` fallback; `docs/known-gaps.md:202-215` already tracks the absence of
+    `ErrorKind::InvalidInput` fallback; [`docs/known-gaps.md`](../known-gaps.md#udp-intake) already tracks the absence of
     per-errno send accounting (`ENOBUFS` vs `EMSGSIZE` vs `ECONNREFUSED` are one undifferentiated
     failure). Listed as documented context, not a surprise.
   - `collectd_out` has **no `flush()` override** (`collectd.rs:169-212`) — correct for UDP, but it
@@ -6274,7 +6277,7 @@ Test-module boundaries (everything below the marker is `#[cfg(test)]`): `statsd.
   `:3666` (`a_negative_absolute_gauges_two_lines_are_never_split_across_datagrams`),
   `:2888`/`:2938` (multi-value samples per dialect), `:3413` (oversize event line).
   Integration: `crates/logit-cli/tests/statsd_round_trip.rs`. ADRs: `statsd-output`,
-  `framed-encoder`, `lossless-transit`; `docs/known-gaps.md:687-730` for the post-sketch-kind and
+  `framed-encoder`, `lossless-transit`; [`docs/known-gaps.md`](../known-gaps.md#statsd) for the post-sketch-kind and
   unit/rename debt.
 - **Suggested verification approach:** Construct a realistic worst-case `Samples` record from a
   full-size `statsd_in` datagram and measure the rendered line against the default 1432 cap;
