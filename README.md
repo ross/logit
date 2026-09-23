@@ -1,162 +1,215 @@
 # logit
 
-A logging, metrics, and tracing multiplexer: ingest over many protocols, transform with
-user-defined Lua and built-in parsers, emit to many destinations. Runs as a sidecar or a host
-agent — same binary, different config. See [docs/OVERVIEW.md](docs/OVERVIEW.md) for the full
-scope, [docs/adr/](docs/adr) for why the stack is what it is, [docs/design/](docs/design) for
-the internal event model, the Lua scripting API, the pipeline component graph, and the native wire
-protocol, and [docs/known-gaps.md](docs/known-gaps.md) for already-identified rough edges in what's
-built so far.
+`logit` is a single binary that receives logs, metrics, and traces over many protocols, transforms
+them with built-in components and LuaJIT scripts, and sends them to many destinations. The same
+binary runs as a sidecar, a host agent, or a central aggregator; the config file decides which.
 
-## Try it
+Use it when you want one lightweight process to parse, enrich, aggregate, sample, and route
+telemetry, with real scripting instead of a configuration DSL. Relaying a protocol to itself (for
+example, `statsd_in` to `statsd_out`) is lossless by design. For scope and positioning against
+Vector, the OpenTelemetry Collector, Fluent Bit, and Telegraf, see
+[docs/OVERVIEW.md](docs/OVERVIEW.md).
 
-```sh
-cd demo && docker compose up --build
-```
+`logit` is pre-release. Config, wire formats, and behavior can change without a compatibility path.
 
-Then open **http://localhost:8080** — a small hello-world app that's both the landing page and the
-demo's traffic source, with a link to Grafana (dashboard already provisioned) and this stack's own
-pipeline rendered live via `logit graph | dot`. No Rust toolchain, no clone-and-build, nothing else
-in this repo required. All three signals flow end to end now — logs into Loki, metrics into
-InfluxDB, and real spans into Tempo, `logit` observing its own pipeline as all three at once — see
-[demo/README.md](demo/README.md) for what's flowing (everything) and the one thing still deferred
-by choice (`docs/known-gaps.md`).
+## Try the demo
 
-To run `logit` itself rather than the demo, pull the published image
-([ADR `publish-release-image-to-ghcr`](docs/adr/publish-release-image-to-ghcr.md)):
+The demo runs `logit` against a small web stack and sends its logs, metrics, and traces to Loki,
+InfluxDB, and Tempo, with Grafana dashboards already provisioned. It needs only Docker with the
+Compose plugin.
 
 ```sh
-docker pull ghcr.io/ross/logit:latest
-docker run --rm -v /path/to/config.yaml:/config.yaml:ro ghcr.io/ross/logit:latest run /config.yaml
+cd demo
+docker compose up --build
 ```
 
-`latest` is the only tag, amd64 only, and moves on demand rather than on a release schedule — see
-[docs/deploying.md](docs/deploying.md) for what that means and the full operator-facing story.
+The first run builds the images from source and takes several minutes. When it's up, open
+http://localhost:8080. That page generates traffic, links to Grafana, and shows the demo's own
+pipeline graph. The demo takes shortcuts that don't belong in production, such as hardcoded
+secrets and anonymous Grafana admin access. See [demo/README.md](demo/README.md) for what flows
+where.
 
-**Status:** v0.1's statsd/InfluxDB slice is complete — statsd in, a 10s `aggregate` window, a Lua
-enrichment stage, InfluxDB 2.x out, via `logit run <config>`. Since then, `syslog_in` (RFC 3164/5424
-over UDP), `stdio_out`, `file_out` (a rotating file sink sharing `stdio_out`'s implementation,
-[ADR `rotating-file-output`](docs/adr/rotating-file-output.md)), `syslog_out` (RFC 3164/5424 over UDP or TCP,
-[ADR `syslog-output`](docs/adr/syslog-output.md)), `otlp_in`/`otlp_out` (OpenTelemetry Protocol for
-logs, metrics, and traces, over OTLP/HTTP or a hand-rolled OTLP/gRPC transport,
-[ADR `committed-pregenerated-otlp-protobuf`](docs/adr/committed-pregenerated-otlp-protobuf.md)/
-[ADR `hand-rolled-grpc-over-hyper`](docs/adr/hand-rolled-grpc-over-hyper.md)), and `tail_in`/`docker_in`
-(rotation- and checkpoint-aware file tailing, plus Docker json-file container logs enriched from
-`config.v2.json` — no docker socket,
-[ADR `file-tailing-and-docker-json-logs`](docs/adr/file-tailing-and-docker-json-logs.md)) have joined
-statsd/InfluxDB as implemented protocols — `otlp_out` is what carries `logit`'s own internal spans to
-Tempo in the demo above, and
-`logit` now emits those spans itself, one per pipeline node-visit, deterministically sampled on
-`trace_id` ([ADR `internal-span-emission-and-deterministic-sampling`](docs/adr/internal-span-emission-and-deterministic-sampling.md),
-[docs/plans/otlp-end-to-end.md](docs/plans/otlp-end-to-end.md)). `json`, `csv`, `kv_metrics`,
-`keep`, `remove`, `set`, `trace_context`, `scale`, `logfmt`, `kv` (the de-facto `key=value`
-parsers, [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), `flatten`
-(dotted-key expansion of a nested attribute, [ADR `flatten-transform`](docs/adr/flatten-transform.md)),
-`http_access` (a web server's access line, logged under raw OTel semconv names, normalized
-and given a bounded route/user-agent/span-name set,
-[ADR `http-access-normalization`](docs/adr/http-access-normalization.md),
-[docs/http-access-logs.md](docs/http-access-logs.md)), and `sample` (consistent, keyed sampling — every
-event of a kept trace survives, in every process, with nothing propagated,
-[ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md),
-[examples/sample-traces.yaml](examples/sample-traces.yaml)) have joined `aggregate` as implemented native transforms —
-`trace_context`'s opt-in `span:` block turns an access log line into a real span on the same event
-([ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)). `logit
-run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
-graph of named components, each declaring its own `sources` ([ADR `component-graph-configuration`](docs/adr/component-graph-configuration.md),
-[docs/design/pipeline-graph.md](docs/design/pipeline-graph.md)) — `logit graph <config>` prints the
-resolved graph as graphviz DOT. A `route` component (or a Lua script calling `event:to(..)`) directs
-events into named `target` components instead, which downstream flows read like any other source —
-one partition pass in place of a filter per branch ([ADR `target-components`](docs/adr/target-components.md)). To see it running, use [demo/](demo/README.md) (above) rather than
-building from source — [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) and
-[examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml) are contributor-facing fixtures
-`script/server [config]` runs against the local dev stack below (the latter against a real nginx,
-see [docs/deploying.md](docs/deploying.md) for its nginx-side recipe and
-[docs/http-access-logs.md](docs/http-access-logs.md) for the access-log schema). See
-[ADR `aggregation-window-semantics`](docs/adr/aggregation-window-semantics.md)
-for `aggregate`'s windowing semantics. Any field on any component can pull its value from the
-environment with `!env VAR_NAME` (e.g. `token: !env INFLUXDB_TOKEN`) — see
-[ADR `env-yaml-tag`](docs/adr/env-yaml-tag.md). For deploying `logit` outside this repo's dev stack —
-getting the image, running it, `logit validate` as a preflight, signal/restart behavior — see
-[docs/deploying.md](docs/deploying.md). An out-of-CI load-test harness (`generate_in`/`null_out`,
-`crates/logit-perf`, `script/perf run|compare|attribute|flamegraph`) spawns the real release
-binary against `perf/scenarios/*.yaml` to measure throughput, CPU per event, and peak RSS, and to
-attribute time per pipeline node — see [ADR `load-test-harness`](docs/adr/load-test-harness.md) and
-[docs/design/performance.md](docs/design/performance.md) for the recorded results, measured on the
-disposable perf VM ([ADR `disposable-azure-perf-vm`](docs/adr/disposable-azure-perf-vm.md)).
+## Run logit
+
+Published images are at `ghcr.io/ross/logit`. Only the `latest` tag exists, it's amd64 only, and
+it moves whenever a maintainer publishes a new build, so don't treat it as a pinned version.
+
+1. Save this config as `logit.yaml`. It reads statsd metrics, sums them over 10-second windows,
+   adds an `env` tag in Lua, and prints the result:
+
+   ```yaml
+   components:
+     statsd_in:
+       type: statsd_in
+       bind: 0.0.0.0:8125
+     windowed:
+       type: aggregate
+       sources: [statsd_in]
+       interval: 10s
+     enrich:
+       type: lua
+       sources: [windowed]
+       script: |
+         function process(event)
+           event.attributes.env = event.attributes.env or "dev"
+           return event
+         end
+     out:
+       type: stdio_out
+       sources: [enrich]
+   ```
+
+2. Check the config. The container runs as a non-root user, so the file must be world-readable.
+   On an SELinux host such as Fedora or RHEL, add `,z` after `:ro` in each `-v` option below, or
+   the container gets `Permission denied` reading the file.
+
+   ```sh
+   docker run --rm -v "$PWD/logit.yaml:/config.yaml:ro" ghcr.io/ross/logit:latest validate /config.yaml
+   ```
+
+3. Run it. Publish every port your listeners bind, with the right protocol, because Docker
+   doesn't publish anything by default. statsd uses UDP:
+
+   ```sh
+   docker run --rm -p 8125:8125/udp -v "$PWD/logit.yaml:/config.yaml:ro" \
+     ghcr.io/ross/logit:latest run /config.yaml
+   ```
+
+4. From another terminal, send a metric. Within 10 seconds, `logit` prints the aggregated event:
+
+   ```sh
+   echo "requests:1|c" | nc -u -w1 localhost 8125
+   ```
+
+To keep secrets out of config files, write `token: !env INFLUXDB_TOKEN` and pass the variable with
+`docker run -e`. Any field on any component accepts `!env`.
+
+For production use, including health probes, exit codes, buffering, TLS, and forwarding between
+`logit` nodes, see [docs/deploying.md](docs/deploying.md).
+
+## Components
+
+A config is a flat graph of named components. Each component has a `type` and lists the
+components it reads from in `sources`. `logit graph <config>` prints the resolved graph in Graphviz
+DOT format. [examples/](examples) has a runnable config for most components.
+
+| Role | Types |
+|---|---|
+| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `collectd_in`, `graphite_in`, `tail_in`, `docker_in`, `logit_in`, `internal` (`logit`'s own telemetry), `generate_in` |
+| Parsers | `json`, `csv`, `logfmt`, `kv`, `regex`, `http_access` |
+| Reshaping | `set`, `remove`, `keep`, `keep_values`, `flatten`, `scale`, `kv_metrics`, `trace_context` |
+| Filtering and sampling | `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `sample` |
+| Aggregation and routing | `aggregate`, `route`, `target` |
+| Scripting | `lua`, `lua_file` |
+| Observation | `shape` |
+| Outputs | `influxdb_out`, `otlp_out`, `prometheus_out` (exposition or remote-write), `statsd_out`, `syslog_out`, `collectd_out`, `graphite_out`, `logit_out`, `stdio_out`, `file_out`, `null_out` |
+
+`logit_in` and `logit_out` speak `logit`'s own wire protocol, for forwarding between `logit` nodes.
+The editor-ready JSON Schema for the config is [schema/logit.schema.json](schema/logit.schema.json).
+
+## Documentation
+
+- [docs/OVERVIEW.md](docs/OVERVIEW.md): what `logit` is for, and what it isn't.
+- [docs/deploying.md](docs/deploying.md): running `logit` in production.
+- [docs/http-access-logs.md](docs/http-access-logs.md): the access-log schema for nginx, HAProxy,
+  and other web servers.
+- [docs/design/](docs/design): the event model, Lua API, pipeline graph, wire protocol, internal
+  telemetry, memory, and performance.
+- [docs/adr/](docs/adr): architecture decision records, one per decision.
+- [docs/known-gaps.md](docs/known-gaps.md): known limitations. Check it before reporting a bug.
 
 ## Development
 
-Everything runs in a container — no Rust or LuaJIT toolchain needs to be installed on the host.
-Common tasks are `script/*` commands
-([the "Scripts to Rule Them All" pattern](https://github.blog/engineering/scripts-to-rule-them-all/) —
-see [ADR `scripts-to-rule-them-all`](docs/adr/scripts-to-rule-them-all.md)); `make <name>` is a thin alias for anyone
-who reaches for `make` out of habit.
+Everything builds and runs in a container, so you don't need Rust or LuaJIT on the host. You need
+Docker or Podman.
+
+1. Build the dev image and start the local test stack:
+
+   ```sh
+   script/setup
+   ```
+
+2. Run the formatter check, linter, and tests:
+
+   ```sh
+   script/check
+   ```
+
+The scripts run `sudo docker` by default. If your account is in the `docker` group, run them with
+`DOCKER=docker`. For rootless Podman, use `DOCKER=podman`. See
+[ADR `containerized-development`](docs/adr/containerized-development.md).
 
 | Command | What it does |
 |---|---|
-| `script/bootstrap` | Build the dev container image. Run this first. |
-| `script/setup` | One-time setup for a fresh checkout: bootstrap + start the local test stack. |
-| `script/update` | Run after pulling changes: rebuild the dev image, refresh the test stack. |
-| `script/test` | `cargo nextest run --workspace` |
-| `script/bench [filter]` | Throughput and allocation benchmarks ([docs/design/memory.md](docs/design/memory.md)) |
-| `script/lint` | `cargo clippy`, warnings denied |
-| `script/format [--check]` | `cargo fmt` |
-| `script/check [test args]` | Routine format-check + lint + workspace tests in one container |
-| `script/schema` | Regenerate `schema/logit.schema.json` from the config types |
-| `script/validate` | `logit validate` over every shipped config (`demo/`, `examples/`) |
-| `script/audit` | Supply-chain checks (`cargo-deny`, `cargo-audit`) |
-| `script/cibuild` | The full check sequence CI runs — the real preflight check |
-| `script/console` | Interactive shell in the dev container |
-| `script/server [config]` | Start the test stack and run `logit` against a config file |
-| `script/demo [compose args]` | Run the self-contained demo stack ([demo/](demo/README.md)) — the release image, not the dev container |
+| `script/bootstrap` | Build the dev container image. |
+| `script/setup` | Set up a fresh checkout: bootstrap, then start the local test stack. |
+| `script/update` | Rebuild the dev image and refresh the test stack after you pull changes. |
+| `script/check [test args]` | Check formatting, lint, and run the workspace tests in one container. |
+| `script/test [args]` | Run `cargo nextest run --workspace`. |
+| `script/lint` | Run `cargo clippy` with warnings denied. |
+| `script/format [--check]` | Run `cargo fmt`. |
+| `script/schema` | Regenerate `schema/logit.schema.json` from the config types. |
+| `script/validate` | Run `logit validate` on every shipped config. |
+| `script/audit` | Run supply-chain checks (`cargo-deny`, `cargo-audit`). |
+| `script/cibuild` | Run the full CI sequence. |
+| `script/console` | Open a shell in the dev container. |
+| `script/server [config]` | Start the local test stack and run `logit` against a config. |
+| `script/image [tag]` | Build the production image. |
+| `script/demo [compose args]` | Run the demo stack. |
+| `script/bench [filter]` | Run throughput and allocation benchmarks. |
+| `script/perf <command>` | Run the load-test harness ([docs/design/performance.md](docs/design/performance.md)). |
 
-All of these use `sudo docker` by default. Override with `DOCKER=docker script/...` if your
-account is in the `docker` group (`sudo usermod -aG docker $USER`, then re-login removes the need
-for `sudo` entirely), or `DOCKER=podman script/...` for rootless Podman — both are drop-in
-compatible with the plain `Dockerfile.dev`/`compose.yaml` here. See
-[ADR `containerized-development`](docs/adr/containerized-development.md) for why and how.
+`make <name>` is an alias for most of these. [AGENTS.md](AGENTS.md) lists the remaining
+specialized scripts.
 
-Cargo downloads and build artifacts live in project-wide `logit_cargo_home` and
-`logit_target_cache` Docker volumes, so a new worktree reuses warm dependencies. Older
-worktree-scoped volumes are deliberately not removed automatically; inspect them with
-`docker volume ls` and remove only explicitly named volumes belonging to worktrees you no longer
-need. See [ADR `fast-local-development-loop`](docs/adr/fast-local-development-loop.md).
+Cargo downloads and build artifacts live in the shared `logit_cargo_home` and `logit_target_cache`
+Docker volumes, so a new git worktree starts with warm dependencies. Don't remove these volumes
+during routine cleanup.
 
-## Local test stack
+### Local test stack
 
-`script/setup` (or `make up`) starts InfluxDB 2.x (seeded with a `logit`/`metrics` org/bucket and
-a dev token) and Grafana (anonymous admin access, with the InfluxDB datasource pre-provisioned) at
-`localhost:8086` and `localhost:3000`. [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml)
-is the config the v0.1 slice targets against this stack.
+`script/setup` starts InfluxDB and Grafana. `script/server` also starts nginx.
+
+| Service | Address | Notes |
+|---|---|---|
+| InfluxDB 2.x | http://localhost:8086 | Org `logit`, bucket `metrics`, with a dev token. |
+| Grafana | http://localhost:3000 | Anonymous admin access, with InfluxDB already provisioned as a datasource. |
+| nginx | http://localhost:8080 | Sends access logs to `logit` over syslog, for [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml). |
+
+`script/server` runs [examples/statsd-to-influxdb.yaml](examples/statsd-to-influxdb.yaml) unless
+you pass another config.
 
 ## Contributing
 
-Work happens on branches, landed via pull request — nothing is pushed straight to `main`.
-Use `script/check` while iterating. `script/cibuild` is what CI runs; it's the thing to run locally
-before opening a PR. See
-[AGENTS.md](AGENTS.md) if you're an AI coding agent working in this repo.
+Work on a branch and open a pull request; nobody commits to `main` directly. Run `script/cibuild`
+before you open the pull request, because it runs the same sequence as CI. A significant design
+decision gets an ADR in [docs/adr/](docs/adr), copied from
+[docs/adr/TEMPLATE.md](docs/adr/TEMPLATE.md). [AGENTS.md](AGENTS.md) has the branch and PR naming
+conventions and the constraints that tests enforce, such as exact allocation counts.
 
 ## Repo layout
 
-```
+```text
 crates/
-  logit-core        internal event model: Event, Value, Resource, metric kinds, interner
-  logit-config      YAML config types + generated JSON Schema
-  logit-script      LuaJIT embedding (mlua), the Event proxy
-  logit-proto       codec traits, native wire format, output buffering
-  logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution, the node runtime
-  logit-inputs      per-protocol listeners; statsd, syslog, otlp, tail (tail_in/docker_in)
-  logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
-  logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv, flatten, http_access, sample
+  logit-core        event model: Event, Value, Resource, metric kinds, interner, self-telemetry
+  logit-config      YAML config types and the generated JSON Schema
+  logit-script      LuaJIT embedding and the Event proxy
+  logit-proto       codecs and the native wire format
+  logit-pipeline    Input/Output/Transform/Router traits, graph validation, node runtime
+  logit-inputs      input components
+  logit-outputs     output components
+  logit-transforms  built-in transforms and the route router
   logit-cli         the `logit` binary
-  logit-bench       dev-only: allocation-count tests and throughput benchmarks
-  logit-perf        dev-only: the out-of-CI load-test harness binary (script/perf)
-docs/
-  OVERVIEW.md       project scope, ~1 page
-  adr/              architecture decision records
-  design/           the event model, Lua API, pipeline component graph, wire protocol, and memory design docs
-  plans/            staged implementation plans for larger, multi-session pieces of work
-perf/
-  scenarios/        logit-perf's shipped YAML scenarios (generate_in -> ... -> null_out or a real sink)
-  results/          gitignored: script/perf run/attribute/flamegraph output
+  logit-bench       dev only: allocation-count tests and throughput benchmarks
+  logit-perf        dev only: the load-test harness
+demo/               self-contained demo stack
+examples/           example configs, also used by the local test stack
+docs/               overview, deployment guide, ADRs, design docs, and plans
+perf/               load-test scenarios; results are gitignored
+schema/             generated JSON Schema for the config
+tools/              data-shape survey, unsafe-code checks, fixture recording
 ```
+
+## License
+
+[MIT](LICENSE)
