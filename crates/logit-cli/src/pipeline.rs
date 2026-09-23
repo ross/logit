@@ -60,8 +60,9 @@ use logit_transforms::{
     KeepSignals as KeepSignalsTransform, KeepValues as KeepValuesTransform, Kv as KvTransform,
     KvMetrics as KvMetricsTransform, Logfmt as LogfmtTransform, MatchMode as TransformMatchMode,
     Normalize as TransformNormalize, RegexParser, Remove as RemoveTransform,
-    Route as RouteTransform, Scale as ScaleTransform, Set as SetTransform, Sets as TransformSets,
-    Shape as ShapeTransform, SignalSet, SpanLift, TraceContext as TraceContextTransform,
+    Route as RouteTransform, Sample as SampleTransform, Scale as ScaleTransform,
+    Set as SetTransform, Sets as TransformSets, Shape as ShapeTransform, SignalSet, SpanLift,
+    TraceContext as TraceContextTransform,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -730,6 +731,16 @@ fn build_spec(
             ))?
             .with_telemetry(telemetry.clone())
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone())),
+        )),
+        // Rule 61 has already checked every field; the transform never fails to build.
+        Sample { rate, key, missing, always_keep } => NodeSpec::Transform(Box::new(
+            SampleTransform::new(
+                *rate,
+                key.as_ref().map(to_sample_key),
+                to_sample_missing(*missing),
+                always_keep.as_ref().map(to_sample_override),
+            )
+            .with_telemetry(telemetry.clone()),
         )),
         // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
         // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
@@ -1652,6 +1663,44 @@ fn to_flatten_arrays(arrays: logit_config::FlattenArrays) -> TransformArrays {
     }
 }
 
+/// Converts `logit-config`'s `SampleKey` into `logit_transforms::SampleKey` -- the transform owns
+/// its own types, same reasoning as [`to_flatten_fields`].
+fn to_sample_key(key: &logit_config::SampleKey) -> logit_transforms::SampleKey {
+    match key {
+        logit_config::SampleKey::TraceId => logit_transforms::SampleKey::TraceId,
+        logit_config::SampleKey::Attribute(name) => {
+            logit_transforms::SampleKey::Attribute(name.clone())
+        }
+        logit_config::SampleKey::Resource(name) => {
+            logit_transforms::SampleKey::Resource(name.clone())
+        }
+    }
+}
+
+/// `missing:` absent means `random` (`docs/adr/consistent-sampling-component.md`); the config
+/// keeps it an `Option` only so rule 61 can see "set without `key:`".
+fn to_sample_missing(
+    missing: Option<logit_config::SampleMissing>,
+) -> logit_transforms::SampleMissing {
+    match missing.unwrap_or_default() {
+        logit_config::SampleMissing::Random => logit_transforms::SampleMissing::Random,
+        logit_config::SampleMissing::Keep => logit_transforms::SampleMissing::Keep,
+        logit_config::SampleMissing::Drop => logit_transforms::SampleMissing::Drop,
+    }
+}
+
+/// Converts `always_keep:`, folding rule 61's "exactly one of `attribute`/`resource`" into
+/// `SampleField`'s two variants. The literal goes through [`to_set_value`], so `always_keep`
+/// reads a YAML scalar exactly as `set`/`has_attributes` do.
+fn to_sample_override(o: &logit_config::SampleOverride) -> logit_transforms::SampleOverride {
+    let field = match (&o.attribute, &o.resource) {
+        (Some(name), _) => logit_transforms::SampleField::Attribute(name.clone()),
+        (None, Some(name)) => logit_transforms::SampleField::Resource(name.clone()),
+        (None, None) => unreachable!("graph rule 61 requires one of attribute/resource"),
+    };
+    logit_transforms::SampleOverride { field, value: o.value.as_ref().map(to_set_value) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2085,6 +2134,31 @@ mod tests {
         assert!(matches!(
             build_spec("r", &component, Path::new(""), None).unwrap().0,
             NodeSpec::Router(_)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_a_sample_transform() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec!["in".to_string()],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::Sample {
+                rate: 0.1,
+                key: Some(logit_config::SampleKey::TraceId),
+                missing: None,
+                always_keep: Some(logit_config::SampleOverride {
+                    attribute: None,
+                    resource: Some("debug".to_string()),
+                    value: Some(logit_config::SetValue::Bool(true)),
+                }),
+            },
+        };
+        assert!(matches!(
+            build_spec("sampled", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Transform(_)
         ));
     }
 

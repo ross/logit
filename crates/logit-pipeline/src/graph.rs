@@ -345,6 +345,15 @@
 //!     {trust: false}` is rejected in favour of omitting the block, so "don't trust XFF" has one
 //!     spelling. There is deliberately **no** "nothing configured" clause: a bare
 //!     `type: http_access` still coerces, caps, derives, and classifies with the built-in tables.
+//! 61. `sample`-specific validation (`docs/adr/consistent-sampling-component.md`): `rate` must be
+//!     finite and within `[0, 1]`, rule 16's reasoning; `rate: 1` is rejected (it keeps every
+//!     event, a no-op) and so is `rate: 0` without `always_keep` (it keeps nothing -- that's
+//!     `null_out`), rules 7/12/54/59's "a config that can only be a no-op is an error" -- `rate: 0`
+//!     *with* `always_keep` is the "only flagged events" mode, and allowed; an empty `key:` or
+//!     `always_keep:` field name is rejected, rules 19/20's reasoning; `always_keep` must name
+//!     exactly one of `attribute`/`resource`; a non-finite `always_keep.value` is rejected, since
+//!     it can never match anything (rules 36/54); and `missing:` without `key:` is rejected as
+//!     meaningless -- there is no key to be missing.
 //!
 //! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
 //! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
@@ -441,6 +450,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Shape { .. }
         | Flatten { .. }
         | HttpAccess { .. }
+        | Sample { .. }
         | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
@@ -503,6 +513,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Shape { .. } => "shape",
         Flatten { .. } => "flatten",
         HttpAccess { .. } => "http_access",
+        Sample { .. } => "sample",
         Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
@@ -603,6 +614,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Shape { .. }
             | ComponentKind::Flatten { .. }
             | ComponentKind::HttpAccess { .. }
+            | ComponentKind::Sample { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
             | ComponentKind::StdioOut { .. }
@@ -2993,6 +3005,87 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 61: `sample`-specific validation (`docs/adr/consistent-sampling-component.md`). The
+    // rate's range is rule 16's, word for word -- `sampling::keep` shares `trace_is_sampled`'s
+    // "NaN keeps everything" fallback, which is no more what a typo should get here than there.
+    // Its two no-op edges are rules 7/12/54/59's: `rate: 1` keeps everything and `rate: 0` alone
+    // keeps nothing, but `rate: 0` with `always_keep` is the "only flagged events" mode and
+    // stays. The empties are rules 19/20's; a non-finite override value is rules 36/54's (it can
+    // never compare equal under `value_matches`); `missing:` has nothing to apply to without
+    // `key:`.
+    for (id, component) in &components {
+        if let ComponentKind::Sample { rate, key, missing, always_keep } = &component.kind {
+            if !rate.is_finite() {
+                anyhow::bail!(
+                    "component '{id}': sample 'rate' must be a finite number, got {rate}"
+                );
+            }
+            if !(0.0..=1.0).contains(rate) {
+                anyhow::bail!(
+                    "component '{id}': sample 'rate' must be between 0.0 and 1.0, got {rate}"
+                );
+            }
+            if *rate == 1.0 {
+                anyhow::bail!(
+                    "component '{id}': a sample with 'rate: 1' keeps every event and can only \
+                     ever be a no-op -- remove the component instead"
+                );
+            }
+            if *rate == 0.0 && always_keep.is_none() {
+                anyhow::bail!(
+                    "component '{id}': a sample with 'rate: 0' and no 'always_keep' drops every \
+                     event -- that is what 'null_out' does; add 'always_keep' to keep only flagged \
+                     events"
+                );
+            }
+            match key {
+                Some(
+                    logit_config::SampleKey::Attribute(name)
+                    | logit_config::SampleKey::Resource(name),
+                ) if name.is_empty() => {
+                    anyhow::bail!(
+                        "component '{id}': a sample 'key' field name must not be empty -- it \
+                         could never name a real attribute"
+                    );
+                }
+                None if missing.is_some() => {
+                    anyhow::bail!(
+                        "component '{id}': sample 'missing' only applies with 'key' -- without \
+                         a key there is nothing to be missing"
+                    );
+                }
+                _ => {}
+            }
+            if let Some(always_keep) = always_keep {
+                let field = match (&always_keep.attribute, &always_keep.resource) {
+                    (Some(_), Some(_)) => anyhow::bail!(
+                        "component '{id}': sample 'always_keep' names both 'attribute' and \
+                         'resource' -- it takes exactly one"
+                    ),
+                    (None, None) => anyhow::bail!(
+                        "component '{id}': sample 'always_keep' needs one of 'attribute' or \
+                         'resource'"
+                    ),
+                    (Some(name), None) | (None, Some(name)) => name,
+                };
+                if field.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': a sample 'always_keep' field name must not be empty \
+                         -- it could never name a real attribute"
+                    );
+                }
+                if let Some(logit_config::SetValue::F64(v)) = &always_keep.value {
+                    if !v.is_finite() {
+                        anyhow::bail!(
+                            "component '{id}': sample 'always_keep.value' must be finite, got \
+                             {v} -- a non-finite value can never match anything"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
         // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
@@ -5123,6 +5216,158 @@ mod tests {
             ("out", vec!["tap"], sink()),
         ]));
         assert!(err.contains("max_tracked_keysets"), "{err}");
+    }
+
+    /// A bare `sample` at `rate` -- no key, no `missing`, no override.
+    fn sample_at(rate: f64) -> ComponentKind {
+        ComponentKind::Sample { rate, key: None, missing: None, always_keep: None }
+    }
+
+    /// An `always_keep` override on `attribute: sampling.keep`, any value.
+    fn keep_flag() -> logit_config::SampleOverride {
+        logit_config::SampleOverride {
+            attribute: Some("sampling.keep".to_string()),
+            resource: None,
+            value: None,
+        }
+    }
+
+    fn resolve_sample(kind: ComponentKind) -> anyhow::Result<Graph> {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("sampled", vec!["in"], kind),
+            ("out", vec!["sampled"], sink()),
+        ]))
+    }
+
+    fn sample_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            ("sampled", vec!["in"], kind),
+            ("out", vec!["sampled"], sink()),
+        ]))
+    }
+
+    #[test]
+    fn a_bare_sample_resolves_as_a_transform() {
+        let graph = resolve_sample(sample_at(0.5)).expect("should resolve");
+        assert_eq!(graph.components["sampled"].role(), Role::Transform);
+        assert_eq!(graph.components["sampled"].kind_name(), "sample");
+    }
+
+    /// Rule 61: `rate: 0` with an override is the "only flagged events" mode.
+    #[test]
+    fn a_sample_at_rate_zero_with_always_keep_is_accepted() {
+        let kind = ComponentKind::Sample {
+            rate: 0.0,
+            key: Some(logit_config::SampleKey::TraceId),
+            missing: Some(logit_config::SampleMissing::Drop),
+            always_keep: Some(keep_flag()),
+        };
+        resolve_sample(kind).expect("rate 0 with always_keep keeps flagged events");
+    }
+
+    /// Rule 61: range, NaN.
+    #[test]
+    fn a_sample_with_a_non_finite_rate_is_rejected() {
+        let err = sample_err(sample_at(f64::NAN));
+        assert!(err.contains("finite"), "got: {err}");
+    }
+
+    /// Rule 61: range, out of `[0, 1]`.
+    #[test]
+    fn a_sample_with_a_rate_outside_zero_to_one_is_rejected() {
+        for rate in [-0.1, 1.5] {
+            let err = sample_err(sample_at(rate));
+            assert!(err.contains("between 0.0 and 1.0"), "rate {rate}, got: {err}");
+        }
+    }
+
+    /// Rule 61: `rate: 1` is a no-op.
+    #[test]
+    fn a_sample_at_rate_one_is_rejected() {
+        let err = sample_err(sample_at(1.0));
+        assert!(err.contains("no-op"), "got: {err}");
+    }
+
+    /// Rule 61: `rate: 0` alone drops everything.
+    #[test]
+    fn a_sample_at_rate_zero_without_always_keep_is_rejected() {
+        let err = sample_err(sample_at(0.0));
+        assert!(err.contains("null_out"), "got: {err}");
+    }
+
+    /// Rule 61: empty key field names.
+    #[test]
+    fn a_sample_with_an_empty_key_name_is_rejected() {
+        for key in [
+            logit_config::SampleKey::Attribute(String::new()),
+            logit_config::SampleKey::Resource(String::new()),
+        ] {
+            let kind = ComponentKind::Sample {
+                rate: 0.5,
+                key: Some(key),
+                missing: None,
+                always_keep: None,
+            };
+            let err = sample_err(kind);
+            assert!(err.contains("'key' field name must not be empty"), "got: {err}");
+        }
+    }
+
+    /// Rule 61: `missing:` without `key:`.
+    #[test]
+    fn a_sample_with_missing_but_no_key_is_rejected() {
+        let kind = ComponentKind::Sample {
+            rate: 0.5,
+            key: None,
+            missing: Some(logit_config::SampleMissing::Keep),
+            always_keep: None,
+        };
+        let err = sample_err(kind);
+        assert!(err.contains("'missing' only applies with 'key'"), "got: {err}");
+    }
+
+    /// Rule 61: `always_keep` naming both, or neither.
+    #[test]
+    fn a_sample_override_must_name_exactly_one_field() {
+        let both = logit_config::SampleOverride {
+            attribute: Some("a".to_string()),
+            resource: Some("b".to_string()),
+            value: None,
+        };
+        let neither = logit_config::SampleOverride { attribute: None, resource: None, value: None };
+        for (o, expected) in [(both, "both"), (neither, "needs one of")] {
+            let kind =
+                ComponentKind::Sample { rate: 0.5, key: None, missing: None, always_keep: Some(o) };
+            let err = sample_err(kind);
+            assert!(err.contains(expected), "got: {err}");
+        }
+    }
+
+    /// Rule 61: an empty override field name.
+    #[test]
+    fn a_sample_override_with_an_empty_field_name_is_rejected() {
+        let o = logit_config::SampleOverride {
+            attribute: None,
+            resource: Some(String::new()),
+            value: None,
+        };
+        let kind =
+            ComponentKind::Sample { rate: 0.5, key: None, missing: None, always_keep: Some(o) };
+        let err = sample_err(kind);
+        assert!(err.contains("'always_keep' field name must not be empty"), "got: {err}");
+    }
+
+    /// Rule 61: a non-finite override value can never match.
+    #[test]
+    fn a_sample_override_with_a_non_finite_value_is_rejected() {
+        let mut o = keep_flag();
+        o.value = Some(logit_config::SetValue::F64(f64::INFINITY));
+        let kind =
+            ComponentKind::Sample { rate: 0.5, key: None, missing: None, always_keep: Some(o) };
+        let err = sample_err(kind);
+        assert!(err.contains("must be finite"), "got: {err}");
     }
 
     /// A `flatten` with everything defaulted -- `attributes: all`, `resource: none`,
