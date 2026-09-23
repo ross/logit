@@ -1,37 +1,38 @@
 # Data shapes: what actually flows through `logit`
 
-A reference, not a plan, and the third of three siblings:
-[`telemetry-landscape.md`](telemetry-landscape.md) records what each protocol *can* express,
-[`memory.md`](memory.md) records what the event model *costs*, and this document records what real
-producers *do* send — how many attributes, how long, how nested, how repetitive, how batched. It
-exists because `memory.md` §8 defers two inline-capacity decisions as needing "a real distribution
-of attribute/metric counts," and because the same distribution is what fixtures, perf scenarios,
-examples, and priorities should be built from rather than from one reference pipeline.
+This document records what real producers send: how many attributes, how long, how nested, how
+repetitive, and how batched. It is a reference, not a plan, and it makes no sizing decision. Its
+two siblings are [`telemetry-landscape.md`](telemetry-landscape.md), which records what each
+protocol *can* express, and [`memory.md`](memory.md), which records what the event model *costs*.
+It exists because `memory.md` §8 defers two inline-capacity decisions until there is "a real
+distribution of attribute/metric counts," and because fixtures, perf scenarios, examples, and
+priorities should be built from that same distribution instead of from one reference pipeline.
 
-[`docs/plans/data-shape-survey.md`](../plans/data-shape-survey.md) is the plan that produced it.
-Collected 2026-09-20: a desk survey of about 300 rows counted from pinned sources and
-specifications (condensed to the 132 in [`data-shapes-rows.md`](data-shapes-rows.md), every one
-with its citation), and live captures of real third-party software measured by the
-[`shape`](../adr/shape-observer-component.md) component through `script/shape-survey`. §2–§4 read
-the two together by signal, §5 records the captures, §6 says what the numbers imply, §7 says how
-far to trust them.
+The data was collected on 2026-09-20 under
+[`docs/plans/data-shape-survey.md`](../plans/data-shape-survey.md), from two sources:
 
-This document describes data. It makes no sizing decision — §6 states what the numbers imply for
-today's constants and stops there.
+- A desk survey of about 300 rows counted from pinned sources and specifications, condensed to the
+  132 in [`data-shapes-rows.md`](data-shapes-rows.md), each with its citation.
+- Live captures of real third-party software, measured by the
+  [`shape`](../adr/shape-observer-component.md) component through `script/shape-survey`.
 
-**The five findings, for a reader who stops here:**
+§2–§4 read the two together by signal, §5 records the captures, §6 states what the numbers imply
+for today's constants, and §7 says how far to trust them.
+
+**The five findings:**
 
 1. **Per-event width is set by the signal, not the ecosystem.** Metric points are narrow (median
    0–2 labels for every scraped exporter measured, above 8 under 0.5% of the time; 5–7 where a
    series carries its own identity as labels — a tagged statsd line, a collectd value list, a
-   remote-write or cAdvisor series — with a ceiling of 10–11). Spans straddle the 8-slot boundary (desk typical 5–11, ceiling 14–17; measured median 8,
-   35% above 8, 14% above 16). Parsed structured logs sit above it — a request-log
+   remote-write or cAdvisor series — with a ceiling of 10–11). Spans straddle the 8-slot boundary
+   (desk typical 5–11, ceiling 14–17; measured median 8, 35% above 8, 14% above 16). Parsed structured logs sit above it — a request-log
    record of eight ordinary access fields (method, path, status, duration, …) landed at a median of
    9–14 top-level attributes through every JSON logging library measured, 99.9–100% of events above
    8 and none above 16, before any operator-added context.
 2. **Width comes from enrichment and identity, and the model already pays for that per batch.** A
-   bare SDK resource is 4–6 attributes in most languages (9 in Ruby, 12–15 from the Java agent); through one collector it measured 17 (median) to 29, and
-   the enrichment layers on offer go to 30–43 fixed names plus unbounded label maps. That cost
+   bare SDK resource is 4–6 attributes in most languages (9 in Ruby, 12–15 from the Java agent);
+   through one collector it measured 17 (median) to 29, and the enrichment layers on offer go to
+   30–43 fixed names plus unbounded label maps. That cost
    lands on `Resource`, shared by a batch whose median size was 5 events.
 3. **More than one metric per event is rare and shallow.** Live collectd with its default plugins:
    82.3% of events carry one metric, 17.4% two, 0.4% three, nothing more. Every other metric input
@@ -45,12 +46,12 @@ today's constants and stops there.
 
 ## 0. What these numbers can and can't tell you
 
-No production traffic was available to this survey. Every number here is one of: counted from a
+No production traffic was available to this survey. Every number here is counted from a
 producer's pinned source or specification, measured from real software run for the purpose, or
-cited from someone else's published figure. None is a sample of anyone's production. The grading in
-§1 exists so that limitation stays visible on every row instead of being stated once and forgotten.
+cited from someone else's published figure. None is a sample of anyone's production. §1 grades
+every row so that this limitation stays visible on each one.
 
-Three consequences worth holding onto while reading anything below:
+Keep three consequences in mind:
 
 - **A demo is not a deployment.** Instrumentation demos exercise every feature of every library at
   once and carry no operator-added context; real services are configured, enriched, and trimmed.
@@ -92,7 +93,7 @@ JSON access log with 12 fields arriving over syslog is a 12-field source shape a
 
 ### Grading
 
-Every row carries two grades.
+Every row carries two grades: fidelity and representativeness.
 
 | Fidelity | Meaning |
 |---|---|
@@ -159,21 +160,23 @@ and the shipper add.
 
 ### What lands in an `Event`
 
-Parsing is what widens a log. Straight off `tail_in` every library measured is **one** attribute
-(the file path) and a body of 280–470 bytes at the median; after `json` it is 9–14. The same holds
-for `syslog_in`, which stamps its own `syslog.*` attributes first (a median of 5 on the recorded
-producers) and then takes whatever `json` merges in on top. The two-tap measurement exists because
-of this — an input-side count says nothing about a log leg.
+Parsing is what widens a log, so an input-side count says nothing about a log leg; that is why log
+legs are measured at two taps. Straight off `tail_in`, every library measured is **one** attribute
+(the file path) and a body of 280–470 bytes at the median; after `json` it is 9–14. `syslog_in`
+behaves the same way: it stamps its own `syslog.*` attributes first (a median of 5 on the recorded
+producers), and `json` merges the parsed fields in on top.
 
-Two consequences of how `json` merges. It merges the **top level only**, so a nested object becomes
-a `Value::Map` — its own boxed `AttrMap` — rather than more top-level attributes. pino-http is the
-instructive case: its request serializers make the record *narrower* at the top (9 against bare
-pino's 14) and *deeper*, carrying four nested maps per event; the top-level count understates it and
-the nested-map count is where the cost went. And key-sets barely vary: every library produced two or
-three distinct key-sets over ~7,300 events, the most common one covering 96.7–97.3% of them — the
-second shape is the error line.
+How `json` merges has two consequences:
 
-Keys are short and values are not always. Measured key length is 4–9 bytes at the median for JSON
+- It merges the **top level only**, so a nested object becomes a `Value::Map`, its own boxed
+  `AttrMap`, rather than more top-level attributes. pino-http shows the effect: its request
+  serializers make the record *narrower* at the top (9 against bare pino's 14) and *deeper*, with
+  four nested maps per event. The top-level count understates its cost; the nested-map count shows
+  where the cost went.
+- Key-sets barely vary. Every library produced two or three distinct key-sets over ~7,300 events,
+  and the most common one covered 96.7–97.3% of them. The second shape is the error line.
+
+Keys are short; values are not always. Measured key length is 4–9 bytes at the median for JSON
 logs, 14 for OpenTelemetry log attributes, 11 for journald; values run 10–16 bytes at the median
 and 26–37 at p90, with a tail of user-agents and stack traces to 135–323 bytes, and one 6,103-byte
 value in the OpenTelemetry Demo's logs. Roughly half to three-quarters of values are strings.
@@ -220,11 +223,11 @@ carries **no** attributes at all: both agents bake identity into the dotted path
 is switched on. Label names are 3–7 bytes at the median and values 4–7 for exporters; collectd's
 identity keys are long (median 15) and its values short.
 
-Series *counts* are a different matter and are not settled here. A containerised node_exporter
+This survey does not settle series *counts*. A containerised node_exporter
 exposed 1,378 series against 3,034 for the fixture from a real host; kube-state-metrics and cAdvisor
 scale with object count (roughly 5–15 series per pod and 100–300 per container); one histogram
 family in the kubelet is 126 series. Cloudflare reports about 5 million series per Prometheus
-instance in production. Everything measured here is a floor on counts and is not a floor on label
+instance in production. Everything measured here is a floor on series counts, but not on label
 structure.
 
 ### Metrics per event
@@ -259,7 +262,7 @@ operator configures (four in this repository's own nginx example — an illustra
 | OpenTelemetry SDK export, no collector | median 3, p90 32, max 55 per (Resource, Scope) group | same | Measured / Default |
 | OpenTelemetry Demo collector export | median 5, p90 16, p99 50, max 309 | same | Measured / Demo |
 
-Client batching defaults do not converge: DogStatsD packs to 1,432 bytes over UDP and 8,192 over
+Client batching defaults disagree: DogStatsD packs to 1,432 bytes over UDP and 8,192 over
 UDS, pystatsd to 512 bytes, statsd-ruby batches by count (10), node-statsd not at all. All six
 OpenTelemetry SDKs read agree on a 512-record export batch over a 2,048 queue, flushing spans every
 5 s and logs every 1 s; the Collector's own batch processor defaults to 8,192. An OTLP batch as
@@ -287,8 +290,7 @@ medians are single digits against a 512-record export.
 | dd-trace, web and DB spans | 4 · 8–9 · 13–15 and 3 · 5–9 · 10 — the same band as the OpenTelemetry instrumentations | Counted / Default |
 | **OpenTelemetry Demo, all services** | **n = 114,551: p50 8, p90 17, max 18; > 8 35.0%, > 12 23.7%, > 16 14.4%**; per-service medians from 1 to 14 | Measured / Demo |
 
-Spans are the signal that straddles today's inline boundary, and they do it bimodally rather than
-around a mean: a request is many narrow spans (a database call, a middleware layer, an
+Spans straddle today's inline boundary bimodally, not around a mean: a request is many narrow spans (a database call, a middleware layer, an
 `active_record` method with nothing on it) and one or two wide ones (the HTTP server span, whose
 ceiling under default configuration is 14–17 in every language with a stated maximum — Python
 and JS 14, Java and Go 16, .NET 17, the measured maximum 18 — because they share one convention). The static-to-runtime
@@ -391,9 +393,9 @@ body. Two substitutions are recorded in the run's provenance: semantic_logger st
 with lograge, and the Django app uses sqlite rather than Postgres — which is why its database span
 reads 2 attributes. The Django leg's span, resource and batch figures are in §4 and §3.
 
-One hazard met on the way is worth keeping: passing pino-http its destination as the first argument
-silently drops its serializers, and the record then carries kilobytes of raw socket internals. A
-single misconfiguration is all it takes to produce a pathologically wide event.
+One hazard found during the capture: passing pino-http its destination as the first argument
+silently drops its serializers, and the record then carries kilobytes of raw socket internals. One
+misconfiguration is enough to produce a pathologically wide event.
 
 ### 5.4 `oteldemo` — the OpenTelemetry Demo
 
@@ -431,8 +433,8 @@ lifted from it) attributes, in line with the Counted rows for those formats in �
 
 ## 6. What this says about today's constants
 
-Implications, stated so a later decision can cite them. None of this decides anything; the sizing
-ADR is follow-up 1 in §7.
+These implications are stated so that a later decision can cite them. None of them decides
+anything; the sizing ADR is follow-up 1 in §7.
 
 **`AttrMap`, 8 inline slots on every `Event`.** Read per archetype, as the share of events whose
 top-level attributes exceed a given inline capacity:
@@ -483,9 +485,9 @@ top-level attributes exceed a given inline capacity:
   price: about 12 attributes with 8-byte keys and 12-byte values for a JSON log; 8 with 14-byte keys
   for a span; 0–2 with 5-byte keys for a scraped series.
 
-**`MetricList`, 1 inline slot.** For `otlp_in`, `prometheus_in`, `statsd_in` and `graphite_in` every
-event carries exactly one metric by construction, so one slot is never exceeded. For `collectd_in` it spills on 17.7% of events under a default plugin
-set, never past three records. For `kv_metrics` the answer is the operator's configuration. Growing
+**`MetricList`, 1 inline slot.** For `otlp_in`, `prometheus_in`, `statsd_in`, and `graphite_in`,
+every event carries exactly one metric by construction, so one slot is never exceeded. For
+`collectd_in` it spills on 17.7% of events under a default plugin set, never past three records. For `kv_metrics` the answer is the operator's configuration. Growing
 it costs 224 bytes a slot on every event to save an allocation on a minority of one input's events;
 whether `otlp_in` *should* group a scope's points onto one event is a separate design question the
 wire data does not force (a collector export's (Resource, Scope) group had a median of 5 events).
@@ -498,19 +500,23 @@ median and 4 at the maximum, so its inline attribute capacity is almost entirely
 
 **Interner and `KeyCache`.** Distinct keys per leg were 0–29 for every homogeneous source (0 on
 carbon plaintext, 1 for a blackbox probe, 6–22 for the other agents and exporters, 10–17 for a
-logging library, 29 for the Django app), 83 for node_exporter, and 264 on the mixed OTLP gateway — against a per-component `KeyCache` of 64 entries.
-No measured key exceeded 41 bytes, well inside its 128-byte cap.
+logging library, 29 for the Django app), 83 for node_exporter, and 264 on the mixed OTLP gateway,
+against a per-component `KeyCache` of 64 entries. No measured key exceeded 41 bytes, well inside
+its 128-byte cap.
 
 **Batching defaults.** Wire batches measured from 1 (carbon, unbuffered statsd) through about 30
 (collectd), 440–480 (a Telegraf flush), to 1,378 (one node_exporter scrape). Only the scrape exceeds
 `batch_max_events: 1000`, and it bypasses the accumulator.
 
 **Fixtures.** `crates/logit-bench`'s hand-modelled shapes hold up better than their caveats suggest:
-the sshd shape (6) sits inside the measured syslog range; the statsd shape (3 tags) is on the low
-side of the recorded clients' 0–8 (median 6 on a tagged line, once the decoder's own `statsd.*`
-carriers are counted); and the
-"modelled on pino, no live process captured" wide-JSON shape (32) is wider than any library measured
-(9–15) — it is an access-log or audit-log width, not an application-log one. There is no fixture for
+
+- The sshd shape (6) sits inside the measured syslog range.
+- The statsd shape (3 tags) is on the low side of the recorded clients' 0–8 (median 6 on a tagged
+  line, once the decoder's own `statsd.*` carriers are counted).
+- The "modelled on pino, no live process captured" wide-JSON shape (32) is wider than any library
+  measured (9–15). It is an access-log or audit-log width, not an application-log one.
+
+There is no fixture for
 the commonest measured log shape (12 flat string attributes), for a span at the 16–17 ceiling, or
 for a nested-map record.
 
@@ -529,10 +535,10 @@ plus every row the synthesis leans on hardest — with instructions not to trust
 | OpenTelemetry (Java, Go, .NET, Rust); infrastructure logs | 32 | 26 | 3 | 2 |
 
 About 83% confirmed exactly (one row could not be checked). Most errors were counts off by one to
-four or a mislabel; the larger ones were a subtotal reported as a total (25 for 30), a transposed
+four, or a mislabel. The larger ones were a subtotal reported as a total (25 for 30), a transposed
 table cell (98 for 9), a default that had moved between the docs and the pinned source (8 MiB for
-20), and a limit that no longer exists. None changed a headline, and every correction is applied and listed in the appendix. Two claims two tracks
-disagreed on were settled against source: Rust `tracing`'s 32-field cap was removed in 2023, and the
+20), and a limit that no longer exists. None changed a headline, and the appendix applies and lists
+every correction. Two claims that two tracks disagreed on were settled against source: Rust `tracing`'s 32-field cap was removed in 2023, and the
 HTTP server span count differs between two revisions of the conventions six weeks apart (opt-in
 attributes grew from 11 to 13). The least-checked rows are the unsampled ones from the Python, JS
 and Ruby instrumentation track, whose parent review was lost to a tooling failure. A handful of
@@ -545,8 +551,7 @@ product-scoped figure.
 
 - **It is not production traffic.** Ten desk rows carry a Production grade, and only three of them
   describe per-event shape (one workstation's journald, one third-party pod scrape, one vendor's
-  observation); the captures are
-  defaults, documented configurations and a demo. Defaults are systematically narrower than
+  observation). The captures are defaults, documented configurations, and a demo. Defaults are systematically narrower than
   deployments, and every measured log width is explicitly a floor — no application fields, no
   shipper enrichment.
 - **The two archetypes with the widest shapes have no capture.** Edge and access-log streams
@@ -564,15 +569,15 @@ product-scoped figure.
 
 ### Follow-ups
 
-Decisions and builds this data is for:
+Decisions and builds this data serves:
 
 1. **An ADR on `AttrMap` and `MetricList` sizing.** **Done for `AttrMap`, 2026-09-21:**
    [ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md) —
    8 stays, measured on both sides on the perf VM, and pre-sizing the spill was built and measured
-   *slower* end to end (`performance.md` §8). `MetricList` remains open. As first framed, §6 frames it: the candidates are keeping 8, a
-   larger constant, no inline storage, a per-batch arena, and a shared-key layout; measured with the
-   allocation pins and `script/perf`, on benchmarks that clone, across the bimodal population rather
-   than one shape.
+   *slower* end to end (`performance.md` §8). `MetricList` remains open. As §6 first framed the
+   question, the candidates are keeping 8, a larger constant, no inline storage, a per-batch arena,
+   and a shared-key layout, each measured with the allocation pins and `script/perf`, on benchmarks
+   that clone, across the bimodal population rather than one shape.
 2. **Survey-derived fixtures and perf scenarios** (**done**, `crates/logit-bench/src/fixtures.rs` and
    `perf/scenarios/json-parse-{app,nested,access}-log.yaml`) at the measured medians and tails: a 12-attribute
    flat JSON log, a pino-http-style nested record, a 16–17-attribute server span, a 30-field
@@ -583,7 +588,7 @@ Decisions and builds this data is for:
    could share back — the only route to production-derived numbers this project is likely to have.
 5. **Whether `otlp_in` should group a scope's points onto one event**, informed by §3's batch data.
 
-Deep dives this pass turned up, ranked by value for the effort:
+Deep dives this survey turned up, ranked by value for the effort:
 
 1. **Run VRL's `objectmap_cliff` benchmark** from the open flat-map proposal — a peer's directly
    comparable measurement of the same question, whose per-width numbers the proposal only summarises.

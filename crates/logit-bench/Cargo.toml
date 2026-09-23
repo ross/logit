@@ -28,7 +28,7 @@ bytes.workspace = true
 prost.workspace = true
 serde.workspace = true
 # The native-wire-format bake-off's other two arms (docs/design/wire-protocol.md's "Encoding:
-# decide with a benchmark, not up front", docs/adr/native-wire-format-encoding.md). Both serialize
+# decided — hand-rolled", docs/adr/native-wire-format-encoding.md). Both serialize
 # `bakeoff::wire_mirror::WireBatch`, a plain-data mirror of `EventBatch` -- never the shipped
 # `logit_proto::native` codec, which is hand-rolled either way. `logit-bench` ships in nothing (see
 # this crate's own module doc), so these live in `[dependencies]` rather than `[dev-dependencies]`

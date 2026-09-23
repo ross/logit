@@ -6,9 +6,9 @@
 //! **This is the same format for a socket and a file.** [`NativeEncoder`]/[`NativeDecoder`]
 //! implement the ordinary [`crate::Encoder`]/[`crate::Decoder`] traits every other codec in this
 //! crate does -- nothing here assumes a connection; [`crate::frame::write_frame`]/`read_frame`
-//! work identically appending to a file. A durable buffer or a `logit_in`/`logit_out` transport
-//! (both future work, `docs/design/wire-protocol.md`'s connection protocol) both build on exactly
-//! this module, unmodified.
+//! work identically appending to a file. The `buffer.disk:` spool and the `logit_in`/`logit_out`
+//! transport (`docs/design/wire-protocol.md`'s "Buffering" and "Connection protocol") both build
+//! on exactly this module, unmodified.
 //!
 //! **Correctness rules this module exists to uphold** (`docs/design/wire-protocol.md`,
 //! `docs/design/data-model.md`):

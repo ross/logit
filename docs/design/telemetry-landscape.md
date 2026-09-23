@@ -1,16 +1,14 @@
 # Telemetry landscape survey
 
-A reference, not a plan: what each wire protocol `logit` implements or has stated an intent to
-implement ([`docs/OVERVIEW.md`](../OVERVIEW.md)'s "Ingest"/"Emit" scope) can actually express, per
-signal, so [ADR `lossless-transit`](../adr/lossless-transit.md)'s "the internal model is a superset
-of every supported protocol" has concrete edges to check against instead of being argued from
-memory each time a new codec needs a decision. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)
-is where today's model and codecs get assessed against the matrices here and a target model gets
-proposed — this document only describes the protocols themselves.
+What each wire protocol `logit` implements or intends to implement
+([`docs/OVERVIEW.md`](../OVERVIEW.md)'s "Ingest"/"Emit" scope) can express, per signal. It gives
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s rule, "the internal model is a superset of
+every supported protocol", concrete edges to check a new codec against. This document describes
+only the protocols. [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md) assesses
+`logit`'s model and codecs against these matrices.
 
-Every field list below was checked against the protocol's own specification or reference
-implementation at the URL given; where a detail couldn't be verified from a primary source it says
-so explicitly rather than presenting a guess as fact.
+Every field list was checked against the protocol's specification or reference implementation at
+the URL given. A detail that couldn't be verified from a primary source says so.
 
 ## Metrics
 
@@ -23,10 +21,9 @@ Reference: <https://github.com/statsd/statsd/blob/master/docs/metric_types.md>.
 - **Types:** `c` (counter, `@rate` optional), `g` (gauge — absolute; a leading `+`/`-` is a
   *relative* adjustment, not a negative absolute value), `ms` (timer — the server derives
   count/mean/sum/upper/lower and configured percentiles), `s` (set — cardinality of distinct
-  string values seen), `h` (histogram, several server implementations treat this as an alias of
-  `ms`).
-- No tags, no unit, no explicit timestamp, no per-point metadata. Identity is the metric name
-  alone; multiple metrics in one datagram are newline-separated, each fully self-contained.
+  string values seen), `h` (histogram; several servers treat it as an alias of `ms`).
+- No tags, unit, explicit timestamp, or per-point metadata. The metric name alone is the identity.
+  Each newline-separated metric in a datagram is self-contained.
 
 ### DogStatsD
 
@@ -42,13 +39,13 @@ Superset of statsd's grammar: `<name>:<value>[:<value>...]|<type>|@<rate>|#<tag>
 - **Sample rate `@rate`:** valid on `c`, `ms`, `h`, `d` — explicitly *not* applied to `g` or `s`.
 - **Container ID `|c:<id>`** (v1.2+): appended after tags; v1.4+ adds prefixed variants
   `c:ci-<container-id>` / `c:in-<cgroup-inode>` for the same slot.
-- **Timestamp `|T<unix-seconds>`** (v1.3+): only valid on `c` and `g` — explicitly not aggregated
-  by the receiving agent when present (each point is submitted as its own instant).
-- **Events:** `_e{<title-utf8-len>,<text-utf8-len>}:<title>|<text>|d:<ts>|h:<host>|p:<priority>|t:<alert_type>|#<tags>`
-  (also `k:<aggregation_key>` and `s:<source_type_name>`, order among the optional pipe-segments
-  not fixed by the format beyond `_e{...}:` leading and title/text following the first `|`).
-- **Service checks:** `_sc|<name>|<status 0-3: OK/WARNING/CRITICAL/UNKNOWN>|d:<ts>|h:<host>|#<tags>|m:<message>` —
-  the message segment must be last if present, since its value can itself contain `|`.
+- **Timestamp `|T<unix-seconds>`** (v1.3+): valid only on `c` and `g`. The receiving agent doesn't
+  aggregate a timestamped point; it submits each as its own instant.
+- **Events:** `_e{<title-utf8-len>,<text-utf8-len>}:<title>|<text>|d:<ts>|h:<host>|p:<priority>|t:<alert_type>|#<tags>`,
+  plus `k:<aggregation_key>` and `s:<source_type_name>`. The format fixes only that `_e{...}:`
+  leads and title/text follow the first `|`; the optional pipe-segments can come in any order.
+- **Service checks:** `_sc|<name>|<status 0-3: OK/WARNING/CRITICAL/UNKNOWN>|d:<ts>|h:<host>|#<tags>|m:<message>`.
+  The message segment, if present, must be last, because its value can contain `|`.
 
 ### OTLP metrics
 
@@ -69,14 +66,14 @@ oneofs:
   `negative` bucket sets each as `(offset, []bucket_counts)` (sparse, geometrically spaced), plus
   `count`, optional `sum`/`min`/`max`.
 - **`Summary{data_points: []SummaryDataPoint}`** — pre-computed `quantile_values: []{quantile,
-  value}`, plus `count` and `sum` (no temporality concept — a summary is inherently a point-in-time
-  computation over the exporter's own window).
+  value}`, plus `count` and `sum`. No temporality: a summary is a point-in-time computation over
+  the exporter's own window.
 
-Every data point (all five types) carries `attributes`, `start_time_unix_nano`,
+Every data point of all five types carries `attributes`, `start_time_unix_nano`,
 `time_unix_nano`, `flags` (bit 0 = `DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK`, "this point is
 explicitly absent, not zero"), and `exemplars: []Exemplar{value: double|int, time_unix_nano,
-filtered_attributes, trace_id?, span_id?}`. `NumberDataPoint.value` is `oneof{as_double, as_int}` —
-OTLP has both integer and float wire representations. Batches nest as
+filtered_attributes, trace_id?, span_id?}`. `NumberDataPoint.value` is `oneof{as_double, as_int}`,
+so OTLP has both integer and float wire representations. Batches nest as
 `ResourceMetrics{resource{attributes, dropped_attributes_count}, schema_url,
 scope_metrics: []ScopeMetrics{scope{name, version, attributes, dropped_attributes_count},
 schema_url, metrics}}`.
@@ -88,10 +85,9 @@ References: <https://prometheus.io/docs/instrumenting/exposition_formats/>,
 
 Text format: `# HELP <name> <description>`, `# TYPE <name> <type>`, then
 `<name>{label="value",...} <float value> [<timestamp ms>]` lines per sample. The timestamp unit
-differs by dialect: text 0.0.4's is an integer count of milliseconds since the epoch, while
-OpenMetrics's `Timestamp` (and its `_created` series) is Unix epoch time in **float seconds** —
-the two are not interchangeable digit-for-digit, a detail a codec crossing between them has to
-convert rather than reinterpret.
+differs by dialect: text 0.0.4 uses integer milliseconds since the epoch, while OpenMetrics's
+`Timestamp` (and its `_created` series) uses **float seconds**. A codec crossing between them must
+convert the value, not reinterpret its digits.
 
 - **Types:** `counter` (with a companion `_total` suffix and, in OpenMetrics, an optional
   `_created` timestamp series), `gauge`, `histogram` (`_bucket{le="<bound>"}` cumulative counts
@@ -102,50 +98,53 @@ convert rather than reinterpret.
   distribution sampled from a gauge).
 - **Exemplars** (OpenMetrics): `# {trace_id="...",...} <value> <timestamp>` trailing a bucket or
   counter line.
-- **Native histograms** (Prometheus-specific extension to the protobuf exposition format, not
-  plaintext): sparse exponential bucketing structurally identical in spirit to OTLP's
-  `ExponentialHistogram` — `schema` (resolution), `zero_threshold`, `zero_count`, sparse
-  positive/negative spans+deltas, plus a float-count variant for pre-aggregated inputs.
-- Labels are always string-valued; a metric name plus its label set is the series identity, exactly
-  OTLP's `(name, attributes)` shape.
+- **Native histograms** (a Prometheus extension to the protobuf exposition format, absent from
+  plaintext): sparse exponential bucketing, the same idea as OTLP's `ExponentialHistogram` —
+  `schema` (resolution), `zero_threshold`, `zero_count`, sparse positive/negative spans+deltas,
+  plus a float-count variant for pre-aggregated inputs.
+- Labels are always strings. A metric name plus its label set is the series identity, the same
+  shape as OTLP's `(name, attributes)`.
 
 ### Prometheus remote-write
 
 References: <https://prometheus.io/docs/specs/remote_write_spec/> (1.0),
-<https://prometheus.io/docs/specs/remote_write_spec_2_0/> (2.0). Both versions are **supported** —
-`prometheus_in`'s `bind:` receives them on one listener and `prometheus_out`'s `endpoint:` sends
-either under an explicit `version:` — over the same `MetricFamily` seam the exposition codec uses;
-see [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md) for `logit`'s model mapping,
-its timestamp-group decomposition, and its permitted normalizations. **Native histograms are the
-one part of the format `logit` does not map**: skipped and counted in both directions, deferred to
-a follow-up (`docs/known-gaps.md`).
+<https://prometheus.io/docs/specs/remote_write_spec_2_0/> (2.0).
+
+`logit` supports both versions over the same `MetricFamily` seam the exposition codec uses:
+`prometheus_in`'s `bind:` receives either on one listener, and `prometheus_out`'s `endpoint:` sends
+the one set by an explicit `version:`. **`logit` doesn't map native histograms**, the one part of
+the format it skips; they're counted in both directions and deferred to a follow-up
+(`docs/known-gaps.md`). [ADR `prometheus-remote-write`](../adr/prometheus-remote-write.md) has the
+model mapping, the timestamp-group decomposition, and the permitted normalizations.
 
 1.0: `WriteRequest{timeseries: []TimeSeries{labels, samples: []{value, timestamp_ms}, exemplars,
-histograms}, metadata}`. 2.0 replaces this with `io.prometheus.write.v2.Request`, whose headline
-changes are a deduplicated **symbol table** (every label/metadata string in the request is
-interned once and referenced by index — a wire-efficiency change, not a semantic one), a
-`Metadata{type, help, unit}` message attached per series rather than out-of-band, first-class
-**native histogram** samples in the wire format itself (the `schema`/`zero_count`/
-`zero_threshold`/positive-negative-spans shape above), a `created_timestamp` per series, and
-per-series `Exemplar` support. Semantically remote-write is a transport for exactly what the
-exposition/OpenMetrics format already describes — it doesn't add new metric semantics beyond
-native histograms.
+histograms}, metadata}`. 2.0 replaces it with `io.prometheus.write.v2.Request`, which adds:
+
+- A deduplicated **symbol table**: each label or metadata string in the request is interned once
+  and referenced by index. This changes wire efficiency, not semantics.
+- A `Metadata{type, help, unit}` message per series, instead of out-of-band.
+- First-class **native histogram** samples (the `schema`/`zero_count`/
+  `zero_threshold`/positive-negative-spans shape above).
+- A `created_timestamp` per series, and per-series `Exemplar` support.
+
+Apart from native histograms, remote-write adds no metric semantics; it transports what the
+exposition/OpenMetrics format already describes.
 
 ### InfluxDB line protocol
 
 Reference: <https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/>.
-(`logit`'s `influxdb_out` is egress-only — no `influxdb_in` exists — so this is a target for
-egress fidelity, not a like-to-like pair under [ADR `lossless-transit`](../adr/lossless-transit.md).)
+`logit` has `influxdb_out` but no `influxdb_in`, so this is a target for egress fidelity, not a
+like-protocol pair under [ADR `lossless-transit`](../adr/lossless-transit.md).
 
 `<measurement>[,<tag_key>=<tag_value>...] <field_key>=<field_value>[,<field_key>=<field_value>...] [<timestamp>]`.
 
-- No metric *kind* at all — a field is just a typed value (`1.0` float, `1i` signed 64-bit,
-  `1u` unsigned 64-bit, `"text"` string, `true`/`t`/`false`/`f` boolean); "this is a counter" vs.
-  "this is a gauge" is purely a convention the writer and reader agree on out of band.
-  Multiple fields may share one point (one timestamp, one tag set).
-- Tag values are always strings; comma, equals sign, and space are escaped with a backslash in
-  measurement names, tag keys/values, and field keys; double quote and backslash are escaped in
-  string field values. Timestamp precision is configurable per write, nanoseconds by default.
+- No metric *kind*. A field is a typed value (`1.0` float, `1i` signed 64-bit, `1u` unsigned
+  64-bit, `"text"` string, `true`/`t`/`false`/`f` boolean); whether it's a counter or a gauge is a
+  convention the writer and reader agree on out of band. Multiple fields can share one point (one
+  timestamp, one tag set).
+- Tag values are always strings. A backslash escapes comma, equals sign, and space in measurement
+  names, tag keys and values, and field keys, and escapes double quote and backslash in string
+  field values. Timestamp precision is set per write; the default is nanoseconds.
 
 ### collectd binary/network protocol
 
@@ -153,45 +152,54 @@ Reference: <https://github.com/collectd/collectd/wiki/Binary-protocol>. See
 [ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md) for `logit`'s `collectd_in`/
 `collectd_out` model mapping, attribute convention, and permitted normalizations.
 
-A stream of TLV "parts": `type u16 BE, len u16 BE` (`len` includes the 4-byte header). Strings are
-NUL-terminated (`len = 4 + n + 1`); numeric parts are a single `u64` BE (`len = 12`). Identity parts
-precede value parts and are **sticky within one datagram** — a `Host`/`Plugin`/etc. part applies to
-every `Values` part that follows it until replaced, so a sender may elide a string part that hasn't
-changed since the last one it wrote, and the receiver keeps the last value it saw. Part types:
-`Host` (0x0000, string), `Time` (0x0001, unix seconds) and, v5.0+, `TimeHR` (0x0008, higher-resolution
-time in 2⁻³⁰-second units — "cdtime" — instead of a float, avoiding floating-point time arithmetic),
-`Plugin`/`PluginInstance` (0x0002/0x0003, string, e.g. `"cpu"`/`"1"`), `Type`/`TypeInstance`
-(0x0004/0x0005, string, e.g. `"cpu"`/`"idle"`), `Values` (0x0006), `Interval` (0x0007, seconds) /
-`IntervalHR` (0x0009, cdtime) — the sender writes `TimeHR`/`IntervalHR` unconditionally per value
-list, never the legacy pair. `Message` (0x0100) and `Severity` (0x0101, one of 1 FAILURE/2 WARNING/
-4 OKAY) carry a notification instead of a metric value, sent in the order TimeHR, Severity, Host,
-Plugin, PluginInstance, Type, TypeInstance, Message; a receiver drops one with severity outside
-`{1,2,4}`, time `0`, or an empty message, and `NOTIF_MAX_MSG_LEN` is 256. `Signature` (0x0200) and
-`Encryption` (0x0210) optionally wrap the remainder of the payload; not a value-semantics concern on
-their own, but a receiver that can't verify/decrypt has nothing further to parse.
+A stream of TLV "parts": `type u16 BE, len u16 BE`, where `len` includes the 4-byte header. Strings
+are NUL-terminated (`len = 4 + n + 1`); numeric parts are a single `u64` BE (`len = 12`). Identity
+parts precede value parts and are **sticky within one datagram**: a `Host`/`Plugin`/etc. part
+applies to every following `Values` part until replaced. A sender can therefore elide a string part
+that hasn't changed since the last one it wrote, and the receiver keeps the last value it saw.
+
+Part types:
+
+- `Host` (0x0000, string).
+- `Time` (0x0001, unix seconds) and, v5.0+, `TimeHR` (0x0008): time in 2⁻³⁰-second units
+  ("cdtime"), which avoids floating-point time arithmetic.
+- `Plugin`/`PluginInstance` (0x0002/0x0003, string, e.g. `"cpu"`/`"1"`) and `Type`/`TypeInstance`
+  (0x0004/0x0005, string, e.g. `"cpu"`/`"idle"`).
+- `Values` (0x0006); layout below.
+- `Interval` (0x0007, seconds) / `IntervalHR` (0x0009, cdtime). The sender always writes
+  `TimeHR`/`IntervalHR` per value list, never the legacy pair.
+- `Message` (0x0100) and `Severity` (0x0101, one of 1 FAILURE/2 WARNING/4 OKAY) carry a
+  notification instead of a metric value, sent in the order TimeHR, Severity, Host, Plugin,
+  PluginInstance, Type, TypeInstance, Message. A receiver drops a notification with severity
+  outside `{1,2,4}`, time `0`, or an empty message. `NOTIF_MAX_MSG_LEN` is 256.
+- `Signature` (0x0200) and `Encryption` (0x0210) optionally wrap the rest of the payload. They don't
+  affect value semantics, but a receiver that can't verify or decrypt has nothing further to parse.
+
+Behavior:
 
 - **`Values` layout**: `u16 count`, then `count` one-byte data-source-type tags, then `count`
-  8-byte values — `len == 6 + 9*count` (2-byte count + `count` type bytes + `count*8` value bytes,
-  plus the 4-byte part header). Each a fixed-width wire value: `COUNTER` (u64, network/big-endian,
-  semantics: wraps on overflow — a monotonic counter with no OTLP-style explicit temporality flag,
-  delta is computed downstream by differencing), `GAUGE` (f64, **little-endian**, the one value type
-  not in network byte order), `DERIVE` (i64, network byte order — a signed monotonic-or-not counter,
-  collectd's answer to "a counter that can also decrease or reset without wrapping"), `ABSOLUTE`
-  (u64, network byte order — a counter reset to the reported value on every read, e.g. a queue
-  depth sampled destructively).
-- **Sender behavior** (`add_to_buffer`): elides only the five string identity parts versus what it
-  last wrote to the packet; packs value lists to `MaxPacketSize` (default **1452** bytes, matching a
-  typical Ethernet MTU after IP/UDP headers on a slightly-tunneled path), flushing and starting a new
-  packet when a list wouldn't fit. Default port 25826; default multicast groups `239.192.74.66` (v4)
-  / `ff18::efc0:4a42` (v6).
-- **Receiver behavior** (`network_dispatch_values`): rejects a value list outright (`-EINVAL`) when
-  its time is `0` or its host/plugin/type string is empty; `plugin_dispatch_values` separately
-  rejects a type not present in its configured `types.db`, or a value count that doesn't match that
-  type's declared data-source count. `escape_slashes` turns a literal `/` into `_` in every identity
-  string, since several collectd write plugins treat these fields as filesystem-adjacent.
-  `DATA_MAX_NAME_LEN` is 128 bytes (127 plus the trailing NUL); `parse_part_string` fails, and the
-  parser abandons the rest of the packet (value lists already dispatched from earlier parts stand), if a
-  string part overflows that bound or lacks its terminating NUL.
+  8-byte values, so `len == 6 + 9*count` (2-byte count + `count` type bytes + `count*8` value bytes,
+  plus the 4-byte part header). The four value types:
+  - `COUNTER`: u64, network (big-endian) byte order. Wraps on overflow: a monotonic counter with
+    no OTLP-style temporality flag; consumers compute the delta by differencing.
+  - `GAUGE`: f64, **little-endian**, the one value type not in network byte order.
+  - `DERIVE`: i64, network byte order. A signed counter that can also decrease or reset without
+    wrapping.
+  - `ABSOLUTE`: u64, network byte order. A counter reset to the reported value on every read, such
+    as a queue depth sampled destructively.
+- **Sender behavior** (`add_to_buffer`): elides only the five string identity parts, compared with
+  what it last wrote to the packet. Packs value lists up to `MaxPacketSize` (default **1452** bytes,
+  a typical Ethernet MTU after IP/UDP headers on a slightly tunneled path), and starts a new packet
+  when a list wouldn't fit. Default port 25826; default multicast groups `239.192.74.66` (v4) /
+  `ff18::efc0:4a42` (v6).
+- **Receiver behavior** (`network_dispatch_values`): rejects a value list (`-EINVAL`) when its time
+  is `0` or its host, plugin, or type string is empty. `plugin_dispatch_values` also rejects a type
+  missing from its configured `types.db`, or a value count that doesn't match that type's declared
+  data-source count. `escape_slashes` turns a literal `/` into `_` in every identity string,
+  because several collectd write plugins use these fields in file paths. `DATA_MAX_NAME_LEN` is 128
+  bytes (127 plus the trailing NUL). If a string part exceeds that bound or lacks its NUL,
+  `parse_part_string` fails and the parser abandons the rest of the packet; value lists already
+  dispatched from earlier parts stand.
 
 ### Graphite
 
@@ -199,25 +207,27 @@ References: <https://graphite.readthedocs.io/en/latest/feeding-carbon.html> (pla
 <https://graphite.readthedocs.io/en/latest/tags.html> (tags). `logit`'s relay:
 [ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md).
 
-Plaintext: `<path> <value> <timestamp>`, one per line, `path` a dot-separated hierarchy
-(`servers.web01.cpu.idle`). No kind, no explicit metadata — retention and aggregation function
+Plaintext: `<path> <value> <timestamp>`, one per line, where `path` is a dot-separated hierarchy
+(`servers.web01.cpu.idle`). No kind and no explicit metadata: retention and aggregation function
 (sum/average/max/last) are configured server-side per path pattern, not carried on the wire.
-**Tagged** extension: `<path>;tag1=value1;tag2=value2 <value> <timestamp>` — tag names forbid
-`;`, `!`, `^`, `=`; tag values forbid `;` and a leading `~`; Carbon normalizes tag order on
+**Tagged** extension: `<path>;tag1=value1;tag2=value2 <value> <timestamp>`. Tag names forbid
+`;`, `!`, `^`, `=`; tag values forbid `;` and a leading `~`. Carbon normalizes tag order on
 ingest.
 
-A pickle-serialized batch protocol exists as a transport optimization over the same semantics, on
-its own port (2004, versus plaintext's 2003): each message is a 4-byte **big-endian** length
-prefix (Twisted's `Int32StringReceiver` framing) followed by exactly that many bytes of a pickled
-`[(path, (timestamp, value)), ...]` — a flat list of `(str, (number, number))` tuples, one per
-datapoint, in no particular grouping. Real senders (`carbon-relay`'s own pickle client, collectd's
-`write_graphite` plugin in `Protocol Pickle` mode) emit protocol 2 or `-1` (which resolves to the
-sender's highest available protocol); nothing in the field emits protocol 0 or 1 for this payload
-shape. Carbon's receiver treats `timestamp <= 0` specially: `-1` means "now" (the point is stamped
-with receipt time, not rejected), while `pickle.dumps`'s own float/int formatting is otherwise
-carried straight through. Both wire forms share one value rule: Carbon filters out NaN before
-storing it (a `nan` datapoint is silently dropped, never written to Whisper), and both share the
-same tag grammar given above regardless of which protocol carries the tagged path.
+Pickle is a batch transport with the same semantics, on its own port (2004; plaintext uses 2003).
+Each message is a 4-byte **big-endian** length prefix (Twisted's `Int32StringReceiver` framing)
+followed by exactly that many bytes of a pickled `[(path, (timestamp, value)), ...]`: a flat list
+of `(str, (number, number))` tuples, one per datapoint, in no particular grouping.
+
+- Real senders (`carbon-relay`'s own pickle client, collectd's `write_graphite` plugin in
+  `Protocol Pickle` mode) emit protocol 2 or `-1`, which resolves to the sender's highest available
+  protocol. Nothing in the field emits protocol 0 or 1 for this payload shape.
+- Carbon's receiver treats `timestamp <= 0` specially: `-1` means "now", so the point gets receipt
+  time instead of being rejected. Otherwise `pickle.dumps`'s float/int formatting passes straight
+  through.
+
+Both wire forms share the tag grammar above and one value rule: Carbon silently drops a `nan`
+datapoint and never writes it to Whisper.
 
 ### Metrics comparison matrix
 
@@ -256,11 +266,13 @@ same tag grammar given above regardless of which protocol carries the tagged pat
 
 Reference: <https://www.rfc-editor.org/rfc/rfc3164>.
 
-`<PRI>TIMESTAMP HOSTNAME TAG[PID]: MSG` — `PRI` is `<facility*8+severity>` (facility 0-23,
-severity 0-7); `TIMESTAMP` is `Mmm dd hh:mm:ss` with **no year and no timezone**; `HOSTNAME` and
-`TAG`/`PID` are conventional, not formally delimited (many real senders, `nginx` among them, omit
-HOSTNAME entirely); `MSG` is free text, historically ASCII but the RFC places no hard encoding
-requirement on it.
+`<PRI>TIMESTAMP HOSTNAME TAG[PID]: MSG`.
+
+- `PRI` is `<facility*8+severity>` (facility 0-23, severity 0-7).
+- `TIMESTAMP` is `Mmm dd hh:mm:ss`, with **no year and no timezone**.
+- `HOSTNAME` and `TAG`/`PID` are conventional, not formally delimited. Many real senders, `nginx`
+  among them, omit HOSTNAME entirely.
+- `MSG` is free text, historically ASCII; the RFC sets no hard encoding requirement.
 
 ### RFC 5424
 
@@ -274,11 +286,11 @@ Reference: <https://www.rfc-editor.org/rfc/rfc5424>.
   or NILVALUE `-` when unknown/undisclosed.
 - `STRUCTURED-DATA`: NILVALUE `-`, or one or more `SD-ELEMENT`s: `[SD-ID PARAM-NAME="PARAM-VALUE" ...]`.
   `SD-ID`/`PARAM-NAME` are 1-32 `PRINTUSASCII` characters excluding `=`, space, `]`, `"`; an
-  `SD-ID` may be `name@<private enterprise number>` for a vendor-specific element, or one of a
-  small set of IANA-registered names (`timeQuality`, `origin`, `meta`) with no PEN. `PARAM-VALUE`
-  is any UTF-8 string with `"`, `\`, `]` backslash-escaped; a PARAM-NAME may repeat within one
-  element (multi-valued parameters are legal). `MSG` may carry a leading UTF-8 BOM to signal
-  `MSG-UTF8`; without one, MSG-ANY permits arbitrary octets.
+  `SD-ID` is either `name@<private enterprise number>` for a vendor-specific element or one of a
+  few IANA-registered names (`timeQuality`, `origin`, `meta`) with no PEN. `PARAM-VALUE` is any
+  UTF-8 string with `"`, `\`, `]` backslash-escaped. A PARAM-NAME can repeat within one element,
+  so multi-valued parameters are legal.
+- `MSG`: a leading UTF-8 BOM signals `MSG-UTF8`; without one, MSG-ANY permits arbitrary octets.
 - Transports: RFC 5425 (TLS), RFC 5426 (plain UDP, one message per datagram), RFC 6587 (TCP,
   either octet-counting framing or non-transparent `\n`-delimited framing).
 
@@ -290,25 +302,25 @@ Reference: <https://github.com/open-telemetry/opentelemetry-proto/blob/main/open
 attributes, dropped_attributes_count, flags, trace_id, span_id, event_name}`.
 
 - `severity_number`: 24 levels in six named bands of four (`TRACE`=1-4, `DEBUG`=5-8, `INFO`=9-12,
-  `WARN`=13-16, `ERROR`=17-20, `FATAL`=21-24; `UNSPECIFIED`=0) — a producer can express fine
-  gradations within a band (`INFO2`=10) that a coarser 6-or-8-level scheme collapses.
-  `severity_text` is the source's own free-text label, independent of the numeric band.
-- `time_unix_nano == 0` means "unknown," distinct from the actual Unix epoch, per the field's own
-  spec comment; `observed_time_unix_nano` is when the collection pipeline itself saw the record,
-  which for an externally-sourced event (not originated by an OTel SDK) differs from `time_unix_nano`.
-- `body` is a full `AnyValue` — string, bytes, or a nested map/array — not text-only.
-- `flags`: low 8 bits are W3C trace flags (mirroring the log's own `trace_id`/`span_id`
-  correlation), upper 24 bits reserved.
-- `event_name`: a short, low-cardinality category identifier distinct from the free-text body —
-  "this record is an instance of event X," not the message itself.
+  `WARN`=13-16, `ERROR`=17-20, `FATAL`=21-24; `UNSPECIFIED`=0). A producer can express gradations
+  within a band (`INFO2`=10) that a coarser 6- or 8-level scheme collapses. `severity_text` is the
+  source's own free-text label, independent of the numeric band.
+- `time_unix_nano == 0` means "unknown", not the Unix epoch, per the field's spec comment.
+  `observed_time_unix_nano` is when the collection pipeline saw the record; for an event that
+  didn't originate in an OTel SDK, it differs from `time_unix_nano`.
+- `body` is a full `AnyValue` — string, bytes, or a nested map/array — not only text.
+- `flags`: the low 8 bits are W3C trace flags, mirroring the log's own `trace_id`/`span_id`
+  correlation; the upper 24 bits are reserved.
+- `event_name`: a short, low-cardinality category ("this record is an instance of event X"),
+  distinct from the free-text body.
 - Nests in `ResourceLogs{resource, schema_url, scope_logs: []ScopeLogs{scope, schema_url, log_records}}`,
-  identical shape to metrics/traces.
+  the same shape as metrics and traces.
 
 ### Files / Docker json-file (`tail_in`/`docker_in`'s wire shape)
 
-No spec — a convention. A line of text (or, for Docker's json-file driver, one JSON object per
-line: `{"log": "...", "stream": "stdout"|"stderr", "time": "<RFC3339Nano>"}`), an originating file
-path, and for Docker, which of the container's two streams it came from.
+No spec, only a convention: a line of text and the file path it came from. Docker's json-file
+driver writes one JSON object per line,
+`{"log": "...", "stream": "stdout"|"stderr", "time": "<RFC3339Nano>"}`, which adds which of the container's two streams the line came from.
 
 ### Logs comparison matrix
 
@@ -339,29 +351,29 @@ attributes, dropped_attributes_count}, dropped_events_count, links: []Link{trace
 trace_state, attributes, dropped_attributes_count, flags}, dropped_links_count,
 status: Status{message, code: UNSET|OK|ERROR}}`.
 
-- `kind`: `INTERNAL`, `SERVER`, `CLIENT`, `PRODUCER`, `CONSUMER` (`UNSPECIFIED` recommended to
-  decode as `INTERNAL`).
-- `trace_state`: the raw W3C `tracestate` header value — vendor-specific key=value pairs riding
-  alongside a trace, opaque to `logit`.
-- `flags` (on both `Span` and `Span.Link`): low 8 bits are W3C trace flags (bit 0 = sampled);
-  bits 8-9 record whether the span's parent context is known to be remote and, if so, whether it
-  actually was; bits 10-31 reserved. A `Span.Link`'s own `flags` describes the *linked* span's
-  context the same way.
-- Every attribute-bearing sub-message (`Span`, `Event`, `Link`) carries its own independent
-  `dropped_attributes_count`; `Span` additionally tracks `dropped_events_count`/`dropped_links_count`.
-- Nests identically to metrics/logs: `ResourceSpans{resource, schema_url, scope_spans: []ScopeSpans{scope, schema_url, spans}}`.
+- `kind`: `INTERNAL`, `SERVER`, `CLIENT`, `PRODUCER`, `CONSUMER`. The spec recommends decoding
+  `UNSPECIFIED` as `INTERNAL`.
+- `trace_state`: the raw W3C `tracestate` header value, vendor-specific key=value pairs that ride
+  alongside a trace and are opaque to `logit`.
+- `flags` (on both `Span` and `Span.Link`): the low 8 bits are W3C trace flags (bit 0 = sampled).
+  Bits 8-9 record whether the parent context is known to be remote and, if so, whether it was.
+  Bits 10-31 are reserved. A `Span.Link`'s `flags` describes the *linked* span's context the same
+  way.
+- Each attribute-bearing sub-message (`Span`, `Event`, `Link`) carries its own
+  `dropped_attributes_count`; `Span` also tracks `dropped_events_count`/`dropped_links_count`.
+- Nests the same way as metrics and logs: `ResourceSpans{resource, schema_url, scope_spans: []ScopeSpans{scope, schema_url, spans}}`.
 
 ### W3C Trace Context, Zipkin, Jaeger (reference only — not implemented as `logit` codecs)
 
 References: <https://www.w3.org/TR/trace-context/>, <https://zipkin.io/zipkin-api/>,
-<https://www.jaegertracing.io/docs/1.6/apis/>. `logit` already parses the W3C `traceparent`
-header format as an attribute convention (`docs/design/data-model.md`'s well-known attribute
-table) rather than as a separate wire codec. Zipkin's span model (`traceId`, `id`, `parentId`,
-`kind`, `name`, timestamps, `localEndpoint`/`remoteEndpoint`, `annotations`, `tags`) and Jaeger's
-(`traceID`, `spanID`, `operationName`, `references`, `tags`, `logs`) are both strict subsets of
-what OTLP's `Span` above already expresses — named here only to support the claim that OTLP is the
-superset among trace formats `logit` might ever need to bridge, not because either is a planned
-codec.
+<https://www.jaegertracing.io/docs/1.6/apis/>.
+
+`logit` parses the W3C `traceparent` header format as an attribute convention
+(`docs/design/data-model.md`'s well-known attribute table), not as a wire codec. Zipkin's span
+model (`traceId`, `id`, `parentId`, `kind`, `name`, timestamps, `localEndpoint`/`remoteEndpoint`,
+`annotations`, `tags`) and Jaeger's (`traceID`, `spanID`, `operationName`, `references`, `tags`,
+`logs`) are both strict subsets of OTLP's `Span`. Neither is a planned codec; they're listed to
+support the claim that OTLP is the superset among trace formats `logit` might bridge.
 
 ### Traces comparison matrix
 
@@ -378,8 +390,10 @@ codec.
 
 ## Superset requirements
 
-The properties [`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s target model is
-checked against, derived from the matrices above:
+These properties, derived from the matrices above, are what
+[`docs/plans/lossless-transit.md`](../plans/lossless-transit.md)'s target model is checked against.
+That plan's "Closing assessment" records how the landed model (2026-09-12) meets them and names
+the residual debt, which `docs/known-gaps.md` tracks.
 
 1. A metric point carries temporality (delta/cumulative) and monotonicity, and an optional series
    start time.

@@ -3,9 +3,8 @@
 //! See `docs/design/pipeline-graph.md`'s "Runtime model" and "Thread model" sections.
 //!
 //! Every component gets one inbox channel, created up front for the whole graph before any node
-//! is spawned -- unlike the design doc's "build in reverse topological order" framing, this
-//! doesn't actually need dependency ordering: a `Fanout` is just cloned `Sender`s into inboxes
-//! that already exist by construction, regardless of which node gets spawned first.
+//! is spawned, so spawning needs no dependency ordering: a `Fanout` is just cloned `Sender`s into
+//! inboxes that already exist by construction, regardless of which node gets spawned first.
 
 use crate::fanout::{BatchContext, Delivered, TraceContext};
 use crate::graph::{Graph, Role};

@@ -1,13 +1,13 @@
 # Internal data model
 
-This is the representation every input decodes into and every output encodes from, and the type
-Lua scripts operate on ([docs/design/lua-api.md](lua-api.md)). It has to represent logs, metrics,
-and traces uniformly, cheaply, and without losing the fields any of the target protocols need.
+Every input decodes into this model, every output encodes from it, and Lua scripts operate on it
+([docs/design/lua-api.md](lua-api.md)). It represents logs, metrics, and traces uniformly and
+cheaply, without losing any field a supported protocol needs.
 
 ## Top-level shape
 
-Events travel through the pipeline in **batches**, never individually — per-event channel sends and
-per-event allocation would dominate the profile at any interesting throughput.
+Events travel through the pipeline in **batches**, never individually, because per-event channel
+sends and allocations would dominate the profile at any real throughput.
 
 ```rust
 pub struct EventBatch {
@@ -25,27 +25,27 @@ pub struct Event {
 }
 ```
 
-**An event is whatever it carries, not a tagged one-of** ([ADR `multi-payload-events`](../adr/multi-payload-events.md)).
-An access log line is a log record and, once a transform like `kv_metrics` derives request/byte
-counts and latency from its fields, a source of several metrics at once — the same event, not two
-related-but-separate ones. `log`/`span` stay `Option` (an event can have at most one of each); an
-event with none of the three is legal and representable. A sink emits whatever it finds:
-`influxdb_out` writes every metric on an event and ignores its log/span.
+**An event is whatever it carries, not a tagged one-of**
+([ADR `multi-payload-events`](../adr/multi-payload-events.md)). An access log line is a log record,
+and once a transform like `kv_metrics` derives request/byte counts and latency from its fields, the
+same event also carries those metrics. An event has at most one `log` and one `span`, and an event
+with none of the three payloads is legal. A sink emits whatever it finds: `influxdb_out` writes
+every metric on an event and ignores its log and span.
 
-`Resource` is `Arc`-shared rather than copied onto every event — a batch typically comes from one
-socket/file/OTLP request and shares one origin. It's per-batch, not immutable, though: a transform
-or Lua script may substitute it for the batch currently in hand by minting a new `Arc`, the
-mechanism an operator uses to declare a resource identity `logit`'s own code won't invent on its
-own (`logit_pipeline::Transform::map_resource`,
+`Resource` is `Arc`-shared across the batch rather than copied onto every event, because a batch
+typically comes from one socket, file, or OTLP request with one origin. It is per-batch, not
+immutable: a transform or Lua script can replace it for the batch in hand by minting a new `Arc`.
+That is how an operator declares a resource identity that `logit`'s own code won't invent
+(`logit_pipeline::Transform::map_resource`,
 [ADR `operator-declared-resource-attributes`](../adr/operator-declared-resource-attributes.md)).
 
-**`Event` is 864 bytes**, and that size is paid unconditionally — a statsd counter with three tags
-costs exactly as much to move as a fully-populated nginx access log, because `AttrMap`'s inline
-capacity and `MetricKind`'s inlined `DDSketch`/`Samples` are reserved whether or not they're used. Since an
-event is moved by value on every hop between nodes and deep-cloned once per extra fan-out consumer,
-that number is a throughput property. [memory.md](memory.md) breaks it down term by term, measures
-what each pipeline stage allocates, and lists what could be reclaimed;
-`crates/logit-core/tests/type_sizes.rs` asserts it so it can't drift silently.
+**`Event` is 864 bytes, paid unconditionally.** A statsd counter with three tags costs as much to
+move as a fully populated nginx access log, because `AttrMap`'s inline capacity and `MetricKind`'s
+inlined `DDSketch`/`Samples` are reserved whether or not they're used. An event is moved by value on
+every hop between nodes and deep-cloned once per extra fan-out consumer, so its size is a
+throughput property. [memory.md](memory.md) breaks it down term by term, measures what each
+pipeline stage allocates, and lists what could be reclaimed.
+`crates/logit-core/tests/type_sizes.rs` asserts the size so it can't drift silently.
 
 ## Values
 
@@ -64,85 +64,81 @@ pub enum Value {
 }
 ```
 
-This is deliberately also the type the Lua API exposes ([docs/design/lua-api.md](lua-api.md)) —
-designing it twice would mean keeping two conversions in sync forever.
+The Lua API exposes this same type ([docs/design/lua-api.md](lua-api.md)), so there is no second
+value model to keep in sync.
 
-**`bytes::Bytes` everywhere strings and blobs appear.** A syslog line parsed out of a socket read
-buffer should end up as a zero-copy slice of that buffer, not a fresh allocation. `Bytes` is
-cheaply `Clone`-able (refcounted) and cheaply sliced, which both the parsing path and the Lua proxy
-depend on.
+**Strings and blobs are `bytes::Bytes` everywhere.** A syslog line parsed out of a socket read
+buffer ends up as a zero-copy slice of that buffer, not a fresh allocation. `Bytes` is cheap to
+`Clone` (refcounted) and to slice, which both the parsing path and the Lua proxy depend on.
 
-Measured, `syslog_in`, `json`, and `statsd_in` all keep that promise now: decoding a line costs one
-allocation (`statsd_in`: two, split across a per-line and a per-batch `Vec<Event>` by its
-multi-value grammar) regardless of how many fields, tag values, or set members it yields.
-`statsd_in`'s tag values, `|c:<id>`, and a `SetMembers` line's members are all zero-copy slices of
-the datagram, the same pointer-arithmetic reconstruction (`slice_of`) `syslog_in`'s own fields use.
-See [memory.md](memory.md)'s zero-copy section — pinned by tests, not left to inspection.
+`syslog_in`, `json`, and `statsd_in` each decode a line with one allocation, however many fields,
+tag values, or set members it yields. `statsd_in` takes two, a per-line and a per-batch
+`Vec<Event>`, because of its multi-value grammar. `statsd_in`'s tag values, `|c:<id>`, and a
+`SetMembers` line's members are zero-copy slices of the datagram, reconstructed by the same pointer
+arithmetic (`slice_of`) as `syslog_in`'s fields. Tests pin these counts; see
+[memory.md](memory.md)'s zero-copy section.
 
 ## Attributes: interned keys, small-map storage
 
-Attribute keys repeat enormously across telemetry — `host`, `env`, `service.name`, and so on appear
-on nearly every event. Two optimizations, both hard to retrofit once scripts and codecs depend on
-the shape:
+Attribute keys such as `host`, `env`, and `service.name` repeat on nearly every event. Two
+optimizations exploit that. Both are hard to retrofit once scripts and codecs depend on the shape:
 
-- **Interning.** A process-wide symbol table (`lasso::ThreadedRodeo` or equivalent) maps attribute
-  keys to `Symbol(u32)`. `AttrMap` then compares, hashes, and stores `u32`s instead of repeated
-  string allocations, and the same table backs the wire format's dictionary encoding
+- **Interning.** A process-wide symbol table (`lasso::ThreadedRodeo`) maps attribute keys to
+  `Symbol(u32)`. `AttrMap` compares, hashes, and stores `u32`s instead of repeated string
+  allocations, and the same table backs the wire format's dictionary encoding
   ([docs/design/wire-protocol.md](wire-protocol.md)).
-- **Small-map layout.** Most events carry well under a dozen attributes.
-  `AttrMap = SmallVec<[(Symbol, Value); 8]>`, kept sorted by `Symbol`, beats a `HashMap` at this
-  size for both lookup and iteration, and gives deterministic ordering for free — which matters for
-  the wire format's dictionary encoding and for reproducible tests.
+- **Small-map layout.** Most events carry well under a dozen attributes. At that size
+  `AttrMap = SmallVec<[(Symbol, Value); 8]>`, kept sorted by `Symbol`, beats a `HashMap` for both
+  lookup and iteration. It also gives a deterministic order, which the wire format's dictionary
+  encoding and reproducible tests rely on.
 
 ## Well-known attribute names
 
-`syslog_in` (`syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd`)
-and the OTLP codec (`otel.severity_number`/`otel.severity_text`) already stamp dotted, `service.name`-style attribute
-names as a convention rather than a typed field, when the data belongs on the event but doesn't
-rise to a core-model field of its own. `syslog.pid` may be `Value::Str` as well as `Value::U64`
-(RFC 5424's PROCID is free-form PRINTUSASCII, not necessarily numeric), and `syslog.timestamp` may
-be `Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str` — see
+When data belongs on an event but doesn't warrant a core-model field, a codec stamps it as a
+dotted, `service.name`-style attribute. `syslog_in` stamps
+`syslog.facility`/`.severity`/`.timestamp`/`.hostname`/`.tag`/`.pid`/`.msgid`/`.sd`, and the OTLP
+codec stamps `otel.severity_number`/`otel.severity_text`. `syslog.pid` may be `Value::Str` as well
+as `Value::U64`, because RFC 5424's PROCID is free-form PRINTUSASCII. `syslog.timestamp` may be
+`Value::Null` (a nil `-` RFC 5424 TIMESTAMP) as well as `Value::Timestamp`/`Value::Str`. See
 [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md).
 
-**OTLP severity is the OTLP instance of the same precedent `syslog.severity` already set** —
-`syslog_in`/`syslog_out` deliberately let the raw, protocol-native value outrank the normalized
-field on egress ([ADR `syslog-output`](../adr/syslog-output.md)'s "Header-field precedence",
-generalized into a repo-wide rule by [ADR `lossless-transit`](../adr/lossless-transit.md)'s rule
-(b)): OTLP's 24 raw severity numbers collapse onto this model's 6-variant `Severity` on decode, so
-the raw value rides alongside the normalized one and wins on the way back out.
+**The raw, protocol-native value rides alongside the normalized field and wins on the way back
+out.** `syslog_in`/`syslog_out` set this precedent for `syslog.severity`
+([ADR `syslog-output`](../adr/syslog-output.md)'s "Header-field precedence"), and
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s rule (b) makes it a repo-wide rule. OTLP
+severity follows it: OTLP's 24 raw severity numbers collapse onto this model's 6-variant `Severity`
+on decode, so the raw number travels as an attribute.
 
 | Attribute | Value | Meaning |
 |---|---|---|
-| `otel.severity_number` | `Value::I64`, `1..=24` | Stamped by `otlp_in` when the wire's `severity_number` is non-zero. `otlp_out` prefers this over the band-derived value when present, consuming (removing) it from the emitted attribute set the same way `otel.status_message` used to. |
+| `otel.severity_number` | `Value::I64`, `1..=24` | Stamped by `otlp_in` when the wire's `severity_number` is non-zero. `otlp_out` prefers this over the band-derived value when present, and consumes (removes) it from the emitted attribute set. |
 | `otel.severity_text` | `Value::Str` | Stamped by `otlp_in` when the wire's `severity_text` is non-empty. Same precedence and consumption rule as `otel.severity_number`. |
 
-**The Prometheus codec is the same precedent again** (`crates/logit-proto/src/prometheus/`,
-[ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)): the
-exposition format distinguishes things this model has one kind for — an `untyped` sample from a
-`gauge`, a sample that carried its own timestamp from one that didn't — so the protocol-native fact
-rides alongside as an attribute and wins on the way back out. Every `prometheus.*` attribute is
-**consumed** by `prometheus_out` (never rendered as a label) and appears as an ordinary tag at every
-other sink, which is what makes `prometheus_in -> prometheus_out` an exact fixed point.
+**The Prometheus codec follows the same rule** (`crates/logit-proto/src/prometheus/`,
+[ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)). The
+exposition format distinguishes cases this model has one kind for: an `untyped` sample from a
+`gauge`, and a sample that carried its own timestamp from one that didn't. `prometheus_out`
+**consumes** every `prometheus.*` attribute (never renders it as a label); every other sink sees it
+as an ordinary tag. That is what makes `prometheus_in -> prometheus_out` an exact fixed point.
 
 | Attribute | Value | Meaning |
 |---|---|---|
 | `prometheus.type` | `Value::Str`: `untyped`\|`unknown`\|`info`\|`stateset`\|`gaugehistogram` | The wire family type for the five cases the model has no distinct kind for: `untyped`/`unknown` (both a `Gauge`, one spelling per dialect), `info` (a `Gauge(1)` whose labels are the payload), `stateset` (one `Gauge(0\|1)` per state), `gaugehistogram` (a `Histogram` of a quantity that can decrease). Stamped by `prometheus_in`; read and consumed by `prometheus_out`, which re-emits that exact family type. |
-| `prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't — a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. The same "the wire carried its own timestamp" convention `statsd.timestamp` below already uses for DogStatsD's `|T` segment, in the shape a boolean marker needs: a Prometheus sample's timestamp is the event's own, so there is nothing to carry but the fact that it was sent. |
-| `prometheus.target` | `Value::Str`, a **resource** attribute | The full scrape URL of the target this batch came from (`http://node-exporter:9100/metrics`), stamped once per target by `prometheus_in`. Factual, like `docker_in`'s `container.*` — not an invented `service.name`. Consumed by `prometheus_out`. |
-| `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target — deliberately **unprefixed**, so it renders as a label like any other resource attribute, exactly the `instance` label Prometheus's own scrape adds. Without it two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
+| `prometheus.timestamp` | `Value::Bool(true)` | The sample carried its own timestamp on the wire (most don't; a scrape stamps them all with its own start time). `prometheus_out` re-emits a timestamp on that line only, in the output dialect's own unit. This is the "the wire carried its own timestamp" convention `statsd.timestamp` below uses for DogStatsD's `|T` segment, reduced to a boolean: the sample's timestamp already is the event's own, so only the fact that it was sent needs carrying. |
+| `prometheus.target` | `Value::Str`, a **resource** attribute | The full scrape URL of the target this batch came from (`http://node-exporter:9100/metrics`), stamped once per target by `prometheus_in`. Factual, like `docker_in`'s `container.*`, not an invented `service.name`. Consumed by `prometheus_out`. |
+| `instance` | `Value::Str`, a **resource** attribute | `host:port` of the scraped target. Deliberately **unprefixed**, so it renders as a label like any other resource attribute: the same `instance` label Prometheus's own scrape adds. Without it, two targets running the same exporter would collapse onto one series through a relay. An event-level `instance` wins over the resource's (`honor_labels` semantics), which falls out of the ordinary resource/event attribute merge. `job` is operator identity, not a scrape fact, and comes from a downstream `set`. |
 
-`trace_context`'s `span:` block
-([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)) is the first place the
-same *reserved-attribute* convention is deliberately *read* by more than one producer, so it's worth
-naming as a real table too rather than leaving it to be reverse-engineered from that transform's
-source:
+The next table starts with the trace/span names `trace_context`'s `span:` block reads
+([ADR `trace-context-span-lifting`](../adr/trace-context-span-lifting.md)), then lists the syslog
+and statsd carriers. The trace/span names are reserved attributes that several producers write and
+a transform reads, so they are listed here rather than left to that transform's source.
 
-A protocol whose tag/param namespace is a **multiset** rather than a map — a key can legally repeat
-on one line, each occurrence a distinct value — folds those repeats into one attribute holding a
-`Value::Array`, in wire order, rather than letting a plain last-write-wins map insertion silently
-destroy every occurrence but the last. `syslog.sd` below (a repeated RFC 5424 PARAM-NAME within one
-SD-ELEMENT) and DogStatsD's `|#` tags (a repeated tag key) are the two producers of this shape today;
-see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md) and [ADR
+A protocol whose tag/param namespace is a **multiset** (a key can legally repeat on one line, each
+occurrence a distinct value) folds the repeats into one attribute holding a `Value::Array` in wire
+order. A last-write-wins map insertion would silently destroy every occurrence but the last.
+`syslog.sd` (a repeated RFC 5424 PARAM-NAME within one SD-ELEMENT) and DogStatsD's `|#` tags (a
+repeated tag key) produce this shape; see
+[ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-convention.md) and [ADR
 `statsd-output`](../adr/statsd-output.md)'s amendment.
 
 | Attribute | Value | Meaning |
@@ -178,29 +174,32 @@ see [ADR `syslog-structured-data-convention`](../adr/syslog-structured-data-conv
 | `statsd.service_check.message` | `Value::Str` | `statsd_in`'s `m:` field, only when sent -- verbatim, including any `\|` it contains (`m:` is always the wire line's last field, so nothing after it needs its own delimiter). `statsd_out` re-emits it last, with control bytes (including a real newline) substituted and `\|` left alone. |
 | `statsd.service_check.host` | `Value::Str` | `statsd_in`'s `h:` field on a service-check line, only when sent; round-tripped the same way as `statsd.event.host`/`statsd.event.aggregation_key`. |
 
-Rules that apply across the whole table (the trace/span rows above; `syslog.sd`'s own rules are the
-linked ADR's, not these): `""`, `"-"`, and `Null` all count as absent — how nginx's
-`escape=json` and a plain log format spell "this variable had no value," and how an unset HAProxy
-`txn` var renders. Exactly one form of a given timing quantity may be present — the base
-nanosecond form together with any suffix, or two suffixes, for the *same* quantity is invalid, not
-resolved by precedence. Any two of a span's start/end/duration determine the third; a lone start
-or duration borrows the event's own (receipt) timestamp as the end, which is what lets an
-unchanged nginx line carrying only `request_time` still yield a span. Everything is carried and
-computed as `i64` nanoseconds with checked arithmetic — `logit` never rounds a value below the
-precision the source actually offered.
+Rules for the trace/span rows (`syslog.sd` follows its own ADR's rules instead):
 
-**The collectd codec is the same precedent once more** (`crates/logit-proto/src/collectd/`,
-[ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md)): collectd identifies every value
-list by a five-tuple — host, plugin, plugin instance, type, type instance — that this model has one
-`MetricRecord.name` for, and carries a per-list reporting interval it has no field for at all. So
-the raw wire facts ride alongside as attributes and win on the way back out. Every `collectd.*`
-attribute is **consumed** by `collectd_out` (never re-emitted as anything else) and appears as an
-ordinary tag at every other sink, which is what makes `collectd_in -> collectd_out` a fixed point.
-These are **event** attributes, never resource ones: `logit_pipeline::BatchAccumulator::absorb` keys
-accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender — the same
-reasoning behind `syslog.hostname`. The presence of `collectd.type` is what selects like-relay
-encoding at `collectd_out`; an event without it is encoded through that sink's fallback naming path
-instead. `crates/logit-proto/src/collectd/mod.rs`'s module doc is the full mapping table.
+- `""`, `"-"`, and `Null` all count as absent. That is how nginx's `escape=json` and a plain log
+  format spell "this variable had no value," and how an unset HAProxy `txn` var renders.
+- Exactly one form of a timing quantity may be present. The base nanosecond form together with a
+  suffixed form, or two suffixed forms, of the *same* quantity is invalid, not resolved by
+  precedence.
+- Any two of a span's start, end, and duration determine the third. A lone start or duration
+  borrows the event's own (receipt) timestamp as the end, which lets an unchanged nginx line
+  carrying only `request_time` still yield a span.
+- Everything is carried and computed as `i64` nanoseconds with checked arithmetic. `logit` never
+  rounds a value below the precision the source offered.
+
+**The collectd codec follows the same rule** (`crates/logit-proto/src/collectd/`,
+[ADR `collectd-binary-relay`](../adr/collectd-binary-relay.md)). collectd identifies every value
+list by a five-tuple (host, plugin, plugin instance, type, type instance) where this model has one
+`MetricRecord.name`, and carries a per-list reporting interval the model has no field for. The raw
+wire facts ride alongside as attributes and win on the way back out. `collectd_out` **consumes**
+every `collectd.*` attribute (never re-emits it as anything else); every other sink sees it as an
+ordinary tag. That is what makes `collectd_in -> collectd_out` a fixed point.
+
+These are **event** attributes, never resource ones. `logit_pipeline::BatchAccumulator::absorb`
+keys accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender; the
+same reasoning keeps `syslog.hostname` on the event. The presence of `collectd.type` selects
+like-relay encoding at `collectd_out`; an event without it goes through that sink's fallback naming
+path. `crates/logit-proto/src/collectd/mod.rs`'s module doc has the full mapping table.
 
 | Attribute | Value | Meaning |
 |---|---|---|
@@ -212,14 +211,18 @@ instead. `crates/logit-proto/src/collectd/mod.rs`'s module doc is the full mappi
 | `collectd.interval` | `Value::F64` seconds | The list's reporting interval, exactly `cdtime / 2³⁰` — collectd's own 2⁻³⁰-second tick unit, converted losslessly. Absent when the wire carried no interval part or a zero one; re-emitted as `IntervalHR round(v · 2³⁰)`, or as `IntervalHR 0` when absent. A non-`F64` or non-positive value is counted `logit.output.tags.dropped{reason="unrepresentable"}` and written as zero. |
 | `collectd.severity` | `Value::U64` ∈ {1, 2, 4} | The raw wire severity of a *notification* (1 FAILURE, 2 WARNING, 4 OKAY). Its presence is what marks an event as a notification rather than a value list; decoded from a `0x0101` Severity part alongside a `0x0100` Message into an `Event::log` (`LogRecord.severity` 1→`Error`/2→`Warn`/4→`Info`). On `collectd_out`, this raw attribute — not the normalized `LogRecord.severity` — is what reaches the wire, outranking it exactly as `syslog.severity`/`otel.severity_number` outrank their own normalized field (rule (b), [ADR `lossless-transit`](../adr/lossless-transit.md)); absent or out of `{1, 2, 4}` → the notification is dropped (`logit.output.metrics.skipped{reason="notification_dropped"}`). |
 
-Two model-side rules follow from that table rather than from any one attribute. A Values part
-carrying N data sources becomes **one** event whose `metrics` holds N `MetricRecord`s in wire order
-(`logit_core::MetricList` is a `SmallVec` inlined at 1, so the common single-source list costs
-nothing extra) — not N events, which is what lets it be re-encoded as the same single list. And the
-record names are **display/cross-protocol only**: like-relay fidelity rides on the attributes, the
-`MetricList` order and the metric kinds, never on the name, so every rule below changes what an
-InfluxDB/Prometheus/statsd sink calls the series and nothing about what `collectd_out` puts back on
-the wire. The wire itself carries no data-source names, so the naming rule is:
+Two model-side rules follow from that table:
+
+- A Values part carrying N data sources becomes **one** event whose `metrics` holds N
+  `MetricRecord`s in wire order, not N events, so it re-encodes as the same single list.
+  `logit_core::MetricList` is a `SmallVec` inlined at 1, so the common single-source list costs
+  nothing extra.
+- Record names are **display/cross-protocol only**. Like-relay fidelity rides on the attributes, the
+  `MetricList` order, and the metric kinds, never on the name. The naming rules below change what an
+  InfluxDB, Prometheus, or statsd sink calls the series, and nothing about what `collectd_out` puts
+  back on the wire.
+
+The wire carries no data-source names, so records are named as follows:
 
 | The list's `collectd.type` | Record name |
 |---|---|
@@ -231,62 +234,60 @@ the wire. The wire itself carries no data-source names, so the naming rule is:
 Index naming is `<plugin>.<type>` for a single-source list and `<plugin>.<type>.<i>` (0-based)
 otherwise.
 
-**The Graphite/Carbon codec is the counter-example, and that is the point**
-(`crates/logit-proto/src/graphite/`,
-[ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)): it adds **no well-known attributes
-at all** — no `graphite.*` namespace, no `pub const ATTR_*`, nothing in the table above. Carbon's
-wire carries exactly four facts, and each one already has a home in this model with no lossy
-normalization on the way: a dotted path *is* `MetricRecord.name`, the `;k=v` tags *are* event
-attributes, the number *is* `MetricKind::Gauge`'s payload, and the whole second *is*
-`Event.timestamp`. Rule (b) of [ADR `lossless-transit`](../adr/lossless-transit.md) — the raw
-protocol-native fact rides alongside the normalized model field and wins on the way back out —
-exists to resolve a *conflict* between the two, and here there is none to resolve; a carrier would
-be a second spelling of something already stored once, and `graphite_in -> graphite_out` would be a
-fixed point either way. So a protocol-namespaced attribute is not the default for a new codec: it
-is what a codec reaches for when the wire says something the model would otherwise have to
-throw away or reinterpret.
+**A protocol-namespaced attribute is not the default for a new codec.** A codec adds one only when
+the wire says something the model would otherwise throw away or reinterpret. The Graphite/Carbon
+codec (`crates/logit-proto/src/graphite/`,
+[ADR `graphite-carbon-relay`](../adr/graphite-carbon-relay.md)) adds **none**: no `graphite.*`
+namespace, no `pub const ATTR_*`. Carbon's wire carries exactly four facts, and each already has a
+lossless home in this model: the dotted path is `MetricRecord.name`, the `;k=v` tags are event
+attributes, the number is `MetricKind::Gauge`'s payload, and the whole second is
+`Event.timestamp`. Rule (b) of [ADR `lossless-transit`](../adr/lossless-transit.md) exists to
+resolve a *conflict* between a raw wire fact and the normalized model field, and here there is
+none. A carrier would be a second spelling of something already stored once, and
+`graphite_in -> graphite_out` is a fixed point without one.
 
-The visible consequence is worth stating, because it is the one place this pair is *less* forgiving
-than collectd or syslog: with no `graphite.path` carrier, a `lua`/`set` stage that renames
-`MetricRecord.name` silently changes the wire path. That is the intended way to rename a series —
-neither `graphite_in` nor `graphite_out` has a `prefix:`/`template:` field — and
-[docs/deploying.md](../deploying.md) says so plainly.
+This makes Graphite *less* forgiving than collectd or syslog in one place: with no
+`graphite.path` carrier, a `lua`/`set` stage that renames `MetricRecord.name` silently changes the
+wire path. That is the intended way to rename a series, because neither `graphite_in` nor
+`graphite_out` has a `prefix:`/`template:` field; [docs/deploying.md](../deploying.md) says so.
 
 `tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
 [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
-more event attributes, and a resource sub-convention of their own:
+event attributes and a set of resource attributes:
 
 | Attribute | Value | Meaning |
 |---|---|---|
 | `log.file.path` | `Value::Str` | `tail_in` only. The absolute path of the file this line was read from. |
-| `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` only. Which of the container's own two streams this line came from — `docker_in` has no per-stream filter of its own (a downstream stage, e.g. a `lua` component reading this attribute, does that). |
+| `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` only. Which of the container's two streams this line came from. `docker_in` has no per-stream filter; a downstream stage, such as a `lua` component reading this attribute, does that. |
 
 `docker_in`'s resource carries `container.id`, `container.name`, `container.image.name`,
-`container.image.tag` (absent for an untagged/digest reference), and `container.label.<key>` for
-every key named in its `labels:` config (opt-in, never every label — see the ADR's event/resource
-shape section). These are read locally from the sibling `config.v2.json` at open time, once per
-container, never re-read afterward — a `docker rename` after that point is a known gap
-([docs/known-gaps.md](../known-gaps.md)).
+`container.image.tag` (absent for an untagged or digest reference), and `container.label.<key>` for
+every key named in its `labels:` config (opt-in, never every label; see the ADR's event/resource
+shape section). `docker_in` reads these from the sibling `config.v2.json` once per container, when
+it opens the log, and never re-reads them, so a `docker rename` after that point is not picked up,
+a known gap ([docs/known-gaps.md](../known-gaps.md)).
 
 ### HTTP access-log names
 
-The canonical table of HTTP attribute names — the OTel semconv names a web server's access line
-is logged under, `logit`'s own composites and proxy fields, and what `http_access` does to each —
-is [`docs/http-access-logs.md`](../http-access-logs.md), not this document
-([ADR `http-access-normalization`](../adr/http-access-normalization.md)). Its one overlap with the
-trace/span table above: `http_access` *emits* `span.name` (`{method} {route}`), `span.status`
-(`error` for a 5xx or `0` status, `unset` otherwise, never `ok`), and `span.duration_s`
-(mirrored from the request duration unless the line already states a span duration, or both a
-start and an end), which `trace_context` then reads exactly as documented above. `http_access`
-also accepts every trace/span name in that table spelled with each `.` replaced by `-`
-(`trace-id`, `span-parent_id`, `span-start_us`) and renames it to the dotted spelling, for
-emitters whose key grammar forbids a dot (HAProxy's `%{+json}o`); `trace_context` itself only
-ever reads the dotted names, so the dashed spelling works only with `http_access` ahead of it.
+[`docs/http-access-logs.md`](../http-access-logs.md) is the canonical table of HTTP attribute
+names: the OTel semconv names a web server's access line is logged under, `logit`'s own composites
+and proxy fields, and what `http_access` does to each
+([ADR `http-access-normalization`](../adr/http-access-normalization.md)). It overlaps the
+trace/span table above in two ways:
+
+- `http_access` *emits* `span.name` (`{method} {route}`), `span.status` (`error` for a 5xx or `0`
+  status, `unset` otherwise, never `ok`), and `span.duration_s` (mirrored from the request duration
+  unless the line already states a span duration, or both a start and an end). `trace_context` then
+  reads them as documented above.
+- `http_access` accepts every trace/span name in that table spelled with each `.` replaced by `-`
+  (`trace-id`, `span-parent_id`, `span-start_us`) and renames it to the dotted spelling, for
+  emitters whose key grammar forbids a dot (HAProxy's `%{+json}o`). `trace_context` reads only the
+  dotted names, so the dashed spelling works only with `http_access` ahead of it.
 
 ## Record types
 
-The three record types an event can independently carry ([ADR `multi-payload-events`](../adr/multi-payload-events.md)) —
-no longer variants of one enum, just three fields on `Event`:
+The three record types are independent fields on `Event`, not variants of one enum
+([ADR `multi-payload-events`](../adr/multi-payload-events.md)):
 
 ```rust
 pub struct LogRecord {
@@ -408,92 +409,84 @@ pub struct Resource {
 ```
 
 **`LogRecord::trace` is the application's trace context, not `logit`'s own.** `logit`'s internal
-pipeline trace context (`logit_pipeline::fanout::TraceContext`, which node-visit produced what) is
-a separate thing, propagated on `Delivered` and exposed to Lua as the `trace` global
-([pipeline-graph.md](pipeline-graph.md)'s "Trace context propagation") -- it never appears on an
-`Event`. A `TraceRef` only ever holds what a codec decoded off the wire, or what an operator's
-config or script explicitly set; `logit`'s own code never invents one. See
+pipeline trace context (`logit_pipeline::fanout::TraceContext`, which node visit produced what)
+travels on `Delivered` and is exposed to Lua as the `trace` global
+([pipeline-graph.md](pipeline-graph.md)'s "Trace context propagation"); it never appears on an
+`Event`. A `TraceRef` holds only what a codec decoded off the wire or what an operator's config or
+script explicitly set. `logit`'s own code never invents one. See
 [ADR `log-record-trace-context`](../adr/log-record-trace-context.md).
 
-**Metric kinds are chosen to be mergeable**, because the split-collection topology
-([overview](../OVERVIEW.md)) means two edge nodes' aggregates may need to combine into one
-downstream, and that has to be correct, not approximate-and-hope. [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)
-reshaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-transit.md) named —
-raw-sample (`Samples`) and raw-member (`SetMembers`) representations alongside the sketch/HLL ones,
-temporality and monotonicity on `Sum`, sum/count/min/max on `Histogram`/`ExponentialHistogram`/
-`Summary` — per [docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model:
+**Metric kinds are mergeable**, because in the split-collection topology
+([overview](../OVERVIEW.md)) two edge nodes' aggregates may combine into one downstream, and the
+result has to be correct, not approximate. [ADR `metrics-model-v2`](../adr/metrics-model-v2.md)
+shaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-transit.md) named, per
+[docs/plans/lossless-transit.md](../plans/lossless-transit.md)'s target model: raw-sample
+(`Samples`) and raw-member (`SetMembers`) representations alongside the sketch and HyperLogLog
+ones, temporality and monotonicity on `Sum`, and sum/count/min/max on
+`Histogram`/`ExponentialHistogram`/`Summary`.
 
 - `Distribution` uses **DDSketch** (`sketches-ddsketch`), which merges with a guaranteed relative
-  error bound. Plain reservoir sampling or naive percentile-of-percentiles does not merge correctly
-  — merging two nodes' p99s is not the p99 of the merged data — so DDSketch is load-bearing for the
-  whole distributed-aggregation story, not a nice-to-have. `Samples` (raw statsd `ms`/`h`/`d`
-  observations, `statsd_in`'s own decode target since W3) is what `aggregate` sketches into a
-  `Distribution` by default, or retains raw under `distributions: samples` (a real absorb rule
-  since W2, above).
-- `Set` uses a **HyperLogLog** (wrapping the `cardinality-estimator` crate), which merges (union)
-  exactly by construction. `SetMembers` (raw statsd `s` members, `statsd_in`'s own decode target
-  since W3) is `Set`'s own raw counterpart, same relationship as `Samples`/`Distribution`.
-  `aggregate` (W2) absorbs both raw pairs: a `Samples` series sketches into a `Distribution` by
-  default (or retains raw values under `distributions: samples`, bounded by a cap), and a
-  `SetMembers` series estimates into a `Set` by default (or retains an exact deduplicated member
-  set under `sets: members`, bounded by a cap) — see
-  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment for the
-  full design, including the fallback rule each raw mode's cap (or, for `distributions: samples`,
-  a `sample_rate` mismatch) triggers, and [ADR `statsd-output`](../adr/statsd-output.md)'s amendment
-  for `statsd_in`/`statsd_out`'s own side of the raw pair.
-- `Sum`/`Gauge` merge trivially (sum / last-write-wins by timestamp) for a **delta** `Sum`
-  (monotonic or not — `monotonic` is carried, not merged on) and a `Gauge`; an *incoming* cumulative
-  `Sum` has no merge rule defined here and passes through unmerged, the same as
-  `ExponentialHistogram`/`Summary`. What a *flushed* `Sum` is labelled is a separate question,
-  answered by `aggregate`'s `temporality:` mode rather than by this table: `delta` (the default)
-  emits each window's own increment, while `temporality: cumulative` keeps the accumulator alive
-  across flushes and emits the running total as `Sum { temporality: Cumulative }` with
-  `start_timestamp` set to the series' first-seen time — the reset signal OTLP and Prometheus
-  consumers need. A delta `Histogram` merges per bucket under that same mode (and passes through
-  under `delta`); see [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
-  cumulative amendment.
-- `GaugeDelta` is not mergeable on its own terms — it's statsd/DogStatsD's relative gauge
-  adjustment (a leading `+`/`-`), decoded by `statsd_in` but left explicitly **unresolved**: it
-  must never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value
-  in arrival order (never touching the value's last-write-wins timestamp, asymmetric on purpose —
-  see [ADR `relative-gauge-adjustments`](../adr/relative-gauge-adjustments.md)). This is the one metric kind whose
-  aggregation state *always* needs to survive a flush to be correct, regardless of how `aggregate`
-  is configured — see
+  error bound. Reservoir sampling and percentile-of-percentiles don't merge correctly (two nodes'
+  p99s don't combine into the p99 of the merged data), so the whole distributed-aggregation story
+  depends on DDSketch. `Samples` holds raw statsd `ms`/`h`/`d` observations; `statsd_in` decodes
+  those lines to it.
+- `Set` uses a **HyperLogLog** (wrapping the `cardinality-estimator` crate), whose merge (union) is
+  exact by construction. `SetMembers` holds raw statsd `s` members; `statsd_in` decodes those lines
+  to it. It is `Set`'s raw counterpart, as `Samples` is `Distribution`'s.
+- `aggregate` absorbs both raw kinds. By default a `Samples` series sketches into a `Distribution`
+  and a `SetMembers` series estimates into a `Set`. Under `distributions: samples` it retains the
+  raw values instead, and under `sets: members` an exact deduplicated member set, each bounded by a
+  cap. [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s amendment has
+  the full design, including the fallback each raw mode's cap (or, for `distributions: samples`, a
+  `sample_rate` mismatch) triggers. [ADR `statsd-output`](../adr/statsd-output.md)'s amendment
+  covers `statsd_in`/`statsd_out`'s side of the raw pair.
+- A **delta** `Sum` merges by summing (monotonic or not; `monotonic` is carried, not merged on), and
+  a `Gauge` by last-write-wins on timestamp. An *incoming* cumulative `Sum` has no merge rule and
+  passes through unmerged, like `ExponentialHistogram`/`Summary`. `aggregate`'s `temporality:` mode
+  decides how a *flushed* `Sum` is labeled: `delta` (the default) emits each window's own
+  increment; `temporality: cumulative` keeps the accumulator across flushes and emits the running
+  total as `Sum { temporality: Cumulative }`, with `start_timestamp` set to the series' first-seen
+  time (the reset signal OTLP and Prometheus consumers need). A delta `Histogram` merges per bucket
+  under `cumulative` and passes through under `delta`; see
+  [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s cumulative
+  amendment.
+- `GaugeDelta` is statsd/DogStatsD's relative gauge adjustment (a leading `+`/`-`) and is not
+  mergeable on its own. `statsd_in` decodes it but leaves it explicitly **unresolved**, and it must
+  never reach a sink. Only `aggregate` resolves it, applying it to a `Gauge`'s running value in
+  arrival order without touching that value's last-write-wins timestamp, asymmetric on purpose (see
+  [ADR `relative-gauge-adjustments`](../adr/relative-gauge-adjustments.md)). It is the one metric
+  kind whose aggregation state must *always* survive a flush to be correct, however `aggregate` is
+  configured; for a delta `Sum` that is opt-in (`temporality: cumulative`). See
   [ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s gauge-retention
-  amendment for why that's true for gauges specifically and only opt-in (`temporality: cumulative`)
-  for a delta `Sum`.
+  amendment for why.
 
-A `Distribution`'s `count()` becomes a **population estimate**, not a count of raw observations
-retained, wherever sample-rate extrapolation is in play: `aggregate`'s default `distributions:
-sketch` mode inserts `(1.0 / sample_rate).round()` weighted samples per absorbed `Samples` record
-via `Samples::sketch`/`DdSketch::add_weighted` (`crates/logit-core/src/metric.rs`), so a sketch fed
-by the `Samples` record `statsd_in` decodes from `100|ms|@0.1` reports `count() == 10` even though
-that record itself held one raw value. This is the same relationship
-`MetricKind::counter(value / sample_rate)` already has for counters, made explicit for
-distributions too — `count` answers "how many events this represents," not "how many raw
-observations were retained." Since [ADR `lossless-transit`](../adr/lossless-transit.md)'s W3,
-`statsd_in` itself performs no such extrapolation at decode time at all: the raw `sample_rate`
-rides verbatim on the `Samples` record it decodes to, and only `aggregate` (or a sink encoding
-`Samples` directly) ever reads it.
+**A `Distribution`'s `count()` is a population estimate**, not a count of retained raw observations,
+wherever a sample rate applies. `aggregate`'s default `distributions: sketch` mode inserts
+`(1.0 / sample_rate).round()` weighted samples per absorbed `Samples` record via
+`Samples::sketch`/`DdSketch::add_weighted` (`crates/logit-core/src/metric.rs`). A sketch fed the
+`Samples` record `statsd_in` decodes from `100|ms|@0.1` reports `count() == 10`, though that record
+held one raw value. Counters already work this way (`MetricKind::counter(value / sample_rate)`):
+`count` answers "how many events this represents." `statsd_in` performs no extrapolation at decode
+time ([ADR `lossless-transit`](../adr/lossless-transit.md)): the raw `sample_rate` rides verbatim on
+the `Samples` record, and only `aggregate`, or a sink encoding `Samples` directly, reads it.
 
 ## What lives outside `Event`
 
-Two things are deliberately *not* part of the per-event type, because putting them there would
-either bloat every event or fight the ownership model:
+Three things are deliberately *not* part of the per-event type, because putting them there would
+bloat every event or fight the ownership model:
 
-- **Aggregation state** (the running DDSketch/HLL/counter between flushes) belongs to the
-  stateful `aggregate` processor, not to `Event` — see [docs/design/lua-api.md](lua-api.md)'s
-  `flush()` contract. `Event`/`MetricRecord` is what a processor *emits*, not what it accumulates
-  into.
-- **Buffering/retry state** belongs to the output layer's buffer trait
-  ([docs/design/wire-protocol.md](wire-protocol.md)), not to events sitting in a queue somewhere.
-- **Batch provenance** (which component created a batch, which one most recently handled it) is
-  pipeline-graph identity, not data — it travels alongside `EventBatch` on the graph edge
-  (`logit_pipeline::fanout::Delivered`), never inside it, so a transform has no way to forge or
-  silently drop it. See [pipeline-graph.md](pipeline-graph.md)'s "Provenance propagation" and
+- **Aggregation state** (the running DDSketch, HyperLogLog, or counter between flushes) belongs to
+  the stateful `aggregate` processor; see [docs/design/lua-api.md](lua-api.md)'s `flush()`
+  contract. `Event`/`MetricRecord` is what a processor *emits*, not what it accumulates into.
+- **Buffering and retry state** belongs to the sink's delivery queue (`SinkQueue`, or a
+  `buffer.disk:` spool), not to the events in it
+  ([docs/design/wire-protocol.md](wire-protocol.md)).
+- **Batch provenance** (which component created a batch and which one last handled it) is
+  pipeline-graph identity, not data. It travels alongside `EventBatch` on the graph edge
+  (`logit_pipeline::fanout::Delivered`), never inside it, so a transform can't forge or silently
+  drop it. See [pipeline-graph.md](pipeline-graph.md)'s "Provenance propagation" and
   [ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md). A script that
-  wants it in the data copies it into an attribute explicitly; `logit` never stamps it there on its
-  own.
+  wants it in the data copies it into an attribute explicitly; `logit` never stamps it there.
 
 ## Codecs
 
@@ -512,21 +505,21 @@ trait FramedEncoder { type Meta; type Stats; fn encode_into(&mut self, batch: &E
 ```
 
 statsd, syslog, OTLP, collectd, graphite, and the native protocol
-([docs/design/wire-protocol.md](wire-protocol.md)) are all just implementations of these traits — which shape a codec gets is decided by what its
-transport needs to frame, not by the protocol's importance
-([ADR `framed-encoder`](../adr/framed-encoder.md)), and OTLP has no special status in the core,
-per [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md).
-(`prometheus` is the one pair outside them: a scrape client and a registry rendered on demand,
-[ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md).)
-[ADR `lossless-transit`](../adr/lossless-transit.md) generalizes this from OTLP specifically to
-every protocol `logit` ships an `_in`/`_out` pair for: the model has to be a strict superset of
-what each of them can express, or that codec's own relay becomes lossy. See
+([docs/design/wire-protocol.md](wire-protocol.md)) are all implementations of these traits. What
+the transport needs to frame decides which shape a codec gets, not the protocol's importance
+([ADR `framed-encoder`](../adr/framed-encoder.md)), and OTLP has no special status in the core
+([ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)).
+`prometheus` is the one pair outside these traits: a scrape client and a registry rendered on
+demand ([ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md)).
+
+**The model must be a strict superset of what every `_in`/`_out` protocol can express**, or that
+protocol's relay becomes lossy ([ADR `lossless-transit`](../adr/lossless-transit.md)). See
 [docs/design/telemetry-landscape.md](telemetry-landscape.md) for what each protocol can express and
 [docs/plans/lossless-transit.md](../plans/lossless-transit.md) for the resulting target shape.
 
 ## Open question
 
-Whether `Value`/`Event` need a `#[non_exhaustive]`-style extensibility story for payload variants
-users might want without a core change (a `Custom(Bytes)` escape hatch, for instance) is unresolved
-— revisit once the first few real protocols are implemented and it's clear what, if anything, the
-model is missing.
+Should `Value`/`Event` have a `#[non_exhaustive]`-style extension point, such as a `Custom(Bytes)`
+escape hatch, for payloads users want without a core change? This is unresolved. `Value` is a
+closed enum today, and the native wire format decodes an unrecognized value tag to `Value::Null`
+(`crates/logit-proto/src/native/value.rs`). No shipped protocol has needed an escape hatch yet.

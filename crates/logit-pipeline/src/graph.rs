@@ -687,10 +687,9 @@ impl ResolvedComponent {
 
 pub struct Graph {
     pub components: HashMap<String, ResolvedComponent>,
-    /// Listener-first, sink-last ("produce before consume") order. Used by `logit graph` for
-    /// deterministic output; the node runtime doesn't need it -- every component's inbox channel
-    /// is created up front, independent of build order, so there's nothing dependency-ordering
-    /// actually has to protect there.
+    /// Listener-first, sink-last ("produce before consume") order, a byproduct of rule 5's cycle
+    /// check. Nothing outside tests reads it: the node runtime creates every inbox up front, so
+    /// spawn order doesn't matter, and `logit graph` renders from the raw `Config`.
     pub topological_order: Vec<String>,
 }
 

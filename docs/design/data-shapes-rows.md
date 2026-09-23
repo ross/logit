@@ -1,10 +1,10 @@
 # Data shapes: the desk-survey rows
 
-The appendix to [`data-shapes.md`](data-shapes.md): every desk-survey row that document draws on,
-grouped by signal, with its citation. Nothing here was measured by `logit` — the measured rows are
-in `data-shapes.md` §5. These were counted from pinned sources, specifications and documentation on
-2026-09-20 across eight research tracks, and then roughly a third of them (106 rows) were
-independently re-derived by a second pass that was told not to trust the first.
+This appendix to [`data-shapes.md`](data-shapes.md) lists every desk-survey row that document draws
+on, grouped by signal, with its citation. `logit` measured none of them; the measured rows are in
+`data-shapes.md` §5. Eight research tracks counted these rows from pinned sources, specifications,
+and documentation on 2026-09-20. A second pass, told not to trust the first, then independently
+re-derived roughly a third of them (106 rows).
 
 Reading a row:
 

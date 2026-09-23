@@ -276,8 +276,9 @@ Per pair:
   Examples: [examples/prometheus-remote-write-receive.yaml](examples/prometheus-remote-write-receive.yaml),
   [examples/prometheus-remote-write-send.yaml](examples/prometheus-remote-write-send.yaml).
 - **`collectd_in -> collectd_out`**: `crates/logit-proto`'s `collectd` codec holds both
-  directions in one module whose doc is the mapping table. It covers value lists; notifications,
-  the other kind collectd's binary `network` protocol carries, aren't built yet. A sticky-identity
+  directions in one module whose doc is the mapping table. It covers both kinds collectd's binary
+  `network` protocol carries: value lists, and notifications as a log event with a
+  `collectd.severity` attribute. A sticky-identity
   decoder turns one datagram into one event per Values part, with its N data sources as N
   `MetricRecord`s in wire order. A multicast `bind:` is detected from the address and joined with
   no extra field. An optional `types_db:` names those data sources without ever changing what
@@ -451,7 +452,6 @@ the operator-facing account of all of this.
 
 - Credit-based flow control beyond one frame in flight, and QUIC, for the native transport
   (`docs/known-gaps.md`).
-- collectd notifications (`collectd_in`/`collectd_out` carry value lists only).
 - Prometheus native histograms, skipped and counted in both directions.
 
 ## Environment

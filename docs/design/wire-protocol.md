@@ -1,9 +1,10 @@
 # Native wire protocol
 
-The `logit`-to-`logit` protocol for splitting collection from processing across nodes
-([overview](../OVERVIEW.md), [ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)). OTLP
-remains available as an interop codec at ingest/egress; this document is specifically the efficient
-native path between two `logit` nodes.
+The native protocol carries batches between two `logit` nodes when collection and processing run on
+different hosts ([overview](../OVERVIEW.md),
+[ADR `native-wire-format-with-otlp-bridge`](../adr/native-wire-format-with-otlp-bridge.md)). OTLP
+stays available as an interop codec at ingest and egress. The same frames also back `stdio_out`/
+`file_out`'s `format: native` and the `buffer.disk:` spool.
 
 ## Framing
 
@@ -20,56 +21,52 @@ crc32c (u32)                over the (possibly compressed) payload
 payload (compressed_len bytes)
 ```
 
-24 bytes total (`crates/logit-proto/src/frame.rs::HEADER_LEN`) — the two reserved bytes after
-`compression` keep every following multi-byte field on a 4-byte boundary, and are spare room for a
-future flag or narrow field, not padding to be removed. Fixed, versioned header so a future
-incompatible payload format can still be framed and rejected (or, later, negotiated) cleanly rather
-than corrupting the stream. `write_frame`/`read_frame` are the shipped implementation, and are
-deliberately the same function pair a socket write and a file append both use — see
-[ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md).
+The header is 24 bytes (`crates/logit-proto/src/frame.rs::HEADER_LEN`). The two reserved bytes
+after `compression` keep every later multi-byte field on a 4-byte boundary and leave room for a
+future flag or narrow field; don't remove them as padding. The header is fixed and versioned so a
+reader can reject an incompatible future payload format cleanly instead of corrupting the stream.
+`write_frame`/`read_frame` implement it, and a socket write and a file append use the same pair
+([ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md)).
 
-**Only `lz4` is encodable today.** The real `zstd` crate builds C via `zstd-sys`, breaking
+**Only `lz4` is encodable.** The real `zstd` crate builds C through `zstd-sys`, which breaks
 [ADR `containerized-development`](../adr/containerized-development.md)'s "no host toolchain needed"
-property, and the pure-Rust alternatives aren't yet competitive on ratio or speed — `Zstd = 2`
-stays a reserved discriminant `write_frame` and `read_frame` both reject with
+property, and the pure-Rust alternatives aren't competitive on ratio or speed. `Zstd = 2` stays a
+reserved discriminant that `write_frame` and `read_frame` both reject with
 `CodecError::Unsupported`, per the same ADR.
 
-`uncompressed_len` is bounded at 64 MiB (`MAX_SANE_UNCOMPRESSED_LEN`) before it is used to size a
-decompression buffer — a frame declaring more is rejected as `Malformed` on the header alone.
+A reader rejects a frame whose `uncompressed_len` exceeds 64 MiB (`MAX_SANE_UNCOMPRESSED_LEN`) as
+`Malformed` on the header alone, before the value sizes a decompression buffer.
 
 ## Payload: dictionary-first batches
 
-Telemetry is extraordinarily repetitive — the same attribute keys and often the same values recur
-across an entire batch. Before compression even enters the picture, each `EventBatch`
-([docs/design/data-model.md](data-model.md)) is encoded (`crates/logit-proto/src/native/`) as:
+Telemetry is repetitive: the same attribute keys, and often the same values, recur across a batch.
+Before compression, `crates/logit-proto/src/native/` encodes each `EventBatch`
+([docs/design/data-model.md](data-model.md)) as:
 
 1. A **dictionary**: every interned `Symbol` used in this batch — attribute/span-attribute keys,
    metric names, metric units, metric descriptions, and log `event_name`s — written once as a
    string.
 2. **Events**, each referencing dictionary entries by `u32` index rather than repeating the string.
 
-**v1 dictionary-indexes keys, not string values.** `Value::Str`/`Value::Bytes` payloads (a log
-message, a repeated tag *value*) are written inline rather than through the dictionary — the
-"repeated string values worth deduplicating" this section originally described for *values* too.
-Keys are the dominant repetition in practice (`host`, `env`, `service.name`, ... on nearly every
-event, `docs/design/data-model.md`) and dictionary-indexing them costs nothing extra to build (the
-process interner already resolved every one of them once); value-deduplication is a real, separable
-follow-up once it's clear from real traffic that repeated attribute *values* (not just keys) are
-common enough to be worth the added complexity — not designed away, just not v1.
+**v1 dictionary-indexes keys, not string values.** `Value::Str`/`Value::Bytes` payloads, such as
+a log message or a repeated tag *value*, are written inline. Keys are the dominant repetition
+(`host`, `env`, `service.name`, and so on appear on nearly every event,
+`docs/design/data-model.md`), and indexing them costs almost nothing: the dictionary reuses the
+interning the in-process `AttrMap` already does ([docs/design/data-model.md](data-model.md)), so it
+is largely the symbol table filtered to what this batch uses. Deduplicating values is a separate
+follow-up, worth building only if real traffic shows repeated attribute values are common enough to
+pay for the complexity.
 
-This reuses the same interning the in-process `AttrMap` already does
-([docs/design/data-model.md](data-model.md)), so building the wire dictionary is close to free —
-it's largely the symbol table's contents, filtered to what this batch actually uses.
-
-Compression then runs over the dictionary-encoded payload: **lz4** for low-latency hops (the
-sidecar-to-local-aggregator case), **zstd** where bandwidth matters more than latency (a
-cross-region hop). Configurable per link.
+Compression, when enabled, runs over the dictionary-encoded payload. Each writer chooses it with a
+`compression: none | lz4` setting (`logit_out`, `stdio_out`/`file_out`'s native format, and
+`buffer.disk:`), defaulting to `none`; `logit_in` can negotiate a `logit_out`'s offer down to
+`none`.
 
 ## `CODEC_NATIVE_V2`: a provenance trailer
 
-A second payload codec, `CODEC_NATIVE_V2`, carries everything v1 does plus a mandatory
-length-prefixed trailer holding the batch's `Provenance` — which component created it, which
-component most recently handled it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
+`CODEC_NATIVE_V2` carries everything v1 does plus a mandatory, length-prefixed trailer holding the
+batch's `Provenance`: the component that created the batch and the one that most recently handled
+it (`docs/design/pipeline-graph.md`'s "Provenance propagation",
 [ADR `batch-provenance-on-delivered`](../adr/batch-provenance-on-delivered.md)):
 
 ```
@@ -78,60 +75,53 @@ payload_v2 := dict | resource attrs | uvarint(event_count) | events...
 trailer_bytes := (tag: u8, len: uvarint, value: [u8; len])*   -- tag 1 = origin, tag 2 = previous
 ```
 
-v1 and v2's *relationship* is untouched — `encode_batch_v2`/`decode_batch_v2` still call
-`encode_batch`/`decode_batch` as subroutines and only add the trailer around them.
-`encode_batch`/`decode_batch` themselves are not byte-for-byte stable across time, though: ADR
-`metrics-model-v2` reshaped every record's own framing to TLV and added the mandatory `Scope`
-section described in "Record layout" below, so a frame encoded before that ADR does not decode
-after it — `logit` is pre-release (ADR `lossless-transit`), so this is a straight reshape, not a
-version-negotiated, dual-read compatibility path. The trailer's length prefix is *mandatory*,
-present (as a single `0x00` byte) even when both fields are
-absent — deliberately, not an optional convenience: an optional trailer on an otherwise-unchanged
-v1 payload would let a payload truncated exactly at the trailer boundary decode as "no provenance"
-instead of failing, silently breaking this format's own truncation-safety invariant (every proper
-prefix of a valid encoding must fail to decode, pinned by
-`crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`). With the
-length mandatory, v2 holds the identical invariant v1 does. Each trailer field's value is inline,
-not dictionary-indexed: `origin`/`previous` are at most two scalar strings written once per batch,
-with no repetition within one payload for a dictionary to amortize.
+`encode_batch_v2`/`decode_batch_v2` call `encode_batch`/`decode_batch` and add the trailer around
+them. The v1 encoding itself is not stable across releases: ADR `metrics-model-v2` reshaped every
+record to TLV and added the mandatory `Scope` section (see "Record layout" below), so a frame
+encoded before that ADR doesn't decode after it. `logit` is pre-release (ADR `lossless-transit`), so
+format changes are straight reshapes with no dual-read compatibility path.
 
-`Hello.codecs`/`HelloAck.codec` (below) negotiate v2 whenever both sides offer it, falling back to
-v1 with provenance simply absent otherwise — no version bump forced on either side. `DiskQueue`'s
-spooled records (`crates/logit-pipeline/src/disk_queue.rs`) are self-describing the same way: the
-existing per-record codec byte picks v1 or v2 decoding, so an already-spooled v1 record keeps
-replaying correctly after an upgrade.
+**The trailer length is mandatory**, written as a single `0x00` byte when both fields are absent.
+An optional trailer would let a payload truncated exactly at the trailer boundary decode as "no
+provenance" instead of failing. That breaks the format's truncation-safety invariant: every proper
+prefix of a valid encoding must fail to decode, pinned by
+`crates/logit-proto/tests/robustness.rs`'s `assert_every_truncation_fails_cleanly`. Trailer values
+are inline, not dictionary-indexed, because `origin`/`previous` are at most two strings per batch
+with nothing for a dictionary to amortize.
+
+`Hello.codecs`/`HelloAck.codec` (below) negotiate v2 when both sides offer it and fall back to v1,
+without provenance, otherwise, so neither side needs a protocol version bump. `DiskQueue`'s
+spooled records (`crates/logit-pipeline/src/disk_queue.rs`) carry the same per-record codec byte,
+so a v1 record spooled before an upgrade still replays after it.
 
 ## Encoding: decided — hand-rolled
 
-**Settled by [ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md), on a four-arm bake-off
-(`crates/logit-bench/src/bakeoff/`, run via `script/bench wire_format`) plus a fidelity/version-skew
-gate (`crates/logit-bench/tests/wire_format_bakeoff.rs`).** A hand-rolled encoder over the
-dictionary-first layout below, shipped as `logit_proto::native`
-(`crates/logit-proto/src/frame.rs` + `crates/logit-proto/src/native/`) — full control over
-forward/backward compatibility (explicit `tag(1) + len(varint) + payload` framing on every `Value`
-and every `Event` field, with a defined, tested skip-unknown behavior for both), which the bake-off
-confirmed neither `rkyv` (true zero-copy, but no skip-unknown story over a derived type) nor a
-`postcard`/`serde` encoding offers without hand-written support of their own. See the ADR for the
-comparison table, the throughput/size numbers, and — the other question this bake-off had to answer
-first — the concrete, test-pinned reasons OTLP itself isn't a close enough fit to be the internal
-transport at all.
+`logit_proto::native` (`crates/logit-proto/src/frame.rs` + `crates/logit-proto/src/native/`) is a
+hand-rolled encoder over the dictionary-first layout. [ADR
+`native-wire-format-encoding`](../adr/native-wire-format-encoding.md) chose it from a four-arm
+bake-off (`crates/logit-bench/src/bakeoff/`, run with `script/bench wire_format`) and a
+fidelity/version-skew gate (`crates/logit-bench/tests/wire_format_bakeoff.rs`). Hand-rolling gives
+full control over compatibility: every `Value` and every `Event` field is framed as
+`tag(1) + len(varint) + payload`, with tested skip-unknown behavior. Neither `rkyv` (true zero-copy,
+but no skip-unknown story over a derived type) nor a `postcard`/`serde` encoding offers that without
+hand-written support. The ADR has the comparison table, the throughput and size numbers, and the
+test-pinned reasons OTLP itself doesn't fit as the internal transport.
 
 ### Record layout
 
-Every record type in `crates/logit-proto/src/native/record.rs` is TLV-framed the same way
-`Event`'s own fields always were: `tag(u8) + len(uvarint) + payload`, an unrecognized tag skipped
-whole by its declared length. **Only non-default field values are written** — an absent field
-decodes to that type's own default (`0`, `None`, empty), so a record carrying mostly-default values
-stays small on the wire and a round trip is exact whether or not a given field happened to be
-present. A list of same-typed records (`Event.metrics`, `MetricRecord.exemplars`,
-`SpanRecord.events`/`links`) is `uvarint(count)` followed by `count` length-prefixed entries —
-`uvarint(len) + body` each — since, unlike a single embedded record (which gets its boundary for
-free from its own enclosing TLV frame), each list entry needs its own length prefix so its reader
-knows where to stop instead of consuming its neighbors' bytes. This reshape (`ADR
-metrics-model-v2`) replaced `MetricRecord`/`LogRecord`/`SpanRecord`/`SpanLink`/`SpanEvent`'s
-previous positional layouts; `logit` is pre-release, so growing a record's field set is a straight
-reshape of this module, not a version-negotiated, dual-read path — skip-unknown framing is kept as
-hygiene against a torn write, not to support mixed-version readers and writers.
+Every record type in `crates/logit-proto/src/native/record.rs` is TLV-framed like `Event`'s
+fields: `tag(u8) + len(uvarint) + payload`, with an unrecognized tag skipped by its declared length.
+**Only non-default field values are written.** An absent field decodes to its type's default (`0`,
+`None`, empty), so mostly-default records stay small and a round trip is exact either way.
+
+A list of same-typed records (`Event.metrics`, `MetricRecord.exemplars`,
+`SpanRecord.events`/`links`) is `uvarint(count)` followed by `count` entries of
+`uvarint(len) + body`. A single embedded record gets its boundary from its enclosing TLV frame, but
+a list entry needs its own length prefix so the reader stops before its neighbor's bytes.
+
+`ADR metrics-model-v2` introduced this layout for `MetricRecord`/`LogRecord`/`SpanRecord`/
+`SpanLink`/`SpanEvent`. Adding a field is a straight reshape of this module, not a
+version-negotiated path; skip-unknown framing guards against a torn write, not mixed-version peers.
 
 **`Event`**
 
@@ -240,11 +230,10 @@ hygiene against a torn write, not to support mixed-version readers and writers.
 | 4 | `dropped_attributes_count` | `u32` LE |
 | 5 | `schema_url` | raw bytes |
 
-**`MetricKind` (the `MetricRecord.kind` field's own payload)** — one kind tag byte, then
-`uvarint(len)`, then the kind's own *fixed, sequential* body: unlike a record's fields, a kind
-variant's shape is locked to its tag, so there's nothing to skip-unknown inside one. An
-unrecognized kind tag is a hard `Malformed` error in `read_metric_kind`, not a skip, since a metric
-with no interpretable value can't be meaningfully carried forward.
+**`MetricKind` (the `MetricRecord.kind` field's own payload)**: one kind tag byte, `uvarint(len)`,
+then the kind's *fixed, sequential* body. A kind's shape is locked to its tag, so there's nothing to
+skip inside one. `read_metric_kind` rejects an unrecognized kind tag as `Malformed` instead of
+skipping it, because a metric with no interpretable value can't be carried forward.
 
 | Tag | Kind | Payload |
 |---|---|---|
@@ -267,28 +256,27 @@ resource_section := uvarint(len) + resource TLV body
 scope_section := presence: u8 (0 | 1)  [+ uvarint(len) + scope TLV body]
 ```
 
-`scope_section` sits right after `resource_section` — never as an optional *trailing* section,
-which would let a payload truncated exactly at that boundary decode successfully as "no scope"
-instead of failing, breaking `robustness.rs`'s "no proper prefix of a valid encoding is itself
-valid" invariant (the same reasoning `CODEC_NATIVE_V2`'s mandatory trailer length above already
-follows). v2 appends the unchanged provenance trailer described above, unmodified by this reshape.
+`scope_section` sits right after `resource_section`, never as an optional *trailing* section. A
+trailing one would let a payload truncated at that boundary decode as "no scope", breaking
+`robustness.rs`'s "no proper prefix of a valid encoding is itself valid" invariant, the same reason
+`CODEC_NATIVE_V2`'s trailer length is mandatory. v2 appends the provenance trailer after this.
 
 ## Connection protocol
 
-**Shipped**, as `logit_out`/`logit_in` (`crates/logit-outputs/src/logit.rs` /
-`crates/logit-inputs/src/logit.rs`) — see [ADR
-`native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md) for the full
-decision record; this section is the as-built summary.
+`logit_out`/`logit_in` (`crates/logit-outputs/src/logit.rs` /
+`crates/logit-inputs/src/logit.rs`) implement this protocol. This section summarizes it as built;
+[ADR `native-transport-handshake-and-ack`](../adr/native-transport-handshake-and-ack.md) has the
+decision record.
 
-- **Transport:** TCP, optionally TLS via `rustls` (not OpenSSL — keeps the "no host toolchain
-  needed" property, [ADR `containerized-development`](../adr/containerized-development.md), intact
-  since `rustls` has no system OpenSSL dependency to link against). QUIC remains a plausible later
-  upgrade, not attempted here.
-- **Control frames.** A control message (handshake or ack) is an ordinary frame with
-  [`FLAG_CONTROL`](../../crates/logit-proto/src/frame.rs) set in the header's `flags` — `codec`/
-  `compression` are meaningless on one. The payload is hand-rolled TLV over `native::varint`
-  (`crates/logit-proto/src/native/control.rs`), the same `tag(u8) + len(uvarint) + payload` shape
-  and skip-unknown forward compatibility as a native-v1 `Event`'s own fields:
+- **Transport:** TCP, optionally TLS through `rustls`. `rustls` has no system OpenSSL to link,
+  which keeps [ADR `containerized-development`](../adr/containerized-development.md)'s "no host
+  toolchain needed" property. QUIC isn't implemented.
+- **Control frames.** A handshake or ack is an ordinary frame with
+  [`FLAG_CONTROL`](../../crates/logit-proto/src/frame.rs) set in the header's `flags`. Its `codec`
+  byte is meaningless, and its `compression` is always `none`: the messages are tiny, and
+  compression is itself being negotiated. The payload is hand-rolled TLV over `native::varint`
+  (`crates/logit-proto/src/native/control.rs`), with the same `tag(u8) + len(uvarint) + payload`
+  shape and skip-unknown behavior as a native-v1 `Event`'s fields:
 
   | Message | Fields | Sent by |
   |---|---|---|
@@ -297,29 +285,28 @@ decision record; this section is the as-built summary.
   | `Ack` | `seq` | the listener, once per data frame forwarded |
   | `Reject` | `code`, `message` | either side, closing the connection |
 
-- **Handshake.** The connecting side sends `Hello`; the listener replies `HelloAck` (codec and
-  compression negotiated down to the intersection of what both sides offer, its own
-  `max_frame_bytes`, its own `window`) or `Reject` — a version mismatch or no shared codec is a
-  clean, legible refusal, not a corrupted stream.
-- **Sequence numbers are implicit**, not a field on the data frame: TCP is ordered, so the Nth data
-  frame on a connection is always seq N, and `Ack.seq` is the cumulative count the receiver has
-  forwarded so far. This keeps the native-v1 payload itself untouched by the transport layer.
-- **Acknowledgement point:** after the batch is in every downstream inbox (`Fanout::send` returning
-  on the listener side), not merely after it decodes. A stalled downstream delays the ack, which
-  stalls the sender's next attempt — that *is* this protocol's backpressure, and it's what removes
-  the need for a receive-side queue on `logit_in` the way a UDP listener has one.
-- **Flow control: negotiated, not yet exercised.** `Hello`/`HelloAck` both carry `window`, but the
-  sender only ever has one frame outstanding today (`docs/plans/native-transport.md`'s "In-flight"
-  decision) — `LogitOutput`'s `SinkQueue` `peek`/`commit` is the retransmit state for that one
-  frame. Credit-based flow control (several outstanding, cumulative acks against them) is real,
-  designed-for future work — negotiating `window` now is what lets it land later without a
-  wire-format version bump — tracked in `docs/known-gaps.md`, not built yet.
+- **Handshake.** The connecting side sends `Hello`. The listener replies with `HelloAck` (codec
+  and compression negotiated down to what both sides offer, plus its own `max_frame_bytes` and
+  `window`) or with `Reject`. A version mismatch or no shared codec is a clean refusal, not a
+  corrupted stream.
+- **Sequence numbers are implicit.** TCP is ordered, so the Nth data frame on a connection is seq
+  N, and `Ack.seq` is the cumulative count the receiver has forwarded. The native payload carries
+  no transport fields.
+- **Acknowledgement point:** after the batch is in every downstream inbox (`Fanout::send` returns
+  on the listener side), not when it decodes. A stalled downstream delays the ack, which stalls the
+  sender's next frame. That is the protocol's backpressure, and it's why `logit_in` needs no
+  receive-side queue the way a UDP listener does.
+- **Flow control: negotiated, not yet used.** `Hello`/`HelloAck` both carry `window`, but the sender
+  keeps one frame outstanding (`docs/plans/native-transport.md`'s "In-flight" decision), and
+  `LogitOutput`'s `SinkQueue` `peek`/`commit` holds that frame for retransmit. Credit-based flow
+  control (several frames outstanding, cumulative acks) isn't built; negotiating `window` now lets
+  it land without a wire-format version bump. `docs/known-gaps.md` tracks it.
 
 ## Buffering
 
-`Buffer<T>` (`logit_proto::buffer`) is a bounded, in-process queue between a producer and a
-slower/intermittent consumer, with an ack shape rather than a plain pop — see
-`docs/adr/buffered-sink-delivery.md` for the reasoning:
+`Buffer<T>` (`logit_proto::buffer`) is a bounded, in-process queue between a producer and a slower
+or intermittent consumer. It acknowledges instead of popping (`docs/adr/buffered-sink-delivery.md`
+has the reasoning):
 
 ```rust
 pub trait Buffer<T> {
@@ -331,35 +318,29 @@ pub trait Buffer<T> {
 }
 ```
 
-`peek`/`commit`, not `push`/`pop`, is the ack mechanism: `Buffer::pop` would remove an item before
-delivery is confirmed, so a failed send would already have lost the batch. Instead the head stays
-in place across `peek`, retried until whatever the caller does with it succeeds, and only then
-removed via `commit`. This is the whole of in-process at-least-once delivery — deliberately
-in-order and single-in-flight (one queue, one head); out-of-order acks across several in-flight
-batches are a real future need for this native protocol's credit-based flow control, but not
-something worth building speculatively ahead of a second caller that needs it.
+`peek`/`commit` is the ack mechanism. A `Buffer::pop` would remove an item before delivery is
+confirmed, so a failed send would lose the batch. Instead the head stays in place across `peek`
+and retries until the caller succeeds, and only `commit` removes it. That is all of in-process
+at-least-once delivery, deliberately in order with one item in flight. The native protocol's future
+credit-based flow control will need out-of-order acks across several in-flight batches, but they
+aren't worth building before that caller exists.
 
-`push` takes the pushed item's weight in bytes alongside it, so a bounded buffer can weigh a
-byte-aware bound (e.g. `EventBatch::estimated_heap_bytes`) as well as an item-count one, and never
-has to recompute it later. Overflow is one of two dropping policies (`OverflowPolicy::DropOldest`,
-`DropNewest`); `push` returns a `PushOutcome<T>` so an eviction is never silent —
-`PushOutcome::Evicted` hands back the displaced item, `PushOutcome::Rejected` hands back the
-pushed item unchanged. A third overflow behavior, blocking until space frees up, is deliberately
-not a variant here: a synchronous trait can't block usefully, so that's a concern of an async
-wrapper layered on top of `Buffer`, not of the trait or its implementations.
+`push` takes the item's weight in bytes, so a buffer can enforce a byte bound (for example,
+`EventBatch::estimated_heap_bytes`) alongside an item-count bound without recomputing it. Overflow
+follows one of two dropping policies (`OverflowPolicy::DropOldest`, `DropNewest`), and `push`
+returns a `PushOutcome<T>` so no drop is silent: `PushOutcome::Evicted` hands back the displaced
+item, and `PushOutcome::Rejected` hands back the pushed item unchanged. Blocking until space frees
+up isn't a policy here, because a synchronous trait can't block usefully; an async wrapper above
+`Buffer` owns that.
 
-`InMemoryBuffer<T>` is the one shipping implementation of this trait, and turns out to be the only
-one: a disk-backed sink buffer landed (`crates/logit-pipeline/src/disk_queue.rs`, ADR
-`disk-backed-sink-buffer`), but *not* against `Buffer<T>` — that trait's sync/`&mut self`/generic
-shape was the wrong seam for an implementation that has to do real file I/O and is concrete over
-`(Arc<EventBatch>, TraceContext)`, not generic over `T`. `DiskQueue` implements its own async
-surface directly instead. `Buffer<T>`'s role narrows to `InMemoryBuffer<T>` alone; the "cheap to
-add now, expensive to retrofit" bet this trait was built on paid off for the *first* buffer this
-crate needed (`SinkQueue`'s own `BoundedQueue<T: Queued>` wraps it), just not for the disk-backed
-one.
+`InMemoryBuffer<T>` is the only implementation; `SinkQueue`'s `BoundedQueue<T: Queued>` wraps it.
+The disk-backed sink buffer (`crates/logit-pipeline/src/disk_queue.rs`, ADR
+`disk-backed-sink-buffer`) doesn't implement `Buffer<T>`: the trait's sync, `&mut self`, generic
+shape is the wrong seam for real file I/O over a concrete `(Arc<EventBatch>, TraceContext)`, so
+`DiskQueue` has its own async surface.
 
 ## Open question
 
-Whether the native protocol should be able to carry OTLP-encoded payloads unmodified as a passthrough
-codec (a `logit` node relaying OTLP without re-encoding into the native format) is worth
-revisiting once the OTLP codec exists — deferred rather than designed now.
+Should the native protocol carry OTLP-encoded payloads unmodified as a passthrough codec, so a
+`logit` node can relay OTLP without re-encoding it into the native format? The OTLP codec exists
+now (`crates/logit-proto/src/otlp/`), but this remains undecided and undesigned.

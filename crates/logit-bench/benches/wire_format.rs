@@ -1,5 +1,5 @@
 //! Throughput and encoded-size benches for the native-wire-format bake-off
-//! (`docs/design/wire-protocol.md`'s "Encoding: decide with a benchmark, not up front",
+//! (`docs/design/wire-protocol.md`'s "Encoding: decided — hand-rolled",
 //! `docs/adr/native-wire-format-encoding.md`). Run with `script/bench wire_format`.
 //!
 //! Every arm here already passed the fidelity gate in
