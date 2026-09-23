@@ -10,8 +10,8 @@
 //! One file pair per case: `<name>.in` (the raw line, exactly as a real sender would put it on
 //! the wire) and `<name>.expected` (the exact bytes `syslog_out` must emit for that line's
 //! decode, or the literal marker [`SAME_AS_INPUT`] when the sink's own canonicalization happens
-//! to reproduce the input verbatim). The six `testdata/interop/syslog/*.raw` captures are read
-//! from there directly at runtime, per that directory's own README ("`logit`'s own encoder never
+//! to reproduce the input verbatim). The six UDP `testdata/interop/syslog/*.raw` captures (every
+//! one but `rsyslog-tcp-000.raw`) are read from there directly at runtime, per that directory's own README ("`logit`'s own encoder never
 //! touches these") -- they are not copied into this corpus.
 //!
 //! ## Permitted normalizations (recorded here, and in the ADR this test's PR adds)

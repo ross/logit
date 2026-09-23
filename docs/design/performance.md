@@ -629,10 +629,11 @@ for reasons that have nothing to do with the code:
   two runs that differ only in *when* they ran. A delta smaller than that drift is reported as "no
   signal," not as an improvement.
 - **A box-state checklist gates whether a number is worth writing down**: `perf/load/README.md`'s
-  "Box state" table (AC power, not battery; the `performance` governor, not `powersave`; a
-  non-power-saving energy-performance preference; thermal headroom, meaning a rested box and gaps
-  between repeats; nothing else building). `logit-perf run` records what it can into the results
-  file's `box_state` and warns before the first scenario on `powersave` or battery.
+  "Box state" table (nothing else running on the VM; a VM freshly provisioned this session; gaps
+  between repeats for host-maintenance headroom; sender and child pinned). `logit-perf run` still
+  records governor, EPP, platform profile, and AC power best-effort into the results file's
+  `box_state` and warns before the first scenario on `powersave` or battery, but the Azure guest
+  exposes none of those sysfs nodes, so on the VM `box_state` is an empty `{}`.
 - **The denominator is events *delivered* to `null_out`, and the telemetry leg that counts them
   runs inside the measured process** (§0's "Driven scenarios" has both, and the self-checks). So a
   driven scenario's absolute CPU µs/event is comparable only to its own history, never to a

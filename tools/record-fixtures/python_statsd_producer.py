@@ -3,7 +3,7 @@
 `script/record-fixtures statsd` to capture through `raw_capture.py --proto udp`.
 
 Two clients, four modes, because the thing worth capturing is not "a statsd line" -- this repo
-already has 40 hand-written ones under `crates/logit-cli/tests/fixtures/statsd/` -- but **how a
+already has 44 hand-written ones under `crates/logit-cli/tests/fixtures/statsd/` -- but **how a
 real client packs an application's metrics into datagrams**:
 
     --client dogstatsd --mode unbuffered   `datadog`'s DogStatsd, one datagram per call

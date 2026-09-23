@@ -1432,7 +1432,7 @@ mod tests {
         // list preserves send order, and `graphite_in` never reorders within one frame): an `int`
         // timestamp/value pair, a fractional timestamp with a float value, a negative float
         // value, and a large float value -- covering the int/float encoding split pickle itself
-        // makes (`BININT`/`LONG1` vs. `BINFLOAT`) on both fields independently.
+        // makes (`BININT1`/`BININT` vs. `BINFLOAT`) on both fields independently.
         assert_eq!(
             got,
             vec![

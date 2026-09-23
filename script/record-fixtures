@@ -286,8 +286,9 @@ record_graphite() {
     # RUN_SECONDS=3, not collectd-entrypoint.sh's default 10: write_graphite holds one TCP
     # connection open for as long as collectd runs (unlike `network`'s UDP datagrams, which flush
     # and stop well before the default elapses), so the fixture size is directly proportional to
-    # this -- three read cycles at `Interval 1` is already "several", per this function's own
-    # top comment, and keeps the capture in the same size class as this corpus's other fixtures.
+    # this -- the committed capture holds four read cycles at `Interval 1`, already "several" per
+    # this function's own top comment, and stays in the same size class as this corpus's other
+    # fixtures.
     ${DOCKER} run --rm --network "${NET}" -e RUN_SECONDS=3 \
         -v "${TOOLS_DIR}/collectd-write-graphite.conf:/etc/collectd-fixture.conf:ro,z" \
         -v "${TOOLS_DIR}/collectd-entrypoint.sh:/entrypoint.sh:ro,z" \
