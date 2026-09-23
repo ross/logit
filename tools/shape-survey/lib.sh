@@ -45,7 +45,8 @@ SURVEY_IMAGE="logit:shape-survey"
 SURVEY_PYTHON_IMAGE="python:3.12-slim"
 
 # Every container name this run has started, in order, for `survey_cleanup`. Appended to by
-# `survey_run_container`/`start_logit`; never read for anything else.
+# `survey_track` (from `start_logit`, `survey_start_service` and `survey_python`); never read for
+# anything else.
 SURVEY_CONTAINERS=()
 
 # Set by `survey_out_dir`: the current producer's run directory on the host. `start_logit` mounts
@@ -74,7 +75,7 @@ survey_project_name() {
     echo "shape-survey-${SURVEY_PRODUCER}-$1"
 }
 
-# survey_track <name>: remember a container for cleanup. Called by the two starters below; a
+# survey_track <name>: remember a container for cleanup. Called by the three starters below; a
 # producer needing its own one-off container should call this right after `docker run -d`.
 survey_track() {
     SURVEY_CONTAINERS+=("$1")
