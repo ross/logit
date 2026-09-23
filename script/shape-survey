@@ -1,32 +1,12 @@
 #!/bin/bash
 # Usage: script/shape-survey [producer ...]
-#   Producers: every tools/shape-survey/producers/*.sh -- run `script/shape-survey` with no
-#   arguments to survey all of them, or name one or more.
+#   Producers: every tools/shape-survey/producers/*.sh. With no arguments, surveys all of them.
 #
-# Captures the *shape* of real telemetry -- how many attributes an event carries, how long its
-# keys and values are, how deeply they nest, how many events ride in a batch -- by replaying or
-# driving real traffic through `logit`'s own `shape` component
-# (docs/adr/shape-observer-component.md) and folding the result with `aggregate` into a file.
-# This is the capture half of docs/plans/data-shape-survey.md; the measurements it produces are
-# what docs/design/data-shapes.md is built from, and what docs/design/memory.md §8's two deferred
-# inline-capacity questions have been waiting on.
+# Drives real or replayed telemetry through `logit`'s `shape` component and summarizes what the
+# events look like. See tools/shape-survey/README.md for the producers, the environment
+# variables, what a run writes, and how to add a producer.
 #
-# `shape` emits **counts and lengths only** -- never a key, a value, a log body or a metric name
-# from an observed event. That property is what lets a survey output leave an environment the
-# traffic itself could not, and it is why this harness writes summaries rather than captures:
-# raw traffic never enters the repo, and nothing here writes under testdata/.
-#
-# Deliberately NOT part of script/cibuild, for exactly the reason script/record-fixtures isn't:
-# this runs real third-party software (image pulls, a 15-minute demo stack, real clients with
-# their own nondeterminism) and produces *measurements*, which are a deliberate, reviewed act, not
-# something CI should re-run on every push. Like script/record-fixtures and script/perf, it runs on
-# the host and drives docker; it never needs the dev container.
-#
-# Adding a producer: write ONE file, tools/shape-survey/producers/<name>.sh, defining
-# `survey_<name>()`, plus its config(s) under tools/shape-survey/configs/. Nothing in this
-# dispatcher or in lib.sh is a list you have to join -- producers are discovered by glob, so two
-# people can add one in parallel without touching the same file. See
-# tools/shape-survey/README.md.
+# Not part of script/cibuild: it runs real third-party software and produces measurements.
 
 set -euo pipefail
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
@@ -35,8 +15,8 @@ source "${SCRIPT_PATH}/common.sh"
 TOOLS_DIR="${ROOT}/tools/shape-survey"
 source "${TOOLS_DIR}/lib.sh"
 
-# Discovery, not a hand-maintained list: `producers/<name>.sh` defines `survey_<name>`, with `-`
-# in a filename mapping to `_` in the function name (`otel-demo.sh` -> `survey_otel_demo`).
+# `producers/<name>.sh` defines `survey_<name>`, with `-` in a filename mapping to `_` in the
+# function name (`otel-demo.sh` -> `survey_otel_demo`).
 available=()
 for file in "${TOOLS_DIR}"/producers/*.sh; do
     [ -e "${file}" ] || continue
@@ -66,17 +46,15 @@ done
 
 trap survey_cleanup EXIT
 
-# Before anything expensive: prove the summarizer still understands `stdio_out`'s human render.
-# A render change that silently broke the parser would otherwise be discovered only after a
-# capture had already been collected and thrown away.
+# Before anything expensive: a render change that broke the summarizer fails here, not after a
+# capture.
 survey_self_test
 
 survey_image
 
-# One producer at a time, each with its own network, container names and compose projects
-# (`survey_begin`), each torn down before the next starts. That namespacing is also what makes two
-# *concurrent* `script/shape-survey <producer>` invocations safe on one shared daemon -- see
-# tools/shape-survey/lib.sh's header.
+# One producer at a time, each namespaced by `survey_begin` and torn down before the next starts.
+# The namespacing is also what makes two concurrent invocations safe (README "Two surveys at
+# once").
 for p in "${producers[@]}"; do
     echo "== surveying: ${p} =="
     survey_begin "${p}"
