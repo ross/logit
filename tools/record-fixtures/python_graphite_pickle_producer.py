@@ -19,11 +19,13 @@ makes this exercise `FRAME` (0x95, a protocol-4+ opcode wrapping the whole paylo
 `SHORT_BINUNICODE` (0x8c, protocol 4+'s compact string opcode for short strings -- protocol 2 uses
 plain `BINUNICODE` instead) and `MEMOIZE` (0x94, protocol 4+'s single-opcode memo store) -- three
 opcodes protocol 2 never emits, all three on the restricted reader's allow-list
-(`crates/logit-proto/src/graphite/mod.rs`'s "Pickle opcode subset" doc section).
+(`docs/adr/graphite-carbon-relay.md`'s "Pickle opcode subset", and
+`crates/logit-proto/src/graphite/pickle.rs`'s "Accepted opcodes").
 
 Both runs pickle the exact same `DATAPOINTS` below: a handful of `(path, (timestamp, value))`
 tuples with a deliberate mix of `int`/`float` timestamps and `int`/`float` values (pickle encodes
-those differently -- an `int` becomes `BININT`/`LONG1`, a `float` always `BINFLOAT`), so the two
+those differently -- an `int` becomes `BININT1`/`BININT` here (`LONG1` only past `i32`, which none
+of these reach), a `float` always `BINFLOAT`), so the two
 captured fixtures carry identical decoded events and a consuming test can assert the exact same
 paths/values against either one. Every path is prefixed `logit-fixture.`, matching the
 `write_graphite` fixture's collectd `Hostname`, so both `graphite` producers' fixtures satisfy the
