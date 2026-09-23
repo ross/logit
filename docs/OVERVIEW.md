@@ -1,68 +1,77 @@
-# logit
+# logit overview
 
 ## What it is
 
-`logit` is a single binary that ingests logs, metrics, and traces over many wire protocols,
-normalizes them into one internal event representation, runs user-defined transforms over them, and
-emits the results to many destinations. The same binary runs as a sidecar next to one workload, as a
-host-level agent collecting for everything on a machine, or as a central aggregator that other `logit`
-nodes forward to — the deployment shape is a config file, not a different build.
+`logit` is a single binary that receives logs, metrics, and traces over many wire protocols,
+converts them into one internal event model, transforms them, and sends the results to many
+destinations. The same binary runs as a sidecar next to one workload, as a host agent for
+everything on a machine, or as a central aggregator that other `logit` nodes forward to. The config
+file decides which; there is no separate build.
 
 ## Why
 
-Telemetry pipelines tend to force a choice: fast and rigid (statsd, Telegraf), or flexible and heavy
-(a full stream-processing engine). `logit` targets the middle — a lightweight Rust core with an
-efficient built-in event model, plus a genuinely fast embedded scripting layer (LuaJIT) so users can
-express real logic — reshaping, enriching, aggregating, routing — directly in config, without
-standing up a separate processing tier.
+Telemetry pipelines usually force a choice between fast but rigid tools, such as statsd and
+Telegraf, and flexible but heavy ones, such as a full stream-processing engine. `logit` aims between
+them: a lightweight Rust core with an efficient event model, plus an embedded LuaJIT scripting layer
+fast enough to reshape, enrich, aggregate, and route events directly in config, without a separate
+processing tier.
 
-The other piece existing tools handle awkwardly is **splitting collection from processing**. Running a
-thin collector at the edge and a heavier processor centrally is common in practice, but usually means
-gluing two different tools together with a lossy intermediate format. `logit` is designed so that a
-`logit` talking to a `logit` is a first-class, efficient path — the same event model on both ends, an
-internal wire protocol designed for it, and OpenTelemetry (OTLP) as the interoperable option at the
-edges.
+The second problem is **splitting collection from processing**. Running a thin collector at the
+edge and a heavier processor centrally is common, but it usually means gluing two different tools
+together through a lossy intermediate format. `logit` has a first-class, efficient, lossless
+transport between nodes: a native wire protocol that carries the internal event model as is.
+OpenTelemetry Protocol (OTLP) is the interoperable option at the edges.
 
-A stated property of that internal event model: data of the same protocol should transit `logit`
-losslessly — `statsd_in` to `statsd_out`, `otlp_in` to `otlp_out`, `syslog_in` to `syslog_out`,
-`prometheus_in` to `prometheus_out`, `collectd_in` to `collectd_out`, `graphite_in` to
-`graphite_out` are each meant to be a transparent relay, with regrouping and summing allowed but no
-information dropped, per [ADR `lossless-transit`](adr/lossless-transit.md).
+Relaying a protocol to itself is lossless. Each of these pairs is a transparent relay:
 
-## Scope (v1 direction)
+- `statsd_in` to `statsd_out`
+- `otlp_in` to `otlp_out`
+- `syslog_in` to `syslog_out`
+- `prometheus_in` to `prometheus_out`
+- `collectd_in` to `collectd_out`
+- `graphite_in` to `graphite_out`
 
-- **Ingest:** UDP/TCP listeners for statsd and DogStatsD-style tagged metrics, collectd,
-  Graphite/Carbon (plaintext and pickle), syslog (RFC 3164/5424), OTLP (logs/metrics/traces). File
-  tailing for logs (rotation- and
-  checkpoint-aware, `tail_in`), including Docker's json-file container logs enriched with
-  per-container identity (`docker_in`, no docker socket,
-  [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). More
-  protocols added incrementally behind the same input trait.
-- **Transform:** built-in parsers for common line shapes (JSON, logfmt, key=value, CSV, regex/grok),
-  chainable in front of user logic. User logic is Lua, loaded inline from YAML or from referenced
-  `.lua` files, run per pipeline stage. A built-in stateful aggregation processor for metrics
-  (counters, gauges, sets, distributions/percentiles) that users opt into per pipeline.
-- **Emit:** the mirror of ingest — the same protocols available as outputs, plus the native
-  `logit`-to-`logit` protocol for forwarding between nodes.
-- **Configuration:** YAML, validated against a JSON Schema published alongside the binary and
-  generated directly from the Rust config types, so it cannot drift from what the binary actually
-  accepts. Config is one flat graph of named **components** — each with a `type` and a `sources`
-  list of the other components it reads from — not a fixed inputs/transforms/outputs shape: a
-  listener has no sources, a sink has sources and is nobody's source, and anything in between can
-  feed as many downstream components as need it. See
-  [docs/design/pipeline-graph.md](design/pipeline-graph.md) and
+A relay can regroup events into different batches and apply a short, named list of normalizations,
+but it drops no information. Summarizing, such as summing counters over a window, happens only in a
+stage you add on purpose. See [ADR `lossless-transit`](adr/lossless-transit.md).
+
+## Scope
+
+- **Ingest:** statsd and DogStatsD, collectd, Graphite (plaintext and pickle), syslog (RFC 3164
+  and 5424), OTLP logs, metrics, and traces, Prometheus scraping and remote-write, and the native
+  `logit` protocol. Listeners use UDP, TCP, or TLS, depending on the protocol. File tailing handles
+  rotation and keeps a checkpoint (`tail_in`), including Docker's json-file container logs,
+  enriched with each container's identity without access to the Docker socket (`docker_in`). See
+  [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md).
+- **Transform:** built-in parsers for common line formats (JSON, logfmt, `key=value`, CSV, regular
+  expressions, and web-server access logs) run ahead of user logic. User logic is Lua, written
+  inline in the YAML or loaded from a `.lua` file. Built-in components also cover stateful metric
+  aggregation (counters, gauges, sets, and distributions with percentiles), consistent sampling,
+  filtering, and routing. Every stage is opt-in.
+- **Emit:** the same protocols as ingest, except file tailing, plus InfluxDB 2.x, standard output,
+  and rotating files. The native `logit` protocol forwards events between nodes.
+- **Configuration:** YAML, validated against a JSON Schema generated from the Rust config types, so
+  the schema can't drift from what the binary accepts. A config is one flat graph of named
+  **components**, not a fixed inputs, transforms, and outputs structure. Each component has a
+  `type` and a `sources` list naming the components it reads from. A listener has no sources, a
+  sink is nobody's source, and any component in between can feed as many downstream components as
+  need it. See [docs/design/pipeline-graph.md](design/pipeline-graph.md) and
   [ADR `component-graph-configuration`](adr/component-graph-configuration.md).
 
-## What this is not (for now)
+## Non-goals
 
-Not a storage engine, not a query layer, not a dashboarding or alerting tool. `logit` moves and
-reshapes telemetry; it hands the result to systems (InfluxDB, Prometheus, Grafana, a SIEM, another
-`logit`) that do those jobs.
+`logit` is not a storage engine, a query layer, or a dashboarding or alerting tool. It moves and
+reshapes telemetry, then hands the result to systems that do those jobs, such as InfluxDB,
+Prometheus, Grafana, a security information and event management (SIEM) system, or another
+`logit`.
 
 ## Positioning
 
-Closest prior art is Vector, the OpenTelemetry Collector, Fluent Bit, and Telegraf. `logit`'s bet is
-narrower and more opinionated than any of them: a real, fast, general-purpose scripting language
-(rather than a bespoke DSL or Collector-style Go plugins that require a rebuild) sitting behind
-built-in parsers for the 90% case, over an event model and wire protocol designed from the start for
-efficient node-to-node splitting of collection and processing.
+The closest prior art is Vector, the OpenTelemetry Collector, Fluent Bit, and Telegraf. `logit`
+makes a narrower, more opinionated bet than any of them:
+
+- A fast, general-purpose scripting language, instead of a custom DSL or Collector-style Go plugins
+  that require a rebuild.
+- Built-in parsers for the common cases, in front of that language.
+- An event model and wire protocol designed from the start for efficient splitting of collection
+  and processing across nodes.

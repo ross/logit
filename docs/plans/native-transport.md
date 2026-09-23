@@ -7,8 +7,8 @@ updated: 2026-09-09
 
 ## Context
 
-`docs/OVERVIEW.md`'s headline bet is that "a `logit` talking to a `logit` is a first-class,
-efficient path." The *format* half exists: `logit_proto::native` (`crates/logit-proto/src/frame.rs`
+`docs/OVERVIEW.md`'s headline bet is a first-class, efficient, lossless transport between `logit`
+nodes. The *format* half exists: `logit_proto::native` (`crates/logit-proto/src/frame.rs`
 + `src/native/`) is a tested `Encoder`/`Decoder`, decided by
 [ADR `native-wire-format-encoding`](../adr/native-wire-format-encoding.md). The *transport* half
 does not: `ComponentKind::LogitIn { bind }` / `LogitOut { endpoint }`
