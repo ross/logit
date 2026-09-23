@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Drives every `applogs` app with a small, realistic request mix for the capture window.
 
-stdlib-only (it runs in `python:3.12-slim` with no pip step, like every other script in this
-directory). One thread pool per target, paced to a fixed request rate so the apps' line counts are
-comparable and neither the apps nor the host are saturated -- a survey that measured a machine
-under load would be measuring the machine.
+Stdlib-only. Each target gets a thread pool paced to a fixed rate, so line counts are comparable
+and nothing saturates. Prints progress every 15s.
 
 Usage:  drive.py <seconds> <profile>=<base-url>[,<rate>] ...
-        profile is `app` (the four logging-library apps) or `django` (trailing slashes, /fanout/).
+        profile is `app` (the logging-library apps) or `django` (trailing slashes, /fanout/).
 """
 
 import random
@@ -17,8 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
-# A handful of real user-agent strings of very different lengths -- the field an access log's
-# value-byte distribution has its long tail in.
+# Real user-agent strings of very different lengths: the long tail of an access log's value bytes.
 AGENTS = [
     "curl/8.5.0",
     "python-requests/2.32.3",
@@ -31,8 +28,8 @@ AGENTS = [
 
 TERMS = ["widget", "blue%20widget", "socket+wrench", "q1%20report", "ünïcode", "a", "very-long-search-term-nobody-would-type"]
 
-#: The mix, as (weight, path-template) pairs. Roughly an ordinary read-mostly web tier: mostly
-#: successful reads, a tail of 404s from bad links and scanners, and a small trickle of 500s.
+#: (weight, path-template) pairs for a read-mostly web tier: mostly successful reads, a tail of
+#: 404s, and a trickle of 500s.
 MIX_APP = [
     (20, "/"),
     (30, "/items?limit={limit}&page={page}&sort=created"),
