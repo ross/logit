@@ -18,9 +18,9 @@ processing tier.
 
 The second problem is **splitting collection from processing**. Running a thin collector at the
 edge and a heavier processor centrally is common, but it usually means gluing two different tools
-together through a lossy intermediate format. In `logit`, a `logit` talking to a `logit` is a
-first-class, efficient path: both ends share the same event model and a native wire protocol built
-for it. OpenTelemetry Protocol (OTLP) is the interoperable option at the edges.
+together through a lossy intermediate format. `logit` has a first-class, efficient, lossless
+transport between nodes: a native wire protocol that carries the internal event model as is.
+OpenTelemetry Protocol (OTLP) is the interoperable option at the edges.
 
 Relaying a protocol to itself is lossless. Each of these pairs is a transparent relay:
 
