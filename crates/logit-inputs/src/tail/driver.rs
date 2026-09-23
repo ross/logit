@@ -351,7 +351,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Which wake source actually fired. `inotify` flatlining while `poll` carries on is the one
     /// externally visible signal that the low-latency path has stopped working
-    /// (`docs/deploying.md`'s "What to watch").
+    /// (`docs/deploying.md`'s "What to watch for file tailing").
     fn count_wake(&self, source: &'static str) {
         self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", source)]);
     }
