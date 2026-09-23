@@ -321,6 +321,50 @@ components:
         assert_eq!(out.buffer.shutdown_grace, std::time::Duration::from_secs(10));
     }
 
+    /// `sample`'s `key: trace_id` is a bare YAML string naming a unit variant, and `{attribute:
+    /// x}` a one-key map -- both through the real YAML path, not just `serde_json`, along with an
+    /// `always_keep.value: true` that must stay a `Bool` (`SetValue`'s untagged order).
+    #[test]
+    fn sample_key_and_override_read_through_the_real_yaml_path() {
+        let yaml = r#"
+components:
+  in:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+  by_trace:
+    type: sample
+    sources: [in]
+    rate: 0.5
+    key: trace_id
+    always_keep:
+      attribute: sampling.keep
+      value: true
+  by_attr:
+    type: sample
+    sources: [in]
+    rate: 0.1
+    key: {attribute: request_id}
+    missing: drop
+"#;
+        let config = parse(yaml, &env(&[])).expect("should parse");
+        match &config.components["by_trace"].kind {
+            logit_config::ComponentKind::Sample { key, always_keep, .. } => {
+                assert_eq!(key, &Some(logit_config::SampleKey::TraceId));
+                let o = always_keep.as_ref().unwrap();
+                assert_eq!(o.attribute.as_deref(), Some("sampling.keep"));
+                assert_eq!(o.value, Some(logit_config::SetValue::Bool(true)));
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+        match &config.components["by_attr"].kind {
+            logit_config::ComponentKind::Sample { key, missing, .. } => {
+                assert_eq!(key, &Some(logit_config::SampleKey::Attribute("request_id".into())));
+                assert_eq!(missing, &Some(logit_config::SampleMissing::Drop));
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
     /// The quoted-bare-number form of `max_bytes` (as opposed to `"64MiB"` above) through the
     /// same real YAML path. `human_bytes` is string-only, both directions (an unquoted YAML
     /// integer is rejected -- see `crates/logit-config/src/lib.rs`'s `human_bytes` module doc

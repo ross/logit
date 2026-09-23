@@ -104,27 +104,14 @@ pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 /// hop, a dropped one dropped at every hop, without any node ever telling another its answer.
 /// Same shape as OTel's `TraceIdRatioBased` sampler.
 ///
-/// The top 53 bits of the low 8 `trace_id` bytes, not all 64: `rate * 2f64.powi(64)` loses
-/// precision near 1.0, which would reject traces it should keep. 53 bits is `f64`'s
-/// exact-integer range, so the comparison below is exact, not an approximation of one.
+/// The low 8 `trace_id` bytes, big-endian, straight into [`crate::sampling::keep`] (the top 53
+/// bits of them against `rate * 2^53` -- that fn's doc says why 53) with no hash: these are
+/// `logit`'s own pipeline trace ids, random by construction and never an application's. The
+/// `sample` transform hashes its key instead, so the two reach different verdicts for the same 16
+/// bytes on purpose (`docs/adr/consistent-sampling-component.md`).
 pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool {
-    // `!(rate < 1.0)` rather than `rate >= 1.0` -- also catches NaN (every comparison against NaN
-    // is false, so `rate < 1.0` is false and this branch is taken): keep everything rather than
-    // silently drop everything on a malformed rate. Graph validation (rule 16,
-    // `crates/logit-pipeline/src/graph.rs`) is what actually rejects a NaN/out-of-range config
-    // value before this is ever called with one in practice; the negated comparison is what makes
-    // this fn's own behavior correct even if that guarantee is ever bypassed (a direct caller, a
-    // future one), so it's kept as-is rather than rewritten to a `partial_cmp` form that would
-    // lose the "NaN falls through to `true`" property clippy's lint can't see is deliberate here.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(rate < 1.0) {
-        return true;
-    }
-    if rate <= 0.0 {
-        return false;
-    }
     let x = u64::from_be_bytes(trace_id[8..16].try_into().expect("8 bytes"));
-    (x >> 11) < (rate * (1u64 << 53) as f64) as u64
+    crate::sampling::keep(x, rate)
 }
 
 #[derive(Clone, Debug)]
@@ -1327,6 +1314,37 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(trace_is_sampled(&id, 0.37), first);
         }
+    }
+
+    /// Exact verdicts for fixed ids, not just determinism or a proportion: the bit source (the
+    /// top 53 bits of the low 8 bytes, big-endian) and the compare are both pinned, so a refactor
+    /// of `trace_is_sampled` that changes which ids it keeps fails here.
+    #[test]
+    fn the_sampler_reaches_pinned_verdicts_for_fixed_trace_ids() {
+        fn id(high: u64, low: u64) -> [u8; 16] {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&high.to_be_bytes());
+            id[8..].copy_from_slice(&low.to_be_bytes());
+            id
+        }
+        // The rate-0.5 threshold is exactly 2^63 in the low 8 bytes; the high 8 never matter.
+        assert!(trace_is_sampled(&id(0, 0x7FFF_FFFF_FFFF_FFFF), 0.5));
+        assert!(trace_is_sampled(&id(u64::MAX, 0x7FFF_FFFF_FFFF_FFFF), 0.5));
+        assert!(!trace_is_sampled(&id(0, 0x8000_0000_0000_0000), 0.5));
+        assert!(!trace_is_sampled(&id(u64::MAX, 0x8000_0000_0000_0000), 0.5));
+        // W3C's own example trace id: low 8 bytes 0xa3ce929d0e0e4736, ~0.6399 of the range.
+        let w3c = id(0x4bf9_2f35_77b3_4da6, 0xa3ce_929d_0e0e_4736);
+        assert!(trace_is_sampled(&w3c, 0.65));
+        assert!(!trace_is_sampled(&w3c, 0.63));
+        // The low 11 bits are discarded: an id of only those bits sits at 0, kept at the smallest
+        // representable threshold (2^-53) and dropped below it, where `rate * 2^53` truncates to 0.
+        assert!(trace_is_sampled(&id(0, 0x7FF), 2f64.powi(-53)));
+        assert!(!trace_is_sampled(&id(0, 0x7FF), 2f64.powi(-54)));
+        // NaN and >= 1 keep; <= 0 drops, even for the all-zero id.
+        assert!(trace_is_sampled(&id(0, u64::MAX), f64::NAN));
+        assert!(trace_is_sampled(&id(0, u64::MAX), 1.5));
+        assert!(!trace_is_sampled(&id(0, 0), 0.0));
+        assert!(!trace_is_sampled(&id(0, 0), -1.0));
     }
 
     #[test]

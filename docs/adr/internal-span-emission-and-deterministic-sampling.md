@@ -1,6 +1,6 @@
 ---
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-22
 ---
 
 # Internal span emission, one span per node-visit, and deterministic-on-`trace_id` sampling
@@ -226,8 +226,15 @@ Internal {
 }
 ```
 
-Named `span_sample_rate`, not `sample_rate` — there is already a `ComponentKind::Sample` transform,
-and `internal` may grow other sampling knobs later. Below `1.0` by default: span volume is a
+Named `span_sample_rate`, not `sample_rate` — `internal` may grow other sampling knobs later, and
+the name keeps it distinct from the `sample` transform. (When this was written a
+`ComponentKind::Sample` existed only as an unimplemented placeholder; ADR
+`routing-by-condition-is-lua` then retired it, and ADR
+[`consistent-sampling-component`](consistent-sampling-component.md) brought it back as a real,
+keyed sampler on 2026-09-22. The two share `logit_core::sampling::keep`'s 53-bit compare but not
+their bits: this sampler reads a trace id's raw low 8 bytes, since `logit`'s own pipeline ids are
+random by construction, while `sample` hashes its key first — so the two reach different verdicts
+for the same 16 bytes, on purpose.) Below `1.0` by default: span volume is a
 different shape than metric volume (one span per node-visit per batch, where a metric point
 coalesces between drains).
 

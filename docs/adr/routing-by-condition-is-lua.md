@@ -1,12 +1,19 @@
 ---
 created: 2026-09-07
-updated: 2026-09-13
+updated: 2026-09-22
 ---
 
 # Routing by condition, sampling, throttling, dedup, and renaming are `lua` components
 
 ## Status
-Accepted
+Accepted. Superseded in part on 2026-09-22 by
+[ADR `consistent-sampling-component`](consistent-sampling-component.md): the `sample` clause. The
+premise below — that `math.random() < rate` in a `lua` component already does sampling's job —
+holds for random sampling and not for *consistent* sampling, where every sampler that sees any
+span of a trace must reach the same verdict with nothing propagated; `lua` exposes no hash and
+its `math.random` is per-VM. `sample` is a native `ComponentKind` again, implemented. Everything
+else here — no native predicate language, no `filter`/`rename`/`throttle`/`dedup`, the measured
+cost table and its revisit trigger — stands unchanged.
 
 ## Context
 
@@ -49,6 +56,11 @@ upvalue, reset in `flush()`), and `dedup` (a seen-set in a Lua upvalue) — each
 events in ordinary Lua globals, and a `lua`/`lua_file` component already has a `flush()` hook
 (`docs/design/lua-api.md`) for anything that needs to act on a timer rather than per event.
 
+**Superseded in part (2026-09-22):** the `sample` sentence above is wrong for keyed sampling —
+`math.random() < rate` cannot keep every span of the same trace across nodes or processes — and
+[ADR `consistent-sampling-component`](consistent-sampling-component.md) reinstates `sample` as a
+native kind on that ground. `rename`, `throttle`, and `dedup` are unaffected.
+
 `logfmt`, `kv`, `csv`, and `regex` are a different kind of gap, and this ADR does not retire them:
 LuaJIT ships Lua patterns, not a general parser or a real regex engine, so hand-writing a `k=v` or
 CSV parser per event in a script is both slow and not something users should have to write. Those
@@ -62,6 +74,11 @@ throttling, deduplication, and attribute renaming are `lua`/`lua_file` component
 from `crates/logit-config/src/lib.rs`, `crates/logit-pipeline/src/graph.rs`'s `role`/`kind_name`,
 and the generated schema — not left as unimplemented placeholders, because leaving them would keep
 advertising a component this decision says isn't worth building yet.
+
+**Superseded in part (2026-09-22):** `sample` is back —
+[ADR `consistent-sampling-component`](consistent-sampling-component.md) — as a native kind
+implemented in the same change that reinstated the variant, never as a placeholder. The other four
+remain removed, and the no-native-predicate-language holding is untouched.
 
 **The revisit trigger is explicit and measured, not a hunch: sustained central-collector
 throughput pressure.** The cost of the Lua route, measured (`docs/design/memory.md`):

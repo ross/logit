@@ -591,7 +591,7 @@
               ]
             },
             "span_sample_rate": {
-              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs later, and the name should keep meaning \"which knob\" even though the per-event `sample` transform this once also disambiguated against was retired (`docs/adr/routing-by-condition-is-lua.md`). See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
+              "description": "Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id` the same way at every node -- a kept trace is kept at every hop, never partially. Below `1.0` by default: span volume is a different shape than metric volume (one span per node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full traces rather than a representative sample would set this explicitly. Named `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs later, and the name disambiguates against the per-event `sample` transform, which samples an application's events by a hashed key rather than `logit`'s own spans by raw trace-id bits (`docs/adr/consistent-sampling-component.md`). See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.",
               "default": 0.1,
               "type": "number",
               "format": "double"
@@ -1455,6 +1455,63 @@
               "items": {
                 "$ref": "#/definitions/UserAgentRule"
               }
+            }
+          }
+        },
+        {
+          "description": "Keeps a fraction of events, consistently: with `key:` set, the key's value is hashed (XXH64, seed 0, over a fixed canonical byte form) and compared against `rate`, so every event sharing a key -- every span and log of one trace, under `key: trace_id` -- gets the same verdict in every `logit` process that sees it, with nothing propagated between them. With no `key:`, each event is an independent draw. `always_keep:` pins flagged events through regardless. Never mutates an event. Validated by `crates/logit-pipeline/src/ graph.rs` rule 61. See `docs/adr/consistent-sampling-component.md`, which also freezes the hash as a cross-version contract.",
+          "type": "object",
+          "required": [
+            "rate",
+            "type"
+          ],
+          "properties": {
+            "always_keep": {
+              "description": "Events carrying this field (optionally with this value) are kept unconditionally, before the key is even looked at. Per leg: nothing is propagated to other samplers.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SampleOverride"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "key": {
+              "description": "What to hash. Absent means an independent draw per event.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SampleKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "missing": {
+              "description": "What happens to an event the configured `key:` isn't on. Only meaningful with `key:` -- rule 61 rejects it otherwise. Absent means `random`.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/SampleMissing"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "rate": {
+              "description": "Fraction of events (or of keys) kept, `0.0..=1.0`. `1` is rejected (a no-op), and `0` is rejected unless `always_keep` is set -- then it keeps only the flagged events.",
+              "type": "number",
+              "format": "double"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "sample"
+              ]
             }
           }
         },
@@ -2926,6 +2983,105 @@
           "additionalProperties": false
         }
       ]
+    },
+    "SampleKey": {
+      "description": "What one `sample` (`ComponentKind::Sample`) hashes to reach its keep/drop verdict. Externally tagged like [`RouteBy`], so config reads `key: trace_id`, `key: {attribute: request_id}`, or `key: {resource: service.name}`. See `docs/adr/consistent-sampling-component.md` for the canonicalization every shape is hashed through.",
+      "oneOf": [
+        {
+          "description": "The event's application trace id: `span.trace_id` if it carries a span, else its log record's `trace.trace_id` (what `trace_context` or `otlp_in` sets). Hashed as its 32 lowercase hex characters, so it agrees with `{attribute: ...}` on the same id left as an unlifted hex string.",
+          "type": "string",
+          "enum": [
+            "trace_id"
+          ]
+        },
+        {
+          "description": "A top-level event attribute, named literally (never a path).",
+          "type": "object",
+          "required": [
+            "attribute"
+          ],
+          "properties": {
+            "attribute": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A resource attribute -- every event of one resource gets the same verdict.",
+          "type": "object",
+          "required": [
+            "resource"
+          ],
+          "properties": {
+            "resource": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SampleMissing": {
+      "description": "What `sample` does with an event its configured `key:` isn't on -- no span or log trace reference, no such attribute, or a `Null`/`Array`/`Map` value there.",
+      "oneOf": [
+        {
+          "description": "Draw at `rate` as if no key were configured (the default).",
+          "type": "string",
+          "enum": [
+            "random"
+          ]
+        },
+        {
+          "description": "Forward it.",
+          "type": "string",
+          "enum": [
+            "keep"
+          ]
+        },
+        {
+          "description": "Drop it.",
+          "type": "string",
+          "enum": [
+            "drop"
+          ]
+        }
+      ]
+    },
+    "SampleOverride": {
+      "description": "`sample`'s `always_keep:` override: an event carrying the named field -- and, with `value:`, carrying it with that value -- is kept whatever the rate. Exactly one of `attribute`/`resource` (graph rule 61).",
+      "type": "object",
+      "properties": {
+        "attribute": {
+          "description": "A top-level event attribute to look for, named literally.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resource": {
+          "description": "A resource attribute to look for, named literally.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The value the field must carry, compared under `has_attributes`' equality rules (numeric coercion across integer/float/string, none for booleans -- `value: true` does not match a logfmt `\"true\"` string). Absent means any value.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SetValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "SetValue": {
       "description": "One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as written, no `!i64`/`!f64` tag needed.\n\n**`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants in declaration order and keeps the first that parses; `3` parses as both an `i64` and an `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float. `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a number) so their position doesn't matter.",

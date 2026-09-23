@@ -1,0 +1,94 @@
+# Consistent, keyed sampling (docs/adr/consistent-sampling-component.md): `sample` keeps a
+# fraction of *traces*, not of events -- every event of a kept trace survives, none of a dropped
+# one does -- and it reaches the same verdict on every run, in every `logit` process, with nothing
+# propagated between them. Self-contained: no socket, no service, it runs and exits.
+#
+#   gen ──────────┐
+#                 ├─> traced (trace_context) ─> sampled (sample) ─> out (stdio_out)
+#   gen_flagged ──┘
+#
+#   logit run examples/sample-traces.yaml | grep -o 'trace_id=[0-9a-f]*' | sort | uniq -c
+#
+# ...prints the trace ids that survived and how many events each kept: roughly half of the ten,
+# each with all 100 of its events (plus the flagged ones below), and the *same* half every time you
+# run it -- the verdict is a hash of the trace id, not a draw. Change `rate` and the kept set grows
+# or shrinks, but a trace kept at 0.3 is always also kept at 0.5: the threshold only moves.
+#
+# The split-collection shape this exists for (docs/OVERVIEW.md) is the same component on every
+# collector a trace's spans pass through -- each one keeps the same traces independently:
+#
+#   spans_in:
+#     type: otlp_in
+#     bind: 0.0.0.0:4318
+#   sampled:
+#     type: sample
+#     sources: [spans_in]
+#     rate: 0.1
+#     key: trace_id
+#   spans_out:
+#     type: otlp_out
+#     sources: [sampled]
+#     endpoint: http://tempo:4318
+components:
+  # 1000 log lines across ten traces, 100 each: `{seq%10}` completes a 32-hex-character W3C trace
+  # id, so `trace.id` cycles through ten distinct ids.
+  gen:
+    type: generate_in
+    count: 1000
+    batch: 100
+    rate: 5000
+    resource:
+      service.name: checkout
+    event:
+      log: '{{"msg":"step","request":{seq}}}'
+      attributes:
+        trace.id: "4bf92f3577b34da6a3ce929d0e0e473{seq%10}"
+        request_id: "{seq}"
+
+  # Ten more lines from the same ten traces, each carrying `sampling.keep` -- the "keep *this*
+  # request whatever the rate" flag an operator sets while debugging. These survive even in a
+  # trace `sample` drops; the rest of that trace's events still don't (the override is per event,
+  # and per leg -- nothing is propagated to other samplers).
+  gen_flagged:
+    type: generate_in
+    count: 10
+    batch: 10
+    resource:
+      service.name: checkout
+    event:
+      log: '{{"msg":"debug","request":"flagged-{seq}"}}'
+      attributes:
+        trace.id: "4bf92f3577b34da6a3ce929d0e0e473{seq%10}"
+        sampling.keep: "true"
+
+  # Lifts `trace.id` onto each line's `LogRecord.trace` -- what `key: trace_id` reads on an event
+  # with no span (and what `otlp_in` already sets on a real OTLP log). `key: {attribute: trace.id}`
+  # on the unlifted hex string would reach exactly the same verdicts: a trace id is hashed as its
+  # 32 lowercase hex characters either way.
+  traced:
+    type: trace_context
+    sources: [gen, gen_flagged]
+
+  sampled:
+    type: sample
+    sources: [traced]
+    # Fraction of traces kept, in [0, 1]. `1` is rejected (a no-op); `0` is rejected unless
+    # `always_keep` is set, when it means "only the flagged events".
+    rate: 0.5
+    # What is hashed: `trace_id` (a span's, else a log's trace reference), `{attribute: <name>}`,
+    # or `{resource: <name>}` (every event of a resource together). Omit for a plain per-event
+    # draw that keeps nothing together.
+    key: trace_id
+    # An event with no trace id at all: `random` (the default) draws for it, `keep` forwards it,
+    # `drop` drops it. None arrive here -- every line above carries one.
+    missing: drop
+    # Kept unconditionally when the event carries this attribute. Add `value:` to require a
+    # specific value (compared the way `has_attributes` compares -- a `value: true` boolean does
+    # not match the string "true" these lines carry, so it's omitted here: any value counts).
+    always_keep:
+      attribute: sampling.keep
+
+  out:
+    type: stdio_out
+    sources: [sampled]
+    target: stdout

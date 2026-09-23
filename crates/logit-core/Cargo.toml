@@ -23,6 +23,9 @@ tracing.workspace = true
 # (docs/plans/operator-surface.md, workstream D) -- needs the `Layer` trait itself, not a
 # subscriber (that's `logit-cli::main::init_logging`'s job).
 tracing-subscriber.workspace = true
+# XXH64, seed 0 -- the frozen cross-process hash `sampling` keys `sample`'s verdicts on
+# (`docs/adr/consistent-sampling-component.md`).
+twox-hash.workspace = true
 
 [dev-dependencies]
 # `tests/type_sizes.rs` asserts `size_of::<bytes::Bytes>()` directly -- it's the term that sets

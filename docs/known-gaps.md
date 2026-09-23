@@ -30,6 +30,33 @@ already built that have a known, accepted rough edge.
   named streams — is native now: `route` (equality on provenance/attribute/resource) and `target`
   components (ADR [`target-components`](adr/target-components.md)), and `lua` can route with
   `event:to`. Sampling, throttling, dedup, and anything needing an operator remain Lua-only.
+  **Narrowed a third time on 2026-09-22:** sampling is native now — `sample`
+  ([ADR `consistent-sampling-component`](adr/consistent-sampling-component.md)), which supersedes
+  the routing ADR's `sample` clause on different grounds than the revisit trigger: keyed,
+  cross-process-consistent sampling is something a `lua` component can't express at all, not just
+  a cost. Throttling, dedup, and anything needing an operator remain Lua-only.
+- **`sample`'s consistency is `logit`'s own, not OTel's, and stops at the key.** Four edges,
+  all deliberate ([ADR `consistent-sampling-component`](adr/consistent-sampling-component.md)):
+  1. **No OTEP 235 / W3C `tracestate` `th:` interop.** An OTel SDK or collector sampling by
+     threshold compares the trace id's *low 56 bits* against a `th:` value it also writes into
+     `tracestate`; `logit` hashes the id's hex text with XXH64 and compares the hash's *top 53
+     bits*. So a `logit` `sample` and an upstream OTel sampler at the same rate keep *different*
+     traces, and `logit` neither reads nor writes `th:`, so downstream can't recover the sampling
+     probability from a `logit`-sampled trace. Adopting OTEP 235 would mean a second bit
+     convention for `key: trace_id` only (no other key has a `tracestate`) — and, since the hash is
+     a frozen cross-version contract, its own ADR.
+  2. **`always_keep` is per leg.** Nothing about an override hit is propagated — a flagged event
+     kept by one sampler meets the next sampler in the path unflagged-in-effect unless that one is
+     configured with the same `always_keep`. Same "no propagated bit" reasoning as the rate itself.
+  3. **Two spellings of one trace id that aren't lowercase hex don't agree.** `key: trace_id`
+     hashes a lifted id as its 32 lowercase hex characters, and `{attribute: ..}` hashes a `Str`
+     as-is, so an *uppercase*-hex attribute (off-spec — W3C mandates lowercase) or a trace id
+     carried as a 16-byte `Value::Bytes` reaches a different verdict than the same id lifted by
+     `trace_context`. Case is not folded, and raw bytes are not hex-encoded, on purpose: the
+     canonicalization table stays one rule per `Value` variant.
+  4. **A resource key is all-or-nothing per resource.** `key: {resource: ..}` gives every event of
+     one resource the same verdict — the point of keying on one, but at a low resource count the
+     kept fraction is lumpy (two services at `rate: 0.5` keep zero, one, or both), not `rate`.
 - ~~**`HyperLogLog` is real now; statsd still has no producer for it.**~~ — **closed, both halves,
   as of W3.** [`docs/plans/lossless-transit.md`](plans/lossless-transit.md)'s W2 gave `HyperLogLog`
   (`crates/logit-core/src/metric.rs`) a real implementation wrapping the `cardinality-estimator`
@@ -1075,7 +1102,9 @@ already built that have a known, accepted rough edge.
     self-observability, deliberately independent of the traffic it's observing: raising or lowering
     it changes how much of the internal pipeline you can see, never what the pipeline does to an
     event. What it does *not* do: it doesn't sample the events themselves (a dropped trace's events
-    still flow through the pipeline and reach every configured sink, untouched); it doesn't
+    still flow through the pipeline and reach every configured sink, untouched -- sampling the
+    traffic is the `sample` transform's job, ADR `consistent-sampling-component`, which hashes its
+    key rather than reading raw trace-id bits and so owes this sampler no agreement); it doesn't
     propagate to or from a peer (no `sampled` flag crosses `otlp_in`/`otlp_out`'s wire boundary, so
     a `logit` downstream of another `logit` -- or of any other OTLP producer -- makes its own
     independent keep/drop decision on the same `trace_id`, per ADR `internal-span-emission-and-deterministic-sampling`'s "no propagated bit"

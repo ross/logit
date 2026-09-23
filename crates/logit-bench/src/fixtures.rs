@@ -33,7 +33,8 @@ use logit_proto::Decoder;
 use logit_transforms::{
     AggregateTemporality, Aggregator, Arrays, CsvParser, Distributions, Fields, Flatten,
     HttpAccess, HttpAccessConfig, JsonParser, Keep, KeepValues, Kv, KvMetrics, Logfmt, MetricSpec,
-    Normalize, RegexParser, RouteRule, RouteSet, Set, Shape,
+    Normalize, RegexParser, RouteRule, RouteSet, Sample, SampleField, SampleKey, SampleMissing,
+    SampleOverride, Set, Shape,
 };
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -589,6 +590,40 @@ pub fn shape() -> Shape {
 /// common case, for `crates/logit-bench/tests/allocations.rs`'s `flatten_*` measurements.
 pub fn flatten() -> Flatten {
     Flatten::new(Fields::All, Fields::None, Arrays::Index)
+}
+
+/// A `sample` keyed on `trace_id` at `rate: 0.5` -- `examples/sample-traces.yaml`'s shape, for
+/// `crates/logit-bench/tests/allocations.rs`'s `sample_*` measurements
+/// (`docs/adr/consistent-sampling-component.md`). Seeded so the keyless draw a missing key falls
+/// to is reproducible.
+pub fn sample_by_trace_id() -> Sample {
+    Sample::new(0.5, Some(SampleKey::TraceId), SampleMissing::Random, None).with_seed(1)
+}
+
+/// A `sample` keyed on [`nginx_event`]'s `status` attribute, a `Value::I64` -- the path that
+/// formats a number's decimal text straight into the hasher.
+pub fn sample_by_status() -> Sample {
+    Sample::new(0.5, Some(SampleKey::Attribute("status".to_string())), SampleMissing::Random, None)
+        .with_seed(1)
+}
+
+/// A keyless `sample` -- one seeded draw per event.
+pub fn sample_random() -> Sample {
+    Sample::new(0.5, None, SampleMissing::Random, None).with_seed(1)
+}
+
+/// A `sample` at `rate: 0` with an `always_keep` on [`nginx_event`]'s `host: static.local` --
+/// the override-hit path, a `value_matches` string compare.
+pub fn sample_override() -> Sample {
+    Sample::new(
+        0.0,
+        Some(SampleKey::TraceId),
+        SampleMissing::Drop,
+        Some(SampleOverride {
+            field: SampleField::Attribute("host".to_string()),
+            value: Some(Value::str("static.local")),
+        }),
+    )
 }
 
 /// A `set` configured with one attribute pair and no resource pairs -- the per-event-only path

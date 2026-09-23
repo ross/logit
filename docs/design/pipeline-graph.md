@@ -135,12 +135,18 @@ pub enum ComponentKind {
     // (docs/adr/target-components.md). An unrouted event goes to this component's ordinary
     // consumers.
     Route { by: RouteBy, routes: BTreeMap<String, String> },
+    // Keeps a fraction of events by a hashed key (trace_id, an attribute, or a resource
+    // attribute), so every event sharing a key gets the same verdict in every process;
+    // `always_keep` pins flagged events through (docs/adr/consistent-sampling-component.md).
+    Sample { rate: f64, key: Option<SampleKey>, missing: Option<SampleMissing>,
+             always_keep: Option<SampleOverride> },
     // as each lands in logit-transforms, same shape: a `ComponentKind` variant, no `sources`
-    // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`sample`/
-    // `throttle`/`dedup` used to be sketched here too -- retired before landing, not merely
-    // deferred: each is already expressible as a `lua` component, and
-    // `docs/adr/routing-by-condition-is-lua.md` records why a native equivalent wasn't worth
-    // building yet.
+    // opinion of its own (that lives on `Component`, uniformly). `rename`/`filter`/`throttle`/
+    // `dedup` used to be sketched here too -- retired before landing, not merely deferred: each is
+    // already expressible as a `lua` component, and `docs/adr/routing-by-condition-is-lua.md`
+    // records why a native equivalent wasn't worth building yet. `sample` was retired with them
+    // and came back once keyed, cross-process consistency turned out to be the part `lua` can't
+    // express.
 
     InfluxDbOut { url: String, org: String, bucket: String, token: String },
     OtlpOut { endpoint: String },
@@ -160,7 +166,7 @@ UDP or TCP, `docs/adr/syslog-output.md`) is exactly that case, landing well afte
 Transform kinds — `lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`,
 `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`,
 `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `logfmt`, `kv`, `regex`,
-`shape`, `flatten`, `http_access`, and any future native transform — take no suffix; there's only ever one direction
+`shape`, `flatten`, `http_access`, `sample`, and any future native transform — take no suffix; there's only ever one direction
 for a transform to be.
 
 **`interval` stays a per-kind optional field, unchanged from today.** `lua`/`lua_file` already carry
@@ -206,7 +212,7 @@ the tag's literal argument string instead of failing.
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
 | Listener (`statsd_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `prometheus_in`, `generate_in`) | must be empty | required (≥1 consumer) |
-| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `route`) | ≥1 required | required (≥1 consumer) |
+| Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `keep_values`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `http_access`, `sample`, `route`) | ≥1 required | required (≥1 consumer) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
 
@@ -757,6 +763,17 @@ Replaces `validate_semantics` (`crates/logit-cli/src/pipeline.rs`). In order:
     of omitting the block, so "don't trust `X-Forwarded-For`" has one spelling. There is
     deliberately **no** "nothing configured" clause: a bare `type: http_access` still coerces,
     caps, derives, and classifies with the built-in tables.
+61. `sample`-specific validation
+    ([ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md)). `rate` must
+    be finite and within `[0, 1]` — rule 16's reasoning, since `sampling::keep` shares
+    `trace_is_sampled`'s "NaN keeps everything" fallback. `rate: 1` is rejected (it keeps every
+    event) and so is `rate: 0` without `always_keep` (it keeps nothing — that's `null_out`) — rules
+    7/12/54/59's "a config that can only be a no-op is an error"; `rate: 0` *with* `always_keep`
+    is the "only flagged events" debugging mode and is allowed. An empty `key:` or `always_keep:`
+    field name is rejected — rules 19/20's reasoning. `always_keep` must name exactly one of
+    `attribute`/`resource`, and a non-finite `always_keep.value` is rejected since it can never
+    match anything (rules 36/54). `missing:` without `key:` is rejected — there is no key to be
+    missing.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

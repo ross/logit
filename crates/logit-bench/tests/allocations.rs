@@ -1207,6 +1207,72 @@ fn flatten_pino_http_event_cold_key_cache() {
     expect_allocs("flatten: pino-http shape, cold KeyCache (first event)", stats, 12);
 }
 
+// -- sample (docs/adr/consistent-sampling-component.md) -----------------------------------------
+//
+// Every `sample` path is free: the key and override names are interned once at construction,
+// lookups are `AttrMap::get_sym`, a trace id is hex-encoded into a stack array, a number is
+// formatted straight into the streaming hasher (`logit_core::sampling`'s `KeyHasher`), and the
+// per-batch telemetry tally is plain integers. `sample` sits on every event of the streams it
+// exists for, so each of its four decision paths is pinned separately. Each measurement runs the
+// same event twice (warm, then measured) so the verdict is the same both times.
+
+/// `key: trace_id` on a span -- hex-encode the 16 bytes on the stack, one XXH64.
+#[test]
+fn sample_by_span_trace_id_one_event() {
+    let mut s = fixtures::sample_by_trace_id();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::span_event();
+    let expected = s.process(&resource, &mut warm);
+
+    let mut event = fixtures::span_event();
+    let (forwarded, stats) = measure(|| s.process(&resource, &mut event));
+    assert_eq!(forwarded, expected, "same trace id, same verdict");
+    expect_allocs("sample: key trace_id, span event", stats, 0);
+}
+
+/// `key: {attribute: status}` on `nginx_event`'s `I64(200)` -- `write!` into the hasher, no
+/// intermediate `String`.
+#[test]
+fn sample_by_integer_attribute_one_event() {
+    let mut s = fixtures::sample_by_status();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    let expected = s.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| s.process(&resource, &mut event));
+    assert_eq!(forwarded, expected, "same key, same verdict");
+    expect_allocs("sample: key attribute, I64 value", stats, 0);
+}
+
+/// No key -- a counter mixed with the seed through the same hash.
+#[test]
+fn sample_random_one_event() {
+    let mut s = fixtures::sample_random();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    s.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (_, stats) = measure(|| s.process(&resource, &mut event));
+    expect_allocs("sample: keyless draw", stats, 0);
+}
+
+/// `always_keep` hit -- one `get_sym` and a `value_matches` string compare, before the key is
+/// ever looked at.
+#[test]
+fn sample_override_hit_one_event() {
+    let mut s = fixtures::sample_override();
+    let resource = fixtures::resource();
+    let mut warm = fixtures::nginx_event();
+    s.process(&resource, &mut warm);
+
+    let mut event = fixtures::nginx_event();
+    let (forwarded, stats) = measure(|| s.process(&resource, &mut event));
+    assert!(forwarded, "an always_keep hit is kept at rate 0");
+    expect_allocs("sample: always_keep hit", stats, 0);
+}
+
 // -- http_access (docs/adr/http-access-normalization.md) ----------------------------------------
 
 /// A metric-only event, matching `http_access`'s own contract exactly (`process`'s doc comment):

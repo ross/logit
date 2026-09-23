@@ -489,6 +489,57 @@ pub enum ProvenanceField {
     Previous,
 }
 
+/// What one `sample` (`ComponentKind::Sample`) hashes to reach its keep/drop verdict. Externally
+/// tagged like [`RouteBy`], so config reads `key: trace_id`, `key: {attribute: request_id}`, or
+/// `key: {resource: service.name}`. See `docs/adr/consistent-sampling-component.md` for the
+/// canonicalization every shape is hashed through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleKey {
+    /// The event's application trace id: `span.trace_id` if it carries a span, else its log
+    /// record's `trace.trace_id` (what `trace_context` or `otlp_in` sets). Hashed as its 32
+    /// lowercase hex characters, so it agrees with `{attribute: ...}` on the same id left as an
+    /// unlifted hex string.
+    TraceId,
+    /// A top-level event attribute, named literally (never a path).
+    Attribute(String),
+    /// A resource attribute -- every event of one resource gets the same verdict.
+    Resource(String),
+}
+
+/// What `sample` does with an event its configured `key:` isn't on -- no span or log trace
+/// reference, no such attribute, or a `Null`/`Array`/`Map` value there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleMissing {
+    /// Draw at `rate` as if no key were configured (the default).
+    #[default]
+    Random,
+    /// Forward it.
+    Keep,
+    /// Drop it.
+    Drop,
+}
+
+/// `sample`'s `always_keep:` override: an event carrying the named field -- and, with `value:`,
+/// carrying it with that value -- is kept whatever the rate. Exactly one of `attribute`/`resource`
+/// (graph rule 61).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SampleOverride {
+    /// A top-level event attribute to look for, named literally.
+    #[serde(default)]
+    pub attribute: Option<String>,
+    /// A resource attribute to look for, named literally.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// The value the field must carry, compared under `has_attributes`' equality rules (numeric
+    /// coercion across integer/float/string, none for booleans -- `value: true` does not match a
+    /// logfmt `"true"` string). Absent means any value.
+    #[serde(default)]
+    pub value: Option<SetValue>,
+}
+
 /// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String,
 /// String>` -- a typo'd key there would silently do nothing, where a struct field gets schema
 /// validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves
@@ -998,9 +1049,9 @@ pub enum ComponentKind {
         /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
         /// traces rather than a representative sample would set this explicitly. Named
         /// `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs
-        /// later, and the name should keep meaning "which knob" even though the per-event
-        /// `sample` transform this once also disambiguated against was retired
-        /// (`docs/adr/routing-by-condition-is-lua.md`). See
+        /// later, and the name disambiguates against the per-event `sample` transform, which
+        /// samples an application's events by a hashed key rather than `logit`'s own spans by
+        /// raw trace-id bits (`docs/adr/consistent-sampling-component.md`). See
         /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
@@ -1513,13 +1564,39 @@ pub enum ComponentKind {
         #[serde(default)]
         forwarded: Option<ForwardedConfig>,
     },
-    // `filter`/`rename`/`sample`/`throttle`/`dedup` used to live here too -- retired, not merely
+    /// Keeps a fraction of events, consistently: with `key:` set, the key's value is hashed
+    /// (XXH64, seed 0, over a fixed canonical byte form) and compared against `rate`, so every
+    /// event sharing a key -- every span and log of one trace, under `key: trace_id` -- gets the
+    /// same verdict in every `logit` process that sees it, with nothing propagated between them.
+    /// With no `key:`, each event is an independent draw. `always_keep:` pins flagged events
+    /// through regardless. Never mutates an event. Validated by `crates/logit-pipeline/src/
+    /// graph.rs` rule 61. See `docs/adr/consistent-sampling-component.md`, which also freezes the
+    /// hash as a cross-version contract.
+    Sample {
+        /// Fraction of events (or of keys) kept, `0.0..=1.0`. `1` is rejected (a no-op), and `0`
+        /// is rejected unless `always_keep` is set -- then it keeps only the flagged events.
+        rate: f64,
+        /// What to hash. Absent means an independent draw per event.
+        #[serde(default)]
+        key: Option<SampleKey>,
+        /// What happens to an event the configured `key:` isn't on. Only meaningful with `key:`
+        /// -- rule 61 rejects it otherwise. Absent means `random`.
+        #[serde(default)]
+        missing: Option<SampleMissing>,
+        /// Events carrying this field (optionally with this value) are kept unconditionally,
+        /// before the key is even looked at. Per leg: nothing is propagated to other samplers.
+        #[serde(default)]
+        always_keep: Option<SampleOverride>,
+    },
+    // `filter`/`rename`/`throttle`/`dedup` used to live here too -- retired, not merely
     // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
     // a `lua` component (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the
     // ADR records why building a second, native way to say the same thing wasn't worth it yet.
-    // Referencing one of those five kinds is now a deserialization error naming the valid kinds,
+    // Referencing one of those four kinds is now a deserialization error naming the valid kinds,
     // not a graph-validation "not implemented" -- see the ADR's Consequences for why that trade
-    // was accepted.
+    // was accepted. `sample` was retired with them and has since returned as a native kind
+    // (above): *consistent* sampling is the one thing a `lua` component can't express --
+    // `docs/adr/consistent-sampling-component.md`.
     /// `rename`d explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`
     /// (a word break at the embedded capital `Db`), not `influxdb_out` as published in
     /// `docs/design/pipeline-graph.md` and every example config.
@@ -3869,8 +3946,8 @@ mod tests {
         }
     }
 
-    /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`sample`/`throttle`/`dedup`
-    /// were retired, not merely left unimplemented -- a config referencing one is now a
+    /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`throttle`/`dedup` were
+    /// retired, not merely left unimplemented -- a config referencing one is now a
     /// deserialization error (naming the valid kinds) rather than `graph::resolve`'s "not
     /// implemented yet" (`crates/logit-pipeline/src/graph.rs`'s `unimplemented_kind_is_rejected`
     /// covers a still-unimplemented-but-declared kind; this is the different, now-gone case).
@@ -4316,6 +4393,83 @@ mod tests {
             }
             other => panic!("expected Flatten, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sample_component_deserializes_with_only_a_rate() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "sample", "sources": ["in"], "rate": 0.25}"#).unwrap();
+        match component.kind {
+            ComponentKind::Sample { rate, key, missing, always_keep } => {
+                assert_eq!(rate, 0.25);
+                assert_eq!(key, None);
+                assert_eq!(missing, None);
+                assert_eq!(always_keep, None);
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_key_reads_each_shape() {
+        let key: SampleKey = serde_json::from_str(r#""trace_id""#).unwrap();
+        assert_eq!(key, SampleKey::TraceId);
+        let key: SampleKey = serde_json::from_str(r#"{"attribute": "request_id"}"#).unwrap();
+        assert_eq!(key, SampleKey::Attribute("request_id".to_string()));
+        let key: SampleKey = serde_json::from_str(r#"{"resource": "service.name"}"#).unwrap();
+        assert_eq!(key, SampleKey::Resource("service.name".to_string()));
+        assert_eq!(serde_json::to_string(&SampleKey::TraceId).unwrap(), r#""trace_id""#);
+        assert!(serde_json::from_str::<SampleKey>(r#""span_id""#).is_err());
+    }
+
+    #[test]
+    fn sample_missing_reads_each_mode() {
+        for (text, mode) in [
+            (r#""random""#, SampleMissing::Random),
+            (r#""keep""#, SampleMissing::Keep),
+            (r#""drop""#, SampleMissing::Drop),
+        ] {
+            assert_eq!(serde_json::from_str::<SampleMissing>(text).unwrap(), mode);
+        }
+        assert_eq!(SampleMissing::default(), SampleMissing::Random);
+    }
+
+    #[test]
+    fn sample_component_deserializes_full_form() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "sample", "sources": ["in"], "rate": 0.1, "key": "trace_id",
+                "missing": "drop",
+                "always_keep": {"attribute": "sampling.keep", "value": true}}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::Sample { rate, key, missing, always_keep } => {
+                assert_eq!(rate, 0.1);
+                assert_eq!(key, Some(SampleKey::TraceId));
+                assert_eq!(missing, Some(SampleMissing::Drop));
+                let always_keep = always_keep.unwrap();
+                assert_eq!(always_keep.attribute.as_deref(), Some("sampling.keep"));
+                assert_eq!(always_keep.resource, None);
+                // A YAML/JSON `true` stays a `Bool`, not a string -- `SetValue`'s untagged order.
+                assert_eq!(always_keep.value, Some(SetValue::Bool(true)));
+            }
+            other => panic!("expected Sample, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_override_without_a_value_matches_any_value() {
+        let o: SampleOverride = serde_json::from_str(r#"{"resource": "debug"}"#).unwrap();
+        assert_eq!(o.resource.as_deref(), Some("debug"));
+        assert_eq!(o.attribute, None);
+        assert_eq!(o.value, None);
+    }
+
+    #[test]
+    fn sample_override_rejects_an_unknown_field() {
+        let err = serde_json::from_str::<SampleOverride>(r#"{"attribute": "a", "equals": 1}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
     }
 
     #[test]
