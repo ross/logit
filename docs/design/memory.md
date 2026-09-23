@@ -835,12 +835,12 @@ tokio scheduling, never in between and never the pre-`Arc` code's flat 3. If the
 handle is still alive, it clones (4). Two tests pin each ordering
 (`fanout_send_mixed_output_and_transform_consumers[_when_output_finishes_first]`).
 
-**1 is the likelier outcome, since [ADR `buffered-sink-delivery`](../adr/buffered-sink-delivery.md).**
-Before it, `run_output` held its `Arc` handle for all of `output.send`, typically real I/O and
-slower than a `Transform`'s local work, so the clone was likelier. Now `drain_inbox` drops its
-handle as soon as it matches the received `Delivered`, independent of how long the paired
-`write_loop`'s `output.send` takes, so the race is between two comparably cheap local operations.
-That is an expectation about typical scheduling, not a guarantee; both outcomes stay reachable.
+**4 is the likelier outcome.** `drain_inbox` moves the `Output` branch's handle into the sink's
+store (`SinkStore::push`). A `Memory` store holds it until `write_loop` commits the batch after
+`output.send`, typically real I/O and slower than a `Transform`'s local work, so the mutating
+branch usually finds the handle alive and clones. A `Disk` store drops it once the record is
+written, which shortens the window but doesn't close it. That is an expectation about typical
+scheduling, not a guarantee; both outcomes stay reachable.
 
 **An `Output` branch pays one more hop past `Fanout::send`.** The table measures `Fanout::send`
 alone. A sink's batch then goes through `drain_inbox` (`runtime.rs`,
