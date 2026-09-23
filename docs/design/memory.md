@@ -74,9 +74,9 @@ with the constituent parts:
 | `Value` | 40 | sized by `Bytes` (4 words) plus an aligned discriminant |
 | `(Symbol, Value)` | 48 | 4 bytes of padding after `Symbol` |
 | `AttrMap` | 392 | 8 × 48 inline, + 8 of smallvec overhead (`union` feature, below) |
-| `DdSketch` | 176 | `sketches_ddsketch::DDSketch` inlined directly (no `Box`): two `Store`s plus a `Config` |
-| `Samples` | 168 | `SmallVec<[f64; SAMPLES_INLINE]>` (`SAMPLES_INLINE = 19`) + `sample_rate: f64` -- deliberately sized to sit just under `DdSketch`'s 176, see `MetricKind` below |
-| `MetricKind` | 176 | sized by the larger of its two big variants (`Distribution`'s inlined `DdSketch`), with just enough room left over for a real discriminant that `Samples`'s smaller payload doesn't use up -- every other variant (`Sum`/`Gauge`/`GaugeDelta`/`SetMembers`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`) is far smaller and pays the same 176 regardless |
+| `DdSketch` | 128 | the hand-rolled sketch (`crates/logit-core/src/sketch.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)) inlined directly (no `Box`): a `Mapping` (40), two bin `Vec`s (48), five `f64` summary fields (40), the exact-stats flag; it was 176 as a wrapped `sketches_ddsketch::DDSketch` |
+| `Samples` | 168 | `SmallVec<[f64; SAMPLES_INLINE]>` (`SAMPLES_INLINE = 19`) + `sample_rate: f64` -- sized when it had to sit just under the 176-byte `DdSketch`; now the largest variant, see `MetricKind` below |
+| `MetricKind` | 176 | sized by its largest variant, `Samples` at 168, plus a real discriminant -- every other variant (`Distribution`'s 128-byte `DdSketch` included, and `Sum`/`Gauge`/`GaugeDelta`/`SetMembers`/`Set`/`Histogram`/`ExponentialHistogram`/`Summary`) is smaller and pays the same 176 regardless. Shrinking `Samples` to 19 → 13 inline values would take it to 128 and `MetricKind` to 136; that's a sizing decision for the perf VM ([ADR `event-sizing-and-allocation-strategy`](../adr/event-sizing-and-allocation-strategy.md)), not a free change |
 | `MetricRecord` | 224 | `MetricKind` (176) + `name`/`unit`/`description` (4 each, one padded) + `start_timestamp: i64` (8) + `exemplars: Vec<Exemplar>` (24) + `flags: u32` (4, fills former padding) |
 | `MetricList` | 232 | 1 × 224 inline + 8 |
 | `TraceRef` | 26 | `[u8;16]` trace id + `Option<[u8;8]>` span id + a flags byte; `Option<TraceRef>` is also 26 -- niche-filled through `Option<[u8;8]>`'s own tag |
@@ -118,7 +118,7 @@ The trades don't all point the same direction (see §0):
 |---|---:|---|---|
 | smallvec's `union` feature | 16 B | none — it's a feature flag | **done** — applied, no tradeoff |
 | `Box` `SpanRecord` | 136 B | +1 alloc per event that carries a span | **not done** — see below |
-| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B | +1 alloc per distribution metric created | **not done** — see below |
+| `Box` the `DdSketch` in `MetricKind::Distribution` | ~168 B when measured; 0 B now that `Samples` bounds `MetricKind` | +1 alloc per distribution metric created | **not done** — see below |
 | Re-pick `AttrMap`'s inline capacity | up to 192 B | more spills, or (if increased) more bytes | **deferred** — see below |
 
 Only the `union` feature landed, taking `Event` from 792 to 776 bytes at the time. `Event` has
@@ -137,9 +137,10 @@ way unless the payload is rare in its intended workload.
 
 Neither payload is rare:
 
-- **Boxing the `DdSketch` is not free.** A sketch doesn't allocate at construction:
-  `sketches_ddsketch`'s `Store::new` starts with `Vec::new()`, and the bins are allocated on the
-  first `add`. So the box is a new allocation, not one folded into an existing one. Measured at the
+- **Boxing the `DdSketch` is not free.** A sketch doesn't allocate at construction: its bin
+  `Vec`s start empty, and the first `add` allocates the first one (64 bins, 1 KiB, the same
+  bytes `sketches_ddsketch`'s 128-`u64` chunk cost when this was measured). So the box is a new
+  allocation, not one folded into an existing one. Measured at the
   time, boxing took `kv_metrics` from 3 allocations for 4 metrics (one `MetricList` spill plus one
   bins `Vec` per distribution) to 5, and the reference config, which carries 2 distributions per
   event, from 5 to 7 allocations per ingested line. That is the flagship config, not an edge case.

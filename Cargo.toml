@@ -71,7 +71,6 @@ socket2 = "0.6.5"
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 serde_norway = "0.9"
-sketches-ddsketch = "0.4"
 # `logit-core::metric::HyperLogLog` (docs/plans/lossless-transit.md's W2) -- a real, mergeable
 # cardinality estimator for `MetricKind::Set`, replacing the stub. Apache-2.0, in `deny.toml`'s
 # allowlist. Its `CardinalityEstimator` has no `as_bytes`/`to_bytes` of its own -- only a

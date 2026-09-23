@@ -425,8 +425,10 @@ shaped these kinds to close the gaps [ADR `lossless-transit`](../adr/lossless-tr
 ones, temporality and monotonicity on `Sum`, and sum/count/min/max on
 `Histogram`/`ExponentialHistogram`/`Summary`.
 
-- `Distribution` uses **DDSketch** (`sketches-ddsketch`), which merges with a guaranteed relative
-  error bound. Reservoir sampling and percentile-of-percentiles don't merge correctly (two nodes'
+- `Distribution` uses **DDSketch** (`logit_core::sketch`, hand-rolled with the Datadog Agent's
+  own bin mapping so a sketch relays to and from Datadog bin-for-bin, [ADR
+  `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)), which merges with
+  a guaranteed relative error bound. Reservoir sampling and percentile-of-percentiles don't merge correctly (two nodes'
   p99s don't combine into the p99 of the merged data), so the whole distributed-aggregation story
   depends on DDSketch. `Samples` holds raw statsd `ms`/`h`/`d` observations; `statsd_in` decodes
   those lines to it.

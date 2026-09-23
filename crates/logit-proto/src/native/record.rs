@@ -350,7 +350,7 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
             out.extend_from_slice(&tmp);
         }
         MetricKind::Distribution(sketch) => {
-            let blob = sketch.to_java_bytes();
+            let blob = sketch.to_bytes();
             out.extend_from_slice(&[METRIC_DISTRIBUTION]);
             write_uvarint(out, blob.len() as u64);
             out.extend_from_slice(&blob);
@@ -368,7 +368,7 @@ fn write_metric_kind(out: &mut BytesMut, kind: &MetricKind) {
         }
         MetricKind::Set(hll) => {
             // `HyperLogLog::to_bytes()`'s blob, the same shape `Distribution`'s
-            // `DdSketch::to_java_bytes()` blob takes -- see `crates/logit-core/src/metric.rs`.
+            // `DdSketch::to_bytes()` blob takes -- see `crates/logit-core/src/metric.rs`.
             let blob = hll.to_bytes();
             out.extend_from_slice(&[METRIC_SET]);
             write_uvarint(out, blob.len() as u64);
@@ -452,7 +452,7 @@ fn read_metric_kind(bytes: &mut Bytes) -> Result<MetricKind, CodecError> {
             MetricKind::Samples(samples)
         }
         METRIC_DISTRIBUTION => {
-            let sketch = DdSketch::from_java_bytes(&body)
+            let sketch = DdSketch::from_bytes(&body)
                 .map_err(|e| CodecError::Malformed(format!("bad distribution blob: {e:?}")))?;
             MetricKind::Distribution(sketch)
         }
@@ -1335,7 +1335,7 @@ mod tests {
             match (&kind, &out.kind) {
                 (MetricKind::Distribution(a), MetricKind::Distribution(b)) => {
                     // DDSketch has no PartialEq of its own but MetricKind's PartialEq compares
-                    // via to_java_bytes -- exercised directly here too, for clarity.
+                    // via to_bytes -- exercised directly here too, for clarity.
                     assert_eq!(a, b);
                 }
                 (a, b) => assert_eq!(a, b, "kind mismatch for {a:?}"),

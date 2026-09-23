@@ -792,8 +792,7 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   hard cardinality cap (the TTL bounds only the retained set's tail, not its peak).
 
   **Sample-rate extrapolation.** `DdSketch::add_weighted(value, count)`
-  (`crates/logit-core/src/metric.rs`) delegates to `sketches_ddsketch::DDSketch::add_with_count`,
-  an O(1) native weighted add. A repeated-`add` loop and a binary-doubling `merge` were rejected;
+  (`crates/logit-core/src/sketch.rs`) adds `count` to one bin, an O(1) weighted add. A repeated-`add` loop and a binary-doubling `merge` were rejected;
   `merge` specifically because it is O(log count) allocations on `statsd_decode_one_line`'s
   exact-equality allocation path, which this project doesn't relax. `100|ms|@0.1` extrapolates into
   10 weighted samples, as a `c` (counter) already extrapolates via `value / sample_rate`. Weight is

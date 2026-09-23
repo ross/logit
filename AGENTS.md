@@ -578,9 +578,13 @@ not a style preference:
 - **Metric kinds must stay mergeable.** `Distribution` needs a sketch with a real error bound
   (`DDSketch`, not a naive percentile), `Set` needs a real union (`HyperLogLog`) — this is what
   makes the split-collection topology in `docs/OVERVIEW.md` correct rather than approximate.
-  `logit-core::metric::DdSketch` is a real wrapper with a working `merge` (`crates/logit-transforms`'
-  `aggregate` is its first caller); `HyperLogLog` wraps the `cardinality-estimator` crate, also a
-  real, mergeable sketch — don't replace either with a non-mergeable shortcut.
+  `logit-core::sketch::DdSketch` is a hand-rolled DDSketch with a working `merge`
+  (`crates/logit-transforms`' `aggregate` is its first caller) that keys bins exactly as the
+  Datadog Agent does, so a sketch relays to and from Datadog bin-for-bin
+  ([ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md)); its
+  mapping is part of the wire, so don't change `Mapping::agent`'s constants. `HyperLogLog` wraps
+  the `cardinality-estimator` crate, also a real, mergeable sketch — don't replace either with a
+  non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
   prometheus_out`, `collectd_in -> collectd_out`, and `graphite_in -> graphite_out` must each be a
   lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a

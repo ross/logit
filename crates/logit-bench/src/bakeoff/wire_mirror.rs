@@ -9,7 +9,7 @@
 //! traits directly with no remote-type wrapper plumbing. Two of the correctness rules
 //! `logit_proto::native`'s own module doc states apply here too, for a fair comparison: a `Symbol`
 //! is dictionary-indexed rather than written raw, and `MetricKind::Distribution`/`MetricKind::Set`
-//! ride as `DdSketch::to_java_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
+//! ride as `DdSketch::to_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -199,7 +199,7 @@ pub enum WireMetricKind {
     Gauge(f64),
     GaugeDelta(f64),
     Samples(WireSamples),
-    /// `DdSketch::to_java_bytes()` -- the same canonical, cross-language blob
+    /// `DdSketch::to_bytes()` -- the same canonical, cross-language blob
     /// `logit_proto::native` uses, since `DDSketch`'s fields are private with no bin iteration
     /// (`crates/logit-core/src/metric.rs`).
     Distribution(Vec<u8>),
@@ -480,7 +480,7 @@ fn metric_kind_to_wire(kind: &MetricKind) -> WireMetricKind {
             values: s.values.iter().copied().collect(),
             rate: s.sample_rate,
         }),
-        MetricKind::Distribution(sketch) => WireMetricKind::Distribution(sketch.to_java_bytes()),
+        MetricKind::Distribution(sketch) => WireMetricKind::Distribution(sketch.to_bytes()),
         MetricKind::SetMembers(members) => {
             WireMetricKind::SetMembers(members.iter().map(|m| m.to_vec()).collect())
         }
@@ -530,7 +530,7 @@ fn wire_to_metric_kind(kind: &WireMetricKind) -> MetricKind {
             sample_rate: s.rate,
         }),
         WireMetricKind::Distribution(blob) => {
-            MetricKind::Distribution(DdSketch::from_java_bytes(blob).expect("valid blob"))
+            MetricKind::Distribution(DdSketch::from_bytes(blob).expect("valid blob"))
         }
         WireMetricKind::SetMembers(members) => {
             MetricKind::SetMembers(members.iter().map(|m| bytes::Bytes::from(m.clone())).collect())

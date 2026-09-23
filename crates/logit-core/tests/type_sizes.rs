@@ -75,24 +75,20 @@ fn attr_map_pays_its_inline_capacity_whether_or_not_it_spills() {
     assert_eq!(size_of_val(&spilled), size_of::<AttrMap>());
 }
 
-/// `MetricKind` inlines either a whole `sketches_ddsketch::DDSketch` (`Distribution`) or a
-/// `SmallVec<[f64; SAMPLES_INLINE]>` (`Samples`) -- the two largest variants, deliberately sized to
-/// match. `size_of::<DdSketch>()` is 176 bytes (two `Store`s, each a `Vec` plus bookkeeping, and a
-/// `Config`), and `MetricKind::Distribution(DdSketch)` fits in exactly that many bytes with no
-/// separate discriminant byte: rustc niche-fills the outer enum's tag into spare bit patterns
-/// already present inside `DDSketch`'s own layout. That trick is specific to `DDSketch`'s layout,
-/// not available to `Samples`'s -- a `Samples` variant sized to exactly 176 bytes too would force a
-/// real discriminant on top, growing `MetricKind` to 184 (measured directly while choosing
-/// `SAMPLES_INLINE`, see `metric.rs`'s own doc comment on the constant). `SAMPLES_INLINE = 19`
-/// keeps `Samples` at 168 bytes, leaving exactly enough room for that discriminant to land inside
-/// the existing 176-byte envelope instead of growing it.
+/// `MetricKind` inlines either a whole `DdSketch` (`Distribution`) or a
+/// `SmallVec<[f64; SAMPLES_INLINE]>` (`Samples`), its two largest variants. `size_of::<DdSketch>()`
+/// is 128 bytes (a `Mapping`, two bin `Vec`s, and the summary; it was 176 as a wrapped
+/// `sketches_ddsketch::DDSketch`, whose layout is what `SAMPLES_INLINE = 19` was measured
+/// against). `Samples` at 168 bytes is now the larger, and needs a real discriminant on top, so
+/// `MetricKind` stays at the 176 it always was: the sketch's shrink freed nothing there, and a
+/// `Samples` of 176 would still grow it to 184 (see `metric.rs`'s doc comment on the constant).
 #[test]
 fn metric_kind_is_sized_by_its_two_largest_variants() {
     assert_eq!(
         size_of::<DdSketch>(),
-        176,
-        "sketches_ddsketch::DDSketch inlined directly (no Box): two Stores (a Vec plus \
-         bookkeeping each) and a Config"
+        128,
+        "a Mapping (kind, gamma, gamma_ln, offset, bin_limit), two bin Vecs, and the f64 \
+         summary (zero_count, count, min, max, sum) plus the exact-stats flag"
     );
     assert_eq!(
         size_of::<Samples>(),
@@ -103,10 +99,9 @@ fn metric_kind_is_sized_by_its_two_largest_variants() {
     assert_eq!(
         size_of::<MetricKind>(),
         176,
-        "sized by the larger of its two big variants (Distribution's inlined DDSketch, at 176) \
-         plus room for a real discriminant that Samples's own 168-byte payload leaves inside that \
-         envelope -- every other variant (Sum/Gauge/GaugeDelta/SetMembers/Set/Histogram/\
-         ExponentialHistogram/Summary) is far smaller and pays the same 176 regardless"
+        "sized by its largest variant, Samples at 168, plus a real discriminant -- every other \
+         variant (Distribution's 128-byte DdSketch included, and Sum/Gauge/GaugeDelta/SetMembers/\
+         Set/Histogram/ExponentialHistogram/Summary) is smaller and pays the same 176 regardless"
     );
     assert_eq!(
         size_of::<MetricRecord>(),
