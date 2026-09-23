@@ -325,7 +325,7 @@ is `ReceiveConfig::default()` by the time a resolved graph reaches `build_spec`.
 introspection, mirroring how `NodeSpec::Output`'s `SinkQueueConfig`/`WriteLoopConfig` are directly
 inspectable.
 
-**Test list, as run:** 9 new `graph.rs` tests (rules 16/17, each zero-bound field individually,
+**Test list, as run:** 9 new `graph.rs` tests (rules 17/18, each zero-bound field individually,
 `batch_flush_interval: 0s` validating fine, `internal` specifically rejected with its own message);
 8 new `logit-config` tests (omitted/empty/fully-specified `receive: {}`, each `overflow` variant,
 `deny_unknown_fields`, `receive_buffer_bytes` round-tripping a quoted size / explicit null /

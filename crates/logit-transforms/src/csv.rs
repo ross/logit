@@ -38,7 +38,7 @@ pub struct CsvParser {
 impl CsvParser {
     /// `columns` is the config-declared schema (left to right); `delimiter` is a single ASCII
     /// byte, already validated at graph-resolution time (`docs/design/pipeline-graph.md`'s rule
-    /// 29) to be neither `"` nor `\n`/`\r`/non-ASCII.
+    /// 32) to be neither `"` nor `\n`/`\r`/non-ASCII.
     pub fn new(columns: Vec<String>, delimiter: u8) -> Self {
         let header_line = columns.join(&(delimiter as char).to_string()).into_bytes();
         Self {
@@ -95,7 +95,7 @@ impl Transform for CsvParser {
         // guarantee (an OTLP body's `bytes_value` decodes straight into one,
         // `crates/logit-proto/src/otlp/common.rs`), so validate here -- once, for the whole
         // message, not per field. One check is sufficient: `delimiter` is a single ASCII byte and
-        // `"` is ASCII (rule 29, `crates/logit-pipeline/src/graph.rs`), so every boundary
+        // `"` is ASCII (rule 32, `crates/logit-pipeline/src/graph.rs`), so every boundary
         // `split_row` computes falls on an ASCII byte and never inside a multi-byte sequence, and
         // `unescape` only ever deletes an ASCII `"` -- both keep a valid whole valid in its parts.
         if std::str::from_utf8(&raw).is_err() {
@@ -577,7 +577,7 @@ mod tests {
     }
 
     /// Why one whole-message check is enough for every field: the delimiter and `"` are both
-    /// ASCII (rule 29), so no field boundary can land inside a multi-byte sequence.
+    /// ASCII (rule 32), so no field boundary can land inside a multi-byte sequence.
     #[test]
     fn a_multi_byte_utf8_field_is_sliced_intact() {
         let mut csv = parser(&["a", "b"]);

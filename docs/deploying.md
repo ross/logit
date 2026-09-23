@@ -1395,7 +1395,7 @@ components:
 ```
 
 `http://`/`grpc://` (or a bare `host:port` under `protocol: grpc`) stays plaintext regardless of
-`tls:`. A non-empty `tls:` block under a plaintext endpoint is a config error (rule 22), not
+`tls:`. A non-empty `tls:` block under a plaintext endpoint is a config error (rule 24), not
 silently ignored, since it would have no effect. `ca_file`/`cert_file`/`key_file` paths resolve
 relative to the config file's own directory, like `lua_file`, and, like any other field, accept
 `!env` if the certificate material comes from the environment instead of a mounted file
@@ -1547,7 +1547,7 @@ Which component takes which block:
 
 | Component | Block | Turned on by | Notes |
 |---|---|---|---|
-| `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 22 |
+| `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 24 |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |

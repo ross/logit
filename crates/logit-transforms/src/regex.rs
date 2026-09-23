@@ -34,7 +34,7 @@ pub struct RegexParser {
 
 impl RegexParser {
     /// Compiles `pattern`. Fallible here and infallible at every call site that matters: graph
-    /// validation (`crates/logit-pipeline/src/graph.rs`'s rule 29) already compiled the same
+    /// validation (`crates/logit-pipeline/src/graph.rs`'s rule 31) already compiled the same
     /// pattern successfully, so `build_spec` can only ever reach this with a pattern it knows is
     /// valid -- see `crates/logit-cli/src/pipeline.rs`'s `build_spec` for why its own `?` on this
     /// call is unreachable in practice.

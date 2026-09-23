@@ -114,7 +114,7 @@ uniformly to all three rather than needing to be threaded through three call sit
   `serde_norway::from_str` does. Partly offset by `!env`'s own errors carrying a config path
   (`components.influx_out.token`), and by the note appended when a substitution's resolved type
   likely caused the failure. Documented in `docs/known-gaps.md`.
-- `crates/logit-pipeline/src/graph.rs` rule 7 (`is_implemented`) Debug-prints a whole
+- `crates/logit-pipeline/src/graph.rs` rule 8 (`is_implemented`) Debug-prints a whole
   `ComponentKind` on failure (`"kind {:?} is not implemented yet"`). Harmless today — no
   *unimplemented* kind carries a secret field — but with secrets inlined directly into fields
   rather than referenced by name, that becomes a real leak the moment one does. Documented in

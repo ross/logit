@@ -662,7 +662,7 @@ fn build_spec(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
         )),
-        // The `?` here is unreachable in practice: `graph::resolve`'s rule 29 already compiled
+        // The `?` here is unreachable in practice: `graph::resolve`'s rule 31 already compiled
         // this exact pattern successfully, so `RegexParser::new` can only fail on a pattern
         // validation let through -- which it doesn't.
         Regex { pattern, field } => NodeSpec::Transform(Box::new(
@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     /// `build_spec` (via `OtlpOutput::with_tls`) is where a bad `tls.ca_file` path actually loads
-    /// the file and fails -- `graph::resolve`'s rule 22 never touches the filesystem, so it can't
+    /// the file and fails -- `graph::resolve`'s rule 24 never touches the filesystem, so it can't
     /// catch this (`docs/deploying.md`'s TLS section documents that `logit validate` doesn't
     /// either, since `validate_semantics` only runs `graph::resolve`).
     #[test]

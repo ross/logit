@@ -499,7 +499,7 @@ pub struct ComponentBuffer {
     logs_dropped: AtomicU64,
     /// Copied from [`Registry`] at construction (never changes after) so [`Telemetry::span`]
     /// never needs a second lock beyond whichever one this buffer's own state already takes --
-    /// process-wide, set once, per graph validation rule 16 guaranteeing at most one `internal`
+    /// process-wide, set once, per graph validation rule 13 guaranteeing at most one `internal`
     /// component (`crates/logit-pipeline/src/graph.rs`).
     span_sample_rate: f64,
 }

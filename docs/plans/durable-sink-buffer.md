@@ -140,7 +140,7 @@ reopens with the backlog intact); the abandoned-inbox sweep appends to the spool
   none, checkpoint_interval: Duration = 1s }` with `deny_unknown_fields, default` on the
   optional fields (`path` has no default, so the struct derives `Default` only via a manual
   impl or drops `default` — follow `TlsServerConfig`'s "presence is the on-switch" precedent).
-- `graph.rs`: rule 34: with `disk:` set, `max_batches`/`max_bytes` must be default (they are
+- `graph.rs`: rule 35: with `disk:` set, `max_batches`/`max_bytes` must be default (they are
   ignored); `segment_bytes ≤ max_bytes`; `segment_bytes ≤ 64 MiB` (a frame is ≤
   `MAX_SANE_UNCOMPRESSED_LEN`, and a segment must hold at least one); two sinks may not share a
   `disk.path` (resolve against the config dir and compare canonical paths). Documented in

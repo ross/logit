@@ -95,7 +95,7 @@ pub enum OtlpTransport {
 /// Per-signal HTTP path overrides (`paths:` in config) -- `None` means "use
 /// [`Signal::path`]'s default." gRPC method names are fixed by the `.proto` service definitions
 /// (`Signal::grpc_method`, shared with `otlp_in`'s router), so this is HTTP-only;
-/// `logit-pipeline::graph::resolve`'s rule 21 rejects a non-empty `paths:` under `protocol: grpc`
+/// `logit-pipeline::graph::resolve`'s rule 23 rejects a non-empty `paths:` under `protocol: grpc`
 /// rather than silently ignoring it.
 #[derive(Debug, Clone, Default)]
 pub struct SignalPaths {
@@ -211,13 +211,13 @@ impl OtlpOutput {
 
     /// Sets the extra headers sent on every export request (`headers:` in config) -- e.g.
     /// `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud target. Fails if any name or
-    /// value isn't a legal HTTP header (`logit-pipeline::graph::resolve`'s rule 20 rejects a
+    /// value isn't a legal HTTP header (`logit-pipeline::graph::resolve`'s rule 22 rejects a
     /// protocol-owned name like `content-type` before construction ever sees it; this catches the
     /// lexical shape `graph` can't -- illegal bytes, embedded newlines). Also fails if two names
     /// collide once `HeaderName` normalizes their case (`X-Scope-OrgID`/`x-scope-orgid` are the
     /// same header on the wire) -- `HeaderMap::insert` would otherwise silently keep whichever of
     /// the two happened to be iterated last out of `headers`' arbitrary `HashMap` order, and
-    /// `graph::resolve`'s own rule 20 check for this is the same defense-in-depth relationship as
+    /// `graph::resolve`'s own rule 22 check for this is the same defense-in-depth relationship as
     /// the reserved-name check above.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());
@@ -240,7 +240,7 @@ impl OtlpOutput {
 
     /// Sets per-signal HTTP path overrides (`paths:` in config) -- for a backend using a
     /// non-standard OTLP mount point. gRPC method names are protocol-fixed, so this has no effect
-    /// under `protocol: grpc`; `graph::resolve`'s rule 21 rejects a non-empty `paths:` there at
+    /// under `protocol: grpc`; `graph::resolve`'s rule 23 rejects a non-empty `paths:` there at
     /// config-validation time rather than silently ignoring it.
     pub fn with_paths(mut self, paths: SignalPaths) -> Self {
         self.paths = paths;
@@ -306,7 +306,7 @@ impl OtlpOutput {
         // Built as one `HeaderMap`, custom headers cloned in first and the protocol-owned ones
         // inserted after -- `HeaderMap::insert` unconditionally replaces any prior value for that
         // key (unlike `RequestBuilder::header`, which appends), so the fixed headers always win
-        // even if `graph::resolve`'s reserved-name rule (rule 20) were ever bypassed. One
+        // even if `graph::resolve`'s reserved-name rule (rule 22) were ever bypassed. One
         // `.headers(..)` call rather than mixing it with further `.header(..)` calls, whose
         // append-not-replace semantics would otherwise undo this guarantee.
         let mut headers = self.headers.clone();
@@ -585,7 +585,7 @@ async fn grpc_roundtrip(
 ) -> Result<(u32, String, Bytes), (Fault, anyhow::Error)> {
     // Built as one `HeaderMap`, custom headers cloned in first and the protocol-owned ones
     // inserted after -- `HeaderMap::insert` unconditionally replaces any prior value for that
-    // key, so these three always win even if `graph::resolve`'s reserved-name rule (rule 20)
+    // key, so these three always win even if `graph::resolve`'s reserved-name rule (rule 22)
     // were ever bypassed. Assigned onto the request wholesale rather than via the builder's own
     // `.header(..)` (which appends, not replaces), for the same reason as `send_http`.
     let mut req_headers = headers.clone();
@@ -1121,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_custom_header_does_not_override_content_type() {
-        // `graph::resolve`'s rule 20 rejects `content-type` at config-validation time -- this
+        // `graph::resolve`'s rule 22 rejects `content-type` at config-validation time -- this
         // proves the defense-in-depth guarantee directly, bypassing that rule via `with_headers`.
         let (addr, captured) = canned_http_server_capturing_request().await;
         let mut output = http_output(addr)

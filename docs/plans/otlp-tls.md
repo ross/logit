@@ -32,7 +32,7 @@ handshake to every request.
   (`tokio_rustls::TlsAcceptor`) runs inside the per-connection spawned task, after that
   connection's `MAX_CONCURRENT_CONNECTIONS` permit is acquired, so a slow or hostile handshake
   can't stall the accept loop.
-- **`logit-pipeline::graph::resolve`** rule 22: `cert_file`/`key_file` paired,
+- **`logit-pipeline::graph::resolve`** rule 24: `cert_file`/`key_file` paired,
   `insecure_skip_verify` + `ca_file` rejected as contradictory, and a non-empty `tls:` under a
   plaintext endpoint rejected.
 - **Test fixtures**: `testdata/tls/` (repo root) — a committed self-signed test CA, server/client
@@ -47,8 +47,8 @@ handshake to every request.
   `cargo tree -i aws-lc-rs` (nothing) and a `Cargo.lock` diff of only new dependency edges, no new
   package versions. `cargo deny check` passes with no `deny.toml` change.
 - **Docs**: this plan; [ADR `otlp-tls-and-pooled-grpc-client`](../adr/otlp-tls-and-pooled-grpc-client.md);
-  `docs/design/pipeline-graph.md`'s validation list gained rule 22 (and, in passing, the
-  previously-undocumented rules 20/21 from the headers/paths workstream); `docs/deploying.md`
+  `docs/design/pipeline-graph.md`'s validation list gained rule 24 (and, in passing, the
+  previously-undocumented rules 22/23 from the headers/paths workstream); `docs/deploying.md`
   gained a TLS section; `docs/known-gaps.md`'s two TLS-shaped entries retired, two smaller ones
   (startup-only cert loading, no `server_name` override) filed; `AGENTS.md`'s "Current state"
   paragraph updated.

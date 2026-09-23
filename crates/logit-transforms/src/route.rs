@@ -10,7 +10,7 @@
 //! **Every route value is resolved to its target's slot once, in [`Route::new`], not per event.**
 //! `targets` is [`logit_pipeline::graph::targets_of`]'s output for this component -- the same
 //! slot order the node runtime builds its `Vec<Fanout>` in -- so `Destination::To(n)` here means
-//! exactly `targets[n]` there. Rules 44/47 (`docs/design/pipeline-graph.md`) guarantee every
+//! exactly `targets[n]` there. Rules 48/51 (`docs/design/pipeline-graph.md`) guarantee every
 //! `routes:` value names a target in that list before this is ever constructed; if one didn't,
 //! that would be a graph-validation bug, not a runtime condition to recover from, so
 //! [`Route::new`] panics rather than threading a `Result` through a hot-path constructor nothing
