@@ -235,9 +235,10 @@ the `204` and the sender's queue throttles, which is remote-write's own flow-con
 Shutdown is per-connection, like `otlp_in`'s.
 
 Counters take **`prometheus_in`'s own scrape-side spelling**, not `otlp_in`'s — `otlp_in` has no
-request-level counters to match (its only telemetry is `logit.input.connections{,.rejected,.closed}`,
-`crates/logit-inputs/src/otlp.rs:391,413,772`, which `docs/design/internal-telemetry.md:620-624`
-records as deliberate). The sibling to mirror is this component's other mode:
+request-level counters to match (its only telemetry is
+`logit.input.connections{,.rejected,.closed}`, `crates/logit-inputs/src/otlp.rs:391,413,772`, which
+[`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#otlp_in) records as
+deliberate). The sibling to mirror is this component's other mode:
 `logit.input.scrapes{class}` and `logit.input.scrape.duration`
 (`crates/logit-inputs/src/prometheus.rs:73,507-508`). So the receiver emits
 `logit.input.writes{class="ok"|"not_found"|"method"|"unsupported"|"oversize"|"bad_request"}`,

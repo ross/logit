@@ -4362,11 +4362,9 @@ fn native_round_trip_enriched_resource_batch() {
 // ---------------------------------------------------------------------------------------------
 
 /// `NativeEncoder::encode`, one event, warmed so the dictionary's interner lookups have already
-/// happened once (see this file's own doc comment). Not part of the reference nginx pipeline
-/// chain above -- no `ComponentKind` consumes this codec yet
-/// ([ADR `native-wire-format-encoding`](../../../docs/adr/native-wire-format-encoding.md),
-/// `docs/known-gaps.md`) -- so this stands as its own section rather than extending the "full
-/// ingest chain" story those tests tell. It exists for the same reason every other
+/// happened once (see this file's own doc comment). The reference nginx pipeline chain above never
+/// touches this codec, so this stands as its own section rather than extending the "full ingest
+/// chain" story those tests tell. It exists for the same reason every other
 /// exact-equality assertion here does: an allocation regression in `crates/logit-proto/src/native/`
 /// should fail `script/test`, not wait for someone to notice
 /// `crates/logit-bench/benches/wire_format.rs`'s numbers drift.

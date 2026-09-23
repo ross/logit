@@ -552,12 +552,13 @@ says, not a reading of anything.
 **Where `kernel` appears in a name, and where it doesn't.** Only on the drops counter, where it
 says *whose loss this was*. `logit.component.datagrams.dropped` is a drop `logit` chose and can be
 sized out of; `logit.input.kernel.drops` is one the kernel took before `logit` had any say. The
-remedies differ (see `docs/deploying.md`'s "What to watch"), so an operator needs to tell them apart
-at a glance. The gauges need no qualifier: `used.bytes` and `utilization` extend the
-`logit.input.receive_buffer.*` family that `receive_buffer.bytes`/`.requested.bytes` established,
-where "the receive buffer" has only ever meant the kernel's, so `receive_buffer.kernel.used.bytes`
-would say it twice. `accept_queue.*` has no `kernel` segment for the same reason: a listener has no
-accept queue of its own to confuse it with.
+remedies differ (see `docs/deploying.md`'s "What to watch for listener intake"), so an operator
+needs to tell them apart at a glance. The gauges need no qualifier: `used.bytes` and
+`utilization` extend the `logit.input.receive_buffer.*` family that
+`receive_buffer.bytes`/`.requested.bytes` established, where "the receive buffer" has only ever
+meant the kernel's, so `receive_buffer.kernel.used.bytes` would say it twice. `accept_queue.*`
+has no `kernel` segment for the same reason: a listener has no accept queue of its own to confuse
+it with.
 
 `utilization` is deliberately the same last segment as `logit.component.receive.utilization` and
 `logit.component.buffer.utilization`: three different buffers, one convention (a 0-to-1 fill ratio

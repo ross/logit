@@ -1335,9 +1335,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   /srv/app/logs/*.log]` over a symlink registers one watch and reports two. Harmless: a
   `Wake::Discover` may name the other spelling, but the driver discards its payload before
   rescanning, and the `IN_IGNORED` purge drops both entries together. Only the gauge over-reports,
-  and `docs/deploying.md`'s "What to watch" says so. Normalizing the desired set (or passing
-  `IN_DONT_FOLLOW`) would change which paths a config can name — a config-surface decision, not a
-  bug fix.
+  and `docs/deploying.md`'s "What to watch for file tailing" says so. Normalizing the desired set
+  (or passing `IN_DONT_FOLLOW`) would change which paths a config can name — a config-surface
+  decision, not a bug fix.
 - **`parse_events` discards the rest of a `read` buffer after a malformed event**, rather than
   resynchronizing. Unreachable from a real inotify fd (the kernel never returns a partial event,
   and `len` is always 0 or a multiple of 16 — both pinned in the ADR), and acceptable because the
