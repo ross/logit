@@ -107,7 +107,7 @@ them apart.
 | Line length | 94–164 B tagged (median 139), 53–76 B tagless (median 61) | Model: 33–134 B, median 116 over all templates. Slightly shorter at the top end — the capture's longest lines carry a `\|c:in-<id>` container-id segment this model omits (see below) |
 | Tags per line | 4–6, median 6 | Model: 3–8, median 6. Widened on purpose, to exercise the decoder's tag loop either side of what this one app happened to emit |
 | Tag keys | `env`, `service`, `region`, `host`, `endpoint`, `status`, `queue`, `query`, `db` | The model uses these plus `tier`, `payment_method`, `priority`, `shard`, `dc`, `component`, `upstream`, `job`, `pool`, `node_role`, `az` — ~20 distinct keys, which is what exercises the decoder's `KeyCache` |
-| Metric name length | 16–28 B tagged (median 23), 46–64 B tagless (median 56) | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
+| Metric name length | 16–28 B tagged (median 23), 46–64 B tagless (median 55) | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
 | Both dialects are real | 2 of the 4 captures are tagless | The model is 80% tagged / 20% tagless |
 
 Every capture figure in the table is over the whole corpus (all 65 tagged and all 55 tagless
