@@ -1,28 +1,30 @@
 # Load specs: driving a perf scenario over a real socket
 
-Every scenario under `perf/scenarios/` used to generate its own events, in-process, from a
-`generate_in` component ([ADR `load-test-harness`](../../docs/adr/load-test-harness.md)). That
-measures the graph and deliberately measures nothing about *intake*: no socket is opened, no
-datagram is parsed, no kernel receive buffer can overflow.
-
-A **driven** scenario is the other kind ([ADR
+A **driven** scenario receives its load over a real UDP socket instead of generating it in-process,
+so it measures intake: the socket, datagram parsing, and kernel receive-buffer overflow. This
+directory holds the load specs that `logit-perf` sends from ([ADR
 `udp-intake-batching-and-socket-visibility`](../../docs/adr/udp-intake-batching-and-socket-visibility.md)).
-It is an ordinary validating `logit` config with no generator in it at all, and the load arrives
-over a real UDP socket, sent by `logit-perf` itself from the matching spec in **this** directory:
 
-```
+Every other scenario under `perf/scenarios/` generates its events from a `generate_in` component
+([ADR `load-test-harness`](../../docs/adr/load-test-harness.md)). That measures the graph and
+deliberately measures nothing about *intake*: no socket is opened, no datagram is parsed, and no
+kernel receive buffer can overflow. A driven scenario is an ordinary validating `logit` config with
+no generator in it at all. `logit-perf` itself sends the load from the matching spec in **this**
+directory:
+
+```text
 perf/scenarios/udp-statsd.yaml   ->   perf/load/udp-statsd.yaml   ->   perf/load/statsd-app.yaml
         the graph                          how hard to send it              what to send
 ```
 
-This is a separate directory rather than more files under `perf/scenarios/` because both
-`script/validate` and `crates/logit-cli/src/config.rs`'s `every_shipped_config_loads_and_validates`
-glob `perf/scenarios/*.yaml` unconditionally — anything dropped in there is a `logit` config or it
-is a build failure. A future `syslog`/`graphite` UDP scenario is one new pair under this same
-layout, with no change to `crates/logit-perf`: the spec format is protocol-agnostic apart from the
-wire syntax inside `lines:`.
+The specs live in their own directory because both `script/validate` and
+`crates/logit-cli/src/config.rs`'s `every_shipped_config_loads_and_validates` glob
+`perf/scenarios/*.yaml` unconditionally. Any file there must be a `logit` config, or the build
+fails. A future `syslog`/`graphite` UDP scenario is one new pair under the same layout, with no
+change to `crates/logit-perf`: the spec format is protocol-agnostic apart from the wire syntax
+inside `lines:`.
 
-```
+```sh
 script/perf run --scenario udp-statsd --repeat 5 --pin-sender 0,1 --pin-child 2,3
 script/perf run --scenario udp-statsd-small --verify         # the strict, zero-drop self-check
 script/perf run --scenario udp-statsd --rate-scale 0.5       # a stable point below the drop knee
@@ -51,6 +53,10 @@ datagram_mix:             # weighted packing targets. Exactly one of `single`/`m
   - { weight: 15, max_bytes: 8192 }  # packed local-agent style
 ```
 
+`target`, `datagrams`, `model`, and `datagram_mix` are required. `sockets`, `threads`, `seed`, and
+`ring_datagrams` default to the values shown, and `sink` and `rate` are optional. Unknown fields are
+rejected.
+
 The model file is a weighted list of line templates:
 
 ```yaml
@@ -60,36 +66,36 @@ lines:
 ```
 
 `{seq%N}` is the only placeholder (`logit_core::template`, the same grammar `generate_in` uses). A
-bare `{seq}` is **rejected**: the receiver interns every distinct metric name, so an unbounded one
-would grow the interner for the length of the run and the scenario would be measuring a leak rather
-than a workload.
+bare `{seq}` is **rejected**, because the receiver interns every distinct metric name. An unbounded
+name would grow the interner for the length of the run, and the scenario would measure a leak
+rather than a workload.
 
-Each template carries its own counter, so `{seq%N}` cycles 0..N-1 per *template*. Two placeholders
-in one template therefore advance together — a `{seq%50}` host and a `{seq%100}` endpoint are
-correlated, and a template's distinct-name count is the lcm of the moduli in its name. That is a
-named simplification, not an oversight: what the receiver actually pays for is the number of
-distinct metric *names* (interner pressure), the number of distinct tag *keys* (its `KeyCache`), and
-the line's length. None of those depend on whether two tag values happen to co-vary.
+Each template has its own counter, so `{seq%N}` cycles 0..N-1 per *template*. Two placeholders in
+one template therefore advance together: a `{seq%50}` host and a `{seq%100}` endpoint are
+correlated, and a template's distinct-name count is the lcm of the moduli in its name. This
+simplification is deliberate. What the receiver pays for is the number of distinct metric *names*
+(interner pressure), the number of distinct tag *keys* (its `KeyCache`), and the line's length. None
+of those depend on whether two tag values co-vary.
 
-**Everything is pre-rendered before the blast starts.** `ring_datagrams` finished datagrams are
-built up front and then cycled, so at send time there is no formatting, no allocation and no
-weighted choice left — the sender is a `sendmmsg(2)` loop over immutable slices and must never be
-the thing a `udp-statsd` number is measuring. The ring sizes are prime so cycling never falls into
-step with `sockets`, `threads` or the 64-datagram send batch, and are large enough that every
-template gets enough turns for its `{seq%N}` moduli to come round (`udp-statsd-small` needs four
-times the ring of the other two, because a single-line ring holds one line per datagram rather than
-a dozen).
+**Everything is pre-rendered before the blast starts.** `logit-perf` builds `ring_datagrams`
+finished datagrams up front and then cycles them. At send time there is no formatting, allocation,
+or weighted choice left: the sender is a `sendmmsg(2)` loop over immutable slices, and must never be
+what a `udp-statsd` number measures. Ring sizes are prime so that cycling never falls into step with
+`sockets`, `threads`, or the 64-datagram send batch. They're also large enough that every template
+gets enough turns for its `{seq%N}` moduli to come round. `udp-statsd-small` needs four times the
+ring of the other two, because a single-line ring holds one line per datagram rather than a dozen.
 
 ## Calibration: what came from the capture, and what didn't
 
 The traffic model is calibrated against a **real client capture**, committed at
 [`testdata/interop/statsd/`](../../testdata/interop/statsd/) and recorded by
-`script/record-fixtures statsd`: 56 UDP datagrams from Datadog's `datadog` 0.53.0 (`DogStatsd`) and
-the plain-statsd `statsd` 4.0.1 (`StatsClient`), each in a buffered and an unbuffered mode, all four
-running one shared app-like workload. That directory's README has the provenance table and how to
-re-record.
+`script/record-fixtures statsd`. It holds 56 UDP datagrams from Datadog's `datadog` 0.53.0
+(`DogStatsd`) and the plain-statsd `statsd` 4.0.1 (`StatsClient`), each in a buffered and an
+unbuffered mode, all four running one shared app-like workload. That directory's README has the
+provenance table and how to re-record.
 
-Be precise about which half of this model is measured and which is chosen.
+Part of the model is measured from that capture, and part is chosen. The two sections below keep
+them apart.
 
 ### Measured from the capture
 
@@ -104,55 +110,52 @@ Be precise about which half of this model is measured and which is chosen.
 | Metric name length | 16–28 B tagged (median 23), 46–64 B tagless (median 56) | The model keeps that split: a tagged client's cardinality lives in tags and its names stay short; a tagless one has to put everything in the name |
 | Both dialects are real | 2 of the 4 captures are tagless | The model is 80% tagged / 20% tagless |
 
-Every capture figure in that table is over the whole corpus — all 65 tagged and all 55 tagless
-lines — not over any one file. An earlier revision quoted two per-file medians (137 B and 60 B, from
-the buffered DogStatsD and pipelined plain-statsd captures respectively) as if they were corpus-wide;
-the corpus-wide figures are 139 B and 61 B. **Nothing in the model moves as a result**: no weight
-here was derived from a median. The packing targets come from the two clients' buffer ceilings
-(1,432 B and 512 B, unchanged), the tag range from the tag counts (4–6, unchanged), and the line
-lengths are an *output* of the templates that the table compares against the capture rather than an
-input taken from it. The comparison reads the same either way — the model's median line is ~20 B
-shorter than the tagged capture's and ~55 B longer than the tagless one's, because it mixes both.
+Every capture figure in the table is over the whole corpus (all 65 tagged and all 55 tagless
+lines), not over any one file; `testdata/interop/statsd/`'s README records the per-file medians that
+differ. No weight in the model comes from a median. The packing targets come from the two clients'
+buffer ceilings (1,432 B and 512 B), and the tag range from the tag counts (4–6). The line lengths
+are an *output* of the templates, which the table compares against the capture, not an input taken
+from it. Because the model mixes both dialects, its median line is ~20 B shorter than the tagged
+capture's and ~55 B longer than the tagless one's.
 
 ### Chosen, not measured
 
 - **The metric-type mix.** The model is counters 50%, timers+histograms+distributions 30%, gauges
-  15%, sets 5%. The capture's own mix across its 120 lines is `c` 43 / `ms` 22 / `g` 21 / `h` 14 /
-  `d` 13 / `s` 7 — but **that is a property of the producer script**
+  15%, and sets 5%. The capture's own mix across its 120 lines is `c` 43 / `ms` 22 / `g` 21 / `h`
+  14 / `d` 13 / `s` 7, but **that's a property of the producer script**
   (`tools/record-fixtures/python_statsd_producer.py`, a synthetic app emitting three gauges and a
-  set every fifth request), not of production traffic, and it would be dishonest to present it as
-  calibration. The weights above are the commonly-cited shape of real statsd traffic; they are a
-  reasoned choice, and a real production corpus would be the thing that either confirms or moves
-  them.
-- **Cardinality.** 50 hosts, 100 endpoints, 5-ish statuses, ~600 distinct metric names across the
-  model. Same reason: the capture's own cardinality is whatever the producer script's topology was
-  (8 tagged names, 18 tagless).
-- **The 80/20 tagged/tagless split.** Both dialects are in the capture; their *ratio* there is
-  1:1 because the recording runs two clients, which says nothing about how common each is.
-- **The ≤8192 B packing target.** Nothing in the capture measures it — neither client packs that
-  large over UDP. It is in `udp-statsd`'s mix at the smallest weight because a local-agent-style
-  sender on a loopback or UDS-adjacent path genuinely does pack that big, and leaving it out
-  entirely would mean nothing in the whole scenario family ever exercises a large datagram.
-- **The sampled share (13%).** Both clients sample *client-side* — the call returns without sending
-  at `1 - rate` — so the capture contains very few `|@0.1` lines by construction, which understates
-  how often a real hot path is configured to sample. 13% is a share chosen to make sure the
-  decoder's sample-rate extrapolation path is exercised.
+  set every fifth request), not of production traffic, and presenting it as calibration would be
+  dishonest. The model's weights are the commonly cited shape of real statsd traffic: a reasoned
+  choice that a real production corpus would either confirm or move.
+- **Cardinality.** 50 hosts, 100 endpoints, about five statuses, and ~600 distinct metric names
+  across the model. Same reason: the capture's own cardinality is whatever the producer script's
+  topology was (8 tagged names, 18 tagless).
+- **The 80/20 tagged/tagless split.** Both dialects are in the capture, but their 1:1 *ratio* there
+  comes from the recording running two clients. It says nothing about how common each is.
+- **The ≤8192 B packing target.** Nothing in the capture measures it, because neither client packs
+  that large over UDP. It's in `udp-statsd`'s mix at the smallest weight because a local-agent-style
+  sender on a loopback or UDS-adjacent path does pack that big. Leaving it out would mean nothing in
+  the scenario family ever exercises a large datagram.
+- **The sampled share (13%).** Both clients sample *client-side*: the call returns without sending
+  at `1 - rate`. So the capture contains very few `|@0.1` lines by construction, which understates
+  how often a real hot path is configured to sample. 13% makes sure the decoder's sample-rate
+  extrapolation path is exercised.
 - **No `|c:<container-id>` segment.** The captured DogStatsD lines carry one, because the client
-  detected the recording container and volunteered it. It is in the capture (and asserted by
+  detected the recording container and volunteered it. It's in the capture (and asserted by
   `crates/logit-inputs/src/statsd.rs`'s interop tests) but deliberately not in the load model: it
   would add a constant ~11 B to 80% of lines on the strength of one recording environment's
   accident.
 
-Every rendered line is checked against the real `StatsdDecoder` in CI
+CI checks every rendered line against the real `StatsdDecoder`
 (`crates/logit-perf/src/load.rs`'s `every_line_the_shipped_model_renders_decodes_cleanly`), and
-every run re-checks it from the child's own telemetry — see "Self-checks" below. A model that
-rendered lines the decoder rejects would benchmark the malformed-line path and look *fast* doing
-it, since a rejected line never becomes an event.
+every run re-checks it from the child's own telemetry (see [Self-checks](#self-checks)). This
+matters because a model that rendered lines the decoder rejects would benchmark the malformed-line
+path and look *fast* doing it, since a rejected line never becomes an event.
 
 ## The three scenarios
 
-They share one `model:` and differ only in `datagram_mix:`, which is the axis that decides which
-half of the pipeline a number is about.
+The three scenarios share one `model:` and differ only in `datagram_mix:`, the axis that decides
+which half of the pipeline a number is about.
 
 | Scenario | Packing | What it isolates |
 |---|---|---|
@@ -160,52 +163,77 @@ half of the pipeline a number is about.
 | `udp-statsd-small` | all single-line | The **syscall-bound worst case**: per-datagram fixed cost dominates a payload too small to amortize it, so this is where `recvmmsg`/batched gauge updates should show most |
 | `udp-statsd-packed` | all ≤1432 B | The **decode-bound** end: ~13.5 metrics per syscall, so per-datagram costs are amortized away and the decoder and `BatchAccumulator` dominate |
 
-A number from only one of them would mislead about which half of the pipeline a change actually
-helped, which is why all three are reported together.
+A number from only one of them would mislead about which half of the pipeline a change helped, so
+all three are reported together.
 
 ## Tuning
 
-Each spec's `datagrams` and `rate`, and each scenario's `receive_buffer_bytes`, are set so a pinned
-release run takes **5–10 s** and the baseline sits in a regime with a **small, non-zero kernel drop
-rate** — the regime a later improvement has somewhere to move. A zero-drop baseline could not show
-one, and a saturated 95%-drop baseline is a regime nobody deploys in. Rates are calibrated against
-the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`), the project's reference box since
-2026-09-20 — `udp-statsd`/`udp-statsd-packed` are bisected there directly; `udp-statsd-small`'s
-rate is still its original laptop-tuned value, since the automated calibration on the VM never
-found a drop rate above ~0% within the range it searched (see that spec's own comment for why, and
-`docs/design/performance.md` §7 for the per-binary capacity numbers that explain it).
+Each spec's `datagrams` and `rate`, and each scenario's `receive_buffer_bytes`, are set so that a
+pinned release run takes **5–10 s** and the baseline has a **small, non-zero kernel drop rate**.
+That's the regime a later improvement has room to move in. A zero-drop baseline couldn't show an
+improvement, and a saturated 95%-drop baseline is a regime nobody deploys in. `rate` is set a few
+percent above what the receiver sustains, per scenario, which both lengthens the run into the
+target band and puts the drop rate where it's useful.
 
-The other extreme was measured before settling here — on the original dev laptop, when these specs
-were first tuned. Pinned but **unpaced**, the sender outran the receiver by 4–30×: `udp-statsd`
-dropped 95.8%, `udp-statsd-packed` 95.1% and `udp-statsd-small` 76.2%, with wall times of
-0.19–0.99 s — far too short to measure and far too lossy to be a regime anybody runs in. The same
-qualitative shape holds on the VM (an unscaled `--rate-scale 1.0` still drops well above target on
-every scenario there too), which is why calibration remains necessary on the reference box, not
-just a laptop artifact. `rate` is set a few percent above what the receiver sustains, per scenario,
-which both lengthens the run into the target band and puts the drop rate where it's useful.
+Rates are calibrated on the disposable perf VM (`docs/adr/disposable-azure-perf-vm.md`), the
+project's reference box since 2026-09-20:
 
-**The drop rate is the tuning's sensitive number, not its robust one.** These specs are paced a few
-percent above capacity, so the drop rate is the *difference* between two nearly-equal rates and
-amplifies anything that moves either of them. This was first found on the laptop — a run taken
-while another build was going on the same machine turned `udp-statsd-small`'s 1.4% into 35%, and
-after ~90 minutes of continuous benchmarking the same scenario went from 3.1% to 12.4% (CPU
-µs/event up ~23%) as a laptop-class part settled into a lower sustained power state, confirmed by
-re-running the earlier commit and reproducing the later numbers. The reference VM removes the
-governor/thermal/battery half of this, but not all of it: last-level cache and memory bandwidth
-are still shared with other tenants on the physical host, and a new `script/vm up` may land on
-different hardware entirely (`docs/adr/disposable-azure-perf-vm.md`'s "Consequences" section) — so
-the same two rules still apply.
+- `udp-statsd` and `udp-statsd-packed` were bisected there directly on 2026-09-20, on then-current
+  `main`, to 2.31% and 3.97% kernel drop.
+- `udp-statsd-small` keeps its original laptop-tuned rate. The automated calibration on the VM
+  never found a drop rate above ~0% within the range it searched, meaning `recvmmsg`'s real
+  capacity gain for this scenario exceeds what a 3× search ceiling can probe. That spec's own
+  comment explains why, and `docs/design/performance.md` §7's per-binary capacity table has the
+  numbers.
 
-Two rules follow. Take a baseline on a freshly-provisioned, idle VM; and **take a baseline and the
-delta it is compared against back to back in one sitting, interleaved** (parent, branch, parent,
-branch …) — a delta measured an hour after its baseline is measuring the machine as much as the
-change, and two unbroken blocks put one side on the cool half of the session and the other on the
-warm half. `compare` warns on a host/CPU-model mismatch for a related reason, but it cannot see
-this one.
+The first VM session (2026-09-18, `Standard_F4as_v6`) needed `--rate-scale` 0.49–0.83 against the
+then laptop-tuned rates. Rates are hardware-specific: don't assume a rate calibrated on one box
+carries over to another.
+
+The unpaced extreme was measured on the original dev laptop when these specs were first tuned.
+Pinned but **unpaced**, the sender outran the receiver by 4–30×: `udp-statsd` dropped 95.8%,
+`udp-statsd-packed` 95.1%, and `udp-statsd-small` 76.2%, with wall times of 0.19–0.99 s. That's far
+too short to measure and far too lossy to be a regime anybody runs in. The VM shows the same
+qualitative shape (an unscaled `--rate-scale 1.0` still drops well above target on every scenario),
+so calibration is necessary on the reference box too, not a laptop artifact.
+
+**The drop rate is the tuning's sensitive number, not its robust one.** Because the specs are paced
+a few percent above capacity, the drop rate is the *difference* between two nearly equal rates, and
+amplifies anything that moves either one. This was first found on the laptop:
+
+- A run taken while another build ran on the same machine turned `udp-statsd-small`'s 1.4% into
+  35%.
+- After ~90 minutes of continuous benchmarking, the same scenario went from 3.1% to 12.4% (CPU
+  µs/event up ~23%) as the laptop-class CPU settled into a lower sustained power state. Re-running
+  the earlier commit reproduced the later numbers.
+
+The reference VM removes the governor, thermal, and battery half of this, but not all of it.
+Last-level cache and memory bandwidth are still shared with other tenants on the physical host, and
+a new `script/vm up` may land on different hardware entirely
+(`docs/adr/disposable-azure-perf-vm.md`'s "Consequences" section). So two rules still apply:
+
+- Take a baseline on a freshly provisioned, idle VM.
+- **Take a baseline and the delta compared against it back to back in one sitting, interleaved**
+  (parent, branch, parent, branch, and so on). A delta measured an hour after its baseline measures
+  the machine as much as the change, and two unbroken blocks put one side on the cool half of the
+  session and the other on the warm half. `compare` warns on a host or CPU-model mismatch for a
+  related reason, but it can't see this one.
+
+**`rate` stays fixed across a baseline/delta pair**, so the comparison isolates the change. Retune
+it only when establishing a new baseline, which you must do whenever the receiver's own speed
+changes: after a workstream like `udp-intake-batching-and-socket-visibility`, and after a change of
+*box*, not just a change of code.
+
+`receive_buffer_bytes` is `1MiB` in all three scenarios. Linux grants double what's requested and
+clamps at `net.core.rmem_max`, which is **16 MiB by cloud-init default on the reference VM** (left at
+that default, not clamped down to match any particular container the way an earlier session did).
+So 1 MiB is requested, 2 MiB is granted, and nothing is clamped. If that sysctl differs on your
+machine, re-tune. `logit.input.receive_buffer.bytes` in the run's own telemetry reports what was
+actually granted.
 
 ### Box state
 
-Before a run whose numbers are going to be written down anywhere, on the reference VM:
+Before a run whose numbers you'll write down anywhere, check the reference VM:
 
 | Check | Why | Where to look |
 |---|---|---|
@@ -214,57 +242,45 @@ Before a run whose numbers are going to be written down anywhere, on the referen
 | Thermal/host-maintenance headroom: gaps between repeats | Azure hosts support live migration/memory-preserving maintenance mid-session, which can freeze the guest briefly (inflates wall-clock, not CPU time) | check the scheduled-events endpoint before a long run: `curl -H Metadata:true 'http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01'` |
 | Sender and child pinned to distinct physical cores | See "Pinning" below | `--pin-sender`/`--pin-child`, always |
 
-`logit-perf run` still reads governor/EPP/platform-profile/AC-power best-effort into the results
-file's preamble (`box_state`) — on this Azure guest, that comes back an **empty `{}`** on every
-result file, since the guest exposes none of the `cpufreq`/`power_supply` sysfs nodes those checks
-read. That's not a gap to work around; it's the isolation the VM is for — there is no governor to
-drift and no battery to run down. The laptop-era checklist this section used to carry (AC power,
-`performance` governor, energy-performance preference, ACPI platform profile, `grep MHz
-/proc/cpuinfo`) doesn't apply to a VM with none of those knobs exposed.
-
-`receive_buffer_bytes: 1MiB` on all three. Linux grants double what is requested, and clamps at
-`net.core.rmem_max` — **16 MiB by cloud-init default on the reference VM** (left at that default,
-not clamped down to match any particular container the way an earlier session did), so 1 MiB is
-requested, 2 MiB is granted, and nothing is clamped. Re-tune if that sysctl differs on the machine
-you are running on; `logit.input.receive_buffer.bytes` in the run's own telemetry reports what was
-actually granted.
-
-Retune whenever the receiver's own speed changes — which is exactly what a workstream like
-`udp-intake-batching-and-socket-visibility` does. The rule is: **`rate` stays fixed across a
-baseline/delta pair**, so the comparison isolates the change; it moves only when a new baseline is
-being established.
+`logit-perf run` still reads governor, EPP, platform profile, and AC power best-effort into the
+results file's preamble (`box_state`). On the Azure guest, that's an **empty `{}`** in every result
+file, because the guest exposes none of the `cpufreq`/`power_supply` sysfs nodes those checks read.
+That isn't a gap to work around; it's the isolation the VM is for, with no governor to drift and no
+battery to run down. The laptop-era checklist this section used to carry (AC power, `performance`
+governor, energy-performance preference, ACPI platform profile, `grep MHz /proc/cpuinfo`) doesn't
+apply to a VM that exposes none of those knobs.
 
 ## Self-checks
 
-Every driven run is checked before its numbers are believed (`crates/logit-perf/src/run.rs`'s
-`self_check`):
+`logit-perf` checks every driven run before its numbers are believed
+(`crates/logit-perf/src/run.rs`'s `self_check`):
 
 0. **The kernel socket sampler reported at all.** `getsockopt(SO_MEMINFO)` needs Linux 4.12+ and a
-   sandbox that permits it; where it isn't available W1's sampler disables itself for the process
-   after one failed call and says so through a log line that carries no counter. Then
-   `logit.input.kernel.drops` reads as a flat zero, the accounting below cannot close, and every
-   repeat would fail blaming a `--settle` that was never the problem. Detected by the *presence* of
-   a `receive_buffer.*` gauge rather than its value — each of those numbers is legitimately zero at
-   times — and reported as itself.
+   sandbox that permits it. Where it isn't available, W1's sampler disables itself for the process
+   after one failed call and says so in a log line that carries no counter. `logit.input.kernel.drops`
+   then reads as a flat zero, the accounting below can't close, and every repeat would fail blaming
+   a `--settle` that was never the problem. The check looks for the *presence* of a
+   `receive_buffer.*` gauge rather than its value, since each of those numbers is legitimately zero
+   at times, and reports this failure as itself.
 1. **`sent == received + kernel-dropped`, exactly.** On loopback a datagram either arrives or the
-   kernel drops it — there is no lossy link, no fragmentation, no middlebox. A mismatch means
-   something the harness believes about the run is wrong, not that something interesting happened,
-   and the run fails. (The most common cause while this was being built: a settle too short for the
-   receive queue to drain and the listener's final `SO_MEMINFO` sample to land. Hence the 3 s floor
-   `run.rs` applies to `--settle` for a driven scenario.)
-2. **No decode diagnostics.** Any `logit.component.diagnostics{key=...}` on the listener — a
-   `bad_line`, a `bad_datagram` — fails the run.
-3. **`--verify`**: the strict form. Zero kernel drops, zero queue drops, and the delivered event
-   count equal to what the ring says it sent, *exactly*. Note that is not the same as the line
-   count: a multi-value counter or gauge line (`a:1:2:3|c`) decodes to one event per value, which
-   the ring accounts for per line. Since the shipped specs are paced deliberately *above* capacity,
-   `--verify` quarters each spec's own `rate` for the run — so it is runnable against the specs as
-   they ship rather than needing a hand-edited copy of each. A spec with no `rate:` at all is
-   rejected rather than asked to be lossless.
+   kernel drops it: there's no lossy link, fragmentation, or middlebox. A mismatch means something
+   the harness believes about the run is wrong, not that something interesting happened, and the
+   run fails. The most common cause while this was being built was a settle too short for the
+   receive queue to drain and the listener's final `SO_MEMINFO` sample to land. That's why `run.rs`
+   applies a 3 s floor to `--settle` for a driven scenario.
+2. **No decode diagnostics.** Any `logit.component.diagnostics{key=...}` on the listener, such as a
+   `bad_line` or `bad_datagram`, fails the run.
+3. **`--verify`**: the strict form. Zero kernel drops, zero queue drops, and a delivered event count
+   *exactly* equal to what the ring says it sent. That isn't the same as the line count: a
+   multi-value counter or gauge line (`a:1:2:3|c`) decodes to one event per value, which the ring
+   accounts for per line. Because the shipped specs are paced deliberately *above* capacity,
+   `--verify` quarters each spec's own `rate` for the run, so it runs against the specs as they ship
+   without a hand-edited copy of each. A spec with no `rate:` at all is rejected rather than asked to
+   be lossless.
 
 ### `--verify` and `--rate-scale` together
 
-They are two knobs, and `--verify` only *defaults* one of them:
+These are two knobs, and `--verify` only *defaults* one of them:
 
 | Invocation | Pace | Asserts |
 |---|---|---|
@@ -273,47 +289,42 @@ They are two knobs, and `--verify` only *defaults* one of them:
 | `--verify` | a **quarter** of the spec's `rate` | the above, plus zero drops and an exact delivered count |
 | `--verify --rate-scale 1.0` | the spec's own `rate` | the same strict set, at the shipped pace |
 
-An explicit `--rate-scale` replaces `--verify`'s 0.25 derate and **nothing else** — the exactness
-assertion always stays on. So `--verify --rate-scale 1.0` is the way to ask "is this spec's own rate
-loss-free?", and it is *expected to fail* whenever anything drops. That is the question it answers,
-not a misuse of the flag: the shipped rates are tuned to drop a little, so on a healthy box that
-combination should fail, and a run of it that passes means the receiver got faster.
+An explicit `--rate-scale` replaces `--verify`'s 0.25 derate and **nothing else**; the exactness
+assertion always stays on. So `--verify --rate-scale 1.0` asks "is this spec's own rate
+loss-free?", and it's *expected to fail* whenever anything drops. That isn't a misuse of the flag:
+the shipped rates are tuned to drop a little, so on a healthy box that combination should fail, and
+a passing run means the receiver got faster.
 
 ## Pinning
 
-Not optional, though the reason changed when the reference box did. On the original dev laptop
-(heterogeneous Zen 5 performance vs. Zen 5c efficiency cores), an unpinned run landed on one kind
-or the other by scheduler luck, making every number bimodal by roughly 2×. The reference VM's
-cores are identical, so that specific failure mode is gone — but pinning still matters, for a
-simpler reason: it keeps the sender and the measured child from contending for the same core's
-time, which would inflate both sides' numbers together and make a delta harder to trust.
+Pinning isn't optional, though the reason changed with the reference box. On the original dev
+laptop (heterogeneous Zen 5 performance and Zen 5c efficiency cores), an unpinned run landed on one
+kind or the other by scheduler luck, making every number bimodal by roughly 2×. The reference VM's
+cores are identical, so that failure mode is gone. Pinning still keeps the sender and the measured
+child from contending for the same core's time, which would inflate both sides' numbers together
+and make a delta harder to trust.
 
 Every recorded `udp-statsd*` number states which CPUs it pinned to. The recorded baseline uses
-`--pin-sender 0,1 --pin-child 2,3`: two cores for the sender, two for the child, disjoint from each
-other, on the reference VM's 8-core `Standard_F8as_v6` (cores 4–7 sit free — headroom the earlier
-4-core session didn't have). `--pin-child` is applied between `fork` and `exec`, so every thread the
-child ever creates inherits the mask — pinning after spawn would leave the threads created during
-startup on whatever CPU the scheduler picked.
+`--pin-sender 0,1 --pin-child 2,3`: two cores for the sender and two for the child, disjoint from
+each other, on the reference VM's 8-core `Standard_F8as_v6`. Cores 4–7 stay free, headroom the
+earlier 4-core session didn't have. `--pin-child` is applied between `fork` and `exec`, so every
+thread the child creates inherits the mask. Pinning after spawn would leave the threads created
+during startup on whatever CPU the scheduler picked.
 
 ## Portability notes from the Azure perf-VM sessions
 
-- **Rates are hardware-specific and must be recalibrated per box.** The shipped `udp-statsd`/
-  `udp-statsd-packed` rates are now calibrated against the reference VM directly (2026-09-20,
-  bisected on current `main` to 2.31%/3.97% kernel drop respectively) rather than the original dev
-  laptop, closing the gap the first VM session (2026-09-18, `Standard_F4as_v6`, needed
-  `--rate-scale` 0.49–0.83 against the then-laptop-tuned rates) first found. `udp-statsd-small` is
-  the one exception, left at its original laptop value — the automated calibration on the VM never
-  found a drop rate above ~0% within the range it searched, meaning `recvmmsg`'s real capacity gain
-  for this scenario exceeds what a 3× search ceiling can even probe (`docs/design/performance.md`
-  §7's per-binary capacity table). Don't assume a rate calibrated on one box carries over to
-  another regardless — retune whenever the receiver's own speed changes, and that includes a
-  change of *box*, not just a change of code.
-- **Give each ref its own `CARGO_TARGET_DIR` when building several for one comparison.** Building
-  multiple refs' binaries under one shared target directory (even across separate source trees
-  extracted at nearly the same wall-clock time) let cargo's mtime-based fingerprinting falsely match
-  a later ref's freshly-extracted files against an earlier ref's build record, silently reusing the
-  earlier binary under the later ref's label — caught only by comparing sha256 checksums, not by
-  build output (the reused build reported `0.11s` and zero `Compiling` lines, which is itself a
-  tell). `script/vm build` now gives each git-ref source its own target directory by default,
-  closing this specific hazard; verifying each binary's checksum before every run remains good
-  practice regardless.
+- **Rates are hardware-specific and must be recalibrated per box.** See [Tuning](#tuning) for what
+  was calibrated where and the one spec (`udp-statsd-small`) still on its laptop value.
+- **Verify each binary's sha256 before every run when measuring several refs.** Building several
+  refs' binaries under one shared `CARGO_TARGET_DIR` (even from separate source trees extracted at
+  nearly the same wall-clock time) once let cargo's mtime-based fingerprinting match a later ref's
+  freshly extracted files against an earlier ref's build record. It silently reused the earlier
+  binary under the later ref's label, which only a sha256 comparison caught. The build output's
+  only tell was the reused build reporting `0.11s` and zero `Compiling` lines. `script/vm build` now
+  builds git refs one at a time with sequential `git checkout`s in one clone, which keeps mtime
+  fingerprinting honest, and gives each directory or tarball source its own `CARGO_TARGET_DIR`.
+  `LOGIT_VM_TARGET_PER_REF` opts ref builds into a per-ref target directory too, and
+  `script/vm build` refuses two sources that produce an identical binary unless given
+  `--allow-identical`
+  ([ADR `disposable-azure-perf-vm`](../../docs/adr/disposable-azure-perf-vm.md)'s "Multiple
+  sources, one VM" section).
