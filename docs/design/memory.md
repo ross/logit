@@ -588,7 +588,7 @@ thread divan's `AllocProfiler` watches. Measured this way:
 |---|---:|---:|
 | `process_batch` through `keep` | 525 ns | 0 |
 | `Fanout::send`+`recv`, 1 consumer | 210 ns | 0 |
-| `Fanout::send`+`recv`, 2 consumers | 630 ns | 6 (1 `Arc::new` + the 5-allocation clone above) |
+| `Fanout::send`+`recv`, 2 consumers | 630 ns | 4 (1 `Arc::new` + the 3-allocation contended `unwrap_batch` above) |
 | `send_batch` through a no-op `Output` | 206 ns | 1 (the `async_trait` box) |
 | `send_batch` through a **failing** `Output` | 319 ns | 4 (matches the disabled-telemetry failure row above exactly) |
 

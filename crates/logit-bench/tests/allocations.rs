@@ -1806,10 +1806,10 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     });
     assert_eq!(a.events.len(), 1);
     assert_eq!(b.events.len(), 1);
-    // 1 (Arc::new, once per send) + 5 (one EventBatch deep clone: 1 for the Vec<Event>, 4 for the
+    // 1 (Arc::new, once per send) + 3 (one EventBatch deep clone: 1 for the Vec<Event>, 2 for the
     // one nginx-shaped Event inside it, matching clone_one_event) + 0 (the other branch, free).
-    // The pre-Arc code paid 5 for this same shape (the clone, with the other branch's move costing
-    // nothing) -- so this is 1 *more*, not less; see the doc comment above.
+    // The pre-Arc code would pay 3 for this same shape (the clone, with the other branch's move
+    // costing nothing) -- so this is 1 *more*, not less; see the doc comment above.
     expect_allocs(
         "fanout: send + receive, 2 consumers (1 clones, 1 free, +1 for the Arc)",
         stats,
@@ -2278,14 +2278,15 @@ fn fanout_send_mixed_output_and_transform_consumers() {
     });
     assert_eq!(out_len, 1);
     assert_eq!(xform_len, 1);
-    // 1 (Arc::new, once per send) + 5 (the Transform branch's forced deep clone: 1 for the
-    // Vec<Event>, 4 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
+    // 1 (Arc::new, once per send) + 3 (the Transform branch's forced deep clone: 1 for the
+    // Vec<Event>, 2 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
     // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above --
     // this is the "Output hasn't finished yet" outcome, not the only reachable one; see
     // `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first` below for the
-    // other. Against `main` (pre-PR): a flat, unconditional 5 for any 2-consumer fan-out regardless
-    // of kind -- so this specific outcome is 1 allocation worse than `main`, same as the
-    // all-Transform case, though (unlike that case) it's not the only place this shape can land.
+    // other. The pre-`Arc` code paid a flat, unconditional clone (3 today) for any 2-consumer
+    // fan-out regardless of kind -- so this specific outcome is 1 allocation worse than that, same
+    // as the all-Transform case, though (unlike that case) it's not the only place this shape can
+    // land.
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output not yet finished (racy outcome A)",
         stats,
@@ -2307,12 +2308,12 @@ fn fanout_send_mixed_output_and_transform_consumers() {
 /// already returned from `output.send` and moved on) *before* the `Transform` side ever calls
 /// `unwrap_batch` -- the mirror image of the ordering the test above pins.
 ///
-/// **The two tests together are the honest picture for this shape: 1 or 6, decided by real
-/// scheduling, never anything in between** (there's no path to landing on `main`'s flat 5, since
-/// `Arc::new` is always paid the moment there are 2+ consumers). Whether this design is a net win,
-/// a wash, or a regression for a given deployment depends on how its `Output` implementations and
-/// `Transform`/Lua stages actually get scheduled relative to each other -- not something a fixed
-/// allocation count can answer on its own.
+/// **The two tests together are the honest picture for this shape: 1 or 4, decided by real
+/// scheduling, never anything in between** (there's no path to landing on the pre-`Arc` code's
+/// flat 3, since `Arc::new` is always paid the moment there are 2+ consumers). Whether this design
+/// is a net win, a wash, or a regression for a given deployment depends on how its `Output`
+/// implementations and `Transform`/Lua stages actually get scheduled relative to each other -- not
+/// something a fixed allocation count can answer on its own.
 #[test]
 fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2347,10 +2348,10 @@ fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first()
     assert_eq!(out_len, 1);
     assert_eq!(xform_len, 1);
     // 1 (Arc::new, once per send) + 0 (the Transform branch's try_unwrap now succeeds, since the
-    // Output branch already dropped its handle) + 0 (the Output branch, as always). Against
-    // `main`'s flat, unconditional 5 for this shape, this outcome is a real, substantial
+    // Output branch already dropped its handle) + 0 (the Output branch, as always). Against the
+    // pre-`Arc` code's flat, unconditional 3 for this shape, this outcome is a real, substantial
     // improvement -- the other reachable outcome (the test above) is 1 allocation worse than
-    // `main`. Which one a given run lands on is decided by scheduling, not by this design.
+    // that. Which one a given run lands on is decided by scheduling, not by this design.
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output finished first (racy outcome B)",
         stats,
