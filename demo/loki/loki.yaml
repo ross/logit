@@ -1,6 +1,7 @@
-# Loki 3.7.x, monolithic single-binary, no auth, no multi-tenancy, filesystem storage. Demo-only:
-# everything under /loki lives in the `loki_data` named volume (demo/compose.yaml) and is
-# disposable.
+# Loki 3.7.x, monolithic single-binary, no auth, no multi-tenancy, filesystem storage. It receives
+# logs from `logit`'s `loki_out` over OTLP/HTTP and serves Grafana's queries on :3100 inside the
+# `demo` network (not published on the host). Demo-only: everything under /loki lives in the
+# `loki_data` named volume (demo/compose.yaml) and is disposable.
 auth_enabled: false
 
 server:
@@ -20,8 +21,8 @@ common:
     kvstore:
       store: inmemory
 
-# Loki's schema config has changed repeatedly across 2.x/3.x -- v13 + tsdb + filesystem is the
-# current combination; boltdb-shipper and schemas below v13 are deprecated.
+# v13 + tsdb + filesystem is the current schema combination; boltdb-shipper and schemas below
+# v13 are deprecated.
 schema_config:
   configs:
     - from: 2024-01-01
@@ -33,9 +34,9 @@ schema_config:
         period: 24h
 
 limits_config:
-  # Nothing feeds Loki today (demo/README.md's "What isn't wired yet") -- kept for whatever
-  # eventually does: a restarted sender can replay lines slightly out of order, and without this
-  # Loki rejects them as "too old" rather than accepting them.
+  # `logit`'s `loki_out` (demo/logit.yaml) is the only sender. A restarted sender can replay
+  # lines slightly out of order, and without this Loki rejects them as "too old" rather than
+  # accepting them.
   reject_old_samples: false
   allow_structured_metadata: true
   volume_enabled: true

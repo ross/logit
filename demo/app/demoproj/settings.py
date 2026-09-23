@@ -1,9 +1,12 @@
-"""Settings for the demo's app tier (docs/plans/demo-tracing-stack.md's workstream B). Deliberately
-close to `django-admin startproject`'s own defaults -- the point of this tier is to show a real
-framework's drop-in integration points (tracing via `opentelemetry-instrumentation-django`, logging
-via stdlib `logging.handlers.SysLogHandler`), not a from-scratch minimal app. Tracing itself is
-wired in demo/app/gunicorn.conf.py's `post_fork`, not here -- it must run once per forked worker,
-before Django's own instrumentation-relevant imports happen in that worker.
+"""Settings for the demo's app tier (docs/plans/demo-tracing-stack.md), shared by the gunicorn
+web workers and the Celery `worker` service.
+
+Deliberately close to `django-admin startproject`'s defaults: the point of this tier is to show a
+real framework's drop-in integration points (tracing via `opentelemetry-instrumentation-django`,
+logging via stdlib `logging.handlers.SysLogHandler`), not a from-scratch minimal app. Tracing is
+wired in demo/app/gunicorn.conf.py's `post_fork` (and demoproj/celery.py's `worker_process_init`),
+not here, because it must run once per forked worker, before Django's instrumentation-relevant
+imports happen in that worker.
 """
 
 import os
@@ -12,20 +15,19 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# A fixed demo value, like demo/compose.yaml's INFLUXDB_TOKEN -- this stack has no real users or
+# A fixed demo value, like demo/compose.yaml's INFLUXDB_TOKEN: this stack has no real users or
 # sessions to protect. Never do this outside a throwaway demo.
 SECRET_KEY = "demo-only-not-a-real-secret"
 
 DEBUG = False
-# No real hostname to pin here -- nginx forwards whatever Host a client sent (haproxy's own
-# hostname, `localhost:8080`, ...). Fine for a demo; a real deployment would list real hostnames.
+# No real hostname to pin here: nginx forwards whatever Host a client sent (haproxy's hostname,
+# `localhost:8080`, ...). Fine for a demo; a real deployment would list real hostnames.
 ALLOWED_HOSTS = ["*"]
 
-# No `django.contrib.staticfiles` -- this tier's one template is inline-styled and serves no
-# static assets of its own (`graph.svg`/`architecture.svg` are dynamic views reading a shared
-# volume, and now `telemetry.js` -- docs/plans/browser-tracing.md's Workstream C -- is a dynamic
-# view reading the bundle esbuild produced at image-build time, not a static file), so there's
-# nothing for it to collect or serve. A whole app + `STATIC_URL`/`STATIC_ROOT`/`collectstatic` for
+# No `django.contrib.staticfiles`: this tier's one template is inline-styled and serves no static
+# assets of its own. `graph.svg`/`architecture.svg` are dynamic views reading a shared volume, and
+# `telemetry.js` (docs/plans/browser-tracing.md) is a dynamic view reading the bundle esbuild
+# produced at image-build time. A whole app plus `STATIC_URL`/`STATIC_ROOT`/`collectstatic` for
 # one bundled JS file would be more machinery than the thing it serves.
 INSTALLED_APPS = [
     "pages",
@@ -34,10 +36,10 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.common.CommonMiddleware",
-    # Last (innermost) -- runs closest to the view, so it logs the real status code/body length
-    # the view produced. It's inside the OpenTelemetry request span either way (that span wraps
-    # the WSGI handler, not `MIDDLEWARE`, so position here doesn't affect that) -- see
-    # demo/app/pages/middleware.py's own header comment.
+    # Last (innermost), so it runs closest to the view and logs the real status code/body length
+    # the view produced. It's inside the OpenTelemetry request span either way, because that span
+    # wraps the WSGI handler, not `MIDDLEWARE`; see demo/app/pages/middleware.py's module
+    # docstring.
     "pages.middleware.AccessLogMiddleware",
 ]
 
@@ -52,8 +54,8 @@ TEMPLATES = [
             "context_processors": [
                 "django.template.context_processors.debug",
                 "django.template.context_processors.request",
-                # docs/plans/browser-tracing.md's Workstream C -- see
-                # pages/context_processors.py's own header comment.
+                # Renders the page's <meta name="traceparent"> (docs/plans/browser-tracing.md);
+                # see pages/context_processors.py's module docstring.
                 "pages.context_processors.traceparent",
             ],
         },
@@ -62,11 +64,10 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "demoproj.wsgi.application"
 
-# `docs/plans/demo-richer-traces.md` workstream C: real state, and a real driver-level CLIENT
-# span (opentelemetry-instrumentation-psycopg, demo/app/gunicorn.conf.py) rather than the
-# request-only spans every other route produces. Django auto-selects the psycopg 3 backend once
-# `psycopg` (not `psycopg2`) is the importable driver (Django 4.2+); still spelled
-# `django.db.backends.postgresql` either way.
+# Real state (`docs/plans/demo-richer-traces.md`), with a real driver-level CLIENT span per
+# statement (opentelemetry-instrumentation-psycopg, demo/app/demoproj/telemetry.py). Django
+# auto-selects the psycopg 3 backend when `psycopg` (not `psycopg2`) is the importable driver
+# (Django 4.2+); it's still spelled `django.db.backends.postgresql` either way.
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
@@ -82,13 +83,12 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 USE_TZ = True
 
-# `logit`'s own syslog listeners for this app -- one per tier (demo/logit.yaml's `app_in`, :5142,
-# `worker_in`, :5143, docs/plans/demo-richer-traces.md workstream D), distinct from haproxy's
-# :5140 and nginx's :5141 for the identical reason: `set`'s `resource:` block stamps a whole
-# *batch*, so each tier needs its own listener or they'd interleave into one batch with one wrong
-# `service.name`. This one settings module is shared by both processes (gunicorn's own workers and
-# the `worker` service, demo/compose.yaml) -- each only ever logs through its own logger below, so
-# both handlers existing in both processes is harmless.
+# `logit`'s syslog listeners for this app, one per tier (demo/logit.yaml's `app_in`, :5142, and
+# `worker_in`, :5143; docs/plans/demo-richer-traces.md), distinct from haproxy's :5140.
+# `set`'s `resource:` block stamps a whole *batch*, so each tier needs its own listener, or they'd
+# interleave into one batch with one wrong `service.name`. This settings module is shared by both
+# processes (gunicorn's workers and the `worker` service, demo/compose.yaml). Each only logs
+# through its own logger below, so both handlers existing in both processes is harmless.
 LOGIT_HOST = os.environ.get("LOGIT_HOST", "logit")
 LOGIT_PORT = int(os.environ.get("LOGIT_PORT", "5142"))
 WORKER_LOGIT_PORT = int(os.environ.get("WORKER_LOGIT_PORT", "5143"))
@@ -102,13 +102,13 @@ LOGGING = {
     },
     "handlers": {
         "access_syslog": {
-            # Not the base `logging.handlers.SysLogHandler` -- see
-            # pages/syslog_handler.py's header comment for why.
+            # Not the base `logging.handlers.SysLogHandler`; see pages/syslog_handler.py's
+            # module docstring for why.
             "class": "pages.syslog_handler.NoNulSysLogHandler",
             "address": (LOGIT_HOST, LOGIT_PORT),
             "socktype": socket.SOCK_DGRAM,
-            # Matches demo/haproxy/haproxy.cfg's own facility (PRI 134 = facility 16/local0) --
-            # consistent across tiers, though `logit` doesn't key on it.
+            # Matches demo/haproxy/haproxy.cfg's facility (PRI 134 = facility 16/local0), for
+            # consistency across tiers, though `logit` doesn't key on it.
             "facility": "local0",
             "formatter": "access_json",
         },
@@ -121,16 +121,16 @@ LOGGING = {
         },
     },
     "loggers": {
-        # `propagate: False` -- this logger's only purpose is the one `access_syslog` line per
-        # request (demo/app/pages/middleware.py); it shouldn't also hit Django's root logger and
-        # print to stderr.
+        # `propagate: False`: this logger's only purpose is the one `access_syslog` line per
+        # request (demo/app/pages/middleware.py), and it shouldn't also hit Django's root logger
+        # and print to stderr.
         "demoapp.access": {
             "handlers": ["access_syslog"],
             "level": "INFO",
             "propagate": False,
         },
-        # Same reasoning as `demoapp.access` above -- `pages/tasks.py`'s only log line per task,
-        # nothing else.
+        # Same reasoning as `demoapp.access`: `pages/tasks.py`'s one log line per task, nothing
+        # else.
         "demoapp.worker": {
             "handlers": ["worker_syslog"],
             "level": "INFO",

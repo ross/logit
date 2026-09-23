@@ -3,11 +3,28 @@
 #
 # This is deliberately separate from the repo root's compose.yaml, which is the contributor dev
 # stack (bind-mounted source, `script/server`, `cargo run` inside a long-lived container). This
-# stack instead builds and runs the production image (../Dockerfile) -- what a real user gets.
+# stack builds and runs the production image (../Dockerfile), which is what a real user gets.
+#
+# How the services connect:
+#   - `traffic` loops curl requests through `haproxy` (the front door, published on :8080) ->
+#     `nginx` -> `app` (Django). `/work` also writes to `postgres` and enqueues a Celery task on
+#     `redis` that `worker` runs.
+#   - Each tier's logs reach `logit`: haproxy, app, and worker over syslog; nginx and redis via
+#     `logit` tailing their Docker json-file logs off the host; postgres via a shared log volume.
+#     demo/logit.yaml is the pipeline, and its header comment is the map of it.
+#   - `logit` writes metrics to `influxdb`, logs to `loki`, and spans to `tempo`. `app` and `worker`
+#     also send their own OTel spans straight to `tempo`, bypassing `logit`.
+#   - `grafana` (:3000) reads all three backends.
+#   - `graph-dot`, `graph-svg`, and `arch-svg` render the landing page's two diagrams once at
+#     startup, and `app-migrate` creates `app`'s schema. All four exit when done; `Exited (0)` in
+#     `docker compose ps` is expected.
+#
+# `docker compose down -v` wipes every volume at the bottom of this file, Postgres's data and logs
+# and `logit`'s checkpoints included.
 
-# Shared via YAML's merge key (`<<:`), not repeated per service -- `app` and `app-migrate` both
-# need the same Postgres connection settings (`demo/app/demoproj/settings.py`'s `DATABASES`), and
-# duplicating five env vars invites exactly one of them drifting.
+# Shared via YAML's merge key (`<<:`) rather than repeated per service: `app`, `app-migrate`, and
+# `worker` need the same Postgres connection settings (`demo/app/demoproj/settings.py`'s
+# `DATABASES`), and duplicating five env vars invites one of them drifting.
 x-postgres-env: &postgres-env
   POSTGRES_HOST: postgres
   POSTGRES_PORT: "5432"
@@ -37,24 +54,23 @@ services:
       - influxdb_data:/var/lib/influxdb2
     networks: [demo]
 
-  # `demo/app`'s state (`docs/plans/demo-richer-traces.md` workstream C), and this stack's first
-  # real exercise of `tail_in` (`crates/logit-inputs/src/tail/`) -- `nginx_in` below is `docker_in`,
-  # `tail_in`'s Docker-specific sibling, so nothing here has tailed a plain file directly until now
-  # (see demo/README.md's old "What isn't exercised yet"). `jsonlog` (Postgres 15+), not the plain-
-  # text default, so `logit`'s existing `json` transform reads it unchanged, the same way every
-  # other tier's access line already does. `log_min_duration_statement=0` logs every statement, not
-  # just slow ones -- this is a demo meant to show the mechanism, not a production sampling policy.
-  # `log_rotation_age` is minutes, not the default 24h, deliberately: `tail_in`'s directory-glob
-  # discovery (demo/logit.yaml's `postgres_in`, `paths: [.../*.json]`) only sees a rotation if one
-  # actually happens during a demo session. Wrapped in a `/bin/sh -c` entrypoint, not passed as
-  # `command:` alone, because `log_directory` points outside `PGDATA` -- the official image's own
-  # entrypoint only prepares `PGDATA` itself, so the directory has to exist (and be owned by the
-  # `postgres` user postgres eventually drops privileges to) before `docker-entrypoint.sh` runs.
+  # `demo/app`'s database (`docs/plans/demo-richer-traces.md`), and the source `logit`'s `tail_in`
+  # reads (`crates/logit-inputs/src/tail/`; demo/README.md's "Postgres"). Settings:
+  #   - `jsonlog` (Postgres 15+), not the plain-text default, so `logit`'s `json` transform reads
+  #     it unchanged, like every other tier's access line.
+  #   - `log_min_duration_statement=0` logs every statement, not just slow ones. This demo shows
+  #     the mechanism; it isn't a production sampling policy.
+  #   - `log_rotation_age` is minutes, not the default 24h, so a rotation actually happens during a
+  #     demo session and `tail_in`'s directory-glob discovery (demo/logit.yaml's `postgres_in`,
+  #     `paths: [.../*.json]`) has something to discover.
+  # It's wrapped in a `/bin/sh -c` entrypoint rather than passed as `command:` alone because
+  # `log_directory` points outside `PGDATA`. The official image's entrypoint only prepares `PGDATA`,
+  # so the directory has to exist (and be owned by the `postgres` user postgres drops privileges
+  # to) before `docker-entrypoint.sh` runs.
   postgres:
     image: docker.io/library/postgres:17-alpine
-    # The official image only ever reads its own POSTGRES_DB/USER/PASSWORD out of this map --
-    # POSTGRES_HOST/PORT (also in `*postgres-env`, for `app`'s/`app-migrate`'s benefit) are simply
-    # ignored here, not meaningful to this service itself.
+    # The official image only reads POSTGRES_DB/USER/PASSWORD out of this map. POSTGRES_HOST/PORT
+    # (also in `*postgres-env`, for the app services) are ignored here.
     environment:
       <<: *postgres-env
     entrypoint: ["/bin/sh", "-c"]
@@ -78,11 +94,11 @@ services:
       - postgres_logs:/var/log/postgresql
     networks: [demo]
 
-  # Celery's broker (`docs/plans/demo-richer-traces.md` workstream D) -- `app`'s `.delay()` and
-  # `worker`'s own consumption both go through here. No persistence configured: this demo has
-  # nothing worth surviving a restart on the broker side, unlike `postgres_data` above. Logs to
-  # stdout only, which `redis_in` (demo/logit.yaml) tails straight off the host with `docker_in` --
-  # the same mechanism `nginx_in` uses, and no Redis-side config change needed for it.
+  # Celery's broker (`docs/plans/demo-richer-traces.md`): `app`'s `.delay()` and `worker`'s
+  # consumption both go through here. No persistence is configured, because nothing on the broker
+  # side is worth surviving a restart, unlike `postgres_data` above. It logs to stdout only, which
+  # `redis_in` (demo/logit.yaml) tails straight off the host with `docker_in`, the same mechanism
+  # `nginx_in` uses, with no Redis-side config change.
   redis:
     image: docker.io/library/redis:7-alpine
     # Fixed, not Compose's default `<project>-redis-<n>`, for the same reason `nginx`'s is (below):
@@ -107,24 +123,23 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # Provisioning config vs. the dashboard JSON files it points at are two separate mounts --
-      # Grafana's `dashboards` provider reads `options.path` from wherever the config says, which
-      # is not under `provisioning/` itself.
+      # The provisioning config and the dashboard JSON files it points at are two separate mounts,
+      # because Grafana's `dashboards` provider reads `options.path` from wherever the config says,
+      # which isn't under `provisioning/` itself.
       - ./grafana/provisioning:/etc/grafana/provisioning:z,ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:z,ro
       - grafana_data:/var/lib/grafana
     networks: [demo]
 
-  # Log backend -- receives `logit`'s own log lines directly over OTLP/HTTP from `loki_out`
-  # (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md's workstream B; no relay
-  # service in between). Unlike the old demo writer, `hello` below doesn't also write to Loki
-  # directly -- `logit`'s own `otlp_out` is the only path in.
+  # Log backend. `logit`'s `loki_out` is the only path in: logs arrive over OTLP/HTTP with no relay
+  # service in between (demo/logit.yaml, docs/plans/otlp-logs-and-resource-identity.md). Not
+  # published on the host; Grafana queries it over the `demo` network.
   loki:
     image: docker.io/grafana/loki:3.7.7
     command: ["-config.file=/etc/loki/loki.yaml"]
     healthcheck:
-      # Loki's image is distroless -- no shell, no curl/wget, so this is the native probe
-      # (backported to 3.6.5+), not the classic `wget --spider` healthcheck you'll see elsewhere.
+      # Loki's image is distroless (no shell, no curl/wget), so this is the native probe
+      # (backported to 3.6.5+), not the usual `wget --spider` healthcheck.
       test: ["CMD", "loki", "-health"]
       interval: 5s
       timeout: 3s
@@ -138,9 +153,11 @@ services:
       - loki_data:/loki
     networks: [demo]
 
-  # Trace backend -- receives `logit`'s own internal spans over OTLP/gRPC from `tempo_out`
-  # (demo/logit.yaml), provisioned in Grafana with `tracesToLogsV2` pointed at Loki -- both Loki
-  # and Tempo receive real data now (demo/grafana/provisioning/datasources/datasources.yaml).
+  # Trace backend. It receives `logit`'s spans over OTLP/gRPC from `tempo_out` (demo/logit.yaml)
+  # and `app`'s/`worker`'s own spans over OTLP/HTTP (demo/tempo/tempo.yaml). Grafana provisions it
+  # with `tracesToLogsV2` pointed at Loki
+  # (demo/grafana/provisioning/datasources/datasources.yaml). Only the OTLP ports are published;
+  # the query API (:3200) is reached through Grafana.
   tempo:
     # Pinned to 2.10.x, not the current 3.0.x: Tempo 3.0 removed the legacy ingester write path
     # and reworked config wholesale (docs/plans/demo-stack.md). 2.10's monolithic mode is
@@ -159,9 +176,9 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
-    # Named explicitly so `graph-dot` below can reuse this exact image without a second `build:`
-    # -- unnamed, Compose would call it `<project>-logit`, derived from the directory name and
-    # overridable via -p/COMPOSE_PROJECT_NAME, not something worth another service guessing at.
+    # Named explicitly so `graph-dot` below can reuse this exact image without a second `build:`.
+    # Unnamed, Compose would call it `<project>-logit`, derived from the directory name and
+    # overridable via -p/COMPOSE_PROJECT_NAME, which isn't something another service should guess.
     image: logit-demo:latest
     command: ["run", "/config.yaml"]
     depends_on:
@@ -172,32 +189,29 @@ services:
         condition: service_healthy
       loki:
         condition: service_healthy
-      # `service_started`, not `service_healthy` -- `tempo` (above) declares no healthcheck at
-      # all, so `service_started` is the honest limit anyway (same reasoning as `hello`'s
-      # dependency on `logit` below). Unlike `influxdb_out`/`otlp_out`'s Loki leg, `tempo_out`
-      # doesn't need Tempo up first for a clean start: it retries through `write_loop` like any
-      # other sink (ADR `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit`
-      # that starts before Tempo finishes booting just retries its first few span exports rather
-      # than failing.
+      # `service_started`, not `service_healthy`, because `tempo` declares no healthcheck. That's
+      # enough: `tempo_out` retries through `write_loop` like any other sink (ADR
+      # `service-lifecycle-and-output-retry`'s bounded output retry), so a `logit` that starts
+      # before Tempo finishes booting retries its first few span exports rather than failing.
       tempo:
         condition: service_started
-      # `service_started`, same reasoning as `tempo` above -- `postgres_in` (demo/logit.yaml) is a
-      # `tail_in` glob over `postgres`'s own log directory, and a glob matching nothing yet is a
-      # silent, retried no-op by design (`docs/deploying.md`'s "What to watch"), not a startup
-      # ordering `logit` needs `postgres` healthy first to avoid.
+      # `service_started`, for the same reason: `postgres_in` (demo/logit.yaml) is a `tail_in` glob
+      # over `postgres`'s log directory, and a glob matching nothing yet is a silent, retried no-op
+      # by design (`docs/deploying.md`'s "What to watch"). `logit` doesn't need `postgres` healthy
+      # first.
       postgres:
         condition: service_started
-    # `nginx_in` (demo/logit.yaml) tails `nginx`'s own Docker json-file log directly off the host
-    # (`docker_in`, docs/adr/file-tailing-and-docker-json-logs.md) rather than receiving a
-    # `syslog:` stream -- this stack's end-to-end proof for that ADR. Docker's per-container state
-    # directories are `root:root 0710` and the logs `root:root 0640` on a stock install, so
-    # `logit` needs both `user: "0:0"` and the bind mount below; this is real cost specific to
-    # reading the json-file driver directly rather than the docker socket/API (see the ADR's
-    # "Root privileges" section) -- only this one service pays it, and only for this one reason.
+    # Why this service runs as root: `nginx_in` and `redis_in` (demo/logit.yaml) tail those
+    # containers' Docker json-file logs directly off the host (`docker_in`,
+    # docs/adr/file-tailing-and-docker-json-logs.md) rather than receiving a `syslog:` stream.
+    # Docker's per-container state directories are `root:root 0710` and the logs `root:root 0640`
+    # on a stock install, so `logit` needs both `user: "0:0"` and the bind mount below. That cost
+    # is specific to reading the json-file driver directly rather than the docker socket/API (see
+    # the ADR's "Root privileges" section), and only this one service pays it.
     # **Native Linux Docker Engine only**: rootless Docker uses `~/.local/share/docker/containers`
-    # and Docker Desktop's paths live inside its VM, neither matching `/var/lib/docker/containers`
-    # -- `docker_in`'s own `root:` config field (unset here, so it keeps its stock default) is
-    # where a non-default install would point it instead.
+    # and Docker Desktop's paths live inside its VM, neither matching `/var/lib/docker/containers`.
+    # `docker_in`'s `root:` config field (unset here, so it keeps its stock default) is where a
+    # non-default install would point it instead.
     user: "0:0"
     volumes:
       - ./logit.yaml:/config.yaml:ro
@@ -205,23 +219,23 @@ services:
       # directory (not a directory this stack owns) would be actively harmful, unlike every other
       # bind mount in this file. `security_opt` below is the SELinux accommodation instead.
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      # `nginx_in`'s, `redis_in`'s and `postgres_in`'s checkpoints (demo/logit.yaml) -- survive a
-      # `logit` restart so it resumes without replaying/losing lines; `docker compose down -v` wipes
-      # them along with everything else this stack persists.
+      # `nginx_in`'s, `redis_in`'s, and `postgres_in`'s checkpoints (demo/logit.yaml), so a `logit`
+      # restart resumes without replaying or losing lines. `docker compose down -v` wipes them
+      # along with everything else this stack persists.
       - logit_state:/var/lib/logit
-      # `postgres_in`'s own source (demo/logit.yaml) -- `:ro`, unlike the Docker-state mount above,
-      # since this is a directory this stack owns outright, not the daemon's live state.
+      # `postgres_in`'s source (demo/logit.yaml). `:ro`, like the Docker-state mount above, but this
+      # is a directory this stack owns outright, not the daemon's live state.
       - postgres_logs:/var/log/postgresql:ro
-    # Only meaningful on an SELinux host (Fedora/RHEL and derivatives) -- a no-op elsewhere.
+    # Only meaningful on an SELinux host (Fedora/RHEL and derivatives); a no-op elsewhere.
     # Disables SELinux confinement for this one container rather than relabeling the bind mount
     # above (`:z` would do that, and is exactly what must NOT happen to the daemon's own state).
     security_opt: ["label=disable"]
     environment:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-logit-demo-token}
     # `logit ready` (`docs/deploying.md`'s "Probes and exit codes", ADR `admin-readiness-endpoint`)
-    # against demo/logit.yaml's own `admin: { bind: 0.0.0.0:9600 }` -- the same probe
-    # `Dockerfile`'s own `HEALTHCHECK` runs, just declared explicitly here so this stack's
-    # `depends_on: service_healthy` entries below have something real to wait on.
+    # against demo/logit.yaml's own `admin: { bind: 0.0.0.0:9600 }`. It's the same probe
+    # `Dockerfile`'s `HEALTHCHECK` runs, declared explicitly here so the `depends_on:
+    # service_healthy` entries below have something real to wait on.
     healthcheck:
       test: ["CMD", "logit", "ready"]
       interval: 5s
@@ -232,36 +246,35 @@ services:
       demo:
         aliases: [logit]
 
-  # -- The demo's front door, and the two graph renders that feed it --------------------------
+  # -- The two diagram renders the landing page shows ------------------------------------------
   #
-  # `logit graph` prints DOT; turning that into an SVG needs graphviz, which the release image
-  # doesn't (and shouldn't) carry. So: one-shot containers, chained by
+  # `logit graph` prints DOT, and turning that into an SVG needs graphviz, which the release image
+  # doesn't (and shouldn't) carry. So these are one-shot containers, chained by
   # `service_completed_successfully` where there's a real dependency (graph-dot -> graph-svg),
-  # writing through a shared `graph_data` volume. This is runtime sequencing, not build-time --
+  # writing through a shared `graph_data` volume. This is runtime sequencing, not build-time:
   # `up --build` finishes every build before starting any container, but doesn't order builds
   # relative to each other, so a cross-image `COPY --from=<another service's image>` at build time
   # would be a race; depends_on isn't.
   #
-  # Note for podman-compose (script/common.sh's DOCKER=podman): `service_completed_successfully`
-  # is reportedly unimplemented there and may be ignored rather than honored, in which case `app`
-  # can start before `graph-svg`/`arch-svg` finish. Harmless either way -- see `app`'s
-  # `pages.views._serve_svg`, which reads each file fresh per request rather than caching it, so a
-  # page load a few seconds later just works.
+  # podman-compose (script/common.sh's DOCKER=podman) reportedly doesn't implement
+  # `service_completed_successfully` and may ignore it, so `app` can start before
+  # `graph-svg`/`arch-svg` finish. That's harmless: `app`'s `pages.views._serve_svg` reads each file
+  # fresh per request rather than caching it, so a page load a few seconds later works.
 
-  # Step 1: render the pipeline config to DOT, from the very image the demo is running.
+  # Step 1: render the pipeline config to DOT, from the image the demo is running.
   graph-dot:
-    # Not a `build:` -- reuses the `logit` service's already-built `logit-demo:latest` tag.
+    # Not a `build:`; reuses the `logit` service's already-built `logit-demo:latest` tag.
     image: logit-demo:latest
     # The release image runs as the non-root `logit` user (../Dockerfile). A named volume whose
     # mountpoint doesn't exist in the image is created root-owned, so the redirect below would
-    # fail EPERM -- silently, given the `|| true` needed for the reason in the next comment.
-    # Root just for this one-shot write.
+    # fail EPERM, silently, given the `|| true` explained in the next comment. Root just for this
+    # one-shot write.
     user: "0:0"
-    # Overrides ENTRYPOINT ["logit"] with a shell, purely to redirect stdout to a file. `|| true`:
-    # `logit graph` resolves `!env` exactly like `validate`/`run` (needs INFLUXDB_TOKEN) and
-    # exits 1 with nothing on stdout if that fails to resolve -- but on a config that loads yet
-    # fails *semantic* validation, it prints complete, valid DOT to stdout before exiting 1, so
-    # gating this step on exit code alone would throw away perfectly good output.
+    # Overrides ENTRYPOINT ["logit"] with a shell, purely to redirect stdout to a file. Why
+    # `|| true`: `logit graph` resolves `!env` exactly like `validate`/`run` (needs INFLUXDB_TOKEN)
+    # and exits 1 with nothing on stdout if that fails. But on a config that loads yet fails
+    # *semantic* validation, it prints complete, valid DOT to stdout before exiting 1, so gating
+    # this step on exit code alone would throw away good output.
     entrypoint: ["/bin/sh", "-c"]
     command: ["logit graph /config.yaml > /graph/logit.dot || true"]
     environment:
@@ -280,21 +293,21 @@ services:
       graph-dot:
         condition: service_completed_successfully
     # `test -s` first: a config that fails to *load* leaves graph-dot's redirect writing nothing
-    # at all (as opposed to the semantic-validation-failure case, which still writes real DOT).
-    # Either way this must exit 0, or `app` (below) never starts.
+    # at all (unlike the semantic-validation-failure case, which still writes real DOT). Either
+    # way this must exit 0, or `app` (below) never starts.
     command: ["test -s /graph/logit.dot && dot -Tsvg /graph/logit.dot -o /graph/logit.svg || true"]
     volumes:
       - graph_data:/graph
     networks: [demo]
 
   # A second, independent diagram: the demo's service architecture (who talks to whom, and what
-  # *kind* of traffic -- web/logging/tracing/metrics/query), shown just above the pipeline diagram
-  # on the landing page. Unlike graph-dot -> graph-svg above, there's no generation step first --
-  # demo/architecture.dot is hand-authored (see its own header comment for why: no single
-  # machine-readable source encodes "traffic type" the way demo/logit.yaml encodes the pipeline),
-  # so this just renders it, reusing the same Graphviz image graph-svg already builds. No
-  # `depends_on: graph-svg` -- independent output file, no shared input, and `up --build` finishes
-  # every image build before starting any container either way (graph-dot's own comment above).
+  # *kind* of traffic -- web/logging/tracing/metrics/query), shown above the pipeline diagram on
+  # the landing page. There's no generation step: demo/architecture.dot is hand-authored (its
+  # header comment says why: no single machine-readable source encodes "traffic type" the way
+  # demo/logit.yaml encodes the pipeline), so this renders it with the same Graphviz image
+  # graph-svg builds. No `depends_on: graph-svg`: it's an independent output file with no shared
+  # input, and `up --build` finishes every image build before starting any container either way
+  # (see the section comment above).
   arch-svg:
     image: logit-demo-graph-renderer:latest
     command: ["dot -Tsvg /architecture.dot -o /graph/architecture.svg"]
@@ -303,26 +316,22 @@ services:
       - graph_data:/graph
     networks: [demo]
 
-  # One-shot: `manage.py migrate` against a real Postgres, gated on `postgres` being ready to
-  # accept connections -- `service_healthy`, not `service_started`, since (unlike `docker_in`'s
-  # tolerant treatment of `postgres` above) a migration that runs before Postgres can accept
-  # connections just fails outright, no retry built in. Same `service_completed_successfully`
-  # pattern as `graph-dot`/`graph-svg` below: expect `Exited (0)` in `docker compose ps`, not a
-  # crash. Reuses `logit-demo-app:latest` with no second `build:` of its own, the same trick
-  # `graph-dot` already uses against `logit-demo:latest` -- `--build` builds every image once,
-  # regardless of how many services reference the tag afterward.
+  # One-shot: `manage.py migrate` against Postgres. It waits for `service_healthy`, not
+  # `service_started`, because unlike `logit`'s tolerant `postgres_in`, a migration that runs
+  # before Postgres accepts connections fails outright, with no retry. Expect `Exited (0)` in
+  # `docker compose ps`, not a crash. It reuses `logit-demo-app:latest` with no `build:` of its
+  # own, the same trick `graph-dot` uses with `logit-demo:latest`: `--build` builds every image
+  # once, however many services reference the tag.
   app-migrate:
     image: logit-demo-app:latest
     depends_on:
       postgres:
         condition: service_healthy
-      # Every `manage.py` invocation loads `demoproj/settings.py`'s `LOGGING` regardless of which
-      # command runs, and `SysLogHandler.__init__` resolves its `address` host synchronously at
-      # handler-configuration time -- so `migrate` needs `logit`'s network alias to exist before it
-      # runs, even though it never actually logs anything. `service_healthy`, not just
-      # `service_started`, now that `logit`'s own healthcheck (`docs/deploying.md`'s "Probes and
-      # exit codes") gives Compose something real to wait on -- previously the honest limit was
-      # "started," since there was no way to know a listener was actually bound.
+      # Every `manage.py` invocation loads `demoproj/settings.py`'s `LOGGING`, whatever the
+      # command, and `SysLogHandler.__init__` resolves its `address` host synchronously at
+      # handler-configuration time. So `migrate` needs `logit`'s network alias to exist before it
+      # runs, even though it never logs anything. `service_healthy` waits on `logit`'s healthcheck
+      # (`docs/deploying.md`'s "Probes and exit codes").
       logit:
         condition: service_healthy
     entrypoint: ["python", "manage.py"]
@@ -331,19 +340,17 @@ services:
       <<: *postgres-env
     networks: [demo]
 
-  # Step 3: the innermost tier a request reaches -- no longer the demo's front door or its own
-  # traffic source (docs/plans/demo-tracing-stack.md's workstream A). Sits behind `nginx` below;
-  # `traffic` drives requests through the whole haproxy -> nginx -> app chain. A real Django app
-  # now (workstream B) -- replaces `hello`'s stdlib stub, so unlike every other bind-mounted script
-  # in this stack, this one is a real image build: `demo/app/Dockerfile`, not "nothing to install."
-  # Writes into `logit` for its access log only (syslog, `app_in`, :5142, same reasoning as every
-  # other tier's own listener). Its own OTel request spans bypass `logit` entirely and go straight
-  # to `tempo`'s own OTLP/HTTP receiver (below) -- deliberate, not every telemetry leg needs
-  # `logit` in front of it, and `demo/logit.yaml`'s header comment explains why this is the one
-  # that doesn't. `otlp_in` (`crates/logit-inputs/src/otlp.rs`) is wired into this stack now too,
-  # just not for `app`'s own spans -- see `haproxy`'s (below) `/v1/*` route and
-  # `demo/logit.yaml`'s `browser_in`. No port published here for it: reached through `haproxy`'s
-  # already-published `:8080`, not directly.
+  # Step 3: `app`, the innermost tier a request reaches, behind `nginx` below
+  # (docs/plans/demo-tracing-stack.md). A real Django app built from `demo/app/Dockerfile`.
+  #   - Its access log goes to `logit` over syslog (`app_in`, :5142), on its own listener like
+  #     every other tier.
+  #   - Its OTel request spans bypass `logit` and go straight to `tempo`'s OTLP/HTTP receiver.
+  #     That's deliberate: not every telemetry leg needs `logit` in front of it, and
+  #     `demo/logit.yaml`'s header comment explains why this one doesn't.
+  #   - It serves the landing page, whose browser SDK posts spans to `logit`'s `otlp_in`
+  #     (`crates/logit-inputs/src/otlp.rs`) through `haproxy`'s `/v1/*` route; see
+  #     `demo/logit.yaml`'s `browser_in`.
+  # No port is published; everything reaches `app` through `haproxy`'s `:8080`.
   app:
     build:
       context: ./app
@@ -353,28 +360,25 @@ services:
         condition: service_completed_successfully
       arch-svg:
         condition: service_completed_successfully
-      # `service_healthy`: `logit`'s own healthcheck (`docs/deploying.md`'s "Probes and exit
-      # codes") now answers "is the UDP listener actually bound" for real, closing the gap
-      # `docs/deploying.md`'s "ordering rule" used to name -- UDP is still fire-and-forget once
-      # `app` is running, this only bounds when it's allowed to start sending.
+      # `service_healthy`: `logit`'s healthcheck (`docs/deploying.md`'s "Probes and exit codes")
+      # answers "is the UDP listener actually bound". UDP is still fire-and-forget once `app` is
+      # running; this only bounds when it's allowed to start sending.
       logit:
         condition: service_healthy
-      # The OTLP/HTTP leg below is TCP and does get retried by the exporter's own SDK-level retry
-      # (a `BatchSpanProcessor` export failure just gets dropped and retried on the next batch, no
-      # crash), so `service_started` is no less honest a limit for `tempo` either -- same reasoning
-      # `logit`'s own dependency on `tempo` above already uses for `tempo_out`.
+      # The OTLP/HTTP leg is TCP and retried by the exporter SDK (a `BatchSpanProcessor` export
+      # failure is dropped and retried on the next batch, no crash), so `service_started` is enough
+      # for `tempo` here too, the same reasoning `logit`'s dependency on `tempo` uses.
       tempo:
         condition: service_started
       # The schema `pages/models.py`'s `WorkRecord` needs must exist before the first `/work`
-      # request, not just before this container starts serving -- `service_completed_successfully`,
-      # not `service_started`, since `app-migrate` racing its own `migrate` against live traffic is
-      # exactly the ordering bug this dependency exists to rule out.
+      # request, not just before this container starts serving. `service_completed_successfully`,
+      # not `service_started`, rules out `app-migrate` racing its `migrate` against live traffic.
       app-migrate:
         condition: service_completed_successfully
       # `.delay()` (pages/views.py's `work`) publishes to Redis synchronously, in the request
-      # thread -- unlike `tempo`/`logit` above, there's no background retry queue underneath it,
-      # so `service_healthy` here (Redis's own healthcheck is fast: 5s interval, 5s start period)
-      # is worth the small extra startup wait.
+      # thread. Unlike `tempo`/`logit` above, there's no background retry queue underneath it, so
+      # `service_healthy` here (Redis's healthcheck is fast: 5s interval, 5s start period) is worth
+      # the small extra startup wait.
       redis:
         condition: service_healthy
     environment:
@@ -385,34 +389,32 @@ services:
       LOGIT_PORT: "5142" # app_in, not haproxy_in/nginx_in -- see demo/logit.yaml
       OTEL_SERVICE_NAME: demo-app
       # Straight to Tempo's OTLP/HTTP receiver (demo/tempo/tempo.yaml's `otlp.protocols.http`,
-      # :4318) -- not `logit`. See the comment above and demo/logit.yaml's header comment for why.
+      # :4318), not `logit`. See the comment above and demo/logit.yaml's header comment for why.
       OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf # documentation -- see gunicorn.conf.py's comment
-      # `/work` (pages/views.py) calls back into nginx's own `/inner` -- a container-network name,
-      # unlike GRAFANA_URL above, since this call never leaves the `demo` network. `docs/plans/
-      # demo-richer-traces.md` workstream B: nginx, not haproxy, so this hop takes a different path
-      # than the request that triggered it, while still landing on a tier `logit` mints a real span
-      # from (demo/logit.yaml's `nginx_trace`).
+      # `/work` (pages/views.py) calls back into nginx's `/inner`, by container-network name,
+      # unlike GRAFANA_URL above, because this call never leaves the `demo` network
+      # (`docs/plans/demo-richer-traces.md`). It targets nginx, not haproxy, so this hop takes a
+      # different path than the request that triggered it, while still landing on a tier `logit`
+      # mints a real span from (demo/logit.yaml's `nginx_trace`).
       INNER_URL: http://nginx/inner
-      # 4, not `gunicorn.conf.py`'s own default of 2 -- `/work` blocks one worker on its own
-      # inbound call to `/inner`, which needs a *different* worker of this same pool to answer. At
-      # 2, two concurrent `/work` requests self-deadlock: both hold a worker waiting on `/inner`,
-      # and neither request the inner call is waiting for can ever be served. `traffic`'s loop
-      # (below) is serial, so 4 is ample headroom, not a value tuned against real concurrency.
+      # 4, not `gunicorn.conf.py`'s default of 2: `/work` blocks one worker on its inbound call to
+      # `/inner`, which needs a *different* worker of this same pool to answer. At 2, two
+      # concurrent `/work` requests self-deadlock: both hold a worker waiting on `/inner`, and
+      # neither inner call can ever be served. `traffic`'s loop (below) is serial, so 4 is ample
+      # headroom, not a value tuned against real concurrency.
       WEB_CONCURRENCY: "4"
-    # No longer published -- haproxy is the front door now.
+    # No `ports:`: haproxy is the front door.
     volumes:
       - graph_data:/graph:ro
     restart: unless-stopped
     networks: [demo]
 
-  # The demo's async tier (`docs/plans/demo-richer-traces.md` workstream D) -- `pages/tasks.py`'s
-  # one task, run here, never in a gunicorn worker. Reuses `logit-demo-app:latest` with no second
-  # `build:` of its own, the same trick `app-migrate`/`graph-dot` already use: `--build` builds
-  # every image once, regardless of how many services reference the tag afterward. Its own real
-  # OTel spans (`demoproj/telemetry.py`) go straight to Tempo, exactly like `app`'s -- `logit`
-  # isn't in this leg either, consistent with every other tier's own SDK-carried spans in this
-  # demo.
+  # The demo's async tier (`docs/plans/demo-richer-traces.md`): runs `pages/tasks.py`'s one task,
+  # never in a gunicorn worker. It reuses `logit-demo-app:latest` with no `build:` of its own, like
+  # `app-migrate`/`graph-dot`. Its real OTel spans (`demoproj/telemetry.py`) go straight to Tempo,
+  # like `app`'s; `logit` isn't in this leg either, consistent with every other SDK-carried span
+  # in this demo.
   worker:
     image: logit-demo-app:latest
     depends_on:
@@ -420,8 +422,7 @@ services:
         condition: service_healthy
       app-migrate:
         condition: service_completed_successfully
-      # `service_healthy`, now that `logit` has a real healthcheck to wait on
-      # (`docs/deploying.md`'s "Probes and exit codes").
+      # Waits on `logit`'s healthcheck (`docs/deploying.md`'s "Probes and exit codes").
       logit:
         condition: service_healthy
       tempo:
@@ -432,8 +433,8 @@ services:
       <<: *postgres-env
       CELERY_BROKER_URL: redis://redis:6379/0
       OTEL_SERVICE_NAME: demo-worker
-      # worker_in, not app_in -- pages/tasks.py logs through `demoapp.worker`
-      # (demoproj/settings.py), a separate logger/handler/port from `app`'s own `demoapp.access`.
+      # worker_in, not app_in: pages/tasks.py logs through `demoapp.worker`
+      # (demoproj/settings.py), a separate logger/handler/port from `app`'s `demoapp.access`.
       WORKER_LOGIT_PORT: "5143"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
       OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
@@ -444,36 +445,32 @@ services:
   # demo/nginx/nginx.conf's header comment.
   nginx:
     image: docker.io/library/nginx:1.27-alpine
-    # Fixed, not Compose's default `<project>-nginx-<n>` -- `nginx_in` (demo/logit.yaml) names
-    # this container explicitly (`docker_in`'s `containers:`), and a project-derived name would
-    # be one more thing to keep in sync by hand across two files for no benefit.
+    # Fixed, not Compose's default `<project>-nginx-<n>`: `nginx_in` (demo/logit.yaml) names this
+    # container explicitly (`docker_in`'s `containers:`), and a project-derived name would be one
+    # more thing to keep in sync by hand across two files.
     container_name: logit-demo-nginx
     environment:
-      # Keeps the entrypoint script's own non-JSON startup lines off stdout -- see
-      # demo/nginx/nginx.conf's header comment for why that matters now that `logit` tails this
-      # container's stdout directly.
+      # Keeps the entrypoint script's non-JSON startup lines off stdout, which `logit` tails
+      # directly; see demo/nginx/nginx.conf's header comment for why that matters.
       NGINX_ENTRYPOINT_QUIET_LOGS: "1"
     depends_on:
       app:
         condition: service_started
-      # No `logit` dependency any more -- nginx no longer sends it anything directly (no more
-      # `syslog:` destination), and `nginx_in`'s `read_from: beginning` plus its checkpoint mean
-      # nothing is lost even if `nginx` happens to start, and log a few lines, before `logit`
-      # first discovers its container directory.
+      # No `logit` dependency: nginx sends `logit` nothing directly, and `nginx_in`'s
+      # `read_from: beginning` plus its checkpoint mean nothing is lost even if `nginx` starts,
+      # and logs a few lines, before `logit` first discovers its container directory.
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:z,ro
     networks: [demo]
 
   # Step 5: the demo's front door. Mints (or reuses) a W3C traceparent, forwards it to nginx, and
-  # is what `traffic` and any browser actually talk to. See demo/haproxy/haproxy.cfg's header
-  # comment.
+  # is what `traffic` and any browser talk to. See demo/haproxy/haproxy.cfg's header comment.
   haproxy:
     image: docker.io/library/haproxy:3.0-alpine
     depends_on:
       nginx:
         condition: service_started
-      # `service_healthy`, now that `logit` has a real healthcheck to wait on
-      # (`docs/deploying.md`'s "Probes and exit codes").
+      # Waits on `logit`'s healthcheck (`docs/deploying.md`'s "Probes and exit codes").
       logit:
         condition: service_healthy
     volumes:
@@ -482,10 +479,10 @@ services:
       - "8080:8080"
     networks: [demo]
 
-  # The demo's traffic source, replacing `hello`'s old in-process synthetic loop (which fabricated
-  # syslog lines directly and so never crossed haproxy/nginx, carrying no trace context). Low
-  # volume by design -- this is a demo showing correlation working, not a load test. A stock image
-  # and an inline loop, not a Dockerfile, for the same "nothing to build" reason `hello` is one.
+  # The demo's traffic source: a curl loop through haproxy -> nginx -> app, so every request
+  # carries real trace context across all three tiers. Low volume by design; this demo shows
+  # correlation working, not a load test. A stock image and an inline loop, so there's nothing to
+  # build.
   traffic:
     image: docker.io/curlimages/curl:8.11.1
     depends_on:
@@ -493,25 +490,24 @@ services:
         condition: service_started
     entrypoint: ["/bin/sh", "-c"]
     # `$$p`, not `$p`: compose interpolates `$VAR`/`${VAR}` in this file itself before the string
-    # ever reaches the container's shell (confirmed empirically: unescaped, compose warned about
-    # an unset variable "p" and substituted an empty string, so every request hit "haproxy:8080"
-    # instead of cycling through the four paths below).
+    # reaches the container's shell. Unescaped, compose warns about an unset variable "p" and
+    # substitutes an empty string, so every request hits "haproxy:8080" instead of cycling through
+    # the paths below.
     #
-    # A YAML *sequence* of one string, like graph-dot's/graph-svg's `command: ["..."]` above --
-    # NOT a bare scalar. Compose word-splits a bare-scalar `command:` itself (the same short-form
+    # A YAML *sequence* of one string, like graph-dot's/graph-svg's `command: ["..."]` above, NOT
+    # a bare scalar. Compose word-splits a bare-scalar `command:` itself (the same short-form
     # normalization that turns `command: python3 app.py` into `["python3", "app.py"]`), stopping
-    # at the first `;` -- confirmed empirically: a bare multi-line scalar here resolved
-    # (`docker compose config`) to just `["while", "true"]`, silently discarding everything after,
-    # which `/bin/sh -c` then read as a bodyless `while true` and errored `unexpected end of file
-    # (expecting "do")`. Wrapping the whole script as one list element makes it a single opaque
-    # argv entry -- exactly what `-c` needs -- with no compose-side splitting at all. `|` (literal
-    # block) inside that one element keeps every line break a real newline, which the shell inside
-    # the container treats as a statement separator exactly like `;`.
-    # `/work` repeated three times, not once, so it's the majority of the loop's traffic --
-    # `docs/plans/demo-richer-traces.md` workstream A's whole point is a Tempo/Grafana story worth
-    # looking at, which means enough `/work` traces (jittered latency, an occasional real 503) to
-    # fill in `web.request_time`'s p50/p99 spread and the "Loki: 5xx lines/sec" panel without `/boom`
-    # (a guaranteed 500, kept rare here) dominating either one.
+    # at the first `;`: a bare multi-line scalar here resolves (`docker compose config`) to just
+    # `["while", "true"]`, silently discarding everything after, which `/bin/sh -c` then reads as
+    # a bodyless `while true` and errors `unexpected end of file (expecting "do")`. Wrapping the
+    # whole script as one list element makes it a single opaque argv entry, which is what `-c`
+    # needs, with no compose-side splitting. `|` (literal block) inside that element keeps every
+    # line break a real newline, which the shell treats as a statement separator like `;`.
+    #
+    # `/work` is repeated three times so it's the majority of the loop's traffic
+    # (`docs/plans/demo-richer-traces.md`). Enough `/work` traces (jittered latency, an occasional
+    # real 503) fill in `web.request_time`'s p50/p99 spread and the "Loki: 5xx lines/sec" panel
+    # without `/boom` (a guaranteed 500, kept rare here) dominating either one.
     command:
       - |
         while true; do

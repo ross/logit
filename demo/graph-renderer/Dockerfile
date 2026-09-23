@@ -1,7 +1,8 @@
-# Graphviz in a container, for one job: turning `logit graph`'s DOT into the SVG the demo's
-# hello-world page shows (demo/compose.yaml's `graph-dot` -> `graph-svg` -> `hello` chain).
+# Graphviz in a container, for one job: turning DOT into the SVGs the demo's landing page shows.
+# `graph-svg` renders `logit graph`'s output (demo/compose.yaml's `graph-dot` -> `graph-svg` ->
+# `app` chain), and `arch-svg` renders demo/architecture.dot with this same image.
 #
-# A tiny purpose-built image rather than a stock one -- no official image ships `dot`. Same
+# A tiny purpose-built image rather than a stock one, because no official image ships `dot`. Same
 # Debian version the rest of the demo's Debian-based services use.
 FROM docker.io/library/debian:13-slim
 

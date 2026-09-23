@@ -1,7 +1,7 @@
-# Pre-provisioned datasources so `docker compose up` gives a working Grafana with no manual
-# clicking. Matches demo/compose.yaml's service names and demo-token values. Separate from (not
-# an edit of) the dev stack's deploy/grafana/provisioning/datasources/influxdb.yaml -- this stack
-# is self-contained.
+# Pre-provisioned datasources, so `docker compose up` gives a working Grafana with no manual
+# setup. Matches demo/compose.yaml's service names and demo-token values. Separate from the dev
+# stack's deploy/grafana/provisioning/datasources/influxdb.yaml, because this stack is
+# self-contained.
 apiVersion: 1
 
 datasources:
@@ -25,13 +25,12 @@ datasources:
     access: proxy
     url: http://loki:3100
     jsonData:
-      # Two derived fields, both click through to the same Tempo trace. The label matcher is the
-      # one that actually fires against real data (docs/plans/demo-tracing-stack.md's workstream
-      # A): demo/logit.yaml's `trace_context` transforms lift each tier's trace_id/span_id onto
-      # LogRecord.trace with `keep_source` at its default `false`, so the id leaves the log body
-      # and becomes Loki's *native* trace_id structured metadata via OTLP ingestion, not text in
-      # the message. The body-regex field is kept as a fallback for any log line that names an id
-      # inline instead.
+      # Two derived fields, both linking to the same Tempo trace. The label matcher is the one
+      # that fires against real data (docs/plans/demo-tracing-stack.md): demo/logit.yaml's
+      # `trace_context` transforms lift each tier's trace_id/span_id onto LogRecord.trace with
+      # `keep_source` at its default `false`, so the id leaves the log body and becomes Loki's
+      # *native* trace_id structured metadata via OTLP ingestion, not text in the message. The
+      # body-regex field is a fallback for any log line that names an id inline instead.
       derivedFields:
         - name: TraceID (structured metadata)
           datasourceUid: tempo
@@ -41,16 +40,15 @@ datasources:
           urlDisplayLabel: "View trace"
         - name: TraceID (body)
           datasourceUid: tempo
-          # `trace\.id` first -- the dotted convention name (docs/design/data-model.md's
-          # "Well-known attribute names") a body only ever carries when `trace_context` skipped
-          # the line (`keep_source: false` removes it on every successful lift); the other three
-          # alternatives are pre-convention/generic spellings, kept for anything not produced by
-          # this demo's own tiers.
+          # `trace\.id` first: the dotted convention name (docs/design/data-model.md's
+          # "Well-known attribute names"), which a body only carries when `trace_context` skipped
+          # the line (`keep_source: false` removes it on every successful lift). The other three
+          # alternatives are generic spellings, for anything not produced by this demo's tiers.
           matcherRegex: '(?:trace\.id|trace_id|traceID|traceid)[=":\s]+([a-fA-F0-9]{16,32})'
-          # `$$` (not `$`): Grafana's *provisioning* loader interpolates `${VAR}` as an
-          # environment variable first -- `${__value.raw}` is the derived field's own runtime
+          # `$$`, not `$`: Grafana's *provisioning* loader interpolates `${VAR}` as an
+          # environment variable first. `${__value.raw}` is the derived field's own runtime
           # templating syntax, evaluated later, and silently resolves to "" if written unescaped
-          # here (confirmed empirically: the API showed url: "" until this was doubled).
+          # here (the API shows url: "" unless it's doubled).
           url: "$${__value.raw}"
           urlDisplayLabel: "View trace"
 

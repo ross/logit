@@ -1,40 +1,55 @@
-# The demo pipeline (demo/README.md, docs/plans/demo-tracing-stack.md, docs/plans/demo-stack.md,
+# The demo's `logit` pipeline. demo/README.md's "What's actually flowing" walks through it in
+# prose, and the landing page (http://localhost:8080) shows it rendered live by `logit graph`.
+#
+# Traffic crosses five real tiers: haproxy -> nginx -> app -> postgres, plus an async Celery worker
+# over Redis. demo/compose.yaml's `traffic` service drives requests into the first three.
+#
+# What comes in:
+#   - haproxy, the app, and the worker send JSON log lines over syslog (`haproxy_in`, `app_in`,
+#     `worker_in`: UDP 5140, 5142, 5143).
+#   - nginx and Redis log to stdout; `docker_in` tails their containers' Docker json-file logs
+#     (`nginx_in`, `redis_in`).
+#   - Postgres writes a rotating jsonlog directory; `tail_in` tails it (`postgres_in`).
+#   - The landing page's browser OTel SDK posts OTLP/JSON traces through haproxy's `/v1/*` route
+#     (demo/haproxy/haproxy.cfg) to `browser_in` (`otlp_in`, ADR `otlp-json-decoding`), which
+#     isn't published on the host directly.
+#   - `self` (`internal`) observes `logit`'s own pipeline (ADR
+#     `internal-telemetry-as-pipeline-events`, ADR
+#     `internal-span-emission-and-deterministic-sampling`).
+#
+# What goes out:
+#   - Logs to Loki (`loki_out`, OTLP/HTTP).
+#   - Metrics to InfluxDB (`influx_out`).
+#   - Spans to Tempo (`tempo_out`, OTLP/gRPC): `logit`'s own internal spans, the spans haproxy and
+#     nginx get from their access lines (`docs/adr/trace-context-span-lifting.md`'s `span:` block),
+#     and the browser's spans from `browser_in`.
+#   - Every event to `stdout`, for `docker compose logs -f logit`.
+#
+# Why the app's and worker's spans bypass `logit`: every real SDK-carried span (`demo-app`'s
+# request, database-client, and Celery-producer spans; `demo-worker`'s Celery-consumer and
+# database-client spans) goes straight to Tempo, deliberately not through `logit`. Not every
+# telemetry leg needs `logit` in front of it, and this demo shows that honestly rather than routing
+# everything through `logit` just to prove it can. Postgres's own log lines still carry the same
+# trace id back into Loki (`postgres_trace_lift`/`postgres_trace` below), through a `traceparent`
+# lifted out of a sqlcommenter-tagged SQL statement rather than a second SDK.
+#
+# Components exercised: syslog_in, tail_in, docker_in, otlp_in, set, json, lua, regex,
+# http_access, trace_context, kv_metrics, keep_signals, has_signal, keep, aggregate, internal,
+# influxdb_out, and otlp_out over both HTTP and gRPC.
+#
+# Background: docs/plans/demo-stack.md, docs/plans/demo-tracing-stack.md,
 # docs/plans/otlp-end-to-end.md, docs/plans/otlp-logs-and-resource-identity.md,
 # docs/plans/access-log-spans.md, docs/plans/file-tailing.md, docs/plans/demo-richer-traces.md,
-# docs/plans/operator-surface.md).
-# Exercises syslog in, tail_in, docker_in, otlp_in, set + json + lua + regex + http_access +
-# trace_context + kv_metrics + keep_signals + keep + aggregate, InfluxDB out, OTLP/HTTP out,
-# OTLP/gRPC out, plus `internal` observing the pipeline itself (ADR
-# `internal-telemetry-as-pipeline-events`, ADR
-# `internal-span-emission-and-deterministic-sampling`) -- against traffic that crosses five real
-# tiers: haproxy -> nginx -> app -> postgres, plus an async worker over Redis
-# (demo/compose.yaml's `traffic` service drives the first three; docs/plans/demo-tracing-stack.md's
-# workstream A, docs/plans/demo-richer-traces.md's workstreams C and D). Logs and metrics leave
-# `logit` for a real backend (Loki, InfluxDB); traces reach Tempo four ways -- `logit`'s own
-# internal spans via `tempo_out`, haproxy's and nginx's real access-line spans (`docs/adr/
-# trace-context-span-lifting.md`'s `span:` block, also via `tempo_out`), every real SDK-carried
-# span (`demo-app`'s request/database-client/Celery-producer spans, `demo-worker`'s own
-# Celery-consumer/database-client spans) going straight to Tempo, deliberately not through `logit`
-# at all (see the comment above `stdout` below), and now real OTLP traces `logit` itself decodes --
-# `browser_in` (`otlp_in`, ADR `otlp-json-decoding`), reachable through `haproxy`'s own `/v1/*`
-# route (`demo/haproxy/haproxy.cfg`) rather than published directly -- not every telemetry leg
-# needs `logit` in front of it, and this demo shows that honestly rather than routing everything
-# through `logit` just to prove it can. `postgres`'s own log lines still carry that same trace id
-# back into Loki, though (`postgres_trace_lift`/`postgres_trace` below) -- a `traceparent` lifted
-# out of a sqlcommenter-tagged SQL statement, not a second SDK.
-# `browser_in` wires `otlp_in` into this demo for the first time (demo/README.md's old "What isn't
-# exercised yet"), closing that gap structurally -- but nothing in this stack's own traffic sends
-# to it yet: a real browser OTel SDK is docs/plans/browser-tracing.md's workstream C, separate and
-# later. This workstream only proves the server-side path, with a manual OTLP/JSON POST.
+# docs/plans/operator-surface.md, docs/plans/browser-tracing.md.
 #
 # Topology:
 #
-#   One listener per tier -- `set` stamps a resource onto the whole BATCH, not per event, so
+#   One listener per tier, because `set` stamps a resource onto the whole BATCH, not per event:
 #   three tiers sharing one listener would interleave into one batch and get one wrong
-#   service.name (docs/plans/demo-tracing-stack.md's workstream A). nginx's is `docker_in`, not
-#   `syslog_in` (docs/adr/file-tailing-and-docker-json-logs.md, docs/plans/file-tailing.md's
-#   workstream D) -- this demo is that ADR's end-to-end proof; `nginx_stdout` (`lua`) drops its
-#   container's own error_log lines (`log.iostream: stderr`) before they'd otherwise reach
+#   service.name (docs/plans/demo-tracing-stack.md). nginx's listener is `docker_in`, not
+#   `syslog_in` (docs/adr/file-tailing-and-docker-json-logs.md, docs/plans/file-tailing.md); this
+#   demo is that ADR's end-to-end proof. `nginx_stdout` (`lua`) drops the container's own
+#   error_log lines (`log.iostream: stderr`), which would otherwise reach
 #   `nginx_identity`/`nginx_json` as if they were access lines.
 #
 #   haproxy --syslog/UDP:5140--> haproxy_in -> haproxy_identity (set) -> haproxy_json (json)
@@ -88,17 +103,16 @@
 #                      |                                                                  |
 #                      +-> trace_only (has_signal) ---------------------------------> tempo_out (otlp_out, gRPC) --> tempo
 #
-#   demo-app --OTLP/HTTP protobuf--> tempo:4318 directly, bypassing `logit` entirely --
-#   parented to nginx's span (docs/adr/trace-context-span-lifting.md: nginx now mints and forwards
-#   its own span id, rather than only relaying haproxy's), since the default W3C propagator
-#   extracts whichever `traceparent` it's given regardless of which backend the span is headed for.
-#   demo-worker does the same, straight to the same tempo:4318 -- its own Celery CONSUMER span
-#   parents to demo-app's Celery PRODUCER span (`.delay()`, docs/plans/demo-richer-traces.md
-#   workstream D), which parents to whichever request enqueued it, same propagator, no code either
-#   side of that hop.
+#   demo-app --OTLP/HTTP protobuf--> tempo:4318 directly, bypassing `logit`. Its span parents to
+#   nginx's span (nginx mints and forwards its own span id, docs/adr/trace-context-span-lifting.md),
+#   because the default W3C propagator extracts whichever `traceparent` it's given, regardless of
+#   which backend the span is headed for. demo-worker sends to the same tempo:4318: its Celery
+#   CONSUMER span parents to demo-app's Celery PRODUCER span (`.delay()`,
+#   docs/plans/demo-richer-traces.md), which parents to the request that enqueued it. The same
+#   propagator does it, with no code on either side of that hop.
 #
-#   Three more parallel legs (docs/plans/demo-richer-traces.md workstreams C and D), untied to the
-#   diagram above since none touches haproxy/nginx/app's own listeners:
+#   Four more legs, separate from the diagram above because none touches haproxy/nginx/app's
+#   listeners (docs/plans/demo-richer-traces.md):
 #
 #   postgres --jsonlog file--> tail(tail_in)--> postgres_in -> postgres_identity (set)
 #             -> postgres_json (json) -> postgres_trace_lift (regex, extracts a `traceparent` out
@@ -111,24 +125,24 @@
 #
 #   redis --stdout--> json-file --tail(docker_in)--> redis_in -> redis_identity (set)
 #             -> redis_parse (regex, splits pid/role/level off Redis's plain-text line) -> stdout /
-#             logs_only -> loki_out. No trace_context -- Redis logs carry none; its query traffic
-#             is already real CLIENT spans from demo-app/demo-worker's own Redis instrumentation.
+#             logs_only -> loki_out. No trace_context: Redis logs carry no trace, and its query
+#             traffic is already real CLIENT spans from demo-app/demo-worker's Redis instrumentation.
 #
 #   browser (real OTel SDK, or curl) --OTLP/JSON POST /v1/traces--> haproxy (`is_otlp` ACL,
 #             demo/haproxy/haproxy.cfg) --> browser_in (otlp_in, :4318) -> stdout / browser_spans
-#             (keep_signals: [traces]) -> tempo_out. No set/json/trace_context chain -- unlike
+#             (keep_signals: [traces]) -> tempo_out. No set/json/trace_context chain: unlike
 #             every listener above, the sender already carries its own Resource and a real
 #             SpanRecord, so there's nothing for `set` to stamp on. `browser_spans` exists for the
-#             identical reason `trace_only`/`access_spans` do (see `trace_only`'s comment below),
+#             same reason `trace_only`/`access_spans` do (see `trace_only`'s comment below),
 #             not because a real OTel SDK would ever send this input anything but traces.
 #
-#   logit's own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
+#   `logit`'s own self-diagnostics (warn and above, `internal`'s default `logs:` threshold) ride
 #   the same `self` -> logs_only -> loki_out leg as every other tier's log events, alongside
-#   `self`'s own points/spans (docs/plans/operator-surface.md, workstream D) -- they are ordinary
-#   `LogRecord`-carrying events, nothing loki_out needs to know is different.
+#   `self`'s own points and spans (docs/plans/operator-surface.md). They're ordinary
+#   `LogRecord`-carrying events; loki_out treats them like any other.
 #
 # `admin: { bind: 0.0.0.0:9600 }` below serves `/readyz`/`/healthz`
-# (docs/deploying.md's "Probes and exit codes") -- what demo/compose.yaml's own `logit` healthcheck
+# (docs/deploying.md's "Probes and exit codes"), which demo/compose.yaml's `logit` healthcheck
 # probes via `logit ready`.
 admin:
   bind: 0.0.0.0:9600
@@ -137,41 +151,40 @@ components:
   haproxy_in:
     type: syslog_in
     bind: 0.0.0.0:5140
-  # docker_in, not syslog_in -- `nginx` (demo/compose.yaml) logs to stdout only now, and this
-  # tails its container's own Docker json-file log directly off the host
-  # (docs/adr/file-tailing-and-docker-json-logs.md; this demo is that ADR's end-to-end proof).
-  # `containers:` names the fixed `container_name` demo/compose.yaml gives the `nginx` service --
-  # explicit, not `discover: true`, since there's exactly one container to follow and naming it
-  # is clearer than opting into every container on the host. `read_from: beginning` plus the
-  # checkpoint below mean nothing is lost even if nginx logs a request before `logit` first
-  # discovers its container directory.
+  # `nginx` (demo/compose.yaml) logs to stdout only, so this tails its container's Docker
+  # json-file log directly off the host (docs/adr/file-tailing-and-docker-json-logs.md; this demo
+  # is that ADR's end-to-end proof). `containers:` names the fixed `container_name` demo/compose.yaml
+  # gives the `nginx` service. It's explicit rather than `discover: true` because there's exactly
+  # one container to follow, and naming it is clearer than opting into every container on the
+  # host. `read_from: beginning` plus the checkpoint mean nothing is lost even if nginx logs a
+  # request before `logit` first discovers its container directory.
   nginx_in:
     type: docker_in
     containers: [logit-demo-nginx]
     read_from: beginning
     checkpoint_path: /var/lib/logit/nginx.checkpoint
 
-  # Redis's own server log (Celery's broker, docs/plans/demo-richer-traces.md workstream D) --
-  # `docker_in` exactly like `nginx_in` above, against the fixed `container_name` demo/compose.yaml
-  # gives the `redis` service. No `nginx_stdout`-style iostream filter: Redis writes every log line
-  # to stdout, so there's no second stream in this container's json-file log to tell apart. Redis
-  # has no per-command log, so this is startup/persistence/warning lines only -- the broker's own
-  # query traffic is already covered by `demo-app`/`demo-worker`'s real
-  # `opentelemetry-instrumentation-redis` CLIENT spans (`LPUSH`, `LLEN`, ...) straight to Tempo.
+  # Redis's own server log (Celery's broker, docs/plans/demo-richer-traces.md), read by `docker_in`
+  # like `nginx_in` above, against the fixed `container_name` demo/compose.yaml gives the `redis`
+  # service. There's no `nginx_stdout`-style iostream filter: Redis writes every log line to
+  # stdout, so there's no second stream to tell apart. Redis has no per-command log, so this is
+  # startup, persistence, and warning lines only. The broker's query traffic is already covered by
+  # `demo-app`/`demo-worker`'s real `opentelemetry-instrumentation-redis` CLIENT spans (`LPUSH`,
+  # `LLEN`, ...), sent straight to Tempo.
   redis_in:
     type: docker_in
     containers: [logit-demo-redis]
     read_from: beginning
     checkpoint_path: /var/lib/logit/redis.checkpoint
 
-  # nginx's own error_log shares the same container (and so the same Docker json-file log) as its
-  # access log, distinguished only by `log.iostream` (`stdout` vs `stderr`) -- `docker_in` itself
-  # has no per-stream filter (deliberately; see the ADR's "Alternatives considered"), so this
-  # inline `lua` stage is the filter, dropping anything that isn't an access line before it ever
-  # reaches `nginx_identity`/`nginx_json` below (an error_log line isn't the JSON `nginx_json`
-  # expects, and would otherwise inflate `web.requests` by one per error line too). `lua`, not a
-  # native `filter` component -- there isn't one; `logit` ships no native predicate language, and
-  # this five-line stage is the worked example for why (docs/adr/routing-by-condition-is-lua.md).
+  # nginx's error_log shares its container (and so its Docker json-file log) with the access log,
+  # told apart only by `log.iostream` (`stdout` vs `stderr`). `docker_in` deliberately has no
+  # per-stream filter (see the ADR's "Alternatives considered"), so this inline `lua` stage is the
+  # filter: it drops anything that isn't an access line before it reaches
+  # `nginx_identity`/`nginx_json`. An error_log line isn't the JSON `nginx_json` expects, and would
+  # also inflate `web.requests` by one per error line. It's `lua` because there's no native
+  # `filter` component: `logit` ships no native predicate language, and this five-line stage is
+  # the worked example for why (docs/adr/routing-by-condition-is-lua.md).
   nginx_stdout:
     type: lua
     sources: [nginx_in]
@@ -186,48 +199,48 @@ components:
     type: syslog_in
     bind: 0.0.0.0:5142
 
-  # The `worker` service's own log line for `pages/tasks.py`'s one task
-  # (docs/plans/demo-richer-traces.md workstream D) -- a separate listener from `app_in`, same
-  # reasoning as every other tier: one `service.name` per batch. Its own OTel spans (Celery
-  # CONSUMER, psycopg CLIENT) go straight to Tempo, exactly like `app`'s -- this listener only
-  # ever sees the one log line `pages/tasks.py`'s `worker_logger` emits per task run.
+  # The `worker` service's log line for `pages/tasks.py`'s one task
+  # (docs/plans/demo-richer-traces.md). It's a separate listener from `app_in` for the same reason
+  # as every other tier: one `service.name` per batch. The worker's OTel spans (Celery CONSUMER,
+  # psycopg CLIENT) go straight to Tempo like `app`'s, so this listener only ever sees the one log
+  # line `pages/tasks.py`'s `worker_logger` emits per task run.
   worker_in:
     type: syslog_in
     bind: 0.0.0.0:5143
 
-  # This demo's first real `tail_in` (docs/plans/demo-richer-traces.md workstream C) -- every
-  # other tier so far is `syslog_in` or `docker_in`, `tail_in`'s own Docker-specific sibling.
-  # `paths`' `*` is permitted only in the final path component (`crates/logit-config/src/lib.rs`),
-  # which is exactly Postgres's own jsonlog rotation shape: a fresh `postgresql-<timestamp>.json`
-  # file every `log_rotation_age` (demo/compose.yaml), never a rename-in-place. `read_from:
-  # beginning` plus the checkpoint below mean a `logit` restart resumes rather than replaying or
-  # skipping, the same contract `nginx_in` already has. Unlike `docker_in`, `tail_in` stamps no
-  # resource attributes of its own -- `postgres_identity` below is load-bearing, not decorative.
+  # The demo's plain-file tail (docs/plans/demo-richer-traces.md); every other log tier is
+  # `syslog_in` or `docker_in`, `tail_in`'s Docker-specific sibling. `paths`' `*` is permitted only
+  # in the final path component (`crates/logit-config/src/lib.rs`), which matches Postgres's jsonlog
+  # rotation exactly: a fresh `postgresql-<timestamp>.json` file every `log_rotation_age`
+  # (demo/compose.yaml), never a rename in place. `read_from: beginning` plus the checkpoint mean a
+  # `logit` restart resumes rather than replaying or skipping, the same contract `nginx_in` has.
+  # Unlike `docker_in`, `tail_in` stamps no resource attributes of its own, so
+  # `postgres_identity` below is load-bearing, not decorative.
   postgres_in:
     type: tail_in
     paths: ["/var/log/postgresql/*.json"]
     read_from: beginning
     checkpoint_path: /var/lib/logit/postgres.checkpoint
 
-  # Browser-facing OTLP ingress (docs/plans/demo-tracing-stack.md workstream C,
-  # docs/plans/browser-tracing.md) -- reachable through `haproxy`'s `is_otlp` ACL on its published
-  # `:8080` (demo/haproxy/haproxy.cfg's `/v1/*` route), not published directly (demo/README.md):
-  # a browser SDK needs a same-origin endpoint, and there's no other reason to expose `logit` to
-  # the host. `protocol: http`, not `grpc` -- a browser's `fetch`/`XMLHttpRequest` can't speak
-  # gRPC, and OTLP/JSON decoding (ADR `otlp-json-decoding`) is what makes this endpoint usable from
-  # one at all, not just protobuf. Unlike every syslog/docker/tail-sourced input above, no `set`
-  # stage stamps a resource in front of this one: a real OTel SDK (or a hand-built OTLP/JSON
-  # payload, like this workstream's own curl verification) sets its own `Resource` with
-  # `service.name`, so there's nothing for `set` to supply that the sender didn't already provide.
+  # Browser-facing OTLP ingress (docs/plans/demo-tracing-stack.md, docs/plans/browser-tracing.md).
+  # The landing page's browser SDK reaches it through `haproxy`'s `is_otlp` ACL on its published
+  # `:8080` (demo/haproxy/haproxy.cfg's `/v1/*` route); it isn't published directly
+  # (demo/README.md's "`otlp_in` from the browser"). A browser SDK needs a same-origin endpoint,
+  # and there's no other reason to expose `logit` to the host. `protocol: http`, not `grpc`,
+  # because a browser's `fetch`/`XMLHttpRequest` can't speak gRPC; OTLP/JSON decoding (ADR
+  # `otlp-json-decoding`) is what makes this endpoint usable from one at all. Unlike every
+  # syslog/docker/tail input above, no `set` stage stamps a resource in front of this one: a real
+  # OTel SDK (or a hand-built OTLP/JSON payload sent with curl) sets its own `Resource` with
+  # `service.name`, so there's nothing for `set` to add.
   browser_in:
     type: otlp_in
     bind: 0.0.0.0:4318
     protocol: http
 
   # `syslog_in` mustn't invent a resource identity for data it didn't produce
-  # (docs/design/internal-telemetry.md's "Resource identity" section) -- `set` is the operator
-  # declaring one instead (ADR `operator-declared-resource-attributes`), one per tier since each
-  # has its own listener (see the topology comment above).
+  # (docs/design/internal-telemetry.md's "Resource identity" section), so `set` is the operator
+  # declaring one instead (ADR `operator-declared-resource-attributes`): one per tier, since each
+  # tier has its own listener (see the topology comment above).
   haproxy_identity:
     type: set
     sources: [haproxy_in]
@@ -272,41 +285,48 @@ components:
   nginx_json:
     type: json
     sources: [nginx_identity]
+  # The app sends through a `SysLogHandler` subclass with `append_nul` off
+  # (demo/app/pages/syslog_handler.py). The stock handler's trailing NUL byte would survive to
+  # here as a character after the JSON object's closing `}`, and `json` would reject the line as
+  # trailing garbage.
   app_json:
     type: json
     sources: [app_identity]
   worker_json:
     type: json
     sources: [worker_identity]
-  # Parses each raw jsonlog line itself -- Postgres already writes one JSON object per line
-  # (`log_destination=jsonlog`, demo/compose.yaml), so this needs no field remapping, the same way
-  # every other tier's own JSON access line doesn't.
+  # Postgres already writes one JSON object per line (`log_destination=jsonlog`,
+  # demo/compose.yaml), so this parses each raw jsonlog line with no field remapping, like every
+  # other tier's JSON access line.
   postgres_json:
     type: json
     sources: [postgres_identity]
 
-  # Both web tiers now log raw OTel semconv attribute names with the untouched value
-  # (demo/haproxy/haproxy.cfg, demo/nginx/nginx.conf) -- nothing capped, coerced, or classified at
-  # the producer; `http_access` does all of it here (docs/adr/http-access-normalization.md):
-  # `http.response.status_code` to an integer, nginx's `url.original` split into `url.path`/
-  # `url.query`, both tiers' durations to `_s` seconds, `user_agent.class` from the built-in table
-  # (haproxy only -- nginx's line doesn't log the header, and an absent header gets no class), and
-  # a bounded `http.route` from `routes:` below -- which is what names each tier's span `GET /work`
-  # rather than a bare `http.request`, and sets `span.status` (error on a 5xx, unset otherwise, per
-  # semconv -- never `ok`). HAProxy can't write a dotted key through `%{+json}o` (`.` isn't legal
-  # in its `%(name)` item), so its line arrives dashed (`http-response-status_code`) and
-  # `haproxy_http` de-aliases it to the dotted spelling before anything else runs -- nothing
-  # downstream ever sees a dashed key.
+  # Both web tiers log raw OTel semconv attribute names with the untouched value
+  # (demo/haproxy/haproxy.cfg, demo/nginx/nginx.conf). Nothing is capped, coerced, or classified
+  # at the producer; `http_access` does all of it here (docs/adr/http-access-normalization.md):
+  #   - `http.response.status_code` to an integer.
+  #   - nginx's `url.original` split into `url.path`/`url.query`.
+  #   - Both tiers' durations to `_s` seconds.
+  #   - `user_agent.class` from the built-in table (haproxy only: nginx's line doesn't log the
+  #     header, and an absent header gets no class).
+  #   - A bounded `http.route` from `routes:` below. That route names each tier's span
+  #     `GET /work` rather than a bare `http.request`, and sets `span.status` (error on a 5xx,
+  #     unset otherwise, per semconv -- never `ok`).
+  # HAProxy can't write a dotted key through `%{+json}o` (`.` isn't legal in its `%(name)` item),
+  # so its line arrives dashed (`http-response-status_code`). `haproxy_http` de-aliases it to the
+  # dotted spelling before anything else runs, so nothing downstream ever sees a dashed key.
   #
-  # One `routes:` block, copied verbatim between the two, sized to demo/compose.yaml's `traffic`
-  # loop (`/`, `/health`, `/graph.svg`, `/missing`, `/work`, `/boom`) plus `/inner`, the nginx hop
-  # `/work` calls back into (demo/app/pages/views.py). The built-in `probes`/`assets` sets name
-  # `/health` and `/graph.svg` (and the index page's own `/architecture.svg`/`/telemetry.js`)
-  # `/{probe}`/`/{asset}`; the app's real routes are each listed literally; `/missing` -- a 404
-  # with no route behind it -- falls through to `route_other`'s literal `/{other}`, the one bucket
-  # every scanner-shaped path lands in too. Every value comes from this config or a built-in set,
-  # never from the path itself, so the route set (and so the span-name set, and the `http.route`
-  # tag `trimmed` keeps below) stays bounded however many distinct paths arrive.
+  # The `routes:` block is copied verbatim between the two stages. It's sized to
+  # demo/compose.yaml's `traffic` loop (`/`, `/health`, `/graph.svg`, `/missing`, `/work`,
+  # `/boom`) plus `/inner`, the nginx hop `/work` calls back into (demo/app/pages/views.py). The
+  # built-in `probes`/`assets` sets name `/health` and `/graph.svg` (and the index page's own
+  # `/architecture.svg`/`/telemetry.js`) `/{probe}`/`/{asset}`. The app's real routes are each
+  # listed literally. `/missing`, a 404 with no route behind it, falls through to `route_other`'s
+  # literal `/{other}`, the bucket every scanner-shaped path lands in too. Every value comes from
+  # this config or a built-in set, never from the path itself, so the route set (and so the
+  # span-name set, and the `http.route` tag `trimmed` keeps below) stays bounded however many
+  # distinct paths arrive.
   haproxy_http:
     type: http_access
     sources: [haproxy_json]
@@ -338,21 +358,26 @@ components:
         route: /inner
     route_other: /{other}
 
-  # Lifts each tier's trace.id/span.id/trace.flags (or an inbound `traceparent`, parsed natively
-  # as of `docs/adr/trace-context-span-lifting.md`) onto `LogRecord.trace`. `haproxy_trace`/
-  # `nginx_trace` additionally mint a real `SpanRecord` on the same event via `span:` -- an access
-  # line's own start/end/duration attributes become a span whose start replaces `event.timestamp`.
-  # Their `name:` is only a fallback now: `haproxy_http`/`nginx_http` wrote `span.name` (`GET
-  # /work`, `GET /{probe}`, ...) and `span.status`, and an event attribute always wins over the
-  # block's default. Neither sets `mint_id`: both tiers log the span id they forwarded downstream
-  # in their own outbound `traceparent` (haproxy's `span-id`, nginx's `$request_id`-derived
-  # `span.id`), and minting a different one here would orphan the next hop's span.
-  # `app_trace` carries no `span:` block: `app`'s request span is already real
-  # (opentelemetry-instrumentation-django), so lifting one from its access log would be a second,
-  # redundant span for the same request rather than a useful one. `keep_source` left at its
-  # default `false`: the convention attributes are removed on a successful lift so `logs_only`/
-  # `loki_out` below carry only what each tier's own log body actually needs, and a surviving
-  # `trace_id`-shaped attribute can't collide with Loki's *native* trace_id structured metadata.
+  # Lifts each tier's trace.id/span.id/trace.flags (or an inbound `traceparent`, parsed natively,
+  # `docs/adr/trace-context-span-lifting.md`) onto `LogRecord.trace`.
+  #
+  # `haproxy_trace`/`nginx_trace` also mint a real `SpanRecord` on the same event via `span:`: an
+  # access line's own start/end/duration attributes become a span whose start replaces
+  # `event.timestamp`. Their `name:` is only a fallback, because `haproxy_http`/`nginx_http`
+  # already wrote `span.name` (`GET /work`, `GET /{probe}`, ...) and `span.status`, and an event
+  # attribute always wins over the block's default. Neither sets `mint_id`: both tiers log the
+  # span id they forwarded downstream in their own outbound `traceparent` (haproxy's `span-id`,
+  # nginx's `$request_id`-derived `span.id`), and minting a different one here would orphan the
+  # next hop's span.
+  #
+  # `app_trace` has no `span:` block, because `app`'s request span is already real
+  # (opentelemetry-instrumentation-django); lifting one from its access log would add a second,
+  # redundant span for the same request.
+  #
+  # `keep_source` stays at its default `false`: the convention attributes are removed on a
+  # successful lift, so `logs_only`/`loki_out` below carry only what each tier's log body needs,
+  # and a surviving `trace_id`-shaped attribute can't collide with Loki's *native* trace_id
+  # structured metadata.
   haproxy_trace:
     type: trace_context
     sources: [haproxy_http]
@@ -368,24 +393,28 @@ components:
   app_trace:
     type: trace_context
     sources: [app_json]
-  # No `span:` block, same reasoning as `app_trace` above -- the worker's own spans (Celery
-  # CONSUMER, psycopg CLIENT) are already real (`demoproj/telemetry.py`), so lifting one from this
-  # log line would only be redundant.
+  # No `span:` block, for the same reason as `app_trace`: the worker's own spans (Celery CONSUMER,
+  # psycopg CLIENT) are already real (`demoproj/telemetry.py`), so lifting one from this log line
+  # would be redundant.
   worker_trace:
     type: trace_context
     sources: [worker_json]
 
-  # `opentelemetry-instrumentation-psycopg`'s sqlcommenter (`enable_commenter=True`,
-  # demo/app/gunicorn.conf.py) appends a trailing SQL comment carrying `traceparent='<header>'`
-  # (among other, irrelevant keys) to every statement `pages/views.py`'s `work` issues --
-  # `log_min_duration_statement=0` (demo/compose.yaml) then logs that statement, comment included,
-  # verbatim into `message`. `regex` (docs/adr/regex-transform.md) extracts it: `field: message`
-  # matches `postgres_json`'s already-lifted `attributes.message` instead of `log.message`, and
-  # the pattern's one named capture, `traceparent`, becomes that same attribute for `trace_context`
-  # below to parse exactly as it would a real HTTP header. A line with no match (Postgres's own
-  # startup/checkpointer/autovacuum lines, or a statement issued outside a request's span) passes
-  # through unchanged, not dropped -- `trace_context` reports `skipped{reason="missing"}` for those
-  # and passes them through as plain logs, same as any tier's own untraced line.
+  # How a Postgres log line gets the request's trace id:
+  #   1. `opentelemetry-instrumentation-psycopg`'s sqlcommenter (`enable_commenter=True`,
+  #      demo/app/demoproj/telemetry.py) appends a trailing SQL comment carrying
+  #      `traceparent='<header>'` (among other, irrelevant keys) to every statement
+  #      `pages/views.py`'s `work` issues.
+  #   2. `log_min_duration_statement=0` (demo/compose.yaml) logs that statement, comment included,
+  #      verbatim into `message`.
+  #   3. `regex` (docs/adr/regex-transform.md) extracts it. `field: message` matches
+  #      `postgres_json`'s already-lifted `attributes.message`, not `log.message`, and the
+  #      pattern's one named capture, `traceparent`, becomes an attribute of that name.
+  #   4. `postgres_trace` parses it exactly as it would a real HTTP header.
+  # A line with no match (Postgres's own startup/checkpointer/autovacuum lines, or a statement
+  # issued outside a request's span) passes through unchanged, not dropped. `trace_context` reports
+  # `skipped{reason="missing"}` for those and passes them on as plain logs, like any tier's own
+  # untraced line.
   postgres_trace_lift:
     type: regex
     sources: [postgres_json]
@@ -395,40 +424,42 @@ components:
     type: trace_context
     sources: [postgres_trace_lift]
 
-  # Redis's plain-text log line, `<pid>:<role> <day> <mon> <year> <hh:mm:ss.mmm> <level> <message>`
-  # (e.g. `1:M 12 Sep 2026 23:01:01.041 * DB saved on disk`) -- no JSON to hand `json`, so `regex`
-  # (docs/adr/regex-transform.md) splits it instead. `redis.role` is Redis's own one-letter process
-  # role (`M` primary, `S` replica, `C` a forked child such as a background save, `X` sentinel);
-  # `redis.level` its one-character severity (`.` debug, `-` verbose, `*` notice, `#` warning) --
-  # kept as the raw character, since `regex` has no mapping step and `event.log.severity` is
-  # read-only from `lua` (docs/design/lua-api.md). Namespaced, not a bare `level`, deliberately:
-  # Loki reads a `level` structured-metadata key as the line's severity, and would otherwise show
-  # every notice line with a `detected_level` of `*`. Redis's own timestamp is left unparsed: `docker_in` already stamps
-  # the json-file envelope's `time`, the same instant to within Docker's own write. A line that
-  # doesn't match (none expected, but a future Redis could change its format) passes through
-  # unchanged as a plain log. No `trace_context` stage after it -- Redis logs carry no trace.
+  # Redis's plain-text log line is `<pid>:<role> <day> <mon> <year> <hh:mm:ss.mmm> <level> <message>`
+  # (e.g. `1:M 12 Sep 2026 23:01:01.041 * DB saved on disk`). There's no JSON to hand `json`, so
+  # `regex` (docs/adr/regex-transform.md) splits it instead:
+  #   - `redis.role` is Redis's one-letter process role (`M` primary, `S` replica, `C` a forked
+  #     child such as a background save, `X` sentinel).
+  #   - `redis.level` is its one-character severity (`.` debug, `-` verbose, `*` notice,
+  #     `#` warning), kept as the raw character because `regex` has no mapping step and
+  #     `event.log.severity` is read-only from `lua` (docs/design/lua-api.md).
+  # The level is namespaced rather than a bare `level` on purpose: Loki reads a `level`
+  # structured-metadata key as the line's severity, and would show every notice line with a
+  # `detected_level` of `*`. Redis's own timestamp is left unparsed, because `docker_in` already
+  # stamps the json-file envelope's `time`, the same instant to within Docker's own write. A line
+  # that doesn't match (none expected, but a future Redis could change its format) passes through
+  # unchanged as a plain log. No `trace_context` stage follows, because Redis logs carry no trace.
   redis_parse:
     type: regex
     sources: [redis_identity]
     pattern: '^(?P<process.pid>\d+):(?P<redis.role>[MSCX]) \d{2} \w{3} \d{4} [\d:.]+ (?P<redis.level>[.\-*#]) '
 
-  # No component here for the app's own OTel spans (demo/app/gunicorn.conf.py) -- they go straight
-  # to Tempo's own `otlp.protocols.http` receiver on :4318 (`demo/tempo/tempo.yaml`), alongside the
-  # gRPC one `tempo_out` below uses, never touching `logit` (see the header comment for why). The
-  # default W3C propagator still makes each span a genuine child of nginx's span with no code in
-  # `demo/app` at all -- that part doesn't depend on which backend the span lands in.
+  # There's no component here for the app's own OTel spans (demo/app/gunicorn.conf.py). They go
+  # straight to Tempo's `otlp.protocols.http` receiver on :4318 (`demo/tempo/tempo.yaml`),
+  # alongside the gRPC one `tempo_out` below uses, and never touch `logit` (see the header comment
+  # for why). The default W3C propagator still makes each one a genuine child of nginx's span, with
+  # no code in `demo/app`; that doesn't depend on which backend the span lands in.
 
-  # `docker compose logs -f logit` -- the fastest way to see the pipeline doing something, now one
-  # block per tier per request (haproxy's and nginx's carrying a real `span` section too), all
-  # three sharing a trace id and differing in span id. The app's own spans don't appear here --
-  # they never reach `logit` (see above). `postgres_trace`/`worker_trace` join the other four
-  # tiers -- most of `postgres_trace`'s lines carry no trace at all (Postgres logs far more than
-  # one line per request), and `worker_trace`'s block for a given trace typically arrives well
-  # after the other tiers' own, since the task itself runs after the response already went back
-  # to the client. Both are expected, not bugs. `browser_in` joins the same sink directly, not
-  # through a `*_trace` stage -- it's already a span, with no companion log line the way every
-  # other source here has -- but nothing in this stack's own traffic sends to it yet (see the
-  # header comment), so its block only shows up after a manual `curl`/browser POST to `/v1/traces`.
+  # `docker compose logs -f logit` is the fastest way to see the pipeline doing something: one
+  # block per tier per request (haproxy's and nginx's with a real `span` section too), sharing a
+  # trace id and differing in span id. The app's own spans don't appear here, because they never
+  # reach `logit` (see above). Two things look odd but are expected:
+  #   - Most of `postgres_trace`'s lines carry no trace at all, because Postgres logs far more than
+  #     one line per request.
+  #   - `worker_trace`'s block for a given trace typically arrives well after the other tiers',
+  #     because the task runs after the response has gone back to the client.
+  # `browser_in` feeds this sink directly, not through a `*_trace` stage: it's already a span,
+  # with no companion log line. Its blocks appear once someone loads the landing page in a browser
+  # (or POSTs to `/v1/traces` by hand); `traffic`'s curl loop never sends to it.
   stdout:
     type: stdio_out
     sources:
@@ -442,73 +473,67 @@ components:
         browser_in,
       ]
 
-  # Loki's OTLP ingestion accepts logs only -- it registers no `TracesService`/`MetricsService` --
-  # and `otlp_out` aborts an entire batch's `send` on the first signal request that fails
-  # (`crates/logit-outputs/src/otlp.rs`'s module doc; see `trace_only`/`tempo_out` below for the
-  # identical reasoning applied to Tempo). Before `docs/adr/trace-context-span-lifting.md`,
-  # `haproxy_trace`/`nginx_trace`/`app_trace` only ever produced log events, so this was never a
-  # problem; now that the first two also produce span-only events downstream, `loki_out` needs
-  # this `keep_signals: [logs]` gate in front of it -- `keep_signals` clears the payload slots it
-  # isn't given (ADR `signal-filtering-components`), so every log that does reach `loki_out`
-  # arrives with its log payload intact, just without the span-only events that would otherwise
-  # trip Loki's `send`. `self` (below) joins the same gate for the identical reason: it emits
-  # points, spans, *and* (docs/plans/operator-surface.md, workstream D) logs, all through this one
-  # component -- `keep_signals: [logs]` is what lets `logit`'s own self-diagnostics reach Loki
-  # without also sending `loki_out` a metric point or a span it would reject.
+  # Loki's OTLP ingestion accepts logs only (it registers no `TracesService`/`MetricsService`), and
+  # `otlp_out` aborts an entire batch's `send` on the first signal request that fails
+  # (`crates/logit-outputs/src/otlp.rs`'s module doc; `trace_only`/`tempo_out` below apply the same
+  # reasoning to Tempo). `haproxy_trace`/`nginx_trace` produce span-only events, so `loki_out`
+  # needs this `keep_signals: [logs]` gate in front of it. `keep_signals` clears the payload slots
+  # it isn't given (ADR `signal-filtering-components`), so every log that reaches `loki_out` keeps
+  # its log payload intact, without the span-only events that would trip Loki's `send`. `self`
+  # (below) joins the same gate for the same reason: it emits points, spans, *and* logs
+  # (docs/plans/operator-surface.md) through this one component, and `keep_signals: [logs]` lets
+  # `logit`'s own self-diagnostics reach Loki without also sending `loki_out` a metric point or a
+  # span it would reject.
   logs_only:
     type: keep_signals
     sources:
       [haproxy_trace, nginx_trace, app_trace, worker_trace, postgres_trace, redis_parse, self]
     signals: [logs]
 
-  # Logs to Loki, direct over OTLP -- no relay service in between (docs/plans/
-  # otlp-logs-and-resource-identity.md's workstream B; Loki accepts OTLP logs natively as of
-  # 3.7.7, the version this stack pins). `protocol: http`, not `grpc` like `tempo_out` below --
-  # Loki's OTLP ingestion is HTTP-only. `endpoint` is a URL base for HTTP (unlike gRPC's bare
-  # authority): `http://loki:3100/otlp` resolves to exactly `/otlp/v1/logs`
+  # Logs to Loki, direct over OTLP with no relay service in between (docs/plans/
+  # otlp-logs-and-resource-identity.md; Loki accepts OTLP logs natively as of 3.7.7, the version
+  # this stack pins). `protocol: http`, not `grpc` like `tempo_out` below, because Loki's OTLP
+  # ingestion is HTTP-only. `endpoint` is a URL base for HTTP (unlike gRPC's bare authority):
+  # `http://loki:3100/otlp` resolves to exactly `/otlp/v1/logs`
   # (`crates/logit-proto/src/lib.rs`'s hardcoded per-signal path). Loki's default index-label set
-  # already includes `service.name`/`service.namespace` -- what each `*_identity` stamps above --
-  # so no `demo/loki/loki.yaml` change is needed for real stream labels.
+  # already includes `service.name`/`service.namespace`, which each `*_identity` stamps above, so
+  # real stream labels need no `demo/loki/loki.yaml` change.
   loki_out:
     type: otlp_out
     sources: [logs_only]
     protocol: http
     endpoint: http://loki:3100/otlp
 
-  # The real spans `haproxy_trace`/`nginx_trace` minted, isolated from the log event each rides in
-  # on -- `app_trace` isn't a source here at all, since it never produces a span (see its own
-  # comment above). Feeds `tempo_out` below alongside `logit`'s own internal spans (`trace_only`).
+  # The real spans `haproxy_trace`/`nginx_trace` minted, separated from the log event each rides
+  # in on. `app_trace` isn't a source because it never produces a span (see its comment above).
+  # Feeds `tempo_out` below alongside `logit`'s own internal spans (`trace_only`).
   access_spans:
     type: keep_signals
     sources: [haproxy_trace, nginx_trace]
     signals: [traces]
 
-  # Same reasoning as `trace_only`/`access_spans` above, applied to `browser_in`: `otlp_out`
-  # aborts `tempo_out`'s entire batch send on the first signal request that fails
+  # Same reasoning as `trace_only`/`access_spans`, applied to `browser_in`: `otlp_out` aborts
+  # `tempo_out`'s entire batch send on the first signal request that fails
   # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo registers no `MetricsService`.
-  # The browser will only ever send traces here -- there's no logs/metrics leg on this input at
-  # all -- but making that structural rather than incidental is the same call this config already
-  # makes for every other source feeding `tempo_out`: `keep_signals` costs nothing and rules the
-  # failure mode out by construction rather than by what a well-behaved sender happens to do.
+  # The browser only ever sends traces here, but this config makes that structural rather than
+  # incidental for every source feeding `tempo_out`: `keep_signals` costs nothing and rules the
+  # failure mode out by construction, rather than relying on a well-behaved sender.
   browser_spans:
     type: keep_signals
     sources: [browser_in]
     signals: [traces]
 
-  # No `nginx_scale` here any more: it used to convert nginx's `request_time` from seconds to
-  # milliseconds to match haproxy's own millisecond timer, but `http_access` now converts both
-  # tiers' durations to `http.request.duration_s` itself (the unit is only ever in the name), so
-  # there is nothing left to reconcile. `scale` is no longer exercised by this demo -- the demo
-  # isn't meant to stay exhaustive over every component (docs/adr/scale-transform.md's
+  # `http_access` hands both tiers' durations over as `http.request.duration_s` (the unit is only
+  # ever in the name), so neither chain needs a `scale` stage (docs/adr/scale-transform.md's
   # 2026-09-22 amendment).
   #
   # Both tiers share the `web.*` measurement names below and are told apart by the `service.name`
-  # tag `*_identity` already stamped (Grafana panels filter on it) -- safe because `http_access`
-  # hands both the same quantity in the same unit. `web.bytes_sent` is the one name shared despite
+  # tag `*_identity` stamped (Grafana panels filter on it). That's safe because `http_access` hands
+  # both the same quantity in the same unit. `web.bytes_sent` is the one name shared despite
   # meaning slightly different things per tier: HAProxy's `%B` (demo/haproxy/haproxy.cfg) is total
   # bytes written to the client, headers included (`http.response.size`); nginx's
-  # `$body_bytes_sent` is body only (`http.response.body.size`). Neither tier's panel ever compares
-  # the two directly, so sharing the name is fine -- just not exact.
+  # `$body_bytes_sent` is body only (`http.response.body.size`). No panel compares the two tiers
+  # directly, so sharing the name is fine, just not exact.
   nginx_metrics:
     type: kv_metrics
     sources: [nginx_trace]
@@ -534,10 +559,10 @@ components:
       - name: web.requests
       - name: web.bytes_sent
         field: http.response.size
-    # A process-wide gauge (HAProxy's own concurrent-connection count), not a per-request value --
-    # it rides on this event's request/response tags the same way every other field here does, so
-    # it lands as one series per tag combination holding the last value seen each window. A panel
-    # over it should `|> group() |> last()` rather than plot the raw series.
+    # A process-wide gauge (HAProxy's concurrent-connection count), not a per-request value. It
+    # rides on this event's request/response tags like every other field here, so it lands as one
+    # series per tag combination holding the last value seen each window. A panel over it should
+    # `|> group() |> last()` rather than plot the raw series.
     gauges:
       - name: web.connections_active
         field: conns_active
@@ -546,16 +571,16 @@ components:
         field: http.request.duration_s # HAProxy's %Ta, converted from `_ms` by haproxy_http
         unit: s
 
-  # Before `aggregate`, not after -- otherwise its SeriesKey would key a series per request on
+  # Runs before `aggregate`, not after; otherwise its SeriesKey would key a series per request on
   # `url.path`/`client.address` alone. The list is semconv's own low-cardinality attribute set for
   # `http.server.request.duration` plus `user_agent.class`, each bounded by `http_access` (a route
-  # or class from config or a built-in table, a normalized method, an integer status);
-  # `server.address` is the Host header, unclamped here since the traffic generator only ever
-  # sends one -- `examples/nginx-to-influxdb.yaml`'s `bounded` is the worked `keep_values` clamp
-  # for it. `http.termination_state` is HAProxy-only (absent on nginx events, so it's simply not a
-  # tag there), and a field a tier doesn't log at all (nginx's line carries no `url.scheme`,
+  # or class from config or a built-in table, a normalized method, an integer status).
+  # `server.address` is the Host header, unclamped here because the traffic generator only ever
+  # sends one; `examples/nginx-to-influxdb.yaml`'s `bounded` is the worked `keep_values` clamp for
+  # it. `http.termination_state` is HAProxy-only, so it's simply not a tag on nginx events, and a
+  # field a tier doesn't log at all (nginx's line carries no `url.scheme`,
   # `network.protocol.version`, or user agent) is likewise just absent. The trace/span attributes
-  # never reach here at all -- `haproxy_trace`/`nginx_trace` already removed them (`keep_source:
+  # never reach here, because `haproxy_trace`/`nginx_trace` already removed them (`keep_source:
   # false`, above).
   trimmed:
     type: keep
@@ -577,13 +602,12 @@ components:
     sources: [trimmed]
     interval: 10s
 
-  # `logit` observing itself (docs/design/internal-telemetry.md, ADR `internal-telemetry-as-pipeline-events`) -- the dashboard's
-  # `logit.*` panels come from here. `span_sample_rate` set explicitly to `1.0` rather than left at
-  # its `0.1` default (docs/adr/internal-span-emission-and-deterministic-sampling.md) -- this
-  # is a demo meant to show every span it can, not a production deployment weighing span volume
-  # against storage cost. Its batches carry `service.name = logit` on their resource (see
-  # internal-telemetry.md's "Resource identity" section) -- that's what lets Tempo resolve a root
-  # service for these traces at all.
+  # `logit` observing itself (docs/design/internal-telemetry.md, ADR `internal-telemetry-as-pipeline-events`);
+  # the dashboard's `logit.*` panels come from here. `span_sample_rate` is `1.0` rather than its
+  # `0.1` default (docs/adr/internal-span-emission-and-deterministic-sampling.md), because this
+  # demo is meant to show every span it can, not weigh span volume against storage cost. Its
+  # batches carry `service.name = logit` on their resource (see internal-telemetry.md's "Resource
+  # identity" section), which is what lets Tempo resolve a root service for these traces at all.
   self:
     type: internal
     interval: 10s
@@ -602,42 +626,41 @@ components:
     bucket: metrics
     token: !env INFLUXDB_TOKEN
 
-  # `self` is `internal` observing *all* of `logit`'s own telemetry, not just spans -- every drain
-  # also carries this process's own `logit.*` metrics (Counter/Gauge/Distribution) alongside its
-  # spans, but `self` never mixes the two *on one event*: each drain is either a metric-only point
-  # or a span-only span event (`crates/logit-core/src/telemetry.rs`'s `drain`), never both at
-  # once. `trace_only` exists to drop the metric-only ones before `tempo_out` ever sees them --
-  # `has_signal` never mutates a forwarded event, so every span that does reach `tempo_out` arrives
-  # exactly as `self` produced it. See `docs/adr/signal-filtering-components.md`.
+  # `self` carries *all* of `logit`'s own telemetry, not just spans: every drain also carries this
+  # process's `logit.*` metrics (Counter/Gauge/Distribution). It never mixes the two *on one
+  # event*, though: each drain is either a metric-only point or a span-only span event
+  # (`crates/logit-core/src/telemetry.rs`'s `drain`). `trace_only` drops the metric-only ones
+  # before `tempo_out` sees them. `has_signal` never mutates a forwarded event, so every span that
+  # reaches `tempo_out` arrives exactly as `self` produced it. See
+  # `docs/adr/signal-filtering-components.md`.
   #
-  # This isn't pipeline hygiene, it's load-bearing: `otlp_out` issues one request per signal and
-  # aborts the rest of a `send` call on the first failing one
-  # (`crates/logit-outputs/src/otlp.rs`'s module doc), and Tempo is a traces-only gRPC server (it
-  # registers no `MetricsService`) -- an `internal` metric point reaching `tempo_out` would fail
-  # with `grpc-status: 12` (UNIMPLEMENTED), and enough consecutive failures trip `write_loop`'s
-  # ~60s sustained-permanent-failure guard (`docs/adr/service-lifecycle-and-output-retry.md`,
-  # revised by `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process -- taking
-  # the InfluxDB metrics path down with it, not just Tempo. Confirmed directly against an earlier
-  # version of this config that fed `self` straight into `tempo_out`: see `docs/known-gaps.md`'s
-  # "`otlp_out` aborts an entire batch's `send`..." entry for the full account. `access_spans`
-  # above needs the identical gate for the identical reason, once `haproxy_trace`/`nginx_trace`
-  # started producing metric-and-span-carrying batches too -- `browser_spans` needs it too, though
-  # `browser_in` itself only ever emits traces (see `browser_spans`'s own comment above).
+  # This gate is load-bearing, not hygiene. `otlp_out` issues one request per signal and aborts the
+  # rest of a `send` call on the first failing one (`crates/logit-outputs/src/otlp.rs`'s module
+  # doc), and Tempo is a traces-only gRPC server (it registers no `MetricsService`). An `internal`
+  # metric point reaching `tempo_out` would fail with `grpc-status: 12` (UNIMPLEMENTED), and enough
+  # consecutive failures trip `write_loop`'s ~60s sustained-permanent-failure guard
+  # (`docs/adr/service-lifecycle-and-output-retry.md`, revised by
+  # `docs/adr/buffered-sink-delivery.md`), ending the whole `logit` process and taking the InfluxDB
+  # metrics path down with it, not just Tempo. See `docs/known-gaps.md`'s "`otlp_out` aborts an
+  # entire batch's `send`..." entry for the full account. `access_spans` needs the same gate for
+  # the same reason, because `haproxy_trace`/`nginx_trace` produce metric-and-span-carrying
+  # batches, and so does `browser_spans`, even though `browser_in` only ever emits traces (see
+  # `browser_spans`'s comment above).
   trace_only:
     type: has_signal
     sources: [self]
     signals: [traces]
 
-  # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md) -- Tempo's `:4317`
-  # receiver, to exercise the transport the rest of this config doesn't otherwise touch;
+  # Deliberately gRPC, not HTTP (docs/adr/hand-rolled-grpc-over-hyper.md): Tempo's `:4317`
+  # receiver, to exercise the transport the rest of this config doesn't otherwise touch.
   # `endpoint` is a bare `host:port` authority for gRPC, not a URL (see
-  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Three sources now: `logit`'s own
-  # internal spans (`trace_only`), haproxy's/nginx's real access-line spans (`access_spans`,
+  # `crates/logit-outputs/src/otlp.rs`'s `grpc_authority`). Three sources: `logit`'s own internal
+  # spans (`trace_only`), haproxy's/nginx's real access-line spans (`access_spans`,
   # docs/adr/trace-context-span-lifting.md), and whatever real OTLP traces `browser_in` decoded
-  # (`browser_spans`) -- `demo-app`'s real request spans go straight to Tempo's own OTLP/HTTP
-  # receiver instead, never touching `logit` at all (see the comment above `stdout`). All of it
-  # still lands in the same Tempo trace when trace ids agree -- Tempo doesn't care which of its
-  # receivers a span for a given trace arrived through.
+  # (`browser_spans`). `demo-app`'s real request spans go straight to Tempo's OTLP/HTTP receiver
+  # instead, never touching `logit` (see the comment above `stdout`). They still land in the same
+  # Tempo trace when trace ids agree, because Tempo doesn't care which of its receivers a span
+  # arrived through.
   tempo_out:
     type: otlp_out
     sources: [trace_only, access_spans, browser_spans]
