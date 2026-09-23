@@ -326,7 +326,18 @@ which is how `demo/haproxy/haproxy.cfg` now logs. `json` gained `invalid_utf8: r
 it, retrying a parse that failed on invalid UTF-8 (nginx's `escape=json` passes high bytes raw) on
 a lossy copy, failure path only. See [ADR `http-access-normalization`](docs/adr/http-access-normalization.md),
 [docs/http-access-logs.md](docs/http-access-logs.md) (the operator-facing schema, with a snippet
-per server), and [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml).
+per server), and [examples/nginx-to-influxdb.yaml](examples/nginx-to-influxdb.yaml). `sample`
+is newer still: consistent, keyed sampling -- `key: trace_id` (a span's, else a log's
+`TraceRef`), `{attribute: ..}`, or `{resource: ..}` is hashed and compared against `rate`, so
+every event sharing a key gets the same verdict in every `logit` process with nothing propagated,
+an `always_keep:` override pins flagged events through, and `missing:` decides the fate of an
+event the key isn't on. It is the one kind `routing-by-condition-is-lua` retired that has come
+back, because keyed consistency is the thing a `lua` component can't express. The hash --
+XXH64 seed 0 (`twox-hash`) over a fixed canonical byte form, in `logit_core::sampling`, which
+`trace_is_sampled` now shares the 53-bit compare with -- is a **frozen cross-version contract**
+pinned by test vectors; changing it is a wire-breaking change needing its own ADR. See
+[ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md) and
+[examples/sample-traces.yaml](examples/sample-traces.yaml).
 
 ## Environment
 
@@ -516,7 +527,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution+validation, node runtime, sockstat (per-socket kernel counters)
   logit-inputs      per-protocol listeners implementing logit-pipeline::Input; statsd (v0.1 target), syslog, otlp, tail (tail_in/docker_in), internal (self-telemetry), generate_in (load-test event generator)
   logit-outputs     per-protocol sinks implementing logit-pipeline::Output; InfluxDB (v0.1 target), stdio, file, syslog, statsd, null_out (load-test discard sink)
-  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), route (implements logit-pipeline::Router)
+  logit-transforms  native transforms implementing logit-pipeline::Transform; aggregate (v0.1 target), json, csv, kv_metrics, keep, remove, set, trace_context, scale, has_signal, keep_signals, drop_signals, keep_values, logfmt, kv, regex, shape (the fan-out-tapped shape observer), flatten (dotted-key expansion of a nested attribute), http_access (access-log normalization onto OTel semconv), sample (consistent, keyed sampling on a frozen XXH64 hash), route (implements logit-pipeline::Router)
   logit-cli         the `logit` binary: the kind → implementation registry, `Command::{Schema,Validate,Run,Graph}`
   logit-bench       dev-only: allocation-count tests + divan throughput benches (docs/design/memory.md)
   logit-perf        dev-only, publish = false: the load-test harness binary (`logit-perf`, `script/perf`) -- spawns the real logit-cli binary against perf/scenarios/*.yaml (docs/adr/load-test-harness.md, docs/design/performance.md)

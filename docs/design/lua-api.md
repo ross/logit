@@ -1061,9 +1061,12 @@ kind (`docs/design/pipeline-graph.md`'s validation rule 47). Omitted, the compon
 and every event it emits goes to its own consumers.
 
 Built-in native processors (no Lua involved) handle the common structured-parsing cases without
-per-event VM overhead: `json`, `logfmt`, `kv`, `regex`/`grok`, `csv`, `rename`/`remove`/`copy`,
-`filter`, `sample`, `throttle`, `dedup`, `aggregate`. Each is a transform-kind component like `lua`
-above; nothing about being native rather than scripted changes how a component wires into the
+per-event VM overhead: `json`, `logfmt`, `kv`, `regex`, `csv`, `keep`/`remove`/`set`,
+`has_attributes`/`drop_attributes`, `sample`, `aggregate`, and the rest of the transform kinds
+`docs/design/pipeline-graph.md` lists (`filter`, `rename`, `throttle`, and `dedup` were retired
+rather than built -- ADR `routing-by-condition-is-lua`; `sample` came back as a native kind for
+the keyed, cross-process consistency Lua can't express -- ADR `consistent-sampling-component`).
+Each is a transform-kind component like `lua` above; nothing about being native rather than scripted changes how a component wires into the
 graph. These are meant to sit in front of user Lua — "parse the JSON body, then run my logic" —
 rather than being an either/or with scripting: a native transform names a Lua component as its
 source, or vice versa, same as any other edge.

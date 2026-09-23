@@ -52,10 +52,13 @@ Tempo in the demo above, and
 `keep`, `remove`, `set`, `trace_context`, `scale`, `logfmt`, `kv` (the de-facto `key=value`
 parsers, [ADR `logfmt-and-kv-parsing`](docs/adr/logfmt-and-kv-parsing.md)), `flatten`
 (dotted-key expansion of a nested attribute, [ADR `flatten-transform`](docs/adr/flatten-transform.md)),
-and `http_access` (a web server's access line, logged under raw OTel semconv names, normalized
+`http_access` (a web server's access line, logged under raw OTel semconv names, normalized
 and given a bounded route/user-agent/span-name set,
 [ADR `http-access-normalization`](docs/adr/http-access-normalization.md),
-[docs/http-access-logs.md](docs/http-access-logs.md)) have joined `aggregate` as implemented native transforms —
+[docs/http-access-logs.md](docs/http-access-logs.md)), and `sample` (consistent, keyed sampling — every
+event of a kept trace survives, in every process, with nothing propagated,
+[ADR `consistent-sampling-component`](docs/adr/consistent-sampling-component.md),
+[examples/sample-traces.yaml](examples/sample-traces.yaml)) have joined `aggregate` as implemented native transforms —
 `trace_context`'s opt-in `span:` block turns an access log line into a real span on the same event
 ([ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md)). `logit
 run` rejects a config referencing any other unimplemented kind with a clear error. Config is a flat
@@ -144,7 +147,7 @@ crates/
   logit-pipeline    Input/Output/Transform/Router traits, Fanout, graph resolution, the node runtime
   logit-inputs      per-protocol listeners; statsd, syslog, otlp, tail (tail_in/docker_in)
   logit-outputs     per-protocol sinks; InfluxDB, stdio, syslog
-  logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv, flatten, http_access
+  logit-transforms  built-in native transform components; aggregate, json, csv, kv_metrics, keep, remove, set, trace_context, scale, logfmt, kv, flatten, http_access, sample
   logit-cli         the `logit` binary
   logit-bench       dev-only: allocation-count tests and throughput benchmarks
   logit-perf        dev-only: the out-of-CI load-test harness binary (script/perf)

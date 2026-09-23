@@ -983,6 +983,19 @@ Worked examples, one per shipped component:
   agent, and an unrouted path are normal traffic and get counters only. See
   [ADR `http-access-normalization`](../adr/http-access-normalization.md) and
   [`docs/http-access-logs.md`](../http-access-logs.md).
+- `sample` (`crates/logit-transforms/src/sample.rs`): shares `logit.transform.events.filtered`
+  with the filter families above (the batch's dropped count, emitted even at `0` so the series
+  registers), plus `logit.transform.sample.decisions{outcome="kept"|"dropped",
+  by="key"|"random"|"override"|"missing"}` (count, non-zero cells only) — `override` is an
+  `always_keep` hit, `key` a hashed verdict, `random` a keyless sampler's draw, and `missing` an
+  event whose configured key was absent, whatever `missing:` then did with it (a random draw
+  included), so that cell counts exactly the events the key didn't cover. Unlike the filter
+  families above, both are **tallied in plain integers per event and emitted once per batch from
+  `end_batch`** (`kv_metrics`' pattern): a sampler sits on every event of the high-volume streams
+  it exists for, where a `Telemetry::count` per event is the cost. The runtime's own
+  `logit.component.events.dropped{reason="absorbed"}` also counts every drop, as for any transform
+  that returns `false`. No `Diagnostics` — nothing here can fail. See
+  [ADR `consistent-sampling-component`](../adr/consistent-sampling-component.md).
 - `json` (`crates/logit-transforms/src/json.rs`): no counters, three throttled `Diagnostics`
   keys — `parse_failure` (the message isn't a JSON object; the event passes through with its
   attributes untouched), `no_brace` (`skip_to_brace: true` and no `{` anywhere), and
