@@ -15,7 +15,11 @@ they can't cover **how a real client packs an application's metrics into datagra
 a buffer, how long its names get, and how many tags it attaches to a line. These four captures cover
 that.
 
-## What's here
+To regenerate, run `script/record-fixtures statsd`. CI doesn't run it, for the reason the
+top-level [`README.md`](../README.md) gives for every producer here: recording from live
+third-party software is a deliberate, reviewed act.
+
+## Fixtures
 
 All four captures run the **same workload**, so the only differences between the files are the
 client and its buffering. The workload,
@@ -37,6 +41,10 @@ is a small web service reporting:
 
 Whole corpus: 56 files, 12,389 bytes, within
 [`testdata/interop/README.md`](../README.md)'s size discipline.
+
+The run pulls `python:3.12-slim` and `pip install`s the client fresh, so **a re-record picks up
+whatever version of `datadog`/`statsd` is current**. The producer prints the resolved version as
+its first line of output. Update the table above from that output rather than assuming the version.
 
 ## What was measured out of them
 
@@ -68,25 +76,14 @@ The metric-type mix across all 120 captured lines is `c` 43, `ms` 22, `g` 21, `h
 synthetic app emits. `perf/load/README.md` says so explicitly where it chooses its own type weights
 instead.
 
-## Re-recording
+## Tests that consume these fixtures
 
-```
-script/record-fixtures statsd
-```
-
-CI doesn't run this, for the reason the top-level [`README.md`](../README.md) gives for every
-producer here: recording from live third-party software is a deliberate, reviewed act.
-
-The run pulls `python:3.12-slim` and `pip install`s the client fresh, so **a re-record picks up
-whatever version of `datadog`/`statsd` is current**. The producer prints the resolved version as
-its first line of output. Update the table above from that output rather than assuming the version.
-
-A re-record does **not** reproduce these bytes. The workload's values come from a seeded
-`random.Random`, so the *shape* is stable. But the DogStatsD container ID changes with the
-container, and which lines land in which buffered datagram depends on flush timing. Every producer
-in this corpus has the same "real capture, not a golden file" property: consuming tests assert on
-decoded values, never on raw bytes. See the `interop_fixture_*` tests in
-`crates/logit-inputs/src/statsd.rs`.
+The `interop_fixture_*` tests in `crates/logit-inputs/src/statsd.rs` read this corpus. They assert
+on decoded values rather than exact bytes, because a re-record does **not** reproduce these bytes. The
+workload's values come from a seeded `random.Random`, so the *shape* is stable. But the DogStatsD
+container ID changes with the container, and which lines land in which buffered datagram depends
+on flush timing. Every producer in this corpus has the same "real capture, not a golden file"
+property.
 
 ## What isn't covered here (yet)
 

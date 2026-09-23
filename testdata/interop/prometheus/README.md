@@ -6,8 +6,12 @@ re-encoding.** Each `.bin` is exactly the Snappy-compressed protobuf Prometheus 
 `logit`'s own encoder never touches these, which is the point:
 `crates/logit-proto/src/prometheus/remote_write.rs` was written from the two remote-write specs and
 the vendored `prompb`, and these fixtures check that reading against the sender every deployment
-runs. Regenerate them with `script/record-fixtures prometheus` (see `../README.md` and
-`script/record-fixtures`'s own header comment).
+runs.
+
+To regenerate, run `script/record-fixtures prometheus`. See `../README.md` and the header comment
+in `script/record-fixtures`.
+
+## Fixtures
 
 **Each request has two files.** The `.bin` is the body. The `.headers` sidecar beside it holds the
 request's method, its path, and every request header with the name lowercased, one per line. The
@@ -50,6 +54,8 @@ choices keep it there:
   a capture is one whole scrape rather than a fragment.
 - **The small static target the metadata side scrapes.** It keeps a *complete* metadata request
   under 400 bytes, where a self-scrape's would be ~16 KB.
+
+## Tests that consume these fixtures
 
 `crates/logit-proto/tests/prometheus_remote_write_interop.rs` consumes these fixtures. It asserts
 that:
