@@ -43,8 +43,9 @@
 //! `SETITEM` `0x73`, `SETITEMS` `0x75`, `EMPTY_SET` `0x8f`, `FROZENSET` `0x91`, `ADDITEMS` `0x90`),
 //! `BYTEARRAY8` `0x96`, `NEXT_BUFFER` `0x97`, `READONLY_BUFFER` `0x98`, and every protocol-0
 //! textual opcode (`INT` `0x49`, `LONG` `0x4c`, `FLOAT` `0x46`, `STRING` `0x53`, `UNICODE` `0x56`,
-//! `PUT` `0x70`, `GET` `0x67`, ...). A protocol-0 or protocol-1 dump therefore fails at its first
-//! value rather than being half-understood.
+//! `PUT` `0x70`, `GET` `0x67`, ...). A protocol-0 dump therefore fails at its first value rather
+//! than being half-understood. A protocol-1 dump decodes: it has no `PROTO` header, but every
+//! opcode it emits for a carbon payload is a binary one from the table above.
 //!
 //! ## Bounds
 //!
@@ -795,6 +796,14 @@ mod tests {
         0x0a, 0x61, 0x2e,
     ];
 
+    /// pickle.dumps([('a.b', (1, 1.0))], protocol=1) -- no `PROTO` header, `TUPLE` 0x74 rather
+    /// than `TUPLE2`, but only binary opcodes.
+    const CPYTHON_PROTOCOL_1: &[u8] = &[
+        0x5d, 0x71, 0x00, 0x28, 0x58, 0x03, 0x00, 0x00, 0x00, 0x61, 0x2e, 0x62, 0x71, 0x01, 0x28,
+        0x4b, 0x01, 0x47, 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x71, 0x02, 0x74,
+        0x71, 0x03, 0x61, 0x2e,
+    ];
+
     /// pickle.dumps({'a': 1}, protocol=2) -- `EMPTY_DICT` 0x7d, `SETITEM` 0x73.
     const CPYTHON_DICT: &[u8] = &[
         0x80, 0x02, 0x7d, 0x71, 0x00, 0x58, 0x01, 0x00, 0x00, 0x00, 0x61, 0x71, 0x01, 0x4b, 0x01,
@@ -887,6 +896,15 @@ mod tests {
         let (points, skipped) = read(CPYTHON_PROTOCOL_5).expect("protocol 5 must decode");
         assert_eq!(skipped, 0);
         assert_eq!(points, vec![point("sys.cpu", 1_700_000_000.0, 0.5)]);
+    }
+
+    /// Protocol 1 predates `PROTO`, but a carbon payload dumped under it uses only allowlisted
+    /// binary opcodes, so it decodes like protocol 2; only protocol 0's textual opcodes are refused.
+    #[test]
+    fn a_cpython_protocol_1_dump_decodes() {
+        let (points, skipped) = read(CPYTHON_PROTOCOL_1).expect("protocol 1 must decode");
+        assert_eq!(skipped, 0);
+        assert_eq!(points, vec![point("a.b", 1.0, 1.0)]);
     }
 
     #[test]

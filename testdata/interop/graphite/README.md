@@ -74,9 +74,10 @@ up in the script's own log, the same discipline `../collectd/README.md` describe
   `crates/logit-inputs/src/graphite/mod.rs`'s own socket tests cover multiple connections and
   connection loss against the real driver instead.
 - **Protocol 0/1 pickle (text mode and the original binary protocol).** The restricted reader
-  rejects both outright (the "Rejected" list in `docs/adr/graphite-carbon-relay.md`'s "Pickle
-  opcode subset", and `crates/logit-proto/src/graphite/pickle.rs`'s module doc). A hand-built unit
-  test with a CPython-dump provenance comment in `crates/logit-proto/src/graphite/pickle.rs`
-  (`object_construction_opcodes_are_rejected`, over a protocol-0 dump) covers this instead of a
-  fixture, because no modern sender is left to capture one from: Python's own
-  `pickle.DEFAULT_PROTOCOL` has been 3 or higher since Python 3.0.
+  rejects protocol 0 outright (the "Rejected" list in `docs/adr/graphite-carbon-relay.md`'s
+  "Pickle opcode subset", and `crates/logit-proto/src/graphite/pickle.rs`'s module doc) and
+  decodes protocol 1, whose carbon payloads use only allowlisted binary opcodes. Hand-built unit
+  tests with CPython-dump provenance comments in `crates/logit-proto/src/graphite/pickle.rs` cover
+  both instead of a fixture (`object_construction_opcodes_are_rejected` over a protocol-0 dump,
+  `a_cpython_protocol_1_dump_decodes` over a protocol-1 one), because no modern sender is left to
+  capture one from: Python's own `pickle.DEFAULT_PROTOCOL` has been 3 or higher since Python 3.0.
