@@ -85,7 +85,14 @@ digraph architecture {
   app    -> redis [label="queue"];
   worker -> redis [label="queue"];
 
-  // -- Tracing: two independent paths into Tempo -------------------------------------------
+  // -- Tracing: three paths into Tempo ------------------------------------------------------
+  // The landing page's browser SDK (demo/app/browser/telemetry.js) POSTs OTLP/HTTP traces to
+  // haproxy on the page's own origin, and haproxy's `is_otlp` ACL forwards `/v1/*` to `logit`'s
+  // `browser_in`. Same-origin through haproxy, not straight to `logit`, because `otlp_in` has no
+  // CORS support (demo/haproxy/haproxy.cfg). These are drawn as their own "tracing" edges, apart
+  // from the "web" and "logging" edges that share their endpoints. Only a real browser takes this
+  // path: `traffic` is a `curl` loop and sends none.
+  //
   // `logit`'s own internal spans travel the `logit -> tempo` edge, and so do haproxy's/nginx's
   // real access-line spans (docs/adr/trace-context-span-lifting.md's `span:` block), derived
   // from the same log line the "logging" edges above already show: one wire, two signals, no new
@@ -98,9 +105,11 @@ digraph architecture {
   // Loki only, via its "logging" edge, and redis's log carries none (its "logging" edge is server
   // lines only; the broker traffic is traced from both client ends, `app`'s and `worker`'s Redis
   // CLIENT spans).
-  logit  -> tempo [label="tracing"];
-  app    -> tempo [label="tracing"];
-  worker -> tempo [label="tracing"];
+  client  -> haproxy [label="tracing"];
+  haproxy -> logit   [label="tracing"];
+  logit   -> tempo   [label="tracing"];
+  app     -> tempo   [label="tracing"];
+  worker  -> tempo   [label="tracing"];
 
   // -- Metrics -------------------------------------------------------------------------------
   logit -> influxdb [label="metrics"];
