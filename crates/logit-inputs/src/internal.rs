@@ -145,9 +145,7 @@ impl Input for InternalInput {
 impl InternalInput {
     async fn tick(&self, started: Instant, sink: &Fanout) {
         // Process-level facts sampled here rather than pushed by anything else, since nothing
-        // else has an occasion to push them -- closes the `interner::len()` observability hook
-        // `docs/known-gaps.md` names as "nearly free... and would make this observable rather
-        // than silent" once something reads it.
+        // else has an occasion to push them.
         self.telemetry.gauge("logit.process.interner.strings", interner::len() as f64, &[]);
         self.telemetry.gauge("logit.process.uptime", started.elapsed().as_secs_f64(), &[]);
 

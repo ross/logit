@@ -225,8 +225,9 @@ follow-up.
 - **`json-parse`** (0.904 µs/event) and **`lua`** (2.001 µs/event) are no longer close to tied.
   `json-parse` dropped sharply from the laptop's 2.054 µs/event because the interner key-cache and
   in-place `Transform::process` work landed since (`docs/adr/in-place-transform-process.md`).
-  `lua`'s LuaJIT round trip had no equivalent optimization, so the "Lua costs more than a native
-  transform" relationship `docs/known-gaps.md` documents holds by a larger factor now.
+  `lua`'s LuaJIT round trip had no equivalent optimization, so the gap between a `lua` stage and a
+  native transform that [`docs/known-gaps.md`](../known-gaps.md#transforms-predicates-and-sampling)
+  documents holds by a larger factor now.
   `json-parse-x3` (2.248 µs/event, three parallel parsers sharing the interner) sits close to
   `lua`, consistent with its purpose: showing shared-interner contention, not a single parse.
 - **`encode-human-devnull`** vs **`encode-native-devnull`** (1.098 vs 0.995 µs/event): the native
