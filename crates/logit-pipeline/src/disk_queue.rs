@@ -2296,6 +2296,25 @@ mod tests {
     }
 
     #[test]
+    fn a_record_one_byte_after_a_corrupt_byte_is_still_recovered() {
+        // The nearest a real record's `MAGIC` can sit after a failed parse at `pos`: one corrupt
+        // byte, then the record's context. `resync_after` must start its scan no later.
+        let a = raw_record(&batch("a"), ctx());
+        let b = raw_record(&batch("b"), ctx());
+        let mut bytes = a.clone();
+        bytes.push(0x5A);
+        bytes.extend_from_slice(&b);
+
+        let mut emitted: Vec<(u64, u64)> = Vec::new();
+        let outcome = walk_segment(&bytes, 0, |offset, _, _, len| emitted.push((offset, len)));
+
+        let b_at = a.len() as u64 + 1;
+        assert_eq!(emitted, vec![(0, a.len() as u64), (b_at, b.len() as u64)]);
+        assert_eq!(outcome.corrupt_skipped, 1);
+        assert_eq!(outcome.good_len, bytes.len() as u64);
+    }
+
+    #[test]
     fn a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards() {
         // Record A, then fewer than `CONTEXT_LEN` filler bytes, then a frame with no context of
         // its own. Parsing at A's end fails (its "frame" starts inside the real one). The MAGIC
