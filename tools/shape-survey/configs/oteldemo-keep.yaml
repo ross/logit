@@ -1,32 +1,24 @@
-# The `oteldemo` producer's **second, optional** pipeline: identical to configs/oteldemo.yaml
-# except that the tap runs `resource: keep`, so `aggregate` keys every series per resource and a
-# per-service breakdown becomes possible. Used only by an explicitly-requested short second run
-# (`SHAPE_SURVEY_OTELDEMO_KEEP=1`), never by the main capture.
+# The `oteldemo` producer's optional second capture: configs/oteldemo.yaml with the tap on
+# `resource: keep`, so `aggregate` keys every series per resource and a per-service breakdown
+# becomes possible. Run only on `SHAPE_SURVEY_OTELDEMO_KEEP=1`
+# (tools/shape-survey/producers/oteldemo.sh), never by the main capture.
+# tools/shape-survey/README.md, "`resource: keep` captures", has the handling rules.
 #
-# **Why this is a separate config and not a flag on the first one.**
+# Why a separate config: `resource: drop` is what lets a run's summary leave an environment the
+# traffic could not (docs/adr/shape-observer-component.md). With `keep`, the observed `Resource`
+# reaches `aggregate`, which keys its series on it, and `file_out`'s human render merges those
+# attributes into each record's `attrs` line. The output of this config is identity-bearing: it
+# names the demo's services, host, container ids and the collector's detected CPU model. It stays
+# in the run directory (`perf/results/` is gitignored) and nothing derived from it is pasted
+# anywhere without being read first.
 #
-# `resource: drop` (configs/oteldemo.yaml) is what lets a run's summary leave an environment the
-# traffic itself could not: `shape` emits counts and lengths only, and dropping the resource means
-# no observed resource attribute -- `service.name`, `host.name`, `container.id`, and everything
-# else `resource_detection` stamps -- reaches the output at all
-# (docs/adr/shape-observer-component.md). That is the property the main run keeps.
+# What it answers that the main run cannot: does attribute width differ by service? The demo
+# instruments many languages, each with its own SDK and instrumentation-library stack, and a
+# pooled distribution hides that. A short run suffices: per-service shape is a property of each
+# SDK's instrumentation, not of run length.
 #
-# `resource: keep` trades it away deliberately and locally. The events this pipeline writes carry
-# the observed `Resource` through to `aggregate`, which keys its series on it, and `file_out`'s
-# human render merges those resource attributes into each record's `attrs` line. **The output of a
-# run using this config is identity-bearing**: it names the demo's services, the host, the
-# container ids and the collector's detected host CPU model. It stays in the run directory
-# (`perf/results/` is gitignored) and nothing derived from it is pasted anywhere the main run's
-# summary would go without being read first.
-#
-# It is worth having anyway, for one question the main run structurally cannot answer: **does
-# attribute width differ by service?** The demo instruments nine languages with nine different SDK
-# and instrumentation-library stacks, and "a Go service's spans are narrower than a .NET service's"
-# is exactly the kind of thing a single pooled distribution hides. A short run is enough: the
-# per-service *shape* is a property of each SDK's instrumentation, not of how long it ran.
-#
-# Everything else -- one input, one tap, the `aggregate` and `file_out` settings -- is unchanged
-# from configs/oteldemo.yaml, whose header is the reference for what every series means.
+# Everything else is unchanged from configs/oteldemo.yaml, whose header says what every series
+# means.
 admin:
   bind: 0.0.0.0:9600
 
@@ -37,20 +29,17 @@ components:
     protocol: http
 
   # The one difference from configs/oteldemo.yaml. `keep` governs the per-event output only: what
-  # `shape` emits at `flush` (the per-batch samples and the cumulative gauges) always goes out
-  # under an empty `Resource`, because a window spans many batches and there is no single resource
-  # to keep. So a per-service split is available for `logit.shape.attributes` and its per-event
-  # siblings, and *not* for `logit.shape.batch.*` -- which is the honest answer rather than a
-  # limitation to work around.
+  # `shape` emits at flush (per-batch samples and cumulative gauges) goes out under an empty
+  # `Resource`, since a window spans many batches. So a per-service split exists for
+  # `logit.shape.attributes` and its per-event siblings, not for `logit.shape.batch.*`.
   tap_input:
     type: shape
     sources: [otlp_gateway]
     interval: 10s
     resource: keep
 
-  # `max_retained_series` matters more here than in the main config: `keep` multiplies the series
-  # count by the number of distinct resources (roughly: services x containers), so the same ceiling
-  # is doing real work rather than sitting unused.
+  # `max_retained_series` does real work here: `keep` multiplies the series count by the number of
+  # distinct resources (roughly services x containers).
   shape_rollup:
     type: aggregate
     sources: [tap_input]

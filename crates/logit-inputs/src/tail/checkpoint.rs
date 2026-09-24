@@ -1,12 +1,11 @@
 //! Persisted read offsets, so a restart resumes tailing instead of replaying or skipping.
-//! `docs/adr/file-tailing-and-docker-json-logs.md` covers the trade-off this makes explicit:
-//! written on an interval and only when dirty (never per line), so a crash between two writes
-//! can replay up to `checkpoint_interval` worth of already-emitted lines on restart -- accepted
-//! at-least-once behavior, not a bug, the same trade-off `buffer:`'s sink-side retry already
-//! makes on the delivery side of this same pipeline. A checkpoint write is always preceded by a
-//! flush of every accumulator, and never covers bytes still held as an incomplete line
-//! (`Tailer::write_checkpoint` subtracts `LineSplitter::pending_bytes()`), so the replay window
-//! this accepts is strictly "already-emitted lines re-emitted" -- never "read lines lost".
+//!
+//! Written on an interval and only when dirty, never per line, so a crash can replay up to
+//! `checkpoint_interval` of already-emitted lines: accepted at-least-once behavior
+//! (`docs/adr/file-tailing-and-docker-json-logs.md`'s "Checkpoints: optional, written on an
+//! interval, only when dirty"). Every accumulator is flushed before a write, and the offset
+//! written excludes a held partial line (`Tailer::write_checkpoint` subtracts
+//! `LineSplitter::pending_bytes()`), so a crash can re-emit lines but never lose one that was read.
 
 use logit_core::{Diagnostics, Telemetry};
 use serde::{Deserialize, Serialize};
@@ -14,10 +13,10 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// A tailed file's identity across restarts and across a rename -- Linux's `(st_dev, st_ino)`
-/// pair, the only thing that survives both a rotation (the path keeps its name; the inode
-/// doesn't) and a checkpoint resume (the inode is what's persisted; the path is only carried
-/// alongside for a human reading the checkpoint file, never used to match on restart).
+/// A tailed file's `(st_dev, st_ino)` identity, stable across a rename and a restart.
+///
+/// Rotation keeps the path and changes the inode, so a checkpoint matches on this pair only. The
+/// persisted path is for a human reading the file, never matched on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FileId {
     pub dev: u64,
@@ -48,21 +47,20 @@ struct CheckpointEntry {
     offset: u64,
 }
 
-/// Owns one tailing component's checkpoint file. Reading it is a one-time [`CheckpointStore::
-/// load`] at startup; writing is dirty-tracked so [`CheckpointStore::write`] is a no-op on a
-/// tick with nothing new to persist.
+/// One tailing component's checkpoint file: loaded once at startup, and written only when dirty
+/// or forced.
 pub(crate) struct CheckpointStore {
     path: PathBuf,
     dirty: bool,
 }
 
 impl CheckpointStore {
-    /// Loads `path` if it exists, returning the store handle plus a resume map keyed by file
-    /// identity (not path -- a rotated-then-restarted file is still resumed correctly by inode
-    /// even though `scan` will see it under whatever path it currently has). A missing file is
-    /// the ordinary first-run case, not an error; an unreadable or malformed one is diagnosed
-    /// and treated the same as missing (every file then falls back to `read_from`) rather than
-    /// being fatal to the whole component -- a corrupt checkpoint shouldn't stop tailing.
+    /// Loads `path`, returning the store and a resume map keyed by [`FileId`], not path, so a
+    /// file renamed before the restart still resumes under its new name.
+    ///
+    /// A missing file is the first-run case, not an error. An unreadable, malformed, or
+    /// wrong-version one is diagnosed `checkpoint_error` and treated as missing (every file falls
+    /// back to `read_from`); it's never fatal to the component.
     pub fn load(path: PathBuf, diag: &mut Diagnostics) -> (Self, HashMap<FileId, (PathBuf, u64)>) {
         let mut resume = HashMap::new();
         match std::fs::read(&path) {
@@ -108,13 +106,13 @@ impl CheckpointStore {
         self.dirty = true;
     }
 
-    /// Writes every `(identity, path, offset)` triple in `entries` -- unless neither dirty nor
-    /// `force`, in which case this is a no-op. `entries` is expected to be exactly the tailer's
-    /// currently-tracked files, which is what makes this prune on its own: a file that rotated
-    /// or was removed has already left the tracked set by the time this runs, so its old
-    /// checkpoint entry simply isn't reproduced in the next write. Atomic (tmp file + rename) so
-    /// a crash mid-write can never leave a half-written, unparseable checkpoint on disk. Leaves
-    /// the dirty flag set on failure, so the next tick retries rather than silently giving up.
+    /// Replaces the checkpoint with `entries`; a no-op unless dirty or `force`.
+    ///
+    /// `entries` must be the tailer's tracked files, which is what prunes: a rotated or removed
+    /// file has left that set, so its entry isn't rewritten. The tmp file + rename is atomic
+    /// against a process crash, but nothing is fsynced, so a power loss can still lose or empty
+    /// the file (then treated as missing by [`CheckpointStore::load`]). A failed write leaves the
+    /// store dirty, so the next tick retries.
     pub fn write<'a>(
         &mut self,
         entries: impl Iterator<Item = (FileId, &'a Path, u64)>,
@@ -219,8 +217,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The pruning contract: a second write naming fewer entries than the first drops the
-    /// missing one entirely, rather than leaving its stale offset behind.
+    /// A write naming fewer entries than the last drops the missing one's stale offset.
     #[test]
     fn a_subsequent_write_prunes_entries_no_longer_passed_in() {
         let dir = crate::tail::test_support::scratch_dir("checkpoint-prune");

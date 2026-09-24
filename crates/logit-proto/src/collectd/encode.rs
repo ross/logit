@@ -1,13 +1,9 @@
-//! Encoding a batch of events back into collectd datagrams -- the `| Model | Wire |` half of
-//! [`super`]'s module doc, which is the spec for everything here.
+//! Encoding a batch of events back into collectd datagrams: the encode half of [`super`]'s module
+//! doc, which is the spec for everything here.
 //!
-//! Pure: no socket anywhere, so every packing, elision and sanitization test runs directly against
-//! [`CollectdEncoder`] (`crates/logit-outputs/src/statsd.rs`'s same split). [`CollectdEncoder`]
-//! implements [`crate::FramedEncoder`] (ADR `framed-encoder`) rather than [`crate::Encoder`] -- see
-//! [`super`]'s "No `crate::Encoder`" paragraph for why a datagram-framed sink needs the former: the
-//! output is a [`crate::MessageBuf`]`<usize>`, one entry per datagram, whose `usize` meta is the
-//! number of messages (value lists or notifications) that datagram carries -- what `collectd_out`
-//! needs to attribute an `EMSGSIZE` drop to the right number of metrics.
+//! No socket, so packing, elision, and sanitization tests run directly against
+//! [`CollectdEncoder`]. [`super`]'s module doc says why it is a [`crate::FramedEncoder`] of packed
+//! datagrams, each entry's meta the number of messages it carries.
 
 use super::part::{self, DsValue};
 use super::{
@@ -21,95 +17,82 @@ use logit_core::{
     Temporality, Value,
 };
 
-/// Usable bytes in an identity field: [`DATA_MAX_NAME_LEN`] minus the NUL terminator collectd's own
-/// `parse_part_string` insists on. A longer field would make collectd reject the **whole packet**,
-/// taking every unrelated list in it down too, so the encoder truncates rather than hoping.
+/// Usable bytes in an identity field: [`DATA_MAX_NAME_LEN`] minus the NUL. A longer field makes
+/// collectd reject the **whole packet**, so the encoder truncates.
 const MAX_IDENTITY_BYTES: usize = DATA_MAX_NAME_LEN - 1;
 
-/// Per-batch outcome counts from [`CollectdEncoder::encode_into`] -- the aggregate this module's
-/// own tests and `crates/logit-bench/tests/allocations.rs`'s allocation case assert on exactly.
-/// The codec emits every one of its own `logit.output.*` counters and diagnostics directly, at
-/// each drop site (see [`Ctx`]), through the `Telemetry`/`Diagnostics` handles
-/// [`CollectdEncoder::with_telemetry`]/[`CollectdEncoder::with_diagnostics`] install -- unlike
-/// `statsd_out`, whose sink turns its encoder's returned `EncodeStats` into telemetry itself,
-/// `collectd_out` (`crates/logit-outputs/src/collectd.rs`) discards this return value; it exists
-/// for tests and benches, not production telemetry.
+/// Per-batch outcome counts from [`CollectdEncoder::encode_into`], for tests and benches.
+///
+/// The codec emits its `logit.output.*` counters and diagnostics itself at each drop site (see
+/// [`Ctx`]), so `collectd_out` discards this value, unlike `statsd_out`, whose sink turns its
+/// encoder's stats into telemetry.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events carrying no metrics at all -- a log- or span-only event, legal under
-    /// `docs/adr/multi-payload-events.md`. Not a loss: there was nothing collectd could carry.
+    /// Metrics-empty events that aren't notification attempts (a span, or a log without
+    /// `collectd.severity`). Not a loss: nothing to carry.
     pub skipped_no_metrics: usize,
     /// A metric kind collectd has no data-source type for (every post-summarization kind, plus a
-    /// delta non-monotonic `Sum`). Counted once per drop, with the kind as the counter's tag.
+    /// delta non-monotonic `Sum`), tagged with the kind.
     pub dropped_unsupported_kind: usize,
     /// A `Sum` that is non-finite, has a fractional part, or falls outside its target integer
     /// range. collectd's COUNTER/DERIVE/ABSOLUTE are integers; rounding would fabricate.
     pub dropped_unencodable_value: usize,
-    /// A `NO_RECORDED_VALUE`-flagged point of any kind **other than** `Gauge` (a flagged gauge has a
-    /// real wire form -- NaN -- and is encoded, not dropped).
+    /// A `NO_RECORDED_VALUE`-flagged point of any kind **other than** `Gauge` (which encodes as
+    /// NaN).
     pub dropped_no_recorded_value: usize,
-    /// A `MetricKind::GaugeDelta`, which means a missing `aggregate` stage rather than a bad metric.
+    /// A `MetricKind::GaugeDelta`, which means a missing `aggregate` stage, not a bad metric.
     pub dropped_gauge_delta: usize,
     /// An event whose `timestamp` is zero or negative: there is no cdtime before the epoch, and
-    /// stamping "now" instead would invent an instant nothing upstream reported. Counted once per
-    /// value **list** the event would have produced -- 1 for a like-relay event, one per record for
-    /// a fallback one -- so this number means the same thing as every other sink's
-    /// `metrics.skipped`.
+    /// stamping "now" would invent an instant.
+    ///
+    /// Counted once per value **list** the event would have produced (1 for like-relay, one per
+    /// record for fallback), so it means what every other sink's `metrics.skipped` means.
     pub dropped_unencodable_timestamp: usize,
-    /// An event with no host to write: no `collectd.host`, no `host.name`, and no configured
-    /// [`CollectdEncoder::with_hostname`]. collectd's receiver rejects an empty host outright, and
-    /// this encoder has no business inventing one -- see that builder's own doc. Counted per value
-    /// list, exactly as [`Self::dropped_unencodable_timestamp`] is.
+    /// An event with no `collectd.host`, no `host.name`, and no
+    /// [`CollectdEncoder::with_hostname`]. Counted per value list, like
+    /// [`Self::dropped_unencodable_timestamp`].
     pub dropped_no_host: usize,
-    /// A like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records. One list, one `u16`
-    /// `count` on the wire, and the decode side of this very codec rejects a longer one as a
-    /// malformed part -- which would take every unrelated list packed behind it in the same
-    /// datagram with it. Counted once: it is one list that was dropped, however many records it
-    /// held.
+    /// A like-relay event carrying more than [`MAX_VALUES_PER_LIST`] records. Counted once per
+    /// list, however many records it held.
     pub dropped_too_many_values: usize,
-    /// A list whose plugin or type sanitized to nothing -- collectd's receiver rejects both.
+    /// A list whose plugin or type sanitized to nothing, which collectd's receiver rejects.
     pub dropped_empty_name: usize,
-    /// A single value list larger than `max_packet_bytes` all by itself: dropped whole, never split
-    /// across datagrams (a split list would be dispatched against the wrong identity).
+    /// A single value list larger than `max_packet_bytes`: dropped whole, never split across
+    /// datagrams (a split list would be dispatched against the wrong identity).
     pub dropped_oversize_list: usize,
-    /// An attribute outside the `collectd.` namespace. collectd has no tag concept at all, so every
-    /// one of them is dropped -- counted once per attribute per event, including `host.name`, which
-    /// the host resolution reads but cannot carry as itself.
+    /// An attribute outside the `collectd.` namespace (collectd has no tags), once per attribute
+    /// per event, including `host.name`, which host resolution reads but can't carry as itself.
     pub tags_dropped_no_wire_form: usize,
-    /// A `collectd.*` attribute whose `Value` type has no wire form here: an identity field that
-    /// isn't `Str`/`Bytes`, an interval that isn't a finite positive `F64`, or a `collectd.*` name
-    /// this codec doesn't know (`collectd.severity`, until W5 gives it a wire form).
+    /// A `collectd.*` attribute with no wire form here: an identity field that isn't
+    /// `Str`/`Bytes`, an interval that isn't a finite positive `F64`, a `collectd.severity` that
+    /// isn't `U64` or rides on a value list, or a `collectd.*` name this codec doesn't know.
     pub tags_dropped_unrepresentable: usize,
-    /// An identity field that had a NUL or `/` replaced with `_`. Counted once per field, not once
-    /// per byte.
+    /// An identity field that had a NUL or `/` replaced with `_`. Counted once per field.
     pub identity_sanitized_substituted: usize,
     /// An identity field truncated to [`MAX_IDENTITY_BYTES`]. Counted once per field.
     pub identity_sanitized_truncated: usize,
-    /// A `log`-only event carrying a [`super::ATTR_SEVERITY`] attribute that is not `Value::U64` or
-    /// not one of `{1, 2, 4}` -- an attempted notification whose severity this codec cannot put on
-    /// the wire. Distinct from [`Self::skipped_no_metrics`]: an event with **no**
-    /// `collectd.severity` attribute at all is not a notification attempt in the first place, and
-    /// is counted there instead (this module's own doc table).
+    /// A `log`-only event whose [`super::ATTR_SEVERITY`] is not `Value::U64` in `{1, 2, 4}`: an
+    /// attempted notification. An event with **no** such attribute is not an attempt, and counts
+    /// under [`Self::skipped_no_metrics`] instead.
     pub dropped_notification: usize,
-    /// An attempted notification whose `LogRecord::message` is empty (after sanitizing) or is not
-    /// a `Str`/`Bytes` `Value` -- collectd's own receiver rejects an empty notification message.
+    /// An attempted notification whose `LogRecord::message` is empty (after sanitizing) or not a
+    /// `Str`/`Bytes`; collectd's receiver rejects an empty message.
     pub dropped_empty_message: usize,
-    /// A single notification larger than `max_packet_bytes` all by itself: dropped whole, never
-    /// split -- the notification's own [`Self::dropped_oversize_list`].
+    /// A single notification larger than `max_packet_bytes`, dropped whole: the notification
+    /// counterpart of [`Self::dropped_oversize_list`].
     pub dropped_oversize_notification: usize,
-    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes. Counted once
-    /// per message, not once per byte -- collectd's own sender-side `NOTIF_MAX_MSG_LEN`.
+    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes, once per
+    /// message.
     pub notification_messages_truncated: usize,
 }
 
-/// The identity a value list is dispatched against, owned rather than borrowed: the *previous*
-/// list's identity has to outlive the event that produced it, since elision compares across events
-/// within one datagram. `clone_from` reuses these `Vec`s, so steady-state encoding allocates
-/// nothing here -- **hand-implemented below, not derived**: `#[derive(Clone)]` only generates
-/// `clone()`, and the default `Clone::clone_from` it leaves in place is `*self = source.clone()`,
-/// which allocates a fresh `Vec` per non-empty field and drops `self`'s old one, every single list
-/// (`pack_list`'s `last.clone_from(cur)`) -- exactly the per-event allocation this struct's own doc
-/// comment claims does not happen.
+/// The identity a value list is dispatched against, owned because the *previous* list's identity
+/// outlives its event: elision compares across events within one datagram.
+///
+/// `Clone` is **hand-implemented, not derived**: the derive leaves the default `clone_from`
+/// (`*self = source.clone()`), which allocates per non-empty field on every list in `pack_list`'s
+/// `last.clone_from(cur)`. The override reuses the `Vec`s, so steady-state encoding allocates
+/// nothing here.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Identity {
     host: Vec<u8>,
@@ -130,10 +113,7 @@ impl Clone for Identity {
         }
     }
 
-    /// The override that makes the struct doc's claim true: each field is refilled in place
-    /// (`Vec::clear` then `extend_from_slice`) rather than replaced by a freshly allocated clone,
-    /// so `last.clone_from(cur)` (`pack_list`) costs nothing once `last`'s buffers have grown to
-    /// their steady-state size.
+    /// Refills each field in place, so it doesn't allocate once `self`'s buffers have grown.
     fn clone_from(&mut self, source: &Self) {
         self.host.clear();
         self.host.extend_from_slice(&source.host);
@@ -149,9 +129,8 @@ impl Clone for Identity {
 }
 
 impl Identity {
-    /// The "nothing written yet" state, which is also exactly what a receiver's sticky state is at
-    /// the start of a datagram -- so comparing against this is what makes a fresh packet's first
-    /// list carry its full identity.
+    /// The "nothing written yet" state, which is a receiver's sticky state at the start of a
+    /// datagram, so a fresh packet's first list carries its full identity.
     fn clear(&mut self) {
         self.host.clear();
         self.plugin.clear();
@@ -170,22 +149,17 @@ impl Identity {
     }
 }
 
-/// Encodes events as collectd value lists packed into datagrams. Pure -- no socket -- so
-/// `collectd_out` (W3) is only a transport wrapper over this.
+/// Encodes events as collectd value lists and notifications packed into datagrams. `collectd_out`
+/// is a transport wrapper over it.
 pub struct CollectdEncoder {
     telemetry: Telemetry,
     diag: Diagnostics,
-    /// The operator-configured hostname, already sanitized at construction so the per-event host
-    /// path never re-sanitizes (and never counts) a value that came from config rather than data.
-    /// `None` means "not configured", which is not the same as empty -- see
-    /// [`CollectdEncoder::with_hostname`].
+    /// The operator-configured hostname, sanitized once at construction so the per-event path
+    /// never counts a config value. `None` means not configured.
     hostname: Option<Bytes>,
-    /// The longest single **datagram** this encoder will pack -- a list that alone exceeds it is
-    /// dropped whole (`EncodeStats::dropped_oversize_list`), never split. `usize::MAX` (the
-    /// default) is effectively uncapped; `collectd_out` (`crates/logit-outputs/src/collectd.rs`)
-    /// sets it once at build time from its own `max_packet_bytes:` config field. Encoder state
-    /// rather than a per-call argument so `encode_into` has [`FramedEncoder`]'s one signature --
-    /// `StatsdEncoder::max_packet_bytes`'s identical reasoning.
+    /// The longest single **datagram** this encoder packs; a list that alone exceeds it is
+    /// dropped whole, never split. `usize::MAX` (the default) is uncapped. Encoder state, not an
+    /// argument, so `encode_into` keeps [`FramedEncoder`]'s signature.
     max_packet_bytes: usize,
     /// The identity of the last list written into the packet currently being packed.
     last: Identity,
@@ -193,14 +167,12 @@ pub struct CollectdEncoder {
     cur: Identity,
     /// The datagram being packed.
     packet: Vec<u8>,
-    /// One encoded value list *or* one encoded notification -- cleared before each, never
-    /// reallocated. The two never overlap in time (one event's encoding finishes before the
-    /// next's begins), so a single buffer serves both.
+    /// One encoded value list *or* notification, cleared before each; they never overlap in time,
+    /// so one buffer serves both.
     list: Vec<u8>,
     /// The resolved wire values of the list currently being encoded.
     values: Vec<DsValue>,
-    /// The sanitized message of the notification currently being encoded -- cleared and rewritten
-    /// per notification, never reallocated once grown to a message's steady-state size.
+    /// The sanitized message of the notification being encoded, reused across notifications.
     message: Vec<u8>,
 }
 
@@ -236,32 +208,26 @@ impl CollectdEncoder {
         self
     }
 
-    /// Caps the longest single datagram this encoder packs -- see the field's own doc comment.
-    /// `usize::MAX` means uncapped. [`super::DEFAULT_MAX_PACKET_BYTES`] is collectd's own default;
-    /// `collectd_out` passes its own `max_packet_bytes:` (or that default) here at build time.
+    /// Caps the longest single datagram this encoder packs; `usize::MAX` means uncapped.
+    /// [`super::DEFAULT_MAX_PACKET_BYTES`] is collectd's own default.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         self
     }
 
-    /// The host written when neither `collectd.host` nor `host.name` is present -- `collectd_out`'s
-    /// own `hostname:` config field (W3), passed straight through.
+    /// The host written when neither `collectd.host` nor `host.name` is present (`collectd_out`'s
+    /// `hostname:`).
     ///
-    /// **Deliberately operator-supplied, with no default of any kind.** This encoder neither reads
-    /// the OS hostname (an OS-hostname source is explicitly deferred work, `docs/known-gaps.md`)
-    /// nor invents a literal placeholder (`syslog_out` rejected exactly that, for exactly the
-    /// reason it would be wrong here: a receiver keys every series on the host, so one made-up name
-    /// silently merges every unlabelled sender into a single host's metrics). With nothing
-    /// configured and nothing on the event, the value list is dropped and counted -- a visible,
-    /// greppable misconfiguration instead of a quiet mislabelling.
+    /// **Operator-supplied, with no default.** The encoder neither reads the OS hostname (deferred,
+    /// `docs/known-gaps.md`) nor invents a placeholder: a receiver keys every series on the host,
+    /// so one made-up name would merge every unlabelled sender into one host's metrics. With
+    /// nothing configured and nothing on the event, the list is dropped and counted.
     ///
-    /// Sanitized here, once, rather than per event; an empty or all-substituted-away value is the
-    /// same as not configuring one at all.
+    /// Sanitized once, here; an empty value is the same as none.
     pub fn with_hostname(mut self, hostname: impl Into<Bytes>) -> Self {
         let raw: Bytes = hostname.into();
         let mut sanitized = Vec::new();
-        // Byte truncation, not character truncation: a configured hostname arrives as bytes here and
-        // is not guaranteed UTF-8 any more than a wire one is.
+        // Byte truncation: a configured hostname is no more guaranteed UTF-8 than a wire one.
         sanitize_raw(&mut sanitized, &raw, false);
         self.hostname = (!sanitized.is_empty()).then(|| Bytes::from(sanitized));
         self
@@ -269,22 +235,20 @@ impl CollectdEncoder {
 }
 
 impl FramedEncoder for CollectdEncoder {
-    /// The number of messages (value lists or notifications) each datagram carries -- see this
-    /// module's doc comment. A notification's own datagram always carries exactly `1`.
+    /// The number of messages (value lists or notifications) each datagram carries; `1` for a
+    /// notification.
     type Meta = usize;
     type Stats = EncodeStats;
 
     /// Encodes every event in `batch` into `out` (cleared first), packing value lists into
     /// datagrams of at most [`CollectdEncoder::with_max_packet_bytes`]. Never fails: a per-list
-    /// problem is a counted drop, not an error, and there is nothing for a caller to react to
-    /// beyond the returned [`EncodeStats`].
+    /// problem is a counted drop.
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<usize>) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
         let max_packet_bytes = self.max_packet_bytes;
-        // Destructured rather than reached through `self`: `last`, `cur`, `packet`, `list`,
-        // `values` and `message` are all borrowed at once by the packing loop below, which
-        // `&mut self` methods could not express.
+        // Destructured: the packing loop borrows these fields at once, which `&mut self` methods
+        // can't express.
         let Self { telemetry, diag, hostname, last, cur, packet, list, values, message, .. } = self;
         let mut ctx = Ctx { telemetry, diag, stats: &mut stats };
 
@@ -294,14 +258,10 @@ impl FramedEncoder for CollectdEncoder {
 
         for event in &batch.events {
             if event.metrics.is_empty() {
-                // A `log`-only event is not a notification *attempt* unless it carries a
-                // `collectd.severity` attribute at all -- a plain log event with no such attribute
-                // is exactly the "no counter of its own" skip this module doc's table already
-                // documents, unchanged from before this attribute existed. Checked with a plain
-                // scan rather than `collect_carriers` so that non-attempt (the common case) costs
-                // nothing beyond this scan and, critically, does not count every other attribute on
-                // the event as `tags_dropped_no_wire_form` -- work `collect_carriers` only does once
-                // an attempt is actually underway.
+                // A `log`-only event is a notification *attempt* only if it carries
+                // `collectd.severity`; otherwise it is the uncounted no-metrics skip. A plain scan,
+                // not `collect_carriers`, so a non-attempt doesn't count every attribute as
+                // `tags_dropped_no_wire_form`.
                 let is_notification_attempt = event.log.is_some()
                     && logit_core::attrs::merged(&batch.resource, event)
                         .any(|(key, _)| logit_core::interner::resolve(key) == ATTR_SEVERITY);
@@ -331,51 +291,35 @@ impl FramedEncoder for CollectdEncoder {
 
             let carriers = collect_carriers(&batch.resource, event, &mut ctx);
 
-            // Metrics win: `collectd.severity` has no wire form on a value list (only a
-            // metrics-empty `log` event can be a notification -- `mod.rs`'s module doc). A
-            // wrong-typed carrier was already counted inside `collect_carriers`'s own match; this
-            // is the correctly-typed case, which that function deliberately leaves uncounted since
-            // it doesn't yet know which path the caller is on.
+            // Metrics win: `collectd.severity` has no wire form on a value list. `collect_carriers`
+            // counted a wrong-typed one; it leaves the `U64` case for the caller, which knows the
+            // path.
             if carriers.severity.is_some() {
                 ctx.tag_dropped_unrepresentable();
             }
 
-            // How many value lists this event would have produced: one for a like-relay event, one
-            // per record for a fallback one. The two whole-event drops below happen before either
-            // path runs, so this is the number they have to count -- `logit.output.metrics.skipped`
-            // is a *per record* figure at every other sink (`prometheus/mod.rs` counts inside its
-            // own `for record in &event.metrics`), and an operator summing it across sinks needs
-            // this one to mean the same thing.
+            // The value lists this event would produce, which the two whole-event drops below
+            // count, so `logit.output.metrics.skipped` stays per-record as at every other sink.
             let lists = if carriers.type_.is_some() { 1 } else { event.metrics.len() };
 
-            // `nanos_to_cdtime` returns 0 for any non-positive instant, which is also collectd's own
-            // "no time given" -- and a list with no time is one its receiver rejects, so this is a
-            // drop rather than a zero on the wire.
+            // 0 is collectd's "no time given", which its receiver rejects: drop, don't send it.
             let time_cdtime = nanos_to_cdtime(event.timestamp);
             if time_cdtime == 0 {
                 ctx.drop_unencodable_timestamp(event.timestamp, lists);
                 continue;
             }
 
-            // The host is the same for every list this event produces, so it is resolved once --
-            // and if it cannot be resolved at all, every one of those lists goes.
+            // Resolved once per event; without one, every list the event produces goes.
             cur.host.clear();
             if !resolve_host(&mut cur.host, &carriers, hostname.as_deref(), lists, &mut ctx) {
                 continue;
             }
 
             if carriers.type_.is_some() {
-                // Like-relay: the event arrived from `collectd_in` (or was given `collectd.*`
-                // attributes on purpose), so its identity is the wire's own and its whole
-                // `MetricList` is one value list, in order.
-                //
-                // Which is why the encode side needs the same cap the decode side enforces: the
-                // wire's `count` is a `u16`, this codec accepts at most `MAX_VALUES_PER_LIST` of
-                // them, and a longer list would sail under the byte cap only to be rejected as a
-                // malformed part by any receiver built on this codec -- taking every unrelated list
-                // packed behind it in the same datagram down with it. `aggregate`/`kv_metrics` can
-                // both put far more than 64 records on one event, and a `set` stamping
-                // `collectd.type` is all it takes to route that here.
+                // Like-relay: the identity is the wire's own and the whole `MetricList` is one
+                // value list, in order, so the decode side's `MAX_VALUES_PER_LIST` cap applies.
+                // `aggregate`/`kv_metrics` can put far more records on one event, and a `set`
+                // stamping `collectd.type` routes it here.
                 if event.metrics.len() > MAX_VALUES_PER_LIST {
                     ctx.drop_too_many_values(event.metrics.len());
                     continue;
@@ -397,10 +341,9 @@ impl FramedEncoder for CollectdEncoder {
                     match resolve_value(record, &mut ctx) {
                         Some(value) => values.push(value),
                         None => {
-                            // The whole list goes, counted once by `resolve_value` for the first
-                            // failing record: collectd's receiver rejects a list whose value count
-                            // disagrees with its type's `ds_num`, so a partial list would be
-                            // discarded at the far end anyway -- and silently, which is worse.
+                            // The whole list goes, counted once for the first failing record:
+                            // collectd's receiver would reject a partial list (its value count
+                            // disagrees with the type's `ds_num`) without counting it.
                             resolved_all = false;
                             break;
                         }
@@ -426,9 +369,8 @@ impl FramedEncoder for CollectdEncoder {
                 continue;
             }
 
-            // Fallback: an event from anywhere else in the pipeline. Each record becomes its own
-            // single-data-source list, named the way collectd's own `write_graphite` reads a
-            // dotted name back: plugin, then type_instance.
+            // Fallback: each record becomes its own single-data-source list, its dotted name split
+            // into plugin and type_instance.
             for record in &event.metrics {
                 let Some(value) = resolve_value(record, &mut ctx) else { continue };
                 let full = logit_core::interner::resolve(record.name);
@@ -468,9 +410,8 @@ impl FramedEncoder for CollectdEncoder {
     }
 }
 
-/// The telemetry/diagnostics/stats triple every drop site needs, carried together so a drop reports
-/// itself in all three places at once and can never be counted in one but not the others
-/// (`crates/logit-outputs/src/statsd.rs`'s `EncodeCtx` is the same idea).
+/// The telemetry/diagnostics/stats triple every drop site needs, carried together so a drop is
+/// never counted in one but not the others.
 struct Ctx<'a> {
     telemetry: &'a Telemetry,
     diag: &'a mut Diagnostics,
@@ -498,8 +439,8 @@ impl Ctx<'_> {
         self.telemetry.count("logit.output.identity.sanitized", 1.0, &[("reason", "truncated")]);
     }
 
-    /// One of the metric kinds collectd has no data-source type for. `metric_kind` is the counter
-    /// tag (`&'static str`, as every tag must be); `described` is the prose the diagnostic uses.
+    /// A metric kind collectd has no data-source type for. `metric_kind` is the counter tag;
+    /// `described` is the diagnostic's prose.
     fn drop_kind(&mut self, metric_kind: &'static str, described: &str, name: &str) {
         self.stats.dropped_unsupported_kind += 1;
         self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", metric_kind)]);
@@ -558,9 +499,8 @@ impl Ctx<'_> {
         );
     }
 
-    /// `lists` is how many value lists the dropped event would have produced -- see
-    /// [`EncodeStats::dropped_unencodable_timestamp`] for why both whole-event drops are counted
-    /// per list rather than per event.
+    /// `lists` is how many value lists the dropped event would have produced (see
+    /// [`EncodeStats::dropped_unencodable_timestamp`]).
     fn drop_unencodable_timestamp(&mut self, timestamp: i64, lists: usize) {
         self.stats.dropped_unencodable_timestamp += lists;
         self.telemetry.count(
@@ -636,9 +576,8 @@ impl Ctx<'_> {
         );
     }
 
-    /// A `log`-only event's [`super::ATTR_SEVERITY`] resolved to nothing this codec can put on the
-    /// wire -- absent-despite-being-attempted (present but the wrong `Value` type), or present as
-    /// `Value::U64` but outside `{1, 2, 4}`.
+    /// A `log`-only event's [`super::ATTR_SEVERITY`] is the wrong `Value` type (`None`) or a
+    /// `U64` outside `{1, 2, 4}`.
     fn drop_notification(&mut self, severity: Option<u64>) {
         self.stats.dropped_notification += 1;
         self.telemetry.count(
@@ -655,8 +594,7 @@ impl Ctx<'_> {
         );
     }
 
-    /// An attempted notification whose message is empty (after sanitizing) or not a `Str`/`Bytes`
-    /// `Value` -- collectd's own receiver rejects an empty notification message.
+    /// See [`EncodeStats::dropped_empty_message`].
     fn drop_empty_message(&mut self) {
         self.stats.dropped_empty_message += 1;
         self.telemetry.count("logit.output.metrics.skipped", 1.0, &[("reason", "empty_message")]);
@@ -667,10 +605,8 @@ impl Ctx<'_> {
         );
     }
 
-    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` bytes. Counted once per
-    /// message, the `logit.output.messages.truncated` shape `syslog_out` already established for
-    /// an oversize message body (as opposed to `identity.sanitized`, which is for the five
-    /// identity fields).
+    /// A notification message truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` bytes, counted as
+    /// `logit.output.messages.truncated` (as `syslog_out` does), not `identity.sanitized`.
     fn notification_message_truncated(&mut self) {
         self.stats.notification_messages_truncated += 1;
         self.telemetry.count("logit.output.messages.truncated", 1.0, &[]);
@@ -683,9 +619,7 @@ impl Ctx<'_> {
         );
     }
 
-    /// A single notification larger than `max_packet_bytes` all by itself -- the notification's own
-    /// [`Ctx::drop_oversize_list`], counted separately so the two reasons stay distinguishable in
-    /// telemetry (a notification is never a value list, and vice versa).
+    /// [`Ctx::drop_oversize_list`] for a notification, under its own reason.
     fn drop_oversize_notification(&mut self, max_packet_bytes: usize) {
         self.stats.dropped_oversize_notification += 1;
         self.telemetry.count(
@@ -712,25 +646,20 @@ struct Carriers<'a> {
     plugin_instance: Option<&'a Value>,
     type_: Option<&'a Value>,
     type_instance: Option<&'a Value>,
-    /// Already converted to ticks; `0` means absent, which is collectd's own "unspecified".
+    /// In ticks; `0` means absent, collectd's "unspecified".
     interval_cdtime: u64,
     /// The normalized host attribute, used only when `collectd.host` is absent.
     host_name: Option<&'a Value>,
-    /// Whether a [`super::ATTR_SEVERITY`] attribute was present at all, in **any** `Value` type --
-    /// what `encode_into` reads to decide a `log`-only event is an *attempted* notification rather
-    /// than an ordinary metrics-empty skip. See [`EncodeStats::dropped_notification`]'s own doc for
-    /// why this is `bool` and [`Self::severity`] is a separate, narrower `Option`.
+    /// Whether a [`super::ATTR_SEVERITY`] attribute was present in **any** `Value` type, which
+    /// makes a `log`-only event an *attempted* notification.
     severity_present: bool,
-    /// The raw wire severity, resolved only when the attribute was `Value::U64` -- `None` covers
-    /// both "absent" and "present with the wrong `Value` type", which fail identically once a
-    /// notification is attempted ([`EncodeStats::dropped_notification`]).
+    /// The raw wire severity when the attribute was `Value::U64`; `None` for absent or wrong-typed,
+    /// which fail identically once a notification is attempted.
     severity: Option<u64>,
 }
 
-/// Walks one event's attributes merged over its resource (event wins -- [`logit_core::attrs::merged`]),
-/// capturing the `collectd.*` carriers and counting everything that has no wire form. One pass does
-/// both jobs and stays symmetric with what it filters out, exactly the way `statsd_out`'s
-/// `build_tag_suffix` does.
+/// Walks one event's attributes merged over its resource ([`logit_core::attrs::merged`]; the
+/// event wins), capturing the `collectd.*` carriers and counting everything with no wire form.
 fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx) -> Carriers<'a> {
     let mut carriers = Carriers::default();
     for (key, value) in logit_core::attrs::merged(resource, event) {
@@ -747,30 +676,21 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
                     carriers.type_instance = Some(value)
                 }
                 ("interval", Value::F64(seconds)) if seconds.is_finite() && *seconds > 0.0 => {
-                    // Exact for every interval a real sender uses: the tick count is what the
-                    // decode side divided by, so `10.0` seconds comes back as `10 << 30` ticks.
+                    // Exact for every interval a decoded list carries: `10.0` is `10 << 30` ticks.
                     carriers.interval_cdtime = (seconds * CDTIME_ONE_SECOND as f64).round() as u64;
                 }
-                // Captured regardless of whether the caller turns out to be on the notification
-                // path or the value-list one -- `collect_carriers` runs before that's decided.
-                // The value-list path counts this `tags_dropped_unrepresentable` itself
-                // (`encode_into`'s own comment): metrics win, and `collectd.severity` has no wire
-                // form there.
+                // Uncounted here: only the caller knows whether it's on the notification path.
                 ("severity", Value::U64(v)) => {
                     carriers.severity_present = true;
                     carriers.severity = Some(*v);
                 }
-                // Present, but not `Value::U64` -- resolves to nothing (`severity` stays `None`),
-                // yet still marks the attempt as having *had* a `collectd.severity` attribute, so
-                // `encode_into` treats this as a failed notification (`dropped_notification`)
-                // rather than an ordinary metrics-empty skip.
+                // Wrong-typed: still an attempt, so it fails as `dropped_notification` rather than
+                // skipping as a plain log event.
                 ("severity", _) => {
                     carriers.severity_present = true;
                     ctx.tag_dropped_unrepresentable();
                 }
-                // A carrier of the wrong `Value` type, a non-positive interval, or a `collectd.*`
-                // name this codec has no wire form for. Not silently ignored: an operator who set
-                // one of these deliberately deserves to see it counted.
+                // A wrong-typed carrier, a non-positive interval, or an unknown `collectd.*` name.
                 _ => ctx.tag_dropped_unrepresentable(),
             }
             continue;
@@ -778,17 +698,15 @@ fn collect_carriers<'a>(resource: &'a Resource, event: &'a Event, ctx: &mut Ctx)
         if key == "host.name" && matches!(value, Value::Str(_) | Value::Bytes(_)) {
             carriers.host_name = Some(value);
         }
-        // Counted even for `host.name`: the host resolution reads it, but the *attribute* still has
-        // no wire form of its own -- collectd has no tags at all.
+        // Counted even for `host.name`: host resolution reads it, but it has no wire form itself.
         ctx.tag_dropped_no_wire_form();
     }
     carriers
 }
 
-/// This event's host: `collectd.host`, else `host.name`, else the encoder's configured
-/// [`CollectdEncoder::with_hostname`] -- the first that survives sanitizing non-empty. Returns
-/// whether one was found; `false` means the event is dropped (counted `no_host`), because collectd's
-/// receiver rejects an empty host and no honest value exists to substitute.
+/// This event's host: `collectd.host`, else `host.name`, else
+/// [`CollectdEncoder::with_hostname`], the first that sanitizes non-empty. `false` means none, and
+/// the event is dropped (counted `no_host`).
 fn resolve_host(
     out: &mut Vec<u8>,
     carriers: &Carriers,
@@ -804,7 +722,7 @@ fn resolve_host(
             }
         }
     }
-    // Already sanitized and known non-empty (`with_hostname`), so this is a copy.
+    // Sanitized and non-empty since `with_hostname`.
     if let Some(hostname) = hostname {
         out.clear();
         out.extend_from_slice(hostname);
@@ -814,17 +732,16 @@ fn resolve_host(
     false
 }
 
-/// [`sanitize_into`] for an optional carrier: an absent one leaves `out` empty, which is exactly
-/// what an absent instance means on the wire.
+/// [`sanitize_into`] for an optional carrier: an absent one leaves `out` empty, which is what an
+/// absent instance means on the wire.
 fn sanitize_carrier(out: &mut Vec<u8>, carrier: Option<&Value>, ctx: &mut Ctx) {
     if let Some((raw, is_utf8)) = carrier.and_then(text_of) {
         sanitize_into(out, raw, is_utf8, ctx);
     }
 }
 
-/// A `Value`'s bytes and whether they are known-valid UTF-8 (which is what decides between
-/// character- and byte-boundary truncation). `None` for every other `Value` kind -- those never
-/// reach here, since [`collect_carriers`] filters and counts them first.
+/// A `Value`'s bytes and whether they are known-valid UTF-8 (character- or byte-boundary
+/// truncation). `None` for any other kind; [`collect_carriers`] filters those out first.
 fn text_of(value: &Value) -> Option<(&[u8], bool)> {
     match value {
         Value::Str(bytes) => Some((bytes, true)),
@@ -833,8 +750,7 @@ fn text_of(value: &Value) -> Option<(&[u8], bool)> {
     }
 }
 
-/// [`sanitize_raw`], reporting what it did. See [`super`]'s "Sanitization" section for the rules and
-/// why the list is as short as it is.
+/// [`sanitize_raw`], counting what it did. [`super`]'s "Sanitization" section has the rules.
 fn sanitize_into(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool, ctx: &mut Ctx) {
     let (substituted, truncated) = sanitize_raw(out, raw, is_utf8);
     if substituted {
@@ -848,11 +764,9 @@ fn sanitize_into(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool, ctx: &mut Ctx) {
 /// Writes `raw` into `out` (cleared first) with NUL and `/` replaced by `_`, truncated to
 /// [`MAX_IDENTITY_BYTES`]. Returns `(substituted, truncated)`.
 ///
-/// Pure, so [`CollectdEncoder::with_hostname`] can sanitize a configured hostname at
-/// construction with nothing to count. Substitution rather than deletion, following
-/// `crates/logit-outputs/src/statsd.rs`'s `sanitize_into`: distinct inputs stay distinct.
-/// `is_utf8` truncates on a character boundary instead of a byte one -- neither substitution
-/// changes a byte's length, so the boundaries of the input still hold in `out`.
+/// Uncounted, so [`CollectdEncoder::with_hostname`] can use it. Substitution rather than deletion
+/// keeps distinct inputs distinct. `is_utf8` truncates on a character boundary; a substitution
+/// never changes length, so the input's boundaries still hold in `out`.
 fn sanitize_raw(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> (bool, bool) {
     out.clear();
     let mut substituted = false;
@@ -868,9 +782,8 @@ fn sanitize_raw(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> (bool, bool) {
     if out.len() > MAX_IDENTITY_BYTES {
         let mut end = MAX_IDENTITY_BYTES;
         if is_utf8 {
-            // Walk back off any UTF-8 continuation byte (`0b10xxxxxx`) so the truncated string is
-            // still valid UTF-8 -- a half-written character would make the attribute it round-trips
-            // into a `Value::Bytes` instead of a `Value::Str`.
+            // Walk back off UTF-8 continuation bytes (`0b10xxxxxx`): a half-written character
+            // would round-trip as a `Value::Bytes` instead of a `Value::Str`.
             while end > 0 && out[end] & 0xC0 == 0x80 {
                 end -= 1;
             }
@@ -881,9 +794,8 @@ fn sanitize_raw(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> (bool, bool) {
     (substituted, truncated)
 }
 
-/// The stock `types.db` type name for a one-data-source list of this value's kind. All four
-/// (`counter`, `gauge`, `derive`, `absolute`) are single-data-source types in collectd's own shipped
-/// `types.db`, so a receiver resolves them with nothing extra installed.
+/// The stock `types.db` type name for a one-data-source list of this value's kind. All four are
+/// single-data-source types in collectd's shipped `types.db`, so any receiver resolves them.
 fn fallback_type(value: DsValue) -> &'static str {
     match value {
         DsValue::Counter(_) => "counter",
@@ -893,15 +805,14 @@ fn fallback_type(value: DsValue) -> &'static str {
     }
 }
 
-/// One record's wire value, or `None` (counted, with a throttled diagnostic) when collectd has no
-/// way to carry it. The exhaustive `match` below has one arm per [`MetricKind`] variant and **no
-/// wildcard**, on purpose: a new variant must be a compile error here, not a silent drop.
+/// One record's wire value, or `None` (counted, with a throttled diagnostic) when collectd can't
+/// carry it. The `match` has **no wildcard**, so a new [`MetricKind`] variant is a compile error
+/// here, not an uncounted drop.
 fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
     let name = logit_core::interner::resolve(record.name);
 
-    // Checked before the kind match rather than inside every arm: only `Gauge` has a wire form for
-    // "no reading this interval" (NaN), so a flagged point of any other kind is a drop regardless of
-    // what its default numeric payload happens to be (`MetricRecord::flags`' own doc).
+    // Only `Gauge` has a wire form for "no reading" (NaN); any other flagged kind is a drop,
+    // whatever its default payload (`MetricRecord::flags`).
     if record.is_no_recorded_value() && !matches!(record.kind, MetricKind::Gauge(_)) {
         ctx.drop_no_recorded_value(name);
         return None;
@@ -919,7 +830,7 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
                 None
             }
         },
-        // A flagged gauge leaves as NaN -- the exact inverse of the decode side's flagged zero.
+        // A flagged gauge leaves as NaN, the inverse of the decode side's flagged zero.
         MetricKind::Gauge(value) => {
             Some(DsValue::Gauge(if record.is_no_recorded_value() { f64::NAN } else { *value }))
         }
@@ -959,15 +870,13 @@ fn resolve_value(record: &MetricRecord, ctx: &mut Ctx) -> Option<DsValue> {
 }
 
 /// A `Sum`'s `f64` as a `u64`, or `None` (counted) when it is non-finite, fractional, or out of
-/// range. Never rounds: statsd's `page.views:2|c|@0.3` reaches a sink as `6.666…`, and both `6` and
-/// `7` are numbers nobody sent.
+/// range. Never rounds: statsd's `page.views:2|c|@0.3` reaches a sink as `6.666…`, and neither `6`
+/// nor `7` was sent.
 ///
-/// The bounds are inclusive, and the `as` cast saturates (guaranteed since Rust 1.45) -- which
-/// matters at exactly one value: a wire COUNTER of `u64::MAX` decodes to the `f64` `2^64` (the
-/// nearest representable double, since `u64::MAX` itself is not), so an exclusive bound would drop
-/// the very value it round-tripped from. Everything above `2^53` is already imprecise on the way in
-/// (`docs/known-gaps.md`'s shared int/double row); saturating there is the honest end of an
-/// already-documented approximation, and `decode(encode(b)) == b` holds across the whole range.
+/// The bounds are inclusive and the `as` cast saturates: a wire COUNTER of `u64::MAX` decodes to
+/// the `f64` `2^64`, so an exclusive bound would drop the value it round-tripped from. Above `2^53`
+/// the value is already imprecise (`docs/known-gaps.md`), and `decode(encode(b)) == b` holds across
+/// the whole range.
 fn as_u64(value: f64, name: &str, ctx: &mut Ctx) -> Option<u64> {
     if value.is_finite() && value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
         return Some(value as u64);
@@ -976,8 +885,8 @@ fn as_u64(value: f64, name: &str, ctx: &mut Ctx) -> Option<u64> {
     None
 }
 
-/// [`as_u64`]'s signed sibling, for DERIVE -- same inclusive bounds, for the same reason
-/// (`i64::MAX as f64` is `2^63`; `i64::MIN as f64` is exactly `-2^63`).
+/// [`as_u64`]'s signed sibling, for DERIVE, with the same inclusive bounds (`i64::MAX as f64` is
+/// `2^63`; `i64::MIN as f64` is exactly `-2^63`).
 fn as_i64(value: f64, name: &str, ctx: &mut Ctx) -> Option<i64> {
     if value.is_finite()
         && value.fract() == 0.0
@@ -993,9 +902,8 @@ fn as_i64(value: f64, name: &str, ctx: &mut Ctx) -> Option<i64> {
 /// Encodes one value list into `list` (cleared first), eliding every identity part that already
 /// matches `last`.
 ///
-/// TimeHR and IntervalHR are written for **every** list, never elided -- collectd's own sender does
-/// the same, and the two bytes saved would not be worth a list whose time silently came from an
-/// earlier one.
+/// TimeHR and IntervalHR are written for **every** list, never elided, though collectd's own
+/// sender elides unchanged ones: normalization 10 in [`super`]'s list.
 fn write_list(
     list: &mut Vec<u8>,
     last: &Identity,
@@ -1025,11 +933,8 @@ fn write_list(
     part::write_values_part(list, values);
 }
 
-/// Encodes one list and appends it to the packet being packed, flushing the packet first if the list
-/// will not fit.
-///
-/// Every buffer is passed in rather than reached through `&mut self`: `packet`, `list`, `last`,
-/// `cur` and `values` are all live simultaneously here, which no `&mut self` method could express.
+/// Encodes one list and appends it to the packet being packed, flushing the packet first if the
+/// list won't fit. Buffers are passed in because they are all live at once.
 #[allow(clippy::too_many_arguments)]
 fn pack_list(
     packet: &mut Vec<u8>,
@@ -1047,12 +952,10 @@ fn pack_list(
     write_list(list, last, cur, time_cdtime, interval_cdtime, values);
 
     if !packet.is_empty() && packet.len() + list.len() > max_packet_bytes {
-        // Flush, then **encode the same list a second time**. The version just built elided every
-        // identity part that matched the previous list *in the packet being flushed*, and a
-        // receiver resets its sticky state at each datagram boundary -- so if that elided list led
-        // the next datagram, its plugin/type would be whatever that datagram's later parts happen
-        // to set, or nothing at all. Encoding at most twice per boundary is the entire cost of
-        // getting this right, and it only ever happens on a boundary, not per list.
+        // Flush, then **encode the same list again**: the version just built elided parts that
+        // matched the packet being flushed, and the receiver resets sticky state at each datagram
+        // boundary, so leading the next datagram it would have no plugin/type. The cost is one
+        // re-encode per boundary.
         out.push_with(packet, *lists_in_packet);
         packet.clear();
         *lists_in_packet = 0;
@@ -1070,11 +973,9 @@ fn pack_list(
     last.clone_from(cur);
 }
 
-/// Sanitizes a notification message into `out` (cleared first): NUL becomes `_` (uncounted -- a
-/// message is free text, not a path-like identity field, and collectd's own C strings make this
-/// substitution routine regardless), `/` rides through untouched, truncated to
-/// [`NOTIF_MAX_MSG_LEN`] `- 1` bytes on a character boundary (`is_utf8`) or a byte boundary.
-/// Returns whether it truncated.
+/// Sanitizes a notification message into `out` (cleared first) per [`super`]'s "Sanitization"
+/// section: NUL becomes `_`, `/` rides through, and it is truncated to [`NOTIF_MAX_MSG_LEN`] `- 1`
+/// bytes on a character (`is_utf8`) or byte boundary. Returns whether it truncated.
 fn sanitize_message(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> bool {
     out.clear();
     for &byte in raw {
@@ -1086,7 +987,7 @@ fn sanitize_message(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> bool {
     }
     let mut end = max;
     if is_utf8 {
-        // Same character-boundary walk-back as `sanitize_raw` -- see its own doc comment.
+        // Same character-boundary walk-back as `sanitize_raw`.
         while end > 0 && out[end] & 0xC0 == 0x80 {
             end -= 1;
         }
@@ -1095,11 +996,10 @@ fn sanitize_message(out: &mut Vec<u8>, raw: &[u8], is_utf8: bool) -> bool {
     true
 }
 
-/// Encodes one notification into `notif` (cleared first), in collectd's own sender order: TimeHR,
-/// Severity, Host, Plugin, PluginInstance, Type, TypeInstance, Message. Plugin/PluginInstance/
-/// Type/TypeInstance are written only when non-empty -- absent exactly as an absent instance on a
-/// value list is -- but, unlike [`write_list`], **never elided against `last`**: see this crate's
-/// `collectd` module doc, "a notification's identity is always written in full."
+/// Encodes one notification into `notif` (cleared first), in collectd's sender order: TimeHR,
+/// Severity, Host, Plugin, PluginInstance, Type, TypeInstance, Message. The four optional identity
+/// parts are written only when non-empty but, unlike [`write_list`], **never elided against
+/// `last`** (see [`super`]'s module doc).
 fn write_notification(
     notif: &mut Vec<u8>,
     cur: &Identity,
@@ -1126,10 +1026,8 @@ fn write_notification(
     part::write_string_part(notif, part::TYPE_MESSAGE, message);
 }
 
-/// Encodes one notification and flushes it as its **own** datagram -- [`pack_list`]'s notification
-/// twin, and simpler in two ways: because [`write_notification`] never elides, there is no need to
-/// re-encode after a flush, and because a notification never shares a datagram with anything else,
-/// there is no packing decision to make beyond "flush what's there, then push this alone".
+/// Encodes one notification and pushes it as its **own** datagram: [`pack_list`]'s counterpart,
+/// with no re-encode (nothing is elided) and no packing decision.
 #[allow(clippy::too_many_arguments)]
 fn pack_notification(
     packet: &mut Vec<u8>,
@@ -1151,16 +1049,9 @@ fn pack_notification(
         return;
     }
 
-    // A notification is always its own datagram, exactly as collectd's own sender does (the
-    // recorded capture confirms it, `mod.rs`'s module doc has the detail): flush whatever
-    // value-list packet is already in progress, then push the notification alone. `last` is
-    // cleared both before and after -- a notification neither elides against a preceding list's
-    // identity (`write_notification` never reads `last` at all) nor leaves elision state behind
-    // for a following one. Without the trailing `clear`, a list right behind this notification
-    // would wrongly see `last` as whatever `cur` the notification carried and elide a field the
-    // real receiver's sticky state never actually held (the field `write_notification` omitted
-    // because it was empty on this notification, not because it was unchanged from the list
-    // before it).
+    // Flush any value-list packet in progress, then push the notification alone. Without the
+    // trailing `clear`, the next list would elide against this notification's `cur`, including
+    // fields `write_notification` omitted as empty, which the receiver's sticky state never held.
     if !packet.is_empty() {
         out.push_with(packet, *lists_in_packet);
         packet.clear();
@@ -1171,10 +1062,8 @@ fn pack_notification(
     last.clear();
 }
 
-/// Encodes one `log`-only event that has already been established as an *attempted* notification
-/// (`carriers.severity_present`) into `packet`/`notif` -- the notification half of
-/// [`CollectdEncoder::encode_into`]'s per-event loop. Every early return here is a drop, already
-/// counted by the callee that returns `None`/`false`.
+/// Encodes one `log`-only event already established as an *attempted* notification
+/// (`carriers.severity_present`). Every early return is a drop, counted where it's detected.
 #[allow(clippy::too_many_arguments)]
 fn encode_notification(
     event: &Event,
@@ -1296,9 +1185,8 @@ mod tests {
         event
     }
 
-    /// Every encoding test runs with a configured hostname: without one, an event carrying neither
-    /// `collectd.host` nor `host.name` is dropped outright ([`CollectdEncoder::with_hostname`]'s own
-    /// doc), which is its own test below rather than a trap for every other one.
+    /// An encoder with a configured hostname, so events without a host aren't dropped; the no-host
+    /// drop has its own test.
     fn encode(batch: &EventBatch, max_packet_bytes: usize) -> (MessageBuf<usize>, EncodeStats) {
         let mut encoder = CollectdEncoder::new()
             .with_hostname("fixture-host")
@@ -1308,8 +1196,7 @@ mod tests {
         (out, stats)
     }
 
-    /// Encodes with live telemetry and diagnostics attached, so a test can assert on both the
-    /// aggregate [`EncodeStats`] and the emitted counters.
+    /// Encodes with live telemetry and diagnostics, to assert on both [`EncodeStats`] and counters.
     fn encode_counted(
         batch: &EventBatch,
         max_packet_bytes: usize,
@@ -1336,18 +1223,15 @@ mod tests {
         })
     }
 
-    /// Whether `registry` recorded a point named `metric` at all, regardless of tags -- for a
-    /// counter with none (`logit.output.messages.truncated`), unlike [`counted`]. Drains, so call
-    /// once.
+    /// Whether `registry` recorded a point named `metric`, regardless of tags (for an untagged
+    /// counter). Drains, so call once.
     fn metric_recorded(registry: &Registry, metric: &str) -> bool {
         registry.drain(0).iter().any(|event| {
             event.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == metric)
         })
     }
 
-    /// The **total** recorded on `logit.output.metrics.skipped{reason}` -- [`counted`] only answers
-    /// "was anything recorded at all", and a per-list count needs the number itself. Drains, so call
-    /// it once.
+    /// The **total** recorded on `logit.output.metrics.skipped{reason}`. Drains, so call once.
     fn skipped_total(registry: &Registry, reason: &str) -> f64 {
         let events = registry.drain(0);
         let mut total = 0.0;
@@ -1368,7 +1252,7 @@ mod tests {
         total
     }
 
-    /// Decodes everything `packets` holds back into events, the way a real `collectd_in` would.
+    /// Decodes every datagram in `packets` back into events.
     fn decode_all(packets: &MessageBuf<usize>) -> Vec<Event> {
         let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
         let mut events = Vec::new();
@@ -1384,8 +1268,8 @@ mod tests {
         event.attributes.get(key).cloned()
     }
 
-    /// How many parts of `part_type` a datagram carries -- a real part walk, never a byte scan:
-    /// `TYPE_HOST` is `0x0000`, a pair of bytes that turns up inside half the payloads here.
+    /// How many parts of `part_type` a datagram carries: a part walk, not a byte scan, because
+    /// `TYPE_HOST` is `0x0000`, which turns up inside many payloads.
     fn count_parts(bytes: &[u8], part_type: u16) -> usize {
         let mut at = 0;
         let mut count = 0;
@@ -1417,8 +1301,8 @@ mod tests {
         assert_eq!(events[0].metrics[0].kind, MetricKind::Gauge(0.5));
     }
 
-    /// A decoded packet, re-encoded, must decode to the same events -- the fixed point in miniature
-    /// (`tests/collectd_fixed_point.rs` is the exhaustive version).
+    /// A decoded packet, re-encoded, decodes to the same events (`tests/collectd_fixed_point.rs` is
+    /// the exhaustive version).
     #[test]
     fn a_decoded_packet_survives_a_re_encode() {
         let mut decoder = CollectdDecoder::new(Arc::new(Resource::default()));
@@ -1430,7 +1314,7 @@ mod tests {
         assert_eq!(decode_all(&packets), first.events);
     }
 
-    /// The byte-order assertion, encode side: a gauge is written little-endian.
+    /// A gauge is written little-endian.
     #[test]
     fn a_gauge_is_written_little_endian() {
         let event = relay_event(vec![record("load.load", MetricKind::Gauge(1.5))]);
@@ -1489,8 +1373,7 @@ mod tests {
         assert_eq!(packets.len(), 1, "both lists fit one datagram");
         let (bytes, lists) = packets.iter_with().next().unwrap();
         assert_eq!(*lists, 2);
-        // One Host/Plugin/Type part for two lists is the whole point of elision; the differing
-        // TypeInstance is the one identity part the second list still has to write.
+        // One Host/Plugin/Type part for two lists; only the differing TypeInstance is rewritten.
         assert_eq!(count_parts(bytes, part::TYPE_HOST), 1, "the second list must elide Host");
         assert_eq!(count_parts(bytes, part::TYPE_PLUGIN), 1);
         assert_eq!(count_parts(bytes, part::TYPE_TYPE), 1);
@@ -1499,8 +1382,8 @@ mod tests {
         assert_eq!(decode_all(&packets).len(), 2);
     }
 
-    /// The re-encode `pack_list` exists for: the first list of a *new* datagram carries its full
-    /// identity, because the receiver's sticky state resets at the boundary.
+    /// The first list of a *new* datagram carries its full identity, because the receiver's
+    /// sticky state resets at the boundary.
     #[test]
     fn the_first_list_of_every_datagram_carries_its_full_identity() {
         // Two lists that cannot share a datagram: a cap just above one list's size.
@@ -1525,7 +1408,7 @@ mod tests {
             assert_eq!(count_parts(bytes, part::TYPE_PLUGIN), 1);
             assert_eq!(count_parts(bytes, part::TYPE_TYPE), 1);
         }
-        // And the values survive: without the re-encode the second datagram would have no plugin.
+        // Without the re-encode, the second datagram would have no plugin.
         let events = decode_all(&packets);
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].metrics[0].kind, MetricKind::Gauge(0.75));
@@ -1607,7 +1490,7 @@ mod tests {
         assert_eq!(attr(&events[0], ATTR_TYPE), Some(Value::from("counter")));
         assert_eq!(attr(&events[0], ATTR_TYPE_INSTANCE), Some(Value::from("requests.total")));
         assert_eq!(attr(&events[0], ATTR_PLUGIN_INSTANCE), None);
-        // A name with no `.` at all: the whole name is the plugin, no type_instance.
+        // With no `.`, the whole name is the plugin, with no type_instance.
         assert_eq!(attr(&events[1], ATTR_PLUGIN), Some(Value::from("uptime")));
         assert_eq!(attr(&events[1], ATTR_TYPE), Some(Value::from("gauge")));
         assert_eq!(attr(&events[1], ATTR_TYPE_INSTANCE), None);
@@ -1685,7 +1568,7 @@ mod tests {
         }
     }
 
-    /// A negative DERIVE is legal (it is a signed type), and `u64::MAX`-adjacent counters are not.
+    /// A negative DERIVE is legal (a signed type); an out-of-range counter is not.
     #[test]
     fn a_negative_derive_encodes_where_a_negative_counter_does_not() {
         let mut event = Event::empty(TS, AttrMap::new());
@@ -1709,9 +1592,7 @@ mod tests {
         );
     }
 
-    /// The one value the integer bounds have to be *inclusive* for: a wire `u64::MAX` COUNTER
-    /// decodes to the `f64` 2^64 (the nearest representable double), which an exclusive bound would
-    /// then refuse to re-encode -- dropping the very value it just round-tripped from.
+    /// A wire `u64::MAX` COUNTER decodes to the `f64` 2^64, which the *inclusive* bound re-encodes.
     #[test]
     fn a_counter_at_the_top_of_the_u64_range_survives_a_round_trip() {
         let event = relay_event(vec![
@@ -1799,8 +1680,7 @@ mod tests {
         }
     }
 
-    /// A flagged gauge is the one flagged point with a wire form: NaN, which decodes back to a
-    /// flagged zero gauge.
+    /// A flagged gauge encodes as NaN, which decodes back to a flagged zero gauge.
     #[test]
     fn a_flagged_gauge_round_trips_through_a_nan_and_a_flagged_non_gauge_is_dropped() {
         let mut event = relay_event(vec![MetricRecord {
@@ -1925,9 +1805,7 @@ mod tests {
         assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("fixture-host")));
     }
 
-    /// A whole-event drop is counted per value **list** the event would have produced, so
-    /// `metrics.skipped` means the same thing here as at every other sink: a three-record fallback
-    /// event would have been three one-source lists, and losing it loses three.
+    /// A whole-event drop is counted per value **list** the event would have produced.
     #[test]
     fn a_whole_event_drop_is_counted_once_per_list_the_event_would_have_produced() {
         let mut fallback = Event::empty(TS, AttrMap::new());
@@ -1937,7 +1815,7 @@ mod tests {
 
         for (label, mut event, expected) in [
             ("fallback, 3 records", fallback.clone(), 3),
-            // A like-relay event is a single list however many records it carries, so it counts 1.
+            // A like-relay event is one list however many records it carries.
             (
                 "like-relay, 3 records",
                 relay_event(vec![
@@ -1979,10 +1857,7 @@ mod tests {
         }
     }
 
-    /// The encode-side half of `MAX_VALUES_PER_LIST`. Without it a 65-record like-relay event fits
-    /// under the byte cap, encodes with `EncodeStats::default()`, and is then rejected as a
-    /// malformed part by any receiver running this codec -- taking every list packed behind it in
-    /// that datagram with it.
+    /// A like-relay event over `MAX_VALUES_PER_LIST` records is dropped whole and counted.
     #[test]
     fn a_like_relay_list_over_the_value_cap_is_dropped_whole_and_counted() {
         let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST + 1)
@@ -1996,8 +1871,7 @@ mod tests {
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "too_many_values")));
     }
 
-    /// And the value exactly at the cap still round-trips -- an off-by-one here would silently drop
-    /// every 64-source list instead.
+    /// A list at exactly the cap still round-trips.
     #[test]
     fn a_like_relay_list_exactly_at_the_value_cap_still_round_trips() {
         let records: Vec<MetricRecord> = (0..MAX_VALUES_PER_LIST)
@@ -2011,8 +1885,7 @@ mod tests {
         assert_eq!(decoded[0].metrics.len(), MAX_VALUES_PER_LIST);
     }
 
-    /// No host anywhere -- and no invented one either. The event is dropped, counted and named in a
-    /// diagnostic that tells the operator exactly which two knobs fix it.
+    /// With no host anywhere, the event is dropped, counted, and diagnosed; no host is invented.
     #[test]
     fn an_event_with_no_host_and_no_configured_hostname_is_dropped_and_counted() {
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
@@ -2035,8 +1908,7 @@ mod tests {
         assert!(counted(&diag_registry, "logit.component.diagnostics", ("key", "no_host")));
     }
 
-    /// An empty, or entirely substituted-away, configured hostname is the same as not configuring
-    /// one -- it must not become a literal `_` host on the wire.
+    /// An empty configured hostname is the same as none; a `\0` one becomes `_`.
     #[test]
     fn an_empty_or_substituted_away_hostname_counts_as_unconfigured() {
         for hostname in ["", "\0"] {
@@ -2051,17 +1923,14 @@ mod tests {
                 assert!(packets.is_empty(), "an empty hostname is not a host");
                 assert_eq!(stats.dropped_no_host, 1);
             } else {
-                // `\0` sanitizes to `_`, which is a real (if odd) host the operator asked for --
-                // substitution never deletes, so this stays configured rather than becoming empty.
+                // Substitution never deletes, so `\0` stays configured, as `_`.
                 assert_eq!(attr(&decode_all(&packets)[0], ATTR_HOST), Some(Value::from("_")));
             }
         }
     }
 
-    /// Normalization (8): `/` and NUL become `_`, counted. This is the one identity transformation
-    /// that is deliberately **not** a fixed point -- a wire string carrying `/` comes back carrying
-    /// `_` -- which is exactly why `tests/collectd_fixed_point.rs`'s generated grammar never
-    /// produces one, and why this test exists in its place.
+    /// Normalization (8): `/` and NUL become `_`, counted. Not a fixed point, so
+    /// `tests/collectd_fixed_point.rs`'s grammar never generates one and this test covers it.
     #[test]
     fn a_slash_or_nul_in_an_identity_field_becomes_an_underscore_and_is_counted() {
         for (raw, expected) in [("a/b", "a_b"), ("sda/1\0x", "sda_1_x")] {
@@ -2097,8 +1966,7 @@ mod tests {
         assert_eq!(stats.identity_sanitized_truncated, 1);
         assert!(counted(&registry, "logit.output.identity.sanitized", ("reason", "truncated")));
         let instance = attr(&decode_all(&packets)[0], ATTR_TYPE_INSTANCE).unwrap();
-        // 63 characters (126 bytes) -- a `Value::Str`, not a `Value::Bytes`, which is what proves
-        // the truncation landed on a character boundary.
+        // 63 characters (126 bytes), still a `Value::Str`: the cut landed on a character boundary.
         assert_eq!(instance, Value::str("é".repeat(63)));
     }
 
@@ -2118,8 +1986,7 @@ mod tests {
     #[test]
     fn an_empty_plugin_or_type_drops_the_list() {
         for key in [ATTR_PLUGIN, ATTR_TYPE] {
-            // An outright empty value, not a `/`: substitution never deletes, so `/` would sanitize
-            // to the perfectly usable `_` rather than to nothing.
+            // Empty, not `/`: substitution never deletes, so `/` would sanitize to a usable `_`.
             let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
             event.attributes.insert(key, Value::from(""));
             let (packets, stats, registry, _) =
@@ -2160,8 +2027,7 @@ mod tests {
         assert_eq!(stats, EncodeStats { skipped_no_metrics: 1, ..EncodeStats::default() });
     }
 
-    /// A resource-level `collectd.*` carrier works, and an event-level one wins over it -- the
-    /// ordinary merge, nothing collectd-specific.
+    /// A resource-level `collectd.*` carrier works, and an event-level one wins over it.
     #[test]
     fn resource_carriers_apply_and_event_carriers_win() {
         let mut resource_attrs = AttrMap::new();
@@ -2181,10 +2047,8 @@ mod tests {
         assert_eq!(attr(&decoded[0], ATTR_PLUGIN), Some(Value::from("from-event")));
     }
 
-    /// Metrics win: a `collectd.severity` attribute on an event that also carries `event.metrics`
-    /// has no wire form at all -- a value list has no severity concept, and only a metrics-empty
-    /// `log` event is ever a notification. Counted `tags_dropped_unrepresentable`, the review's own
-    /// finding that this reached `EncodeStats::default()` uncounted before the fix.
+    /// Metrics win: `collectd.severity` on an event with metrics is counted
+    /// `tags_dropped_unrepresentable`.
     #[test]
     fn a_severity_attribute_on_a_metrics_bearing_event_is_dropped_and_counted() {
         let mut event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
@@ -2204,8 +2068,7 @@ mod tests {
         );
     }
 
-    /// Every packet this encoder writes must be readable by a real decoder, byte for byte -- a
-    /// weaker but much broader guard than any single assertion above, over a hand-built input.
+    /// Every packet this encoder writes decodes cleanly, over a hand-built mixed input.
     #[test]
     fn a_hand_built_multi_list_packet_survives_decode_encode_decode() {
         let bytes = PacketBuilder::new()
@@ -2245,10 +2108,8 @@ mod tests {
         }
     }
 
-    /// A notification-shaped event: `log` set, no metrics, `collectd.severity` present as the raw
-    /// wire value. `severity` mapping is left to the caller via `log_severity` rather than derived
-    /// here, so a test can construct the mismatched combinations the encoder ignores (it is the
-    /// attribute, never `LogRecord::severity`, that reaches the wire).
+    /// A notification-shaped event: `log` set, no metrics, `collectd.severity` as the raw wire
+    /// value. `log_severity` is independent, so a test can build mismatches the encoder ignores.
     fn notification_event(wire_severity: Value, log_severity: Severity, message: &str) -> Event {
         let mut attrs = attrs(&[
             (ATTR_HOST, Value::from("web-1")),
@@ -2333,9 +2194,8 @@ mod tests {
         }
     }
 
-    /// A `collectd.severity` attribute of the wrong `Value` type is still an *attempt* -- it must
-    /// not fall back to `skipped_no_metrics` -- and is counted both as an unrepresentable tag and
-    /// as a dropped notification.
+    /// A wrong-typed `collectd.severity` is still an *attempt*: counted as an unrepresentable tag
+    /// and a dropped notification, not `skipped_no_metrics`.
     #[test]
     fn a_severity_attribute_of_the_wrong_type_is_an_attempt_that_fails() {
         let event = notification_event(Value::from("2"), Severity::Warn, "x");
@@ -2346,8 +2206,7 @@ mod tests {
         assert_eq!(stats.skipped_no_metrics, 0, "a present collectd.severity is an attempt");
     }
 
-    /// A `log`-only event with **no** `collectd.severity` attribute at all is not a notification
-    /// attempt -- the unchanged, pre-existing `skipped_no_metrics` path.
+    /// A `log`-only event with **no** `collectd.severity` is not an attempt: `skipped_no_metrics`.
     #[test]
     fn a_log_event_without_collectd_severity_is_not_a_notification() {
         let event = Event::log(
@@ -2383,8 +2242,7 @@ mod tests {
         assert_eq!(stats.dropped_no_host, 1);
     }
 
-    /// The host fallback chain is identical to a value list's: `collectd.host`, then `host.name`,
-    /// then the encoder's configured hostname.
+    /// A notification's host falls back as a value list's does.
     #[test]
     fn a_notification_falls_back_from_host_name_to_the_configured_hostname() {
         let mut event = notification_event(Value::U64(1), Severity::Error, "x");
@@ -2417,7 +2275,7 @@ mod tests {
         assert!(std::str::from_utf8(message).is_ok());
     }
 
-    /// A message at exactly the 255-byte limit round-trips untouched -- the off-by-one guard.
+    /// A message at exactly the 255-byte limit round-trips untouched.
     #[test]
     fn a_notification_message_at_exactly_255_bytes_is_not_truncated() {
         let message: String = "a".repeat(255);
@@ -2428,7 +2286,7 @@ mod tests {
         assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::str(message));
     }
 
-    /// NUL inside a message becomes `_`, uncounted -- unlike an identity field's substitution.
+    /// NUL inside a message becomes `_`, uncounted, unlike an identity field's substitution.
     #[test]
     fn a_nul_in_a_notification_message_becomes_an_underscore_uncounted() {
         let event = notification_event(Value::U64(1), Severity::Error, "disk\0full");
@@ -2441,11 +2299,9 @@ mod tests {
         assert_eq!(decoded[0].log.as_ref().unwrap().message, Value::from("disk_full"));
     }
 
-    /// A notification is always its own datagram -- confirmed by the recorded capture
-    /// (`testdata/interop/collectd/collectd-notification-000.raw`), not merely written in full:
-    /// a preceding value list's packet is flushed first, so the notification never shares a
-    /// datagram (and therefore never shares elision state) with it, even when both carry the
-    /// exact same host/plugin/type.
+    /// A notification is always its own datagram, as in
+    /// `testdata/interop/collectd/collectd-notification-000.raw`, even when a preceding list shares
+    /// its host/plugin/type.
     #[test]
     fn a_notification_is_always_its_own_datagram_never_packed_with_a_preceding_list() {
         let list_event = relay_event(vec![record("load.load", MetricKind::Gauge(0.5))]);
@@ -2476,10 +2332,7 @@ mod tests {
         assert!(decoded[1].log.is_some() && decoded[1].metrics.is_empty());
     }
 
-    /// A value list immediately after a notification, even sharing its identity, does **not**
-    /// elide against it: `last` is cleared after a notification's own datagram is pushed, so the
-    /// next list restates its identity in full -- the mirror of the previous test, and the other
-    /// half of "a notification shares no elision state with anything".
+    /// A value list right after a notification restates its identity in full, even when shared.
     #[test]
     fn a_value_list_after_a_notification_does_not_elide_against_it() {
         let notif_event = notification_event(Value::U64(2), Severity::Warn, "load high");
@@ -2519,14 +2372,9 @@ mod tests {
         assert_eq!(decoded[1].log.as_ref().unwrap().message, Value::from("load spiked"));
     }
 
-    /// The regression this workstream's review caught: a notification packed (in the *batch*,
-    /// not necessarily the same wire datagram) between two value lists that share an identity but
-    /// differ in `type_instance` must not let the second list inherit the first's `type_instance`
-    /// through stale encoder-side elision state. Before the fix, `pack_notification` cloned the
-    /// notification's own (empty) `type_instance` into `last` unconditionally; since the second
-    /// list's `type_instance` was *also* empty, `cur == last` made the encoder elide it too --
-    /// which a real receiver (whose sticky state a notification's own missing `TypeInstance` part
-    /// never touched) would read as still `"free"`, silently relabeling the second list's series.
+    /// A notification between two value lists that differ only in `type_instance` (the second
+    /// empty) must not let the second inherit the first's: elision against the notification's
+    /// empty `type_instance` would leave a receiver reading `"free"`, relabeling the series.
     #[test]
     fn a_notification_between_two_value_lists_does_not_poison_elision() {
         let mut first = relay_event(vec![record("load.load", MetricKind::Gauge(512.0))]);
@@ -2557,9 +2405,8 @@ mod tests {
             "the second list must NOT have inherited \"free\" from the first"
         );
 
-        // The wire-level guarantee behind that: the third datagram (the second list) restates
-        // Host/Plugin/Type in full and writes no TypeInstance part at all -- not an elided one,
-        // an *absent* one, which is the only honest way to say "this list never had one."
+        // The third datagram (the second list) restates Host/Plugin/Type and has no
+        // TypeInstance part: absent, which a receiver's reset sticky state reads as empty.
         let third_bytes = packets.iter().nth(2).unwrap();
         assert_eq!(count_parts(third_bytes, part::TYPE_HOST), 1);
         assert_eq!(count_parts(third_bytes, part::TYPE_PLUGIN), 1);

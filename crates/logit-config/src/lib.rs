@@ -1,17 +1,16 @@
 //! Config types for `logit`.
 //!
-//! Every type here derives both `Deserialize` and `JsonSchema` together (ADR `config-yaml-jsonschema`) so the
-//! published JSON Schema (`logit schema`, `schema/logit.schema.json`) can never drift from what
-//! the binary actually accepts. YAML parsing itself (via a maintained `serde_yaml` fork, per
-//! ADR `config-yaml-jsonschema`) belongs to `logit-cli`, not here -- this crate only defines the shape.
+//! Every type here derives `Serialize`, `Deserialize`, and `JsonSchema` together, so the published
+//! JSON Schema (`logit schema`, `schema/logit.schema.json`) cannot drift from what the binary
+//! accepts (ADR `config-yaml-jsonschema`). YAML parsing belongs to `logit-cli`; this crate only
+//! defines the shape. Every `///` on a config type or field renders into that schema as the
+//! field's description, so write them for an operator configuring `logit`.
 //!
-//! Config is one flat graph of named [`Component`]s (ADR `component-graph-configuration`,
-//! `docs/design/pipeline-graph.md`) -- there is no separate inputs/outputs/pipelines split. A
-//! component's `sources` name the other components it reads from; its `type`-tagged
-//! [`ComponentKind`] fixes its arity (a listener has none, a sink has at least one and is never
-//! itself a source, a transform has both). Resolving that graph into something runnable -- cycle
-//! detection, arity checks, topological ordering -- is `logit-cli`/`logit-pipeline`'s job, not
-//! this crate's; this crate only defines the shape serde and `schemars` need to agree on.
+//! Config is one flat graph of named [`Component`]s. A component's `sources` name the other
+//! components it reads from; its `type`-tagged [`ComponentKind`] fixes its arity (a listener has
+//! none, a sink has at least one and is never itself a source, a transform has both). Resolving
+//! that graph (cycle detection, arity checks, topological ordering) is `logit-pipeline`'s job,
+//! not this crate's.
 
 use schemars::{gen::SchemaGenerator, schema::Schema, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -24,23 +23,18 @@ pub struct Config {
     #[serde(default)]
     #[schemars(schema_with = "non_empty_components_schema")]
     pub components: HashMap<String, Component>,
-    /// The readiness/liveness HTTP endpoint (`docs/plans/operator-surface.md`,
-    /// `docs/adr/admin-readiness-endpoint.md`) -- off unless `bind` is set. A top-level block, not
-    /// a component: it's process-level (one admin server per `logit run`, not per graph node), and
-    /// a component kind with no `sources` and no consumers would trip graph rule 7's "nothing
-    /// reads what it produces" check.
+    /// The readiness/liveness HTTP endpoint. Off unless `bind` is set. Process-level: one admin
+    /// server per `logit run`, not per component.
     #[serde(default)]
     pub admin: AdminConfig,
 }
 
-/// See [`Config::admin`]'s own doc comment. Every field defaults, so an omitted `admin:` block
-/// (today's universal case -- no shipped config sets one) is exactly "the admin server is off."
+/// The `admin:` block. Every field defaults, so omitting the block leaves the admin server off.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct AdminConfig {
-    /// `host:port` to serve `/readyz`/`/healthz` on -- `None` (the default) means off. No TLS, by
-    /// design: this is a loopback/pod-local endpoint, not one exposed past the process's own
-    /// network namespace (`docs/deploying.md`).
+    /// `host:port` to serve `/readyz` and `/healthz` on. Omitted (the default) means off. No TLS:
+    /// bind this to loopback or a pod-local address, not to a network beyond the process's own.
     pub bind: Option<String>,
 }
 
@@ -52,32 +46,28 @@ fn non_empty_components_schema(generator: &mut SchemaGenerator) -> Schema {
     schema
 }
 
-/// One node in the pipeline's component graph. `sources` names the other components this one
-/// reads events from -- empty for a listener, required for everything else (enforced at
-/// validation time, not in this schema: which arity is legal depends on `kind`, not something a
-/// blanket `minItems` on this shared field can express). See `docs/design/pipeline-graph.md` for
-/// the full arity table and validation rules.
+/// One node in the pipeline's component graph. `sources` names the components this one reads
+/// events from: empty for a listener, required for everything else. Which arity is legal depends
+/// on `type` and is checked by `logit validate`, not by this schema.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Component {
     #[serde(default)]
     pub sources: Vec<String>,
-    /// The `target` components this router directs events into, in slot order
-    /// (`docs/adr/target-components.md`). Legal only on `lua`/`lua_file`; a `route` derives its
-    /// targets from `routes:`' values instead, and every other kind must leave this empty --
-    /// enforced at validation time (`logit-pipeline`'s graph rules), not here, for the same reason
-    /// `buffer:` and `receive:` are validated there.
+    /// The `target` components this component directs events into, in slot order. Legal only on
+    /// `lua`/`lua_file`; a `route` derives its targets from its `routes:` values, and a non-empty
+    /// list on any other kind is rejected. Every id must name a `target` component, and none may
+    /// repeat.
     #[serde(default)]
     pub targets: Vec<String>,
-    /// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
-    /// sink -- graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value
-    /// on any other kind. A sibling field of `kind`, not nested inside every sink
-    /// `ComponentKind` variant, so a future fifth sink kind costs nothing extra here.
+    /// Per-sink delivery buffer. Meaningful only on a sink: a non-default block on any other kind
+    /// is rejected.
     #[serde(default)]
     pub buffer: BufferConfig,
-    /// Per-listener receive queue and batching (`docs/adr/decoupled-listener-io.md`).
-    /// Meaningful only on a datagram listener -- graph validation rejects a non-default value on
-    /// any other kind, `internal` included. A sibling field of `kind`, mirroring `buffer`'s own
-    /// placement.
+    /// Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and
+    /// `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the same
+    /// three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly
+    /// fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`,
+    /// `prometheus_in`, `internal`, and `generate_in` included) is rejected.
     #[serde(default)]
     pub receive: ReceiveConfig,
     #[serde(flatten)]
@@ -85,33 +75,27 @@ pub struct Component {
 }
 
 /// One `kv_metrics` entry: a metric `name`, an optional source `field`, and an optional `unit`.
-/// See `ComponentKind::KvMetrics` and `docs/adr/kv-metrics-semantics.md`.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct MetricSpec {
-    /// The metric's measurement name. An empty name is rejected at graph-validation time --
-    /// `influxdb_out` requires a non-empty measurement to encode a metric line.
+    /// The metric's measurement name. Must be non-empty.
     pub name: String,
-    /// The attribute to read this metric's value from. Omitted means "+1 per event" for a
-    /// counter or "set to 1" for a gauge; a distribution entry with no `field` is rejected at
-    /// graph-validation time (a distribution of nothing is meaningless). Names an attribute
-    /// literally -- `field: http.status` means the attribute literally named `http.status`, never
-    /// a `status` key nested under `http` in a `Value::Map`; nested fields are not addressable.
+    /// The attribute to read this metric's value from. Omitted means "+1 per event" for a counter
+    /// or "set to 1" for a gauge; a distribution entry must name one. The name is literal:
+    /// `field: http.status` reads the attribute named `http.status`, never a `status` key nested
+    /// under `http`. Nested fields are not addressable.
     #[serde(default)]
     pub field: Option<String>,
     #[serde(default)]
     pub unit: Option<String>,
 }
 
-/// One value a `set` component (`ComponentKind::Set`) can stamp onto an attribute or a resource
-/// attribute. `#[serde(untagged)]`: YAML's own scalar types decide the variant, so
-/// `resource: {service.name: nginx, retries: 3, ratio: 0.5, sampled: true}` reads exactly as
-/// written, no `!i64`/`!f64` tag needed.
-///
-/// **`I64` must stay ordered before `F64`.** `serde`'s untagged enum deserializer tries variants
-/// in declaration order and keeps the first that parses; `3` parses as both an `i64` and an
-/// `f64`, so `F64` before `I64` would silently turn every whole-number YAML scalar into a float.
-/// `Bool`/`Str` are unambiguous against the others (a YAML boolean/string never also parses as a
-/// number) so their position doesn't matter.
+/// One value a `set` component stamps onto an attribute or a resource attribute. YAML's own
+/// scalar types decide the variant, so `resource: {service.name: nginx, retries: 3, ratio: 0.5,
+/// sampled: true}` reads as written, with no type tag needed.
+// `I64` must stay ordered before `F64`: serde tries untagged variants in declaration order and
+// keeps the first that parses, and `3` parses as both, so the reverse order would turn every
+// whole-number scalar into a float. `Bool`/`Str` never also parse as a number, so their position
+// doesn't matter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum SetValue {
@@ -121,28 +105,21 @@ pub enum SetValue {
     Str(String),
 }
 
-/// A rewrite `keep_values` (`ComponentKind::KeepValues`) applies to a field's value before
-/// testing it against `allow` -- see `docs/adr/value-allowlist-cardinality-clamp.md`. A list
-/// (not a single value) deliberately, so a later step (`trim`, `strip_port`) can land beside
-/// `lower` with no config break.
+/// A rewrite `keep_values` applies to a field's value before testing it against `allow`. A list,
+/// so further steps can be added beside `lower`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NormalizeStep {
-    /// ASCII-lowercase a `Str`/`Bytes` value, bytewise -- not Unicode case folding. See the ADR
-    /// for why: hostnames and similar tag values are ASCII at the wire, folding is
-    /// locale-dependent, and a bytewise lowercase can't change a string's length, which is what
-    /// keeps an already-lowercase value's clamp allocation-free.
+    /// ASCII-lowercase a string value, bytewise. Not Unicode case folding.
     Lower,
 }
 
-/// `ComponentKind::Json`'s `invalid_utf8` field: what the parser does with a message that is not
-/// valid UTF-8. `Reject` (the default) is the strict behaviour `json` has always had -- the parse
-/// fails, the event passes through untouched, one throttled `parse_failure` diagnostic. `Replace`
-/// retries a failed parse on a copy with every invalid sequence replaced by U+FFFD, on the
-/// failure path only, so a valid line's cost is unchanged. The case it exists for: nginx's
-/// `escape=json` passes bytes >= 0x80 through raw, so one client sending a Latin-1 `User-Agent`
-/// loses the whole access line -- the one failure `http_access` can't reach from behind `json`.
-/// See `docs/adr/http-access-normalization.md`.
+/// What `json` does with a message that is not valid UTF-8. `reject` (the default) fails the
+/// parse: the event passes through untouched with one throttled `parse_failure` diagnostic.
+/// `replace` retries the failed parse on a copy with every invalid sequence replaced by U+FFFD;
+/// a valid line's cost is unchanged. Use `replace` for nginx's `escape=json`, which passes high
+/// bytes (0x80 and above) through raw, so one client with a Latin-1 `User-Agent` would otherwise
+/// lose the whole access line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JsonInvalidUtf8 {
@@ -151,14 +128,9 @@ pub enum JsonInvalidUtf8 {
     Replace,
 }
 
-/// `ComponentKind::Flatten`'s `attributes`/`resource` fields: which top-level attributes to
-/// expand. `#[serde(untagged)]`: a bare `all`/`none` picks the blanket mode
-/// ([`FlattenKeyword`]), a sequence names literal top-level attribute names explicitly --
-/// `SetValue`'s "let YAML's own shape decide the variant" convention, unambiguous here because a
-/// keyword and a sequence never parse as each other. A named entry is a literal attribute name,
-/// never a path into a nested value (`docs/adr/kv-metrics-semantics.md`'s "nested fields are not
-/// addressable" -- `flatten` is what makes one addressable, not a new way to spell a path to one).
-/// See `docs/adr/flatten-transform.md`.
+/// Which top-level attributes `flatten` expands: the keyword `all` or `none`, or a list of
+/// literal top-level attribute names. A named entry is an attribute name, never a path into a
+/// nested value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum FlattenFields {
@@ -166,80 +138,75 @@ pub enum FlattenFields {
     Named(Vec<String>),
 }
 
-/// See [`FlattenFields`].
+/// The blanket modes of `FlattenFields`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlattenKeyword {
-    /// Every nested attribute (or resource attribute) is expanded -- `ComponentKind::Flatten`'s
-    /// default for `attributes`.
+    /// Expand every nested attribute (or resource attribute). The default for `attributes`.
     All,
-    /// Nothing is expanded -- `ComponentKind::Flatten`'s default for `resource`.
+    /// Expand nothing. The default for `resource`.
     None,
 }
 
-/// One field's clamp, under `ComponentKind::KeepValues`'s `resource`/`attributes` maps.
+/// One field's clamp, under `keep_values`' `resource`/`attributes` maps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ValueAllowList {
-    /// Rewrites applied in order, before the `allow` test, and written back to the event when the
-    /// result is allowed. Empty (the default) means no normalization.
+    /// Rewrites applied in order before the `allow` test, and written back to the event when the
+    /// result is allowed. Empty (the default) means no normalization. A repeated step is rejected.
     #[serde(default)]
     pub normalize: Vec<NormalizeStep>,
-    /// The permitted values, compared with `logit-transforms`' coercing `value_matches` -- a
-    /// configured `200` matches `Value::I64(200)`, `U64(200)`, `F64(200.0)`, and `Str("200")`
-    /// alike. May not be empty -- see `crates/logit-pipeline/src/graph.rs` rule 54.
+    /// The permitted values. Comparison coerces across numeric representations: a configured
+    /// `200` matches an integer, float, or string `200`. Must be non-empty, and every number must
+    /// be finite. Under `normalize: [lower]`, a string literal here must already be
+    /// ASCII-lowercase, or it could never match.
     pub allow: Vec<SetValue>,
     /// What a value outside `allow` becomes. Absent (the default) removes the attribute instead.
+    /// The same literal rules as `allow` apply: a number must be finite, and under
+    /// `normalize: [lower]` a string must be ASCII-lowercase.
     #[serde(default)]
     pub other: Option<SetValue>,
 }
 
-/// One entry of `ComponentKind::HttpAccess`'s `routes` list: **exactly** a `builtin` set, or a
-/// `match` regex together with the literal `route` it assigns. One flat struct with three optional
-/// fields rather than an untagged enum, deliberately: serde's untagged failure is "did not match
-/// any variant" with no pointer at the offending key, whereas
-/// `crates/logit-pipeline/src/graph.rs` rule 60 can name exactly which half is missing or which
-/// extra key is present. The `match` pattern is tested (`is_match`, unanchored unless the pattern
-/// anchors itself) against the capped `url.path`; `route` is written verbatim -- never a capture
-/// group, so every `http.route` value comes from config. See
-/// `docs/adr/http-access-normalization.md`.
+/// One entry of `http_access`'s `routes` list: either a `builtin` set, or a `match` regex with
+/// the literal `route` it assigns. Never both, and never a mix; `logit validate` names which half
+/// is missing or which key is extra. `match` is tested unanchored (unless the pattern anchors
+/// itself) against the capped `url.path`; `route` is written verbatim, never from a capture
+/// group, so every `http.route` value comes from config.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpRouteRule {
-    /// A named built-in route set, expanded in place at this position in the list.
+    /// A named built-in route set, expanded in place at this position in the list. A set may
+    /// appear once.
     #[serde(default)]
     pub builtin: Option<HttpRouteSet>,
-    /// A regex over the capped `url.path`, compiled at validate time (rule 60).
+    /// A regex over the capped `url.path`, compiled by `logit validate`. Must be non-empty.
     #[serde(default, rename = "match")]
     pub pattern: Option<String>,
-    /// The literal `http.route` value a matching `match` assigns.
+    /// The literal `http.route` value a matching `match` assigns. Must be non-empty.
     #[serde(default)]
     pub route: Option<String>,
 }
 
-/// The three built-in route sets an [`HttpRouteRule`] can name, each mapping to one fixed route
-/// value -- `/{asset}`, `/{well-known}`, `/{probe}`. The member patterns live in
-/// `logit-transforms`' `http_access` module; the sets and their route values are fixed by
-/// `docs/plans/http-access-normalization.md`.
+/// The built-in route sets an `HttpRouteRule` can name, each mapping to one fixed route value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpRouteSet {
-    /// Static files by extension (`.css`, `.js`, `.png`, `.woff2`, ...) -- `/{asset}`. No
-    /// `json`/`xml`/`txt`/`csv`: those are routinely API responses.
+    /// Static files by extension (`.css`, `.js`, `.png`, `.woff2`, ...): `/{asset}`. Not
+    /// `json`/`xml`/`txt`/`csv`, which are routinely API responses.
     Assets,
-    /// `/.well-known/*`, `robots.txt`, `favicon.ico`, sitemaps and their kin --
-    /// `/{well-known}`.
+    /// `/.well-known/*`, `robots.txt`, `favicon.ico`, sitemaps and their kin: `/{well-known}`.
     WellKnown,
     /// Health, readiness, and status endpoints (`/healthz`, `/readyz`, `/metrics`,
-    /// `/nginx_status`, ...) -- `/{probe}`.
+    /// `/nginx_status`, ...): `/{probe}`.
     Probes,
 }
 
-/// One entry of `ComponentKind::HttpAccess`'s `user_agent_rules`: a regex over the *uncapped*
+/// One entry of `http_access`'s `user_agent_rules`: a regex over the uncapped
 /// `user_agent.original` (the identifying token of a spoofed UA is often at its tail) and the
-/// literal `user_agent.class` it assigns. Tried in order, before the built-in table. A `class` of
-/// `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, exactly as the built-in
-/// classes do. Compiled at validate time by `crates/logit-pipeline/src/graph.rs` rule 60, which
-/// also rejects an empty `match` or `class`. See `docs/adr/http-access-normalization.md`.
+/// literal `user_agent.class` it assigns. Rules are tried in order, before the built-in table. A
+/// `class` of `crawler` or `scanner` also writes `user_agent.synthetic.type: bot`, as the
+/// built-in classes do. `match` is compiled by `logit validate`; an empty `match` or `class` is
+/// rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UserAgentRule {
@@ -248,12 +215,9 @@ pub struct UserAgentRule {
     pub class: String,
 }
 
-/// `ComponentKind::HttpAccess`'s `forwarded` block. `trust: true` (the default once the block is
-/// present at all) overwrites `client.address` with the first hop of
-/// `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy list or hop
-/// count (`docs/known-gaps.md`). `trust: false` is rejected by
-/// `crates/logit-pipeline/src/graph.rs` rule 60 -- omit the block instead, so there is one
-/// spelling of "off". See `docs/adr/http-access-normalization.md`.
+/// `http_access`'s `forwarded` block. When present, `client.address` is overwritten with the
+/// first hop of `http.request.header.x-forwarded-for`. All-or-nothing: there is no trusted-proxy
+/// list or hop count. `trust: false` is rejected; omit the block instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedConfig {
@@ -261,17 +225,14 @@ pub struct ForwardedConfig {
     pub trust: bool,
 }
 
-/// [`ForwardedConfig::trust`]'s default.
+/// `ForwardedConfig::trust`'s default.
 fn default_true() -> bool {
     true
 }
 
-/// Every field `http_access` caps, with its default character limit -- the one source of truth
-/// `crates/logit-pipeline/src/graph.rs` rule 60 (which rejects a `max_length` key not listed
-/// here) and the transform (whose resolved cap list `logit-cli` builds from this plus the
-/// config's overrides) both read, so the two cannot disagree. Characters, not bytes: a cap cuts at
-/// a char boundary, so a capped `Value::Str` stays valid UTF-8. See
-/// `docs/adr/http-access-normalization.md`.
+/// Every field `http_access` caps, with its default character limit. A `max_length` key must name
+/// one of these. Limits are characters, not bytes: a cap cuts at a char boundary, so a capped
+/// value stays valid UTF-8.
 pub const CAPPED_FIELDS: &[(&str, usize)] = &[
     ("url.path", 256),
     ("url.query", 256),
@@ -290,124 +251,104 @@ pub const CAPPED_FIELDS: &[(&str, usize)] = &[
     ("http.termination_state", 8),
 ];
 
-/// Which metric kind a [`GenerateMetric`] produces. Named after the three
-/// `logit_core::MetricKind`s a load-test scenario actually wants to exercise, not the full set:
-/// `Sum` for a counter, `Gauge` for a level, and `Distribution` for the sketch-merging path (as
-/// raw `Samples`, the shape a real listener produces -- never pre-sketched, per
-/// `docs/adr/lossless-transit.md`'s "a decoder never pre-summarizes" rule, which
-/// `generate_in` stands in for here).
+/// Which metric kind a `GenerateMetric` produces: `sum` for a counter, `gauge` for a level, and
+/// `distribution` for the sketch-merging path (emitted as raw samples, the shape a real listener
+/// produces, never pre-sketched).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerateMetricKind {
-    /// A delta counter -- the default, and the cheapest shape to generate.
+    /// A delta counter. The default, and the cheapest shape to generate.
     #[default]
     Sum,
     Gauge,
     Distribution,
 }
 
-/// The metric [`ComponentKind::GenerateIn`] stamps onto every event it generates, when
-/// `event.metric` is set at all. One metric per event: a scenario that needs more than one
-/// exercises a `set`/`kv_metrics` stage downstream rather than growing this block.
+/// The metric `generate_in` stamps onto every event it generates, when `event.metric` is set.
+/// One metric per event: a scenario that needs more uses a `set`/`kv_metrics` stage downstream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateMetric {
-    /// The metric's name. A template like every other `generate_in` string field, with one
-    /// narrowing: **only `{seq%N}`, never a bare `{seq}`** (rule 42). A metric name is *interned*
-    /// and an interned name is never freed, so an unbounded one would leave a fresh,
-    /// never-reclaimed name behind for every event a run generates -- a process-lifetime leak
-    /// rather than the cardinality knob it reads as. `{seq%N}` is bounded by `N`, and is how a
-    /// scenario generates a wide *metric-name* cardinality rather than a wide attribute one.
-    /// Required and non-empty (rule 42).
+    /// The metric's name, a template like every other `generate_in` string field, with one
+    /// narrowing: only `{seq%N}`, never a bare `{seq}`. A metric name is interned and never
+    /// freed, so an unbounded name would leak one entry per generated event. `{seq%N}` is how a
+    /// scenario generates a wide metric-name cardinality. Required and non-empty.
     pub name: String,
     /// Which metric kind to produce. Defaults to `sum`.
     #[serde(default)]
     pub kind: GenerateMetricKind,
-    /// The value carried on every generated point -- constant, deliberately: a varying value
-    /// would measure the generator's own arithmetic rather than the pipeline's. Defaults to `1`,
-    /// the natural increment for the default `sum`. Must be finite (rule 42).
+    /// The value carried on every generated point. Constant, so the number measures the pipeline
+    /// rather than the generator's arithmetic. Defaults to `1`. Must be finite.
     #[serde(default = "default_generate_metric_value")]
     pub value: f64,
 }
 
-/// The event template [`ComponentKind::GenerateIn`] renders per generated event. Every field
-/// defaults, so an omitted `event:` block generates the cheapest event there is: a timestamp, the
-/// configured resource, and nothing else -- which is exactly what a "runtime floor" scenario
-/// wants to measure.
+/// The event template `generate_in` renders per generated event. Every field defaults, so an
+/// omitted `event:` block generates the cheapest event there is: a timestamp, the configured
+/// resource, and nothing else, which is what a "runtime floor" scenario measures.
 ///
-/// `log` and every value in `attributes` (and [`GenerateMetric::name`]) are **templates**:
-/// `{seq}` renders the generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the
-/// knob that gives a scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal
-/// brace, which a JSON log body needs (`docs/plans/load-test-harness.md`,
-/// `logit_core::template`). A field with no placeholder in it is rendered **once**, at
-/// construction, and the resulting bytes are cloned onto every event -- a refcount bump, not a
-/// copy -- so placeholders are for cardinality, never decoration: each one costs a rendering and
-/// a copy per event.
+/// `log`, every value in `attributes`, and `metric.name` are templates: `{seq}` renders the
+/// generator's 0-based event counter and `{seq%N}` renders it modulo `N`, the knob that gives a
+/// scenario a chosen attribute or series cardinality. `{{`/`}}` write a literal brace, which a
+/// JSON log body needs. An unknown placeholder is rejected. A field with no placeholder is
+/// rendered once and shared by every event, so use placeholders for cardinality, not decoration:
+/// each one costs a rendering and a copy per event.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct GenerateEvent {
-    /// The generated log body, as a template. Omitted means the event carries no log record at
-    /// all (a metrics-only scenario).
+    /// The generated log body, as a template. Omitted means the event carries no log record (a
+    /// metrics-only scenario).
     pub log: Option<String>,
-    /// Event attributes: literal keys (interned once, at construction), templated values. An
-    /// empty key is rejected (rule 42).
+    /// Event attributes: literal keys, templated values. An empty key is rejected.
     pub attributes: std::collections::BTreeMap<String, String>,
     /// The metric to stamp on every event. Omitted means the event carries no metrics (a
     /// logs-only scenario).
     pub metric: Option<GenerateMetric>,
 }
 
-/// Which OTLP transport a component speaks -- both `otlp_in` and `otlp_out` carry identical
-/// protobuf payloads (`crates/logit-proto/src/otlp`), differing only in framing and endpoint
-/// shape (`docs/adr/hand-rolled-grpc-over-hyper.md`).
+/// Which OTLP transport a component speaks. Both carry identical protobuf payloads and differ
+/// only in framing and endpoint shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
-    /// OTLP/HTTP, protobuf body, one POST per signal. Default: it's what an
-    /// `http://host:4318`-shaped endpoint already implies, and a bare `endpoint: http://tempo:4318`
-    /// would be silently wrong under any other default.
+    /// OTLP/HTTP, protobuf body, one POST per signal. The default, and what an
+    /// `http://host:4318`-shaped endpoint implies.
     #[default]
     Http,
-    /// Unary gRPC over HTTP/2 -- plaintext (`http://`/`grpc://`) or TLS (`https://`), selected by
-    /// `endpoint`'s scheme (`docs/adr/otlp-tls-and-pooled-grpc-client.md`). `otlp_out`'s `tls:`
-    /// block tunes the TLS case.
+    /// Unary gRPC over HTTP/2: plaintext for an `http://`/`grpc://` endpoint, TLS for `https://`.
+    /// `otlp_out`'s `tls:` block tunes the TLS case.
     Grpc,
 }
 
-/// Client-side TLS tuning for `otlp_out` (`tls:` in config). On the HTTP transport, TLS itself is
-/// already selected by the endpoint's `https://` scheme, matching every OTel SDK's
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` convention; on the gRPC transport, an `https://` endpoint now
-/// also means TLS (`docs/adr/otlp-tls-and-pooled-grpc-client.md` -- this used to be rejected
-/// outright, since the hand-rolled gRPC client had no TLS support at all). This block only tunes
-/// an already-TLS connection -- a non-default value under a plain `http://`/`grpc://` endpoint is
-/// rejected at config-validation time (rule 22) rather than silently ignored.
+/// Client-side TLS tuning for a sink or scrape client. On `otlp_out`, `prometheus_out`, and
+/// `prometheus_in`, TLS itself is selected by the endpoint's `https://` scheme and this block
+/// only tunes an already-TLS connection: a non-default block under a plain `http://`/`grpc://`
+/// endpoint is rejected rather than ignored. On `logit_out`, `syslog_out`, and `statsd_out`,
+/// whose endpoint is a bare `host:port`, the block's presence is what turns TLS on, so even an
+/// empty `tls: {}` means TLS with the bundled Mozilla roots.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TlsClientConfig {
-    /// PEM bundle of CA certificates to trust *instead of* the bundled Mozilla root set. Path is
-    /// resolved relative to the config file's own directory, same as `lua_file`/`stdio_out`'s
-    /// `path`. A plain string, so `!env` works on it (ADR `env-yaml-tag`) if the certificate
-    /// itself needs to come from the environment rather than a mounted file.
+    /// PEM bundle of CA certificates to trust instead of the bundled Mozilla root set. A relative
+    /// path resolves against the config file's directory. A plain string, so `!env` works on it.
     #[serde(default)]
     pub ca_file: Option<String>,
-    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`; rejected at
-    /// config-validation time if set without it (rule 22).
+    /// Client certificate chain (PEM) presented for mutual TLS. Requires `key_file`.
     #[serde(default)]
     pub cert_file: Option<String>,
     /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`. Requires `cert_file`.
     #[serde(default)]
     pub key_file: Option<String>,
-    /// Disables server-certificate verification entirely -- the connection is still encrypted,
-    /// but accepts any certificate the peer presents, self-signed or otherwise. A startup warning
-    /// is logged whenever this is `true`. Never the default; meant for a throwaway or
-    /// pre-production endpoint, not a real deployment. Contradictory (and rejected) together with
-    /// `ca_file` -- a trusted CA and "trust nothing" can't both be meant at once.
+    /// Disables server-certificate verification. The connection is still encrypted but accepts
+    /// any certificate the peer presents, self-signed or otherwise, and `logit` logs a warning at
+    /// startup. For a throwaway or pre-production endpoint only. Rejected together with
+    /// `ca_file`.
     #[serde(default)]
     pub insecure_skip_verify: bool,
 }
 
 impl TlsClientConfig {
-    /// `true` if every field is at its default -- rule 22's "did the operator actually set a
-    /// `tls:` block" check, the same shape as [`OtlpPaths::is_empty`].
+    /// `true` if every field is at its default, which is how validation tells a set `tls:` block
+    /// from an omitted one.
     pub fn is_empty(&self) -> bool {
         self.ca_file.is_none()
             && self.cert_file.is_none()
@@ -416,9 +357,9 @@ impl TlsClientConfig {
     }
 }
 
-/// Server-side TLS for `otlp_in` (`tls:` in config). Its mere presence on a listener turns TLS on
-/// for that component -- there is no separate on/off flag. See [`TlsClientConfig`] for the file
-/// path resolution rule and `!env` compatibility, both identical here.
+/// Server-side TLS for a listener. Its presence turns TLS on for that listener and makes it
+/// required: there is no plaintext fallback. A relative path resolves against the config file's
+/// directory, and every field accepts `!env`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TlsServerConfig {
     /// Certificate chain (PEM) this listener presents to every client.
@@ -426,19 +367,15 @@ pub struct TlsServerConfig {
     /// Private key (PEM, PKCS#8/PKCS#1/SEC1) for `cert_file`.
     pub key_file: String,
     /// PEM bundle of CAs. When set, every connecting client must present a certificate chaining
-    /// to one of them (mutual TLS) -- absent, any client is accepted once the TLS handshake
-    /// itself completes.
+    /// to one of them (mutual TLS). Absent, any client is accepted once the TLS handshake
+    /// completes.
     #[serde(default)]
     pub client_ca_file: Option<String>,
 }
 
-/// Whether `otlp_out` gzips its request bodies -- both transports (HTTP `Content-Encoding: gzip`,
-/// gRPC's per-message compressed-frame flag plus `grpc-encoding: gzip`). Default `none`,
-/// deliberately: flipping it would change an existing pipeline's wire behavior in a patch, and
-/// would break `otlp_out -> otlp_in` across two `logit` versions where only one side has learned
-/// gzip. `otlp_out` never advertises accepting a compressed *response* regardless of this setting
-/// (`docs/adr/otlp-compression-and-decompression-bounds.md`) -- this only ever compresses what it
-/// sends.
+/// Whether `otlp_out` gzips its request bodies, on both transports (HTTP `Content-Encoding:
+/// gzip`; gRPC's per-message compressed flag plus `grpc-encoding: gzip`). Default `none`. This
+/// only compresses what `otlp_out` sends; it never advertises accepting a compressed response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OtlpCompression {
@@ -447,9 +384,8 @@ pub enum OtlpCompression {
     Gzip,
 }
 
-/// A signal an event's payload may carry -- OTLP's vocabulary (`logit_proto::Signal`), not
-/// `Event`'s field names, since that's the vocabulary `has_signal`/`keep_signals`/`drop_signals`
-/// are meant to be read against. `Traces` corresponds to `event.span`.
+/// A signal an event's payload may carry, in OTLP's vocabulary. `traces` corresponds to the
+/// event's span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Signal {
@@ -458,10 +394,10 @@ pub enum Signal {
     Traces,
 }
 
-/// `has_signal`'s matching rule. `AnyOf` forwards an event carrying at least one signal named in
-/// `signals`, untouched, even if it also carries a signal that isn't named. `Only` additionally
-/// requires the event carry nothing outside `signals` -- a mixed event that also has a signal not
-/// listed is dropped, not trimmed (`keep_signals` trims; `has_signal` never mutates an event).
+/// `has_signal`'s matching rule. `any_of` forwards an event carrying at least one listed signal,
+/// untouched, even if it also carries an unlisted one. `only` also requires the event carry
+/// nothing outside `signals`: a mixed event with an unlisted signal is dropped, not trimmed
+/// (`keep_signals` trims; `has_signal` never mutates an event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchMode {
@@ -470,8 +406,8 @@ pub enum MatchMode {
     Only,
 }
 
-/// What one `route` reads from each event. Externally tagged, so config reads
-/// `by: {provenance: origin}`, `by: {attribute: stream}`, or `by: {resource: service.name}`.
+/// What one `route` reads from each event. Written `by: {provenance: origin}`, `by: {attribute:
+/// stream}`, or `by: {resource: service.name}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteBy {
@@ -480,8 +416,8 @@ pub enum RouteBy {
     Resource(String),
 }
 
-/// Which half of a batch's provenance a `route` switches on
-/// (`docs/adr/batch-provenance-on-delivered.md`).
+/// Which half of a batch's provenance a `route` switches on: `origin` is the component that
+/// created the batch, `previous` the one that most recently handled it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceField {
@@ -489,26 +425,24 @@ pub enum ProvenanceField {
     Previous,
 }
 
-/// What one `sample` (`ComponentKind::Sample`) hashes to reach its keep/drop verdict. Externally
-/// tagged like [`RouteBy`], so config reads `key: trace_id`, `key: {attribute: request_id}`, or
-/// `key: {resource: service.name}`. See `docs/adr/consistent-sampling-component.md` for the
-/// canonicalization every shape is hashed through.
+/// What `sample` hashes to reach its keep/drop verdict. Written `key: trace_id`, `key:
+/// {attribute: request_id}`, or `key: {resource: service.name}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleKey {
-    /// The event's application trace id: `span.trace_id` if it carries a span, else its log
-    /// record's `trace.trace_id` (what `trace_context` or `otlp_in` sets). Hashed as its 32
-    /// lowercase hex characters, so it agrees with `{attribute: ...}` on the same id left as an
-    /// unlifted hex string.
+    /// The event's application trace id: the span's `trace_id` if it carries a span, else the log
+    /// record's trace reference (what `trace_context` or `otlp_in` sets). Hashed as its 32
+    /// lowercase hex characters, so it agrees with `{attribute: ...}` on the same id left as a
+    /// hex string.
     TraceId,
     /// A top-level event attribute, named literally (never a path).
     Attribute(String),
-    /// A resource attribute -- every event of one resource gets the same verdict.
+    /// A resource attribute: every event of one resource gets the same verdict.
     Resource(String),
 }
 
-/// What `sample` does with an event its configured `key:` isn't on -- no span or log trace
-/// reference, no such attribute, or a `Null`/`Array`/`Map` value there.
+/// What `sample` does with an event its configured `key:` isn't on: no span or log trace
+/// reference, no such attribute, or a null, array, or map value there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleMissing {
@@ -521,9 +455,9 @@ pub enum SampleMissing {
     Drop,
 }
 
-/// `sample`'s `always_keep:` override: an event carrying the named field -- and, with `value:`,
-/// carrying it with that value -- is kept whatever the rate. Exactly one of `attribute`/`resource`
-/// (graph rule 61).
+/// `sample`'s `always_keep:` override: an event carrying the named field, and with `value:`
+/// carrying it with that value, is kept whatever the rate. Name one of `attribute`/`resource`,
+/// never both.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SampleOverride {
@@ -534,21 +468,17 @@ pub struct SampleOverride {
     #[serde(default)]
     pub resource: Option<String>,
     /// The value the field must carry, compared under `has_attributes`' equality rules (numeric
-    /// coercion across integer/float/string, none for booleans -- `value: true` does not match a
-    /// logfmt `"true"` string). Absent means any value.
+    /// coercion across integer/float/string, none for booleans: `value: true` does not match a
+    /// logfmt `"true"` string). Absent means any value. Must be finite.
     #[serde(default)]
     pub value: Option<SetValue>,
 }
 
-/// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). Not a `HashMap<String,
-/// String>` -- a typo'd key there would silently do nothing, where a struct field gets schema
-/// validation for free. Not a path *prefix* either: `endpoint`'s own trailing text already serves
-/// that role (`endpoint: http://host/otlp` already yields `/otlp/v1/logs` against `Signal::path`'s
-/// default, `crates/logit-outputs/src/otlp.rs`'s `send_http`), so a prefix field would be a second
-/// way to say the same thing. `None` on any field means "use the OTLP-standard default"
-/// (`/v1/logs`, `/v1/metrics`, `/v1/traces`). gRPC method names are fixed by the `.proto` service
-/// definitions, not a mount point an operator can move -- a non-empty `paths:` under
-/// `protocol: grpc` is rejected at config-validation time (rule 21) rather than silently ignored.
+/// Per-signal HTTP path overrides for `otlp_out` (`paths:` in config). An omitted field uses the
+/// OTLP-standard default (`/v1/logs`, `/v1/metrics`, `/v1/traces`). A path prefix belongs on
+/// `endpoint` itself: `endpoint: http://host/otlp` already yields `/otlp/v1/logs`. `protocol:
+/// http` only; gRPC method names are fixed by the service definitions, so a non-empty `paths:`
+/// under `protocol: grpc` is rejected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OtlpPaths {
     #[serde(default)]
@@ -560,156 +490,127 @@ pub struct OtlpPaths {
 }
 
 impl OtlpPaths {
-    /// `true` if every field is `None` -- rule 21's "did the operator actually set a path
-    /// override" check.
+    /// `true` if every field is `None`.
     pub fn is_empty(&self) -> bool {
         self.logs.is_none() && self.metrics.is_none() && self.traces.is_none()
     }
 }
 
-/// `ComponentKind::Internal`'s `span_sample_rate` default when a config omits it -- re-exported
-/// from `logit-core` (not restated as a bare literal here) so the two crates can never drift
-/// apart on what "the default" actually is. This is also the one place `logit-config` depends on
-/// `logit-core` at all: a small, deliberately narrow edge (one `pub const`), not a general
-/// dependency on the event model this crate otherwise has no business needing.
+/// `internal`'s `span_sample_rate` default, taken from `logit-core` so the two crates can't
+/// drift. The one place `logit-config` depends on `logit-core`.
 fn default_span_sample_rate() -> f64 {
     logit_core::DEFAULT_SPAN_SAMPLE_RATE
 }
 
-/// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`
-/// uniformly (`docs/design/pipeline-graph.md`'s naming rationale) so a listener and a sink for the
-/// same protocol never collide on one tag value; transform kinds take no suffix, since there's
-/// only one direction for a transform to be.
+/// A component's kind, tagged by `type` in config. Every protocol kind is suffixed `_in`/`_out`,
+/// so a listener and a sink for one protocol never collide on a tag; transform kinds take no
+/// suffix.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ComponentKind {
     /// statsd / DogStatsD-style tagged metrics, over UDP (the default) or TCP.
     ///
-    /// Under `transport: tcp` a message is one **LF-delimited line, always** -- there is no
-    /// `framing:` field and no octet-counted alternative the way `syslog_in` has: a statsd line
-    /// may legally begin with an ASCII digit (`1.hits:1|c`), so sniffing a leading digit as a
-    /// length prefix could only ever mis-frame. A line longer than 64 KiB is dropped and counted
-    /// (`logit.input.frames.dropped{reason="oversize"}`); the connection stays open and the line
-    /// after it still decodes. There is deliberately no `max_line_bytes` knob -- no statsd server
-    /// exposes one for an operator to match.
+    /// Under `transport: tcp` a message is one LF-delimited line; there is no `framing:` field
+    /// and no octet-counted alternative, because a statsd line may begin with a digit. A line
+    /// longer than 64 KiB is dropped and counted (`logit.input.frames.dropped{reason="oversize"}`);
+    /// the connection stays open and the next line still decodes.
     ///
-    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
-    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
-    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
-    /// block. Plain statsd clients have no TLS of their own -- this is for a `logit`-to-`logit`
-    /// or stunnel-shaped relay hop, the `statsd_in`/`statsd_out` pair included.
+    /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
+    /// listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected.
+    /// Plain statsd clients have no TLS of their own, so this is for a `logit`-to-`logit` or
+    /// stunnel-shaped relay hop.
     ///
-    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
-    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
-    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
-    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
-    /// apply, scoped **per connection**: N live connections can hold up to N times
-    /// `batch_max_events` in flight, not one shared bound.
+    /// A TCP listener has no receive queue (the connection's own flow control is the
+    /// backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
+    /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
     StatsdIn {
         bind: String,
         #[serde(default)]
         transport: StatsdTransport,
         /// Terminates TLS on this listener when present; plaintext when omitted. Requires
-        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
-        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
-        /// See [`TlsServerConfig`].
+        /// `transport: tcp`.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
-        /// udp`, where a datagram listener has no connection to time out). How long one
-        /// connection has, **per pre-message phase**, to get somewhere before this listener
-        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
-        /// set, and then the wait for the connection's very first byte. Each phase gets its own
-        /// budget of this length, so a TLS connection that says nothing at all costs up to two
-        /// of them -- 10s at the default.
+        /// How long one connection has, per pre-message phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
+        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
+        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
         ///
-        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
-        /// once a connection has sent its first byte, the gap before the next line is bounded by
-        /// `idle_timeout` if one is set, and unbounded if it is not.
+        /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
+        /// next line is bounded by `idle_timeout` if set, and unbounded otherwise.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
-        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
-        /// datagram listener has no connection to time out). How long one connection may stay
-        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
-        /// unless set:** with no value, a connection that sent one line and then went silent
-        /// holds its permit indefinitely, which is what every `logit` release so far has done.
+        /// How long one connection may stay quiet before this listener closes it and frees its
+        /// connection-cap slot. Off unless set: with no value, a connection that sent one line
+        /// and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to
+        /// disable. `transport: tcp` only: any value under `transport: udp` is rejected.
         ///
-        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
-        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
-        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
-        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
-        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
-        /// where the sender cannot detect the close. A statsd client flushing on a fixed
-        /// interval is the easy case; one that only emits when its process sees traffic is not.
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. Set it well above the sender's longest normal gap (several
+        /// `batch_flush_interval`s, say). Leave it unset for sparse or bursty senders, and think
+        /// twice on plaintext transports, where the sender cannot detect the close before its
+        /// next write. A statsd client flushing on a fixed interval is the easy case; one that
+        /// only emits when its process sees traffic is not.
         ///
-        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
-        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
-        /// finishing its own work on the connection (an accumulated batch handed downstream).
-        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
-        /// never make a busy connection look idle; a flush tick with nothing to send resets
-        /// nothing.
+        /// The clock runs only while this listener is waiting on the peer's socket, and resets on
+        /// bytes read from the peer and on this listener handing an accumulated batch downstream.
+        /// Time blocked on a full downstream never counts, so a stalled pipeline cannot make a
+        /// busy connection look idle.
         ///
-        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
-        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
-        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
-        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
-        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
-        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        /// An idle close is policy, not a fault: complete buffered frames are flushed downstream
+        /// first (`logit.component.receive.flushed{reason="closed"}`), a buffered partial frame is
+        /// counted `logit.input.frames.dropped{reason="truncated"}`, and the close is counted
+        /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
+        /// `connection_error`.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
-    /// collectd's binary "`network` plugin" protocol over UDP
-    /// (`docs/adr/collectd-binary-relay.md`; `crates/logit-inputs/src/collectd.rs` is the
-    /// listener, `crates/logit-proto/src/collectd/` the codec).
+    /// collectd's binary `network` plugin protocol over UDP.
     ///
-    /// `bind` is an ordinary `host:port` -- collectd's own default port is `25826`. When its
-    /// address is a **multicast group** (collectd's defaults are `239.192.74.66` and
-    /// `ff18::efc0:4a42`), the shared UDP listener sets `SO_REUSEADDR`, binds the unspecified
-    /// address on that port and joins the group on the default interface. There is deliberately no
-    /// `multicast:` field: the address already says it. Because the socket is bound to the
-    /// unspecified address rather than to the group, such a listener **also** accepts ordinary
-    /// unicast datagrams sent to that port from any source -- joining a group is additive, not a
-    /// filter that narrows what else the port receives.
+    /// `bind` is an ordinary `host:port`; collectd's own default port is `25826`. When the
+    /// address is a multicast group (collectd's defaults are `239.192.74.66` and
+    /// `ff18::efc0:4a42`), the listener sets `SO_REUSEADDR`, binds the unspecified address on
+    /// that port, and joins the group on the default interface. There is no `multicast:` field;
+    /// the address says it. Such a listener also accepts unicast datagrams sent to that port from
+    /// any source: joining a group is additive, not a filter.
     ///
-    /// `types_db` names zero or more collectd `types.db` files (relative paths resolve against the
-    /// config file's directory), read at startup and merged in order -- a later file overrides an
-    /// earlier one. They only supply **data-source names**: a list whose type resolves with a
+    /// `types_db` names zero or more collectd `types.db` files (relative paths resolve against
+    /// the config file's directory), read at startup and merged in order, later files overriding
+    /// earlier ones. They supply data-source names only: a value list whose type resolves with a
     /// matching data-source count and kinds is named `<plugin>.<type>.<ds_name>` rather than
     /// `<plugin>.<type>.<i>` (a single-data-source list is `<plugin>.<type>` either way). A
-    /// missing or unparseable file fails startup. Names are display/cross-protocol only --
-    /// `collectd_out` re-encodes from the `collectd.*` attributes, so this setting never changes
-    /// what a `collectd_in -> collectd_out` relay puts back on the wire. collectd's own `types.db`
-    /// is GPL-licensed and is not shipped with `logit`; point this at the installed copy.
+    /// missing or unparseable file fails startup. Names never change what `collectd_out` puts
+    /// back on the wire; it re-encodes from the `collectd.*` attributes. collectd's own
+    /// `types.db` is GPL-licensed and not shipped with `logit`; point this at the installed copy.
     CollectdIn {
         bind: String,
         #[serde(default)]
         types_db: Vec<PathBuf>,
     },
-    /// Graphite/Carbon metric ingress -- carbon's plaintext line protocol or its pickle batch
-    /// protocol, over TCP or UDP (`docs/adr/graphite-carbon-relay.md`;
-    /// `crates/logit-inputs/src/graphite/` is the listener, `crates/logit-proto/src/graphite/` the
-    /// codec). The listener half of the `graphite_in -> graphite_out` lossless pair.
+    /// Graphite/Carbon metric ingress: carbon's plaintext line protocol or its pickle batch
+    /// protocol, over TCP or UDP.
     ///
-    /// `bind` is an ordinary `host:port` -- carbon's own plaintext port is `2003` and its pickle
-    /// port is `2004`. There is deliberately no `prefix:`/`template:` field and no `graphite.*`
-    /// attribute namespace: a datapoint's dotted path **is** the metric name and its `;k=v` tags
-    /// **are** event attributes, so a `lua`/`set` stage that renames the metric renames the wire
-    /// path. See `docs/deploying.md`'s `graphite_in` section.
+    /// `bind` is an ordinary `host:port`; carbon's own plaintext port is `2003` and its pickle
+    /// port is `2004`. There is no `prefix:`/`template:` field and no `graphite.*` attribute
+    /// namespace: a datapoint's dotted path is the metric name and its `;k=v` tags are event
+    /// attributes, so a `lua`/`set` stage that renames the metric renames the wire path.
     ///
-    /// `transport: tcp` (the default, matching carbon's own default listener) runs an accept loop
-    /// with no receive queue -- TCP's own flow control is the backpressure -- so unlike a datagram
-    /// listener only `receive:`'s batch-assembly and `shutdown_grace` fields apply to it (rule
-    /// 17). `transport: udp` runs the shared datagram listener and takes the whole `receive:`
-    /// block. `protocol: pickle` requires `transport: tcp` (rule 46): the 4-byte big-endian length
-    /// prefix carbon frames a pickle batch with has no meaning in a self-delimiting datagram.
+    /// `transport: tcp` (the default, carbon's own) runs an accept loop with no receive queue
+    /// (TCP's own flow control is the backpressure), so only `receive:`'s batch-assembly and
+    /// `shutdown_grace` fields apply to it. `transport: udp` runs the datagram listener and takes
+    /// the whole `receive:` block. `protocol: pickle` requires `transport: tcp`: carbon's 4-byte
+    /// length prefix has no meaning in a self-delimiting datagram.
     ///
-    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
-    /// fallback on a TLS listener. Like `syslog_in`'s, it applies to `transport: tcp` only (rule
-    /// 43): carbon has no DTLS receiver of any kind, so `tls:` under `transport: udp` is a config
-    /// error rather than a silently ignored block. Plain carbon senders have no TLS of their own
-    /// either -- this is for a `logit`-to-`logit` or stunnel-shaped relay hop.
+    /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
+    /// listener. It applies to `transport: tcp` only; `tls:` under `transport: udp` is rejected.
+    /// Carbon senders have no TLS of their own, so this is for a `logit`-to-`logit` or
+    /// stunnel-shaped relay hop.
     GraphiteIn {
         bind: String,
         #[serde(default)]
@@ -717,473 +618,394 @@ pub enum ComponentKind {
         #[serde(default)]
         protocol: GraphiteProtocol,
         /// Terminates TLS on this listener when present; plaintext when omitted. Requires
-        /// `transport: tcp`. No ALPN -- like `syslog_in` and `logit_in`, and unlike `otlp_in`,
-        /// this isn't an HTTP-shaped protocol with anything for a client to negotiate down to.
-        /// See [`TlsServerConfig`].
+        /// `transport: tcp`.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
-        /// udp`, where a datagram listener has no connection to time out). How long one
-        /// connection has, **per pre-message phase**, to get somewhere before this listener
-        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
-        /// set, and then the wait for the connection's very first byte. Each phase gets its own
-        /// budget of this length, so a TLS connection that says nothing at all costs up to two
-        /// of them -- 10s at the default.
+        /// How long one connection has, per pre-message phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
+        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
+        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
         ///
-        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
-        /// once a connection has sent its first byte, the gap before the next datapoint is
-        /// bounded by `idle_timeout` if one is set, and unbounded if it is not.
+        /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
+        /// next datapoint is bounded by `idle_timeout` if set, and unbounded otherwise.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
-        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
-        /// datagram listener has no connection to time out). How long one connection may stay
-        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
-        /// unless set:** with no value, a connection that sent one datapoint and then went
-        /// silent holds its permit indefinitely, which is what every `logit` release so far has
-        /// done.
+        /// How long one connection may stay quiet before this listener closes it and frees its
+        /// connection-cap slot. Off unless set: with no value, a connection that sent one
+        /// datapoint and then went silent holds its slot indefinitely. `0s` is rejected; omit the
+        /// field to disable. `transport: tcp` only: any value under `transport: udp` is rejected.
         ///
-        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
-        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
-        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
-        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
-        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
-        /// where the sender cannot detect the close. A carbon relay that flushes once a minute
-        /// wants a value well above that minute, not a tight one.
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. Set it well above the sender's longest normal gap (several
+        /// `batch_flush_interval`s, say). Leave it unset for sparse or bursty senders, and think
+        /// twice on plaintext transports, where the sender cannot detect the close before its
+        /// next write. A carbon relay that flushes once a minute wants a value well above that
+        /// minute.
         ///
-        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
-        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
-        /// finishing its own work on the connection (an accumulated batch handed downstream).
-        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
-        /// never make a busy connection look idle; a flush tick with nothing to send resets
-        /// nothing.
+        /// The clock runs only while this listener is waiting on the peer's socket, and resets on
+        /// bytes read from the peer and on this listener handing an accumulated batch downstream.
+        /// Time blocked on a full downstream never counts, so a stalled pipeline cannot make a
+        /// busy connection look idle.
         ///
-        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
-        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
-        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
-        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
-        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
-        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        /// An idle close is policy, not a fault: complete buffered frames are flushed downstream
+        /// first (`logit.component.receive.flushed{reason="closed"}`), a buffered partial frame is
+        /// counted `logit.input.frames.dropped{reason="truncated"}`, and the close is counted
+        /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
+        /// `connection_error`.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
-        /// The longest plaintext line this listener will assemble before giving up on it and
-        /// draining to the next newline (counted once as `logit.input.frames.dropped
-        /// {reason="oversize"}`; the line *after* it still decodes). Defaults to `"8192"` --
-        /// carbon itself sets no such bound and Twisted's `LineReceiver` defaults to 16384, so
-        /// 8 KiB is comfortably past any real tagged path while keeping one hostile connection
-        /// from growing an unbounded read buffer. A string via [`human_bytes`], exactly like
-        /// `TailOptions::max_line_bytes`. Rule 46 rejects `0`. TCP plaintext only -- a UDP
-        /// datagram is already its own frame.
+        /// The longest plaintext line this listener assembles before dropping it and draining to
+        /// the next newline (counted once as `logit.input.frames.dropped{reason="oversize"}`; the
+        /// line after it still decodes). A byte-count string (`"8192"`, `"16KiB"`). Defaults to
+        /// `"8192"`, past any real tagged path while keeping one hostile connection from growing
+        /// an unbounded read buffer. `0` is rejected. TCP plaintext only; a UDP datagram is its
+        /// own frame.
         #[serde(default = "default_graphite_max_line_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_line_bytes: u64,
-        /// The largest pickle frame this listener will accept. A frame declaring more than this
-        /// closes the connection (`logit.input.frames.dropped{reason="oversize"}`, diagnostic
-        /// `framing_error`): a length-framed stream has no resync point, so there is nothing to
-        /// skip forward to. Defaults to `"1MiB"`, Twisted's
-        /// `Int32StringReceiver.MAX_LENGTH`, which is what carbon's own pickle receiver inherits
-        /// -- so a `logit` relay refuses exactly the frames carbon would. Rule 46 rejects `0` and
-        /// anything outside `1024..=16MiB`. `protocol: pickle` only.
+        /// The largest pickle frame this listener accepts. A frame declaring more closes the
+        /// connection (`logit.input.frames.dropped{reason="oversize"}`, diagnostic
+        /// `framing_error`): a length-framed stream has no resync point. A byte-count string.
+        /// Defaults to `"1MiB"`, the bound carbon's own pickle receiver inherits from Twisted, so
+        /// this listener refuses the frames carbon would. Must be within `1024..=16MiB`.
+        /// `protocol: pickle` only.
         #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_frame_bytes: u64,
     },
     /// RFC 3164 / RFC 5424 syslog, over UDP (the default) or TCP. RFC 5424 STRUCTURED-DATA is
-    /// parsed into `syslog.sd` either way -- see
-    /// `docs/adr/syslog-structured-data-convention.md`.
+    /// parsed into `syslog.sd` either way.
     ///
-    /// Under `transport: tcp` each connection's framing is **auto-detected from its first byte**
-    /// and latched for that connection's life: an ASCII digit means RFC 6587 section 3.4.1
-    /// octet-counting (`MSG-LEN SP MSG`, the framing `syslog_out` emits, and the only one that
-    /// can carry a message containing a newline), anything else means non-transparent,
-    /// LF-delimited framing (rsyslog's `omfwd` default, and what a well-formed message's leading
-    /// `<` gives away). There is no `framing:` field to get wrong; a frame over 64 KiB, or a
-    /// malformed octet count, closes that one connection. See
-    /// `docs/adr/syslog-tcp-ingress-and-tls.md`.
+    /// Under `transport: tcp` each connection's framing is detected from its first byte and
+    /// latched for that connection's life: an ASCII digit means RFC 6587 octet-counting
+    /// (`MSG-LEN SP MSG`, what `syslog_out` emits, and the only framing that can carry a message
+    /// containing a newline); anything else means LF-delimited framing (rsyslog's `omfwd`
+    /// default). There is no `framing:` field. A frame over 64 KiB, or a malformed octet count,
+    /// closes that one connection.
     ///
-    /// `tls:`'s mere presence turns TLS on **and makes it required** -- there is no plaintext
-    /// fallback on a TLS listener. It applies to `transport: tcp` only: DTLS is out of scope, so
-    /// `tls:` under `transport: udp` is a config error (rule 43) rather than a silently ignored
-    /// block.
+    /// `tls:` turns TLS on and makes it required: there is no plaintext fallback on a TLS
+    /// listener. It applies to `transport: tcp` only (RFC 5425); `tls:` under `transport: udp` is
+    /// rejected.
     ///
-    /// A TCP listener has no receive *queue* -- the connection's own flow control is the
-    /// backpressure -- so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
-    /// `receive_buffer_bytes`) are rejected on one (rule 17). Its batch-assembly fields
-    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` do
-    /// apply, scoped **per connection**: N live connections can hold up to N times
-    /// `batch_max_events` in flight, not one shared bound.
+    /// A TCP listener has no receive queue (the connection's own flow control is the
+    /// backpressure), so `receive:`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+    /// `receive_buffer_bytes`, `read_batch`) are rejected on one. Its batch-assembly fields
+    /// (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace` apply
+    /// per connection: N live connections can hold up to N times `batch_max_events` in flight.
     SyslogIn {
         bind: String,
         #[serde(default)]
         transport: SyslogTransport,
         /// Terminates TLS on this listener when present; plaintext when omitted. Requires
-        /// `transport: tcp`. No ALPN -- like `logit_in`, and unlike `otlp_in`, this isn't an
-        /// HTTP-shaped protocol with anything for a client to negotiate down to. See
-        /// [`TlsServerConfig`].
+        /// `transport: tcp`.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// **`transport: tcp` only** (rule 45 rejects a non-default value under `transport:
-        /// udp`, where a datagram listener has no connection to time out). How long one
-        /// connection has, **per pre-message phase**, to get somewhere before this listener
-        /// closes it and hands back its connection-cap permit: the TLS accept when `tls:` is
-        /// set, and then the wait for the connection's very first byte. Each phase gets its own
-        /// budget of this length, so a TLS connection that says nothing at all costs up to two
-        /// of them -- 10s at the default -- exactly the way `syslog_out`'s `connect_timeout`
-        /// bounds its own TCP connect and TLS handshake separately.
+        /// How long one connection has, per pre-message phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the wait for
+        /// the connection's first byte. Each phase gets its own budget, so a silent TLS
+        /// connection costs up to twice this value. Defaults to `5s`; `0s` is rejected.
+        /// `transport: tcp` only: a non-default value under `transport: udp` is rejected.
         ///
-        /// **Not an idle timeout.** It bounds the pre-message phases and nothing after them:
-        /// once a connection has sent its first byte, the gap before the next frame is bounded by
-        /// `idle_timeout` if one is set, and unbounded if it is not.
+        /// Not an idle timeout. Once a connection has sent its first byte, the gap before its
+        /// next frame is bounded by `idle_timeout` if set, and unbounded otherwise.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
-        /// **`transport: tcp` only** (rule 53 rejects any value under `transport: udp`, where a
-        /// datagram listener has no connection to time out). How long one connection may stay
-        /// quiet before this listener closes it and hands back its connection-cap permit. **Off
-        /// unless set:** with no value, a connection that sent one frame and then went silent
-        /// holds its permit indefinitely, which is what every `logit` release so far has done.
+        /// How long one connection may stay quiet before this listener closes it and frees its
+        /// connection-cap slot. Off unless set: with no value, a connection that sent one frame
+        /// and then went silent holds its slot indefinitely. `0s` is rejected; omit the field to
+        /// disable. `transport: tcp` only: any value under `transport: udp` is rejected.
         ///
-        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
-        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
-        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
-        /// above the sender's longest normal gap (several `batch_flush_interval`s, say); leave it
-        /// unset for genuinely sparse or bursty senders, and think twice on plaintext transports
-        /// where the sender cannot detect the close -- a plaintext syslog sender has no ack to
-        /// lose a message against and may not notice the close until after it has written one.
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. Set it well above the sender's longest normal gap (several
+        /// `batch_flush_interval`s, say). Leave it unset for sparse or bursty senders, and think
+        /// twice on plaintext transports: a plaintext syslog sender has no ack to lose a message
+        /// against and may not notice the close until after it has written one.
         ///
-        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
-        /// socket, and it is reset by two things: any bytes read from the peer, and this listener
-        /// finishing its own work on the connection (an accumulated batch handed downstream).
-        /// Time blocked on a full downstream therefore never counts, so a stalled pipeline can
-        /// never make a busy connection look idle; a flush tick with nothing to send resets
-        /// nothing.
+        /// The clock runs only while this listener is waiting on the peer's socket, and resets on
+        /// bytes read from the peer and on this listener handing an accumulated batch downstream.
+        /// Time blocked on a full downstream never counts, so a stalled pipeline cannot make a
+        /// busy connection look idle.
         ///
-        /// **An idle close is policy, not a fault.** Complete buffered frames are flushed
-        /// downstream first (`logit.component.receive.flushed{reason="closed"}`), a buffered
-        /// partial frame is counted `logit.input.frames.dropped{reason="truncated"}`, and the
-        /// close itself is counted `logit.input.connections.closed{reason="idle"}` -- counted,
-        /// never diagnosed as a `connection_error`. Rule 53 rejects `0s`: omit the field to
-        /// disable the idle timeout. See `docs/adr/idle-connection-timeout.md`.
+        /// An idle close is policy, not a fault: complete buffered frames are flushed downstream
+        /// first (`logit.component.receive.flushed{reason="closed"}`), a buffered partial frame is
+        /// counted `logit.input.frames.dropped{reason="truncated"}`, and the close is counted
+        /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
+        /// `connection_error`.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
-    /// OpenTelemetry Protocol (logs, metrics, and/or traces).
+    /// OpenTelemetry Protocol (logs, metrics, and/or traces) over OTLP/HTTP (protobuf or JSON
+    /// body) or OTLP/gRPC.
     OtlpIn {
         bind: String,
         #[serde(default)]
         protocol: OtlpProtocol,
-        /// Terminates TLS on this listener (both `protocol: http` and `protocol: grpc`) when
-        /// present; plaintext when omitted. See [`TlsServerConfig`].
+        /// Terminates TLS on this listener, under either `protocol`, when present; plaintext when
+        /// omitted.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// How long one connection has, per pre-request phase, before this listener closes it and
-        /// hands back its connection-cap permit: its **TLS accept** when `tls:` is set, and --
-        /// on a plaintext listener, which has no TLS accept -- the wait for its very **first
-        /// byte**. Applies with or without `tls:`.
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
+        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
         ///
-        /// **Not an idle timeout.** It bounds the pre-request phases and nothing after them:
-        /// once a connection has produced one byte it is inside `hyper`'s own read loop, and what
-        /// bounds the quiet gaps there is `idle_timeout` if one is set, and nothing if it is not.
-        /// `hyper`'s own `http1().header_read_timeout(..)` is deliberately not installed either
-        /// way: it re-arms across every idle keep-alive gap, which makes it an idle timeout
-        /// wearing a first-head name, and it covers `protocol: http`'s HTTP/1.1 case only.
+        /// Not an idle timeout. Once a connection has produced one byte, the quiet gaps between
+        /// requests are bounded by `idle_timeout` if set, and by nothing otherwise.
         ///
-        /// Doubles as the grace period an idle close gives `hyper` to shut the connection down in
-        /// before it is dropped -- see `idle_timeout` below, and
-        /// `docs/adr/idle-connection-timeout.md`.
+        /// Also the grace period an idle close gives the HTTP server to shut the connection down
+        /// before it is dropped.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
-        /// How long one connection may sit with **no request in flight** before this listener
-        /// closes it and hands back its connection-cap permit. **Off unless set:** with no value,
-        /// a connection that sent one byte and then went silent holds its permit indefinitely,
-        /// which is what every `logit` release so far has done.
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot. Off unless set: with no value, a connection that
+        /// sent one byte and then went silent holds its slot indefinitely. `0s` is rejected; omit
+        /// the field to disable.
         ///
-        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
-        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
-        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
-        /// above the sender's longest normal gap; leave it unset for genuinely sparse or bursty
-        /// senders. An OTLP exporter pools its connection between exports, so the value belongs
-        /// well above that export interval -- a conformant exporter also reconnects on its own,
-        /// so a close between exports costs it a reconnect, not a batch.
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. An OTLP exporter pools its connection between exports, so set this
+        /// well above the export interval; a conformant exporter reconnects on its own, so a
+        /// close between exports costs it a reconnect, not a batch.
         ///
-        /// **What the clock measures.** It runs only while no request is in flight, and it is
-        /// reset by a request *completing* -- time a handler spends blocked on a full downstream
-        /// therefore never counts, so a stalled pipeline can never make a busy connection look
-        /// idle. Unlike the other listeners this one resets on request completion rather than on
-        /// bytes read, because `hyper` owns this connection's reads: a request *head* that takes
-        /// longer than this to arrive on an otherwise idle keep-alive connection is closed. A
-        /// request *body* that stalls mid-upload is bounded per-frame by this same value instead,
-        /// answering `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`) and then
-        /// closing the connection.
+        /// The clock runs only while no request is in flight and resets when a request completes,
+        /// so time a handler spends blocked on a full downstream never counts. A request head
+        /// that takes longer than this to arrive on an idle keep-alive connection closes it. A
+        /// request body that stalls mid-upload is bounded per frame by the same value, answered
+        /// with `408` (`protocol: http`) or `grpc-status: 4` (`protocol: grpc`), and then closed.
         ///
-        /// **An idle close is policy, not a fault.** `hyper` is asked to shut the connection
-        /// down gracefully, given `handshake_timeout` to do it, and only then dropped, so a
-        /// response already in flight still goes out; the close is counted
-        /// `logit.input.connections.closed{reason="idle"}` -- counted, never diagnosed as a
-        /// `connection_error`. Rule 53 rejects `0s`: omit the field to disable the idle timeout.
-        /// See `docs/adr/idle-connection-timeout.md`.
+        /// An idle close is policy, not a fault: the server is asked to shut the connection down
+        /// gracefully, given `handshake_timeout` to do it, so a response already in flight still
+        /// goes out. The close is counted `logit.input.connections.closed{reason="idle"}`, never
+        /// diagnosed as a `connection_error`.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
-    /// Tails one or more files as a log source, one line per event -- rotation-, truncation-,
-    /// and checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the
-    /// final path component (e.g. `/var/log/app/*.log`), matching any run of non-`/` characters.
-    /// See `docs/adr/file-tailing-and-docker-json-logs.md`.
+    /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
+    /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
+    /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
+    /// list or entry is rejected.
     TailIn {
         paths: Vec<String>,
         #[serde(flatten)]
         tail: TailOptions,
     },
     /// Tails Docker's json-file container logs (`<root>/<id>/<id>-json.log`) and stamps
-    /// per-container resource attributes read from the sibling `config.v2.json` -- no docker
-    /// socket, no HTTP client. Built on the same driver as [`ComponentKind::TailIn`]. See
-    /// `docs/adr/file-tailing-and-docker-json-logs.md`.
+    /// per-container resource attributes read from the sibling `config.v2.json`. No docker
+    /// socket and no HTTP client. Takes the same tailing options as `tail_in`.
     DockerIn {
-        /// The Docker daemon's container-state directory. Only the stock native-Linux-Docker
-        /// path is right by default; rootless Docker, Podman, and Docker Desktop all use a
-        /// different layout or log format -- see the ADR's "Alternatives considered".
+        /// The Docker daemon's container-state directory. Defaults to
+        /// `/var/lib/docker/containers`, right for stock native-Linux Docker only; rootless
+        /// Docker, Podman, and Docker Desktop use a different layout or log format. Must be
+        /// non-empty.
         #[serde(default = "default_docker_root")]
         root: String,
         /// Container names (the `docker ps` name, without a leading `/`) or id prefixes (at
-        /// least 12 hex characters) to follow. Explicit by default -- a container not named here
-        /// is never tailed, even if it exists under `root` -- so a typo'd or forgotten name is a
-        /// silent no-op rather than an accident that tails every container on the host.
+        /// least 12 hex characters) to follow. A container not named here is never tailed, even
+        /// if it exists under `root`, so a mistyped name is a silent no-op rather than every
+        /// container on the host. Required unless `discover: true`; an empty or duplicate entry
+        /// is rejected.
         #[serde(default)]
         containers: Vec<String>,
         /// Follow every container under `root`, including ones that appear after startup,
-        /// instead of only what `containers` names. `containers` may still be given alongside
-        /// this to document intent, but has no additional filtering effect once set.
+        /// instead of only what `containers` names. `containers` may still be listed to document
+        /// intent but has no filtering effect once this is set.
         #[serde(default)]
         discover: bool,
-        /// Container label keys to stamp as `container.label.<key>` resource attributes. Empty
-        /// by default -- a label's value is operator-controlled data, not `logit`'s to expose
-        /// without being asked, and every key here becomes a permanent entry in the process-wide
-        /// attribute interner (`docs/design/memory.md` §4), so this is opt-in, not "all labels".
+        /// Container label keys to stamp as `container.label.<key>` resource attributes. Empty by
+        /// default: a label's value is your data, and every key here becomes a permanent entry in
+        /// the process-wide attribute interner, so this is an opt-in list, never "all labels". An
+        /// empty entry is rejected.
         #[serde(default)]
         labels: Vec<String>,
         #[serde(flatten)]
         tail: TailOptions,
     },
-    /// The native logit-to-logit protocol -- one TCP (optionally TLS) listener accepting many
-    /// connections, each speaking `Hello`/`HelloAck`/`Ack`/`Reject`
-    /// (`docs/design/wire-protocol.md`'s connection protocol).
+    /// The native `logit`-to-`logit` protocol: one TCP (optionally TLS) listener accepting many
+    /// connections, each handshaking with `Hello`/`HelloAck` and acknowledging every frame.
     LogitIn {
         bind: String,
-        /// Terminates TLS on this listener when present; plaintext when omitted. No ALPN --
-        /// unlike `otlp_in`, this isn't an HTTP-shaped protocol with anything for a client to
-        /// negotiate down to. See [`TlsServerConfig`].
+        /// Terminates TLS on this listener when present; plaintext when omitted.
         #[serde(default)]
         tls: Option<TlsServerConfig>,
-        /// Caps the size (post- and pre-decompression alike) of a single frame this listener
-        /// accepts, echoed to every connecting client in `HelloAck.max_frame_bytes`. Defaults to
-        /// 64 MiB (`logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN`); rule 34 rejects a value of
-        /// `0` or over that ceiling.
+        /// Caps the size (before and after decompression alike) of one frame this listener
+        /// accepts, echoed to every connecting client in `HelloAck`. A byte-count string.
+        /// Defaults to 64 MiB, which is also the ceiling; `0` or a larger value is rejected.
         #[serde(default, with = "human_bytes::option")]
         #[schemars(with = "Option<String>")]
         max_frame_bytes: Option<u64>,
-        /// How long one connection has, **per pre-`Hello` phase**, to get somewhere before this
-        /// listener closes it and hands back its connection-cap permit: the TLS accept when
-        /// `tls:` is set, and then the `Hello` read itself. Each phase gets its own budget of
-        /// this length, so a TLS connection that sends no `Hello` costs up to two of them --
-        /// 10s at the default -- exactly the way `logit_out` races every step of its own connect
-        /// against its single `request_timeout`.
+        /// How long one connection has, per pre-`Hello` phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, then the `Hello`
+        /// read itself. Each phase gets its own budget, so a TLS connection that sends no `Hello`
+        /// costs up to twice this value. Defaults to `5s`; `0s` is rejected.
         ///
-        /// **Not an idle timeout.** It bounds the pre-`Hello` phases and nothing after them:
-        /// once a connection is handshaken, the gap before its next data frame is bounded by
-        /// `idle_timeout` if one is set, and unbounded if it is not.
+        /// Not an idle timeout. Once a connection is handshaken, the gap before its next data
+        /// frame is bounded by `idle_timeout` if set, and unbounded otherwise.
         #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         handshake_timeout: Duration,
         /// How long one handshaken connection may stay quiet before this listener closes it and
-        /// hands back its connection-cap permit. **Off unless set:** with no value, a connection
-        /// that sent one frame and then went silent holds its permit indefinitely, which is what
-        /// every `logit` release so far has done.
+        /// frees its connection-cap slot. Off unless set: with no value, a connection that sent
+        /// one frame and then went silent holds its slot indefinitely. `0s` is rejected; omit the
+        /// field to disable.
         ///
-        /// **Recommended wherever consistent traffic is expected** -- a connection quiet for
-        /// longer than this on such a listener is an anomaly (a dead peer, a half-open socket, a
-        /// slow-loris), so closing it costs nothing and returns the permit. Set it comfortably
-        /// above the sender's longest normal gap (several of the peer's flush intervals, say);
-        /// leave it unset for genuinely sparse or bursty senders.
+        /// Recommended wherever steady traffic is expected: a connection quiet for longer than
+        /// this is an anomaly (a dead peer, a half-open socket, a slow-loris), and closing it
+        /// returns the slot. Set it well above the sender's longest normal gap (several of the
+        /// peer's flush intervals, say); leave it unset for sparse or bursty senders.
         ///
-        /// **What the clock measures.** It runs only while this listener is waiting on the peer's
-        /// socket, and it is reset by two things: the handshake completing, and every `Ack` this
-        /// listener writes. A peer patiently waiting for an ack that a slow downstream is
-        /// delaying is by definition not idle -- this listener is the one working -- so time
-        /// blocked on a full downstream never counts against it. A frame body that stops arriving
-        /// part-way through is bounded by this value too, per `read` rather than in total, so a
-        /// large frame that keeps making progress is never cut off.
+        /// The clock runs only while this listener is waiting on the peer's socket, and resets
+        /// when the handshake completes and on every `Ack` this listener writes. A peer waiting
+        /// for an ack a slow downstream is delaying is not idle, so time blocked on a full
+        /// downstream never counts. A frame body that stops arriving part-way is bounded by this
+        /// value per read, not in total, so a large frame that keeps making progress is never cut
+        /// off.
         ///
-        /// **An idle close is policy, not a fault.** It is counted
-        /// `logit.input.connections.closed{reason="idle"}` -- counted, never diagnosed as a
-        /// `connection_error`. Rule 53 rejects `0s`: omit the field to disable the idle timeout.
-        /// Unlike the plaintext listeners, the peer is *told*: this listener writes
-        /// `Reject{GOING_AWAY, "idle for <dur>"}` before closing, and `logit_out` probes a pooled
-        /// connection for exactly that before reusing it, so a `logit_out -> logit_in` pair
-        /// reconnects rather than losing a batch into a closed socket. See
-        /// `docs/adr/idle-connection-timeout.md`.
+        /// An idle close is policy, not a fault: it is counted
+        /// `logit.input.connections.closed{reason="idle"}`, never diagnosed as a
+        /// `connection_error`. The peer is told: this listener writes `Reject{GOING_AWAY, "idle
+        /// for <dur>"}` before closing, and `logit_out` probes a pooled connection for that before
+        /// reusing it, so a `logit_out -> logit_in` pair reconnects rather than losing a batch.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
-    /// `logit` talking about itself: drains every component's buffered self-telemetry points on
-    /// `interval` and emits them as ordinary events into the graph, same as any other listener.
-    /// Named for the source, not the signal it emits today -- free to grow logs and spans later
-    /// without a rename. See `docs/design/internal-telemetry.md` and
-    /// `docs/adr/internal-telemetry-as-pipeline-events.md`.
+    /// `logit` observing itself: drains every component's buffered self-telemetry on `interval`
+    /// and emits it as ordinary events into the graph. At most one per config.
     Internal {
-        /// Both the drain cadence for every component's buffered points and the sampling tick for
-        /// this component's own process-level gauges (interner size, uptime). Should divide
-        /// evenly into any downstream `aggregate` interval, or the two windows beat against each
-        /// other.
+        /// The drain cadence for every component's buffered points, and the sampling tick for
+        /// process-level gauges (interner size, uptime). Should divide evenly into any downstream
+        /// `aggregate` interval, or the two windows beat against each other. `0s` is rejected.
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per-`trace_id`
-        /// the same way at every node -- a kept trace is kept at every hop, never partially. Below
-        /// `1.0` by default: span volume is a different shape than metric volume (one span per
-        /// node-visit per batch, where a metric point coalesces between drains). `0.0` turns spans
-        /// off entirely; `1.0` keeps everything -- e.g. a demo or debugging config that wants full
-        /// traces rather than a representative sample would set this explicitly. Named
-        /// `span_sample_rate`, not `sample_rate` -- `internal` may grow other sampling knobs
-        /// later, and the name disambiguates against the per-event `sample` transform, which
-        /// samples an application's events by a hashed key rather than `logit`'s own spans by
-        /// raw trace-id bits (`docs/adr/consistent-sampling-component.md`). See
-        /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
+        /// Fraction of traces whose internal spans are kept, `0.0..=1.0`, decided per `trace_id`
+        /// the same way at every node, so a kept trace is kept at every hop. Defaults to `0.1`:
+        /// spans cost one per node visit per batch, where metric points coalesce between drains.
+        /// `0.0` turns spans off; `1.0` keeps everything, for a demo or debugging config that
+        /// wants full traces. Distinct from the `sample` transform, which samples your
+        /// application's events by a hashed key.
         #[serde(default = "default_span_sample_rate")]
         span_sample_rate: f64,
-        /// Which of `logit`'s own `tracing` events (`docs/plans/operator-surface.md`, workstream
-        /// D) get captured into the pipeline as ordinary log events, alongside the points/spans
-        /// above -- `warn` (the default) and `error` mirror the two severities every shipped
-        /// `Diagnostics` call already reports at; `off` installs no capturing layer at all, the
-        /// same zero-cost-when-unconfigured guarantee the rest of internal telemetry has.
+        /// Which of `logit`'s own self-log events are captured into the pipeline as ordinary log
+        /// events: `warn` (the default) and `error` by severity, or `off`, which installs no
+        /// capturing layer at all.
         #[serde(default)]
         logs: InternalLogs,
     },
 
-    /// Inline Lua source (a YAML block scalar in practice). See `docs/design/lua-api.md`.
+    /// Inline Lua source (a YAML block scalar in practice).
     Lua {
         script: String,
-        /// Runs this component's `flush()`, if the script defines one, on this interval
-        /// (`docs/design/lua-api.md`'s flush contract). Omitted -- the common case -- means the
-        /// component never ticks, same as a script with no `flush()` at all.
+        /// Runs this component's `flush()`, if the script defines one, on this interval. Omitted
+        /// means the component never ticks, the same as a script with no `flush()`. `0s` is
+        /// rejected.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
     },
-    /// A `.lua` file path, relative to the config file.
+    /// A `.lua` file path, relative to the config file. Takes the same `interval` as `lua`.
     LuaFile {
         lua_file: String,
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         interval: Option<Duration>,
     },
-    /// The stateful aggregator (counters/gauges/sets/distributions). Runs `flush()` on
-    /// `interval`; see `docs/adr/aggregation-window-semantics.md`.
+    /// The windowed aggregator (counters, gauges, sets, distributions). Flushes every `interval`;
+    /// `0s` is rejected.
     Aggregate {
         #[serde(with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
         /// Whether each window's emitted `Sum`/`Histogram` is that window's own increment
-        /// (`delta`, the default -- strictly tumbling, self-contained) or a running total since
-        /// the series was first seen (`cumulative`, what OTLP and Prometheus scrapes carry). See
-        /// [`AggregateTemporality`] and the `docs/adr/aggregation-window-semantics.md`
-        /// "cumulative temporality as an opt-in mode" amendment.
+        /// (`delta`, the default: tumbling, self-contained) or a running total since the series
+        /// was first seen (`cumulative`, what OTLP and Prometheus carry, and what
+        /// `prometheus_out` requires).
         #[serde(default)]
         temporality: AggregateTemporality,
         /// How many consecutive windows a series with no new data is retained past its last
-        /// update. For a gauge that's so a relative gauge adjustment
-        /// (`docs/adr/relative-gauge-adjustments.md`) arriving in a later window can still resolve
-        /// against the value it last held; under `temporality: cumulative` it is also what keeps a
-        /// `Sum`/`Histogram`'s running total alive across the window boundary. `0` disables
-        /// retention entirely -- every series is drained every window, matching this field's
-        /// absence before it existed -- and is therefore rejected at graph-validation time
-        /// alongside `temporality: cumulative`, which would otherwise emit each window's delta
-        /// labelled as a cumulative total. See the `docs/adr/aggregation-window-semantics.md`
-        /// amendments for the full design.
+        /// update. Lets a relative gauge adjustment arriving in a later window resolve against
+        /// the value last held, and under `temporality: cumulative` keeps a `Sum`/`Histogram`'s
+        /// running total alive across the window boundary. Defaults to `5`. `0` disables
+        /// retention (every series is drained every window) and is rejected together with
+        /// `temporality: cumulative`, which would otherwise emit each window's delta labelled as
+        /// a cumulative total.
         #[serde(default = "default_series_retention")]
         series_retention: u32,
-        /// A hard cap on how many series may be retained across this component's whole window at
-        /// once -- a DoS/cardinality guard, not a tuning knob. `series_retention` alone bounds
-        /// only how long one series survives; without this, a sustained stream of never-repeating
-        /// series names would hold unboundedly many retained series regardless of how short the
-        /// retention window is. Least-recently-updated series are evicted first once exceeded.
+        /// A hard cap on how many series may be retained across this component's window at once;
+        /// a cardinality guard, not a tuning knob. `series_retention` alone bounds only how long
+        /// one series survives, so a stream of never-repeating series names would otherwise hold
+        /// unboundedly many. Defaults to `10000`. Least-recently-updated series are evicted first.
+        /// Must be at least `1` under `temporality: cumulative`.
         #[serde(default = "default_max_retained_series")]
         max_retained_series: usize,
-        /// Whether a raw `Samples` series (statsd `ms`/`h`/`d`) absorbs into this window as a
-        /// sketch (the default -- exact, error-bounded quantiles, no raw values retained past the
-        /// window) or keeps its raw observations for the whole window, only falling back to a
-        /// sketch when `max_samples_per_series` is exceeded or an incoming
-        /// record's `sample_rate` disagrees with the series' first one (that fallback is counted,
-        /// see `docs/adr/aggregation-window-semantics.md`'s amendment). Raw retention is the
-        /// lossless-transit option (`docs/adr/lossless-transit.md`): a downstream `logit`
-        /// re-sketching the same samples with a different accuracy target, or a sink that wants the
-        /// individual values, only has that choice available when this is `samples`.
+        /// Whether a raw samples series (statsd `ms`/`h`/`d`) absorbs into this window as a
+        /// sketch (`sketch`, the default: error-bounded quantiles, no raw values retained) or
+        /// keeps its raw observations for the whole window (`samples`), falling back to a sketch,
+        /// counted, when `max_samples_per_series` is exceeded or an incoming record's
+        /// `sample_rate` disagrees with the series' first one. `samples` is the lossless option:
+        /// a downstream `logit` re-sketching with a different accuracy target, or a sink that
+        /// wants the individual values, only has that choice under `samples`.
         #[serde(default)]
         distributions: Distributions,
-        /// A hard cap on how many raw values one `Samples` series may retain in one window before
-        /// `distributions: samples` falls back to sketching what it already holds -- a DoS/memory
-        /// guard, not a tuning knob, the same role `max_retained_series` plays for retention.
-        /// Meaningless when `distributions` is `sketch` (the default), since nothing raw is ever
-        /// retained in that mode.
+        /// A hard cap on how many raw values one series may retain in one window before
+        /// `distributions: samples` falls back to sketching what it holds; a memory guard, not a
+        /// tuning knob. Defaults to `1000`. Meaningless under `distributions: sketch`.
         #[serde(default = "default_max_samples_per_series")]
         max_samples_per_series: usize,
-        /// Whether a raw `SetMembers` series (statsd `s`) absorbs into this window as a
-        /// `HyperLogLog` cardinality estimate (the default) or keeps its exact,
-        /// deduplicated member set for the whole window, only falling back to an estimate when
-        /// `max_set_members_per_series` is exceeded (counted, see the amendment). Exact retention
-        /// is the lossless-transit option: an exact member count/list only survives the window
-        /// when this is `members`.
+        /// Whether a raw set-members series (statsd `s`) absorbs into this window as a
+        /// HyperLogLog cardinality estimate (`estimate`, the default) or keeps its exact,
+        /// deduplicated member set for the whole window (`members`), falling back to an estimate,
+        /// counted, when `max_set_members_per_series` is exceeded. `members` is the lossless
+        /// option: an exact member count or list only survives the window under it.
         #[serde(default)]
         sets: Sets,
-        /// A hard cap on how many distinct members one `SetMembers` series may retain in one
-        /// window before `sets: members` falls back to a `HyperLogLog` estimate -- a DoS/memory
-        /// guard, the same role `max_samples_per_series` plays for raw samples. Meaningless when
-        /// `sets` is `estimate` (the default).
+        /// A hard cap on how many distinct members one series may retain in one window before
+        /// `sets: members` falls back to an estimate; a memory guard, not a tuning knob. Defaults
+        /// to `1000`. Meaningless under `sets: estimate`.
         #[serde(default = "default_max_set_members_per_series")]
         max_set_members_per_series: usize,
     },
     /// Parses a log record's message as JSON, merging the resulting key/values into the event's
-    /// attributes. See `docs/adr/json-parsing-into-attributes.md`.
+    /// attributes. A failed parse passes the event through untouched.
     Json {
-        /// Skip everything before the first `{` and parse from there -- for lines with a
-        /// non-JSON prefix (`2026-08-29 INFO {"a":1}`). Off by default: the whole line is
-        /// assumed to be the JSON data.
+        /// Skip everything before the first `{` and parse from there, for lines with a non-JSON
+        /// prefix (`2026-08-29 INFO {"a":1}`). Off by default: the whole line is the JSON.
         #[serde(default)]
         skip_to_brace: bool,
-        /// What to do with a message that is not valid UTF-8: `reject` (the default -- the parse
+        /// What to do with a message that is not valid UTF-8: `reject` (the default: the parse
         /// fails and the event passes through untouched) or `replace` (retry on a copy with every
-        /// invalid sequence replaced by U+FFFD). See [`JsonInvalidUtf8`].
+        /// invalid sequence replaced by U+FFFD).
         #[serde(default)]
         invalid_utf8: JsonInvalidUtf8,
     },
     /// Splits a log record's message as one CSV row, merging the named columns into the event's
-    /// attributes -- the delimiter-separated sibling of `Json`. See
-    /// `docs/adr/csv-positional-columns.md` for why there is deliberately no header-row mode, why
-    /// every field stays a string, and what happens to a row with the wrong number of fields.
+    /// attributes. Columns are positional, declared in config; there is no header-row mode, and
+    /// every field stays a string.
     Csv {
-        /// Attribute names for each field, left to right -- the schema, declared in config rather
-        /// than read from the data. Required and non-empty; rejected at graph-validation time when
-        /// empty (the same "can only ever be a no-op" rule `KvMetrics`/`Set`/`Scale` already have),
-        /// when any entry is empty (it could never be a useful attribute name), or when two entries
-        /// name the same attribute (the later field would silently overwrite the earlier one on
-        /// every event, leaving one configured column permanently unreachable).
+        /// Attribute names for each field, left to right. Required and non-empty; an empty entry
+        /// or a duplicate entry is rejected (a duplicate would silently overwrite the earlier
+        /// column on every event).
         columns: Vec<String>,
-        /// The field separator -- one ASCII character. `,` by default; `"\t"` (double-quoted, so
-        /// YAML resolves the escape) for TSV, or `;`/`|`. Rejected at graph-validation time as `"`
-        /// (RFC 4180's quote character, which this parser reads as field framing, not data), as
-        /// `\n`/`\r` (already consumed as line framing by every input), or as any non-ASCII
-        /// character.
+        /// The field separator, one ASCII character. `,` by default; `"\t"` (double-quoted, so
+        /// YAML resolves the escape) for TSV, or `;`/`|`. Rejected: `"` (the quote character,
+        /// which this parser reads as field framing), `\n`/`\r` (already consumed as line
+        /// framing), and any non-ASCII character.
         #[serde(default = "default_csv_delimiter")]
         delimiter: char,
     },
     /// Turns attributes already on an event (typically merged there by `json`) into metrics on
-    /// that same event. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the
-    /// numeric coercion rules, and why there is deliberately no `tags:` field here -- tag
-    /// selection is `Keep`'s job, since every metrics sink already reads `event.attributes`.
+    /// that same event. A missing or non-numeric attribute is a silent skip for that entry. At
+    /// least one of `counters`/`gauges`/`distributions` must be non-empty. There is no `tags:`
+    /// field: every metrics sink already reads `event.attributes`, so tag selection is `keep`'s
+    /// job.
     KvMetrics {
         #[serde(default)]
         counters: Vec<MetricSpec>,
@@ -1192,129 +1014,105 @@ pub enum ComponentKind {
         #[serde(default)]
         distributions: Vec<MetricSpec>,
     },
-    /// Retains only the named attributes, dropping the rest -- an allowlist, not just a denylist:
-    /// a new field appearing in a log format later must not be able to silently become a new
-    /// tag dimension on a metrics sink. Place this *before* `aggregate` in a pipeline --
-    /// `aggregate`'s `SeriesKey` includes the whole of `event.attributes`, so pruning first is
-    /// what keeps series cardinality and per-window memory bounded. An empty `fields` list is
-    /// legal and means "drop every attribute."
+    /// Retains only the named attributes, dropping the rest: an allowlist, so a new field
+    /// appearing in a log format later cannot silently become a new tag dimension. Place it
+    /// before `aggregate`, whose series key includes every attribute, to bound series cardinality
+    /// and per-window memory. An empty `fields` list is legal and drops every attribute.
     Keep { fields: Vec<String> },
     /// Drops the named attributes, keeping the rest.
     Remove { fields: Vec<String> },
-    /// Stamps constant values onto every event's attributes and/or the batch's resource --
-    /// the operator-declared counterpart to a wire-carried identity
-    /// (`docs/adr/operator-declared-resource-attributes.md`). Overwrites on key collision in
-    /// both maps: a configured value wins over whatever the wire carried. At least one of
-    /// `resource`/`attributes` must be non-empty -- rejected at graph-validation time otherwise,
-    /// the same "can only ever be a no-op" rule `KvMetrics` already has.
+    /// Stamps constant values onto every event's attributes and/or the batch's resource. A
+    /// configured value overwrites whatever the wire carried under the same key. At least one of
+    /// `resource`/`attributes` must be non-empty.
     Set {
-        /// Applied once per batch, to the batch's `Resource` -- every event in the batch shares
-        /// it (`docs/design/data-model.md`'s "`Resource` is `Arc`-shared" note).
+        /// Applied once per batch, to the batch's resource, which every event in the batch
+        /// shares.
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         /// Applied per event, to `event.attributes`.
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
     },
-    /// Lifts an application trace/span reference off an event's attributes onto its `LogRecord`
-    /// (`docs/adr/log-record-trace-context.md`) -- the common "my JSON log body already has a
-    /// `trace.id` field" case, without writing Lua (`event.log.trace_id`,
-    /// `docs/design/lua-api.md`) -- and, with a `span:` block, also turns that log line into a
-    /// real `SpanRecord` on the same event (`docs/adr/trace-context-span-lifting.md`): an
-    /// access log's ids plus its own start/end/duration become a span whose start is the event's
-    /// timestamp. Reads the well-known attribute names in `docs/design/data-model.md`
-    /// (`traceparent`, `trace.id`, `trace.flags`, `span.id`, `span.parent_id`, `span.name`,
-    /// `span.kind`, `span.status`, `span.start`/`span.end`/`span.duration` and their unit-suffixed
-    /// forms) by default; the three id fields below rename their sources. Overwrites `log.trace`
-    /// on a successful lift -- operator intent, the same posture `Set` has. An event with no
-    /// log, or missing/unparseable attribute(s), passes through untouched (never an error) --
-    /// see `crates/logit-transforms/src/trace_context.rs` for the exact skip conditions.
+    /// Lifts an application trace/span reference off an event's attributes onto its log record,
+    /// for the common "my JSON log body already has a `trace.id` field" case, and with a `span:`
+    /// block also turns that log line into a real span on the same event: an access log's ids
+    /// plus its own start/end/duration become a span whose start is the event's timestamp. Reads
+    /// the well-known attribute names by default (`traceparent`, `trace.id`, `trace.flags`,
+    /// `span.id`, `span.parent_id`, `span.name`, `span.kind`, `span.status`,
+    /// `span.start`/`span.end`/`span.duration` and their unit-suffixed forms); `trace_id`,
+    /// `span_id`, and `flags` rename the three id sources. A successful lift overwrites any trace
+    /// reference the log already had. An event with no log, or with missing or unparseable
+    /// attributes, passes through untouched; it is never an error.
     TraceContext {
-        /// The attribute holding a 32-character hex trace id. Defaults to `trace.id`; rejected
-        /// as an empty string at graph-validation time -- an empty field name could never match
-        /// a real attribute, so a component configured that way can only ever be a no-op. A
-        /// `traceparent` attribute supplies the trace id when this one is absent.
+        /// The attribute holding a 32-character hex trace id. Defaults to `trace.id`; an empty
+        /// string is rejected. A `traceparent` attribute supplies the trace id when this one is
+        /// absent.
         #[serde(default = "default_trace_id_field")]
         trace_id: String,
-        /// The attribute holding this line's own 16-character hex span id. Defaults to
-        /// `span.id`; `null` disables the lookup. An absent attribute means "no span id," not a
-        /// skip (unless a `span:` block needs one) -- only present-but-unparseable is an error.
+        /// The attribute holding this line's own 16-character hex span id. Defaults to `span.id`;
+        /// `null` disables the lookup, and an empty string is rejected. An absent attribute means
+        /// "no span id", not a skip (unless a `span:` block needs one); only a present but
+        /// unparseable value is an error.
         #[serde(default = "default_span_id_field")]
         span_id: Option<String>,
-        /// The attribute holding the W3C trace flags (0-255, decimal -- never hex). Defaults to
-        /// `trace.flags`; `null` disables the lookup. A `traceparent` attribute supplies the
-        /// flags (from its own hex octet) when this one is absent.
+        /// The attribute holding the W3C trace flags (0-255, decimal, never hex). Defaults to
+        /// `trace.flags`; `null` disables the lookup, and an empty string is rejected. A
+        /// `traceparent` attribute supplies the flags when this one is absent.
         #[serde(default = "default_flags_field")]
         flags: Option<String>,
-        /// Keep the source attribute(s) after a successful lift, instead of removing them (the
-        /// default). Removing matters for OTLP-native backends: Loki turns log attributes into
+        /// Keep the source attributes after a successful lift instead of removing them (the
+        /// default). Removal matters for OTLP-native backends: Loki turns log attributes into
         /// structured metadata under their own names, so a leftover `trace_id` attribute would
-        /// collide with the native `trace_id` key `LogRecord.trace_id` already produces. With
-        /// `span:`, every convention attribute consumed (`traceparent`, `span.parent_id`,
-        /// `span.name`, `span.kind`, `span.status`, and the timing fields) is removed too.
+        /// collide with the native one. With `span:`, every convention attribute consumed
+        /// (`traceparent`, `span.parent_id`, `span.name`, `span.kind`, `span.status`, and the
+        /// timing fields) is removed too.
         #[serde(default)]
         keep_source: bool,
-        /// Opt in to minting a `SpanRecord` from the lifted ids plus the event's `span.start`/
-        /// `span.end`/`span.duration` attributes (any two; see `docs/design/data-model.md`).
-        /// Absent (the default) means today's log-only lift.
+        /// Opt in to minting a span from the lifted ids plus the event's `span.start`/`span.end`/
+        /// `span.duration` attributes (any two). Absent (the default) means a log-only lift.
         #[serde(default)]
         span: Option<SpanLiftConfig>,
     },
-    /// Multiplies named numeric attributes by a constant factor, in place -- unit conversion
-    /// (nginx's `request_time` in seconds -> milliseconds, say, to share a measurement name with
-    /// a source that already reports milliseconds) without a Lua script. See
-    /// `docs/adr/scale-transform.md`. A missing or non-numeric attribute is a silent skip for
-    /// that field, never a dropped event -- the same posture `KvMetrics` takes toward its own
-    /// fields.
+    /// Multiplies named numeric attributes by a constant factor, in place: unit conversion
+    /// (nginx's `request_time` in seconds to milliseconds, say) without a Lua script. A missing
+    /// or non-numeric attribute is a silent skip for that field, never a dropped event.
     Scale {
-        /// Attribute name -> multiplication factor. At least one entry is required -- rejected at
-        /// graph-validation time otherwise, the same "can only ever be a no-op" rule `KvMetrics`
-        /// and `Set` already have.
+        /// Attribute name to multiplication factor. At least one entry is required; an empty name
+        /// or a non-finite factor is rejected.
         fields: std::collections::BTreeMap<String, f64>,
     },
-    /// Drops an event that doesn't carry a wanted signal -- e.g. `signals: [traces]` ahead of a
-    /// traces-only sink like Tempo, fed from a source (`internal`) whose drains also carry
-    /// metrics. Never mutates a forwarded event: under the default `mode: any_of`, an event
-    /// carrying a listed signal is forwarded exactly as it arrived, including any signal *not*
-    /// listed. `mode: only` additionally requires the event carry nothing outside `signals`.
-    /// Place `keep_signals`/`drop_signals` ahead of this instead if disallowed payloads must
-    /// actually be stripped, not just tolerated. `signals` may not be empty --
-    /// see `docs/adr/signal-filtering-components.md`.
+    /// Forwards an event carrying a wanted signal and drops the rest: `signals: [traces]` ahead
+    /// of a traces-only sink, say, fed from a source whose events also carry metrics. Never
+    /// mutates a forwarded event: under the default `mode: any_of`, an event carrying a listed
+    /// signal is forwarded as it arrived, unlisted signals included. `mode: only` also requires
+    /// the event carry nothing outside `signals`. Place `keep_signals`/`drop_signals` ahead of
+    /// this instead if unwanted payloads must be stripped rather than tolerated. `signals` may
+    /// not be empty.
     HasSignal {
         signals: Vec<Signal>,
         #[serde(default)]
         mode: MatchMode,
     },
-    /// Retains only the listed signals' payloads on every event, clearing the rest -- an
-    /// allowlist, the same relationship to `drop_signals` that `keep` has to `remove`. Unlike
-    /// `has_signal`, this mutates: an event carrying a log and derived metrics with
-    /// `signals: [logs]` loses the metrics but keeps the log. Drops an event left with no
-    /// payload at all. `signals` may not be empty (that keeps nothing, dropping every event) and
-    /// may not name all three signals (that keeps everything, a no-op that forwards every event
-    /// untouched) -- both are rejected as config mistakes. See
-    /// `docs/adr/signal-filtering-components.md`.
+    /// Retains only the listed signals' payloads on every event, clearing the rest: an allowlist,
+    /// `keep`'s relationship to `remove`. Unlike `has_signal`, this mutates: an event carrying a
+    /// log and derived metrics loses the metrics under `signals: [logs]` but keeps the log. An
+    /// event left with no payload is dropped. `signals` may not be empty (that would drop every
+    /// event) and may not name all three signals (a no-op).
     KeepSignals { signals: Vec<Signal> },
-    /// Clears the listed signals' payloads on every event, keeping the rest -- a denylist, the
-    /// mirror of `keep_signals`. Drops an event left with no payload at all. `signals` may not be
-    /// empty (that drops nothing, a no-op that forwards every event untouched) and may not name
-    /// all three signals (that drops everything, dropping every event) -- both are rejected as
-    /// config mistakes. See `docs/adr/signal-filtering-components.md`.
+    /// Clears the listed signals' payloads on every event, keeping the rest: the mirror of
+    /// `keep_signals`. An event left with no payload is dropped. `signals` may not be empty (a
+    /// no-op) and may not name all three signals (that would drop every event).
     DropSignals { signals: Vec<Signal> },
     /// Forwards an event whose batch resource and/or own attributes match every configured pair,
-    /// dropping the rest. Config is exactly `set`'s -- `resource:`/`attributes:` maps of the same
-    /// `SetValue` literals -- so this matches on precisely what `set` can stamp
-    /// (`docs/adr/attribute-filtering-components.md`). Never mutates a forwarded event, the same
-    /// posture `has_signal` has toward payloads.
+    /// dropping the rest. The config is `set`'s: `resource:`/`attributes:` maps of the same
+    /// literals, so this matches on what `set` can stamp. Never mutates a forwarded event.
     ///
-    /// **A map is a conjunction**: every pair listed, in both maps combined, must match -- there
-    /// is no `or`. **A configured key the event/resource doesn't carry never matches** ("absent is
-    /// `false`"); "key present with any value" is not expressible. **Values coerce across numeric
-    /// representations** (`status: 200` matches `Value::I64(200)`, `U64(200)`, `F64(200.0)`, and
-    /// `Str("200")`) but never coerce a `Bool` to or from anything else, and two strings are never
-    /// compared numerically. At least one of `resource`/`attributes` must be non-empty (an empty
-    /// config matches every event, a no-op -- rejected at graph-validation time), every key must
-    /// be non-empty, and every numeric value must be finite (a non-finite value can never compare
-    /// equal to anything, so it could never match).
+    /// A map is a conjunction: every pair listed, across both maps, must match; there is no
+    /// `or`. A configured key the event or resource doesn't carry never matches, and "key present
+    /// with any value" is not expressible. Values coerce across numeric representations
+    /// (`status: 200` matches an integer, float, or string `200`), but a boolean never coerces,
+    /// and two strings are never compared numerically. At least one of `resource`/`attributes`
+    /// must be non-empty, every key must be non-empty, and every numeric value must be finite.
     HasAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
@@ -1322,45 +1120,38 @@ pub enum ComponentKind {
         attributes: std::collections::BTreeMap<String, SetValue>,
     },
     /// Drops an event whose batch resource and/or own attributes match every configured pair,
-    /// forwarding the rest -- the exact complement of `has_attributes` **on the same config**,
-    /// taken at the top level, not per pair: this drops an event only when *every* configured pair
-    /// matches, so an event matching some-but-not-all of several configured pairs is forwarded,
-    /// not dropped. Combined with "absent is `false`," an event that never carried a configured
-    /// key at all is forwarded too -- read it as "this event isn't one of the ones told to drop,"
-    /// the else-branch of a `has_attributes` fan-out. Same shape, matching rules, and validation
-    /// as `has_attributes` otherwise; see `docs/adr/attribute-filtering-components.md`.
+    /// forwarding the rest: the complement of `has_attributes` on the same config, taken as a
+    /// whole, not per pair. An event matching some but not all configured pairs is forwarded,
+    /// and so is one that never carried a configured key; read it as "this event isn't one of
+    /// the ones told to drop", the else-branch of a `has_attributes` fan-out. Same matching rules
+    /// and validation as `has_attributes`.
     DropAttributes {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, SetValue>,
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, SetValue>,
     },
-    /// Clamps attribute (and/or resource-attribute) values to an operator-configured allow-list,
-    /// per field -- `keep`'s value-side sibling, for a tag whose valid set the operator knows but
-    /// the producer doesn't enforce (a `Host` header against a handful of real vhosts, say). A
-    /// value not in a field's `allow` becomes that field's `other`, or is removed if `other` is
-    /// absent. Never drops an event. An attribute the event doesn't carry is a silent no-op for
-    /// that field, never a stamp. See `docs/adr/value-allowlist-cardinality-clamp.md`.
+    /// Clamps attribute (and/or resource-attribute) values to a per-field allow-list: `keep`'s
+    /// value-side sibling, for a tag whose valid set you know but the producer doesn't enforce
+    /// (a `Host` header against a handful of real vhosts, say). A value not in a field's `allow`
+    /// becomes that field's `other`, or is removed if `other` is absent. Never drops an event. An
+    /// attribute the event doesn't carry is a silent no-op for that field, never a stamp. At
+    /// least one of `resource`/`attributes` must be non-empty, and no field name may be empty.
     KeepValues {
-        /// Applied once per batch, to the batch's `Resource` -- `set`'s `resource`/`attributes`
-        /// split, field for field.
+        /// Applied once per batch, to the batch's resource.
         #[serde(default)]
         resource: std::collections::BTreeMap<String, ValueAllowList>,
         /// Applied per event, to `event.attributes`.
         #[serde(default)]
         attributes: std::collections::BTreeMap<String, ValueAllowList>,
     },
-    /// Forwards an event whose batch's `origin`/`previous` match a configured allowlist --
-    /// `origin`/`previous` are which component created the batch and which one most recently
-    /// handled it (`docs/adr/batch-provenance-on-delivered.md`), not event data. Never mutates a
-    /// forwarded event, the same posture `has_attributes`/`has_signal` have.
+    /// Forwards an event whose batch's `origin`/`previous` match a configured list: `origin` is
+    /// the component that created the batch and `previous` the one that most recently handled
+    /// it, not event data. Never mutates a forwarded event.
     ///
-    /// **Each field is a list of alternatives, OR'd within the field; the two fields AND together
-    /// when both are configured.** An empty list means "not checked" for that field -- a
-    /// configured field the batch doesn't carry a matching value for never matches ("absent is
-    /// `false`"). At least one of `origin`/`previous` must be non-empty (an empty config matches
-    /// every batch, a no-op -- rejected at graph-validation time), and no entry may be an empty
-    /// string. See `docs/adr/provenance-filtering-components.md`.
+    /// Each field is a list of alternatives, OR'd within the field; the two fields AND together
+    /// when both are configured. An empty list means "not checked" for that field. At least one
+    /// of `origin`/`previous` must be non-empty, and no entry may be an empty string.
     HasProvenance {
         #[serde(default)]
         origin: Vec<String>,
@@ -1368,787 +1159,657 @@ pub enum ComponentKind {
         previous: Vec<String>,
     },
     /// Drops an event whose batch's `origin`/`previous` match a configured list, forwarding the
-    /// rest -- the exact complement of `has_provenance` **on the same config**, taken at the top
-    /// level, not per field: this drops an event only when the whole configured match succeeds,
-    /// so a batch matching only one of two configured fields is forwarded, not dropped. Combined
-    /// with "absent is `false`," a batch that never carried a configured value at all is forwarded
-    /// too -- read it as "this batch isn't one of the ones told to drop." Same shape, matching
-    /// rules, and validation as `has_provenance` otherwise; see
-    /// `docs/adr/provenance-filtering-components.md`.
+    /// rest: the complement of `has_provenance` on the same config, taken as a whole, not per
+    /// field. A batch matching only one of two configured fields is forwarded, and so is one that
+    /// never carried a configured value; read it as "this batch isn't one of the ones told to
+    /// drop". Same matching rules and validation as `has_provenance`.
     DropProvenance {
         #[serde(default)]
         origin: Vec<String>,
         #[serde(default)]
         previous: Vec<String>,
     },
-    /// Equality-only routing: one key read per event, one target per matching value
-    /// (`docs/adr/target-components.md`). Deliberately no predicate language -- the same posture
-    /// `has_attributes`/`has_provenance` take (`docs/adr/routing-by-condition-is-lua.md`). An
-    /// event whose key is absent, or whose value no route names, is *unrouted*: it goes to this
-    /// component's ordinary consumers, or is dropped and counted if it has none.
+    /// Equality-only routing: one key read per event, one target per matching value. There is no
+    /// predicate language; use `lua` for a condition. An event whose key is absent, or whose
+    /// value no route names, is unrouted: it goes to this component's ordinary consumers, or is
+    /// dropped and counted (`logit.component.events.dropped{reason="unrouted"}`) if it has none.
     Route {
         by: RouteBy,
-        /// Value -> target id. Several values may name one target. The graph's router->target
-        /// edges derive from these values, so there is no separate `targets:` list to keep in
-        /// sync.
+        /// Value to target id. Several values may name one target. The router's edges derive
+        /// from these values, so there is no separate `targets:` list. Must be non-empty, with no
+        /// empty key or value, and every value must name a `target` component.
         routes: std::collections::BTreeMap<String, String>,
     },
     /// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging
-    /// the resulting key/values into the event's attributes. Additive and pass-through-on-failure,
-    /// exactly like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
+    /// the resulting key/values into the event's attributes. Additive, and a failed parse passes
+    /// the event through, like `json`.
     Logfmt {
-        /// Treat a token with no `=` as a boolean-true flag (`cached` -> `cached: true`), the
-        /// Heroku logfmt convention. **Off by default**: a bareword promotes an arbitrary input
+        /// Treat a token with no `=` as a boolean-true flag (`cached` becomes `cached: true`),
+        /// the Heroku logfmt convention. Off by default: a bareword promotes an arbitrary input
         /// token into attribute-key position, and every attribute key is interned into a
-        /// process-global table that never shrinks -- so a timestamp-prefixed line
-        /// (`2026/09/07 12:00:00 level=info ...`) would leak two never-repeating interner entries
-        /// per line. Turn it on only for a source that genuinely emits flags.
+        /// process-global table that never shrinks, so a timestamp-prefixed line (`2026/09/07
+        /// 12:00:00 level=info ...`) would leak two never-repeating entries per line. Turn it on
+        /// only for a source that emits flags.
         #[serde(default)]
         bare_keys: bool,
     },
     /// Parses a log record's message as literal `key<kv_sep>value` pairs separated by `pair_sep`
-    /// (`a=1&b=2`, `a: 1, b: 2`) -- no quoting and no escapes, unlike `logfmt`. Both separators are
-    /// required: defaulting them to `" "`/`"="` would make a bare `kv` silently mis-parse quoted
-    /// logfmt, and `logfmt` is the right component for that shape anyway.
+    /// (`a=1&b=2`, `a: 1, b: 2`), with no quoting and no escapes, unlike `logfmt`. Both
+    /// separators are required and must differ; an empty separator, or a `kv_sep` that contains
+    /// `pair_sep`, is rejected.
     Kv {
         /// Separator between one pair and the next. Whitespace around each key and value is
-        /// always trimmed, so `", "` and `","` behave the same on `a=1, b=2`.
+        /// trimmed, so `", "` and `","` behave the same on `a=1, b=2`.
         pair_sep: String,
-        /// Separator between a key and its value, within one pair. The **first** occurrence in a
+        /// Separator between a key and its value, within one pair. The first occurrence in a
         /// segment splits it, so `a=b=c` yields `a` -> `b=c`.
         kv_sep: String,
-        /// See `Logfmt::bare_keys` -- identical rule, identical default.
+        /// Treat a token with no `kv_sep` as a boolean-true flag. Off by default, for the same
+        /// interner reason as `logfmt`'s `bare_keys`.
         #[serde(default)]
         bare_keys: bool,
     },
     /// Matches a pattern against a log message (or, with `field:`, a named attribute), turning
-    /// every *named* capture group -- `(?P<name>...)` or `(?<name>...)` -- into an attribute of
-    /// that name; an unnamed group is grouping/alternation only and contributes nothing. See
-    /// `docs/adr/regex-transform.md`. Compiled at graph-validation time, so an invalid pattern (or
-    /// one with no named capture group) is a `logit validate` error, not a run-time surprise.
+    /// every named capture group (`(?P<name>...)` or `(?<name>...)`) into an attribute of that
+    /// name; an unnamed group is grouping/alternation only. The pattern is compiled by `logit
+    /// validate`, so an invalid pattern, or one with no named capture group, is a validation
+    /// error rather than a run-time surprise.
     Regex {
-        /// The pattern. Every named capture group becomes an attribute; first match only -- a
-        /// second match would just overwrite the first's attributes under this flat-`AttrMap`
-        /// model. A non-matching line, or one with no `field` attribute, passes through
-        /// unchanged, with no diagnostic -- only `logit.transform.matched{,.skipped}` counters
-        /// (`docs/adr/scale-transform.md`'s "silent skip is documented behavior" precedent).
+        /// The pattern. Every named capture group becomes an attribute; first match only. A
+        /// non-matching line, or one with no `field` attribute, passes through unchanged with no
+        /// diagnostic, only the `logit.transform.matched{,.skipped}` counters.
         pattern: String,
         /// The attribute to match against, instead of the log message. Absent (the default) reads
-        /// `log.message`, like `json`. `demo/logit.yaml`'s postgres tier is the case this exists
-        /// for: the SQL statement arrives inside a Postgres jsonlog record, so `json` has already
-        /// lifted it to `attributes.message` by the time a pattern can be run over it.
+        /// the log message, like `json`; an empty name is rejected. Use it when an earlier `json`
+        /// has already lifted the text to match into an attribute.
         #[serde(default)]
         field: Option<String>,
     },
-    /// Rewrites every event it sees into a *measurement of that event's shape* -- attribute and
-    /// nested-map counts, key/value byte lengths, value types, metric and span widths -- and, on
-    /// its `interval`, the per-batch and cumulative facts a per-event rewrite has nowhere to put
-    /// (events and resource/scope attributes per batch; distinct keys, distinct key-sets, and the
-    /// share of events the most common one and five key-sets carry). The original payload is
-    /// dropped, so this belongs on its own branch of an ordinary fan-out, never in the flow it
-    /// measures. See `docs/adr/shape-observer-component.md`.
+    /// Rewrites every event it sees into a measurement of that event's shape (attribute and
+    /// nested-map counts, key/value byte lengths, value types, metric and span widths) and, on
+    /// its `interval`, emits per-batch and cumulative measurements (events and resource/scope
+    /// attributes per batch; distinct keys, distinct key-sets, and the share of events the most
+    /// common one and five key-sets carry). The original payload is dropped, so place this on its
+    /// own branch of a fan-out, never in the flow it measures.
     ///
-    /// **It emits counts and lengths only** -- never an attribute key, an attribute value, a log
-    /// body, or a metric name from an observed event, in any metric, tag, diagnostic, or telemetry
+    /// It emits counts and lengths only: never an attribute key, an attribute value, a log body,
+    /// or a metric name from an observed event, in any metric, tag, diagnostic, or telemetry
     /// point. That is what lets its output leave an environment the traffic itself can't.
     ///
-    /// Distribution-shaped quantities go out raw (`MetricKind::Samples`); put an `aggregate`
-    /// downstream to summarize them, per `docs/adr/lossless-transit.md`'s "summarization is opt-in
-    /// and named."
+    /// Distribution-shaped quantities go out as raw samples; put an `aggregate` downstream to
+    /// summarize them.
     Shape {
-        /// How often the per-batch and cumulative measurements are emitted. The per-event ones
-        /// ride out on the events themselves and never wait for this.
+        /// How often the per-batch and cumulative measurements are emitted. Defaults to `10s`;
+        /// `0s` is rejected. The per-event measurements ride out on the events themselves and
+        /// never wait for this.
         #[serde(with = "humantime_serde_duration", default = "default_shape_interval")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// Whether the batch's `Resource` is forwarded (`keep`) or replaced with an empty one
-        /// (`drop`, the default) -- see [`ShapeResource`]. The batch's `Scope` always passes
-        /// through: `Transform` has no hook to substitute one, and a scope names an
+        /// Whether the batch's resource is forwarded (`keep`) or replaced with an empty one
+        /// (`drop`, the default). The batch's scope always passes through: it names an
         /// instrumentation library rather than carrying payload.
         #[serde(default)]
         resource: ShapeResource,
-        /// A hard cap on the distinct top-level attribute keys tracked since start -- a
-        /// DoS/memory guard, not a tuning knob, the same role `aggregate`'s `max_retained_series`
-        /// plays. Past it a new key is counted as overflow rather than tracked, and
-        /// `logit.shape.tracking_overflow` goes to `1`.
+        /// A hard cap on the distinct top-level attribute keys tracked since start; a memory
+        /// guard, not a tuning knob. Defaults to `4096`; `0` is rejected. Past it a new key is
+        /// counted as overflow rather than tracked, and `logit.shape.tracking_overflow` goes to
+        /// `1`.
         #[serde(default = "default_max_tracked_keys")]
         max_tracked_keys: usize,
-        /// A hard cap on the distinct top-level key-*sets* tracked since start -- see
-        /// `max_tracked_keys`: same guard, same overflow behavior.
+        /// A hard cap on the distinct top-level key-sets tracked since start. Same guard and
+        /// overflow behavior as `max_tracked_keys`. Defaults to `4096`; `0` is rejected.
         #[serde(default = "default_max_tracked_keysets")]
         max_tracked_keysets: usize,
     },
-    /// Rewrites a nested `Value::Map`/`Value::Array` attribute into flat, dot-joined keys --
-    /// `{"foo": {"key": "bar"}}` becomes `foo.key = "bar"`, `{"tags": ["a","b"]}` becomes
-    /// `tags.0`/`tags.1`, and the two compose (`{"items": [{"name": "x"}]}` becomes
-    /// `items.0.name`). The event model itself still nests and every decoder still produces
-    /// nesting (`docs/adr/json-parsing-into-attributes.md`); this is an operator-placed, one-way
-    /// rewrite for the leg of a pipeline whose wire has none -- `influxdb_out`, `statsd_out`,
-    /// `prometheus_out`, `graphite_out`, and `collectd_out` each drop a `Value::Map` attribute
-    /// outright, so this is how nested JSON/OTLP data becomes a tag on any of them at all. Never
-    /// drops an event, and never removes an attribute that wasn't itself nested. See
-    /// `docs/adr/flatten-transform.md`, which confronts the three places this codebase previously
-    /// rejected dotted-key flattening as *implicit* decoder/matcher behavior.
+    /// Rewrites a nested map or array attribute into flat, dot-joined keys: `{"foo": {"key":
+    /// "bar"}}` becomes `foo.key = "bar"`, `{"tags": ["a","b"]}` becomes `tags.0`/`tags.1`, and
+    /// the two compose (`{"items": [{"name": "x"}]}` becomes `items.0.name`). `influxdb_out`,
+    /// `statsd_out`, `prometheus_out`, `graphite_out`, and `collectd_out` each drop a nested
+    /// attribute outright, so this is how nested JSON/OTLP data becomes a tag on any of them.
+    /// Never drops an event, and never removes an attribute that wasn't itself nested. Last write
+    /// wins on a key collision, silently.
     Flatten {
-        /// Which top-level attributes to expand. `all` (the default) means every nested
-        /// attribute -- the useful default for a source whose keys the operator doesn't control
-        /// (a Kubernetes label map, an OTLP `KvlistValue`). A named list is a literal attribute
-        /// name, never a path -- see [`FlattenFields`]. Rejected at graph-validation time
-        /// (`crates/logit-pipeline/src/graph.rs` rule 59) if both this and `resource` are `none`,
-        /// or if a named list is empty or contains an empty or duplicate name.
+        /// Which top-level attributes to expand. `all` (the default) expands every nested
+        /// attribute, the useful default for a source whose keys you don't control (a Kubernetes
+        /// label map, an OTLP `KvlistValue`). A named list holds literal attribute names, never
+        /// paths. Rejected if both this and `resource` are `none`, or if a named list is empty or
+        /// contains an empty or duplicate name.
         #[serde(default = "default_flatten_attributes")]
         attributes: FlattenFields,
-        /// Also expand the batch's `Resource` attributes, under the same rules, once per batch
-        /// behind an `Arc::ptr_eq` cache. `none` by default: a resource is a small, mostly
-        /// operator-declared identity map, and paying a per-batch `Resource` rebuild for a map
-        /// that usually isn't nested has no case behind it. Event attributes are controlled
-        /// separately by `attributes` above. `Scope` attributes are never touched -- `Transform`
-        /// has no hook to substitute one through.
+        /// Also expand the batch's resource attributes, under the same rules, once per batch.
+        /// `none` by default: a resource is a small, mostly operator-declared identity map that
+        /// is rarely nested. Scope attributes are never touched.
         #[serde(default = "default_flatten_resource")]
         resource: FlattenFields,
-        /// Whether an array expands by index (`tags.0`, the default) or is left as a leaf and
-        /// written back whole at its path (`skip`), for a source whose arrays are data rather
-        /// than structure. Under `skip` a *top-level* array attribute is left entirely untouched.
+        /// Whether an array expands by index (`index`, the default: `tags.0`) or is left as a leaf
+        /// and written back whole at its path (`skip`), for a source whose arrays are data rather
+        /// than structure. Under `skip` a top-level array attribute is left untouched.
         #[serde(default)]
         arrays: FlattenArrays,
     },
     /// Normalizes a web server's access line, logged under raw OTel semconv attribute names, into
-    /// its conformant form -- composites (`http.request.line`, `url.original`) decomposed into
+    /// its conformant form: composites (`http.request.line`, `url.original`) decomposed into
     /// whichever atomic fields are absent, numerics coerced to integers (`"000"` becomes `0`),
     /// durations in any unit spelling (`_ms`, `_us`, unsuffixed nanoseconds) converted to `_s`,
-    /// an unknown method rewritten to `_OTHER` with the raw
-    /// value kept as `http.request.method_original`, `HTTP/` stripped off the protocol version,
-    /// semconv's sensitive `url.query` values redacted, every free-text field capped and
-    /// control-byte-cleaned -- plus a small, bounded derived set: `user_agent.class`,
+    /// an unknown method rewritten to `_OTHER` with the raw value kept as
+    /// `http.request.method_original`, `HTTP/` stripped off the protocol version, semconv's
+    /// sensitive `url.query` values redacted, every free-text field capped and
+    /// control-byte-cleaned, plus a small, bounded derived set: `user_agent.class`,
     /// `http.route`, `error.type`, `span.name`, `span.status`, and the `span.duration_s` mirror
-    /// `trace_context` resolves a span from. Placed between `json` and `trace_context`. Also
-    /// accepts every canonical name spelled with each `.` as `-` (`url-path`,
-    /// `http-request-header-x-forwarded-for`) for an emitter whose key grammar forbids dots
+    /// `trace_context` resolves a span from. Place it between `json` and `trace_context`. Every
+    /// canonical name is also accepted with each `.` spelled `-` (`url-path`,
+    /// `http-request-header-x-forwarded-for`), for an emitter whose key grammar forbids dots
     /// (HAProxy's `%{+json}o`); the dotted spelling wins when both are present.
     ///
     /// Best-effort per field, never all-or-nothing and never a dropped event: a value that
-    /// doesn't parse is left exactly as it arrived and counted, while every other field is still
-    /// normalized. An absent field produces nothing -- no default `url.scheme`, no invented
-    /// route. Every field is optional: a bare `type: http_access` is meaningful (the built-in
-    /// user-agent table and the default caps still apply), so unlike `keep_values`/`flatten`
-    /// there is no "nothing configured" rejection. Validated by
-    /// `crates/logit-pipeline/src/graph.rs` rule 60. See `docs/adr/http-access-normalization.md`.
+    /// doesn't parse is left as it arrived and counted, while every other field is still
+    /// normalized. An absent field produces nothing: no default `url.scheme`, no invented route.
+    /// Every field is optional, and a bare `type: http_access` is meaningful (the built-in
+    /// user-agent table and default caps still apply).
     HttpAccess {
-        /// Ordered rules classifying the (capped) `url.path` into `http.route`, first match wins
-        /// -- each either a named built-in set or a regex paired with a *literal* route value,
-        /// never a capture, so the route set stays bounded by construction. See
-        /// [`HttpRouteRule`].
+        /// Ordered rules classifying the capped `url.path` into `http.route`, first match wins.
+        /// Each is either a named built-in set or a regex paired with a literal route value,
+        /// never a capture, so the route set stays bounded by construction.
         #[serde(default)]
         routes: Vec<HttpRouteRule>,
-        /// The `http.route` written when no rule matches. Absent (the default) writes no route
-        /// at all, and `span.name` is the method alone.
+        /// The `http.route` written when no rule matches. Absent (the default) writes no route,
+        /// and `span.name` is the method alone. An empty string is rejected.
         #[serde(default)]
         route_other: Option<String>,
-        /// Extra user-agent classes, tried in order *before* the built-in
-        /// scanner/tool/crawler/browser table -- the built-in table can be pre-empted, never
-        /// disabled. See [`UserAgentRule`].
+        /// Extra user-agent classes, tried in order before the built-in
+        /// scanner/tool/crawler/browser table. The built-in table can be pre-empted, never
+        /// disabled.
         #[serde(default)]
         user_agent_rules: Vec<UserAgentRule>,
-        /// Per-field character limits overriding [`CAPPED_FIELDS`]' defaults. A key must name a
-        /// field in that list -- rule 60 rejects anything else, and a limit of `0`.
+        /// Per-field limits, in characters (not bytes), overriding the built-in cap on a
+        /// free-text field such as `url.path` (256) or `client.address` (128). A key must name a
+        /// field `http_access` caps (`logit validate` lists them), and a limit of `0` is rejected.
         #[serde(default)]
         max_length: std::collections::BTreeMap<String, usize>,
         /// Extra `url.query` keys whose values are replaced with `REDACTED`, beyond semconv's
         /// seven (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`, `X-Amz-Signature`,
-        /// `X-Amz-Credential`, `X-Amz-Security-Token`). Matched ASCII-case-insensitively.
+        /// `X-Amz-Credential`, `X-Amz-Security-Token`). Matched ASCII-case-insensitively. An empty
+        /// entry is rejected.
         #[serde(default)]
         redact_query: Vec<String>,
         /// Present only to opt in to overwriting `client.address` from the first hop of
-        /// `http.request.header.x-forwarded-for` -- off by default, since the header is
-        /// client-supplied. See [`ForwardedConfig`].
+        /// `http.request.header.x-forwarded-for`. Off by default, since the header is
+        /// client-supplied.
         #[serde(default)]
         forwarded: Option<ForwardedConfig>,
     },
-    /// Keeps a fraction of events, consistently: with `key:` set, the key's value is hashed
-    /// (XXH64, seed 0, over a fixed canonical byte form) and compared against `rate`, so every
-    /// event sharing a key -- every span and log of one trace, under `key: trace_id` -- gets the
-    /// same verdict in every `logit` process that sees it, with nothing propagated between them.
-    /// With no `key:`, each event is an independent draw. `always_keep:` pins flagged events
-    /// through regardless. Never mutates an event. Validated by `crates/logit-pipeline/src/
-    /// graph.rs` rule 61. See `docs/adr/consistent-sampling-component.md`, which also freezes the
-    /// hash as a cross-version contract.
+    /// Keeps a fraction of events, consistently. With `key:` set, the key's value is hashed
+    /// (XXH64, seed 0, over a fixed canonical byte form; a frozen cross-version contract) and
+    /// compared against `rate`, so every event sharing a key (every span and log of one trace,
+    /// under `key: trace_id`) gets the same verdict in every `logit` process that sees it, with
+    /// nothing propagated between them. With no `key:`, each event is an independent draw.
+    /// `always_keep:` pins flagged events through regardless. Never mutates an event.
     Sample {
         /// Fraction of events (or of keys) kept, `0.0..=1.0`. `1` is rejected (a no-op), and `0`
-        /// is rejected unless `always_keep` is set -- then it keeps only the flagged events.
+        /// is rejected unless `always_keep` is set, in which case only the flagged events are
+        /// kept.
         rate: f64,
-        /// What to hash. Absent means an independent draw per event.
+        /// What to hash. Absent means an independent draw per event. An empty field name is
+        /// rejected.
         #[serde(default)]
         key: Option<SampleKey>,
-        /// What happens to an event the configured `key:` isn't on. Only meaningful with `key:`
-        /// -- rule 61 rejects it otherwise. Absent means `random`.
+        /// What happens to an event the configured `key:` isn't on. Only meaningful with `key:`,
+        /// and rejected without it. Absent means `random`.
         #[serde(default)]
         missing: Option<SampleMissing>,
         /// Events carrying this field (optionally with this value) are kept unconditionally,
-        /// before the key is even looked at. Per leg: nothing is propagated to other samplers.
+        /// before the key is looked at. Per leg: nothing is propagated to other samplers.
         #[serde(default)]
         always_keep: Option<SampleOverride>,
     },
-    // `filter`/`rename`/`throttle`/`dedup` used to live here too -- retired, not merely
-    // unimplemented, by `docs/adr/routing-by-condition-is-lua.md`: each is already expressible as
-    // a `lua` component (`demo/logit.yaml`'s `nginx_stdout` is the worked filter example), and the
-    // ADR records why building a second, native way to say the same thing wasn't worth it yet.
-    // Referencing one of those four kinds is now a deserialization error naming the valid kinds,
-    // not a graph-validation "not implemented" -- see the ADR's Consequences for why that trade
-    // was accepted. `sample` was retired with them and has since returned as a native kind
-    // (above): *consistent* sampling is the one thing a `lua` component can't express --
-    // `docs/adr/consistent-sampling-component.md`.
-    /// `rename`d explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`
-    /// (a word break at the embedded capital `Db`), not `influxdb_out` as published in
-    /// `docs/design/pipeline-graph.md` and every example config.
+    // `filter`/`rename`/`throttle`/`dedup` are retired, not unimplemented (ADR
+    // `routing-by-condition-is-lua`): each is expressible as a `lua` component, and referencing
+    // one is a deserialization error naming the valid kinds. `sample` came back as a native kind
+    // because consistent, keyed sampling is the one thing a `lua` component can't express.
+    /// InfluxDB 2.x line protocol over HTTP, with bounded output retry.
+    // Renamed explicitly: `rename_all = "snake_case"` alone would tag this `influx_db_out`.
     #[serde(rename = "influxdb_out")]
     InfluxDbOut {
         url: String,
         org: String,
         bucket: String,
-        /// A plain string field like any other -- give it `!env INFLUXDB_TOKEN` in config to
-        /// pull it from the environment (`crates/logit-cli/src/config.rs`) rather than inlining
-        /// it. No env-specific field of its own: `!env` works on any field on any component, so
-        /// `url`/`org`/`bucket` (just as deployment-specific) can use it too.
+        /// The API token. A plain string: write `!env INFLUXDB_TOKEN` to pull it from the
+        /// environment rather than inlining it. `!env` works on `url`/`org`/`bucket` too.
         token: String,
     },
+    /// OTLP logs, metrics, and traces over OTLP/HTTP or OTLP/gRPC. TLS is selected by
+    /// `endpoint`'s `https://` scheme.
     OtlpOut {
         endpoint: String,
         #[serde(default)]
         protocol: OtlpProtocol,
-        /// Extra headers sent on every export request, on both `protocol: http` and
-        /// `protocol: grpc` -- e.g. `X-Scope-OrgID` for a multi-tenant Loki/Mimir/Grafana Cloud
-        /// target. A value is a plain string like any other field, so `!env` works on it
-        /// (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token
-        /// without inlining it. A name owned by the protocol itself (`content-type`,
-        /// `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`,
-        /// `connection`, any `grpc-*` header, or an HTTP/2 pseudo-header starting with `:`) is
-        /// rejected at config-validation time rather than silently overridden. Two keys naming
-        /// the same header once case is ignored (e.g. `X-Scope-OrgID` and `x-scope-orgid`) are
-        /// rejected too -- HTTP header names are case-insensitive, so which value would actually
-        /// be sent is otherwise undefined.
+        /// Extra headers sent on every export request, under either `protocol`: `X-Scope-OrgID`
+        /// for a multi-tenant Loki/Mimir/Grafana Cloud target, say. A value is a plain string, so
+        /// `!env` works on it, which is how to carry an `Authorization: Bearer …` token without
+        /// inlining it. A name the protocol owns (`content-type`, `content-length`,
+        /// `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, any `grpc-*`
+        /// header, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys
+        /// naming the same header once case is ignored.
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Per-signal HTTP path overrides -- see [`OtlpPaths`]. `protocol: http` only; a
-        /// non-empty value under `protocol: grpc` is a config error (rule 21), not silently
-        /// ignored, since gRPC method names aren't a mount point an operator can move.
+        /// Per-signal HTTP path overrides. `protocol: http` only; a non-empty value under
+        /// `protocol: grpc` is rejected.
         #[serde(default)]
         paths: OtlpPaths,
-        /// Gzips request bodies on both transports -- see [`OtlpCompression`]. Defaults to
-        /// `none`: a receiver has to opt into decoding it, and most (the OTel Collector's own
-        /// receiver included) accept both, so there's rarely a reason to change this except
-        /// against a bandwidth-constrained link.
+        /// Gzips request bodies on both transports. Defaults to `none`; most receivers (the OTel
+        /// Collector's included) accept both, so change this only for a bandwidth-constrained
+        /// link.
         #[serde(default)]
         compression: OtlpCompression,
-        /// Tunes TLS on an `https://` endpoint -- see [`TlsClientConfig`]. A non-default value
-        /// under a plain `http://`/`grpc://` endpoint is a config error (rule 22), not silently
-        /// ignored.
+        /// Tunes TLS on an `https://` endpoint. A non-default block under a plain
+        /// `http://`/`grpc://` endpoint is rejected.
         #[serde(default)]
         tls: TlsClientConfig,
     },
-    /// The native logit-to-logit protocol -- the mirror of [`ComponentKind::LogitIn`]: one TCP
-    /// (optionally TLS) connection, one native frame per batch, one `Ack` before that batch
-    /// counts as delivered.
+    /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
+    /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
     LogitOut {
-        /// `host:port`. Resolved at connect time, never at config-load time -- the same
-        /// `syslog_out` precedent: a `logit_out` pointed at a peer that isn't up yet is not a
-        /// config error.
+        /// `host:port`. Resolved at connect time, never at config-load time: a peer that isn't up
+        /// yet is not a config error.
         endpoint: String,
-        /// Offered in this sink's `Hello`; the peer may still negotiate it down to `none` if it
-        /// doesn't support `lz4`.
+        /// Offered in this sink's `Hello`; the peer may negotiate it down to `none` if it doesn't
+        /// support `lz4`.
         #[serde(default)]
         compression: Compression,
-        /// Turns on TLS for this connection when present -- presence turns it on, unlike
-        /// `otlp_out` (whose `endpoint` has a scheme to select TLS from): a bare `host:port` has
-        /// no scheme to read that signal from. See [`TlsClientConfig`].
+        /// Turns on TLS for this connection when present, and makes it required: a bare
+        /// `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS
+        /// with the bundled Mozilla roots.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
-        /// Connect, handshake, and per-batch ack-wait timeout, all sharing this one knob.
+        /// Connect, handshake, and per-batch ack-wait timeout, one knob for all three. Defaults
+        /// to `10s`.
         #[serde(default = "default_logit_out_request_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         request_timeout: Duration,
     },
-    /// A general-purpose, human-facing debug sink: dumps every event's details as a readable text
-    /// block to stdout (default), stderr, or a file -- the dev loop for seeing a whole pipeline's
-    /// output without standing up a real backend like InfluxDB.
+    /// A human-facing debug sink: writes every event as a readable text block to stdout (the
+    /// default), stderr, or a file. The dev loop for seeing a whole pipeline's output without a
+    /// real backend.
     StdioOut {
         #[serde(default)]
         target: StdioTarget,
-        /// Which encoder writes through this sink -- `human` (default) is this same readable
-        /// text; `native` is `logit_proto::native`'s wire format
-        /// (`docs/adr/file-output-native-format.md`).
+        /// Which encoder writes through this sink: `human` (the default) is the readable text;
+        /// `native` is `logit`'s own wire format.
         #[serde(default)]
         format: StreamFormat,
-        /// Only meaningful under `format: native` -- graph validation rejects a non-`none` value
-        /// otherwise.
+        /// Per-frame compression under `format: native`. A non-`none` value under `format:
+        /// human` is rejected.
         #[serde(default)]
         compression: Compression,
     },
-    /// A rotating file sink -- `stdio_out`'s file target grown into an operational destination:
-    /// size- and/or calendar-interval-triggered rotation, with logrotate-style numbered-suffix
-    /// retention. Renders the same human-readable text `stdio_out` does by default
-    /// (`logit_outputs::stdio::EventDump`) -- both share one sink implementation,
-    /// `logit_outputs::stdio::StreamOutput`, differing only in rotation policy and, now, encoder.
-    /// See `docs/adr/rotating-file-output.md`/`docs/adr/file-output-native-format.md`.
+    /// A rotating file sink: size- and/or calendar-interval-triggered rotation with
+    /// logrotate-style numbered-suffix retention. Renders the same human-readable text
+    /// `stdio_out` does by default, or `logit`'s native wire format under `format: native`.
     FileOut {
-        /// Resolved against the config file's own directory when relative, exactly like
-        /// `stdio_out`'s `StdioTarget::Path`.
+        /// The active file. A relative path resolves against the config file's directory.
         path: String,
         #[serde(default)]
         rotate: RotateConfig,
-        /// See `StdioOut::format` -- the same choice, same default, same sink implementation.
+        /// Which encoder writes through this sink: `human` (the default) or `native`.
         #[serde(default)]
         format: StreamFormat,
-        /// See `StdioOut::compression`.
+        /// Per-frame compression under `format: native`. A non-`none` value under `format:
+        /// human` is rejected.
         #[serde(default)]
         compression: Compression,
     },
-    /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `SyslogIn`, and a real
+    /// RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `syslog_in` and a real
     /// relay: header fields round-trip from an event's `syslog.*` attributes when present,
-    /// falling back to the defaults below only when an event carries none (e.g. one that never
-    /// passed through `syslog_in`). See `docs/adr/syslog-output.md`.
+    /// falling back to `facility`, `hostname`, and `app_name` only when an event carries none
+    /// (one that never passed through `syslog_in`, say).
     SyslogOut {
-        /// `host:port`. Resolved at connect/bind time, never at config-load time -- a `syslog_out`
-        /// pointed at a destination that isn't up yet is not a config error (`!env` still applies
-        /// like any other string field, ADR `env-yaml-tag`).
+        /// `host:port`. Resolved at connect/bind time, never at config-load time: a destination
+        /// that isn't up yet is not a config error.
         endpoint: String,
         #[serde(default)]
         transport: SyslogTransport,
-        /// RFC 3164 carries no year and no timezone in its TIMESTAMP, so a receiver has to guess
-        /// both -- `rfc5424`'s unambiguous RFC 3339 timestamp is the better default; `syslog_in`
-        /// already parses both dialects, so emitting both is parity, not new scope.
+        /// Which syslog dialect to emit. `rfc5424` (the default) carries an unambiguous RFC 3339
+        /// timestamp; `rfc3164`'s TIMESTAMP has no year and no timezone, so a receiver has to
+        /// guess both.
         #[serde(default)]
         format: SyslogFormat,
-        /// PRI facility used only when the event carries no `syslog.facility` attribute.
+        /// PRI facility used only when the event carries no `syslog.facility` attribute. Defaults
+        /// to `local0`.
         #[serde(default)]
         facility: SyslogFacility,
-        /// HOSTNAME/APP-NAME fallbacks, used only when the event carries no `syslog.hostname`/
-        /// `syslog.tag` attribute -- e.g. an event that never passed through `syslog_in`. Omitted
-        /// entirely (rather than a literal `logit` default) so a relayed line's origin is never
-        /// silently overwritten with something that looks like a config mistake.
+        /// HOSTNAME fallback, used only when the event carries no `syslog.hostname` attribute
+        /// (one that never passed through `syslog_in`, say). No default, so a relayed line's
+        /// origin is never silently overwritten.
         #[serde(default)]
         hostname: Option<String>,
+        /// APP-NAME fallback, used only when the event carries no `syslog.tag` attribute. No
+        /// default.
         #[serde(default)]
         app_name: Option<String>,
-        /// Bounds one encoded message (PRI + header + MSG). Defaults to 8192, matching Grafana
-        /// Alloy's `loki.source.syslog` `max_message_length` default -- a real receiver's own
-        /// choice, verified against Alloy v1.19.2 -- rather than RFC 3164 §4.1's traditional
-        /// 1024, which would truncate a JSON-bodied message on every modern relay chain. A string
-        /// via [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+        /// Bounds one encoded message (PRI + header + MSG). A byte-count string. Defaults to
+        /// `"8192"`, Grafana Alloy's syslog receiver default, rather than RFC 3164's traditional
+        /// 1024, which would truncate a JSON-bodied message on every modern relay chain.
         #[serde(default = "default_max_message_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_message_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) is allowed to take before `send` reports it as a failure. Also
-        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS
-        /// connect can take up to twice this value, the same way `logit_out` races every step of
-        /// its own connect against its single `request_timeout`.
+        /// dropped connection) may take before `send` reports a failure. Also bounds the TLS
+        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice
+        /// this value. Defaults to `5s`.
         #[serde(default = "default_syslog_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
-        /// Turns on TLS for this connection when present -- RFC 5425, syslog over TLS over TCP.
-        /// Presence turns it on and makes it *required* (there is no plaintext fallback), the
-        /// same shape as `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to
-        /// read that signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means
-        /// TLS with the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope,
-        /// and `tls:` alongside `transport: udp` is a config error (rule 44), not silently
-        /// ignored. See [`TlsClientConfig`] for path resolution (relative to the config file's
-        /// own directory) and `!env` compatibility, both identical here.
+        /// Turns on TLS for this connection when present (RFC 5425, syslog over TLS over TCP),
+        /// and makes it required: a bare `host:port` has no scheme to select TLS from, so even an
+        /// empty `tls: {}` means TLS with the bundled Mozilla roots. `transport: tcp` only;
+        /// `tls:` under `transport: udp` is rejected.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
         /// Opt-in RFC 5424 STRUCTURED-DATA element built from an event's own non-`syslog.*`
-        /// attributes -- absent (the default) means no such element is ever emitted; a
-        /// `syslog.sd` attribute (round-tripped from `syslog_in`) still renders regardless of
-        /// this setting. Ignored under `format: rfc3164` (RFC 3164 has no STRUCTURED-DATA field
-        /// at all). See `logit_outputs::syslog`'s module doc, "STRUCTURED-DATA" section, and
-        /// [`SyslogStructuredData`].
+        /// attributes. Absent (the default) emits no such element; a `syslog.sd` attribute
+        /// (round-tripped from `syslog_in`) still renders regardless. Ignored under `format:
+        /// rfc3164`, which has no STRUCTURED-DATA field.
         #[serde(default)]
         structured_data: Option<SyslogStructuredData>,
     },
-    /// statsd / DogStatsD egress over UDP or TCP -- the mirror of `StatsdIn`, and a real relay:
-    /// names, values, and tags round-trip through the real decoder on the other end. See
-    /// `docs/adr/statsd-output.md`.
+    /// statsd / DogStatsD egress over UDP or TCP, the mirror of `statsd_in` and a real relay:
+    /// names, values, and tags round-trip through the decoder on the other end.
     StatsdOut {
-        /// `host:port`. Resolved at connect/bind time, never at config-load time -- the same
-        /// `syslog_out`/`logit_out` precedent.
+        /// `host:port`. Resolved at connect/bind time, never at config-load time.
         endpoint: String,
         #[serde(default)]
         transport: StatsdTransport,
-        /// Which statsd dialect to emit. `dogstatsd` (default) includes the `|#tag:value,...`
-        /// segment; `statsd` omits it entirely for a plain-statsd receiver that would otherwise
-        /// reject it.
+        /// Which statsd dialect to emit. `dogstatsd` (the default) includes the `|#tag:value,...`
+        /// segment; `statsd` omits it for a plain-statsd receiver that would reject it.
         #[serde(default)]
         format: StatsdFormat,
-        /// Encodes a `MetricKind::GaugeDelta` (statsd/DogStatsD's own `+n`/`-n` relative-gauge
-        /// syntax) natively as a signed value, instead of dropping it with a
-        /// `gauge_delta_unresolved` diagnostic. Off by default: a delta reaching *any* sink means
-        /// the pipeline is missing an `aggregate` component (`docs/adr/relative-gauge-
-        /// adjustments.md`) -- this is the one sink able to round-trip a delta losslessly, so
-        /// it's an opt-in relay behavior, not a silent default across every sink.
+        /// Encodes a relative gauge adjustment (statsd's `+n`/`-n` syntax) natively as a signed
+        /// value, instead of dropping it with a `gauge_delta_unresolved` diagnostic. Off by
+        /// default: a delta reaching any sink usually means the pipeline is missing an
+        /// `aggregate`, so this is an opt-in relay behavior.
         #[serde(default)]
         relative_gauges: bool,
         /// Bounds one UDP datagram's worth of packed lines (several statsd lines newline-joined
-        /// per send) -- not a single line's length. Defaults to 1432: Etsy statsd's own
-        /// "commodity Ethernet LAN" recommendation and DataDog's documented DogStatsD client
-        /// default, which is 1500 MTU minus IPv4/UDP headers minus headroom for VXLAN/IPsec
-        /// encapsulation -- exactly where a 1472-byte datagram would silently fragment or
-        /// `EMSGSIZE`. A string via [`human_bytes`], exactly like `SyslogOut::max_message_bytes`.
-        /// Ignored for `transport: tcp`, which has no datagram to overflow.
+        /// per send), not a single line's length. A byte-count string. Defaults to `"1432"`, the
+        /// statsd and DogStatsD client default: a 1500-byte MTU minus IPv4/UDP headers minus
+        /// headroom for VXLAN/IPsec encapsulation, where a larger datagram would silently
+        /// fragment or fail `EMSGSIZE`. `0` is rejected. Ignored for `transport: tcp`.
         #[serde(default = "default_statsd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
         /// TCP only, ignored for UDP. How long a connect attempt (including a reconnect after a
-        /// dropped connection) is allowed to take before `send` reports it as a failure. Also
-        /// bounds the TLS handshake under `tls:`, but *each phase separately* -- so a TLS connect
-        /// can take up to twice this value, exactly as `syslog_out`'s own `connect_timeout` does.
+        /// dropped connection) may take before `send` reports a failure. Also bounds the TLS
+        /// handshake under `tls:`, as a separate phase, so a TLS connect can take up to twice
+        /// this value. Defaults to `5s`.
         #[serde(default = "default_statsd_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
-        /// Turns on TLS for this connection when present. Presence turns it on and makes it
-        /// *required* (there is no plaintext fallback), the same shape as `syslog_out`'s and
-        /// `logit_out`'s own `tls:`: a bare `host:port` `endpoint` has no scheme to read that
-        /// signal from the way `otlp_out`'s URL does, so even an empty `tls: {}` means TLS with
-        /// the bundled Mozilla roots. **`transport: tcp` only** -- DTLS is out of scope, and
-        /// `tls:` alongside `transport: udp` is a config error (rule 52), not silently ignored.
-        /// No statsd client in the wild speaks TLS, so this is for a `logit`-to-`logit` (or
-        /// stunnel-shaped) relay hop rather than for an application's own DogStatsD client. See
-        /// [`TlsClientConfig`] for path resolution (relative to the config file's own directory)
-        /// and `!env` compatibility, both identical here.
+        /// Turns on TLS for this connection when present, and makes it required: a bare
+        /// `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS
+        /// with the bundled Mozilla roots. `transport: tcp` only; `tls:` under `transport: udp`
+        /// is rejected. No statsd client speaks TLS, so this is for a `logit`-to-`logit` or
+        /// stunnel-shaped relay hop.
         #[serde(default)]
         tls: Option<TlsClientConfig>,
     },
-    /// collectd binary-protocol (`network` plugin) egress -- the mirror of `collectd_in`, and a
-    /// real relay: identity, values, and kinds round-trip through the real decoder on the other
-    /// end. See `docs/adr/collectd-binary-relay.md`. **UDP only** -- collectd's own `network`
-    /// plugin has no TCP mode to relay onto, unlike `statsd_out`/`syslog_out`.
+    /// collectd binary `network` plugin egress, the mirror of `collectd_in` and a real relay:
+    /// identity, values, and kinds round-trip through the decoder on the other end. UDP only:
+    /// collectd's `network` plugin has no TCP mode.
     CollectdOut {
-        /// `host:port`. Resolved at send time, never at config-load time -- the same
-        /// `statsd_out`/`syslog_out` precedent.
+        /// `host:port`. Resolved at send time, never at config-load time.
         endpoint: String,
-        /// Bounds one UDP datagram's worth of packed value lists -- not a single list's length.
-        /// Defaults to `"1452"`, collectd's own `MaxPacketSize` default (a 1500-byte Ethernet MTU
-        /// minus the IPv4 and UDP headers minus a little headroom). A string via [`human_bytes`],
-        /// exactly like `StatsdOut::max_packet_bytes`. Rule 38 (`docs/design/pipeline-graph.md`)
-        /// rejects anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range: above
-        /// it, no UDP datagram can actually carry the result, so every send would fail `EMSGSIZE`
-        /// silently (counted as a per-datagram drop, not a `Fault`), and below it is narrower
-        /// than collectd itself allows.
+        /// Bounds one UDP datagram's worth of packed value lists, not a single list's length. A
+        /// byte-count string. Defaults to `"1452"`, collectd's own `MaxPacketSize` default (a
+        /// 1500-byte MTU minus IPv4 and UDP headers minus headroom). Must be within
+        /// `1024..=65535`, collectd's own range: above it no UDP datagram can carry the result,
+        /// so every send would fail `EMSGSIZE` and be counted as a per-datagram drop.
         #[serde(default = "default_collectd_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// Used only when an event carries neither `collectd.host` nor `host.name` -- e.g. an
-        /// event that never passed through `collectd_in`. Omitted entirely (rather than an
-        /// OS-hostname read or a literal `"logit"` placeholder) so a relayed list's origin is
-        /// never silently overwritten with something that looks like a config mistake -- the same
-        /// reasoning `SyslogOut::hostname` gives for its own field. With nothing configured and
-        /// nothing on the event, such a list is dropped and counted (`logit.output.metrics.
-        /// skipped{reason="no_host"}`): collectd's receiver rejects an empty host outright, and
-        /// there is no honest substitute for one.
+        /// Used only when an event carries neither `collectd.host` nor `host.name` (one that
+        /// never passed through `collectd_in`, say). No default, so a relayed list's origin is
+        /// never silently overwritten. With nothing configured and nothing on the event, the list
+        /// is dropped and counted (`logit.output.metrics.skipped{reason="no_host"}`): collectd's
+        /// receiver rejects an empty host.
         #[serde(default)]
         hostname: Option<String>,
     },
-    /// Carbon plaintext or pickle egress -- the mirror of `graphite_in`, and a real relay:
-    /// path, tags, value and timestamp round-trip through the real `GraphiteDecoder` on the
-    /// other end. See `docs/adr/graphite-carbon-relay.md` and
-    /// `docs/plans/graphite-carbon-relay.md`. Unlike `collectd_out`, both transports are
-    /// supported (carbon's own plaintext listener speaks either); pickle is TCP-only (rule 46).
+    /// Carbon plaintext or pickle egress, the mirror of `graphite_in` and a real relay: path,
+    /// tags, value, and timestamp round-trip through the decoder on the other end. Both
+    /// transports are supported; `protocol: pickle` requires `transport: tcp`.
     GraphiteOut {
-        /// `host:port`. Resolved at send time, never at config-load time -- the same
-        /// `statsd_out`/`collectd_out` precedent.
+        /// `host:port`. Resolved at send time, never at config-load time.
         endpoint: String,
         #[serde(default)]
         transport: GraphiteTransport,
         #[serde(default)]
         protocol: GraphiteProtocol,
         /// Whether to render event attributes as carbon tags. `carbon` (the default) writes
-        /// `;name=value` in ascending rendered-name order; `drop` is the escape hatch for a
-        /// pre-1.1 Graphite, whose whisper backend would otherwise take the `;` into a directory
-        /// name silently -- see `docs/deploying.md`'s `graphite_out` section.
+        /// `;name=value` in ascending name order; `drop` is the escape hatch for a pre-1.1
+        /// Graphite, whose whisper backend would otherwise take the `;` into a directory name.
         #[serde(default)]
         tags: GraphiteTags,
         /// What to do with a metric kind carbon's one-number-per-datapoint wire cannot carry.
-        /// `skip` (the default) drops the record, counted; `expand` renders the dotted sub-paths
-        /// `crates/logit-proto/src/graphite/mod.rs`'s module doc tables, counted degraded.
+        /// `skip` (the default) drops the record, counted; `expand` renders one dotted sub-path
+        /// per component value, counted as degraded.
         #[serde(default)]
         multi_value: GraphiteMultiValue,
         /// Bounds one UDP datagram's worth of packed plaintext lines (several lines
-        /// newline-joined per send) -- not a single line's length, and ignored under
-        /// `transport: tcp`, which has no datagram to overflow. Defaults to `"1432"`, the same
-        /// "commodity Ethernet LAN" figure `statsd_out`'s own `max_packet_bytes` uses. A string
-        /// via [`human_bytes`]. Rule 38 rejects `0`.
+        /// newline-joined per send), not a single line's length. A byte-count string. Defaults to
+        /// `"1432"`, the same commodity-Ethernet figure `statsd_out` uses. `0` is rejected.
+        /// Ignored under `transport: tcp`.
         #[serde(default = "default_graphite_max_packet_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_packet_bytes: u64,
-        /// The longest pickle payload this sink will pack into one length-prefixed frame.
-        /// Defaults to `"1MiB"`, Twisted's own `Int32StringReceiver.MAX_LENGTH` -- the same bound
-        /// carbon's own pickle receiver enforces, so a relay never writes a frame the far end
-        /// would refuse. A string via [`human_bytes`]. Rule 46 bounds it `1024..=16MiB` and
-        /// rejects `0`.
+        /// The longest pickle payload this sink packs into one length-prefixed frame. A
+        /// byte-count string. Defaults to `"1MiB"`, the bound carbon's own pickle receiver
+        /// enforces, so a relay never writes a frame the far end would refuse. Must be within
+        /// `1024..=16MiB`.
         #[serde(default = "default_graphite_max_frame_bytes", with = "human_bytes")]
         #[schemars(with = "String")]
         max_frame_bytes: u64,
-        /// TCP only, ignored for UDP. See `SyslogOut::connect_timeout`. Rule 46 rejects `0s`.
+        /// TCP only, ignored for UDP. How long a connect attempt may take before `send` reports a
+        /// failure. Defaults to `5s`; `0s` is rejected.
         #[serde(default = "default_graphite_connect_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         connect_timeout: Duration,
     },
-    /// Scrapes Prometheus `/metrics` endpoints on `interval`, the way Prometheus's own server
-    /// does -- parsing whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each
-    /// target's response declares via its own `Content-Type`. Always synthesizes `up`,
-    /// `scrape_duration_seconds`, and `scrape_samples_scraped` per target per scrape. See
-    /// `docs/adr/prometheus-scrape-and-exposition.md`.
-    ///
-    /// **Two modes, one kind.** `scrape_targets:` is the scrape client above; `bind:` is a
-    /// remote-write *receiver* (`docs/adr/prometheus-remote-write.md`), accepting 1.0 and 2.0
-    /// requests on one listener. Exactly one of the two is set (rule 55), and a field belonging
-    /// to the other mode is a config error rather than a silently ignored setting -- also rule
-    /// 55. A receiver synthesizes no `up`/`scrape_*` series: it never performed a scrape. It does
-    /// hold one piece of cross-request state, and only one: [`MetadataCacheConfig`], which is what
-    /// makes a Prometheus 1.0 sender's writes decode as typed families.
-    ///
-    /// Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
-    /// target-components.md`) claims the bare name at the flattened top level, and `#[serde(flatten)]`
-    /// can't have two fields answer to the same key.
+    /// Prometheus metrics, in one of two modes chosen by which field is set. `scrape_targets:`
+    /// scrapes `/metrics` endpoints on `interval`, the way Prometheus's own server does, parsing
+    /// whichever text dialect (Prometheus text 0.0.4 or OpenMetrics 1.0) each target's response
+    /// declares in its `Content-Type`, and synthesizes `up`, `scrape_duration_seconds`, and
+    /// `scrape_samples_scraped` per target per scrape. `bind:` receives remote-write, accepting
+    /// 1.0 and 2.0 requests on one listener. Set exactly one of the two; a non-default field
+    /// belonging to the other mode is rejected rather than ignored. A receiver synthesizes no
+    /// `up`/`scrape_*` series, and holds one piece of cross-request state: `metadata_cache`.
     PrometheusIn {
-        /// Scrape mode: absolute `http://`/`https://` scrape URLs. Non-empty selects scrape mode
-        /// (rule 55), and every entry is checked by rule 40.
+        /// Scrape mode: absolute `http://`/`https://` URLs with a non-empty host. Non-empty
+        /// selects scrape mode.
         #[serde(default)]
         scrape_targets: Vec<String>,
-        /// Scrape cadence. Rule 9 rejects `0s`. Scrape-mode-only: a non-default value alongside
-        /// `bind:` is rejected by rule 55.
+        /// Scrape cadence. Defaults to `15s`; `0s` is rejected. Scrape mode only: a non-default
+        /// value alongside `bind:` is rejected.
         #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         interval: Duration,
-        /// Per-request timeout. Rule 40 rejects `0s`. Scrape-mode-only (rule 55).
+        /// Per-request timeout. Defaults to `10s`; `0s` is rejected. Scrape mode only.
         #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         timeout: Duration,
-        /// Extra headers sent on every scrape request. A name this input sets itself (`accept`,
-        /// `user-agent`, and the other protocol-owned names -- rule 40) is rejected at
-        /// config-validation time, the same shape as `otlp_out`'s `headers:` (rule 22).
-        /// Scrape-mode-only (rule 55).
+        /// Extra headers sent on every scrape request. A name this input reserves (`accept`,
+        /// `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`,
+        /// `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is
+        /// rejected, as are two keys naming the same header once case is ignored. Scrape mode
+        /// only.
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Client-side TLS tuning for any `https://` *scrape* target -- see [`TlsClientConfig`]. A
-        /// non-default value with no `https://` target is a config error (rule 40), not silently
-        /// ignored. Scrape-mode-only (rule 55).
-        ///
-        /// Named `scrape_tls`, not `tls`: this kind has two TLS-shaped roles -- client TLS for
-        /// outbound scrapes, server TLS for the inbound receiver -- and a bare `tls:` next to a
-        /// `bind_tls:` would be a coin flip for a reader. Every TLS key here is prefixed by the
-        /// socket it governs (`docs/adr/prometheus-remote-write.md`).
+        /// Client-side TLS tuning for `https://` scrape targets. A non-default block with no
+        /// `https://` target is rejected. Scrape mode only. Prefixed `scrape_` because this kind
+        /// has two TLS roles: client TLS for outbound scrapes here, server TLS for the receiver in
+        /// `bind_tls`.
         #[serde(default)]
         scrape_tls: TlsClientConfig,
         /// Receiver mode: `host:port` to accept Prometheus remote-write requests on. Set selects
-        /// bind mode (rule 55). Both wire versions are accepted on the one listener, chosen per
-        /// request from its own `Content-Type` -- there is nothing to configure.
+        /// receiver mode. Both wire versions are accepted on the one listener, chosen per request
+        /// from its `Content-Type`.
         #[serde(default)]
         bind: Option<String>,
         /// The path the receiver answers `POST`s on; anything else is a `404`. Defaults to
-        /// `/api/v1/write`, which is where every remote-write sender points by convention.
-        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        /// `/api/v1/write`, where every remote-write sender points by convention, and must start
+        /// with `/`. Receiver mode only.
         #[serde(default = "default_prometheus_write_path")]
         path: String,
-        /// Server-side TLS for the receiver's listener -- see [`TlsServerConfig`]. Its mere
-        /// presence turns TLS on. Bind-mode-only (rule 55).
-        ///
-        /// Transport security only: the receiver has no authentication of any kind, so a listener
-        /// reachable from an untrusted network belongs behind something that does
-        /// (`docs/known-gaps.md`).
+        /// Server-side TLS for the receiver's listener; its presence turns TLS on. Receiver mode
+        /// only. Transport security only: the receiver has no authentication, so a listener
+        /// reachable from an untrusted network belongs behind something that does.
         #[serde(default)]
         bind_tls: Option<TlsServerConfig>,
         /// How long a receiver connection may sit with no request in flight before it is closed
-        /// and its connection-limit permit handed back. Omitted -- the default -- means no idle
-        /// timeout at all. Rule 53 rejects `0s`; rule 55 rejects it alongside `scrape_targets:`.
-        /// See `docs/adr/idle-connection-timeout.md`.
+        /// and its connection-cap slot freed. Omitted (the default) means no idle timeout; `0s` is
+        /// rejected. Receiver mode only.
         #[serde(default, with = "humantime_serde_duration::option")]
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
-        /// What the receiver remembers about metric *types* between requests, so a Prometheus 1.0
-        /// sender's series decode as the families they are -- see [`MetadataCacheConfig`].
-        /// Bind-mode-only: a non-default value alongside `scrape_targets:` is rejected by rule 55.
+        /// What the receiver remembers about metric types between requests, so a Prometheus 1.0
+        /// sender's series decode as typed families. Receiver mode only.
         #[serde(default)]
         metadata_cache: MetadataCacheConfig,
     },
-    /// A synthetic event source for load testing -- the listener end of the perf harness
-    /// (`docs/plans/load-test-harness.md`). No socket, no decoder: it renders a declarative
-    /// [`GenerateEvent`] template as fast as `count`/`rate` allow, so a scenario measures the
-    /// runtime and the components under test rather than a generator process and a kernel socket
-    /// buffer. Costs nothing unless configured, exactly like every other kind.
-    ///
-    /// Deliberately no "shape" enum (`nginx`, `statsd`, ...): the template plus an ordinary
-    /// `json`/`regex`/`kv_metrics` stage downstream already composes any shape a scenario needs,
-    /// and each shape baked in here would be a second, drifting copy of a fixture.
+    /// A synthetic event source for load testing. No socket and no decoder: it renders a
+    /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
+    /// runtime and the components under test rather than a generator process and a kernel
+    /// socket buffer. There is no shape preset: the template plus an ordinary
+    /// `json`/`regex`/`kv_metrics` stage downstream composes any shape a scenario needs.
     GenerateIn {
-        /// Total events to generate, after which the input returns and the existing
-        /// listener-exit cascade shuts the process down cleanly (`crates/logit-pipeline/src/
-        /// runtime.rs`). **Exact**: the last batch is short (`count % batch`) rather than
-        /// rounded up to a whole batch, so a scenario's derived events/s and CPU-per-event are
-        /// computed against the number actually produced. Omitted means unbounded -- a soak run,
-        /// or one a profiler attaches to. Rejected at `0` (rule 42): a generator that generates
-        /// nothing is the black-hole shape graph rule 7 exists to catch, not a small run.
+        /// Total events to generate, after which the input exits and the process shuts down
+        /// cleanly. Exact: the last batch is short rather than rounded up, so a scenario's derived
+        /// events/s and CPU-per-event count what was produced. Omitted means unbounded (a soak
+        /// run, or one a profiler attaches to). `0` is rejected.
         #[serde(default)]
         count: Option<u64>,
-        /// Events per generated batch -- one `EventBatch` down the fanout, the same unit a real
-        /// listener's batch assembly produces. Defaults to 100. Bigger amortizes the per-batch
-        /// runtime cost (channel send, telemetry point, span) over more events, which is why a
-        /// scenario measuring a *per-batch* cost lowers it rather than raising `count`. Rejected
-        /// at `0` (rule 42).
+        /// Events per generated batch, the same unit a real listener's batch assembly produces.
+        /// Defaults to `100`; `0` is rejected. A bigger batch amortizes the per-batch runtime cost
+        /// (channel send, telemetry point, span) over more events, so a scenario measuring a
+        /// per-batch cost lowers it rather than raising `count`.
         #[serde(default = "default_generate_batch")]
         batch: usize,
-        /// Target events per second, paced against wall clock: `generate_in` sends while it is
-        /// behind the pace `rate` implies and sleeps until the next batch is due otherwise, so
-        /// the *average* rate holds over a run rather than drifting the way a fixed
-        /// `interval(batch/rate)` timer would. Above roughly a thousand batches per second the
-        /// sleep granularity makes it bursty within any given millisecond -- the average is still
-        /// right (`docs/known-gaps.md`). Omitted means unthrottled: generate as fast as
-        /// downstream backpressure allows, which is what a throughput scenario wants. Rejected at
-        /// `0` (rule 42) -- a rate of zero would generate nothing at all, never "as slow as
-        /// possible".
+        /// Target events per second, paced against the wall clock so the average rate holds over
+        /// a run. Above roughly a thousand batches per second the sleep granularity makes it
+        /// bursty within a millisecond, but the average is still right. Omitted means
+        /// unthrottled: generate as fast as downstream backpressure allows, what a throughput
+        /// scenario wants. `0` is rejected.
         #[serde(default)]
         rate: Option<u64>,
-        /// What each generated event carries. See [`GenerateEvent`] -- every field defaults, so
-        /// an omitted block generates a bare timestamped event.
+        /// What each generated event carries. Every field defaults, so an omitted block generates
+        /// a bare timestamped event.
         #[serde(default)]
         event: GenerateEvent,
-        /// Resource attributes for every generated event: literal keys, templated values (`{seq}`
-        /// / `{seq%N}`, the same substitution [`GenerateEvent`] documents). An empty key is
-        /// rejected (rule 42).
+        /// Resource attributes for every generated event: literal keys, templated values
+        /// (`{seq}`/`{seq%N}`, the same substitution `event:` uses). An empty key is rejected.
         ///
-        /// A resource is **batch-level**, not per event, so the unit a placeholder here renders
-        /// at is one batch -- and **in resource position `seq` is the batch ordinal** (0, 1,
-        /// 2, ...), not the event counter. That distinction is the feature: the event counter
+        /// A resource is batch-level, not per event, so in resource position `seq` is the batch
+        /// ordinal (0, 1, 2, ...), not the event counter. That is the feature: the event counter
         /// advances by `batch` each batch, so `{seq%10}` over it under `batch: 100` would render
-        /// `0` forever. Over the ordinal, `resource: { host: "h{seq%10}" }` means what it reads
-        /// as -- ten distinct resources cycling one per batch, which is what a scenario measuring
-        /// resource grouping wants -- costing one attribute map per batch and nothing per event.
-        /// An all-literal resource, the usual case, keeps the cheaper path still: built once at
-        /// startup and `Arc`-shared by every batch forever, one refcount bump per event rather
-        /// than a map.
+        /// `0` forever. Over the ordinal, `resource: { host: "h{seq%10}" }` means ten distinct
+        /// resources cycling one per batch, what a scenario measuring resource grouping wants,
+        /// costing one attribute map per batch and nothing per event. An all-literal resource is
+        /// built once at startup and shared by every batch.
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },
-    /// Prometheus in either of its two sink shapes, chosen by which mode field is set (rule 56
-    /// requires exactly one). `bind:` is an **exposition** endpoint: a stateful sink holding a
-    /// registry of current series that an HTTP handler renders on demand, the mirror of
-    /// `PrometheusIn`'s scrape, serving both text dialects negotiated on the scraping client's
-    /// `Accept`. `endpoint:` is a **remote-write sender**: a stateless sink that POSTs each batch
-    /// to a remote-write receiver, the mirror of `PrometheusIn`'s own `bind:`.
-    ///
-    /// The two modes share no field. A field belonging to the mode that isn't set is a config
-    /// error rather than a silent no-op (rule 56). See
-    /// `docs/adr/prometheus-scrape-and-exposition.md`,
-    /// `docs/adr/prometheus-remote-write.md`, and `logit_outputs::prometheus`'s module doc (the
-    /// spec).
+    /// Prometheus metrics, in one of two sink modes chosen by which field is set. `bind:` serves
+    /// an exposition endpoint: a registry of current series rendered on demand, in whichever text
+    /// dialect the scraping client's `Accept` negotiates. `endpoint:` sends remote-write: each
+    /// batch is POSTed to a remote-write receiver, with no retry in the sink. Set exactly one of
+    /// the two; a non-default field belonging to the other mode is rejected rather than ignored.
+    /// Delta metrics are skipped and counted; put an `aggregate` with `temporality: cumulative`
+    /// upstream.
     PrometheusOut {
-        /// `host:port` to serve the exposition on -- **registry mode**. Bound when the pipeline
-        /// starts (`Output::bind`'s pre-spawn pass), so an address already in use is a startup
-        /// failure rather than a scrape that silently answers nothing.
+        /// `host:port` to serve the exposition on: registry mode. Bound when the pipeline starts,
+        /// so an address already in use is a startup failure rather than a scrape that answers
+        /// nothing.
         ///
-        /// **There is no TLS and no auth on this endpoint**, and it serves every label of every
+        /// There is no TLS and no auth on this endpoint, and it serves every label of every
         /// series the registry holds to anything that connects: bind loopback or pod-local
-        /// (`127.0.0.1:9464`, as every shipped example does) and front it with something that has
-        /// both. See the ADR's "Security posture" section and `docs/known-gaps.md`.
+        /// (`127.0.0.1:9464`) and front it with something that has both.
         #[serde(default)]
         bind: Option<String>,
         /// The HTTP path the exposition is served on; any other path is a `404`. Defaults to
-        /// `/metrics`, what every Prometheus scrape config assumes when a target's own
-        /// `metrics_path` is unset. Registry mode only -- a non-default value alongside
-        /// `endpoint:` is rejected (rule 56).
+        /// `/metrics`, what a Prometheus scrape config assumes when `metrics_path` is unset, and
+        /// must start with `/`. Registry mode only.
         #[serde(default = "default_prometheus_path")]
         path: String,
         /// A series not updated within this window is dropped from the registry and stops being
-        /// exposed. Defaults to 5 minutes -- Prometheus's own staleness horizon, so a series this
-        /// sink stops exposing is one a Prometheus-native exporter's consumer would already have
-        /// treated as stale. `0s` disables expiry entirely, leaving `max_series` as the only bound.
-        /// Registry mode only (rule 56).
+        /// exposed. Defaults to `5m`, Prometheus's own staleness horizon. `0s` disables expiry,
+        /// leaving `max_series` as the only bound. Registry mode only.
         #[serde(default = "default_prometheus_expire_after", with = "humantime_serde_duration")]
         #[schemars(with = "String")]
         expire_after: Duration,
         /// A hard cap on distinct series held in the registry; over it, the least-recently-updated
         /// series is evicted to admit a new one, counted
-        /// `logit.output.series.evicted{reason="cardinality"}` -- the same shape as `aggregate`'s
-        /// `max_retained_gauge_series`, applied to registry memory instead of window memory.
-        /// Registry mode only (rule 56).
+        /// `logit.output.series.evicted{reason="cardinality"}`. Defaults to `100000`; `0` is
+        /// rejected. Registry mode only.
         #[serde(default = "default_prometheus_max_series")]
         max_series: usize,
-        /// An absolute `http://`/`https://` remote-write URL, **path included** (typically
-        /// `/api/v1/write`) -- **sender mode**. Unlike `bind:` this is never resolved at
-        /// config-load time; a receiver that isn't up yet is not a config error, the same
-        /// `otlp_out`/`syslog_out` precedent. Rule 56 checks the scheme and authority.
+        /// An absolute `http://`/`https://` remote-write URL, path included (typically
+        /// `/api/v1/write`): sender mode. Never resolved at config-load time, so a receiver that
+        /// isn't up yet is not a config error.
         #[serde(default)]
         endpoint: Option<String>,
-        /// Which remote-write protocol version this sender writes -- see [`RemoteWriteVersion`].
-        /// Defaults to `1`, what every deployed receiver accepts. There is no negotiation and no
-        /// fallback: pick the version the receiver speaks, exactly as a scrape target's own
-        /// dialect is picked for it. Sender mode only (rule 56).
-        ///
-        /// `serde` reads and writes [`RemoteWriteVersion`] as the integer, so the schema has to
-        /// say so here: the derived variant-name schema would publish a spelling (`"V1"`) config
-        /// never accepts. The same `#[schemars(with = ..)]` hint the hand-rolled `Duration` codec
-        /// carries on every field that uses it (ADR `config-yaml-jsonschema`).
+        /// Which remote-write protocol version this sender writes, `1` or `2`. Defaults to `1`,
+        /// what every deployed receiver accepts. There is no negotiation and no fallback: pick the
+        /// version the receiver speaks. Sender mode only.
+        // Serde reads and writes `RemoteWriteVersion` as the integer, so the schema must say so;
+        // the derived variant-name schema would publish a spelling (`"V1"`) config never accepts.
         #[serde(default)]
         #[schemars(with = "u8")]
         version: RemoteWriteVersion,
-        /// Per-request timeout on the remote-write POST. Defaults to 10s, `otlp_out`'s own
-        /// default. Rule 56 rejects `0s`. Sender mode only.
+        /// Per-request timeout on the remote-write POST. Defaults to `10s`; `0s` is rejected.
+        /// Sender mode only.
         #[serde(
             default = "default_prometheus_endpoint_timeout",
             with = "humantime_serde_duration"
         )]
         #[schemars(with = "String")]
         timeout: Duration,
-        /// Extra headers sent on every remote-write request -- e.g. `X-Scope-OrgID` for a
-        /// multi-tenant Mimir. A value is a plain string like any other field, so `!env` works on
-        /// it (`docs/adr/env-yaml-tag.md`) -- the way to carry an `Authorization: Bearer …` token
-        /// without inlining it. A name the protocol owns (`content-type`, `content-encoding`,
-        /// `content-length`, `x-prometheus-remote-write-version`, `user-agent`) or an HTTP/2
-        /// pseudo-header starting with `:` is rejected at config-validation time (rule 56) rather
-        /// than silently overridden, as are two keys naming the same header once case is ignored.
+        /// Extra headers sent on every remote-write request: `X-Scope-OrgID` for a multi-tenant
+        /// Mimir, say. A value is a plain string, so `!env` works on it, which is how to carry an
+        /// `Authorization: Bearer …` token without inlining it. A name the protocol owns
+        /// (`content-type`, `content-encoding`, `content-length`,
+        /// `x-prometheus-remote-write-version`, `user-agent`) or an HTTP/2 pseudo-header starting
+        /// with `:` is rejected, as are two keys naming the same header once case is ignored.
         /// Sender mode only.
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Client-side TLS tuning for an `https://` `endpoint:` -- see [`TlsClientConfig`]. Named
-        /// for the mode it serves, matching `prometheus_in`'s `scrape_tls:`/`bind_tls:` pair: one
-        /// kind with two TLS-shaped roles must never spell either of them as a bare `tls:`. A
-        /// non-default value under a plain `http://` endpoint is a config error (rule 56), not
-        /// silently ignored. Sender mode only.
+        /// Client-side TLS tuning for an `https://` `endpoint:`. A non-default block under a plain
+        /// `http://` endpoint is rejected. Sender mode only. Prefixed `endpoint_`, matching
+        /// `prometheus_in`'s `scrape_tls`/`bind_tls`, because this kind has two modes.
         #[serde(default)]
         endpoint_tls: TlsClientConfig,
     },
-    /// A sink that drops everything, as cheaply as the runtime allows -- the sink end of the perf
-    /// harness (`docs/plans/load-test-harness.md`). Its point is measuring everything *upstream*
-    /// of a sink without a real one's encoder, socket, or filesystem in the number; the runtime's
-    /// own layer-2 telemetry still counts what it received and how long delivery took, so a
-    /// scenario ending here is still attributable per node.
-    ///
-    /// No fields -- and no `format:`/`path:` to grow later: a scenario that wants an encoder in
-    /// the measurement uses `file_out` to `/dev/null` instead, which is a real sink doing real
-    /// work rather than a special case here.
+    /// A sink that drops everything, as cheaply as the runtime allows; the sink end of the
+    /// load-test harness. It measures everything upstream of a sink without a real one's
+    /// encoder, socket, or filesystem in the number, while the runtime's own telemetry still
+    /// counts what it received. No fields: a scenario that wants an encoder in the measurement
+    /// uses `file_out` to `/dev/null` instead.
     NullOut {},
-    /// A named destination a router directs events into (`docs/adr/target-components.md`). No
-    /// fields, and no `sources:` -- a target is fed by *direction*, from a router that names it,
-    /// never by naming anything itself. Downstream components read it exactly like any other
-    /// component, by listing it in their own `sources:`.
+    /// A named destination a router directs events into. No fields and no `sources:`: a target
+    /// is fed by a router that names it, never by naming anything itself, and must be directed
+    /// to by at least one router. Downstream components read it like any other component, by
+    /// listing it in their own `sources:`.
     Target {},
 }
 
-/// Which remote-write protobuf message `prometheus_out`'s `endpoint:` sender writes, spelled in
-/// config as the bare integer the specs themselves are numbered by: `version: 1` or `version: 2`.
-/// An integer rather than a string enum because that is how both specs, Prometheus's own
-/// `remote_write` config and every receiver's documentation name them -- `version: v1` would be a
-/// spelling this project invented.
-///
-/// Defaults to `1` (`prometheus.WriteRequest`): it is what every remote-write receiver deployed
-/// today accepts, where 2.0 support is still uneven. Maps onto
-/// `logit_proto::prometheus::remote_write::Version`, which holds the `Content-Type` and
-/// `X-Prometheus-Remote-Write-Version` spellings both ends need.
+/// Which remote-write protobuf message `prometheus_out`'s `endpoint:` sender writes, spelled as
+/// the integer the specs are numbered by: `version: 1` or `version: 2`. Defaults to `1`, which
+/// every deployed receiver accepts; 2.0 support is still uneven.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(try_from = "u8", into = "u8")]
 pub enum RemoteWriteVersion {
-    /// `prometheus.WriteRequest` -- remote-write 1.0.
+    /// Remote-write 1.0 (`prometheus.WriteRequest`).
     #[default]
     V1,
-    /// `io.prometheus.write.v2.Request` -- remote-write 2.0: symbol table, inline metadata,
+    /// Remote-write 2.0 (`io.prometheus.write.v2.Request`): symbol table, inline metadata,
     /// created timestamps.
     V2,
 }
@@ -2176,85 +1837,62 @@ impl From<RemoteWriteVersion> for u8 {
     }
 }
 
-/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
-/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
-/// the default beats hand-mirroring it in another crate.
+/// `prometheus_out`'s `path` default. `pub` so graph validation can tell a set registry-mode
+/// field from a defaulted one.
 pub fn default_prometheus_path() -> String {
     "/metrics".to_string()
 }
 
-/// `prometheus_in`'s remote-write receiver remembering metric types across requests
-/// (`metadata_cache:`), so a Prometheus **1.0** sender's writes decode as typed families.
+/// What `prometheus_in`'s remote-write receiver remembers about metric types across requests
+/// (`metadata_cache:`), so a Prometheus 1.0 sender's writes decode as typed families.
 ///
-/// 1.0 carries a family's type, `# HELP` and `# UNIT` in `WriteRequest.metadata[]`, and
-/// Prometheus's own sender ships those in **separate requests** on their own schedule
-/// (`metadata_config`, by default once a minute) rather than attached to the samples they
-/// describe. A receiver that remembers nothing therefore sees, for nearly every request, a bag of
-/// flat series with no type anywhere in the message: every family decodes as `unknown`, and
-/// `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three unrelated series instead
-/// of one histogram. Nothing is *lost* -- the samples and labels are exact, and a relay back out to
-/// remote-write is still a fixed point -- but the model kinds are flatter than the producer's.
+/// 1.0 carries a family's type, `# HELP`, and `# UNIT` in `WriteRequest.metadata[]`, and
+/// Prometheus's own sender ships those in separate requests on their own schedule (by default
+/// once a minute) rather than with the samples they describe. A receiver that remembers nothing
+/// sees, for nearly every request, flat series with no type anywhere: every family decodes as
+/// `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as three
+/// unrelated series instead of one histogram. Nothing is lost (samples and labels are exact, and
+/// a relay back out to remote-write is still a fixed point), but the kinds are flatter than the
+/// producer's.
 ///
-/// So the receiver keeps a table of `family name -> (type, help, unit)`, fed by every declaration
-/// any request carries that actually names a type -- 1.0's `metadata[]` and 2.0's inline
-/// `Metadata` alike, so a mixed fleet fills one table, but a 1.0 `UNKNOWN` or a 2.0 `UNSPECIFIED`
-/// entry declares nothing and is not learned -- and consulted for a family whose own request
-/// declared nothing. **The request always wins**: a sender that retypes a family retypes it
-/// immediately, however stale the remembered entry.
+/// So the receiver keeps a table of family name to (type, help, unit), fed by every declaration
+/// any request carries that names a type (1.0's `metadata[]` and 2.0's inline metadata alike,
+/// so a mixed fleet fills one table; an `UNKNOWN`/`UNSPECIFIED` entry declares nothing and is
+/// not learned) and consulted for a family whose own request declared nothing. The request
+/// always wins: a sender that retypes a family retypes it immediately. 2.0 senders need none of
+/// this, and neither does a 1.0 sender that attaches metadata to its own writes.
 ///
-/// That table is per-family state on a component that otherwise has none, so it is bounded on both
-/// axes -- `max_families` and `ttl` below. 2.0 senders need none of it: 2.0 is fully typed on every
-/// request, and so is any 1.0 sender that attaches metadata to its own writes.
-///
-/// **It is one table per component, shared by every sender that can reach the listener.** That is
-/// what lets a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer
-/// that declares a great many families evicts other peers' entries, by `last_seen` and with no
-/// attribution -- leaving well-behaved senders untyped (their samples still arrive, as flat
-/// families) until their next metadata write. The receiver authenticates no one, so this is the
-/// same rule `bind_tls:` already carries rather than a new one: do not point it at untrusted
-/// senders (`docs/known-gaps.md`). `max_families: 0` turns the sharing off along with the typing.
-///
-/// See `docs/adr/prometheus-remote-write.md`.
+/// It is one table per component, shared by every sender that can reach the listener. That lets
+/// a 2.0 sender's declarations type a 1.0 sender's series, and it equally means a peer that
+/// declares a great many families evicts other peers' entries, leaving well-behaved senders
+/// untyped until their next metadata write. The receiver authenticates no one, so do not point
+/// it at untrusted senders. `max_families: 0` turns the table off along with the typing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MetadataCacheConfig {
-    /// How many families the receiver will remember at once. Over the cap the
-    /// **least-recently-seen** entry is evicted first, counted
-    /// `logit.input.metadata_cache.evicted{reason="cardinality"}` -- the same policy and the same
-    /// counter shape `prometheus_out`'s exposition `max_series:` uses, because it answers the same
-    /// question: the bound has to be a number of things, and the thing worth keeping is whatever
-    /// was written to most recently.
+    /// How many families the receiver remembers at once. Over the cap the least-recently-seen
+    /// entry is evicted first, counted
+    /// `logit.input.metadata_cache.evicted{reason="cardinality"}`. Defaults to `10000`, a
+    /// generous ceiling on distinct families (not series): a large Prometheus scrapes tens of
+    /// thousands of series across low thousands of families.
     ///
-    /// Defaults to `10000`, which is a generous ceiling on the *distinct families* (not series) a
-    /// sender writes -- a large Prometheus scrapes tens of thousands of series across low
-    /// thousands of families.
+    /// An entry is a family name plus its `# HELP` and `# UNIT` text, each bounded at 1 KiB as
+    /// remembered (longer text is truncated and counted `logit.input.metadata_cache.truncated`),
+    /// so the resident bound is roughly `max_families x (name + 2 KiB)`: about 20 MiB at the
+    /// default, and far less in practice. The family name is the sender's and is not bounded
+    /// here.
     ///
-    /// **What it costs.** An entry is a family name plus its `# HELP` and `# UNIT` text, each of
-    /// the two bounded at 1 KiB as it is remembered (past that the text is truncated and counted
-    /// `logit.input.metadata_cache.truncated`), so the resident bound is roughly
-    /// `max_families x (name + 2 KiB)` -- about 20 MiB at the default, and far less in practice,
-    /// since a real `# HELP` is a sentence and most families have no `# UNIT` at all. The family
-    /// *name* is the sender's and is not bounded here; the listener is not built to face a hostile
-    /// one (see "Security posture" in `crates/logit-inputs/src/prometheus.rs`).
-    ///
-    /// **`0` turns the cache off entirely**: nothing is remembered, nothing is swept, and 1.0
-    /// requests decode exactly as a stateless receiver's do. That is the setting for a pure-2.0
-    /// fleet, or for one where the extra state is not wanted.
+    /// `0` turns the cache off: nothing is remembered, nothing is swept, and 1.0 requests decode
+    /// as a stateless receiver's do. That is the setting for a pure-2.0 fleet, or for one where
+    /// the extra state is not wanted.
     #[serde(default = "default_metadata_cache_max_families")]
     pub max_families: usize,
-    /// How long a family is remembered after the last request that declared it. Defaults to `10m`,
-    /// an order of magnitude over Prometheus's own default one-minute metadata cadence, so a
-    /// sender has to miss ten refreshes running before its types lapse.
-    ///
-    /// An expired entry is dropped, counted `logit.input.metadata_cache.evicted{reason="expired"}`,
-    /// and the families it typed decode as `unknown` again until the sender's next metadata
-    /// request. That is the point of the bound rather than a flaw in it: a sender that has stopped
-    /// writing should stop costing memory, and a remembered type nothing has reasserted in ten
-    /// minutes is a guess about a series that may no longer exist.
-    ///
-    /// Rule 55 rejects `0s` -- an entry that expires the instant it is written is a cache that does
-    /// nothing while still sweeping and locking on every request; `max_families: 0` is how the
-    /// cache is turned off.
+    /// How long a family is remembered after the last request that declared it. Defaults to
+    /// `10m`, ten times Prometheus's own default metadata cadence, so a sender has to miss ten
+    /// refreshes running before its types lapse. An expired entry is dropped, counted
+    /// `logit.input.metadata_cache.evicted{reason="expired"}`, and the families it typed decode
+    /// as `unknown` again until the sender's next metadata request. `0s` is rejected;
+    /// `max_families: 0` is how the cache is turned off.
     #[serde(default = "default_metadata_cache_ttl", with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub ttl: Duration,
@@ -2269,23 +1907,18 @@ impl Default for MetadataCacheConfig {
     }
 }
 
-/// `MetadataCacheConfig::max_families`' default. `pub` for rule 55's sake, see
-/// [`default_prometheus_scrape_interval`].
+/// `MetadataCacheConfig::max_families`' default. `pub` for graph validation.
 pub fn default_metadata_cache_max_families() -> usize {
     10_000
 }
 
-/// `MetadataCacheConfig::ttl`'s default. `pub` for rule 55's sake, see
-/// [`default_prometheus_scrape_interval`].
+/// `MetadataCacheConfig::ttl`'s default. `pub` for graph validation.
 pub fn default_metadata_cache_ttl() -> Duration {
     Duration::from_secs(600)
 }
 
-/// `PrometheusIn::path`'s default -- the remote-write receiver's route. Prometheus's own
-/// `remote_write.url` examples, the 1.0 and 2.0 specs' examples, and every receiver in the
-/// ecosystem use `/api/v1/write`, so a sender configured against a stock deployment needs no
-/// `path:` here at all.
-/// `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+/// `prometheus_in`'s `path` default: the route every remote-write sender and receiver uses by
+/// convention. `pub` for graph validation.
 pub fn default_prometheus_write_path() -> String {
     "/api/v1/write".to_string()
 }
@@ -2298,23 +1931,18 @@ fn default_generate_metric_value() -> f64 {
     1.0
 }
 
-/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
-/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
-/// the default beats hand-mirroring it in another crate.
+/// `prometheus_out`'s `expire_after` default. `pub` for graph validation.
 pub fn default_prometheus_expire_after() -> Duration {
     Duration::from_secs(300)
 }
 
-/// `pub` for the same reason [`default_handshake_timeout`] is: graph rule 56 has to tell a *set*
-/// registry-mode field from a defaulted one when `endpoint:` is what's configured, and importing
-/// the default beats hand-mirroring it in another crate.
+/// `prometheus_out`'s `max_series` default. `pub` for graph validation.
 pub fn default_prometheus_max_series() -> usize {
     100_000
 }
 
-/// `PrometheusOut::timeout`'s default -- the same 10s `default_prometheus_scrape_timeout` and
-/// `otlp_out` already use for one HTTP request. `pub` for rule 56, see
-/// [`default_prometheus_path`].
+/// `prometheus_out`'s `timeout` default, the same 10s `otlp_out` uses for one HTTP request.
+/// `pub` for graph validation.
 pub fn default_prometheus_endpoint_timeout() -> Duration {
     Duration::from_secs(10)
 }
@@ -2327,12 +1955,12 @@ fn default_docker_root() -> String {
     "/var/lib/docker/containers".to_string()
 }
 
-/// [`ComponentKind::Internal`]'s `logs` field -- see its own doc comment.
+/// `internal`'s `logs` field: which of `logit`'s own self-log events are captured into the
+/// pipeline as ordinary log events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalLogs {
-    /// Capture `warn` and `error` events -- every shipped `Diagnostics::warn`/`warn_throttled`
-    /// call, plus `error`.
+    /// Capture `warn` and `error` events. The default.
     #[default]
     Warn,
     /// Capture only `error` events.
@@ -2341,83 +1969,68 @@ pub enum InternalLogs {
     Off,
 }
 
-/// Where a tailed file starts reading the first time it's seen, when no checkpoint entry names
-/// it -- meaningless once a checkpoint entry exists (that always wins; see [`TailOptions::
-/// checkpoint_path`]) and meaningless for a file discovered after startup, which always starts
-/// at [`ReadFrom::Beginning`] regardless of this setting (a file that didn't exist yet has no
-/// "before `logit` started" to skip).
+/// Where a tailed file starts reading the first time it is seen, when no checkpoint entry names
+/// it. A checkpoint entry always wins, and a file discovered after startup always starts at
+/// `beginning` regardless of this setting (a file that didn't exist yet has nothing to skip).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadFrom {
-    /// Skip whatever the file already holds and tail only new lines -- matches `syslog_in`'s own
-    /// receive-only-what-arrives-after-startup behavior for a file present before `logit` starts.
+    /// Skip whatever the file already holds and tail only new lines. The default.
     #[default]
     End,
     /// Replay the file's entire existing content, then continue tailing.
     Beginning,
 }
 
-/// How a tailed source notices new lines and new/removed files. See
-/// `docs/adr/file-tailing-and-docker-json-logs.md`.
+/// How a tailed source notices new lines and new or removed files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchMode {
-    /// `inotify` where available (Linux only), falling back to `poll` if it can't be set up
-    /// (e.g. an exhausted `fs.inotify.max_user_instances`). The right default everywhere this
-    /// runs today.
+    /// `inotify` where available (Linux only), falling back to `poll` if it can't be set up (an
+    /// exhausted `fs.inotify.max_user_instances`, say). The default.
     #[default]
     Auto,
-    /// Always `inotify`; a startup error on a non-Linux build or if `inotify` can't be set up,
-    /// rather than a silent fallback -- for an operator who wants to know immediately if the low-
-    /// latency path stopped working.
+    /// Always `inotify`: a startup error on a non-Linux build or if `inotify` can't be set up,
+    /// rather than a silent fallback.
     Inotify,
     /// Always the `poll_interval` tick, even on Linux. Higher latency (new data waits up to
-    /// `poll_interval`) but has no OS-specific dependency and works over filesystems (some
-    /// network or FUSE mounts) where `inotify` events don't reliably fire.
+    /// `poll_interval`), but works over filesystems (some network or FUSE mounts) where
+    /// `inotify` events don't reliably fire.
     Poll,
 }
 
-/// Options shared by every tailing listener kind ([`ComponentKind::TailIn`],
-/// [`ComponentKind::DockerIn`]) -- flattened into each variant with `#[serde(flatten)]` rather
-/// than nested under a sub-block, matching [`ReceiveConfig`]'s own flat-fields precedent. Not
-/// `#[serde(deny_unknown_fields)]`: that attribute cannot be combined with `#[serde(flatten)]`
-/// (a serde limitation, not a choice) -- an unrecognized field here is silently ignored, exactly
-/// like every other `ComponentKind` variant today, none of which deny unknown fields either.
+/// Options shared by `tail_in` and `docker_in`, written directly on the component rather than
+/// under a sub-block. An unrecognized field here is silently ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct TailOptions {
     /// Where read offsets are persisted, so a restart resumes instead of replaying or skipping.
-    /// `None` -- the default -- means no checkpoint at all: every restart re-applies `read_from`
-    /// to every file as if it were newly discovered. Resolved against the config file's own
-    /// directory when relative, exactly like `stdio_out`'s `path` target.
+    /// Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every
+    /// file as if newly discovered. A relative path resolves against the config file's
+    /// directory.
     #[serde(default)]
     pub checkpoint_path: Option<String>,
     #[serde(default)]
     pub read_from: ReadFrom,
     #[serde(default)]
     pub watch: WatchMode,
-    /// The read/rescan cadence used as-is under `watch: poll`, and as a reconciliation pass
-    /// under `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify`
-    /// missed) -- never disabled, since a wake source alone can't safely be trusted as the only
-    /// path to correctness. Also the busy-loop guard: rejected at `0s` (graph validation).
+    /// The read/rescan cadence, used as-is under `watch: poll` and as a reconciliation pass under
+    /// `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify` missed).
+    /// Never disabled. Defaults to `1s`; `0s` is rejected.
     #[serde(default = "default_poll_interval", with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub poll_interval: Duration,
-    /// How long a dirty (unwritten) checkpoint may sit before being flushed to disk, in addition
-    /// to being flushed on every file close and on shutdown -- deliberately not "every line": a
-    /// checkpoint written that often would dominate the cost of tailing an active file for no
-    /// correctness benefit, since a checkpoint only bounds *how much* a crash can replay, and
-    /// replay itself is always safe (downstream is expected to tolerate a duplicate the same way
-    /// any at-least-once pipeline stage does). Rejected at `0s` (graph validation) for the same
-    /// busy-loop reason as `poll_interval`.
+    /// How long a dirty checkpoint may sit before being flushed to disk, in addition to a flush
+    /// on every file close and at shutdown. Not "every line": a checkpoint only bounds how much
+    /// a crash can replay, and replay is safe for an at-least-once pipeline. Defaults to `5s`;
+    /// `0s` is rejected.
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub checkpoint_interval: Duration,
-    /// A line longer than this is dropped whole (not truncated) and diagnosed -- truncating
-    /// would silently hand a downstream JSON parser (`docker_in`'s own envelope, or a `json`
-    /// transform an operator chains after `tail_in`) a value that looks well-formed but isn't
-    /// the real line. A string via [`human_bytes`], exactly like `BufferConfig::max_bytes`.
+    /// A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream
+    /// JSON parser never sees a value that looks well-formed but isn't the real line. A
+    /// byte-count string. Defaults to `"1MiB"`; `0` is rejected.
     #[serde(default = "default_max_line_bytes", with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_line_bytes: u64,
@@ -2448,73 +2061,69 @@ fn default_max_line_bytes() -> u64 {
     1024 * 1024
 }
 
-/// `Csv::delimiter`'s default -- a plain comma, the overwhelmingly common case.
+/// `csv`'s `delimiter` default.
 fn default_csv_delimiter() -> char {
     ','
 }
 
-/// [`ComponentKind::Shape`]'s `resource` field -- whether the batch resource a `shape` sees is
-/// forwarded or replaced. `drop` is the default because this component's defining property is that
-/// its output carries no observed key or value, and a `Resource`'s attributes are observed values
-/// like any other. `keep` is the operator's explicit opt-in to that identity flowing downstream,
-/// in exchange for a per-service breakdown. See `docs/adr/shape-observer-component.md`.
+/// `shape`'s `resource` field: whether the batch resource a `shape` sees is forwarded or
+/// replaced. `drop` is the default because a resource's attributes are observed values like any
+/// other; `keep` opts that identity into flowing downstream in exchange for a per-service
+/// breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ShapeResource {
-    /// Substitute one cached, empty `Resource`, so no resource attribute value flows out.
+    /// Substitute an empty resource, so no resource attribute value flows out. The default.
     #[default]
     Drop,
     /// Forward the incoming resource unchanged.
     Keep,
 }
 
-/// [`ComponentKind::Shape`]'s `interval` default -- ten seconds, matching the reference
-/// `aggregate` window, since a `shape` is almost always configured as a pair with one.
+/// `shape`'s `interval` default: ten seconds, matching the reference `aggregate` window.
 fn default_shape_interval() -> Duration {
     Duration::from_secs(10)
 }
 
-/// [`ComponentKind::Shape`]'s `max_tracked_keys` default -- a DoS/memory guard, not a tuning knob,
-/// the same role `default_max_retained_series` plays for `aggregate`. `logit-transforms`'
-/// `DEFAULT_MAX_TRACKED_KEYS` mirrors this for a direct `Shape::new` caller (that crate does not
-/// read this one's types -- `docs/design/pipeline-graph.md`'s crate layout).
+/// `shape`'s `max_tracked_keys` default. `logit-transforms`' `DEFAULT_MAX_TRACKED_KEYS` mirrors
+/// it for a direct `Shape::new` caller.
 fn default_max_tracked_keys() -> usize {
     4096
 }
 
-/// [`ComponentKind::Shape`]'s `max_tracked_keysets` default -- see [`default_max_tracked_keys`].
+/// `shape`'s `max_tracked_keysets` default.
 fn default_max_tracked_keysets() -> usize {
     4096
 }
 
-/// [`ComponentKind::Flatten`]'s `arrays` field: whether an array expands by index or is treated
-/// as a leaf. See that field's own doc comment.
+/// `flatten`'s `arrays` field: whether an array expands by index or is treated as a leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlattenArrays {
+    /// Expand by index (`tags.0`, `tags.1`). The default.
     #[default]
     Index,
+    /// Leave the array as a leaf, written back whole at its path.
     Skip,
 }
 
-/// [`ComponentKind::Flatten`]'s `attributes` default -- every nested attribute.
+/// `flatten`'s `attributes` default: every nested attribute.
 fn default_flatten_attributes() -> FlattenFields {
     FlattenFields::Keyword(FlattenKeyword::All)
 }
 
-/// [`ComponentKind::Flatten`]'s `resource` default -- nothing.
+/// `flatten`'s `resource` default: nothing.
 fn default_flatten_resource() -> FlattenFields {
     FlattenFields::Keyword(FlattenKeyword::None)
 }
 
-/// [`ComponentKind::Aggregate`]'s `distributions` field -- whether a raw `Samples` series
-/// (statsd `ms`/`h`/`d`) absorbs as a sketch or keeps its raw values for the window. See that
-/// field's own doc comment.
+/// `aggregate`'s `distributions` field: whether a raw samples series (statsd `ms`/`h`/`d`)
+/// absorbs as a sketch or keeps its raw values for the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Distributions {
-    /// Sketch every value on absorb (`DdSketch::add_weighted`) -- no raw samples survive past the
-    /// window. The right default: bounded memory regardless of how many samples a series sees.
+    /// Sketch every value on absorb; no raw samples survive the window. The default: bounded
+    /// memory however many samples a series sees.
     #[default]
     Sketch,
     /// Keep raw values for the whole window (bounded by `max_samples_per_series`), only sketching
@@ -2522,15 +2131,13 @@ pub enum Distributions {
     Samples,
 }
 
-/// [`ComponentKind::Aggregate`]'s `sets` field -- whether a raw `SetMembers` series (statsd `s`)
-/// absorbs as a `HyperLogLog` estimate or keeps its exact member set for the window. See that
-/// field's own doc comment.
+/// `aggregate`'s `sets` field: whether a raw set-members series (statsd `s`) absorbs as a
+/// HyperLogLog estimate or keeps its exact member set for the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Sets {
-    /// Insert every member into a `HyperLogLog` on absorb -- no exact member set survives past the
-    /// window. The right default: bounded memory regardless of how many distinct members a series
-    /// sees.
+    /// Insert every member into a HyperLogLog on absorb; no exact member set survives the window.
+    /// The default: bounded memory however many distinct members a series sees.
     #[default]
     Estimate,
     /// Keep the exact, deduplicated member set for the whole window (bounded by
@@ -2538,138 +2145,106 @@ pub enum Sets {
     Members,
 }
 
-/// [`ComponentKind::Aggregate`]'s `temporality` field -- what a flushed `Sum`/`Histogram` means.
-/// See that field's own doc comment and the `docs/adr/aggregation-window-semantics.md`
-/// "cumulative temporality as an opt-in mode" amendment.
+/// `aggregate`'s `temporality` field: what a flushed `Sum`/`Histogram` means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregateTemporality {
-    /// Every window's emitted `Sum`/`Histogram` is that window's own increment, and the
-    /// accumulator resets at each flush -- strictly tumbling, the behavior every config had before
-    /// this field existed, and what an InfluxDB/statsd-shaped consumer expects.
+    /// Every window emits its own increment and the accumulator resets at each flush: tumbling
+    /// windows, what an InfluxDB/statsd-shaped consumer expects. The default.
     #[default]
     Delta,
-    /// A `Sum`/`Histogram` series' accumulator survives the flush and keeps summing, so every
-    /// window emits the running total since the series was first seen, stamped with that
-    /// first-seen time as `start_timestamp` -- the reset signal OTLP and Prometheus use. Required
-    /// by `prometheus_out`, which skips delta records
-    /// (`docs/adr/prometheus-scrape-and-exposition.md`). Bounded by `series_retention` /
-    /// `max_retained_series`, exactly as gauge retention is.
+    /// A `Sum`/`Histogram` accumulator survives the flush and keeps summing, so every window
+    /// emits the running total since the series was first seen, stamped with that first-seen
+    /// time as its start timestamp. Required by `prometheus_out`, which skips delta records.
+    /// A running total lives only as long as `series_retention` and `max_retained_series` keep
+    /// its series, so both must be at least `1`.
     Cumulative,
 }
 
-/// `Aggregate::series_retention`'s default: retention is on by default, at a modest depth --
-/// `0` (the pre-existing, always-tumbling behavior) is an explicit opt-out, not the default,
-/// since a relative gauge adjustment silently resolving against 0.0 every time (what `0` means)
-/// is the wrong default for a feature whose entire point is making that case rare.
+/// `aggregate`'s `series_retention` default. Retention is on by default; `0` is an explicit
+/// opt-out.
 fn default_series_retention() -> u32 {
     5
 }
 
-/// `Aggregate::max_retained_series`'s default -- a DoS/cardinality guard, not a tuning
-/// knob (see the field's own doc comment).
+/// `aggregate`'s `max_retained_series` default.
 fn default_max_retained_series() -> usize {
     10_000
 }
 
-/// `Aggregate::max_samples_per_series`'s default -- a DoS/memory guard, not a tuning knob (see the
-/// field's own doc comment). Matches `logit_core::Samples::MAX_WEIGHT`'s order of magnitude: both
-/// exist to bound how much one series can cost regardless of what a hostile or misconfigured
-/// producer sends.
+/// `aggregate`'s `max_samples_per_series` default, on the order of
+/// `logit_core::Samples::MAX_WEIGHT`.
 fn default_max_samples_per_series() -> usize {
     1000
 }
 
-/// `Aggregate::max_set_members_per_series`'s default -- same DoS/memory-guard role as
-/// [`default_max_samples_per_series`], for exact set-member retention instead of raw samples.
+/// `aggregate`'s `max_set_members_per_series` default.
 fn default_max_set_members_per_series() -> usize {
     1000
 }
 
-/// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly
-/// (`logit-outputs` depends on `logit-config`, never the reverse), so keep the two in sync by
-/// hand if this ever changes.
+/// Mirrors `logit_outputs::syslog::DEFAULT_CONNECT_TIMEOUT`. `logit-outputs` depends on this
+/// crate, never the reverse, so the two are kept in sync by hand.
 fn default_syslog_connect_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-/// The one default behind `syslog_in`/`logit_in`/`otlp_in`'s `handshake_timeout` -- deliberately
-/// one function for all three, since a per-phase pre-message budget is the same question on every
-/// ingress listener kind and one number is one thing for an operator to learn. Mirrors
-/// `logit_inputs::tcp::HANDSHAKE_TIMEOUT` and `logit_inputs::logit::HANDSHAKE_TIMEOUT` (the
-/// listeners' own constants, still the default when no config value is threaded through) -- can't
-/// reference either directly, same reason as [`default_syslog_connect_timeout`].
-///
-/// `pub`, unlike every other `default_*` in this module: graph rule 45
-/// (`logit_pipeline::graph`) has to tell a *set* `handshake_timeout` from a defaulted one, and
-/// `logit-pipeline` already depends on this crate, so it imports this rather than hand-mirroring
-/// the number.
+/// The one `handshake_timeout` default shared by every TCP listener kind. Mirrors
+/// `logit_inputs::tcp::HANDSHAKE_TIMEOUT` and `logit_inputs::logit::HANDSHAKE_TIMEOUT`, kept in
+/// sync by hand. `pub` so graph validation can tell a set value from a defaulted one.
 pub fn default_handshake_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-/// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT` -- can't reference it directly, same reason
-/// as [`default_syslog_connect_timeout`].
+/// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT`, kept in sync by hand.
 fn default_logit_out_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
-/// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
-/// reason as [`default_syslog_connect_timeout`].
+/// Mirrors `logit_outputs::statsd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
 fn default_statsd_max_packet_bytes() -> u64 {
     1432
 }
 
-/// Mirrors `logit_outputs::statsd::DEFAULT_CONNECT_TIMEOUT` -- can't reference it directly, same
-/// reason as [`default_syslog_connect_timeout`].
+/// Mirrors `logit_outputs::statsd::DEFAULT_CONNECT_TIMEOUT`, kept in sync by hand.
 fn default_statsd_connect_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-/// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
-/// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
+/// Mirrors `logit_proto::collectd::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
 fn default_collectd_max_packet_bytes() -> u64 {
     1452
 }
 
-/// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES` -- can't reference it directly, same
-/// reason as [`default_syslog_connect_timeout`]; kept in sync by hand.
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_LINE_BYTES`, kept in sync by hand.
 fn default_graphite_max_line_bytes() -> u64 {
     8192
 }
 
-/// Mirrors `logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES` -- Twisted's
-/// `Int32StringReceiver.MAX_LENGTH`, which carbon's own pickle receiver inherits. Can't reference
-/// it directly, same reason as [`default_syslog_connect_timeout`]; shared by `graphite_in`'s and
-/// `graphite_out`'s `max_frame_bytes`, kept in sync by hand.
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES` (Twisted's
+/// `Int32StringReceiver.MAX_LENGTH`, which carbon's pickle receiver inherits), kept in sync by
+/// hand. Shared by `graphite_in`'s and `graphite_out`'s `max_frame_bytes`.
 fn default_graphite_max_frame_bytes() -> u64 {
     1 << 20
 }
 
-/// Mirrors `logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES` -- can't reference it directly, same
-/// reason as [`default_syslog_connect_timeout`].
+/// Mirrors `logit_proto::graphite::DEFAULT_MAX_PACKET_BYTES`, kept in sync by hand.
 fn default_graphite_max_packet_bytes() -> u64 {
     1432
 }
 
-/// `GraphiteOut::connect_timeout`'s default -- matches `StatsdOut`'s/`SyslogOut`'s own 5s default
-/// TCP connect timeout.
+/// `graphite_out`'s `connect_timeout` default, matching `statsd_out`'s and `syslog_out`'s.
 fn default_graphite_connect_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-/// `PrometheusIn::interval`'s default -- Prometheus's own server ships the same 15s default scrape
-/// interval.
-/// `pub`, like [`default_handshake_timeout`]: graph rule 55 has to tell a *set* `interval` from a
-/// defaulted one when deciding whether a scrape-only field was written under `bind:`, and
-/// `logit-pipeline` already depends on this crate, so it imports this rather than mirroring the
-/// number by hand.
+/// `prometheus_in`'s `interval` default, Prometheus's own default scrape interval. `pub` so
+/// graph validation can tell a set value from a defaulted one.
 pub fn default_prometheus_scrape_interval() -> Duration {
     Duration::from_secs(15)
 }
 
-/// `PrometheusIn::timeout`'s default -- matches `OtlpOutput`'s/`OtlpInput`'s own 10s default
-/// request timeout. `pub` for rule 55's sake, see [`default_prometheus_scrape_interval`].
+/// `prometheus_in`'s `timeout` default, matching `otlp_out`'s. `pub` for graph validation.
 pub fn default_prometheus_scrape_timeout() -> Duration {
     Duration::from_secs(10)
 }
@@ -2686,30 +2261,28 @@ fn default_flags_field() -> Option<String> {
     Some("trace.flags".to_string())
 }
 
-/// `trace_context`'s `span:` block (`docs/adr/trace-context-span-lifting.md`): the defaults a
-/// minted `SpanRecord` falls back on when the event's own `span.name`/`span.kind` attributes
-/// are absent, plus the two knobs that aren't per-event data at all.
+/// `trace_context`'s `span:` block: the defaults a minted span falls back on when the event's
+/// own `span.name`/`span.kind` attributes are absent, plus two knobs that aren't per-event data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpanLiftConfig {
     /// Mint a fresh span id when the `span_id` attribute is absent, instead of skipping the
-    /// event (`skipped{reason="span_id"}`). Off by default: `logit`'s own code never invents
-    /// identity for data it didn't produce unless an operator asks it to. A missing *trace* id
-    /// is never minted -- that's the edge tier's job.
+    /// event (`skipped{reason="span_id"}`). Off by default: `logit` never invents identity for
+    /// data it didn't produce unless asked. A missing trace id is never minted.
     #[serde(default)]
     pub mint_id: bool,
-    /// The span name when the event carries no `span.name` attribute. Rejected as an empty
-    /// string at graph-validation time -- OTLP requires a span name.
+    /// The span name when the event carries no `span.name` attribute. Defaults to
+    /// `http.request`; an empty string is rejected, because OTLP requires a span name.
     #[serde(default = "default_span_name")]
     pub name: String,
-    /// The span kind when the event carries no `span.kind` attribute. An access log line is a
-    /// server span, so `server` is the default.
+    /// The span kind when the event carries no `span.kind` attribute. Defaults to `server`,
+    /// since an access log line is a server span.
     #[serde(default)]
     pub kind: SpanKindConfig,
     /// A resolved start or end further than this from the event's receipt time is rejected
-    /// (`skipped{reason="skew"}`) rather than written -- one sender with a badly wrong clock
-    /// must not be able to write spans years away and quietly poison a trace store. Rejected as
-    /// `0s` at graph-validation time (an impossible window, never a small one).
+    /// (`skipped{reason="skew"}`) rather than written, so one sender with a badly wrong clock
+    /// can't write spans years away and poison a trace store. Defaults to `1h`; `0s` is
+    /// rejected.
     #[serde(default = "default_max_skew", with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub max_skew: Duration,
@@ -2734,10 +2307,7 @@ fn default_max_skew() -> Duration {
     Duration::from_secs(3600)
 }
 
-/// OTLP's span kinds, as config vocabulary -- mirrors `logit_core::SpanKind` one for one
-/// (`crates/logit-cli/src/pipeline.rs` maps between them, the same way `Signal` maps to
-/// `logit-transforms`' `SignalSet`), kept separate so `logit-config`'s schema doesn't depend on
-/// a core type's derives.
+/// OTLP's span kinds, as config vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanKindConfig {
@@ -2749,20 +2319,11 @@ pub enum SpanKindConfig {
     Consumer,
 }
 
-/// The transport `syslog_in` listens on and `syslog_out` sends over -- one enum shared by both
-/// directions of the one protocol (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-///
-/// UDP is the default on both sides: it is what nginx's `syslog:` writer and most senders speak,
-/// and it needs no ordering guarantee against the receiver's startup -- a fire-and-forget
-/// `send_to` before the receiver is up just loses that line, the same honest limit `syslog_in`'s
-/// own UDP intake accepts on the way in.
-///
-/// TCP is the reliable, framed transport. On the way out it is what makes `Fault` classification
-/// (`docs/adr/buffered-sink-delivery.md`) meaningful for the sink -- a connect failure is
-/// unambiguously `Fault::Clean`; on the way in it is what a `tls:` block needs underneath it,
-/// since syslog-over-TLS (RFC 5425) is RFC 6587-framed syslog carried over TLS over TCP.
-/// `syslog_out` always emits octet-counted frames; `syslog_in` accepts either RFC 6587 framing,
-/// detected per connection.
+/// The transport `syslog_in` listens on and `syslog_out` sends over. `udp` (the default) is what
+/// nginx's `syslog:` writer and most senders speak; a datagram sent before the receiver is up is
+/// lost. `tcp` is the reliable, framed transport, and what `tls:` (RFC 5425) needs underneath
+/// it. `syslog_out` always emits octet-counted frames; `syslog_in` accepts either RFC 6587
+/// framing, detected per connection.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SyslogTransport {
@@ -2771,8 +2332,7 @@ pub enum SyslogTransport {
     Tcp,
 }
 
-/// Which syslog dialect `syslog_out` emits. See `SyslogOut::format`'s doc comment for why
-/// `rfc5424` is the default.
+/// Which syslog dialect `syslog_out` emits. `rfc5424` is the default.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SyslogFormat {
@@ -2781,32 +2341,22 @@ pub enum SyslogFormat {
     Rfc5424,
 }
 
-/// `syslog_out`'s opt-in extra RFC 5424 STRUCTURED-DATA element -- see `SyslogOut::
-/// structured_data`'s doc comment and `logit_outputs::syslog`'s module doc ("STRUCTURED-DATA"
-/// section) for the full semantics. `sd_id` must be a valid `SD-NAME` (RFC 5424 section 6.3.2: 1
-/// to 32 `PRINTUSASCII` characters excluding `=`, SP, `]`, `"`) containing exactly one `@` -- a
-/// private-enterprise-number-qualified id, e.g. `"myapp@12345"`. **No default PEN is shipped**:
-/// RFC 5424's own `32473` example (used throughout its spec text) is documentation only, never a
-/// real assignment -- registering a real PEN with IANA, or reusing one an operator already holds,
-/// is a decision for whoever turns this feature on, not something `logit` should default
-/// silently. `sd_id` is validated at pipeline-build time (`crates/logit-cli/src/pipeline.rs`'s
-/// `SyslogOut` arm, via `logit_outputs::syslog::SyslogEncoder::with_structured_data`), not by
-/// this type's own (de)serialization -- consistent with every other cross-field/format validation
-/// in this crate living in `logit-pipeline::graph` or the sink's own builder, not in `serde`.
+/// `syslog_out`'s opt-in extra RFC 5424 STRUCTURED-DATA element. `sd_id` must be a valid
+/// `SD-NAME` (RFC 5424 section 6.3.2: 1 to 32 printable US-ASCII characters excluding `=`, SP,
+/// `]`, `"`) containing exactly one `@`, a private-enterprise-number-qualified id such as
+/// `myapp@12345`. No default PEN is shipped: RFC 5424's `32473` example is documentation only,
+/// so registering a PEN with IANA, or reusing one you hold, is your decision. `logit run` rejects
+/// an invalid id at startup; `logit validate` doesn't check it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyslogStructuredData {
     pub sd_id: String,
 }
 
-/// `statsd_in`'s and `statsd_out`'s transport. UDP (the default) matches classic statsd and
-/// DogStatsD clients; TCP is the reliable, framed one -- on the way out it is what makes `Fault`
-/// classification meaningful for the sink (same as `SyslogTransport`), and on the way in it is
-/// what a `tls:` block needs underneath it, since DTLS is out of scope. Both directions frame a
-/// TCP message the same way, as one LF-delimited line: there is no statsd equivalent of RFC
-/// 6587's octet counting to choose between. Deliberately its own enum rather than reusing
-/// `SyslogTransport`: schemars publishes a type's own name into the schema's `$defs`, so sharing
-/// one would make `statsd_in`/`statsd_out` document their transport by pointing at a syslog-named
-/// type.
+/// `statsd_in`'s and `statsd_out`'s transport. `udp` (the default) matches classic statsd and
+/// DogStatsD clients; `tcp` is the reliable, framed transport, and what `tls:` needs underneath
+/// it. A TCP message is one LF-delimited line in both directions.
+// Its own enum rather than a shared one: schemars publishes a type's name into the schema's
+// `$defs`, so sharing would document this transport by pointing at a syslog-named type.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsdTransport {
@@ -2815,7 +2365,7 @@ pub enum StatsdTransport {
     Tcp,
 }
 
-/// Which statsd dialect `statsd_out` emits. See `StatsdOut::format`'s doc comment.
+/// Which statsd dialect `statsd_out` emits. `dogstatsd` (the default) includes the tag segment.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StatsdFormat {
@@ -2824,13 +2374,9 @@ pub enum StatsdFormat {
     Statsd,
 }
 
-/// `graphite_in`'s and `graphite_out`'s transport. TCP is the default, matching carbon's own
-/// default listener (plaintext on port 2003); UDP is carbon's other plaintext mode -- rule 46
-/// rejects `protocol: pickle` under `transport: udp`, since Twisted's length-prefixed pickle
-/// framing has no meaning in a datagram. Deliberately its own enum rather than a reused
-/// `StatsdTransport`, for the reason that type's own doc comment gives: schemars publishes a
-/// type's name into the schema's `$defs`, so sharing one would make `graphite_in`/`graphite_out`
-/// document their transport by pointing at a statsd-named type.
+/// `graphite_in`'s and `graphite_out`'s transport. `tcp` (the default) matches carbon's own
+/// default listener; `udp` is carbon's other plaintext mode. `protocol: pickle` under
+/// `transport: udp` is rejected.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphiteTransport {
@@ -2839,12 +2385,10 @@ pub enum GraphiteTransport {
     Udp,
 }
 
-/// Which carbon wire protocol `graphite_in`/`graphite_out` speaks: `plaintext`
-/// (`path[;k=v...] value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a
-/// 4-byte big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's
-/// port 2004). `pickle` requires `transport: tcp` (rule 46). Its own enum for
-/// [`GraphiteTransport`]'s reason. See `crates/logit-proto/src/graphite/mod.rs`'s module doc for
-/// the wire shapes.
+/// Which carbon wire protocol `graphite_in`/`graphite_out` speaks: `plaintext` (`path[;k=v...]
+/// value timestamp`, one line per datapoint, carbon's port 2003) or `pickle` (a 4-byte
+/// big-endian length prefix then a pickled `[(path, (timestamp, value)), ...]`, carbon's port
+/// 2004). `pickle` requires `transport: tcp`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphiteProtocol {
@@ -2853,9 +2397,8 @@ pub enum GraphiteProtocol {
     Pickle,
 }
 
-/// Whether `graphite_out` renders attributes as carbon tags at all. See
-/// `crates/logit-proto/src/graphite/mod.rs`'s `Tags` doc comment -- this is that same choice,
-/// exposed as config.
+/// Whether `graphite_out` renders attributes as carbon `;k=v` tags (`carbon`, the default) or
+/// drops them (`drop`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphiteTags {
@@ -2865,7 +2408,8 @@ pub enum GraphiteTags {
 }
 
 /// What `graphite_out` does with a metric kind carbon's one-number-per-datapoint wire cannot
-/// carry. See `crates/logit-proto/src/graphite/mod.rs`'s `MultiValue` doc comment.
+/// carry: drop it, counted (`skip`, the default), or render one dotted sub-path per component
+/// value (`expand`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphiteMultiValue {
@@ -2874,11 +2418,9 @@ pub enum GraphiteMultiValue {
     Expand,
 }
 
-/// The syslog PRI facility, named rather than a bare `0..=23` integer so schemars publishes a
-/// real enumeration and a typo is a config error rather than a silently-wrong PRI. Ordered to
-/// match the standard facility codes (`kern` is 0); `as_u8` reads the discriminant back out.
-/// `local0` defaults, matching `demo/hello/app.py`'s own `PRI = 134` (facility 16), so the demo
-/// round-trips its own PRI unchanged even before `syslog.facility` attribute precedence applies.
+/// The syslog PRI facility, named rather than a bare `0..=23` integer so a typo is a config error
+/// rather than a silently wrong PRI. Ordered to match the standard facility codes (`kern` is 0).
+/// `local0` is the default.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SyslogFacility {
@@ -2915,32 +2457,17 @@ impl SyslogFacility {
     }
 }
 
-/// Where `stdio_out` writes: config keeps this a plain scalar (`target: stdout`), not a tagged
-/// object -- `stdout` and `stderr` are matched as keywords first, and anything else is treated as
-/// a file path.
+/// Where `stdio_out` writes, as a plain scalar (`target: stdout`): `stdout` and `stderr` are
+/// matched as keywords first, and anything else is a file path. A relative path resolves against
+/// the config file's directory, not the process's working directory.
 ///
-/// `Serialize`/`Deserialize`/`JsonSchema` are all hand-rolled rather than derived: a derived
-/// `#[serde(untagged)]` dispatches each candidate variant against the input's *shape*, and a
-/// fieldless (unit) variant's shape is "absent/null", not "any string that happens to match the
-/// variant's name" -- so a plain `#[derive(Deserialize)]` here would never actually match the
-/// literal string `"stdout"` against the `Stdout` variant, and every value (including `"stdout"`
-/// itself) would silently fall through to `Path`. Matching a string against the two known
-/// keywords first, `Path` as the explicit fallback, has to be written by hand instead --  and
-/// `JsonSchema` follows suit (delegating straight to `String`'s schema) rather than letting a
-/// derive describe the shape the broken derived (de)serializer *would* have accepted: every value
-/// this type actually accepts is a string, `stdout`/`stderr` included, so that's the schema ADR
-/// 0003 needs published, not an artifact of what a derive would guess from the variants.
-///
-/// A relative `Path` is resolved against the config file's own directory (`crates/logit-cli/src/
-/// pipeline.rs::build_spec`, mirroring how `LuaFile { lua_file, .. }` resolves its script path) --
-/// not the process's current working directory, so "next to the config" below is literal.
-///
-/// Two consequences worth knowing, both accepted rather than worked around:
-/// - A file literally named `stdout` (or `stderr`) next to the config is unreachable this way --
-///   write `./stdout` in config to target it instead.
-/// - A typo like `stdrr` silently becomes a file path rather than a config error. That's the price
-///   of the one-field shape; it's visible immediately in practice, since the (wrongly-named) file
-///   appears next to the config the moment an event is written.
+/// Two consequences: a file named `stdout` or `stderr` next to the config is reachable only as
+/// `./stdout`, and a typo like `stdrr` silently becomes a file path rather than a config error
+/// (visible as soon as the wrongly named file appears next to the config).
+// `Serialize`/`Deserialize`/`JsonSchema` are hand-rolled: a derived `#[serde(untagged)]` matches
+// a unit variant's shape ("absent/null"), never the literal string `"stdout"`, so every value
+// would fall through to `Path`. `JsonSchema` delegates to `String`'s schema, since every value
+// this type accepts is a string.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum StdioTarget {
     #[default]
@@ -2981,23 +2508,24 @@ impl JsonSchema for StdioTarget {
     }
 }
 
-/// `file_out`'s rotation policy. Every field defaults, but graph validation (rule 29,
-/// `crates/logit-pipeline/src/graph.rs`) rejects the all-default shape (neither trigger set) as a
-/// config that would never rotate at all -- use `stdio_out` for that instead. `max_files` counts
-/// *every* file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
-/// directly as a disk budget.
+/// `file_out`'s rotation policy. At least one of `max_bytes`/`interval` must be set; a config
+/// that would never rotate is rejected (use `stdio_out` for an unrotated file). `max_files`
+/// counts every file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
+/// as a disk budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct RotateConfig {
-    /// A quoted string in YAML -- `"64MiB"` or a plain `"134217728"` -- via the [`human_bytes`]
-    /// codec, exactly like `BufferConfig::max_bytes`. `None` (the default) means size never
-    /// triggers a rotation.
+    /// Rotate once the active file reaches this size. A quoted byte-count string (`"64MiB"` or
+    /// `"134217728"`). Omitted (the default) means size never triggers a rotation; `0` is
+    /// rejected.
     #[serde(with = "human_bytes::option")]
     #[schemars(with = "Option<String>")]
     pub max_bytes: Option<u64>,
-    /// `None` (the default) means the calendar never triggers a rotation.
+    /// Rotate on this UTC calendar boundary. Omitted (the default) means the calendar never
+    /// triggers a rotation.
     #[serde(default)]
     pub interval: Option<RotateInterval>,
+    /// Files to keep, active plus rotated. Defaults to `5`; `0` is rejected.
     pub max_files: u32,
 }
 
@@ -3011,10 +2539,8 @@ fn default_max_files() -> u32 {
     5
 }
 
-/// Which calendar boundary `file_out` rotates on -- UTC only, never the host's local zone. A
-/// calendar period, not a `Duration`: a duration measured from an arbitrary start (process start,
-/// first write) drifts against the wall clock, which is the opposite of what a daily log file is
-/// for.
+/// Which calendar boundary `file_out` rotates on, in UTC, never the host's local zone. A calendar
+/// period rather than a duration, so a daily file doesn't drift against the wall clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RotateInterval {
@@ -3022,11 +2548,9 @@ pub enum RotateInterval {
     Daily,
 }
 
-/// Which encoder a stream sink (`stdio_out`/`file_out`) writes through --
-/// `docs/adr/file-output-native-format.md`. `Human` (the default) is the existing readable text
-/// render; `Native` is `logit_proto::native`'s wire format, the same one a future `logit_out`
-/// would speak, made available here because every frame it writes is independently decodable --
-/// exactly what a rotated-away file already needs to be.
+/// Which encoder a stream sink (`stdio_out`/`file_out`) writes through: `human` (the default) is
+/// the readable text render; `native` is `logit`'s own wire format, in which every frame is
+/// independently decodable, which is what a rotated-away file needs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamFormat {
@@ -3035,14 +2559,10 @@ pub enum StreamFormat {
     Native,
 }
 
-/// `logit_proto::native`'s compression choice, mirrored here -- `logit-config` must not depend on
-/// `logit-proto` (`docs/design/pipeline-graph.md`'s crate layout), the same reason
-/// `RotatePolicy`/`RotateInterval` mirror into `logit_outputs::file`; `crates/logit-cli/src/
-/// pipeline.rs` is the sole place this crosses into `logit_proto::frame::Compression`. `Zstd` is
-/// deliberately not a variant here: `logit_proto::native` rejects it on both encode and decode
-/// (the real `zstd` crate needs a C build via `zstd-sys`, breaking ADR
-/// `containerized-development`'s "no host toolchain" property), so there is nothing valid for a
-/// config to select.
+/// Per-frame compression for `logit`'s native wire format. There is no `zstd` variant: the native
+/// codec rejects it on both encode and decode.
+// Mirrors `logit_proto::frame::Compression`; `logit-config` must not depend on `logit-proto`, and
+// `logit-cli` converts between the two.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Compression {
@@ -3051,43 +2571,44 @@ pub enum Compression {
     Lz4,
 }
 
-/// Per-sink delivery buffer (`docs/adr/buffered-sink-delivery.md`). Meaningful only on a
-/// sink; graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a non-default value on
-/// any other kind. Every field defaults, so an omitted `buffer:` block is exactly today's
-/// behavior.
+/// Per-sink delivery buffer. Meaningful only on a sink; a non-default block on any other kind is
+/// rejected. Every field defaults, so the block is never required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct BufferConfig {
+    /// Batches the queue may hold ahead of the sink. Defaults to `1024`; `0` is rejected.
     pub max_batches: usize,
-    /// Byte bound on the buffer's estimated heap footprint (`EventBatch::estimated_heap_bytes`),
-    /// checked alongside `max_batches` -- whichever trips first. A quoted string in YAML --
-    /// `"64MiB"` or a plain `"134217728"` -- via the [`human_bytes`] codec below, string-only in
-    /// both directions to match this field's published schema exactly (an unquoted number is
-    /// rejected, not silently accepted).
+    /// Byte bound on the buffer's estimated heap footprint, checked alongside `max_batches`,
+    /// whichever trips first. A quoted byte-count string (`"64MiB"` or `"134217728"`); an
+    /// unquoted number is rejected. Defaults to `"64MiB"`; `0` is rejected.
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
+    /// What happens once both bounds are full. Defaults to `block`.
     pub overflow: OverflowPolicy,
-    /// `None` -- the default -- means "derive from the sink's own `duplicate_safe()` fact"
-    /// (`docs/adr/buffered-sink-delivery.md`'s three-layer posture design). `Some(_)`
-    /// overrides that default for this component specifically.
+    /// Whether re-delivering an already-delivered batch is acceptable for this sink's
+    /// destination. Omitted (the default) derives it from the sink kind; set it to override for
+    /// this component.
     #[serde(default)]
     pub delivery: Option<DeliveryPosture>,
+    /// Hard ceiling on the total time spent retrying one batch, across every attempt and backoff
+    /// sleep. Defaults to `60s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_budget: Duration,
+    /// Cap on the exponential backoff between retry attempts. Defaults to `10s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub retry_max_delay: Duration,
+    /// How long the sink keeps draining after a shutdown signal before being cancelled. Defaults
+    /// to `5s`.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
-    /// Disk-backed durable buffering, opt-in (`docs/adr/disk-backed-sink-buffer.md`). `None` (the
-    /// default) is today's in-memory `SinkQueue`, unchanged. `Some(_)` replaces it -- not sizes
-    /// beside it -- with a disk spool at `DiskBufferConfig::path`; graph validation
-    /// (`crates/logit-pipeline/src/graph.rs` rule 35) rejects `max_batches`/`max_bytes` at
-    /// anything but their defaults alongside it, since disk replaces the in-memory bound rather
-    /// than sharing it.
+    /// Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue.
+    /// Present, it replaces that queue with a disk spool at `disk.path`; `max_batches`/`max_bytes`
+    /// are rejected at anything but their defaults alongside it, since the disk bound replaces
+    /// the in-memory one.
     #[serde(default)]
     pub disk: Option<DiskBufferConfig>,
 }
@@ -3107,38 +2628,32 @@ impl Default for BufferConfig {
     }
 }
 
-/// Disk-backed durable buffering for one sink's delivery queue -- opt-in via `buffer.disk:`
-/// (`docs/adr/disk-backed-sink-buffer.md`). Its mere presence turns disk backing on for that
-/// sink, mirroring [`TlsServerConfig`]'s "presence is the on-switch" precedent: `path` has no
-/// sensible default, so (like `TlsServerConfig::cert_file`/`key_file`) it stays a plain required
-/// field -- this struct deliberately carries no container-level `#[serde(default)]`, only
-/// per-field defaults on everything else, so an omitted `path` is a clear deserialize error
-/// rather than a silently empty one.
+/// Disk-backed durable buffering for one sink's delivery queue, opt-in via `buffer.disk:`. Its
+/// presence turns disk backing on for that sink. `path` is required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DiskBufferConfig {
-    /// The spool directory, resolved against the config file's own directory like every other
-    /// path in this schema (`crates/logit-cli/src/pipeline.rs`). Two sinks may not share one
-    /// (graph rule 35).
+    /// The spool directory. A relative path resolves against the config file's directory. Two
+    /// sinks may not share one.
     pub path: String,
-    /// Bound on the sum of on-disk segment sizes -- replaces `BufferConfig::max_bytes`'s role,
-    /// not sized alongside it.
+    /// Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes`'s role. A
+    /// byte-count string. Defaults to `"1GiB"`; `0` is rejected.
     #[serde(default = "default_disk_max_bytes")]
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
     /// A soft rotation trigger, not a hard cap: the active segment rotates once it already
-    /// exceeds this, so a single record larger than it still lands whole in a fresh segment.
+    /// exceeds this, so a single record larger than it still lands whole in a fresh segment. A
+    /// byte-count string. Defaults to `"64MiB"`; `0`, or a value above `max_bytes`, is rejected.
     #[serde(default = "default_segment_bytes")]
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub segment_bytes: u64,
-    /// `logit_proto::native`'s per-frame compression, mirrored here for the same
-    /// crate-layout reason [`Compression`] itself exists.
+    /// Per-frame compression of the spooled frames. Defaults to `none`.
     #[serde(default)]
     pub compression: Compression,
-    /// How often the read cursor is persisted during ordinary operation (also forced on segment
-    /// rotation and at shutdown, regardless of this interval).
+    /// How often the read cursor is persisted during ordinary operation; also forced on segment
+    /// rotation and at shutdown. Defaults to `1s`.
     #[serde(default = "default_disk_checkpoint_interval")]
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
@@ -3157,22 +2672,22 @@ fn default_disk_checkpoint_interval() -> Duration {
     Duration::from_secs(1)
 }
 
-/// What a sink's `SinkQueue` does once both its bounds (`max_batches`/`max_bytes`) are full.
-/// `logit-config`'s own copy -- `logit-config` must not depend on `logit-pipeline`
-/// (`docs/design/pipeline-graph.md`'s crate layout), so `crates/logit-cli/src/pipeline.rs`
-/// converts this to `logit_pipeline::OverflowPolicy` when building a `NodeSpec::Output`.
+/// What a sink's delivery queue, or a datagram listener's receive queue, does once both its
+/// bounds are full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
+    /// Wait for room.
     Block,
+    /// Evict the oldest queued item to admit the new one.
     DropOldest,
+    /// Discard the arriving item.
     DropNewest,
 }
 
-/// Whether re-delivering an already-delivered batch is safe for a sink's destination -- see
-/// `BufferConfig::delivery`. `logit-config`'s own copy, for the same crate-layout reason as
-/// [`OverflowPolicy`]; converted to `logit_pipeline::DeliveryPosture` in
-/// `crates/logit-cli/src/pipeline.rs`.
+/// Whether re-delivering an already-delivered batch is acceptable for a sink's destination.
+/// `at_least_once` retries as aggressively as fault classification allows and risks a
+/// duplicate; `at_most_once` is the conservative posture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryPosture {
@@ -3180,99 +2695,78 @@ pub enum DeliveryPosture {
     AtMostOnce,
 }
 
-/// Per-listener receive queue and datagram-\>batch assembly
-/// (`docs/adr/decoupled-listener-io.md`). Meaningful only on a datagram listener (today
-/// `statsd_in`/`syslog_in`); graph validation (`crates/logit-pipeline/src/graph.rs`) rejects a
-/// non-default value on any other kind, including `internal` (a listener by role, but one with no
-/// socket, no queue, and no decoder). Flat, following [`BufferConfig`]'s own
-/// `retry_budget`/`retry_max_delay` precedent rather than nesting a `batch:` sub-block -- two
-/// levels of optional-with-defaults is harder to scan in YAML than a flat prefix. Every field
-/// defaults, so a `receive:` block is never required -- **but an omitted block is not byte-for-
-/// byte the pre-ADR `decoupled-listener-io` behavior**, and isn't meant to be: `batch_max_events: 1_000` and
-/// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
-/// batches (up to 1000 events, or up to 100ms of added latency before a send) rather than sending
-/// one batch per datagram immediately, matching what every established UDP listener researched
-/// for ADR `decoupled-listener-io` does out of the box. A deployment that genuinely needs the old one-send-per-
-/// datagram, no-added-latency behavior gets it back explicitly with `batch_max_events: 1`, not by
-/// omitting `receive:`.
+/// Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`,
+/// and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`) accepts every field; the
+/// same three under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly
+/// fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`;
+/// a non-default block on any other kind is rejected. Every field defaults, so the block is never
+/// required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean
+/// a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to
+/// 100ms of added latency before a send). For one send per datagram with no added latency, set
+/// `batch_max_events: 1`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReceiveConfig {
-    /// Datagrams the read half may hold ahead of the decode half.
+    /// Datagrams the read half may hold ahead of the decode half. Defaults to `10000`; `0` is
+    /// rejected.
     pub max_datagrams: usize,
-    /// Byte bound on the queue (undecoded datagram bytes, not `estimated_heap_bytes`), checked
-    /// alongside `max_datagrams` -- whichever trips first.
+    /// Byte bound on the queue (undecoded datagram bytes), checked alongside `max_datagrams`,
+    /// whichever trips first. A byte-count string. Defaults to `"32MiB"`; `0` is rejected.
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_bytes: u64,
-    /// What happens once both bounds are full. Defaults to `drop_oldest`, **deliberately unlike
-    /// `buffer:`'s `block`**: blocking a sink's producer backpressures an in-process drain that
-    /// can wait, while blocking a UDP reader backpressures the kernel, which cannot -- the kernel
-    /// just discards the datagram into a counter this process never reads. `block` relocates loss
-    /// out of view rather than preventing it; every mature UDP listener (syslog-ng, rsyslog,
-    /// Telegraf, gostatsd) treats this the same way.
+    /// What happens once both bounds are full. Defaults to `drop_oldest`, unlike `buffer:`'s
+    /// `block`: blocking a UDP reader backpressures the kernel, which discards the datagram into
+    /// a counter this process never reads, so `block` relocates loss out of view rather than
+    /// preventing it.
     pub overflow: OverflowPolicy,
-    /// Events to accumulate across datagrams before one send downstream. `1` means one send per
-    /// datagram -- the behavior before ADR `decoupled-listener-io` -- since the accumulator flushes on a bound
-    /// *reached or exceeded* and never splits a single decode's output. `0` is rejected as an
-    /// impossible bound (graph rule 18, the twin of rule 15's `buffer.max_batches: 0` check).
+    /// Events to accumulate across datagrams before one send downstream. Defaults to `1000`; `0`
+    /// is rejected. `1` means one send per datagram, since the accumulator flushes on a bound
+    /// reached or exceeded and never splits a single decode's output.
     pub batch_max_events: usize,
+    /// Byte bound on an accumulated batch, checked alongside `batch_max_events`. A byte-count
+    /// string. Defaults to `"1MiB"`; `0` is rejected.
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]
     pub batch_max_bytes: u64,
-    /// Longest an accumulated batch waits before being sent regardless of size. `0s` disables the
-    /// timer entirely (the two bounds above are then the only trigger) -- unlike the count
-    /// bounds, zero here is a meaningful setting, not an impossible one, and is not rejected.
+    /// Longest an accumulated batch waits before being sent regardless of size. Defaults to
+    /// `100ms`. `0s` disables the timer (`batch_max_events` and `batch_max_bytes` are then the
+    /// only triggers) and is not rejected.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub batch_flush_interval: Duration,
-    /// `SO_RCVBUF`, requested at bind. `None` -- the default -- leaves the kernel default alone:
-    /// a nonzero default here would exceed most stock kernels' `net.core.rmem_max` (212992 B) and
-    /// warn on every first run, training operators to ignore the one warning that matters.
+    /// `SO_RCVBUF`, requested at bind. A byte-count string. Omitted (the default) leaves the
+    /// kernel default alone. The kernel clamps a request above `net.core.rmem_max` (212992 on
+    /// most stock kernels), and `logit` logs a warning at startup when the kernel grants less
+    /// than was requested.
     #[serde(with = "human_bytes::option")]
     #[schemars(with = "Option<String>")]
     pub receive_buffer_bytes: Option<u64>,
-    /// How long a listener keeps draining a cooperative shutdown before being cancelled by drop
-    /// (`docs/adr/decoupled-listener-io.md`, revising ADR `service-lifecycle-and-output-retry`'s unconditional cancel-by-drop
-    /// into a bounded one). Matches `buffer.shutdown_grace`'s default so both ends of the
-    /// pipeline drain on the same number.
+    /// How long a listener keeps draining after a shutdown signal before being cancelled.
+    /// Defaults to `5s`, matching `buffer.shutdown_grace`, so both ends of the pipeline drain on
+    /// the same number.
     #[serde(with = "humantime_serde_duration")]
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
-    /// Datagrams one `recvmmsg(2)` call may return, and -- the same number, deliberately -- how
-    /// many the decode half takes off the receive queue per `pop_many`. One knob for both ends of
-    /// one queue (`docs/adr/udp-intake-batching-and-socket-visibility.md`); `1` is one datagram
-    /// per syscall, the behaviour before that ADR.
+    /// Datagrams one `recvmmsg(2)` call may return, and how many the decode half takes off the
+    /// receive queue at a time: one knob for both ends of one queue. Defaults to `64`; `0` is
+    /// rejected, and so is anything above `1024`. `1` is one datagram per syscall.
     ///
-    /// **Linux only, in effect.** `recvmmsg` is a Linux syscall; every other target keeps the
-    /// one-`recv_from`-per-datagram read loop and ignores this field, which still parses and
-    /// validates everywhere so one config file stays portable across targets. The decode-side pop
-    /// batch it also sets is not platform-specific and applies everywhere.
+    /// Linux only, in effect: every other target keeps a one-datagram-per-read loop and ignores
+    /// this field, which still parses and validates everywhere so one config stays portable. The
+    /// decode-side batch it also sets applies everywhere.
     ///
-    /// **What it costs.** The read half owns one slab of `read_batch` x 65,507-byte slots (IPv4's
-    /// largest payload, and the size every UDP read buffer in this codebase has always been) per
-    /// listener -- 4 MiB of *address space* at the default 64,
-    /// 64 MiB at the 1024 ceiling. Only the pages a datagram is actually written into are ever
-    /// faulted in, so the resident cost tracks the traffic's real datagram sizes rather than the
-    /// slab's virtual size (`docs/design/memory.md` has the measured figures).
-    ///
-    /// **What it widens.** A shutdown landing mid-push drops whatever the read half was holding,
-    /// uncounted -- up to `read_batch` datagrams now rather than exactly one. Bounded, and on the
-    /// shutdown path only.
-    ///
-    /// `0` is rejected (graph rule 18 -- no datagram could ever be read); above `1024` is rejected
-    /// (graph rule 57). `1024` is `UIO_MAXIOV`'s number, but the ceiling is `logit`'s own choice,
-    /// not a kernel limit: the kernel imposes no ceiling on how many messages one `recvmmsg(2)`
-    /// call may ask for, and what `1024` actually bounds is the slab above and the shutdown-path
-    /// loss below. A `read_batch` **larger than `max_datagrams`** is deliberately legal and needs
-    /// no rule: a batch that cannot fit in the whole queue is admitted item by item under the
-    /// configured `overflow` policy, exactly as a sequence of single pushes would have been.
+    /// The read half owns one slab of `read_batch` x 65,507-byte slots per listener: 4 MiB of
+    /// address space at the default, 64 MiB at the ceiling. Only the pages a datagram is written
+    /// into are faulted in, so the resident cost tracks real datagram sizes. A shutdown landing
+    /// mid-push drops whatever the read half was holding, uncounted: up to `read_batch`
+    /// datagrams, on the shutdown path only. A `read_batch` larger than `max_datagrams` is legal:
+    /// the batch is admitted item by item under `overflow`.
     pub read_batch: usize,
 }
 
-/// Defaults, justified against established UDP listeners' own tuning figures -- see
-/// `docs/adr/decoupled-listener-io.md` for the full numeric derivation (Telegraf, gostatsd,
-/// DogStatsD, rsyslog, syslog-ng).
+/// Defaults derived from established UDP listeners' own tuning (Telegraf, gostatsd, DogStatsD,
+/// rsyslog, syslog-ng); ADR `decoupled-listener-io` has the derivation.
 impl Default for ReceiveConfig {
     fn default() -> Self {
         Self {
@@ -3289,45 +2783,27 @@ impl Default for ReceiveConfig {
     }
 }
 
-/// `receive.read_batch`'s default, as a function so graph rule 57 compares against the same value
-/// this struct is built from rather than a second copy of the number -- the shape rule 45 already
-/// uses for `default_handshake_timeout`.
-///
-/// **64.** Telegraf's UDP reader, rsyslog's `imudp` (`batchSize: 128` in its own high-throughput
-/// reference config) and gostatsd (`--receive-batch-size`, default 50) all default their
-/// batch-equivalent knob in this range, and `docs/adr/udp-intake-batching-and-socket-visibility.md`
-/// carries the sweep that measured it against this codebase's own decode and queue costs.
+/// `receive.read_batch`'s default, as a function so graph validation compares against the same
+/// value this struct is built from. 64 is in the range Telegraf, rsyslog's `imudp`, and gostatsd
+/// default their equivalent knob to, and the measured sweet spot against this codebase's own
+/// decode and queue costs.
 pub const fn default_read_batch() -> usize {
     64
 }
 
-/// The ceiling graph rule 57 enforces on `receive.read_batch`.
-///
-/// **1024 is `UIO_MAXIOV`'s number, chosen by `logit`, not imposed by the kernel.** `UIO_MAXIOV`
-/// bounds `msg_iovlen` *within one* `msghdr` (`__copy_msghdr`, `net/socket.c`, returns `-EMSGSIZE`
-/// above it) and the UDP read path sets that to 1. There is no equivalent clamp on `recvmmsg`'s
-/// `vlen`: `do_recvmmsg` loops `while (datagrams < vlen)` with no ceiling, and the only
-/// `UIO_MAXIOV` clamp on a `vlen` anywhere in the kernel is `__sys_sendmmsg`'s, on the send side.
-/// What this ceiling really bounds is `logit`'s own cost -- the per-listener `read_batch x 65,507`
-/// slab, and how many datagrams a cancelled push can discard on the shutdown path -- so rejecting
-/// a larger value at validation time is a policy choice with a name attached, not a kernel limit
-/// being pre-empted. See `crates/logit-inputs/src/udp.rs`'s `MAX_READ_BATCH`.
-///
-/// `pub` for the same reason [`default_handshake_timeout`] is: `logit_pipeline::graph` needs the
-/// number and already depends on this crate, so it imports it rather than keeping a second copy.
-/// (`logit_inputs::udp::MAX_READ_BATCH` *is* a second copy, unavoidably -- `logit-inputs` does not
-/// depend on `logit-config` by design.)
+/// The ceiling graph validation enforces on `receive.read_batch`. 1024 is `UIO_MAXIOV`'s number,
+/// but the ceiling is `logit`'s own choice, not a kernel limit: the kernel clamps no `recvmmsg`
+/// `vlen`. What it bounds is the per-listener receive slab and the shutdown-path loss, both of
+/// which grow linearly with it. `pub` so `logit_pipeline::graph` imports it;
+/// `logit_inputs::udp::MAX_READ_BATCH` is an unavoidable second copy, since `logit-inputs` does
+/// not depend on this crate.
 pub const MAX_READ_BATCH: usize = 1024;
 
-/// A human-readable byte-size codec (`134217728`, `64MiB`, `128KiB`, `1GiB`) for `BufferConfig::
-/// max_bytes`, mirroring `humantime_serde_duration`'s shape below -- hand-rolled rather than a new
-/// crate dependency, consistent with that module's own reasoning. Binary (1024-based) units only,
-/// matching `max_bytes`'s own doc comment and the way this codebase already sizes buffers
-/// (`SinkQueueConfig::default`'s `64 * 1024 * 1024`). Always serializes back out as a quoted
-/// decimal-integer string (e.g. `"134217728"`), never a unit suffix and never a bare (unquoted)
-/// number -- string-only in both directions, exactly like `humantime_serde_duration` below,
-/// matching `#[schemars(with = "String")]`'s published schema exactly; a human can still write
-/// `"64MiB"` on the way in.
+/// A human-readable byte-size codec (`134217728`, `64MiB`, `128KiB`, `1GiB`) for every byte-count
+/// field. Binary (1024-based) units only. String-only in both directions: it always serializes as
+/// a quoted decimal-integer string (`"134217728"`), never a unit suffix and never a bare number,
+/// matching the `#[schemars(with = "String")]` schema on every field that uses it; a human can
+/// still write `"64MiB"` on the way in.
 mod human_bytes {
     use serde::{Deserializer, Serializer};
 
@@ -3335,16 +2811,9 @@ mod human_bytes {
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
 
-    /// String-only, both directions -- deliberately, not just permissively. An earlier version
-    /// accepted a bare YAML/JSON integer on input (via `deserialize_any`) while always
-    /// serializing as an integer, which contradicted `#[schemars(with = "String")]`'s published
-    /// claim in *both* directions at once: the generated schema said `"type": "string"` while a
-    /// real config's serialized form was always a bare number, and a schema-strict validator
-    /// would separately reject the bare-integer input form `logit` itself accepted -- two
-    /// distinct violations of ADR `config-yaml-jsonschema`'s "the schema can't drift from what the binary accepts"
-    /// contract, not one. Consistently string-only (a quoted `"134217728"` or `"64MiB"`, always
-    /// serialized the same way) matches the published schema exactly, with no asymmetry to
-    /// reason about.
+    /// String-only, both directions. Accepting a bare integer on input, or emitting one on output,
+    /// would contradict the published `"type": "string"` schema, so a bare number is rejected
+    /// rather than silently accepted.
     pub fn serialize<S: Serializer>(bytes: &u64, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&bytes.to_string())
     }
@@ -3403,9 +2872,8 @@ mod human_bytes {
 
         #[test]
         fn a_bare_unquoted_integer_is_rejected_not_silently_accepted() {
-            // String-only, deliberately, both directions -- see this module's own doc comment.
-            // An earlier version accepted this via `deserialize_any`, which contradicted the
-            // published schema's `"type": "string"` claim.
+            // String-only, both directions: a bare integer would contradict the published
+            // schema's `"type": "string"` claim.
             let err = parse_json("134217728").unwrap_err();
             assert!(err.contains("byte count string"), "got: {err}");
         }
@@ -3438,11 +2906,9 @@ mod human_bytes {
 
         #[test]
         fn rejects_a_negative_number() {
-            // Quoted, since input is string-only now -- an unquoted `-5` is rejected as the
-            // wrong JSON type entirely (see `an_unquoted_negative_number_is_also_rejected`
-            // below), not because it's negative specifically. `-` isn't an ASCII digit, so
-            // `parse`'s digit-scan sees an empty numeric prefix and reports the same "expected a
-            // byte count" shape it would for any other non-numeric-looking string.
+            // Quoted, since input is string-only; an unquoted `-5` is rejected as the wrong JSON
+            // type (`an_unquoted_negative_number_is_also_rejected`). `-` isn't an ASCII digit, so
+            // `parse` sees an empty numeric prefix and reports "expected a byte count".
             let err = parse_json(r#""-5""#).unwrap_err();
             assert!(err.contains("expected a byte count"), "got: {err}");
         }
@@ -3455,9 +2921,7 @@ mod human_bytes {
 
         #[test]
         fn serialize_emits_a_string_matching_the_published_schema() {
-            // Matches `#[schemars(with = "String")]`'s claim exactly, both directions -- see
-            // this module's own doc comment for why an earlier bare-integer form was a real
-            // ADR `config-yaml-jsonschema` schema-drift bug, not just a style choice.
+            // Matches `#[schemars(with = "String")]`'s claim in both directions.
             #[derive(serde::Serialize)]
             struct W {
                 #[serde(with = "super")]
@@ -3468,14 +2932,10 @@ mod human_bytes {
         }
     }
 
-    /// The same codec, for `Option<u64>` fields (`#[serde(default, with =
-    /// "human_bytes::option")]`) -- used by `ReceiveConfig::receive_buffer_bytes`
-    /// (`docs/adr/decoupled-listener-io.md`), where `None` means "leave the kernel default
-    /// alone" rather than a byte count of zero. Mirrors `humantime_serde_duration::option`'s
-    /// shape exactly: a nested module because `#[serde(with = "...")]` on an `Option<u64>` field
-    /// calls *this* module's `serialize`/`deserialize` with `Option<u64>`, not the parent's `u64`
-    /// ones. Still string-only in both directions -- `None` serializes as JSON/YAML null, `Some`
-    /// as the same quoted string the parent codec produces.
+    /// The same codec for `Option<u64>` fields, where `None` means "unset" rather than a byte
+    /// count of zero. A nested module because `#[serde(with = "...")]` on an `Option<u64>` field
+    /// calls this module's functions with `Option<u64>`. `None` serializes as null, `Some` as the
+    /// parent codec's quoted string.
     pub mod option {
         use serde::{Deserializer, Serializer};
 
@@ -3548,7 +3008,7 @@ mod human_bytes {
 }
 
 /// Minimal `humantime`-flavored `(de)serialize` for `Duration` fields (`10s`, `1m`, ...), so
-/// config keeps human-readable durations without pulling in a full external crate for one helper.
+/// config keeps human-readable durations without an external crate for one helper.
 /// TODO: replace with the `humantime-serde` crate once the crate list is finalized.
 mod humantime_serde_duration {
     use super::*;
@@ -3580,11 +3040,9 @@ mod humantime_serde_duration {
         Ok(Duration::from_secs_f64(secs))
     }
 
-    /// The same codec, for `Option<Duration>` fields (`#[serde(default, with =
-    /// "humantime_serde_duration::option")]`) -- used by the Lua component kinds' optional
-    /// `interval`. A nested module because `#[serde(with = "...")]` on an `Option<Duration>`
-    /// field calls *this* module's `serialize`/`deserialize` with `Option<Duration>`, not the
-    /// parent's `Duration` ones.
+    /// The same codec for `Option<Duration>` fields. A nested module because `#[serde(with =
+    /// "...")]` on an `Option<Duration>` field calls this module's functions with
+    /// `Option<Duration>`.
     pub mod option {
         use super::*;
 
@@ -3602,9 +3060,9 @@ mod humantime_serde_duration {
     }
 }
 
-/// Generate the published JSON Schema for [`Config`]. Backs the `logit schema` CLI command
-/// (ADR `config-yaml-jsonschema`) -- an ordinary workspace test compares its output with the
-/// committed `schema/logit.schema.json` and fails if it is stale.
+/// Generate the published JSON Schema for [`Config`]. Backs the `logit schema` CLI command; a
+/// workspace test compares its output with the committed `schema/logit.schema.json` and fails if
+/// it is stale.
 pub fn json_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(Config)
 }
@@ -3623,10 +3081,9 @@ mod tests {
         );
     }
 
-    // Deserialized via `serde_json` rather than the YAML this crate is actually fed through
-    // `logit-cli` (deliberately not a dependency here -- see the crate doc comment): JSON and
-    // YAML are both self-describing formats, so this exercises the same tagged-enum
-    // disambiguation the real deserializer does.
+    // Deserialized via `serde_json` rather than YAML (`logit-cli` owns YAML parsing, and this
+    // crate has no YAML dependency): both are self-describing, so this exercises the same
+    // tagged-enum disambiguation the real deserializer does.
 
     #[test]
     fn lua_component_without_interval_deserializes() {
@@ -3689,9 +3146,7 @@ mod tests {
                 max_set_members_per_series,
             } => {
                 assert_eq!(interval, Duration::from_secs(10));
-                // Additive fields: an existing config with none of these at all still
-                // deserializes, defaulting all of them (proves the config change is additive, per
-                // script/validate over demo/examples).
+                // Every field but `interval` defaults.
                 assert_eq!(temporality, AggregateTemporality::Delta);
                 assert_eq!(series_retention, 5);
                 assert_eq!(max_retained_series, 10_000);
@@ -3719,9 +3174,7 @@ mod tests {
         }
     }
 
-    /// `temporality: cumulative` parses as the opt-in mode (`docs/adr/
-    /// aggregation-window-semantics.md`'s cumulative amendment) -- `snake_case`, like every other
-    /// config enum.
+    /// `temporality: cumulative` parses, `snake_case` like every other config enum.
     #[test]
     fn aggregate_component_parses_cumulative_temporality() {
         let component: Component = serde_json::from_str(
@@ -3737,9 +3190,8 @@ mod tests {
         }
     }
 
-    /// Same defaults assertion as `aggregate_component_with_interval_deserializes`, isolated to
-    /// just the four W2 fields so a future change to the retention fields can't mask a
-    /// regression here (or vice versa).
+    /// The four raw-retention fields' defaults, isolated from the retention fields so a change to
+    /// one set can't mask a regression in the other.
     #[test]
     fn aggregate_component_defaults_to_sketch_and_estimate_with_1000_caps() {
         let component: Component =
@@ -3806,10 +3258,7 @@ mod tests {
         }
     }
 
-    /// `span_sample_rate` is optional, defaulting to `logit_core::DEFAULT_SPAN_SAMPLE_RATE`
-    /// (0.1) -- an `internal` component that predates this field (every shipped config before
-    /// this PR) still deserializes, with spans sampled at a tenth rather than silently disabled
-    /// or silently kept at full volume.
+    /// `span_sample_rate` is optional, defaulting to `logit_core::DEFAULT_SPAN_SAMPLE_RATE` (0.1).
     #[test]
     fn internal_without_span_sample_rate_defaults_to_one_tenth() {
         let component: Component =
@@ -3869,9 +3318,7 @@ mod tests {
         assert!(err.contains("reject") && err.contains("replace"), "names the choices: {err}");
     }
 
-    /// `structured_data` is additive: an existing `syslog_out` config that predates this field
-    /// still deserializes, defaulting to `None` (no opt-in SD-ELEMENT emitted) rather than
-    /// failing or silently inventing an `sd_id`.
+    /// `structured_data` is optional, defaulting to `None` rather than inventing an `sd_id`.
     #[test]
     fn syslog_out_without_structured_data_defaults_to_none() {
         let component: Component =
@@ -3901,8 +3348,7 @@ mod tests {
         }
     }
 
-    /// `tls:` is additive the same way `structured_data` is: absent means plaintext, and every
-    /// pre-TLS `syslog_out` config still deserializes unchanged (`docs/plans/syslog-tls.md`).
+    /// `tls:` is optional: absent means plaintext.
     #[test]
     fn syslog_out_without_tls_defaults_to_none() {
         let component: Component =
@@ -3913,8 +3359,8 @@ mod tests {
         }
     }
 
-    /// Presence turns TLS on, so an empty `tls: {}` is meaningful, not equivalent to omitting it
-    /// -- it means "TLS with the bundled Mozilla roots" (`SyslogOut::tls`'s own doc comment).
+    /// Presence turns TLS on, so an empty `tls: {}` is meaningful: TLS with the bundled Mozilla
+    /// roots.
     #[test]
     fn syslog_out_tls_parses_and_an_empty_block_is_distinct_from_absent() {
         let component: Component = serde_json::from_str(
@@ -3946,11 +3392,8 @@ mod tests {
         }
     }
 
-    /// `docs/adr/routing-by-condition-is-lua.md`: `filter`/`rename`/`throttle`/`dedup` were
-    /// retired, not merely left unimplemented -- a config referencing one is now a
-    /// deserialization error (naming the valid kinds) rather than `graph::resolve`'s "not
-    /// implemented yet" (`crates/logit-pipeline/src/graph.rs`'s `unimplemented_kind_is_rejected`
-    /// covers a still-unimplemented-but-declared kind; this is the different, now-gone case).
+    /// `filter`/`rename`/`throttle`/`dedup` are retired kinds: a config referencing one is a
+    /// deserialization error naming the valid kinds, not graph validation's "not implemented".
     #[test]
     fn a_retired_kind_is_a_deserialization_error_not_an_unimplemented_kind() {
         let err = serde_json::from_str::<Component>(r#"{"type": "filter", "sources": ["in"]}"#)
@@ -4042,10 +3485,8 @@ mod tests {
         }
     }
 
-    /// Pins `SetValue`'s untagged-variant order: a whole-number YAML/JSON scalar must decode as
-    /// `I64`, not `F64` (the enum lists `I64` before `F64` specifically so `serde`'s
-    /// first-match-wins untagged search finds it first) -- and a quoted number must stay `Str`,
-    /// never coerced into either numeric variant.
+    /// Pins `SetValue`'s untagged-variant order: a whole-number scalar decodes as `I64`, not
+    /// `F64`, and a quoted number stays `Str`.
     #[test]
     fn set_value_untagged_variant_selection() {
         let component: Component = serde_json::from_str(
@@ -4450,7 +3891,7 @@ mod tests {
                 let always_keep = always_keep.unwrap();
                 assert_eq!(always_keep.attribute.as_deref(), Some("sampling.keep"));
                 assert_eq!(always_keep.resource, None);
-                // A YAML/JSON `true` stays a `Bool`, not a string -- `SetValue`'s untagged order.
+                // A YAML/JSON `true` stays a `Bool`, not a string.
                 assert_eq!(always_keep.value, Some(SetValue::Bool(true)));
             }
             other => panic!("expected Sample, got {other:?}"),
@@ -4562,8 +4003,8 @@ mod tests {
         }
     }
 
-    /// Both halves of a route rule parse into the one flat struct -- deciding which shape it is
-    /// (and rejecting a mix) is graph rule 60's job, not serde's, so the error can name the key.
+    /// Both halves of a route rule parse into the one flat struct; deciding which shape it is
+    /// (and rejecting a mix) is graph validation's job, so the error can name the key.
     #[test]
     fn http_route_rule_accepts_a_mixed_shape_for_rule_60_to_reject() {
         let rule: HttpRouteRule =
@@ -4661,8 +4102,7 @@ mod tests {
         }
     }
 
-    /// `types_db` is optional -- a `collectd_in` with only a `bind` is the common case, and gets
-    /// index-named records.
+    /// `types_db` is optional; a `collectd_in` with only a `bind` gets index-named records.
     #[test]
     fn collectd_in_component_defaults_types_db_to_empty() {
         let component: Component =
@@ -4699,10 +4139,9 @@ mod tests {
         }
     }
 
-    /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own:
-    /// TCP plaintext (its default listener is plaintext on 2003), an 8 KiB line bound and
-    /// Twisted's 1 MiB `Int32StringReceiver.MAX_LENGTH` frame bound -- plus no TLS and the
-    /// shared 5s `handshake_timeout` the other TCP listeners default to.
+    /// Every `graphite_in` field but `bind` is optional, and the defaults are carbon's own: TCP
+    /// plaintext, an 8 KiB line bound, a 1 MiB frame bound, no TLS, and the shared 5s
+    /// `handshake_timeout`.
     #[test]
     fn graphite_in_component_defaults_to_tcp_plaintext_with_carbons_bounds() {
         let component: Component =
@@ -4731,9 +4170,8 @@ mod tests {
         }
     }
 
-    /// `tls:` and `handshake_timeout:` round-trip on a `graphite_in`, the twin of `syslog_in`'s
-    /// own test -- both reach `GraphiteInput` through `logit-cli`'s `build_spec`, and both are
-    /// rejected on `transport: udp` by graph rules 43/45.
+    /// `tls:` and `handshake_timeout:` round-trip on a `graphite_in`; graph validation rejects
+    /// both on `transport: udp`.
     #[test]
     fn graphite_in_component_parses_tls_and_handshake_timeout() {
         let component: Component = serde_json::from_str(
@@ -4754,8 +4192,8 @@ mod tests {
         }
     }
 
-    /// Both enums are `snake_case` on the wire, like every other config enum -- and the pickle
-    /// listener is the TCP-only combination rule 46 is the gate for.
+    /// Both enums are `snake_case` on the wire; pickle over TCP is the only legal pickle
+    /// combination.
     #[test]
     fn graphite_in_component_parses_snake_case_transport_and_protocol() {
         let component: Component = serde_json::from_str(
@@ -4784,8 +4222,8 @@ mod tests {
         }
     }
 
-    /// Both byte bounds go through [`human_bytes`], so `"16KiB"` and a bare `"16384"` are the same
-    /// setting -- the property `StatsdOut::max_packet_bytes`'s own test pins for that field.
+    /// Both byte bounds go through `human_bytes`, so `"16KiB"` and a bare `"16384"` are the same
+    /// setting.
     #[test]
     fn graphite_in_component_parses_human_byte_sizes() {
         let component: Component = serde_json::from_str(
@@ -4898,9 +4336,8 @@ mod tests {
         }
     }
 
-    /// The default shape every pre-TCP `syslog_in:` config in the wild already has -- UDP, no
-    /// TLS -- must keep deserializing unchanged now that two fields sit behind `#[serde(default)]`
-    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    /// The bare shape (UDP, no TLS) keeps deserializing with the optional fields behind
+    /// `#[serde(default)]`.
     #[test]
     fn syslog_in_defaults_to_udp_with_no_tls() {
         let component: Component =
@@ -5045,10 +4482,8 @@ mod tests {
         }
     }
 
-    /// `handshake_timeout` is one field on three listener kinds behind one shared default
-    /// (`default_handshake_timeout`), so it is worth one test that all three really carry it and
-    /// really parse a humantime string -- a typo in any one of the three attribute copies would
-    /// otherwise only show up as a silently-defaulted value in a deployment.
+    /// `handshake_timeout` is one field on three listener kinds behind one shared default; a typo
+    /// in any one attribute copy would otherwise show up only as a silently defaulted value.
     #[test]
     fn handshake_timeout_parses_on_all_three_tcp_listeners() {
         let syslog: Component = serde_json::from_str(
@@ -5086,12 +4521,8 @@ mod tests {
         }
     }
 
-    /// `idle_timeout` is opt-in on every listener that has one: absent means the pre-`idle_timeout`
-    /// behaviour, where a connection that sent one frame and then went quiet keeps its
-    /// connection-cap permit forever (`docs/adr/idle-connection-timeout.md`). A `#[serde(default)]`
-    /// typo on any one kind would silently turn that default into whatever a `Duration`'s own
-    /// default is, so all of them are checked here rather than only the one that happened to be
-    /// edited last.
+    /// `idle_timeout` is opt-in on every listener that has one: absent means no idle timeout. A
+    /// `#[serde(default)]` typo on any one kind would silently change that, so all are checked.
     #[test]
     fn idle_timeout_defaults_to_none_on_every_tcp_listener() {
         let syslog: Component = serde_json::from_str(
@@ -5135,9 +4566,7 @@ mod tests {
     }
 
     /// The twin of [`handshake_timeout_parses_on_all_three_tcp_listeners`] for the `Option`
-    /// codec: one humantime string per kind, since `humantime_serde_duration::option` is a
-    /// separate module from the non-`Option` one and each kind carries its own copy of the
-    /// attribute pair.
+    /// codec, which is a separate module: one humantime string per kind.
     #[test]
     fn idle_timeout_parses_on_every_tcp_listener() {
         let syslog: Component = serde_json::from_str(
@@ -5263,8 +4692,8 @@ mod tests {
         }
     }
 
-    /// The easiest thing in this whole variant to get silently wrong: `rename_all = "snake_case"`
-    /// on a variant spelled `DogStatsd` turns it into `dog_statsd`, not `dogstatsd`.
+    /// The easiest thing here to get silently wrong: `rename_all = "snake_case"` on a variant
+    /// spelled `DogStatsd` would yield `dog_statsd`, not `dogstatsd`.
     #[test]
     fn the_dogstatsd_format_variant_deserializes_from_the_single_word_dogstatsd_not_dog_statsd() {
         let component: Component = serde_json::from_str(
@@ -5330,8 +4759,8 @@ mod tests {
         }
     }
 
-    /// `hostname:` is optional and config-supplied, the same shape as `SyslogOut::hostname` --
-    /// **not** an OS-hostname read and **not** a literal `"logit"` placeholder either.
+    /// `hostname:` is optional and config-supplied: not an OS-hostname read and not a literal
+    /// `"logit"` placeholder.
     #[test]
     fn collectd_out_hostname_is_optional_and_config_supplied() {
         let component: Component = serde_json::from_str(
@@ -5488,10 +4917,10 @@ mod tests {
         }
     }
 
-    /// Neither mode field is required *by serde* any more -- which of `bind:`/`endpoint:` is set
-    /// is graph rule 56's business, since "exactly one of two fields" is not a shape `serde` can
-    /// state. Both absent therefore deserializes and is rejected at `logit validate` time, with a
-    /// message naming both fields rather than `serde`'s "missing field `bind`".
+    /// Neither mode field is required by serde; which of `bind:`/`endpoint:` is set is graph
+    /// validation's business, since "exactly one of two fields" is not a shape serde can state.
+    /// Both absent deserializes and is rejected by `logit validate` with a message naming both
+    /// fields.
     #[test]
     fn prometheus_out_with_neither_mode_field_deserializes_and_is_left_to_rule_56() {
         let component: Component =
@@ -5535,8 +4964,8 @@ mod tests {
         }
     }
 
-    /// `version:` is the integer both specs are numbered by, not a string enum -- and an integer
-    /// that names no spec is a deserialization error rather than a silent fallback to `1`.
+    /// `version:` is the integer both specs are numbered by, and an integer that names no spec is
+    /// a deserialization error rather than a silent fallback to `1`.
     #[test]
     fn prometheus_out_version_is_an_integer_and_rejects_anything_but_1_or_2() {
         for (text, expected) in [("1", RemoteWriteVersion::V1), ("2", RemoteWriteVersion::V2)] {
@@ -5575,10 +5004,8 @@ mod tests {
         }
     }
 
-    /// `tls:` is additive here exactly as it is on `syslog_out`: absent means plaintext, and
-    /// presence (even an empty block) means TLS with the bundled Mozilla roots -- so an empty
-    /// `tls: {}` is meaningful rather than equivalent to omitting it (`StatsdOut::tls`'s own doc
-    /// comment, `docs/adr/statsd-output.md`'s TLS amendment).
+    /// `tls:` is optional, as on `syslog_out`: absent means plaintext, and presence (even an empty
+    /// block) means TLS with the bundled Mozilla roots.
     #[test]
     fn statsd_out_tls_defaults_to_none_and_an_empty_block_is_distinct_from_absent() {
         let component: Component = serde_json::from_str(
@@ -5623,8 +5050,7 @@ mod tests {
 
     #[test]
     fn zero_interval_deserializes_fine_left_for_validation_to_reject() {
-        // The codec itself has no opinion on zero -- graph validation (`logit-pipeline`) is where
-        // a zero flush interval is actually rejected (it would spin the flush loop).
+        // The codec has no opinion on zero; graph validation rejects a zero flush interval.
         let component: Component =
             serde_json::from_str(r#"{"type": "lua", "script": "x", "interval": "0s"}"#).unwrap();
         match component.kind {
@@ -5781,8 +5207,8 @@ mod tests {
 
     #[test]
     fn a_zstd_compression_value_is_a_clear_deserialize_error() {
-        // `zstd` is deliberately not a `Compression` variant -- `logit_proto::native` rejects it
-        // on both encode and decode, so there is nothing valid for a config to select.
+        // `zstd` is not a `Compression` variant: `logit_proto::native` rejects it on both encode
+        // and decode.
         let result: Result<Compression, _> = serde_json::from_str(r#""zstd""#);
         assert!(result.is_err());
     }
@@ -5988,9 +5414,8 @@ mod tests {
 
     #[test]
     fn each_receive_overflow_variant_deserializes() {
-        // Same enum as `buffer.overflow` (`OverflowPolicy`) -- `each_overflow_variant_deserializes`
-        // above already covers the type itself; this just confirms `receive.overflow` actually
-        // wires to it.
+        // `each_overflow_variant_deserializes` covers `OverflowPolicy` itself; this confirms
+        // `receive.overflow` wires to it.
         for (raw, expected) in [
             ("block", OverflowPolicy::Block),
             ("drop_oldest", OverflowPolicy::DropOldest),
@@ -6075,8 +5500,8 @@ mod tests {
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
                 assert_eq!(scrape_tls, TlsClientConfig::default());
-                // The receiver half all defaults away, so a scrape config is untouched by its
-                // existence -- and graph rule 55 reads exactly these defaults.
+                // The receiver half all defaults away, so a scrape config is untouched by it, and
+                // graph validation reads these defaults.
                 assert_eq!(bind, None);
                 assert_eq!(path, "/api/v1/write");
                 assert_eq!(bind_tls, None);
@@ -6089,9 +5514,8 @@ mod tests {
         }
     }
 
-    /// The cache's two bounds are independent: either may be set on its own, and `0` families is
-    /// a legal value (it's how the cache is turned off) where `0s` is not -- rule 55's, not
-    /// serde's.
+    /// The cache's two bounds are independent, and `0` families is legal (it turns the cache off)
+    /// where `0s` is not; graph validation, not serde, rejects the latter.
     #[test]
     fn prometheus_in_metadata_cache_deserializes_each_bound_on_its_own() {
         let cache = |json: &str| -> MetadataCacheConfig {
@@ -6121,11 +5545,9 @@ mod tests {
         assert_eq!(cache("{}"), MetadataCacheConfig::default());
     }
 
-    /// Every other all-defaulted sub-block here denies unknown fields, and this one has the sharper
-    /// reason: a misspelled key would otherwise deserialize to the defaults, so the cap an operator
-    /// wrote would be ignored *and* rule 55 would see a defaulted block -- letting the same typo
-    /// resolve under `scrape_targets:`, which is precisely the "a setting silently doing nothing"
-    /// failure rule 55 exists to prevent.
+    /// Denies unknown fields: a misspelled key would otherwise deserialize to the defaults, so the
+    /// cap written would be ignored and mode validation would see a defaulted block, letting the
+    /// typo pass under `scrape_targets:`.
     #[test]
     fn prometheus_in_metadata_cache_rejects_a_misspelled_key() {
         let err = serde_json::from_str::<Component>(
@@ -6158,10 +5580,8 @@ mod tests {
 
     #[test]
     fn prometheus_in_rejects_an_empty_scrape_targets_list_at_deserialize_time_only_if_required() {
-        // `scrape_targets` has no `#[serde(default)]`, so an omitted or empty-but-present list
-        // both deserialize fine here -- rule 40 (`logit-pipeline::graph`) is what rejects an
-        // empty list, not this crate's schema (mirrors `TailIn::paths`'s own split of "shape" vs.
-        // "meaning").
+        // `scrape_targets` has a `#[serde(default)]`, so an omitted or empty list both
+        // deserialize here; graph validation is what rejects an empty list.
         let component: Component =
             serde_json::from_str(r#"{"type": "prometheus_in", "scrape_targets": []}"#).unwrap();
         match component.kind {
@@ -6205,8 +5625,8 @@ mod tests {
                 assert_eq!(batch, 500);
                 assert_eq!(rate, Some(50_000));
                 assert_eq!(resource.get("service.name"), Some(&"web".to_string()));
-                // Still the raw template text, doubled braces and all -- unescaping `{{`/`}}` is
-                // `logit_core::template::parse`'s job, not deserialization's.
+                // Still the raw template text, doubled braces and all; unescaping is
+                // `logit_core::template::parse`'s job.
                 assert_eq!(event.log.as_deref(), Some(r#"{{"path":"/x/{seq%50}"}}"#));
                 assert_eq!(event.attributes.get("host"), Some(&"web-{seq%10}".to_string()));
                 assert_eq!(
@@ -6222,8 +5642,8 @@ mod tests {
         }
     }
 
-    /// A `metric:` block names only what it has to; `sum` at `1` is the counter shape every other
-    /// field's default is chosen around.
+    /// A `metric:` block names only what it has to; `sum` at `1` is the counter shape the
+    /// defaults are chosen around.
     #[test]
     fn a_generate_metric_defaults_to_a_sum_of_one() {
         let component: Component = serde_json::from_str(
@@ -6353,12 +5773,9 @@ mod tests {
         assert_eq!(component.targets, vec!["a".to_string(), "b".to_string()]);
     }
 
-    /// `statsd_in`'s three new fields all default, and all round-trip when set: the bare
-    /// `{"type": "statsd_in", "bind": ...}` shape every pre-TCP config in the wild already has
-    /// must keep deserializing unchanged (`component_with_no_sources_defaults_to_empty` above is
-    /// the other half of that pin), and a `transport: tcp` listener must be able to carry a
-    /// `tls:` block and a `handshake_timeout` (`docs/adr/syslog-tcp-ingress-and-tls.md`, whose
-    /// driver this listener now shares).
+    /// `statsd_in`'s optional fields all default and all round-trip when set: the bare
+    /// `{"type": "statsd_in", "bind": ...}` shape keeps deserializing, and a `transport: tcp`
+    /// listener carries a `tls:` block and a `handshake_timeout`.
     #[test]
     fn statsd_in_round_trips_transport_tls_and_handshake_timeout() {
         let bare: Component =
@@ -6392,8 +5809,7 @@ mod tests {
             other => panic!("expected StatsdIn with tls set, got {other:?}"),
         }
 
-        // `transport` alone must not imply TLS -- the same pin `syslog_in_with_transport_tcp_
-        // deserializes` makes.
+        // `transport` alone must not imply TLS.
         let plaintext_tcp: Component = serde_json::from_str(
             r#"{"type": "statsd_in", "bind": "0.0.0.0:8125", "transport": "tcp"}"#,
         )

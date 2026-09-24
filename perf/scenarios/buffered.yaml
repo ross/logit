@@ -1,43 +1,19 @@
-# Disk-backed sink-buffer spool cost (docs/plans/load-test-harness.md's scenario table):
-# passthrough's exact graph, with `buffer.disk:` turned on for the sink
-# (docs/adr/disk-backed-sink-buffer.md) -- so the gap between this scenario's numbers and
-# passthrough's is the disk spool's own cost (native-frame encode into a segment file, the
-# periodic checkpoint write) rather than anything passthrough already measures.
+# Disk-backed sink-buffer spool cost: passthrough's graph with `buffer.disk:` on the sink
+# (docs/adr/disk-backed-sink-buffer.md), so the gap from passthrough's numbers is the spool's own
+# cost (native-frame encode into a segment file, the periodic checkpoint write). Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios"; numbers and the variance history:
+# docs/design/performance.md §3; the open startup-scan question: docs/known-gaps.md's `buffered`
+# entry.
 #
 #   script/perf run --scenario buffered
 #
-# `path` is resolved against *this config file's own directory* (perf/scenarios/,
-# crates/logit-cli/src/pipeline.rs's `queue_config`/`base_dir`), so `../results/spool` lands at
-# `perf/results/spool` -- alongside the harness's own results files, under the same
-# `/perf/results/` `.gitignore` entry, rather than inside perf/scenarios/ itself. The directory is
-# created on demand (`DiskQueue::open`'s `create_dir_all`); nothing needs to exist beforehand.
+# `path` resolves against this config file's own directory (crates/logit-cli/src/pipeline.rs's
+# `queue_config`), so `../results/spool` lands in the gitignored `perf/results/`. The harness
+# clears it before every spawn (crates/logit-perf/src/spool.rs); nothing needs to exist beforehand.
 #
-# `count` is tuned lower than every other scenario's, and to the *median* of a noisy spread rather
-# than a tight one: this is the one scenario whose cost is dominated by real disk I/O (segment
-# writes, periodic checkpoints), so its wall time swings far more under contention from other disk
-# activity on the same machine than any in-memory scenario's does -- expect more run-to-run
-# variance here than elsewhere in this directory.
-#
-# Investigation (docs/design/performance.md's `buffered` notes) found one real contributor to that
-# variance that isn't external contention at all: `DiskQueue::open`
-# (crates/logit-pipeline/src/disk_queue.rs) pays an un-cleared spool's cost twice at every startup:
-# it reads and CRC-walks the *active* segment in full to validate it (bounded by the default 64MiB
-# rotation threshold, so this pass alone isn't obviously large enough on its own to explain a
-# multi-second swing), then reads every segment at or after the read cursor a *second* time to
-# count what's left to replay -- real work whenever the cursor hasn't caught up. An un-cleared spool
-# left exactly that behind, and throughput degraded monotonically within a single `--repeat N`
-# invocation as a measured result.
-#
-# W8 (#165) fixed this on the harness side: `script/perf run`/`attribute`/`flamegraph` now clear
-# this scenario's spool (`../results/spool`, gitignored) before every spawn, every repeat --
-# manually deleting it first is no longer necessary. A post-fix `--repeat 5` no longer degrades
-# monotonically and peak RSS no longer climbs across the run, confirmed on a busy laptop, a quiet
-# laptop, and now the disposable perf VM (docs/design/performance.md §3 has all three runs'
-# numbers) -- this variance is resolved. What remains, narrower than before: on the VM, a roughly
-# 7% events/s spread within five repeats (under 1% on CPU µs/event, the tightest this scenario has
-# measured), and whether `DiskQueue::open`'s own double-read startup scan explains any of it -- a
-# product-side item (crates/logit-pipeline/src/disk_queue.rs), no longer suspected as the main
-# cause (docs/known-gaps.md's `buffered` entry).
+# `count` is lower than every other scenario's: this is the one scenario dominated by real disk
+# I/O, so its wall time moves with other disk activity on the box. Expect more run-to-run variance
+# here than elsewhere in this directory.
 components:
   gen:
     type: generate_in

@@ -1,21 +1,18 @@
 //! A pickle **writer** (a ten-opcode protocol-2 subset) and a **restricted reader** for carbon's
-//! batch protocol -- see [`super`]'s module doc for where they sit in the codec.
+//! batch protocol.
 //!
-//! ## Why this is hand-rolled, and what that buys
+//! ## Why this is hand-rolled
 //!
 //! Pickle is a stack machine whose *purpose* is arbitrary object construction: the opcodes that
 //! make a general unpickler dangerous (`GLOBAL`, `STACK_GLOBAL`, `REDUCE`, `BUILD`, `INST`, `OBJ`,
-//! `NEWOBJ`, the `EXT*` registry, `PERSID`) import names and call them. Carbon's batch payload
-//! needs none of them: it is a list of `(str, (number, number))` tuples and nothing else. So this
-//! reader is an **allowlist**, not a parser with a blocklist bolted on -- any byte that is not one
-//! of the opcodes named below fails the frame with
-//! `CodecError::Malformed("pickle opcode 0x.. is not permitted")`, including every opcode that
-//! does not exist yet. Adding an opcode to the accept list is an ADR-level change
-//! (`docs/plans/graphite-carbon-relay.md`'s open risks).
+//! `NEWOBJ`, the `EXT*` registry, `PERSID`) import names and call them. Carbon's batch payload is a
+//! list of `(str, (number, number))` tuples and needs none of them. So this reader is an
+//! **allowlist**: any byte not named below fails the frame with
+//! `CodecError::Malformed("pickle opcode 0x.. is not permitted")`, including opcodes that don't
+//! exist yet. Adding an opcode to the accept list is an ADR-level change.
 //!
-//! There is no new crate dependency behind this. `serde-pickle`/`pickle` crates exist, but they
-//! implement the *general* format -- the thing whose generality is the risk -- and `deny.toml` /
-//! `script/audit` staying unchanged was a settled decision of the plan.
+//! No pickle crate is used: `serde-pickle`/`pickle` implement the *general* format, whose
+//! generality is the risk.
 //!
 //! ## Accepted opcodes
 //!
@@ -28,13 +25,10 @@
 //! | numbers | `BININT` `0x4a`, `BININT1` `0x4b`, `BININT2` `0x4d`, `LONG1` `0x8a`, `LONG4` `0x8b` (magnitude ≤ 8 bytes), `BINFLOAT` `0x47` |
 //! | inert | `NONE` `0x4e`, `NEWTRUE` `0x88`, `NEWFALSE` `0x89` |
 //!
-//! The three inert opcodes are accepted because a stray `None`/`True` in a sender's list must cost
-//! **that datapoint**, not the whole frame: rejecting the frame would discard every unrelated
-//! datapoint packed behind it, the same per-line isolation rule
-//! `crates/logit-inputs/src/statsd.rs` and `crate::collectd`'s decoder already follow. The bytes
-//! `0x8c`/`0x8d`/`0x8e` and `0x95` are protocol-4/5 opcodes real senders emit under
-//! `pickle.dumps(..., protocol=-1)` on a modern CPython, which is exactly why the plan's settled
-//! decision names both protocol 2 and `-1` as senders to accept.
+//! The three inert opcodes are accepted so a stray `None`/`True` in a sender's list costs **that
+//! datapoint**, not every datapoint in the frame. `0x8c`/`0x8d`/`0x8e` and `0x95` are
+//! protocol-4/5 opcodes that `pickle.dumps(..., protocol=-1)` emits on a modern CPython; protocol 2
+//! and `-1` are both senders to accept.
 //!
 //! Everything else is rejected, in particular: `GLOBAL` `0x63`, `STACK_GLOBAL` `0x93`, `REDUCE`
 //! `0x52`, `BUILD` `0x62`, `INST` `0x69`, `OBJ` `0x6f`, `NEWOBJ` `0x81`, `NEWOBJ_EX` `0x92`,
@@ -44,32 +38,29 @@
 //! `BYTEARRAY8` `0x96`, `NEXT_BUFFER` `0x97`, `READONLY_BUFFER` `0x98`, and every protocol-0
 //! textual opcode (`INT` `0x49`, `LONG` `0x4c`, `FLOAT` `0x46`, `STRING` `0x53`, `UNICODE` `0x56`,
 //! `PUT` `0x70`, `GET` `0x67`, ...). A protocol-0 dump therefore fails at its first value rather
-//! than being half-understood. A protocol-1 dump decodes: it has no `PROTO` header, but every
+//! than being half-understood. A protocol-1 dump **decodes**: it has no `PROTO` header, but every
 //! opcode it emits for a carbon payload is a binary one from the table above.
 //!
 //! ## Bounds
 //!
 //! - every declared length is validated against the **remaining input** before anything is sized
-//!   from it -- `crate::frame::read_frame`'s discipline, and what
-//!   `crates/logit-proto/tests/robustness.rs` measures with a peak-allocation counter;
-//! - no string is ever copied: a string value is a `Range` into the caller's buffer, so a frame
-//!   declaring a gigabyte allocates nothing at all, it just fails the bound;
-//! - [`super::MAX_PICKLE_DEPTH`] bounds open `MARK`s, [`super::MAX_PICKLE_ITEMS`] bounds the stack,
-//!   each arena and the memo independently; the memo is additionally bounded by opcodes actually
-//!   consumed, not only by that cap -- a memo key must be ordinal (one new slot per
-//!   `BINPUT`/`LONG_BINPUT`/`MEMOIZE`; `key <= self.memo.len()`), so a single `LONG_BINPUT` cannot
-//!   grow the memo to an attacker-chosen size the way a declared length could;
-//! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes -- carbon's timestamps are seconds, and
-//!   a 2 GB `LONG4` is an attack, not a datapoint;
+//!   from it (all through [`slice()`]); `crates/logit-proto/tests/robustness.rs` measures this with
+//!   a peak-allocation counter;
+//! - no string is copied: a string value is a range into the caller's buffer, so a frame declaring
+//!   a gigabyte allocates nothing and fails the bound;
+//! - [`super::MAX_PICKLE_DEPTH`] bounds open `MARK`s, and [`super::MAX_PICKLE_ITEMS`] bounds the
+//!   stack, each arena, and the memo independently. A memo key must also be ordinal
+//!   (`key <= self.memo.len()`, one new slot per `BINPUT`/`LONG_BINPUT`/`MEMOIZE`), so one
+//!   `LONG_BINPUT` can't grow the memo to an attacker-chosen size;
+//! - `LONG1`/`LONG4` accept a magnitude of at most 8 bytes: carbon's timestamps are seconds;
 //! - the stack must hold **exactly one** value at `STOP`, and it must be a list.
 //!
 //! ## Reusable state
 //!
-//! [`PickleReader`]'s stack, arenas and memo are struct fields cleared per frame, never
-//! reallocated once grown -- so a warm `decode_into` over a pickle frame allocates only the
-//! caller's `Vec<Event>` (`docs/design/memory.md` §2, and the allocation rows W2 pins). That is
-//! also why a tuple/list is an index range into an arena rather than a `Vec` of its own: a
-//! `Vec`-per-tuple design would allocate twice per datapoint forever.
+//! [`PickleReader`]'s stack, arenas, and memo are fields cleared per frame, so a warm pickle
+//! decode allocates only the caller's `Vec<Event>` (`docs/design/memory.md` §2). That is why a
+//! tuple or list is an index range into an arena: a `Vec` per tuple would allocate twice per
+//! datapoint.
 
 use super::{MAX_PICKLE_DEPTH, MAX_PICKLE_ITEMS};
 use crate::CodecError;
@@ -112,11 +103,10 @@ const OP_BINBYTES8: u8 = 0x8e;
 const OP_MEMOIZE: u8 = 0x94;
 const OP_FRAME: u8 = 0x95;
 
-/// The highest `PROTO` version this reader will look at. Nothing above 5 exists; a payload
-/// claiming one is either corrupt or probing.
+/// The highest `PROTO` version this reader accepts; nothing above 5 exists.
 const MAX_PROTO_VERSION: u8 = 5;
 
-/// The most bytes a `LONG1`/`LONG4` magnitude may carry -- see this module's "Bounds" section.
+/// The most bytes a `LONG1`/`LONG4` magnitude may carry (this module's "Bounds" section).
 const MAX_LONG_BYTES: usize = 8;
 
 // -- writer -------------------------------------------------------------------------------------
@@ -131,9 +121,8 @@ pub const TRAILER_BYTES: usize = 2;
 /// `Int32StringReceiver` framing. Written by [`write_length_prefix`], not by the payload writers.
 pub const LENGTH_PREFIX_BYTES: usize = 4;
 
-/// The protocol version [`write_header`] declares. Protocol 2 is the oldest version every opcode
-/// this writer uses exists in, and is what `carbon-client`/`pickle.dumps(..., protocol=2)` --
-/// carbon's own documented example -- emits.
+/// The protocol version [`write_header`] declares: the oldest that has every opcode this writer
+/// uses, and what carbon's documented `pickle.dumps(..., protocol=2)` example emits.
 pub const WRITE_PROTOCOL: u8 = 2;
 
 /// Opens a datapoint list: `PROTO 2`, `EMPTY_LIST`, `MARK`. Pair with [`write_trailer`], one
@@ -153,10 +142,9 @@ pub fn write_trailer(out: &mut Vec<u8>) {
 
 /// Writes one `(path, (timestamp, value))` tuple.
 ///
-/// `BINUNICODE` rather than `SHORT_BINSTRING`: on Python 3 a `BINSTRING`/`SHORT_BINSTRING` unpickles
-/// to `bytes`, and carbon's own receiver indexes the datapoint's first element as a `str`. The
-/// timestamp is `BININT` when it fits an `i32` and `LONG1` otherwise -- the same choice CPython's
-/// own pickler makes by magnitude, and what keeps a post-2038 second encodable at all.
+/// `BINUNICODE`, not `SHORT_BINSTRING`: on Python 3 a `BINSTRING` unpickles to `bytes`, and
+/// carbon treats the path as a `str`. The timestamp is `BININT` when it fits an `i32` and `LONG1`
+/// otherwise, as CPython's pickler chooses, which keeps a post-2038 second encodable.
 pub fn write_datapoint(out: &mut Vec<u8>, path: &str, timestamp: i64, value: f64) {
     write_binunicode(out, path);
     write_int(out, timestamp);
@@ -168,9 +156,8 @@ pub fn write_datapoint(out: &mut Vec<u8>, path: &str, timestamp: i64, value: f64
 }
 
 /// A whole payload in one call: [`write_header`], one [`write_datapoint`] per item,
-/// [`write_trailer`]. `out` is **not** cleared first. The encoder builds frames incrementally
-/// instead (it has to know where `max_frame_bytes` falls); this is for tests, benches and any
-/// caller with a whole batch in hand.
+/// [`write_trailer`]. `out` is **not** cleared first. For tests and benches; the encoder builds
+/// frames incrementally to find where `max_frame_bytes` falls.
 pub fn write_datapoints<'a>(
     out: &mut Vec<u8>,
     datapoints: impl IntoIterator<Item = (&'a str, i64, f64)>,
@@ -183,9 +170,9 @@ pub fn write_datapoints<'a>(
 }
 
 /// Writes carbon's 4-byte big-endian length prefix for a `payload_len`-byte pickle payload.
-/// Saturates rather than wrapping: a payload past `u32::MAX` cannot exist here (every caller is
-/// bounded by `max_frame_bytes`, itself capped at 16 MiB by the graph rules), and a wrapped prefix
-/// would desynchronize the receiver's stream rather than fail loudly.
+///
+/// Saturates rather than wrapping: callers are bounded by `max_frame_bytes` (at most 16 MiB by the
+/// graph rules), and a wrapped prefix would silently desynchronize the receiver's stream.
 pub fn write_length_prefix(out: &mut Vec<u8>, payload_len: usize) {
     let len = u32::try_from(payload_len).unwrap_or(u32::MAX);
     out.extend_from_slice(&len.to_be_bytes());
@@ -206,10 +193,9 @@ fn write_int(out: &mut Vec<u8>, v: i64) {
     }
     out.push(OP_LONG1);
     let bytes = v.to_le_bytes();
-    // Minimal two's-complement little-endian magnitude, exactly as CPython's `encode_long` emits
-    // it: drop a trailing sign-extension byte only while the byte below it still carries the sign
-    // in its own high bit, so a positive value keeps the leading `0x00` that stops it reading as
-    // negative.
+    // Minimal two's-complement little-endian magnitude, as CPython's `encode_long` emits: drop a
+    // trailing sign-extension byte only while the byte below still carries the sign in its high
+    // bit, so a positive value keeps the `0x00` that stops it reading as negative.
     let sign: u8 = if v < 0 { 0xff } else { 0x00 };
     let mut len = MAX_LONG_BYTES;
     while len > 1 {
@@ -227,13 +213,11 @@ fn write_int(out: &mut Vec<u8>, v: i64) {
 
 // -- reader -------------------------------------------------------------------------------------
 
-/// One value on the restricted reader's stack. `Copy` and pointer-free on purpose: a tuple or list
-/// is an index range into a reusable arena, never a `Vec` of its own, which is what makes a warm
-/// frame decode allocation-free (this module's "Reusable state" section).
+/// One value on the restricted reader's stack. `Copy` and pointer-free: a tuple or list is an
+/// index range into a reusable arena (this module's "Reusable state" section).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PValue {
-    /// A `MARK` sentinel. Never a datapoint; only [`PickleReader`]'s own container opcodes look at
-    /// it.
+    /// A `MARK` sentinel, seen only by container opcodes.
     Mark,
     None,
     Bool(bool),
@@ -264,10 +248,10 @@ pub struct PickleReader {
     tuples: Vec<PValue>,
     /// Flat storage for every list's elements.
     lists: Vec<PValue>,
-    /// Sparse by key: `BINPUT`/`LONG_BINPUT` name an arbitrary index, `MEMOIZE` appends at the
-    /// next one. `None` is "nothing memoized under this key", which a `BINGET` for it rejects.
+    /// Indexed by memo key, filled in key order (`memo_put` rejects a key past the end); a
+    /// `BINGET` of an unset key fails.
     memo: Vec<Option<PValue>>,
-    /// Open `MARK` count -- the depth [`MAX_PICKLE_DEPTH`] bounds.
+    /// Open `MARK` count, the depth [`MAX_PICKLE_DEPTH`] bounds.
     marks: usize,
 }
 
@@ -276,17 +260,15 @@ impl PickleReader {
         Self::default()
     }
 
-    /// Parses one complete, **unframed** pickle payload (no 4-byte length prefix -- the listener
-    /// strips that) and calls `on_datapoint` once per well-shaped `(path, (timestamp, value))`
-    /// item, in list order. Returns how many items were skipped for being the wrong shape.
+    /// Parses one complete, **unframed** pickle payload (the listener strips the length prefix)
+    /// and calls `on_datapoint` once per well-shaped `(path, (timestamp, value))` item, in list
+    /// order. Returns how many items were skipped for being the wrong shape.
     ///
-    /// A wrong-shaped *item* is skipped, never fatal (this module's "Accepted opcodes" section);
-    /// a disallowed opcode, a declared length past the input, a bound, or a payload that does not
-    /// leave exactly one list on the stack fails the whole frame with
-    /// [`CodecError::Malformed`].
+    /// A wrong-shaped *item* is skipped, never fatal. A disallowed opcode, a declared length past
+    /// the input, a bound, or a payload that doesn't leave exactly one list on the stack fails the
+    /// whole frame with [`CodecError::Malformed`].
     ///
-    /// `path` borrows the caller's `input`, so the caller can turn it back into a zero-copy
-    /// [`bytes::Bytes`] slice of the frame it already owns.
+    /// `path` borrows `input`, so the caller can make it a zero-copy [`bytes::Bytes`] slice.
     pub fn read_datapoints<'a>(
         &mut self,
         input: &'a [u8],
@@ -315,9 +297,8 @@ impl PickleReader {
     }
 
     /// Pulls `(path, timestamp, value)` out of one list item, or `None` if it is not a
-    /// `(str, (number, number))`. Depth-bounded by construction: it looks exactly two levels down
-    /// and never recurses, so no crafted nesting can make this the recursion the opcode allowlist
-    /// is there to prevent.
+    /// `(str, (number, number))`. Looks exactly two levels down and never recurses, so crafted
+    /// nesting can't make it recurse.
     fn datapoint<'a>(&self, input: &'a [u8], item: PValue) -> Option<(&'a str, f64, f64)> {
         let PValue::Tuple { start, len } = item else { return None };
         if len != 2 {
@@ -337,14 +318,12 @@ impl PickleReader {
 
     fn as_str<'a>(&self, input: &'a [u8], value: PValue) -> Option<&'a str> {
         let PValue::Str { start, len } = value else { return None };
-        // Validated once at parse time; re-validated here rather than carrying an unsafe
-        // "trust me" across the two, since the cost is a scan of one path.
+        // Re-validated rather than trusted with `unsafe`; the cost is a scan of one path.
         std::str::from_utf8(&input[start as usize..start as usize + len as usize]).ok()
     }
 
-    /// A number, or a **numeric string** -- carbon's own pickle producers are Python, where a
-    /// datapoint value read from a text source routinely arrives as `"3.14"` rather than a float,
-    /// and carbon coerces it with `float()`. `str::parse::<f64>` is the same coercion.
+    /// A number, or a **numeric string**: Python producers often send `"3.14"`, and carbon
+    /// coerces with `float()`, as `str::parse::<f64>` does here.
     fn as_f64(&self, input: &[u8], value: PValue) -> Option<f64> {
         match value {
             PValue::Int(v) => Some(v as f64),
@@ -371,9 +350,8 @@ impl PickleReader {
         self.memo.clear();
         self.marks = 0;
 
-        // Every string is a `u32` range into `input`; a payload this large cannot reach here
-        // (`max_frame_bytes` is capped at 16 MiB by the graph rules) and must not silently
-        // truncate a range if it somehow did.
+        // Ranges are `u32`; `max_frame_bytes` (at most 16 MiB) keeps a larger payload out, but
+        // one must not truncate a range if it got here.
         if input.len() > u32::MAX as usize {
             return Err(malformed("pickle payload is larger than 4 GiB"));
         }
@@ -393,9 +371,8 @@ impl PickleReader {
                         )));
                     }
                 }
-                // The frame length is advisory here -- this reader already holds the whole payload
-                // -- but it is validated anyway, so a frame claiming more than it carries fails
-                // now rather than confusing a later length check.
+                // Advisory, since the reader holds the whole payload, but validated so a frame
+                // claiming more than it carries fails here.
                 OP_FRAME => {
                     let declared = u64::from_le_bytes(slice(input, at, 8)?.try_into().unwrap());
                     at += 8;
@@ -470,8 +447,8 @@ impl PickleReader {
                     self.push_str(input, at, n)?;
                     at += n;
                 }
-                // BINSTRING's length is a *signed* 32-bit count in CPython's own reader, which
-                // rejects a negative one outright rather than sign-extending it into a huge size.
+                // BINSTRING's length is *signed*; CPython rejects a negative one rather than
+                // sign-extending it into a huge size.
                 OP_BINSTRING => {
                     let n = i32::from_le_bytes(slice(input, at, 4)?.try_into().unwrap());
                     at += 4;
@@ -482,8 +459,7 @@ impl PickleReader {
                 }
                 OP_BINUNICODE8 | OP_BINBYTES8 => {
                     let n = u64::from_le_bytes(slice(input, at, 8)?.try_into().unwrap());
-                    // Checked against the remaining input *before* being used as a length -- a
-                    // `u64` that does not fit `usize` can only be a crafted one.
+                    // A `u64` length that doesn't fit `usize` can only be crafted.
                     let n = usize::try_from(n).map_err(|_| {
                         malformed("pickle string length does not fit this platform's usize")
                     })?;
@@ -552,8 +528,8 @@ impl PickleReader {
         Ok(())
     }
 
-    /// Validates `n` against the remaining input, validates the bytes as UTF-8, and pushes the
-    /// **range** -- nothing is copied, so a crafted length costs a comparison, not an allocation.
+    /// Validates `n` against the remaining input and the bytes as UTF-8, then pushes the
+    /// **range**; a crafted length costs a comparison, not an allocation.
     fn push_str(&mut self, input: &[u8], at: usize, n: usize) -> Result<(), CodecError> {
         let bytes = slice(input, at, n)?;
         if std::str::from_utf8(bytes).is_err() {
@@ -643,11 +619,10 @@ impl PickleReader {
     /// Appends `stack[from..]` to the list at `stack[target]`, then truncates the stack to
     /// `target + 1`.
     ///
-    /// The list must be the **tail** of the arena (`start + len == lists.len()`), which is exactly
-    /// what carbon's own `EMPTY_LIST MARK … APPENDS` shape gives. A crafted payload that interleaves
-    /// two open lists is rejected rather than reshuffled: nothing real produces one, and the
-    /// alternative is either a per-list `Vec` (an allocation per frame, forever) or a compaction
-    /// pass a hostile sender chooses the cost of.
+    /// The list must be the **tail** of the arena (`start + len == lists.len()`), as carbon's
+    /// `EMPTY_LIST MARK … APPENDS` shape gives. Interleaved open lists are rejected: nothing real
+    /// produces them, and supporting them needs a per-list `Vec` or a compaction pass whose cost a
+    /// hostile sender chooses.
     fn append_range(&mut self, target: usize, from: usize) -> Result<(), CodecError> {
         let PValue::List { start, len } = self.stack[target] else {
             return Err(malformed("pickle APPEND/APPENDS onto something that is not a list"));
@@ -671,11 +646,9 @@ impl PickleReader {
                 "pickle memo key {key} exceeds the {MAX_PICKLE_ITEMS}-entry cap"
             )));
         }
-        // A memo key must be ordinal: CPython's pickler hands out keys sequentially, one per
-        // `BINPUT`/`LONG_BINPUT`/`MEMOIZE`, so a real stream only ever overwrites an existing slot
-        // (`key < self.memo.len()`) or appends the next one (`key == self.memo.len()`). Anything
-        // past that sizes the memo from an attacker-chosen index rather than opcodes actually
-        // consumed -- see the module doc's "Bounds" section.
+        // A memo key must be ordinal: CPython hands out keys sequentially, so a real stream only
+        // overwrites a slot or appends the next. A key past that would size the memo from an
+        // attacker-chosen index ("Bounds").
         if key > self.memo.len() {
             return Err(malformed(format!(
                 "pickle memo key {key} skips ahead of the {} entries written so far",
@@ -705,8 +678,8 @@ impl PickleReader {
     }
 }
 
-/// `input[at..at + n]`, or [`CodecError::Malformed`] -- the one place a declared length meets the
-/// input's real size, so every length check in this module goes through it.
+/// `input[at..at + n]`, or [`CodecError::Malformed`]: every declared length in this module is
+/// checked against the input here.
 fn slice(input: &[u8], at: usize, n: usize) -> Result<&[u8], CodecError> {
     let end = at.checked_add(n).ok_or_else(|| malformed("pickle length overflows usize"))?;
     input
@@ -750,10 +723,9 @@ mod tests {
     //     python3 -c "import pickle; b = pickle.dumps(<expr>, protocol=<n>); \
     //                 print(', '.join(f'0x{x:02x}' for x in b))"
     //
-    // with `<expr>`/`<n>` exactly as each constant's own doc comment records. Python 3.14.0.
-    // Committing the bytes rather than the generator is deliberate: AGENTS.md's "benchmark and
-    // test fixtures never depend on a running service" rule extends to an interpreter, and these
-    // are precisely the bytes a real carbon sender puts on the wire.
+    // with `<expr>`/`<n>` as each constant's doc comment records. Python 3.14.0. The bytes are
+    // committed, not the generator: fixtures never depend on a running service or interpreter
+    // (AGENTS.md).
 
     /// pickle.dumps([('sys.cpu', (1700000000, 0.5))], protocol=2)
     const CPYTHON_PROTOCOL_2: &[u8] = &[
@@ -888,9 +860,8 @@ mod tests {
         assert_eq!(points, vec![point("sys.cpu", 1_700_000_000.0, 0.5)]);
     }
 
-    /// Protocol `-1` on a modern CPython is protocol 5 -- `FRAME`/`SHORT_BINUNICODE`/`MEMOIZE`,
-    /// three opcodes protocol 2 never emits. The plan's settled decision names both as senders to
-    /// accept, so both are pinned here.
+    /// Protocol `-1` (protocol 5 on a modern CPython) decodes, with `FRAME`/`SHORT_BINUNICODE`/
+    /// `MEMOIZE`.
     #[test]
     fn a_cpython_protocol_5_dump_decodes() {
         let (points, skipped) = read(CPYTHON_PROTOCOL_5).expect("protocol 5 must decode");
@@ -898,8 +869,7 @@ mod tests {
         assert_eq!(points, vec![point("sys.cpu", 1_700_000_000.0, 0.5)]);
     }
 
-    /// Protocol 1 predates `PROTO`, but a carbon payload dumped under it uses only allowlisted
-    /// binary opcodes, so it decodes like protocol 2; only protocol 0's textual opcodes are refused.
+    /// Protocol 1 has no `PROTO` but uses only allowlisted binary opcodes, so it decodes.
     #[test]
     fn a_cpython_protocol_1_dump_decodes() {
         let (points, skipped) = read(CPYTHON_PROTOCOL_1).expect("protocol 1 must decode");
@@ -923,8 +893,7 @@ mod tests {
         assert_eq!(points, vec![point("a.b", 2_147_483_653.0, 1.0)]);
     }
 
-    /// Carbon coerces a datapoint's numbers with `float()`, so a producer that never converted its
-    /// text does not lose its data here either.
+    /// Numeric strings decode, as carbon coerces them with `float()`.
     #[test]
     fn numeric_strings_parse_as_numbers() {
         let (points, skipped) = read(CPYTHON_NUMERIC_STRINGS).expect("numeric strings must decode");
@@ -932,8 +901,7 @@ mod tests {
         assert_eq!(points, vec![point("a.b", 1_700_000_000.0, 2.5)]);
     }
 
-    /// A stray `None` costs **that** datapoint, not the frame: everything packed behind it still
-    /// decodes. The per-line isolation rule `crate::collectd`'s decoder and `statsd_in` follow.
+    /// A stray `None` costs **that** datapoint, not the frame.
     #[test]
     fn a_wrong_shaped_item_is_skipped_and_the_rest_of_the_frame_decodes() {
         let (points, skipped) = read(CPYTHON_WRONG_SHAPE).expect("a stray None must not be fatal");
@@ -949,8 +917,8 @@ mod tests {
 
     // -- rejected payloads ------------------------------------------------------------------------
 
-    /// The allowlist's whole point: every opcode that could make a general unpickler construct or
-    /// call something is refused, with the wording the plan fixes so a diagnostic is greppable.
+    /// Every opcode that could make a general unpickler construct or call something is refused,
+    /// with greppable wording.
     #[test]
     fn object_construction_opcodes_are_rejected() {
         for (name, payload) in [
@@ -969,9 +937,8 @@ mod tests {
         }
     }
 
-    /// `REDUCE` (0x52) and `BUILD` (0x62) don't appear in a stock `pickle.dumps` of a plain class
-    /// (which uses `NEWOBJ`), so they get a hand-assembled payload of their own rather than being
-    /// left untested.
+    /// `REDUCE` (0x52) and `BUILD` (0x62), hand-assembled: a stock `pickle.dumps` of a plain
+    /// class uses `NEWOBJ` instead.
     #[test]
     fn reduce_and_build_are_rejected() {
         for (name, op) in [("REDUCE", 0x52u8), ("BUILD", 0x62u8)] {
@@ -1012,8 +979,7 @@ mod tests {
         let mut payload = vec![OP_PROTO, 2];
         payload.extend(std::iter::repeat_n(OP_MARK, MAX_PICKLE_DEPTH));
         payload.push(OP_STOP);
-        // Exactly at the cap is a bounds question, not a depth one: the marks are still on the
-        // stack at STOP, so this fails the "exactly one list" rule instead.
+        // At the cap the depth check passes; the marks left at STOP fail "exactly one list".
         let err = read(&payload).expect_err("marks left on the stack must fail");
         assert!(!err.to_string().contains("nesting exceeds"), "at the cap, depth must not fire");
 
@@ -1036,9 +1002,8 @@ mod tests {
         assert!(err.to_string().contains("stack exceeds"), "{err}");
     }
 
-    /// A declared length far past the input must fail on a comparison, never on an allocation --
-    /// the property `crates/logit-proto/tests/robustness.rs` measures with a peak-allocation
-    /// counter, asserted here for the reject itself.
+    /// A declared length far past the input is rejected (`crates/logit-proto/tests/robustness.rs`
+    /// checks that the reject allocates nothing).
     #[test]
     fn an_inflated_string_length_is_rejected_before_anything_is_sized_from_it() {
         let mut payload = vec![OP_PROTO, 2, OP_BINUNICODE];
@@ -1074,13 +1039,10 @@ mod tests {
         assert!(err.to_string().contains("was never set"), "{err}");
     }
 
-    /// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` -- the exact 9-byte frame from the review
-    /// finding this test exists to close: a `LONG_BINPUT` key with nothing behind it in the memo
-    /// used to `resize` the memo to 500,000 slots (~8 MB of `Option<PValue>`) before failing later
-    /// (or not at all). Now the ordinal check in `memo_put` rejects it immediately, so the memo
-    /// never grows past what `EMPTY_LIST` itself put on the stack -- asserted at the byte-peak
-    /// level by `graphite_pickle_never_allocates_from_a_hostile_memo_key` in
-    /// `crates/logit-proto/tests/robustness.rs`.
+    /// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP`: a key that skips ahead is rejected by
+    /// `memo_put`'s ordinal check before the memo grows to ~8 MB. The allocation side is
+    /// `crates/logit-proto/tests/robustness.rs`'s
+    /// `graphite_pickle_never_allocates_from_a_hostile_memo_key`.
     #[test]
     fn a_memo_key_that_skips_ahead_is_rejected() {
         let payload = [OP_PROTO, 2, OP_EMPTY_LIST, OP_LONG_BINPUT, 0x1f, 0xa1, 0x07, 0x00, OP_STOP];
@@ -1088,11 +1050,7 @@ mod tests {
         assert!(err.to_string().contains("skips ahead"), "{err}");
     }
 
-    /// A key at or below the memo's current length is exactly what CPython's own pickler emits --
-    /// `BINPUT`/`LONG_BINPUT`/`MEMOIZE` only ever overwrite an existing slot or append the next
-    /// one. This drives a `BINPUT` at key 0 twice: once to memoize the path string (append), once
-    /// more after building the full tuple (overwrite) -- the datapoint must still decode correctly
-    /// even though its memo slot's value changed identity partway through.
+    /// Overwriting a memo slot (`BINPUT` 0 on the path, then again on the tuple) still decodes.
     #[test]
     fn a_memo_key_overwriting_an_existing_slot_still_decodes() {
         let payload = [
@@ -1133,9 +1091,7 @@ mod tests {
         assert_eq!(points, vec![point("a.b", 1.0, 1.0)]);
     }
 
-    /// The ordinary shape a real batch takes: each new memoized value's key is exactly the memo's
-    /// current length, via `LONG_BINPUT` specifically -- the same opcode the hostile frame above
-    /// abuses, shown here appending two slots in sequence rather than skipping ahead.
+    /// `LONG_BINPUT` appending slots in order, as a real batch does, is accepted.
     #[test]
     fn a_memo_key_appending_the_next_slot_still_decodes() {
         let payload = [
@@ -1230,10 +1186,8 @@ mod tests {
         );
     }
 
-    /// A CPython dump and this writer's output for the same datapoint decode to the same thing --
-    /// they are not byte-identical (CPython memoizes every string and uses `APPEND` for a
-    /// one-element list, this writer does neither), and they do not have to be. What matters is
-    /// that a carbon receiver reading either gets the same list.
+    /// A CPython dump and this writer's output decode the same, though the bytes differ (CPython
+    /// memoizes strings and uses `APPEND` for a one-element list).
     #[test]
     fn a_cpython_dump_and_our_writer_decode_identically() {
         let mut ours = Vec::new();
@@ -1244,8 +1198,8 @@ mod tests {
 
     #[test]
     fn a_long1_timestamp_matches_cpythons_own_minimal_encoding() {
-        // The five bytes CPython emits for 2**31 + 5: `LONG1`, length 5, then the minimal
-        // little-endian two's-complement magnitude with the leading `0x00` that keeps it positive.
+        // CPython's bytes for 2**31 + 5: `LONG1`, length 5, then the minimal little-endian
+        // magnitude with the `0x00` that keeps it positive.
         let mut out = Vec::new();
         write_int(&mut out, 2_147_483_653);
         assert_eq!(out, vec![OP_LONG1, 0x05, 0x05, 0x00, 0x00, 0x80, 0x00]);
@@ -1255,8 +1209,7 @@ mod tests {
         );
     }
 
-    /// The writer is a **ten-opcode** subset, and staying that way is what makes it reviewable
-    /// against carbon's unpickler. Disassembles its output and asserts the opcode set.
+    /// The writer emits only its **ten-opcode** subset.
     #[test]
     fn the_writer_emits_only_the_ten_permitted_opcodes() {
         const PERMITTED: [u8; 10] = [
@@ -1278,9 +1231,8 @@ mod tests {
             [("a.b", 1_700_000_000i64, 0.5f64), ("c.d", 2_147_483_653, -1.0)],
         );
 
-        // A miniature disassembler over exactly those ten -- walking operand widths rather than
-        // scanning for bytes, so an opcode byte appearing inside a string or a float can't be
-        // mistaken for an opcode (and an unexpected opcode can't hide behind one).
+        // Walks operand widths rather than scanning bytes, so an opcode-valued byte inside a
+        // string or float can't be mistaken for an opcode, or hide one.
         let mut at = 0usize;
         let mut seen = Vec::new();
         while at < payload.len() {
@@ -1329,10 +1281,8 @@ mod tests {
         assert_eq!(out.len() - before, TRAILER_BYTES);
     }
 
-    /// The reusable-state contract this module's doc claims: a second frame of the same shape
-    /// refills the reader's buffers without touching the allocator. Checked via capacity rather
-    /// than an allocation counter (this crate has none of its own -- `logit-bench` depends on it,
-    /// not the other way around).
+    /// A second frame of the same shape reuses the reader's buffers (checked by capacity; this
+    /// crate has no allocation counter).
     #[test]
     fn a_warm_reader_reuses_its_buffers() {
         let mut payload = Vec::new();

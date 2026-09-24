@@ -1,10 +1,9 @@
 //! Recorded interop fixtures: real remote-write requests a real Prometheus 3.14.0 `POST`ed,
 //! replayed through `logit_proto::prometheus::remote_write::decode`.
 //!
-//! **Real bytes from a real producer** -- not this codec's own encoder, which will happily agree
-//! with itself even where both sides share a misreading of the spec. `remote_write.rs` was written
-//! from the two remote-write specs and the vendored `prompb`; these fixtures are what checks that
-//! reading against the sender every deployment actually runs. See
+//! **Real bytes from a real producer** -- not this codec's own encoder, which agrees with itself
+//! even where both sides share a misreading of the spec. These fixtures check `remote_write.rs`'s
+//! reading of the specs and the vendored `prompb` against the sender deployments run. See
 //! `testdata/interop/prometheus/README.md` for the provenance table and
 //! `testdata/interop/README.md` for why this corpus exists at all; regenerate with
 //! `script/record-fixtures prometheus`.
@@ -13,25 +12,23 @@
 //! input component, unlike `crates/logit-inputs/src/{collectd,graphite,syslog}.rs`'s own
 //! `interop_fixture_*` tests. Two reasons: a remote-write body is only half of what arrived -- the
 //! wire version lives in the request's `Content-Type`, which the capture recorded in a `.headers`
-//! sidecar beside each body -- and `prometheus_in`'s receiver is a thin HTTP shell over exactly
-//! this call, with `crates/logit-cli/tests/prometheus_remote_write_round_trip.rs` already making
-//! the socket-level statement about that component.
+//! sidecar beside each body -- and `prometheus_in`'s receiver is a thin HTTP shell over this call,
+//! with `crates/logit-cli/tests/prometheus_remote_write_round_trip.rs` covering the socket level.
 //!
 //! Assertions are on **decoded, identifiable values** -- family names, types, series counts, what a
 //! request declared -- never on the fixture's bytes, which change on every re-record (timestamps,
-//! whatever Prometheus happened to have measured). That is `testdata/interop/README.md`'s
-//! "Consuming these fixtures" rule.
+//! whatever Prometheus measured). That is `testdata/interop/README.md`'s "Consuming these
+//! fixtures" rule.
 //!
-//! ## What this corpus turned up
+//! ## What the recorded sender does
 //!
-//! Two things worth knowing before reading the assertions, both recorded in the provenance README
-//! as well:
+//! Two facts to know before reading the assertions, both also in the provenance README:
 //!
 //! - **Prometheus 3.14.0's 1.0 sender attaches no metadata to a sample request at all.** Every
 //!   `prometheus-v1-*` sample capture decodes with zero declarations; the types arrive in
 //!   `prometheus-v1-metadata-*`, separate requests on `metadata_config.send_interval`'s own
-//!   ticker. That is precisely the case `prometheus_in`'s `metadata_cache:` exists for, and
-//!   [`recorded_metadata_types_a_recorded_sample_request`] is it, end to end, on real bytes.
+//!   ticker. That is the case `prometheus_in`'s `metadata_cache:` exists for, and
+//!   [`recorded_metadata_types_a_recorded_sample_request`] exercises it on real bytes.
 //! - **Its 2.0 sender attaches an *empty* `Metadata` to every series** -- `type: UNSPECIFIED`, no
 //!   help or unit reference -- in this topology. That held with and without
 //!   `--enable-feature=metadata-wal-records`, on the first request of a process's life and on its
@@ -102,7 +99,7 @@ fn read_capture(name: &str) -> Capture {
 /// What one capture decoded to: its groups flattened into one family list, what the request itself
 /// declared, and every `logit.input.metrics.{skipped,degraded}` reason the decode recorded. A
 /// conforming sender's request should produce none of the last: a reason there means this codec
-/// dropped or downgraded something Prometheus genuinely sent.
+/// dropped or downgraded something Prometheus sent.
 struct Replayed {
     families: Vec<MetricFamily>,
     declarations: Declarations,
@@ -161,12 +158,10 @@ fn all_captures() -> Vec<&'static str> {
 /// ones, because a remote-write series is a label set and a number and nothing else.
 ///
 /// Every suffixed name becomes a family of its own (the histogram's three, the summary's two) and
-/// the summary's `quantile` and the histogram's `le` stay ordinary labels: exactly the "the model
-/// kinds are flatter than the producer's" paragraph in [ADR `prometheus-remote-write`], stated
-/// against a real sender rather than against this codec's own encoder. **Flatter, and nothing
-/// else** -- every sample the request carried is in one of these eight, which is what that
-/// paragraph's "Nothing is lost" means and what the assembler's "only a *declared* base claims a
-/// suffix" rule is there to guarantee.
+/// the summary's `quantile` and the histogram's `le` stay ordinary labels: the "the model kinds are
+/// flatter than the producer's" paragraph in [ADR `prometheus-remote-write`], against a real
+/// sender. **Flatter, and nothing else** -- every sample the request carried is in one of these
+/// eight, which the assembler's "only a *declared* base claims a suffix" rule guarantees.
 ///
 /// [ADR `prometheus-remote-write`]: ../../../docs/adr/prometheus-remote-write.md
 const FLAT_SAMPLE_FAMILIES: [&str; 8] = [
@@ -180,18 +175,8 @@ const FLAT_SAMPLE_FAMILIES: [&str; 8] = [
     "prometheus_tsdb_wal_page_flushes_total",
 ];
 
-/// Every capture decodes -- nothing `Malformed`, nothing rejected -- and **nothing is skipped or
-/// degraded on the way**, which is the ADR's own claim about a metadata-less request: the model
-/// kinds come out flatter than the producer's, and that is the whole of it.
-///
-/// This assertion is the one the corpus was worth having for. Written against the codec as it
-/// stood when these fixtures were recorded, it read `["unknown_suffix"]` for every sample capture:
-/// with no metadata, `go_gc_duration_seconds{quantile=..}` opened the implicit family
-/// `go_gc_duration_seconds` (remote-write sorts its series by name, so the bare one always arrives
-/// first), and `go_gc_duration_seconds_sum`/`_count` were then matched against that implicit base
-/// by the suffix scan and thrown away, because no suffix has a role under an untyped family. Two
-/// real samples per scrape, from a real Prometheus. The fix is in the assembler -- only a
-/// *declared* base claims a suffix -- and this test is what holds it.
+/// Every capture decodes with nothing skipped or degraded, including the unseeded summary's
+/// `go_gc_duration_seconds_sum`/`_count` (`assemble.rs`'s "Only a declared base claims a suffix").
 #[test]
 fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
     for name in all_captures() {
@@ -221,8 +206,7 @@ fn every_recorded_request_decodes_with_nothing_skipped_or_degraded() {
     }
 }
 
-/// The wire version comes from the request's own `Content-Type`, with nothing configured -- which
-/// is exactly what `prometheus_in`'s receiver does, per request, on one `bind:`.
+/// The wire version comes from each capture's own `Content-Type`, as in `prometheus_in`'s receiver.
 #[test]
 fn the_recorded_content_types_select_the_wire_version() {
     for name in V1_SAMPLES.iter().chain(V1_METADATA.iter()) {
@@ -233,11 +217,7 @@ fn the_recorded_content_types_select_the_wire_version() {
     }
 }
 
-/// Both versions' sample requests decode to the same eight flat, untyped families -- the wire
-/// carries a label set and a number, and neither Prometheus 3.14.0 sender attached usable metadata
-/// to these requests (see this module's doc). A summary's `quantile` and a histogram's `le` survive
-/// as ordinary labels rather than being reassembled, and each suffixed name is its own family,
-/// because nothing in the request says which family any of them belongs to.
+/// Both versions' sample requests decode to the same eight flat, untyped families.
 #[test]
 fn a_recorded_sample_request_decodes_to_flat_untyped_families() {
     for name in V1_SAMPLES.iter().chain(V2_SAMPLES.iter()) {
@@ -273,10 +253,7 @@ fn a_recorded_sample_request_decodes_to_flat_untyped_families() {
     }
 }
 
-/// `instance`, `job` and Prometheus's own `external_labels` arrive as ordinary labels on every
-/// series and stay that way -- the ADR's "Labels stay labels" decision, checked against a real
-/// sender. A receiver never touched the target these name, so promoting one to resource identity
-/// would be inventing structure the wire did not carry.
+/// `instance`, `job` and `external_labels` stay ordinary labels (the ADR's "Labels stay labels").
 #[test]
 fn a_recorded_sample_request_carries_scrape_identity_as_ordinary_labels() {
     for name in V1_SAMPLES.iter().chain(V2_SAMPLES.iter()) {
@@ -295,9 +272,7 @@ fn a_recorded_sample_request_carries_scrape_identity_as_ordinary_labels() {
     }
 }
 
-/// The 1.0 shape the metadata cache exists for, recorded from the sender that produces it: a
-/// request that is metadata and nothing else. Decoded stateless it yields declarations and **no
-/// groups at all** -- there is nothing in it to turn into an event.
+/// A recorded 1.0 metadata-only request yields declarations and **no groups**.
 #[test]
 fn a_recorded_1_0_metadata_request_declares_families_with_no_groups() {
     let mut kinds = BTreeSet::new();
@@ -327,23 +302,14 @@ fn a_recorded_1_0_metadata_request_declares_families_with_no_groups() {
     );
 }
 
-/// The whole mechanism, on real bytes from both halves of one real sender: the declarations a
-/// recorded **metadata-only** request reported, used as the seed for a recorded **sample** request
-/// that carries none of its own, fold eight flat untyped families back into the four Prometheus
-/// meant.
+/// A recorded metadata request, as a seed, types a recorded sample request into the four families.
+/// The seed buys typing, never samples: the stateless decode already keeps every one.
 ///
-/// What the cache buys is **typing, never samples**. Stateless, the same request already decodes
-/// losslessly ([`every_recorded_request_decodes_with_nothing_skipped_or_degraded`]) -- it just
-/// decodes to eight flat families where the producer had four, with `quantile` and `le` sitting on
-/// the label set as ordinary labels and `_sum`/`_count` standing alone. The seed is what collapses
-/// them, gives each family its type, and moves `quantile`/`le` into the point.
-///
-/// The overlap between the two halves is guaranteed by the recipe rather than left to luck: the
-/// metadata capture scrapes a small static target declaring exactly these four families
-/// (`tools/record-fixtures/prometheus-metadata-target.prom`), because metadata is not subject to
-/// `write_relabel_configs` and a self-scrape would put several hundred families behind
-/// `metadata_config`'s ticker in map order. That is also why all three metadata captures fit in
-/// ~400 bytes each.
+/// The recipe guarantees the two halves overlap: the metadata capture scrapes a small static target
+/// declaring these four families (`tools/record-fixtures/prometheus-metadata-target.prom`), because
+/// metadata is not subject to `write_relabel_configs` and a self-scrape would put several hundred
+/// families behind `metadata_config`'s ticker in map order. That is also why all three metadata
+/// captures fit in ~400 bytes each.
 #[test]
 fn recorded_metadata_types_a_recorded_sample_request() {
     let mut seed = Declarations::default();
@@ -384,8 +350,7 @@ fn recorded_metadata_types_a_recorded_sample_request() {
         "the seed folds families together; it never adds any"
     );
 
-    // The summary really did reassemble, rather than merely being relabelled: its quantiles are
-    // part of the point now, not leftover labels.
+    // The summary reassembled rather than being relabelled: its quantiles are part of the point.
     let summary = seeded
         .families
         .iter()
