@@ -147,8 +147,8 @@ reviewer can check.
      nothing.
    - **Armed.** Rules live in one global `Mutex` registry, each scoped to a directory prefix.
      `fault::scope(dir)` returns a drop guard that removes its rules and recomputes `ARMED`. A
-     scope can fail the next or the nth hit of a `Point` with an errno, record every hit, or
-     crash at a hit.
+     scope can fail every hit or only the nth hit of a `Point` with an errno, record every hit,
+     or crash at the nth hit.
    - **Crash model: freeze.** At a crash point, the operation doesn't happen, and every later
      `check` under that scope returns an error until the test calls `revive()`. The test then
      drops the component, reopens it, and asserts. Given the call rule, the disk is exactly what a
