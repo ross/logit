@@ -81,6 +81,7 @@ Lua a scenario needs — validated the same way every other example config is.
 | `encode-human-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: human`) | The human-readable encoder in situ | 8M | ~1.23M/s |
 | `encode-native-devnull` | `generate_in` → `file_out` (`/dev/null`, `format: native`) | The native encoder in situ | 10M | ~1.41M/s |
 | `buffered` | `passthrough`'s graph with `buffer: { disk: ... }` on the sink | Disk-backed sink-buffer spool cost | 1.2M | ~0.71M/s (median; see note) |
+| `buffered-small-segments` | `buffered` with `segment_bytes: 1MiB` | Segment-roll cost (a durable cursor persist and an unlink per roll, ~70 per run), read against `buffered` | 1.2M | ~0.67M/s on `main` (`performance.md` §3) |
 | `route` | `passthrough`'s `generate_in` → `route` (by `host`) → 3 × `target` → 3 × `null_out`, plus an unrouted `null_out` | The router hop and `target` delivery, read against `passthrough` | 25M | ~3.15M/s |
 | `logfmt-parse` | `generate_in` (logfmt line, `fixtures::LOGFMT_LINE`) → `logfmt` → `null_out` | The logfmt parse alone; nine interner probes per event until `logfmt` adopts `KeyCache` | 9.5M | ~1.60M/s |
 | `json-parse-x3` | `json-parse`'s `generate_in` → 3 × `json` → 3 × `null_out` (no `kv_metrics`) | Three parsers contending on the process-wide interner at once, read against `json-parse` | 9.5M | ~1.44M/s (generated; each parsed 3×) |

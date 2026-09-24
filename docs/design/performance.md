@@ -510,6 +510,45 @@ What's left open is narrow: how much `DiskQueue::open`'s bounded active-segment 
 present, contributes to a *cleared* spool's remaining spread. On this evidence, not much.
 `perf/scenarios/buffered.yaml`'s comment and `docs/known-gaps.md`'s entry carry the same account.
 
+### Segment rolls: `buffered-small-segments` (2026-09-24)
+
+**A roll's durable cursor persist cost 16–27% of `buffered-small-segments`'s throughput while it
+ran on the sink task; `dur/w8` moves it to a worker thread.** `dur/w1` made every spool cursor
+persist durable (write, fsync, rename, directory fsync:
+[ADR `durable-checkpoint-writes-and-fault-injection`](../adr/durable-checkpoint-writes-and-fault-injection.md)),
+and `roll_read_cursor` ran it inline, then unlinked the segment the cursor left, on every segment
+roll. `main`'s roll was a plain write and rename. At `buffered`'s 64 MiB default a run rolls about
+once; `perf/scenarios/buffered-small-segments.yaml` is `buffered` with 1 MiB segments, so it rolls
+about 70 times per 1.2M-event run.
+
+`origin/main` (`16dd735`) against `origin/dur/w7` (`f2f4094`), `script/perf run --profile release`,
+three passes interleaved by binary on the VM. Pass 1 is `--repeat 3`; passes 2 and 3 are
+`--repeat 5`. Each cell is the pass's median.
+
+| Scenario | Pass | `main` events/s | `dur/w7` events/s | Δ events/s | `main` CPU µs/event | `dur/w7` CPU µs/event |
+|---|---|---:|---:|---:|---:|---:|
+| `buffered` | 1 | 791,362 | 770,616 | −2.6% | 1.693 | 1.727 |
+| `buffered` | 2 | 875,213 | 851,602 | −2.7% | 1.692 | 1.730 |
+| `buffered` | 3 | 880,437 | 848,812 | −3.6% | 1.692 | 1.729 |
+| `buffered-small-segments` | 1 | 687,849 | 578,911 | −15.8% | 1.716 | 1.753 |
+| `buffered-small-segments` | 2 | 671,681 | 492,597 | −26.7% | 1.719 | 1.757 |
+| `buffered-small-segments` | 3 | 659,760 | 480,663 | −27.1% | 1.715 | 1.756 |
+| `buffered` | `dur/w8` | *to be measured* | | | | |
+| `buffered-small-segments` | `dur/w8` | *to be measured* | | | | |
+
+- **`buffered`'s events/s delta is inside noise.** `main`'s own median moved 11% between passes 1
+  and 2.
+- **`buffered-small-segments` regressed on every pass,** and `compare` flagged each one.
+  `script/perf attribute` put the whole delta in `gen`'s time blocked in `send` (+0.63 s): wall
+  time waiting on the disk, not CPU. Each roll's persist took 5–10 ms on the VM's Azure Premium disk.
+- **CPU µs/event rose about 2% on both scenarios** (1.69 against 1.73 on `buffered`, under 1%
+  spread across 13 repeats each). That cost doesn't depend on rolls, and these runs don't explain
+  it.
+
+`dur/w8` keeps every persist durable but runs it, and the unlinks after it, on a per-spool worker
+thread, so `commit` never waits on the disk (the ADR's "Amendment: the spool persists its cursor on
+a worker thread"). Its rows above are filled from a VM run of the `dur/w8` branch.
+
 ## 4. Before/after: the regression workflow
 
 ```sh
