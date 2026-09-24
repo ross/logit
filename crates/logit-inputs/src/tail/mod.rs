@@ -1,17 +1,14 @@
-//! Generic file tailing: read one or more files line by line into log events -- rotation-,
-//! truncation-, and checkpoint-aware. [`TailInput`] (`tail_in`) is the plain "one line, one raw
-//! log event" listener; `crate::docker`'s `docker_in` builds on the same [`driver::Tailer`],
-//! swapping in a decoder for Docker's json-file envelope instead of [`line::LineDecoder`]'s bare
-//! line. See `docs/adr/file-tailing-and-docker-json-logs.md`.
+//! Rotation-, truncation-, and checkpoint-aware file tailing into log events. [`TailInput`]
+//! (`tail_in`) emits one raw log event per line; `crate::docker`'s `docker_in` runs the same
+//! [`driver::Tailer`] with a json-file envelope decoder in place of [`line::LineDecoder`]. See
+//! `docs/adr/file-tailing-and-docker-json-logs.md`.
 //!
-//! **No receive queue.** Every other listener in this crate decouples its socket read from its
-//! decode loop through a `ReceiveQueue` (`docs/adr/decoupled-listener-io.md`), because a kernel
-//! socket buffer can't be asked to wait. A tailed file is different: the file itself is already
-//! a durable, arbitrarily-large buffer, so there's nothing to protect against overflowing by
-//! dropping -- the read loop simply stops advancing when `Fanout::send` is slow, and resumes
-//! exactly where it left off once downstream has room again. `logit_pipeline::BatchAccumulator`
-//! is reused as-is for the decoded-events-\>batch half, one instance per tracked file; only the
-//! read/queue half genuinely differs from `crate::udp`.
+//! **No receive queue.** A datagram listener needs a `ReceiveQueue`
+//! (`docs/adr/decoupled-listener-io.md`) because a kernel socket buffer can't be asked to wait. A
+//! tailed file is already a durable buffer, so the read loop stops advancing while `Fanout::send`
+//! is slow and resumes at the same offset. Batch assembly still reuses
+//! `logit_pipeline::BatchAccumulator`, one per tracked file, configured from `receive:` through
+//! [`TailBatching`].
 
 mod checkpoint;
 mod driver;
@@ -22,9 +19,7 @@ mod watch;
 pub use line::{LineDecoder, TailDecoder};
 pub use pattern::PathPattern;
 
-// `pub(crate)`, not a private `use`: `crate::docker`'s `docker_in` builds on this same driver
-// (`docs/adr/file-tailing-and-docker-json-logs.md`), so both need to be reachable as
-// `crate::tail::{Tailer, DecoderFactory}` from outside this module, not just from within it.
+// `pub(crate)` so `crate::docker` can build `docker_in` on the same driver.
 pub(crate) use driver::{DecoderFactory, Refresh, Tailer};
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
@@ -33,11 +28,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch as shutdown_watch;
 
-/// Where a tailed file starts reading, the first time it's seen and no checkpoint entry names
-/// it. Mirrors `logit_config::ReadFrom` -- kept as its own copy rather than a dependency on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout: `logit-inputs` holds impls,
-/// not config types); `logit-cli::pipeline` converts between the two, the same pattern
-/// `logit_pipeline::OverflowPolicy` already follows for `receive:`.
+/// Where a newly seen file with no checkpoint entry starts reading.
+///
+/// A copy of `logit_config::ReadFrom`, because `logit-inputs` doesn't depend on `logit-config`
+/// (`docs/design/pipeline-graph.md`'s "Crate layout"); `logit-cli::pipeline` converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadFrom {
     #[default]
@@ -45,8 +39,7 @@ pub enum ReadFrom {
     Beginning,
 }
 
-/// Mirrors `logit_config::WatchMode` -- see [`ReadFrom`]'s doc comment for why this is its own
-/// copy.
+/// A copy of `logit_config::WatchMode`, for the reason [`ReadFrom`] gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WatchMode {
     #[default]
@@ -55,11 +48,11 @@ pub enum WatchMode {
     Poll,
 }
 
-/// The receive-side batch-assembly knobs a tailing listener's `receive:` block may set --
-/// everything `logit_config::ReceiveConfig` carries *except* the queue-bounding fields
-/// (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`), which have no meaning
-/// here (`docs/adr/file-tailing-and-docker-json-logs.md`; graph rule 17 rejects them on a tail
-/// listener). Mirrors `crate::udp::UdpListenerConfig`'s own subset of the same source config.
+/// The batch-assembly half of a tailing listener's `receive:` block.
+///
+/// `logit_config::ReceiveConfig`'s queue fields (`max_datagrams`, `max_bytes`, `overflow`,
+/// `receive_buffer_bytes`, `read_batch`) have no meaning without a receive queue; graph rule 17
+/// rejects them on a tail listener.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TailBatching {
     pub max_events: usize,
@@ -79,24 +72,22 @@ impl Default for TailBatching {
     }
 }
 
-/// A tailing listener's full runtime configuration -- built from `logit_config::TailOptions`
-/// (plus `receive:`) by `logit-cli::pipeline`, mirroring `UdpListenerConfig`'s own role for the
-/// datagram listeners.
+/// A tailing listener's runtime configuration, built by `logit-cli::pipeline` from
+/// `logit_config::TailOptions` plus `receive:`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailConfig {
-    /// `None` -- the default -- means no checkpoint at all: every restart re-applies
-    /// `read_from` to every file as if newly discovered.
+    /// `None` (the default) means no checkpoint: every restart applies `read_from` to every file.
     pub checkpoint_path: Option<PathBuf>,
     pub read_from: ReadFrom,
     pub watch: WatchMode,
-    /// The read/rescan cadence used as-is under `WatchMode::Poll`, and as a reconciliation pass
-    /// under `Inotify`/`Auto`. Never disabled -- rejected at `0s` by graph validation.
+    /// The read/rescan cadence under `WatchMode::Poll`, and the reconciliation pass under
+    /// `Inotify`/`Auto`. Never disabled: graph validation rejects `0s`.
     pub poll_interval: Duration,
-    /// How long a dirty checkpoint may sit before being flushed, in addition to being flushed on
-    /// every file close and on shutdown. Rejected at `0s` by graph validation.
+    /// How long a dirty checkpoint may wait before it's written. It's also written on every file
+    /// close and on shutdown. Graph validation rejects `0s`.
     pub checkpoint_interval: Duration,
-    /// A line longer than this is dropped whole (not truncated) and diagnosed. Rejected at `0`
-    /// by graph validation.
+    /// A longer line is dropped whole (not truncated) and diagnosed. Graph validation rejects
+    /// `0`.
     pub max_line_bytes: usize,
     pub batching: TailBatching,
 }
@@ -115,8 +106,7 @@ impl Default for TailConfig {
     }
 }
 
-/// `tail_in`: tails a fixed set of file path patterns, one line -\> one raw log event
-/// ([`LineDecoder`]).
+/// `tail_in`: tails a fixed set of path patterns, one raw log event per line ([`LineDecoder`]).
 pub struct TailInput {
     inner: Tailer<LineDecoder, LineDecoderFactory>,
 }
@@ -154,7 +144,7 @@ impl TailInput {
         self
     }
 
-    /// The currently-configured knobs -- test introspection, mirroring `UdpListener::config`.
+    /// The configured knobs, for test introspection.
     pub fn config(&self) -> &TailConfig {
         self.inner.config()
     }
@@ -180,10 +170,7 @@ impl logit_pipeline::Input for TailInput {
     }
 }
 
-/// Scratch-directory helpers shared by every test module under `tail/` -- this crate has no
-/// `tempfile` dependency (`docs/adr/file-tailing-and-docker-json-logs.md`'s Alternatives), so
-/// tests build and tear down their own unique temp directories by hand, following
-/// `crates/logit-cli/src/pipeline.rs`'s own `std::env::temp_dir()`-based test precedent.
+/// Unique scratch directories for the `tail/` tests; this crate has no `tempfile` dependency.
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::PathBuf;
