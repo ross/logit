@@ -1,14 +1,15 @@
-//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus}/generated/`. Not a workspace
-//! member and not a build-time dependency (see `docs/adr/committed-pregenerated-otlp-protobuf.md`)
-//! -- run via `script/protogen`, inside a throwaway image with `protoc` installed, then review the
-//! diff and commit the result by hand. Messages only, no service stubs: hand-rolled transports
-//! (OTLP's gRPC/HTTP, Prometheus remote-write's HTTP) send/receive these bytes directly.
+//! One-shot generator for `crates/logit-proto/src/{otlp,prometheus,datadog}/generated/`. Not a
+//! workspace member and not a build-time dependency (see
+//! `docs/adr/committed-pregenerated-otlp-protobuf.md`) -- run via `script/protogen`, inside a
+//! throwaway image with `protoc` installed, then review the diff and commit the result by hand.
+//! Messages only, no service stubs: hand-rolled transports (OTLP's gRPC/HTTP, Prometheus
+//! remote-write's HTTP, the Datadog Agent intake's HTTP) send/receive these bytes directly.
 //!
-//! Two independent proto families, each generated from its own vendored `.proto` sources
-//! (`crates/logit-proto/proto/README.md` has the pinned tag/commit for both) into its own
-//! `generated/` directory. Regenerating one family never touches the other's committed output --
-//! `script/protogen` regenerates both every run, and `git diff --stat` after a run should show
-//! changes only under the family whose `.proto` sources actually moved.
+//! Three independent proto families, each generated from its own vendored `.proto` sources
+//! (`crates/logit-proto/proto/README.md` has the pinned tag/commit for all three) into its own
+//! `generated/` directory. Regenerating one family never touches another's committed output --
+//! `script/protogen` regenerates all three every run, and `git diff --stat` after a run should
+//! show changes only under the family whose `.proto` sources actually moved.
 
 use std::collections::HashSet;
 use std::fs;
@@ -94,6 +95,26 @@ const FAMILIES: &[Family] = &[
             ),
         ],
         dest: "crates/logit-proto/src/prometheus/generated",
+        rename: identity,
+    },
+    Family {
+        // `agent_payload.proto`'s `import
+        // "github.com/gogo/protobuf/gogoproto/gogo.proto"` resolves against the `datadog/include`
+        // root, which holds a relative symlink to the one vendored `gogoproto/gogo.proto` at that
+        // Go-style import path (rather than a second copy) -- see
+        // `crates/logit-proto/proto/README.md`'s Datadog section. `/usr/include` is still needed
+        // for `gogo.proto`'s own `import "google/protobuf/descriptor.proto"`, same as the
+        // Prometheus family above.
+        includes: &[
+            "crates/logit-proto/proto/datadog/agent-payload/proto",
+            "crates/logit-proto/proto/datadog/include",
+            "/usr/include",
+        ],
+        files: &[(
+            "crates/logit-proto/proto/datadog/agent-payload/proto/metrics/agent_payload.proto",
+            "datadog.agentpayload.rs",
+        )],
+        dest: "crates/logit-proto/src/datadog/generated",
         rename: identity,
     },
 ];

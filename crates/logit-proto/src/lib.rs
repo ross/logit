@@ -8,6 +8,7 @@
 
 pub mod buffer;
 pub mod collectd;
+pub mod datadog;
 pub mod frame;
 pub mod graphite;
 pub mod msgbuf;

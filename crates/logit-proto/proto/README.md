@@ -108,3 +108,39 @@ diff and commit it by hand. To bump the vendored version: update the tag/commit 
 file from `https://raw.githubusercontent.com/prometheus/prometheus/<tag>/prompb/...` (and
 `gogoproto/gogo.proto` from `https://raw.githubusercontent.com/gogo/protobuf/<commit>/gogoproto/gogo.proto`
 if it has moved), run `script/protogen`, and review both diffs together.
+
+## Vendored Datadog agent-payload `.proto` sources
+
+Fetched verbatim (no local edits) from
+[`DataDog/agent-payload`](https://github.com/DataDog/agent-payload) at:
+
+- **Tag:** `v5.0.211`
+- **Commit:** `9584637d1527d2e12d4678372e11a4082f9980af`
+
+File vendored under `datadog/agent-payload/proto/`:
+
+```
+metrics/agent_payload.proto
+```
+
+`agent_payload.proto` (package `datadog.agentpayload`) `import
+"github.com/gogo/protobuf/gogoproto/gogo.proto"`s using a Go-style import path rather than a
+relative one. `tools/protogen`'s Datadog family resolves that against a second include root,
+`crates/logit-proto/proto/datadog/include/`, which holds nothing but a relative symlink --
+`datadog/include/github.com/gogo/protobuf/gogoproto/gogo.proto ->
+../../../../../../gogoproto/gogo.proto` -- pointing back at the one vendored `gogoproto/gogo.proto`
+Prometheus's family already vendors (see above), so there is exactly one copy of that file in the
+repo regardless of how many families import it. A symlink is preferred over a second copy on
+purpose; if a future `protoc`/environment refuses to follow it, fall back to a real copy under that
+same path and note it here. `/usr/include` is still needed as a third include root, same reason as
+Prometheus's: `gogo.proto`'s own `import "google/protobuf/descriptor.proto"`. The only gogoproto
+extension the vendored file uses is `(gogoproto.nullable) = false` (on `SketchPayload`'s `sketches`/
+`metadata` fields and `Sketch`'s `distributions`/`dogsketches` fields) -- a no-op for `prost`, same
+as the prompb files above.
+
+Regenerating this family works the same way as OTLP's and Prometheus's above: `script/protogen`
+overwrites `crates/logit-proto/src/datadog/generated/datadog.agentpayload.rs`; review the diff and
+commit it by hand. To bump the vendored version: update the tag/commit above, re-fetch
+`metrics/agent_payload.proto` from
+`https://raw.githubusercontent.com/DataDog/agent-payload/<tag>/proto/metrics/agent_payload.proto`,
+run `script/protogen`, and review both diffs together.
