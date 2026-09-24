@@ -217,7 +217,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | findings → libc/w3 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs:229-321` | unreviewed |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs:325-346` | unreviewed |
-| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | in-progress (dur/w1) |
+| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | findings → #324 |
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | in-progress (dur/w4) |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
@@ -488,7 +488,7 @@ All line numbers verified against the worktree at
     `*shutdown.borrow()` check. The two drivers reach the same behavior by different means; worth
     confirming the UDP side really is immune (it compiles, so it is — but the asymmetry suggests one
     of the two comments is imprecise).
-- **Existing coverage:** `udp.rs` tests `shutdown_drains_the_queue_and_delivers_every_already_queued_datagram`
+- **Existing coverage:** `udp.rs` tests `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing`
   (1400), `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered` (1514),
   `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue` (2488),
   `a_block_queue_smaller_than_the_read_batch_still_delivers_every_datagram` (2557),
@@ -1992,6 +1992,10 @@ surveyor's.
     the ADR's durability claim doesn't cover it.
   - A persistently failing `persist_cursor` is only `warn_throttled` — replay grows without bound and nothing
     counts it. Low-medium.
+  - *Closed by #324:* both `persist_cursor` concerns above. The cursor now goes through
+    `atomic_write::write_file_durably` (tmp `fsync`, rename, directory `fsync`), and every failure counts
+    `buffer.disk.errors{op="cursor"}` (`a_cursor_persist_is_fsynced_before_its_rename_and_the_directory_after`,
+    `a_persistently_failing_cursor_write_is_counted_every_time`). The rest of this entry is `dur/w3`'s.
   - `list_segments` (`:121-125`) silently skips anything not matching the pattern, including a file whose seq
     parses but whose name isn't zero-padded; harmless today but the sort is on the parsed `u64`, not the name, so
     keep that the invariant.
@@ -2149,6 +2153,13 @@ surveyor's.
   reordering) to confirm only the active segment's tail can be lost.
 - **Priority:** P1 — the policy is documented and the loss window is accepted, but the silent failure of every
   fsync/create means a real durability regression would be invisible.
+- **Verified 2026-09-24** (#324): both concerns confirmed and fixed. Every rotation, `finish`, and unlink
+  fs call is now preceded by a `logit_pipeline::fault` check, and `disk_queue.rs`'s tests inject `EIO`/`ENOSPC`/
+  `EACCES` at each one and assert `logit.component.buffer.disk.errors{op}` plus a `disk_fs_error` diagnostic
+  (`a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed`, `a_failed_directory_fsync_is_counted`,
+  `a_failed_segment_unlink_is_counted`); `a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation`
+  confirms the self-heal. The fresh-fd `sync_data` holds (Linux `fsync(2)` flushes the inode, not the fd); moving it
+  to the retained write handle is `dur/w4`.
 
 ---
 

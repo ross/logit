@@ -383,9 +383,9 @@ already shipped:
 
 - The semantic mapping between the wire and the model already lives behind `MetricFamily`
   (`logit_proto::prometheus::mod`), independent of the text syntax that `text.rs` implements over
-  it. A future `remote_write.rs` maps prompb messages to and from the same `MetricFamily` type, so
-  none of the "Model mapping" tables above change when remote-write lands — only a second syntax
-  module is added beside `text.rs`.
+  it. `remote_write.rs`, added by [ADR `prometheus-remote-write`](prometheus-remote-write.md), maps
+  prompb messages to and from the same `MetricFamily` type, so none of the "Model mapping" tables
+  above changed when remote-write landed — only a second syntax module beside `text.rs`.
 - `prometheus_in` gains an optional `bind:` field (a remote-write receiver) on the same
   `ComponentKind::PrometheusIn` variant, with a graph rule requiring exactly one of `scrape_targets`/
   `bind` to be set. `prometheus_out` gains an optional `endpoint:` field (a remote-write sender)

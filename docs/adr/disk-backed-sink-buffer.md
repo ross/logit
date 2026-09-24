@@ -257,3 +257,32 @@ a longer outage only for faults the posture retries: an `at_most_once` sink drop
 first ambiguous failure, with no budget spent.
 [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
 records this as its decision 7.
+
+## Amendment: cursor writes are fsynced and every fsync is observed (2026-09-24)
+
+The "Durability" section above says `fdatasync` runs "on the cursor file". In the code, only
+`finish` did that: an ordinary cursor persist was `write(tmp)` + `rename` with no `fsync` at all,
+so after a power loss the rename could land ahead of the bytes it names. Every segment `fsync`,
+rotation `create`, and segment unlink also discarded its result, so a failing disk was invisible.
+
+**Every cursor write is now durable.** `persist_cursor` goes through
+`crate::atomic_write::write_file_durably`: write `cursor.json.tmp`, `fsync` it, rename it over
+`cursor.json`, `fsync` the directory. It still runs synchronously inside `commit`, as before, now
+with two `fsync`s, but outside the state lock, so it never stalls a concurrent `push` or `peek`. A
+small mutex serializes concurrent persists (the consumer's `commit` and a `DropOldest` producer's
+eviction), so the cursor on disk never moves backward. A roll's persist completes before any
+segment it left is unlinked. The cost is bounded by `checkpoint_interval` plus one persist per
+segment roll.
+
+**Every filesystem failure on the spool is counted and diagnosed.** A failed cursor write, segment
+flush, segment or directory `fsync`, rotation `create`, or segment unlink counts
+`logit.component.buffer.disk.errors{op}` (`op` is `cursor`, `flush`, `fsync`, `create`, or
+`unlink`; `truncate` is reserved for the torn-tail repair). A cursor failure is diagnosed under
+`cursor_error`, the rest under `disk_fs_error`. None of them stops the queue. A failed cursor write
+leaves the previous cursor, so its cost is replay, never loss. A failed rotation `create` leaves
+the active segment in place, and the next push retries the rotation.
+
+Segment durability is unchanged: a segment is `fsync`ed when it rotates away and at shutdown, never
+per push. Each of these operations is preceded by a `logit_pipeline::fault` check, so tests can fail
+or freeze it; see ADR
+[`durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md).

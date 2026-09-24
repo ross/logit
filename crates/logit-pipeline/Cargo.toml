@@ -25,6 +25,11 @@ serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 
+[features]
+# Arms the fault-injection seam (`src/fault.rs`) outside this crate's own tests. Only ever a
+# dev-dependency feature: `script/lint` fails if `logit-cli`'s normal dependency graph enables it.
+fault-injection = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads: Linux-only socket
 # options, so a Linux-only dependency.

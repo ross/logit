@@ -276,15 +276,9 @@ async fn openmetrics_only_types_down_convert_when_served_as_text() {
 /// `prometheus-scrape-and-exposition`'s "Temporality is `aggregate`'s job" section.
 #[tokio::test]
 async fn statsd_through_cumulative_aggregate_renders_a_cumulative_counter_with_created() {
-    // Reserves an ephemeral port by bind-drop-rebind, as `otlp_round_trip.rs`'s
-    // `ephemeral_addr()` does for TCP. `StatsdInput::local_addr` after `bind()` would avoid the
-    // race.
-    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-
-    let mut input = StatsdInput::new(addr.to_string());
+    let mut input = StatsdInput::new("127.0.0.1:0");
     input.bind().await.expect("binding statsd_in");
+    let addr = input.local_addr().expect("bind() should leave a real address behind");
     let (tx, mut rx) = mpsc::channel(16);
     let sink = Fanout::new(vec![tx]);
     tokio::spawn(async move {

@@ -49,6 +49,8 @@ tracing.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Arms `logit_pipeline::fault` in this crate's tests. Dev-only, so the release binary never has it.
+logit-pipeline = { workspace = true, features = ["fault-injection"] }
 # `prometheus_in`'s receiver tests hand-build a remote-write 1.0 request with no `metadata[]`:
 # the shape a real Prometheus sends, which `remote_write::encode` never produces.
 prost.workspace = true

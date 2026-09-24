@@ -7,7 +7,8 @@
 //! **On-disk layout.** `<dir>/` holds:
 //!
 //! - `segment-<seq:016>.lgit` files, each a plain concatenation of records, oldest lowest.
-//! - `cursor.json`, the read cursor (segment and byte offset), written tmp+rename.
+//! - `cursor.json`, the read cursor (segment and byte offset), written through
+//!   [`crate::atomic_write::write_file_durably`]: tmp, `fsync`, rename, directory `fsync`.
 //! - `lock`, held with `std::fs::File::try_lock` for the queue's lifetime. The OS releases it on
 //!   any exit, `SIGKILL` included, so a restart needs no stale-lock cleanup.
 //!
@@ -23,10 +24,18 @@
 //! active segment can have a torn tail.
 //!
 //! **`commit` is synchronous**, like `SinkQueue::commit`: it mutates in-memory cursor state and
-//! occasionally makes one small blocking cursor write and one file deletion, never a segment read
-//! or write.
+//! occasionally makes one small blocking cursor write (with two `fsync`s) and one file deletion,
+//! never a segment read or write.
+//!
+//! **Filesystem failures are observed.** A failed cursor write, segment `create`, `flush`,
+//! `fsync`, or unlink counts `logit.component.buffer.disk.errors{op}` and is diagnosed
+//! (`cursor_error` for the cursor, `disk_fs_error` for the rest). Each mutating operation is
+//! preceded by a [`crate::fault`] check, so tests can fail or freeze it. The one exception to
+//! both is the torn-tail repair's `set_len` in `write_record`, which is still unchecked and
+//! unobserved.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,7 +47,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::atomic_write::{self, AtomicWriteError};
 use crate::fanout::{BatchContext, TraceContext};
+use crate::fault::{sites, Op, Point};
+use crate::fault_io;
 use crate::queue::{OverflowPolicy, SINK_QUEUE_METRICS};
 use logit_core::{Diagnostics, EventBatch, Provenance, Telemetry};
 use logit_proto::frame::{self, Compression, MAX_SANE_UNCOMPRESSED_LEN};
@@ -64,6 +76,18 @@ const READ_CHUNK_INITIAL: usize = 8 * 1024;
 const DISK_SEGMENTS: &str = "logit.component.buffer.disk.segments";
 const DISK_REPLAYED: &str = "logit.component.buffer.disk.replayed";
 const DISK_TRUNCATED: &str = "logit.component.buffer.disk.truncated";
+/// Tagged `op`: `cursor`, `flush`, `fsync`, `create`, or `unlink`.
+const DISK_ERRORS: &str = "logit.component.buffer.disk.errors";
+
+const SEGMENT_CREATE: Point = Point::new(sites::SPOOL_SEGMENT, Op::Create);
+const SEGMENT_OPEN: Point = Point::new(sites::SPOOL_SEGMENT, Op::Open);
+const SEGMENT_WRITE: Point = Point::new(sites::SPOOL_SEGMENT, Op::Write);
+const SEGMENT_FLUSH: Point = Point::new(sites::SPOOL_SEGMENT, Op::Flush);
+const SEGMENT_SET_LEN: Point = Point::new(sites::SPOOL_SEGMENT, Op::SetLen);
+const SEGMENT_SYNC: Point = Point::new(sites::SPOOL_SEGMENT, Op::SyncFile);
+const SEGMENT_UNLINK: Point = Point::new(sites::SPOOL_SEGMENT, Op::Unlink);
+const DIR_CREATE: Point = Point::new(sites::SPOOL_DIR, Op::Create);
+const DIR_SYNC: Point = Point::new(sites::SPOOL_DIR, Op::SyncDir);
 
 /// Bounds and behavior for one sink's disk spool. Disk replaces the in-memory queue, so there is
 /// no `max_batches`: `max_bytes` alone bounds the sum of segment sizes.
@@ -256,22 +280,26 @@ fn load_cursor(dir: &Path, diag: &mut Diagnostics) -> Option<(u64, u64)> {
     }
 }
 
-/// Persists the read cursor via tmp+rename.
-fn persist_cursor(dir: &Path, segment: u64, offset: u64, diag: &mut Diagnostics) {
-    let path = dir.join(CURSOR_FILE_NAME);
+/// Persists the read cursor through [`atomic_write::write_file_durably`]: two `fsync`s, so never
+/// call it holding the state lock. On failure the previous cursor stays in place (unless only the
+/// directory `fsync` failed), so the cost is replay, never loss. Callers report a failure with
+/// [`report_cursor_error`].
+fn persist_cursor(dir: &Path, segment: u64, offset: u64) -> Result<(), AtomicWriteError> {
     let doc = CursorFile { version: CURSOR_VERSION, segment, offset };
-    let bytes = match serde_json::to_vec(&doc) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            diag.warn_throttled("cursor_error", format!("encoding cursor: {err}"));
-            return;
-        }
-    };
-    let tmp = path.with_extension("tmp");
-    let result = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(err) = result {
-        diag.warn_throttled("cursor_error", format!("writing cursor {}: {err}", path.display()));
-    }
+    let bytes = serde_json::to_vec(&doc).expect("a CursorFile of plain integers always serializes");
+    atomic_write::write_file_durably(&dir.join(CURSOR_FILE_NAME), &bytes, sites::SPOOL_CURSOR)
+}
+
+/// Counts (`op="cursor"`) and diagnoses (`cursor_error`) a failed [`persist_cursor`].
+fn report_cursor_error(
+    err: &AtomicWriteError,
+    dir: &Path,
+    diag: &mut Diagnostics,
+    telemetry: &Telemetry,
+) {
+    telemetry.count(DISK_ERRORS, 1.0, &[("op", "cursor")]);
+    let path = dir.join(CURSOR_FILE_NAME);
+    diag.warn_throttled("cursor_error", format!("writing cursor {}: {err}", path.display()));
 }
 
 async fn fsync_path(path: &Path) -> io::Result<()> {
@@ -331,6 +359,9 @@ pub struct DiskQueue {
     compression: Compression,
     checkpoint_interval: Duration,
     inner: Mutex<State>,
+    /// Held across a cursor write (see [`DiskQueue::checkpoint_cursor`]). Always taken before
+    /// `inner`, never while holding it.
+    cursor_write: Mutex<()>,
     not_empty: tokio::sync::Notify,
     not_full: tokio::sync::Notify,
     closed: AtomicBool,
@@ -353,16 +384,17 @@ impl DiskQueue {
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
 
-        std::fs::create_dir_all(&config.dir)
+        fault_io!(DIR_CREATE, &config.dir, 0, std::fs::create_dir_all(&config.dir))
             .with_context(|| format!("creating disk buffer directory {}", config.dir.display()))?;
 
         let lock_path = config.dir.join(LOCK_FILE_NAME);
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("opening lock file {}", lock_path.display()))?;
+        let lock_file = fault_io!(
+            DIR_CREATE,
+            &lock_path,
+            0,
+            std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path)
+        )
+        .with_context(|| format!("opening lock file {}", lock_path.display()))?;
         match lock_file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -384,7 +416,7 @@ impl DiskQueue {
 
         let (segments, read_seq, read_offset): (VecDeque<Segment>, u64, u64) = if seqs.is_empty() {
             let path = segment_path(&config.dir, 0);
-            std::fs::File::create(&path)
+            fault_io!(SEGMENT_CREATE, &path, 0, std::fs::File::create(&path))
                 .with_context(|| format!("creating segment {}", path.display()))?;
             (VecDeque::from([Segment { seq: 0, len: 0 }]), 0, 0)
         } else {
@@ -400,13 +432,16 @@ impl DiskQueue {
                         .with_context(|| format!("reading segment {}", path.display()))?;
                     let outcome = walk_segment(&bytes, 0, |_, _, _, _| {});
                     if outcome.good_len < on_disk_len {
-                        std::fs::File::options()
-                            .write(true)
-                            .open(&path)
-                            .and_then(|f| f.set_len(outcome.good_len))
-                            .with_context(|| {
-                                format!("truncating torn segment {}", path.display())
-                            })?;
+                        fault_io!(
+                            SEGMENT_SET_LEN,
+                            &path,
+                            seq,
+                            std::fs::File::options()
+                                .write(true)
+                                .open(&path)
+                                .and_then(|f| f.set_len(outcome.good_len))
+                        )
+                        .with_context(|| format!("truncating torn segment {}", path.display()))?;
                         truncated = true;
                     }
                     segments.push_back(Segment { seq, len: outcome.good_len });
@@ -484,8 +519,11 @@ impl DiskQueue {
             telemetry.count(DISK_REPLAYED, replayed as f64, &[]);
         }
 
-        // Persist any clamping above, regardless of `checkpoint_interval`.
-        persist_cursor(&config.dir, read_seq, read_offset, &mut diag);
+        // Persist any clamping above, regardless of `checkpoint_interval`. A failure isn't fatal:
+        // the next open recomputes the same clamp.
+        if let Err(err) = persist_cursor(&config.dir, read_seq, read_offset) {
+            report_cursor_error(&err, &config.dir, &mut diag, &telemetry);
+        }
 
         let total_bytes: u64 = segments.iter().map(|s| s.len).sum();
         let segment_count = segments.len();
@@ -515,6 +553,7 @@ impl DiskQueue {
             compression: config.compression,
             checkpoint_interval: config.checkpoint_interval,
             inner: Mutex::new(state),
+            cursor_write: Mutex::new(()),
             not_empty: tokio::sync::Notify::new(),
             not_full: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -537,6 +576,14 @@ impl DiskQueue {
     fn count_dropped(&self, reason: &'static str, units: u64) {
         self.telemetry.count(SINK_QUEUE_METRICS.items_dropped, 1.0, &[("reason", reason)]);
         self.telemetry.count(SINK_QUEUE_METRICS.units_dropped, units as f64, &[("reason", reason)]);
+    }
+
+    /// Counts and diagnoses a failed non-cursor filesystem operation. Takes the state lock, so
+    /// never call it while holding one.
+    fn count_fs_error(&self, op: &'static str, what: fmt::Arguments<'_>, err: &io::Error) {
+        self.telemetry.count(DISK_ERRORS, 1.0, &[("op", op)]);
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.diag.warn_throttled("disk_fs_error", format!("{what}: {err}"));
     }
 
     fn after_change(&self) {
@@ -762,9 +809,9 @@ impl DiskQueue {
         // buffer; `flush()` hands them to the kernel. Without it, a batch counted as queued is
         // lost on an ordinary process crash, not only on power loss. A failed flush is repaired
         // like a failed write.
-        let mut result = file.write_all(record).await;
+        let mut result = fault_io!(SEGMENT_WRITE, &self.dir, seq, file.write_all(record).await);
         if result.is_ok() {
-            result = file.flush().await;
+            result = fault_io!(SEGMENT_FLUSH, &self.dir, seq, file.flush().await);
         }
 
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -784,34 +831,49 @@ impl DiskQueue {
     }
 
     async fn open_append(&self, seq: u64) -> io::Result<tokio::fs::File> {
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(segment_path(&self.dir, seq))
-            .await
+        let path = segment_path(&self.dir, seq);
+        fault_io!(
+            SEGMENT_OPEN,
+            &path,
+            seq,
+            tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await
+        )
     }
 
     /// Closes out the active segment (flush and `fsync` it, `fsync` the directory after creating
-    /// the next) and starts a new one.
+    /// the next) and starts a new one. Each failure is counted and diagnosed. A failed flush or
+    /// `fsync` doesn't stop the rotation. A failed `create` leaves `segments` unchanged, so the
+    /// next push appends to the old segment and retries.
     async fn rotate_segment(&self) {
         let (old_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let old_seq = state.segments.back().expect("always at least one segment").seq;
             (old_seq, state.write_file.take())
         };
+        let old_path = segment_path(&self.dir, old_seq);
         // Flush after the guard drops: awaiting under a `std::sync::Mutex` guard trips
         // `clippy::await_holding_lock`.
         if let Some(mut f) = file {
-            let _ = f.flush().await;
+            if let Err(err) = fault_io!(SEGMENT_FLUSH, &old_path, old_seq, f.flush().await) {
+                self.count_fs_error("flush", format_args!("flushing segment {old_seq}"), &err);
+            }
         }
-        let _ = fsync_path(&segment_path(&self.dir, old_seq)).await;
+        if let Err(err) = fault_io!(SEGMENT_SYNC, &old_path, old_seq, fsync_path(&old_path).await) {
+            self.count_fs_error("fsync", format_args!("syncing segment {old_seq}"), &err);
+        }
         let new_seq = old_seq + 1;
         let new_path = segment_path(&self.dir, new_seq);
-        if tokio::fs::File::create(&new_path).await.is_ok() {
-            let _ = fsync_path(&self.dir).await;
-            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            state.segments.push_back(Segment { seq: new_seq, len: 0 });
+        let created =
+            fault_io!(SEGMENT_CREATE, &new_path, new_seq, tokio::fs::File::create(&new_path).await);
+        if let Err(err) = created {
+            self.count_fs_error("create", format_args!("creating segment {new_seq}"), &err);
+            return;
         }
+        if let Err(err) = fault_io!(DIR_SYNC, &self.dir, new_seq, fsync_path(&self.dir).await) {
+            self.count_fs_error("fsync", format_args!("syncing {}", self.dir.display()), &err);
+        }
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.segments.push_back(Segment { seq: new_seq, len: 0 });
     }
 
     /// `DropOldest` under a full queue: advances the read cursor past the head record without
@@ -933,9 +995,10 @@ impl DiskQueue {
     /// `read_seq` once a later `push` rotates that segment away, and `peek` would wait on
     /// `not_empty` forever against a segment that never grows again.
     ///
-    /// Persists the cursor once per roll, then deletes files and notifies `not_full` outside the
-    /// lock. Allocates nothing when no boundary is crossed. Returns whether the cursor now points
-    /// at readable bytes.
+    /// After a roll, and outside the lock, persists the cursor, then deletes the segments it left
+    /// and notifies `not_full`. The cursor is durable before any segment it left is unlinked.
+    /// Allocates nothing when no boundary is crossed. Returns whether the cursor now points at
+    /// readable bytes.
     fn roll_read_cursor(&self) -> bool {
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut to_delete: Vec<u64> = Vec::new();
@@ -958,8 +1021,6 @@ impl DiskQueue {
         }
 
         if !to_delete.is_empty() {
-            persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
-            state.last_checkpoint = Instant::now();
             for &seq in &to_delete {
                 if let Some(pos) = state.segments.iter().position(|s| s.seq == seq) {
                     if let Some(removed) = state.segments.remove(pos) {
@@ -982,8 +1043,13 @@ impl DiskQueue {
         // The no-crossing case must not allocate: it is on `peek`'s cached-hit path
         // (`disk_queue_peek_cached_costs_nothing`).
         if !to_delete.is_empty() {
+            self.checkpoint_cursor();
             for seq in to_delete {
-                let _ = std::fs::remove_file(segment_path(&self.dir, seq));
+                let path = segment_path(&self.dir, seq);
+                if let Err(err) = fault_io!(SEGMENT_UNLINK, &path, seq, std::fs::remove_file(&path))
+                {
+                    self.count_fs_error("unlink", format_args!("deleting segment {seq}"), &err);
+                }
             }
             self.not_full.notify_one();
         }
@@ -1000,10 +1066,33 @@ impl DiskQueue {
             state.read_offset += record_len;
         }
         self.roll_read_cursor();
+        let due = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.last_checkpoint.elapsed() >= self.checkpoint_interval
+        };
+        if due {
+            self.checkpoint_cursor();
+        }
+    }
+
+    /// Persists the current read cursor, records the checkpoint time, and reports a failure. The
+    /// write runs outside the state lock, so its two `fsync`s never stall a `push` or `peek`.
+    ///
+    /// `cursor_write` serializes concurrent calls (the consumer's `commit`, and a `DropOldest`
+    /// producer's roll or eviction), and each reads the cursor only once the previous write has
+    /// finished. The cursor only moves forward, so what lands on disk never moves backward, and a
+    /// roll's call persists a cursor at or past the one it computed.
+    fn checkpoint_cursor(&self) {
+        let _serial = self.cursor_write.lock().unwrap_or_else(|p| p.into_inner());
+        let (seq, offset) = {
+            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            (state.read_seq, state.read_offset)
+        };
+        let result = persist_cursor(&self.dir, seq, offset);
         let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if state.last_checkpoint.elapsed() >= self.checkpoint_interval {
-            persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
-            state.last_checkpoint = Instant::now();
+        state.last_checkpoint = Instant::now();
+        if let Err(err) = result {
+            report_cursor_error(&err, &self.dir, &mut state.diag, &self.telemetry);
         }
     }
 
@@ -1084,26 +1173,32 @@ impl DiskQueue {
         self.not_full.notify_waiters();
     }
 
-    /// Persists the cursor regardless of `checkpoint_interval`, `fsync`s it, the active segment,
-    /// and the directory, and closes files. Drops nothing: what is queued delivers after the next
-    /// open.
+    /// Persists the cursor durably regardless of `checkpoint_interval`, flushes and `fsync`s the
+    /// active segment, `fsync`s the directory, and closes files. Each failure is counted and
+    /// diagnosed. Drops nothing: what is queued delivers after the next open.
     pub async fn finish(&self) {
+        self.checkpoint_cursor();
         let (active_seq, file) = {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            persist_cursor(&self.dir, state.read_seq, state.read_offset, &mut state.diag);
             let file = state.write_file.take();
             state.read_file = None;
-            (state.segments.back().map(|s| s.seq), file)
+            (state.segments.back().expect("always at least one segment").seq, file)
         };
+        let active_path = segment_path(&self.dir, active_seq);
         // Flush outside the lock, as in `rotate_segment`.
         if let Some(mut f) = file {
-            let _ = f.flush().await;
+            if let Err(err) = fault_io!(SEGMENT_FLUSH, &active_path, active_seq, f.flush().await) {
+                self.count_fs_error("flush", format_args!("flushing segment {active_seq}"), &err);
+            }
         }
-        let _ = fsync_path(&self.dir.join(CURSOR_FILE_NAME)).await;
-        if let Some(active_seq) = active_seq {
-            let _ = fsync_path(&segment_path(&self.dir, active_seq)).await;
+        let synced =
+            fault_io!(SEGMENT_SYNC, &active_path, active_seq, fsync_path(&active_path).await);
+        if let Err(err) = synced {
+            self.count_fs_error("fsync", format_args!("syncing segment {active_seq}"), &err);
         }
-        let _ = fsync_path(&self.dir).await;
+        if let Err(err) = fault_io!(DIR_SYNC, &self.dir, 0, fsync_path(&self.dir).await) {
+            self.count_fs_error("fsync", format_args!("syncing {}", self.dir.display()), &err);
+        }
     }
 }
 
@@ -1143,6 +1238,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::scratch_dir;
     use super::*;
+    use crate::fault::{self, errno};
     use logit_core::{AttrMap, Event, Registry, Resource, Value};
 
     fn ctx() -> BatchContext {
@@ -1503,8 +1599,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(segment_path(&dir, 5), raw_record(&batch("a"), ctx())).unwrap();
         // References a segment that doesn't exist (already deleted, in a real run).
-        let mut diag = Diagnostics::new("test");
-        persist_cursor(&dir, 2, 0, &mut diag);
+        persist_cursor(&dir, 2, 0).unwrap();
 
         let q = open(dir.clone());
         let (peeked, _) = q.peek().await.expect("should clamp to the oldest surviving segment");
@@ -1811,6 +1906,185 @@ mod tests {
             .expect("after should still be delivered -- pre-fix this would silently vanish");
         assert_eq!(marker_of(&peeked), "after");
         q.commit().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The cursor write is durable, and every spool fsync, create, and unlink failure is counted
+    // and diagnosed (DISK-04).
+    // -----------------------------------------------------------------------------------------
+
+    /// A queue with live telemetry, plus a clone of its `Diagnostics` (clones share occurrence
+    /// counts) for asserting what was diagnosed.
+    fn open_observed(cfg: DiskQueueConfig) -> (DiskQueue, Arc<Registry>, Diagnostics) {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("test", "output", "sink");
+        let diag = Diagnostics::new("test");
+        let q = DiskQueue::open(cfg, telemetry, diag.clone()).unwrap();
+        (q, registry, diag)
+    }
+
+    fn disk_errors(registry: &Registry, op: &str) -> f64 {
+        metric_sum(&registry.drain(0), DISK_ERRORS, Some(("op", op)))
+    }
+
+    async fn deliver(q: &DiskQueue, labels: &[&str]) {
+        for label in labels {
+            let (peeked, _) = tokio::time::timeout(Duration::from_secs(5), q.peek())
+                .await
+                .expect("peek must not stop responding")
+                .expect("a batch should be queued");
+            assert_eq!(marker_of(&peeked), *label);
+            q.commit().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cursor_persist_is_fsynced_before_its_rename_and_the_directory_after() {
+        let dir = scratch_dir("cursor-fsync-order");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1; // rotate on every push
+        let q = open_with(cfg);
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await;
+
+        let scope = fault::scope(&dir);
+        scope.record();
+        // Crossing out of segment 0 persists the cursor, then deletes the segment.
+        deliver(&q, &["a"]).await;
+
+        let hits = scope.hits();
+        let cursor_ops: Vec<Op> = hits
+            .iter()
+            .filter(|h| h.point.site == sites::SPOOL_CURSOR)
+            .map(|h| h.point.op)
+            .collect();
+        assert_eq!(cursor_ops, vec![Op::Write, Op::SyncFile, Op::Rename, Op::SyncDir]);
+        let cursor_durable_at = hits
+            .iter()
+            .position(|h| h.point == Point::new(sites::SPOOL_CURSOR, Op::SyncDir))
+            .unwrap();
+        let unlinks: Vec<usize> = hits
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.point == SEGMENT_UNLINK)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(unlinks.len(), 1, "segment 0 is deleted: {hits:?}");
+        assert!(
+            unlinks.iter().all(|&i| cursor_durable_at < i),
+            "a segment must be unlinked only once the cursor leaving it is durable: {hits:?}"
+        );
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed() {
+        let dir = scratch_dir("rotation-fsync-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1;
+        let (q, registry, diag) = open_observed(cfg);
+        let scope = fault::scope(&dir);
+        scope.fail(SEGMENT_SYNC, errno::EIO);
+
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await; // rotates, failing segment 0's fsync
+
+        assert_eq!(disk_errors(&registry, "fsync"), 1.0);
+        assert_eq!(diag.occurrences("disk_fs_error"), 1);
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1], "the rotation still completes");
+        deliver(&q, &["a", "b"]).await;
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation() {
+        let dir = scratch_dir("rotation-create-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1;
+        let (q, registry, diag) = open_observed(cfg);
+        let scope = fault::scope(&dir);
+        scope.fail_nth(SEGMENT_CREATE, 1, errno::ENOSPC);
+
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await; // the create fails, so b lands in segment 0
+        assert_eq!(list_segments(&dir).unwrap(), vec![0]);
+        q.push((batch("c"), ctx())).await; // retries the rotation, which now succeeds
+
+        assert_eq!(list_segments(&dir).unwrap(), vec![0, 1]);
+        assert_eq!(disk_errors(&registry, "create"), 1.0);
+        assert_eq!(diag.occurrences("disk_fs_error"), 1);
+        deliver(&q, &["a", "b", "c"]).await;
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_directory_fsync_is_counted() {
+        let dir = scratch_dir("dir-fsync-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1;
+        let (q, registry, diag) = open_observed(cfg);
+        let scope = fault::scope(&dir);
+        scope.fail(DIR_SYNC, errno::EIO);
+
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await; // rotation's directory fsync
+        q.finish().await; // finish's directory fsync
+
+        assert_eq!(disk_errors(&registry, "fsync"), 2.0);
+        assert_eq!(diag.occurrences("disk_fs_error"), 2);
+        assert_eq!(diag.occurrences("cursor_error"), 0, "the cursor syncs under its own site");
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_segment_unlink_is_counted() {
+        let dir = scratch_dir("unlink-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1;
+        let (q, registry, diag) = open_observed(cfg);
+        q.push((batch("a"), ctx())).await;
+        q.push((batch("b"), ctx())).await;
+        let scope = fault::scope(&dir);
+        scope.fail(SEGMENT_UNLINK, errno::EACCES);
+
+        deliver(&q, &["a"]).await; // crosses out of segment 0 and tries to delete it
+
+        assert_eq!(disk_errors(&registry, "unlink"), 1.0);
+        assert_eq!(diag.occurrences("disk_fs_error"), 1);
+        assert!(segment_path(&dir, 0).exists(), "the failed unlink left segment 0 behind");
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_persistently_failing_cursor_write_is_counted_every_time() {
+        let dir = scratch_dir("cursor-write-fails");
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1024 * 1024; // no rotation, so every persist is a commit's
+        cfg.checkpoint_interval = Duration::ZERO; // persist on every commit
+        let (q, registry, diag) = open_observed(cfg.clone());
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        let scope = fault::scope(&dir);
+        scope.fail(Point::new(sites::SPOOL_CURSOR, Op::Rename), errno::EIO);
+
+        deliver(&q, &["a", "b", "c"]).await;
+
+        assert_eq!(disk_errors(&registry, "cursor"), 3.0);
+        assert_eq!(diag.occurrences("cursor_error"), 3);
+        drop(scope);
+
+        // With no cursor ever persisted past the start, a restart replays everything: duplicates,
+        // never loss.
+        drop(q);
+        let reopened = open_with(cfg);
+        deliver(&reopened, &["a", "b", "c"]).await;
         std::fs::remove_dir_all(&dir).ok();
     }
 }
