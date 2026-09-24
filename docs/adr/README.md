@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-24 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-09-22 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-09-22 |
 | [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
@@ -46,15 +47,15 @@ the same date, write the record, then add a row here.
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-09-13 |
 | [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
 | [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-09-09 |
-| [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-09-09 |
+| [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-09-24 |
 | [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-09-09 |
-| [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-09-08 |
+| [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-09-24 |
 | [Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive](native-wire-format-encoding.md) | 2026-09-08 | 2026-09-08 |
 | [Routing by condition, sampling, throttling, dedup, and renaming are `lua` components](routing-by-condition-is-lua.md) | 2026-09-07 | 2026-09-22 |
 | [`logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds](logfmt-and-kv-parsing.md) | 2026-09-07 | 2026-09-07 |
 | [`regex`: named captures into attributes, and taking the `regex` crate](regex-transform.md) | 2026-09-07 | 2026-09-07 |
 | [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-09-07 |
-| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-09-21 |
+| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-09-24 |
 | [`trace_context` grows a `span:` block, and a native `traceparent` parser](trace-context-span-lifting.md) | 2026-09-04 | 2026-09-18 |
 | [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-09-14 |
 | [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-09-22 |
