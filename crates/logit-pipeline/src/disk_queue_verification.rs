@@ -10,6 +10,8 @@
 //! `spool_model_every_push_is_delivered_dropped_or_queued` covers the write path (DISK-03,
 //! DISK-05): random pushes, cancelled pushes, peeks, commits, injected failures, and
 //! crash-reopens, checked against a model of what the spool counted queued or dropped.
+//! `spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake` runs the same
+//! model under a small `max_bytes` (DISK-05's `Block` concern, DISK-06): no push waits forever.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -448,6 +450,9 @@ enum SpoolOp {
     /// Drops the spool (after `finish` if `true`) and its runtime, as a process exit would, then
     /// reopens it.
     Reopen(bool),
+    /// Peeks and commits until nothing is queued. Generated only by [`bounded_spool_op`], so a
+    /// following push can find a bounded spool full with nothing queued.
+    ConsumeAll,
 }
 
 const CRASH_POINTS: [Point; 9] = [
@@ -480,6 +485,14 @@ fn spool_op() -> impl Strategy<Value = SpoolOp> {
         1 => any::<bool>().prop_map(SpoolOp::Reopen),
     ]
 }
+
+/// [`spool_op`] plus [`SpoolOp::ConsumeAll`], for a spool whose `max_bytes` a few records fill.
+fn bounded_spool_op() -> impl Strategy<Value = SpoolOp> {
+    prop_oneof![6 => spool_op(), 1 => Just(SpoolOp::ConsumeAll)]
+}
+
+/// How long a push may take before the model treats it as parked on a full spool.
+const PARK_WAIT: Duration = Duration::from_millis(50);
 
 /// What the model knows about one push, by id (the push's position in the sequence).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -571,6 +584,49 @@ fn poll_then_cancel(
     false
 }
 
+/// Pushes `item` to completion, returning the ids a consumer committed meanwhile. A push that
+/// hasn't finished within [`PARK_WAIT`] is parked on a full spool. With something queued (`depth`
+/// above 0), a consumer then drains alongside it, and its commits must wake it. With nothing
+/// queued, nothing will ever free room, so the push must finish on its own. Either way it must
+/// finish within [`MODEL_TIMEOUT`].
+fn push_waking_if_parked(
+    rt: &tokio::runtime::Runtime,
+    q: &DiskQueue,
+    item: (std::sync::Arc<logit_core::EventBatch>, BatchContext),
+    depth: f64,
+) -> Result<Vec<usize>, TestCaseError> {
+    let mut push = std::pin::pin!(q.push(item));
+    if rt.block_on(async { tokio::time::timeout(PARK_WAIT, push.as_mut()).await }).is_ok() {
+        return Ok(Vec::new());
+    }
+    if depth <= 0.0 {
+        return rt
+            .block_on(async { tokio::time::timeout(MODEL_TIMEOUT, push.as_mut()).await })
+            .map(|()| Vec::new())
+            .map_err(|_| TestCaseError::fail("a push parked on a full spool with nothing queued"));
+    }
+    rt.block_on(async {
+        tokio::time::timeout(MODEL_TIMEOUT, async {
+            let mut committed = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    () = push.as_mut() => break,
+                    peeked = q.peek() => {
+                        if let Some((batch, _)) = peeked {
+                            q.commit().expect("commit what was just peeked");
+                            committed.push(id_of(&marker_of(&batch)));
+                        }
+                    }
+                }
+            }
+            committed
+        })
+        .await
+    })
+    .map_err(|_| TestCaseError::fail("a parked push was never woken while the consumer drained"))
+}
+
 /// Records a commit of `id`, checking that first deliveries are FIFO and that a repeat, or a
 /// push that was never counted queued, comes only after a reopen.
 fn on_commit(m: &mut Model, id: usize) -> Result<(), TestCaseError> {
@@ -597,12 +653,16 @@ fn on_commit(m: &mut Model, id: usize) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-fn run_spool_model(segment_bytes: u64, ops: &[SpoolOp]) -> Result<(), TestCaseError> {
+/// Runs `ops` against a `Block` spool bounded at `max_bytes`.
+fn run_spool_model(
+    segment_bytes: u64,
+    max_bytes: u64,
+    ops: &[SpoolOp],
+) -> Result<(), TestCaseError> {
     let dir = crate::disk_queue::test_support::scratch_dir("spool-model");
     let mut cfg = config(dir.clone());
     cfg.segment_bytes = segment_bytes;
-    // Never full: `Block` never parks a push, so every op runs to completion or times out.
-    cfg.max_bytes = 1 << 30;
+    cfg.max_bytes = max_bytes;
     cfg.checkpoint_interval = Duration::ZERO;
     let result = drive_spool_model(&dir, cfg, ops);
     std::fs::remove_dir_all(&dir).ok();
@@ -645,10 +705,9 @@ fn drive_spool_model(
                 let item = (batch(&marker(id, *pad)), ctx_for_model());
                 let completed = match op {
                     SpoolOp::Push(_) => {
-                        rt.block_on(async {
-                            tokio::time::timeout(MODEL_TIMEOUT, q.push(item)).await
-                        })
-                        .map_err(|_| TestCaseError::fail("push stopped responding"))?;
+                        for id in push_waking_if_parked(&rt, &q, item, m.depth)? {
+                            on_commit(&mut m, id)?;
+                        }
                         true
                     }
                     SpoolOp::CancelPush(_, polls, delay) => {
@@ -687,6 +746,26 @@ fn drive_spool_model(
             }
             SpoolOp::Commit => {
                 if let Some((batch, _)) = q.commit() {
+                    on_commit(&mut m, id_of(&marker_of(&batch)))?;
+                }
+                let events = registry.drain(0);
+                corrupt += corrupt_count(&events);
+                if let Some(depth) = depth_gauge(&events) {
+                    prop_assert_eq!(depth, m.depth);
+                }
+            }
+            SpoolOp::ConsumeAll => {
+                loop {
+                    let wait = if m.depth > 0.0 { MODEL_TIMEOUT } else { EMPTY_PEEK_WAIT };
+                    let peeked = rt.block_on(async { tokio::time::timeout(wait, q.peek()).await });
+                    let Ok(Some((batch, _))) = peeked else {
+                        prop_assert!(
+                            !m.must_deliver(),
+                            "peek stopped responding with a queued record undelivered"
+                        );
+                        break;
+                    };
+                    q.commit().expect("commit what was just peeked");
                     on_commit(&mut m, id_of(&marker_of(&batch)))?;
                 }
                 let events = registry.drain(0);
@@ -782,6 +861,20 @@ proptest! {
         segment_bytes in prop_oneof![Just(1u64), Just(400), Just(1 << 20)],
         ops in prop::collection::vec(spool_op(), 1..=40),
     ) {
-        run_spool_model(segment_bytes, &ops)?;
+        // Never full, so no push parks.
+        run_spool_model(segment_bytes, 1 << 30, &ops)?;
+    }
+
+    /// The same contract under `overflow: block` with a `max_bytes` a few records fill, plus: a
+    /// parked push is woken by the consumer's commits, and a push to a full spool with nothing
+    /// queued never waits at all, even when `segment_bytes` is at or past `max_bytes`, so the
+    /// active segment alone reads as full.
+    #[test]
+    fn spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake(
+        segment_bytes in prop_oneof![Just(1u64), Just(400), Just(1 << 20)],
+        max_bytes in prop_oneof![Just(600u64), Just(1200)],
+        ops in prop::collection::vec(bounded_spool_op(), 1..=40),
+    ) {
+        run_spool_model(segment_bytes, max_bytes, &ops)?;
     }
 }
