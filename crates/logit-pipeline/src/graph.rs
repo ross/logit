@@ -171,6 +171,10 @@
 //! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
 //!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
 //!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
+//! 62. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has leading or
+//!     trailing whitespace: it could never match a request's `DD-API-KEY`. Its zero
+//!     `handshake_timeout`/`idle_timeout` are rules 45/53's
+//!     (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -230,6 +234,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | GraphiteIn { .. }
         | SyslogIn { .. }
         | OtlpIn { .. }
+        | DatadogIn { .. }
         | TailIn { .. }
         | DockerIn { .. }
         | LogitIn { .. }
@@ -290,6 +295,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         GraphiteIn { .. } => "graphite_in",
         SyslogIn { .. } => "syslog_in",
         OtlpIn { .. } => "otlp_in",
+        DatadogIn { .. } => "datadog_in",
         TailIn { .. } => "tail_in",
         DockerIn { .. } => "docker_in",
         LogitIn { .. } => "logit_in",
@@ -386,6 +392,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::GraphiteIn { .. }
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
+            | ComponentKind::DatadogIn { .. }
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
@@ -1859,16 +1866,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // first-byte read, or `Hello` read completes in zero time, so every connection would close on
     // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection to hand shake, so a set
     // value there is rejected (rule 33's shape). Only a non-default value counts as set, so the
-    // default stays legal under UDP. `otlp_in` gets only the zero check: its budget also bounds a
-    // plaintext connection's first-byte wait (`crates/logit-inputs/src/otlp.rs`'s "Handshake
-    // timeout"), so it is live with or without `tls:`.
+    // default stays legal under UDP. `otlp_in` and `datadog_in` get only the zero check: the budget
+    // also bounds a plaintext connection's first-byte wait (`crates/logit-inputs/src/otlp.rs`'s
+    // "Handshake timeout"), so it is live with or without `tls:`.
     for (id, component) in &components {
         let handshake_timeout = match &component.kind {
             ComponentKind::SyslogIn { handshake_timeout, .. }
             | ComponentKind::GraphiteIn { handshake_timeout, .. }
             | ComponentKind::StatsdIn { handshake_timeout, .. }
             | ComponentKind::LogitIn { handshake_timeout, .. }
-            | ComponentKind::OtlpIn { handshake_timeout, .. } => *handshake_timeout,
+            | ComponentKind::OtlpIn { handshake_timeout, .. }
+            | ComponentKind::DatadogIn { handshake_timeout, .. } => *handshake_timeout,
             _ => continue,
         };
         if handshake_timeout.is_zero() {
@@ -1904,9 +1912,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // (`docs/adr/idle-connection-timeout.md`), with two differences. The field is an `Option` whose
     // absence means "no idle timeout", so every `Some` is set: the UDP check rejects any value, and
     // the zero message says to omit the field. And `0s` is impossible because a connection is idle
-    // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, and `prometheus_in` have
-    // no datagram transport, so their arms pass `false`; a scrape-mode `prometheus_in`'s value is
-    // rule 55's wrong-mode check.
+    // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, `datadog_in`, and
+    // `prometheus_in` have no datagram transport, so their arms pass `false`; a scrape-mode
+    // `prometheus_in`'s value is rule 55's wrong-mode check.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -1920,6 +1928,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             }
             ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
             ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
+            ComponentKind::DatadogIn { idle_timeout, .. } => ("datadog_in", *idle_timeout, false),
             ComponentKind::PrometheusIn { idle_timeout, .. } => {
                 ("prometheus_in", *idle_timeout, false)
             }
@@ -2622,6 +2631,36 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Rule 62: `datadog_in` (`docs/adr/datadog-agent-and-intake-relay.md`). An empty `bind` names
+    // no socket. An empty `api_keys` entry could never match, since an Agent always sends a key;
+    // nor could one with leading or trailing whitespace, which HTTP strips from a header value, a
+    // typo `!env` makes easy with a key file's trailing newline. An empty list is the "accept any
+    // key" setting, not an error. `handshake_timeout: 0s` is rule 45's and `idle_timeout: 0s` rule
+    // 53's, as on `otlp_in`.
+    for (id, component) in &components {
+        if let ComponentKind::DatadogIn { bind, api_keys, .. } = &component.kind {
+            if bind.trim().is_empty() {
+                anyhow::bail!(
+                    "component '{id}': datadog_in 'bind' must not be empty -- give the \
+                     'host:port' to listen on"
+                );
+            }
+            if api_keys.iter().any(String::is_empty) {
+                anyhow::bail!(
+                    "component '{id}': a datadog_in 'api_keys' entry must not be empty -- it \
+                     could never match a request's DD-API-KEY; omit 'api_keys' to accept any key"
+                );
+            }
+            if api_keys.iter().any(|key| key.trim() != key) {
+                anyhow::bail!(
+                    "component '{id}': a datadog_in 'api_keys' entry has leading or trailing \
+                     whitespace, which HTTP strips from the DD-API-KEY header, so it could never \
+                     match -- check the value (a key file's trailing newline, say)"
+                );
             }
         }
     }
@@ -4852,6 +4891,73 @@ mod tests {
             ComponentKind::Sample { rate: 0.5, key: None, missing: None, always_keep: Some(o) };
         let err = sample_err(kind);
         assert!(err.contains("must be finite"), "got: {err}");
+    }
+
+    /// A `datadog_in` with every optional field at its default, the shape rule 62 reads.
+    fn datadog_in(bind: &str, api_keys: Vec<&str>) -> ComponentKind {
+        ComponentKind::DatadogIn {
+            bind: bind.to_string(),
+            tls: None,
+            api_keys: api_keys.into_iter().map(String::from).collect(),
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
+        }
+    }
+
+    fn datadog_in_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+    }
+
+    #[test]
+    fn a_datadog_in_with_or_without_api_keys_resolves() {
+        for keys in [vec![], vec!["0123456789abcdef", "fedcba9876543210"]] {
+            resolve(cfg(vec![
+                ("in", vec![], datadog_in("0.0.0.0:8080", keys)),
+                ("out", vec!["in"], sink()),
+            ]))
+            .expect("a datadog_in with a bind and non-empty keys (or none) is valid");
+        }
+    }
+
+    /// Rule 62: an empty `bind` names no socket.
+    #[test]
+    fn a_datadog_in_with_an_empty_bind_is_rejected() {
+        let err = datadog_in_err(datadog_in("", vec![]));
+        assert!(err.contains("'in'"), "got: {err}");
+        assert!(err.contains("'bind' must not be empty"), "got: {err}");
+    }
+
+    /// Rule 62: an empty key could never match; the message names the accept-any spelling.
+    #[test]
+    fn a_datadog_in_with_an_empty_api_key_is_rejected() {
+        let err = datadog_in_err(datadog_in("0.0.0.0:8080", vec!["good-key", ""]));
+        assert!(err.contains("'api_keys' entry must not be empty"), "got: {err}");
+        assert!(err.contains("omit 'api_keys'"), "got: {err}");
+    }
+
+    /// Rule 62: HTTP strips a header value's surrounding whitespace, so this key never matches.
+    #[test]
+    fn a_datadog_in_api_key_with_surrounding_whitespace_is_rejected() {
+        let err = datadog_in_err(datadog_in("0.0.0.0:8080", vec!["key\n"]));
+        assert!(err.contains("leading or trailing whitespace"), "got: {err}");
+    }
+
+    /// Rules 45 and 53 cover `datadog_in`'s two timeouts, as they do `otlp_in`'s.
+    #[test]
+    fn a_datadog_in_with_a_zero_handshake_or_idle_timeout_is_rejected() {
+        let mut kind = datadog_in("0.0.0.0:8080", vec![]);
+        if let ComponentKind::DatadogIn { handshake_timeout, .. } = &mut kind {
+            *handshake_timeout = Duration::ZERO;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'handshake_timeout' must be greater than 0s"), "got: {err}");
+
+        let mut kind = datadog_in("0.0.0.0:8080", vec![]);
+        if let ComponentKind::DatadogIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::ZERO);
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
     /// A `flatten` with everything defaulted -- `attributes: all`, `resource: none`,

@@ -226,13 +226,16 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
 
 ### 2. Kinds and config (W3–W6)
 
-- `datadog_in` (W3): `bind:`, `bind_tls:`, and an optional `api_keys:` allowlist (empty = accept
-  any). Routes: `/api/v1/series`, `/api/v2/series`, `/api/beta/sketches`, `/api/v1/check_run`,
-  `/intake/`, `/api/v2/logs`, `/v1/input`, `/api/v0.2/traces`, `/api/v0.2/stats` (decoded into
-  stats events, not dropped: Vector drops and recomputes them, and that is the "beta" part of
-  its sink); `/api/v1/validate` answers 200; `/api/v2/host_metadata`, `/api/v1/metadata`, and
-  unknown routes are acknowledged and counted `skipped{route}`. Decompresses gzip, deflate, and
-  zstd.
+- `datadog_in` (W3): `bind:`, `tls:` (one mode, so `otlp_in`'s field name rather than
+  `prometheus_in`'s mode-prefixed `bind_tls:`), `handshake_timeout:`, `idle_timeout:`, and an
+  optional `api_keys:` allowlist (empty = accept any). Routes: `/api/v1/series`,
+  `/api/v2/series`, `/api/v1/distribution_points`, `/api/beta/sketches`, `/api/v1/check_run`,
+  `/api/v2/events`, `/intake/`, `/api/v2/logs`, `/v1/input`, `/api/v0.2/traces`,
+  `/api/v0.2/stats` (decoded into stats events, not dropped: Vector drops and recomputes them,
+  and that is the "beta" part of its sink); `/api/v1/validate` answers 200; host and inventory
+  metadata and the process and orchestrator collectors are acknowledged and counted
+  `acknowledged{route}`. An unknown route is a `404`, not an acknowledgement, so an Agent reports
+  what the listener doesn't speak. Decompresses gzip, deflate, and zstd.
 - `datadog_out` (W5): `api_key: !env DD_API_KEY`, `site` (default `datadoghq.com`), optional
   per-signal `endpoints:` overrides so a pair test can point at another `logit`'s `datadog_in`,
   `compression: gzip`, `timeout`, `tls`. One request per endpoint per batch, outside the three
@@ -246,11 +249,12 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
   non-monotonic `Sum`, `GaugeDelta`, `Histogram`, `ExponentialHistogram`, `Summary`, and
   `SetMembers` are skipped and counted `dropped{reason="unsupported_kind"}`, the `statsd_out`
   pattern; `Histogram` as Datadog's `.bucket` counters is a follow-up.
-- `datadog_in` request caps are constants sized to what the Agent sends, not config: 5,242,880 B
-  decompressed for series and sketches, 1 MB for logs, 3,200,000 B for traces, matching
-  `prometheus_in`'s `MAX_REQUEST_BYTES` decision. A full pipeline answers 429 or 503, which the
-  Agent retries with backoff, never 200-and-drop, so the intake stand-in is at-least-once end to
-  end.
+- `datadog_in` request caps are constants sized to what the Agent sends, not config, matching
+  `prometheus_in`'s `MAX_REQUEST_BYTES` decision: 5 MiB compressed on every route, and 5,242,880 B
+  decompressed on every route but traces, whose cap is 16 MiB (the trace agent's own limit is
+  3,200,000 B; the headroom admits a sender that allows more). A full pipeline answers 503 with
+  `Retry-After: 1` after a 5 s bounded wait, which the Agent retries with backoff, never
+  200-and-drop, so the intake stand-in is at-least-once end to end.
 - `datadog_trace_in` (W4a): `bind:` (`:8126`) plus an optional `socket:` Unix path; every
   `/v0.3`–`/v1.0/traces` form; `/v0.6/stats` decoded into the same stats events as
   `datadog_in`'s; `/info`; the tracer's `Datadog-Meta-*`, `Datadog-Container-ID`, and
@@ -416,7 +420,7 @@ the OTel-direct topology is `otlp_out`.
 | W1 | **Landed** (`dd/w1`). Hand-rolled `DdSketch` with the Agent and logarithmic mappings, bins exposed, `sketches-ddsketch` removed, tripwires and wire doc updated; ADR `datadog-agent-and-intake-relay`; `lossless-transit` amendment; ADR index row. | M | W0 |
 | W2a | **Landed** (`dd/w2a`). Vendored `agent-payload` metrics proto as a third protogen family; `logit_proto::datadog` codecs for series v1/v2 (JSON and protobuf), distribution points, sketches, logs, events (Agent envelope and public v1), and service checks; two fixed-point suites. | L | W1 |
 | W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
-| W3 | `datadog_in`: intake receiver, zstd decode, graph rules, schema | M | W2b |
+| W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
 | W4a | `datadog_trace_in`: APM receiver, `/info`, stubs, schema | M | W2b |
 | W4b | `statsd_in`/`statsd_out` Unix sockets, `\|e:`, `\|card:` | S | W0 |
 | W5 | `datadog_out`: direct API client, stale filter, graph rules, schema | M | W3 |
@@ -429,8 +433,9 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), and W2b complete on their stacked
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, and W3 complete on their stacked
 branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it merges.
+W3's receiver hasn't yet been pointed at a real Agent; W7 does that.
 
 ## Verification
 

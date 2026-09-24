@@ -837,6 +837,46 @@ target's redacted URL appears in the message text only, never a tag), `write_rej
 every `400`/`408`/`413`/`415`; the peer address appears in the message text only, for the same
 tag-cardinality reason), and `connection_error` (never an idle close).
 
+##### `datadog_in`
+
+`crates/logit-inputs/src/datadog.rs`, codec in `crates/logit-proto/src/datadog/`,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+
+**The connection metrics are `otlp_in`'s verbatim**, because this listener runs the same accept loop
+and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.input.connections`
+(gauge), `logit.input.connections.rejected{reason="limit"}`,
+`logit.input.connections.closed{reason="idle"}`, and the accept-queue gauges.
+
+**Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
+which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
+arriving or which were refused.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
+| `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
+| `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
+| `logit.input.requests.acknowledged{route}` | count | a payload answered `2xx` and never sent: `host_metadata`, `metadata`, `collector`, `container`, and `orch` on every request, and `intake` for host metadata posted to `/intake/` |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
+
+**A busy request is not a lost one.** When the pipeline doesn't accept a request's batches within
+5 seconds, the request gets `503` with `Retry-After: 1`, counted `class="busy"`, and its
+undelivered batches are counted `batches.dropped{reason="busy"}`. The Agent keeps the payload and
+retries it, so "dropped" here means "not delivered by this request", not "lost". Read a steady busy
+rate as a pipeline that can't keep up with its Agents: the Agent's retry queue is absorbing the
+difference and drops payloads only once it fills. A traces or stats request that decodes to several
+batches can be answered `503` after some of them were delivered; the Agent's retry delivers those
+again (the module doc's "Backpressure" section).
+
+The codec's own counters (a series, sketch, log, event, check, span, or stats group dropped while
+the rest of a request decodes) are in the [`datadog` codec section](#datadog), under this
+component's id.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close), `request_rejected` (every
+rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
+and an API key never appears at all), and `busy` (a `503`).
+
 ##### `tail_in` and `docker_in`
 
 `crates/logit-inputs/src/tail/driver.rs`, `docker.rs`: one shared `Tailer<D, F>` driver.

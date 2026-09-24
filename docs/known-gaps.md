@@ -866,6 +866,22 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
 ## Datadog
 
+- **`datadog_in` doesn't speak every route an Agent can send to.** Each of these gets `404`,
+  counted `logit.input.requests.rejected{reason="unknown_route"}`, so an Agent reports it rather
+  than losing data silently:
+  - The v3 columnar series routes (`/api/intake/metrics/v3/series` and its siblings). An Agent sends
+    v3 only to Datadog's own URLs (`use_v3_api.series.enabled: datadog_only`), so a redirected Agent
+    sends v2, which is served. How the Agent classifies a URL as Datadog's is UNVERIFIED until W7.
+  - The legacy TCP logs intake (port 10516, `<api-key> <json>\n` or length-prefixed protobuf). That
+    isn't HTTP, so it can't share this listener. Set `logs_config.force_use_http: true` on the Agent.
+  - An API key in the query string (`?api_key=`) or the path (`/v1/input/<key>`). Only the
+    `DD-API-KEY` header authenticates, which is what a current Agent sends.
+  - **Consequence:** an Agent configured for any of these shows errors against `datadog_in`.
+  - **Revisit trigger:** W7's recorded Agent traffic shows one of them from a redirected Agent.
+- **`datadog_in` with no `api_keys` accepts any key, `/api/v1/validate` included.** An Agent
+  pointed at it can't detect a mistyped key, because validation always answers `200`.
+  - **Consequence:** a key typo surfaces only when the same Agent also talks to Datadog.
+  - **Workaround:** set `api_keys`, which makes `/api/v1/validate` check the key.
 - ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
   unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
   (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the

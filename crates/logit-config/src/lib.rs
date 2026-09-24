@@ -788,6 +788,42 @@ pub enum ComponentKind {
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
+    /// A stand-in for Datadog's intake API: what a Datadog Agent's `dd_url`,
+    /// `logs_config.logs_dd_url`, `apm_config.apm_dd_url`, or `additional_endpoints` point at.
+    /// Serves series (v1 and v2), distribution points, sketches, service checks, events, logs, APM
+    /// traces, and APM stats over HTTP, decompressing gzip, deflate, and zstd. Host and inventory
+    /// metadata are acknowledged and discarded. A request on a known path with the wrong method
+    /// gets `405`; a request on any other path gets `404`, so an Agent reports a route this
+    /// listener doesn't speak rather than having it silently dropped. When the pipeline can't take
+    /// a request's data within 5s, the request gets `503` with `Retry-After: 1`, and the Agent
+    /// retries it.
+    DatadogIn {
+        bind: String,
+        /// Terminates TLS on this listener when present; plaintext when omitted.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// The API keys this listener accepts, compared with each request's `DD-API-KEY` header.
+        /// A request with none of them gets `403`. Empty, the default, accepts any request,
+        /// whatever key it carries. Take each entry from the environment (`!env DD_API_KEY`)
+        /// rather than writing a key into the file. An empty entry is rejected.
+        #[serde(default)]
+        api_keys: Vec<String>,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and on a
+        /// plaintext listener the wait for its first byte. Defaults to `5s`; `0s` is rejected.
+        /// Also the grace an idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. An Agent keeps its intake connections open between flushes, so set it
+        /// well above the Agent's flush interval (15s for metrics) if you set it at all. It also
+        /// bounds a request body that stalls mid-upload, answered `408`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+    },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty

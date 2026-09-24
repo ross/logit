@@ -931,6 +931,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "flate2",
  "http",
  "http-body-util",
  "hyper",
@@ -947,6 +948,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "ruzstd",
  "serde_json",
  "serde_norway",
  "snap",
@@ -1003,6 +1005,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "ruzstd",
  "serde",
  "serde_json",
  "snap",
@@ -1776,6 +1779,15 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]

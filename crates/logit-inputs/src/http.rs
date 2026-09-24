@@ -1,5 +1,5 @@
-//! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in` and
-//! `prometheus_in`'s remote-write receiver): the idle-timeout tracker ([`Activity`],
+//! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
+//! `prometheus_in`'s remote-write receiver, and `datadog_in`): the idle-timeout tracker ([`Activity`],
 //! [`InFlight`]), the connection driver that acts on it ([`drive_with_idle`]), and the bounded
 //! request-body read.
 //!
@@ -267,12 +267,22 @@ pub(crate) async fn collect_with_stall_bound(
 pub(crate) fn body_read_error_message(
     err: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> String {
+    if is_length_limit(err) {
+        return "request exceeds the maximum allowed size".to_string();
+    }
+    format!("failed reading the request body (not necessarily oversized): {err}")
+}
+
+/// Whether a [`Limited`] read failure is the size limit tripping, recognized as
+/// [`body_read_error_message`] recognizes it. `datadog_in` counts the two cases under different
+/// reasons.
+pub(crate) fn is_length_limit(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cause {
         if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-            return "request exceeds the maximum allowed size".to_string();
+            return true;
         }
         cause = e.source();
     }
-    format!("failed reading the request body (not necessarily oversized): {err}")
+    false
 }

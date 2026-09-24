@@ -102,6 +102,11 @@ http-body-util = "0.1"
 # the pure-Rust `miniz_oxide` backend rather than a C zlib, keeping "no host toolchain needed"
 # intact (ADR `containerized-development`).
 flate2 = "1"
+# datadog_in's zstd request decode (docs/adr/datadog-agent-and-intake-relay.md, decision 4): a
+# Datadog Agent compresses with zstd by default. `ruzstd` is pure Rust (MIT) and is used here to
+# decompress only. The rationale above against the C `zstd` crate is about compressing, and it
+# stands: senders use gzip. `hash` lets the decoder verify a frame's content checksum.
+ruzstd = { version = "0.9", features = ["hash"] }
 # TLS for otlp_out (both transports) and otlp_in (docs/adr/otlp-tls-and-pooled-grpc-client.md).
 # All four already resolve in Cargo.lock at these exact versions, transitively via `reqwest`'s
 # `rustls-tls` feature -- promoting them to direct dependencies adds no new crate version to the

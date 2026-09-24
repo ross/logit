@@ -1255,6 +1255,95 @@ directly from a page on a different origin, can't reach it at all. Put a reverse
 shares the page's origin instead of opening `otlp_in` to arbitrary browser origins
 (`docs/known-gaps.md`).
 
+## `datadog_in`: standing in for Datadog's intake
+
+`datadog_in` answers a Datadog Agent the way Datadog's intake does, so an Agent sends it series,
+sketches, service checks, events, logs, APM traces, and APM stats with nothing changed but its URLs.
+Point the Agent's `dd_url`, `logs_config.logs_dd_url`, and `apm_config.apm_dd_url` at it to replace
+Datadog, or add it under `additional_endpoints` (and the `logs_config`/`apm_config` equivalents) to
+receive a copy while Datadog keeps receiving everything.
+[`examples/datadog-intake-standin.yaml`](../examples/datadog-intake-standin.yaml) has a runnable
+config and the Agent-side settings for both. See
+[ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md) for the design.
+
+```yaml
+components:
+  datadog:
+    type: datadog_in
+    bind: 127.0.0.1:8080
+    api_keys: [!env DD_API_KEY]   # empty or absent accepts any key
+    idle_timeout: 120s            # off by default
+```
+
+**Routes.** Each of these decodes into events:
+
+| Route | What an Agent sends there |
+|---|---|
+| `/api/v2/series` (protobuf or JSON), `/api/v1/series` | metric series |
+| `/api/v1/distribution_points` | raw distribution values |
+| `/api/beta/sketches`, `/api/v1/sketches` | distribution sketches |
+| `/api/v1/check_run`, `/api/v2/service_checks` | service checks |
+| `/api/v2/events`, `/api/v1/events`, `/intake/` | events |
+| `/api/v2/logs`, `/v1/input` | logs |
+| `/api/v0.2/traces` | APM traces (`AgentPayload`) |
+| `/api/v0.2/stats` | APM stats, relayed rather than recomputed |
+
+`/api/v1/validate` answers `200` for a valid key. Host and inventory metadata
+(`/api/v2/host_metadata`, `/api/v1/metadata`, host metadata on `/intake/`) and the process and
+orchestrator collectors (`/api/v1/collector`, `/api/v1/container`, `/api/v2/orch`) are answered
+`202` and discarded, counted `logit.input.requests.acknowledged{route}`. **Any other path gets
+`404`**, deliberately: an Agent feature this listener doesn't speak then shows up as errors in the
+Agent's own status and logs, instead of as data acknowledged and silently lost. A known path with
+the wrong method gets `405`.
+
+**Authentication.** With `api_keys` set, a request whose `DD-API-KEY` header matches none of them
+gets `403`, counted `logit.input.requests.rejected{reason="auth"}`. A key is never logged. Take the
+keys from the environment with `!env`, as the example does. `api_keys` is a shared secret, not
+transport security: add `tls:` before binding beyond loopback, since otherwise the key crosses the
+network in the clear. With `api_keys` empty, every request is accepted and `/api/v1/validate`
+answers `200` to any key, so an Agent can't tell a wrong key from a right one.
+
+**Compression.** The Agent compresses with zstd by default, and `datadog_in` decodes zstd, gzip, and
+deflate (the zlib-wrapped form the Agent sends under that name), so nothing needs changing on the
+Agent. Any other `Content-Encoding` gets `415`.
+
+**Size caps.** These are fixed, sized to what an Agent sends, not configuration:
+
+- A compressed body over 5 MiB gets `413`, on every route.
+- A body that decompresses past 5,242,880 bytes gets `413`, except on `/api/v0.2/traces`, whose cap
+  is 16 MiB. The first is the Agent's own serializer limit for series and sketches, and the trace
+  agent caps its payloads at 3.2 MB, so a conforming Agent stays under both.
+- A zstd frame that declares a window above `max(the route's decompressed cap, 8 MiB)` gets `413`
+  before anything is decompressed, because the decoder would reserve that window up front. The 8
+  MiB floor exists because a Go `klauspost/compress` streaming writer -- what the Agent's forwarder
+  uses -- declares an 8 MiB window regardless of how little it actually writes, so the 5 MiB
+  metrics/logs cap still accepts a legitimately small body sent under that window. The floor
+  doesn't raise how much decoded data a route accepts: the decompressed output is still capped at
+  the route's own limit.
+
+**A full pipeline gets `503`, not a blocked connection.** When the pipeline doesn't accept a
+request's batches within 5 seconds, `datadog_in` answers `503` with `Retry-After: 1` rather than
+holding the connection open, which is what `otlp_in` and `prometheus_in` do. The Agent's forwarder
+retries a `503` with backoff and holds the payload in its retry queue meanwhile, so nothing is lost
+until that queue fills. A blocked connection would instead cost the Agent 20 seconds before its own
+timeout, and then the same retry.
+
+- **Delivery is at-least-once.** A traces or stats request carries one batch per tracer or client
+  payload, and a `503` partway through means the retry delivers the earlier batches again. With
+  several consumers downstream of `datadog_in`, a `503` can also leave a batch delivered to some of
+  them, which the retry then delivers to those again. Datadog's own intake has the same shape: a
+  resent series point overwrites, a resent log or span duplicates.
+- **Watch `logit.input.requests{class="busy"}`.** A steady rate means the pipeline can't keep up
+  with its Agents, and the Agents' retry queues are absorbing the difference.
+  `logit.input.batches.dropped{reason="busy"}` counts the batches those `503`s left undelivered:
+  deferred to the Agent, not lost.
+
+**What to watch.** `logit.input.requests{route, class}` shows which routes are arriving and how
+they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` happened: a nonzero
+`unknown_route` means an Agent is using a route this listener doesn't speak, and `auth` a key
+mismatch. `docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its
+`datadog` codec section the per-item drops inside a request that decoded.
+
 ## Prometheus remote-write: receiving, sending, and picking a version
 
 `prometheus_in` and `prometheus_out` each have two modes, chosen by which field is set:
