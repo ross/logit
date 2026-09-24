@@ -1002,6 +1002,11 @@ impl DiskQueue {
     /// delivering, as a commit would, and counts one `batches.dropped{reason="disk_corrupt"}`
     /// with zero events: how many events a run of undecodable bytes held is unknowable. Returns
     /// whether it skipped: `false` if the head moved or was reserved since the read.
+    ///
+    /// Leaves `queued_records` alone. `open` seeds it from the records that parse, so corruption
+    /// already there at open was never counted, and decrementing for it would under-report
+    /// records still queued. A record corrupted after its push was counted, so it over-reports
+    /// by one until the next `open` re-derives the count.
     fn skip_corrupt(&self, seq: u64, offset: u64, delta: u64) -> bool {
         {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -1009,9 +1014,6 @@ impl DiskQueue {
                 return false;
             }
             state.read_offset += delta;
-            // At least one record's worth, never more than is queued. `open` re-derives the count
-            // from what parses, so any drift here ends at the next restart.
-            state.queued_records = state.queued_records.saturating_sub(1);
         }
         self.count_dropped("disk_corrupt", 0);
         self.after_cursor_advance();
@@ -2257,12 +2259,27 @@ mod tests {
             let (q, registry, _diag) = open_observed(config(dir.clone()));
             // Only the read path's count below: `open` counts the same region once itself.
             registry.drain(0);
+            let mut events = Vec::new();
 
-            deliver(&q, &["good", "next"]).await;
+            deliver(&q, &["good"]).await;
+            // Skips the garbage, crossing into segment 1, then reads `next`.
+            let (peeked, _) = peek_within(&q).await.expect("next is still queued");
+            assert_eq!(marker_of(&peeked), "next");
+            let drained = registry.drain(0);
+            assert_eq!(
+                metric_sum(&drained, SINK_QUEUE_METRICS.depth, None),
+                1.0,
+                "the skip must not count `next`, which open queued, as gone"
+            );
+            events.extend(drained);
+            q.commit().unwrap();
+            let drained = registry.drain(0);
+            assert_eq!(metric_sum(&drained, SINK_QUEUE_METRICS.depth, None), 0.0);
+            events.extend(drained);
             q.close();
             assert!(peek_within(&q).await.is_none());
+            events.extend(registry.drain(0));
 
-            let events = registry.drain(0);
             let corrupt = |metric| metric_sum(&events, metric, Some(("reason", "disk_corrupt")));
             assert_eq!(corrupt(SINK_QUEUE_METRICS.items_dropped), 1.0, "one skipped region");
             assert_eq!(

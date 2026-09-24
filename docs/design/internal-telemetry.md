@@ -460,7 +460,7 @@ disk-backed sink:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit |
+| `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit. For a disk-backed sink, skipping a corrupt region leaves it unchanged: corruption present at `DiskQueue::open` was never counted, and a record corrupted after its push over-counts by one until the next `open` re-derives the count |
 | `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
