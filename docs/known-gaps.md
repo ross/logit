@@ -882,6 +882,29 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   pointed at it can't detect a mistyped key, because validation always answers `200`.
   - **Consequence:** a key typo surfaces only when the same Agent also talks to Datadog.
   - **Workaround:** set `api_keys`, which makes `/api/v1/validate` check the key.
+- **`datadog_trace_in` doesn't decode JSON trace bodies.** A `/v0.3/traces` or `/v0.4/traces`
+  request with `Content-Type: application/json` gets `415`, counted
+  `logit.input.requests.rejected{reason="json_traces"}`. The Agent accepts that form; the codec
+  implements only msgpack.
+  - **Consequence:** a tracer or client that sends JSON traces loses them. No current dd-trace
+    library sends JSON by default.
+  - **Revisit trigger:** W7's recorded tracer traffic, or a user, shows a JSON sender.
+- **`datadog_trace_in` doesn't speak the v1.0 string-table trace form (`idx`).** `/v1.0/traces`
+  gets `404`, and `/info` doesn't list it, so a tracer that reads `/info` falls back to v0.4 or
+  v0.5.
+  - **Consequence:** none for a tracer that honors `/info`; a tracer hard-configured for v1.0 loses
+    its traces.
+- **`datadog_trace_in` does none of the Agent's processing.** Spans relay as the tracer wrote them:
+  no obfuscation, normalization, `_top_level` marking, sampling, or stats computation
+  ([plan §14](plans/datadog-relay.md#14-not-in-this-stack-an-agent-equivalent-trace-processor)).
+  - **Consequence:** its output must reach Datadog through a real Agent (`datadog_trace_out`) or go
+    to an OTLP backend. Fed straight to `datadog_out`, its spans are skipped as not yet processed.
+  - **Revisit trigger:** the Agent-equivalent trace processor the plan defers.
+- **The mode of `datadog_trace_in`'s Unix socket is `0666`, and the Agent's is UNVERIFIED.** The
+  Agent's DogStatsD socket is `0722`; its APM `receiver_socket` mode wasn't found in the source
+  surveyed. `0666` lets a tracer running as any user connect.
+  - **Consequence:** any local user can send spans. Restrict the socket's directory to limit that.
+  - **Revisit trigger:** W7 inspects a real Agent's socket.
 - ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
   unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
   (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the

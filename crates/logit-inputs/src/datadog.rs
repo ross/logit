@@ -10,7 +10,9 @@
 //! The accept loop, connection cap, handshake timeout, and idle timeout are `otlp_in`'s, copied
 //! rather than shared because the telemetry and dispatch are each listener's own; the idle
 //! machinery and bounded body read are shared ([`crate::http`]). `crate::otlp`'s module doc has the
-//! reasoning for each, and it applies here unchanged.
+//! reasoning for each, and it applies here unchanged. The request helpers (`Content-Encoding`,
+//! bounded decompression, the JSON response shapes, deadline-bounded delivery) live in
+//! [`crate::http`] too, shared with `datadog_trace_in` ([`crate::datadog_trace`]).
 //!
 //! # Routes
 //!
@@ -112,10 +114,10 @@
 //! section is the operator-facing account.
 
 use crate::http::{
-    body_read_error_message, collect_with_stall_bound, drive_with_idle, is_length_limit, Activity,
-    BodyReadError,
+    body_read_error_message, collect_with_stall_bound, declared_length, decompress,
+    deliver_with_deadline, drive_with_idle, error_response, is_length_limit, json_response,
+    media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
 };
-use crate::zstd::{self, ZstdError};
 use crate::Input;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -128,7 +130,6 @@ use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::Fanout;
 use logit_proto::datadog::DatadogDecoder;
 use logit_proto::CodecError;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -545,74 +546,6 @@ impl Route {
     }
 }
 
-/// A request's declared `Content-Encoding` (this module's "Request handling", step 4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Encoding {
-    Identity,
-    Gzip,
-    Deflate,
-    Zstd,
-}
-
-impl Encoding {
-    /// Matched case-insensitively, since HTTP content codings are. `Err` carries what was sent,
-    /// for the `415` message.
-    fn from_headers(headers: &HeaderMap) -> Result<Self, String> {
-        let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
-            return Ok(Self::Identity);
-        };
-        let value = value.to_str().unwrap_or("").trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("identity") {
-            Ok(Self::Identity)
-        } else if value.eq_ignore_ascii_case("gzip") {
-            Ok(Self::Gzip)
-        } else if value.eq_ignore_ascii_case("deflate") {
-            Ok(Self::Deflate)
-        } else if value.eq_ignore_ascii_case("zstd") {
-            Ok(Self::Zstd)
-        } else {
-            Err(value.to_string())
-        }
-    }
-}
-
-/// Why [`decompress`] failed: `413` versus `400`, as `otlp_in` distinguishes them.
-enum DecompressError {
-    TooLarge,
-    Malformed(String),
-}
-
-/// Decompresses `body` under `encoding`, bounded to `cap` bytes of output.
-fn decompress(encoding: Encoding, body: Bytes, cap: usize) -> Result<Bytes, DecompressError> {
-    match encoding {
-        // Already capped at `MAX_REQUEST_BYTES`, which no decompressed cap is below.
-        Encoding::Identity => Ok(body),
-        Encoding::Gzip => bounded_read(flate2::read::GzDecoder::new(&body[..]), cap, "gzip"),
-        Encoding::Deflate => {
-            bounded_read(flate2::read::ZlibDecoder::new(&body[..]), cap, "deflate")
-        }
-        Encoding::Zstd => match zstd::decompress(&body, cap) {
-            Ok(out) => Ok(Bytes::from(out)),
-            Err(ZstdError::TooLarge) => Err(DecompressError::TooLarge),
-            Err(ZstdError::Malformed(message)) => Err(DecompressError::Malformed(message)),
-        },
-    }
-}
-
-/// `otlp_in`'s `inflate`: `Read::take` allows one byte past `cap`, so an input inflating to
-/// `cap + 1` is caught rather than truncated to fit.
-fn bounded_read(reader: impl Read, cap: usize, name: &str) -> Result<Bytes, DecompressError> {
-    let mut out = Vec::new();
-    reader
-        .take(cap as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|err| DecompressError::Malformed(format!("invalid {name} body: {err}")))?;
-    if out.len() > cap {
-        return Err(DecompressError::TooLarge);
-    }
-    Ok(Bytes::from(out))
-}
-
 /// The routes table and "Request handling" steps, in order, returning the counters' `route` and
 /// `class` tags alongside the response.
 async fn respond(
@@ -666,7 +599,7 @@ async fn respond(
             return (name, REJECTED, response);
         }
     };
-    let protobuf = route == Route::SeriesV2 && is_protobuf(req.headers());
+    let protobuf = route == Route::SeriesV2 && media_type(req.headers()) == MediaType::Protobuf;
 
     let body =
         match collect_with_stall_bound(Limited::new(req.into_body(), MAX_REQUEST_BYTES), stall)
@@ -756,7 +689,7 @@ async fn respond(
         return (name, OK, route.success());
     }
 
-    match deliver(&shared.sink, batches, shared.busy_after).await {
+    match deliver_with_deadline(&shared.sink, batches, shared.busy_after).await {
         Ok(()) => (name, OK, route.success()),
         Err(not_sent) => {
             shared.telemetry.count(
@@ -777,25 +710,6 @@ async fn respond(
             (name, BUSY, response)
         }
     }
-}
-
-/// Sends `batches` in order under one deadline, `busy_after` from now (this module's
-/// "Backpressure" section). Each batch reaches every consumer or none
-/// ([`Fanout::send_with_deadline`]). `Err` carries how many were not delivered, the timed-out one
-/// included.
-async fn deliver(
-    sink: &Fanout,
-    batches: Vec<EventBatch>,
-    busy_after: Duration,
-) -> Result<(), usize> {
-    let deadline = tokio::time::Instant::now() + busy_after;
-    let total = batches.len();
-    for (sent, batch) in batches.into_iter().enumerate() {
-        if sink.send_with_deadline(batch, deadline).await.is_err() {
-            return Err(total - sent);
-        }
-    }
-    Ok(())
 }
 
 /// Counts one rejection under `reason`, optionally reports it through the throttled
@@ -842,23 +756,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `Content-Length`, when present and a number. An unparseable one is left for hyper, which
-/// rejects it before the handler runs.
-fn declared_length(headers: &HeaderMap) -> Option<u64> {
-    headers.get(http::header::CONTENT_LENGTH)?.to_str().ok()?.trim().parse().ok()
-}
-
-/// `Content-Type: application/x-protobuf` (or `application/protobuf`), matched case-insensitively
-/// and ignoring parameters: the Agent's v2 series protobuf. Anything else, or none, is JSON.
-fn is_protobuf(headers: &HeaderMap) -> bool {
-    let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
-        return false;
-    };
-    let media = value.to_str().unwrap_or("").split(';').next().unwrap_or("").trim();
-    media.eq_ignore_ascii_case("application/x-protobuf")
-        || media.eq_ignore_ascii_case("application/protobuf")
-}
-
 /// The fields an `/intake/` body is probed for (this module's "`/intake/` carries events and
 /// host metadata"). `IgnoredAny` skips each value without building it.
 #[derive(serde::Deserialize)]
@@ -883,28 +780,6 @@ fn is_host_metadata(body: &[u8]) -> bool {
         }
         Err(_) => false,
     }
-}
-
-fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
-
-fn json_response(status: StatusCode, body: Bytes) -> http::Response<Full<Bytes>> {
-    http::Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(body))
-        .expect("a well-formed response always builds")
-}
-
-/// Datadog's error shape: `{"status":"error","errors":[message]}`.
-fn error_response(status: StatusCode, message: &str) -> http::Response<Full<Bytes>> {
-    // Formatted rather than built as a `serde_json::Value`, whose map would sort `errors` first.
-    let message = serde_json::to_string(message).expect("a string always serializes");
-    json_response(status, Bytes::from(format!(r#"{{"status":"error","errors":[{message}]}}"#)))
 }
 
 #[cfg(test)]

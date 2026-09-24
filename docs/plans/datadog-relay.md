@@ -421,7 +421,7 @@ the OTel-direct topology is `otlp_out`.
 | W2a | **Landed** (`dd/w2a`). Vendored `agent-payload` metrics proto as a third protogen family; `logit_proto::datadog` codecs for series v1/v2 (JSON and protobuf), distribution points, sketches, logs, events (Agent envelope and public v1), and service checks; two fixed-point suites. | L | W1 |
 | W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
 | W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
-| W4a | `datadog_trace_in`: APM receiver, `/info`, stubs, schema | M | W2b |
+| W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
 | W4b | `statsd_in`/`statsd_out` Unix sockets, `\|e:`, `\|card:` | S | W0 |
 | W5 | `datadog_out`: direct API client, stale filter, graph rules, schema | M | W3 |
 | W6 | `datadog_trace_out`: Agent client | S | W4a |
@@ -433,9 +433,10 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, and W3 complete on their stacked
-branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it merges.
-W3's receiver hasn't yet been pointed at a real Agent; W7 does that.
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, and W4a complete on their
+stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it
+merges. Neither W3's receiver nor W4a's has yet been pointed at a real Agent or tracer; W7 does
+that.
 
 ## Verification
 

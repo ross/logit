@@ -824,6 +824,49 @@ pub enum ComponentKind {
         #[schemars(with = "Option<String>")]
         idle_timeout: Option<Duration>,
     },
+    /// A stand-in for the Datadog Agent's APM receiver: what a dd-trace tracer sends its traces
+    /// and client-computed stats to. Serves `/v0.3`, `/v0.4`, `/v0.5`, and `/v0.7/traces`
+    /// (msgpack), `/v0.6/stats`, and `/info`, over TCP (`bind`), a Unix stream socket (`socket`),
+    /// or both at once; at least one is required. Every span is kept: the reply sets every
+    /// service's sampling rate to 1.0. Profiling, debugger, and `evp_proxy` uploads are answered
+    /// `200` and discarded; telemetry, Remote Configuration, and the other trace forms get `404`.
+    /// A request the pipeline can't take within 2s gets `503`, which a tracer drops rather than
+    /// retries. Spans pass through unprocessed (no obfuscation, normalization, or stats), so
+    /// send them to a real Agent (`datadog_trace_out`) or `otlp_out`, never straight to
+    /// `datadog_out`.
+    DatadogTraceIn {
+        /// The `host:port` to listen on. The Agent's default is `localhost:8126`. A tracer finds
+        /// it through `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or
+        /// `DD_TRACE_AGENT_URL=http://host:8126`.
+        #[serde(default)]
+        bind: Option<String>,
+        /// An absolute path for a Unix stream socket, the Agent's `receiver_socket`
+        /// (`/var/run/datadog/apm.socket` by default). A tracer finds it through
+        /// `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a
+        /// stale socket file at the path is replaced, and the new one is made writable by every
+        /// user (mode `0666`) so unprivileged tracers can connect.
+        #[serde(default)]
+        socket: Option<String>,
+        /// Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires
+        /// `bind`: the Unix socket is always plaintext.
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        /// How long one connection has, per pre-request phase, before this listener closes it
+        /// and frees its connection-cap slot: the TLS accept when `tls:` is set, and otherwise
+        /// the wait for its first byte. Defaults to `5s`; `0s` is rejected. Also the grace an
+        /// idle close gives the HTTP server, as on `otlp_in`.
+        #[serde(default = "default_handshake_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        handshake_timeout: Duration,
+        /// How long one connection may sit with no request in flight before this listener closes
+        /// it and frees its connection-cap slot, with `otlp_in`'s semantics. Off unless set; `0s`
+        /// is rejected. A tracer flushes every second or so over a kept-alive connection, so set
+        /// it well above that if you set it at all. It also bounds a request body that stalls
+        /// mid-upload, answered `408`.
+        #[serde(default, with = "humantime_serde_duration::option")]
+        #[schemars(with = "Option<String>")]
+        idle_timeout: Option<Duration>,
+    },
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
@@ -4440,6 +4483,38 @@ mod tests {
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn datadog_trace_in_takes_a_bind_a_socket_or_both() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_trace_in", "bind": "127.0.0.1:8126",
+                "socket": "/var/run/datadog/apm.socket"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogTraceIn {
+                bind,
+                socket,
+                tls,
+                handshake_timeout,
+                idle_timeout,
+            } => {
+                assert_eq!(bind.as_deref(), Some("127.0.0.1:8126"));
+                assert_eq!(socket.as_deref(), Some("/var/run/datadog/apm.socket"));
+                assert_eq!(tls, None);
+                assert_eq!(handshake_timeout, Duration::from_secs(5));
+                assert_eq!(idle_timeout, None);
+            }
+            other => panic!("expected DatadogTraceIn, got {other:?}"),
+        }
+        let component: Component =
+            serde_json::from_str(r#"{"type": "datadog_trace_in", "socket": "/tmp/apm.socket"}"#)
+                .unwrap();
+        assert!(matches!(
+            component.kind,
+            ComponentKind::DatadogTraceIn { bind: None, socket: Some(_), .. }
+        ));
     }
 
     #[test]

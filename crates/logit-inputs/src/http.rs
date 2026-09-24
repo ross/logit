@@ -1,7 +1,9 @@
 //! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in`,
-//! `prometheus_in`'s remote-write receiver, and `datadog_in`): the idle-timeout tracker ([`Activity`],
-//! [`InFlight`]), the connection driver that acts on it ([`drive_with_idle`]), and the bounded
-//! request-body read.
+//! `prometheus_in`'s remote-write receiver, `datadog_in`, and `datadog_trace_in`): the
+//! idle-timeout tracker ([`Activity`], [`InFlight`]), the connection driver that acts on it
+//! ([`drive_with_idle`]), and the bounded request-body read. The two Datadog listeners also share
+//! their request helpers here: `Content-Encoding` and `Content-Type` parsing, bounded
+//! decompression, Datadog's JSON response shapes, and the deadline-bounded delivery.
 //!
 //! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
 //! the clock is tracked at the service rather than around the socket, why it resets on request
@@ -285,4 +287,178 @@ pub(crate) fn is_length_limit(err: &(dyn std::error::Error + Send + Sync + 'stat
         cause = e.source();
     }
     false
+}
+
+// -------------------------------------------------------------------------------------------------
+// Request helpers shared by `datadog_in` and `datadog_trace_in`
+// -------------------------------------------------------------------------------------------------
+
+/// A request's declared `Content-Encoding`. Each listener decides which of these it accepts:
+/// `datadog_in` all four, `datadog_trace_in` identity and gzip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Encoding {
+    Identity,
+    Gzip,
+    Deflate,
+    Zstd,
+}
+
+impl Encoding {
+    /// Matched case-insensitively, since HTTP content codings are. `Err` carries what was sent,
+    /// for the `415` message.
+    pub(crate) fn from_headers(headers: &http::HeaderMap) -> Result<Self, String> {
+        let Some(value) = headers.get(http::header::CONTENT_ENCODING) else {
+            return Ok(Self::Identity);
+        };
+        let value = value.to_str().unwrap_or("").trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+            Ok(Self::Identity)
+        } else if value.eq_ignore_ascii_case("gzip") {
+            Ok(Self::Gzip)
+        } else if value.eq_ignore_ascii_case("deflate") {
+            Ok(Self::Deflate)
+        } else if value.eq_ignore_ascii_case("zstd") {
+            Ok(Self::Zstd)
+        } else {
+            Err(value.to_string())
+        }
+    }
+}
+
+/// Why [`decompress`] failed: `413` versus `400`, as `otlp_in` distinguishes them.
+pub(crate) enum DecompressError {
+    TooLarge,
+    Malformed(String),
+}
+
+/// Decompresses `body` under `encoding`, bounded to `cap` bytes of output. An identity body is
+/// returned as-is: the caller has already capped it at its compressed limit, which no caller's
+/// decompressed cap is below.
+pub(crate) fn decompress(
+    encoding: Encoding,
+    body: Bytes,
+    cap: usize,
+) -> Result<Bytes, DecompressError> {
+    match encoding {
+        Encoding::Identity => Ok(body),
+        Encoding::Gzip => bounded_read(flate2::read::GzDecoder::new(&body[..]), cap, "gzip"),
+        Encoding::Deflate => {
+            bounded_read(flate2::read::ZlibDecoder::new(&body[..]), cap, "deflate")
+        }
+        Encoding::Zstd => match crate::zstd::decompress(&body, cap) {
+            Ok(out) => Ok(Bytes::from(out)),
+            Err(crate::zstd::ZstdError::TooLarge) => Err(DecompressError::TooLarge),
+            Err(crate::zstd::ZstdError::Malformed(message)) => {
+                Err(DecompressError::Malformed(message))
+            }
+        },
+    }
+}
+
+/// `otlp_in`'s `inflate`: `Read::take` allows one byte past `cap`, so an input inflating to
+/// `cap + 1` is caught rather than truncated to fit.
+fn bounded_read(
+    reader: impl std::io::Read,
+    cap: usize,
+    name: &str,
+) -> Result<Bytes, DecompressError> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    reader
+        .take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|err| DecompressError::Malformed(format!("invalid {name} body: {err}")))?;
+    if out.len() > cap {
+        return Err(DecompressError::TooLarge);
+    }
+    Ok(Bytes::from(out))
+}
+
+/// A request's `Content-Type` media type, as far as the Datadog listeners tell bodies apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaType {
+    /// `application/x-protobuf` or `application/protobuf`.
+    Protobuf,
+    /// `application/msgpack`, `application/x-msgpack`, or `application/vnd.msgpack`.
+    Msgpack,
+    /// `application/json` or `text/json`.
+    Json,
+    /// Anything else, or no `Content-Type` at all.
+    Other,
+}
+
+/// Sniffs `Content-Type`, matched case-insensitively and ignoring parameters (`; charset=...`).
+pub(crate) fn media_type(headers: &http::HeaderMap) -> MediaType {
+    let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
+        return MediaType::Other;
+    };
+    let media = value.to_str().unwrap_or("").split(';').next().unwrap_or("").trim();
+    let is = |name: &str| media.eq_ignore_ascii_case(name);
+    if is("application/x-protobuf") || is("application/protobuf") {
+        MediaType::Protobuf
+    } else if is("application/msgpack")
+        || is("application/x-msgpack")
+        || is("application/vnd.msgpack")
+    {
+        MediaType::Msgpack
+    } else if is("application/json") || is("text/json") {
+        MediaType::Json
+    } else {
+        MediaType::Other
+    }
+}
+
+/// `Content-Length`, when present and a number. An unparseable one is left for hyper, which
+/// rejects it before the handler runs.
+pub(crate) fn declared_length(headers: &http::HeaderMap) -> Option<u64> {
+    headers.get(http::header::CONTENT_LENGTH)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Wall-clock now in Unix nanoseconds: a request's `received_at`.
+pub(crate) fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// A response with `Content-Type: application/json` and `body`.
+pub(crate) fn json_response(
+    status: http::StatusCode,
+    body: Bytes,
+) -> http::Response<http_body_util::Full<Bytes>> {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(http_body_util::Full::new(body))
+        .expect("a well-formed response always builds")
+}
+
+/// Datadog's error shape: `{"status":"error","errors":[message]}`.
+pub(crate) fn error_response(
+    status: http::StatusCode,
+    message: &str,
+) -> http::Response<http_body_util::Full<Bytes>> {
+    // Formatted rather than built as a `serde_json::Value`, whose map would sort `errors` first.
+    let message = serde_json::to_string(message).expect("a string always serializes");
+    json_response(status, Bytes::from(format!(r#"{{"status":"error","errors":[{message}]}}"#)))
+}
+
+/// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait both
+/// Datadog listeners answer `503` after (`crate::datadog`'s "Backpressure" section). Each batch
+/// reaches every consumer or none ([`logit_pipeline::Fanout::send_with_deadline`]). `Err` carries
+/// how many were not delivered, the timed-out one included.
+pub(crate) async fn deliver_with_deadline(
+    sink: &logit_pipeline::Fanout,
+    batches: Vec<logit_core::EventBatch>,
+    busy_after: std::time::Duration,
+) -> Result<(), usize> {
+    let deadline = tokio::time::Instant::now() + busy_after;
+    let total = batches.len();
+    for (sent, batch) in batches.into_iter().enumerate() {
+        if sink.send_with_deadline(batch, deadline).await.is_err() {
+            return Err(total - sent);
+        }
+    }
+    Ok(())
 }

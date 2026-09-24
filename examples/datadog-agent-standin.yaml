@@ -1,0 +1,33 @@
+# Stands in for a Datadog Agent's two listening surfaces on the application side: DogStatsD on
+# :8125 (`statsd_in`) and the APM receiver on :8126 (`datadog_trace_in`,
+# docs/adr/datadog-agent-and-intake-relay.md). `stdio_out` prints what arrives.
+#
+# Point an application's Datadog libraries at it with the settings you'd use for a local Agent:
+#
+#   DD_AGENT_HOST=<this-host>                              # both, over TCP/UDP
+#   DD_TRACE_AGENT_PORT=8126                               # traces, the default
+#   DD_TRACE_AGENT_URL=http://<this-host>:8126             # or this, overriding both
+#   DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket  # or the Unix socket, with `socket:`
+#   DD_DOGSTATSD_URL=udp://<this-host>:8125                # metrics, events, service checks
+#
+# Spans pass through unprocessed: nothing here obfuscates, normalizes, samples, or computes APM
+# stats the way an Agent does. So send them on to a real Agent (`datadog_trace_out`) or to an
+# OTLP backend (`otlp_out`), never straight to Datadog's intake through `datadog_out`, which
+# skips spans no Agent has processed. A tracer drops a payload it can't deliver rather than
+# retrying it, so a stalled pipeline loses spans (`docs/deploying.md` has the detail); give the
+# real sinks a `buffer:`.
+components:
+  dogstatsd:
+    type: statsd_in
+    bind: 127.0.0.1:8125
+
+  apm:
+    type: datadog_trace_in
+    bind: 127.0.0.1:8126
+    # The Agent's Unix socket. Its directory must already exist; a stale socket file from an
+    # earlier run is replaced, and the new one is mode 0666 so any user's tracer can connect.
+    # socket: /var/run/datadog/apm.socket
+
+  stdout:
+    type: stdio_out
+    sources: [dogstatsd, apm]

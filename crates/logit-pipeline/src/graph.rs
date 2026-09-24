@@ -175,6 +175,10 @@
 //!     trailing whitespace: it could never match a request's `DD-API-KEY`. Its zero
 //!     `handshake_timeout`/`idle_timeout` are rules 45/53's
 //!     (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 63. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a `socket` that
+//!     isn't an absolute path, or `tls` without `bind`: the Unix socket has no TLS. Its zero
+//!     `handshake_timeout`/`idle_timeout` are rules 45/53's
+//!     (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -235,6 +239,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | SyslogIn { .. }
         | OtlpIn { .. }
         | DatadogIn { .. }
+        | DatadogTraceIn { .. }
         | TailIn { .. }
         | DockerIn { .. }
         | LogitIn { .. }
@@ -296,6 +301,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         SyslogIn { .. } => "syslog_in",
         OtlpIn { .. } => "otlp_in",
         DatadogIn { .. } => "datadog_in",
+        DatadogTraceIn { .. } => "datadog_trace_in",
         TailIn { .. } => "tail_in",
         DockerIn { .. } => "docker_in",
         LogitIn { .. } => "logit_in",
@@ -393,6 +399,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::SyslogIn { .. }
             | ComponentKind::OtlpIn { .. }
             | ComponentKind::DatadogIn { .. }
+            | ComponentKind::DatadogTraceIn { .. }
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
             | ComponentKind::Internal { .. }
@@ -1866,9 +1873,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // first-byte read, or `Hello` read completes in zero time, so every connection would close on
     // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection to hand shake, so a set
     // value there is rejected (rule 33's shape). Only a non-default value counts as set, so the
-    // default stays legal under UDP. `otlp_in` and `datadog_in` get only the zero check: the budget
-    // also bounds a plaintext connection's first-byte wait (`crates/logit-inputs/src/otlp.rs`'s
-    // "Handshake timeout"), so it is live with or without `tls:`.
+    // default stays legal under UDP. `otlp_in`, `datadog_in`, and `datadog_trace_in` get only the
+    // zero check: the budget also bounds a plaintext connection's first-byte wait
+    // (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout"), so it is live with or without
+    // `tls:`.
     for (id, component) in &components {
         let handshake_timeout = match &component.kind {
             ComponentKind::SyslogIn { handshake_timeout, .. }
@@ -1876,7 +1884,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             | ComponentKind::StatsdIn { handshake_timeout, .. }
             | ComponentKind::LogitIn { handshake_timeout, .. }
             | ComponentKind::OtlpIn { handshake_timeout, .. }
-            | ComponentKind::DatadogIn { handshake_timeout, .. } => *handshake_timeout,
+            | ComponentKind::DatadogIn { handshake_timeout, .. }
+            | ComponentKind::DatadogTraceIn { handshake_timeout, .. } => *handshake_timeout,
             _ => continue,
         };
         if handshake_timeout.is_zero() {
@@ -1912,9 +1921,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // (`docs/adr/idle-connection-timeout.md`), with two differences. The field is an `Option` whose
     // absence means "no idle timeout", so every `Some` is set: the UDP check rejects any value, and
     // the zero message says to omit the field. And `0s` is impossible because a connection is idle
-    // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, `datadog_in`, and
-    // `prometheus_in` have no datagram transport, so their arms pass `false`; a scrape-mode
-    // `prometheus_in`'s value is rule 55's wrong-mode check.
+    // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, `datadog_in`,
+    // `datadog_trace_in`, and `prometheus_in` have no datagram transport, so their arms pass
+    // `false`; a scrape-mode `prometheus_in`'s value is rule 55's wrong-mode check.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -1929,6 +1938,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             ComponentKind::LogitIn { idle_timeout, .. } => ("logit_in", *idle_timeout, false),
             ComponentKind::OtlpIn { idle_timeout, .. } => ("otlp_in", *idle_timeout, false),
             ComponentKind::DatadogIn { idle_timeout, .. } => ("datadog_in", *idle_timeout, false),
+            ComponentKind::DatadogTraceIn { idle_timeout, .. } => {
+                ("datadog_trace_in", *idle_timeout, false)
+            }
             ComponentKind::PrometheusIn { idle_timeout, .. } => {
                 ("prometheus_in", *idle_timeout, false)
             }
@@ -2660,6 +2672,43 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     "component '{id}': a datadog_in 'api_keys' entry has leading or trailing \
                      whitespace, which HTTP strips from the DD-API-KEY header, so it could never \
                      match -- check the value (a key file's trailing newline, say)"
+                );
+            }
+        }
+    }
+
+    // Rule 63: `datadog_trace_in` (`docs/adr/datadog-agent-and-intake-relay.md`). It serves a TCP
+    // listener, a Unix socket, or both, so naming neither leaves nothing to listen on, and an
+    // empty `bind` names no socket, as rule 62 says for `datadog_in`. A relative `socket` would
+    // resolve against whatever directory `logit` was started in, which a tracer's
+    // `DD_TRACE_AGENT_URL=unix:///...` can't follow. `tls` terminates on the TCP listener only, so
+    // without `bind` it could never take effect. The timeouts are rules 45/53's.
+    for (id, component) in &components {
+        if let ComponentKind::DatadogTraceIn { bind, socket, tls, .. } = &component.kind {
+            if bind.is_none() && socket.is_none() {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in needs 'bind', 'socket', or both -- give \
+                     the 'host:port' (the Agent's is ':8126') or the Unix socket path to listen on"
+                );
+            }
+            if bind.as_deref().is_some_and(|bind| bind.trim().is_empty()) {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in 'bind' must not be empty -- give the \
+                     'host:port' to listen on, or omit it to serve only 'socket'"
+                );
+            }
+            if let Some(socket) = socket {
+                if !std::path::Path::new(socket).is_absolute() {
+                    anyhow::bail!(
+                        "component '{id}': datadog_trace_in 'socket' must be an absolute path, \
+                         got '{socket}' -- tracers name it as unix:///<path>"
+                    );
+                }
+            }
+            if tls.is_some() && bind.is_none() {
+                anyhow::bail!(
+                    "component '{id}': datadog_trace_in 'tls' needs 'bind' -- TLS terminates on \
+                     the TCP listener, and the Unix socket is always plaintext"
                 );
             }
         }
@@ -4954,6 +5003,86 @@ mod tests {
 
         let mut kind = datadog_in("0.0.0.0:8080", vec![]);
         if let ComponentKind::DatadogIn { idle_timeout, .. } = &mut kind {
+            *idle_timeout = Some(Duration::ZERO);
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
+    /// A `datadog_trace_in` with every optional field at its default, the shape rule 63 reads.
+    fn datadog_trace_in(bind: Option<&str>, socket: Option<&str>) -> ComponentKind {
+        ComponentKind::DatadogTraceIn {
+            bind: bind.map(String::from),
+            socket: socket.map(String::from),
+            tls: None,
+            handshake_timeout: default_handshake_timeout(),
+            idle_timeout: None,
+        }
+    }
+
+    #[test]
+    fn a_datadog_trace_in_with_a_bind_a_socket_or_both_resolves() {
+        for (bind, socket) in [
+            (Some("127.0.0.1:8126"), None),
+            (None, Some("/var/run/datadog/apm.socket")),
+            (Some("127.0.0.1:8126"), Some("/var/run/datadog/apm.socket")),
+        ] {
+            resolve(cfg(vec![
+                ("in", vec![], datadog_trace_in(bind, socket)),
+                ("out", vec!["in"], sink()),
+            ]))
+            .expect("a datadog_trace_in with a bind, a socket, or both is valid");
+        }
+    }
+
+    /// Rule 63: neither listener leaves nothing to serve.
+    #[test]
+    fn a_datadog_trace_in_with_neither_bind_nor_socket_is_rejected() {
+        let err = datadog_in_err(datadog_trace_in(None, None));
+        assert!(err.contains("needs 'bind', 'socket', or both"), "got: {err}");
+    }
+
+    /// Rule 63: an empty `bind` names no socket, as rule 62 says for `datadog_in`.
+    #[test]
+    fn a_datadog_trace_in_with_an_empty_bind_is_rejected() {
+        let err = datadog_in_err(datadog_trace_in(Some(" "), Some("/tmp/apm.socket")));
+        assert!(err.contains("'bind' must not be empty"), "got: {err}");
+    }
+
+    /// Rule 63: a relative socket path depends on the working directory.
+    #[test]
+    fn a_datadog_trace_in_with_a_relative_socket_is_rejected() {
+        let err = datadog_in_err(datadog_trace_in(None, Some("apm.socket")));
+        assert!(err.contains("'socket' must be an absolute path"), "got: {err}");
+    }
+
+    /// Rule 63: TLS terminates on the TCP listener only.
+    #[test]
+    fn a_datadog_trace_in_with_tls_and_no_bind_is_rejected() {
+        let mut kind = datadog_trace_in(None, Some("/tmp/apm.socket"));
+        if let ComponentKind::DatadogTraceIn { tls, .. } = &mut kind {
+            *tls = Some(logit_config::TlsServerConfig {
+                cert_file: "server.pem".into(),
+                key_file: "server.key".into(),
+                client_ca_file: None,
+            });
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'tls' needs 'bind'"), "got: {err}");
+    }
+
+    /// Rules 45 and 53 cover `datadog_trace_in`'s two timeouts.
+    #[test]
+    fn a_datadog_trace_in_with_a_zero_handshake_or_idle_timeout_is_rejected() {
+        let mut kind = datadog_trace_in(Some("127.0.0.1:8126"), None);
+        if let ComponentKind::DatadogTraceIn { handshake_timeout, .. } = &mut kind {
+            *handshake_timeout = Duration::ZERO;
+        }
+        let err = datadog_in_err(kind);
+        assert!(err.contains("'handshake_timeout' must be greater than 0s"), "got: {err}");
+
+        let mut kind = datadog_trace_in(Some("127.0.0.1:8126"), None);
+        if let ComponentKind::DatadogTraceIn { idle_timeout, .. } = &mut kind {
             *idle_timeout = Some(Duration::ZERO);
         }
         let err = datadog_in_err(kind);

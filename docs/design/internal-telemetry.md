@@ -882,6 +882,41 @@ component's id.
 rejection except `404` and `405`; the peer address appears in the message text only, never a tag,
 and an API key never appears at all), and `busy` (a `503`).
 
+##### `datadog_trace_in`
+
+`crates/logit-inputs/src/datadog_trace.rs`, codec in `crates/logit-proto/src/datadog/`,
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+
+**The connection metrics are `datadog_in`'s, except the accept-queue gauges cover the TCP
+listener only.** `logit.input.connections` (gauge), `logit.input.connections.rejected{reason="limit"}`,
+and `logit.input.connections.closed{reason="idle"}` count the TCP listener and the Unix socket
+together, under one cap. The accept-queue gauges read the kernel's `TCP_INFO`, which a Unix socket
+has no counterpart for, so a `socket:`-only listener has none.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, or `busy`; `route` is `traces_v03`, `traces_v04`, `traces_v05`, `traces_v07`, `stats_v06`, `info`, one of the `404` or stub routes below, or `unknown` |
+| `logit.input.request.duration` | timing | one per request, every exit included |
+| `logit.input.request.bytes` | count | the body size as sent, once read |
+| `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `unsupported_route` (`404`, also tagged `route`: `traces_v01`, `traces_v02`, `traces_v10`, `pipeline_stats`, `telemetry_proxy`, `remote_config`), `method` (`405`), `encoding` (`415`, anything but identity or gzip), `json_traces` (`415`, a JSON v0.3/v0.4 body), `oversize` (`413`), `stalled` (`408`), `body_read` (`413`), `malformed_encoding` (`400`), or `malformed` (`400`) |
+| `logit.input.requests.acknowledged{route}` | count | a stub's upload, answered `200` and discarded: `evp_proxy_v1`–`v4`, `profiling`, `debugger_v1_input`, `debugger_v1_diagnostics`, `debugger_v2_input`, `symdb`, `dogstatsd_v1_proxy`, `dogstatsd_v2_proxy`, `tracer_flare`, `openlineage` |
+| `logit.input.batches.dropped{reason="busy"}` | count | batches a `503` left undelivered. See below |
+| `logit.input.spans` | count | spans delivered, counted once the batch is accepted |
+
+**A busy request is a lost one.** The wait is 2 seconds, not `datadog_in`'s 5, and a dd-trace
+tracer drops a payload on a `503` instead of retrying it. So `batches.dropped{reason="busy"}` here
+counts spans or stats lost, not deferred. Any nonzero rate calls for more downstream capacity, such
+as a `buffer:` on the sinks.
+
+The codec's own counters are in the [`datadog` codec section](#datadog), under this component's id.
+
+`Diagnostics` keys: `bound`, `connection_error` (never an idle close, nor a connect-and-close
+probe), `request_rejected` (every rejection except `404` and `405`; the peer address or socket path
+appears in the message text only), `busy` (a `503`), `trace_count_mismatch` (an
+`X-Datadog-Trace-Count` header that disagrees with the traces on the wire; the request is still
+served), and `bad_header` (a `Datadog-Client-Dropped-P0-*` header that isn't an unsigned integer,
+left out of the resource).
+
 ##### `tail_in` and `docker_in`
 
 `crates/logit-inputs/src/tail/driver.rs`, `docker.rs`: one shared `Tailer<D, F>` driver.

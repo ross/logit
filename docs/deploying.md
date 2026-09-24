@@ -1347,6 +1347,75 @@ they're answered, and `logit.input.requests.rejected{reason}` says why a `4xx` h
 mismatch. `docs/design/internal-telemetry.md`'s `datadog_in` section has every counter, and its
 `datadog` codec section the per-item drops inside a request that decoded.
 
+## `datadog_trace_in`: standing in for the Agent's APM API
+
+`datadog_trace_in` answers a dd-trace tracer the way a local Datadog Agent's APM receiver does, so
+an application sends it traces and client-computed stats with nothing changed but where it points:
+`DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or `DD_TRACE_AGENT_URL` (`http://HOST:8126` or
+`unix:///PATH`). [`examples/datadog-agent-standin.yaml`](../examples/datadog-agent-standin.yaml)
+pairs it with a DogStatsD `statsd_in` on `:8125`, the Agent's other application-side listener.
+
+```yaml
+components:
+  apm:
+    type: datadog_trace_in
+    bind: 127.0.0.1:8126                  # and/or:
+    socket: /var/run/datadog/apm.socket   # the directory must exist
+```
+
+**Send its output to a real Agent or an OTLP backend, never straight to `datadog_out`.** Spans
+arrive exactly as the tracer wrote them: nothing here obfuscates SQL or URLs, normalizes names,
+marks top-level spans, applies sampling, or computes APM stats, all of which an Agent does before
+Datadog sees a span. Route them to `datadog_trace_out` in front of a real Agent, or to `otlp_out`.
+`datadog_out` skips a span no Agent has processed.
+
+**Routes.** `/v0.3/traces`, `/v0.4/traces`, `/v0.5/traces`, and `/v0.7/traces` (msgpack, `POST` or
+`PUT`) decode into span events, and `/v0.6/stats` into APM stats events. A JSON v0.3/v0.4 body gets
+`415`: only msgpack is decoded, which is what every current tracer sends. Every trace reply sets
+every service's sampling rate to 1.0, so the tracer keeps everything. Two groups of routes are
+answered without relaying anything:
+
+- **`404`, as an Agent with the feature turned off answers:** `/v0.1/traces`, `/v0.2/traces`,
+  `/v1.0/traces`, `/v0.1/pipeline_stats`, `/telemetry/proxy/`, and `/v0.7/config`. A tracer
+  doesn't enable these, because `/info` doesn't list them.
+- **`200` and discarded:** `evp_proxy`, profiling, debugger, symbol-database, DogStatsD-proxy,
+  tracer-flare, and OpenLineage uploads. Several tracers send these whatever `/info` says, and
+  answering stops them logging an error per upload. Each is counted
+  `logit.input.requests.acknowledged{route}`.
+
+Any other path gets `404`.
+
+**`/info` shapes what the tracer sends.** A tracer reads it at startup. This listener's document
+lists only the routes above, so the tracer doesn't turn on telemetry forwarding, Remote
+Configuration, or the v1.0 trace form. It sets `client_drop_p0s: false`, so the tracer sends every
+trace rather than dropping priority-0 ones, which would leave them out of the relay. It lists
+`/v0.6/stats`, so a tracer that computes stats keeps sending them. The module doc in
+`crates/logit-inputs/src/datadog_trace.rs` gives the reason for every field.
+
+**Tracer headers become resource attributes.** `Datadog-Meta-Lang`, `-Lang-Version`,
+`-Tracer-Version`, `Datadog-Container-ID`, and the tracer's other identity and client-computation
+headers land on the batch resource as `datadog.tracer.*`, which `datadog_trace_out` writes back as
+headers. For `/v0.7/traces`, the payload's own fields win over a header.
+
+**The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
+The directory must already exist. A stale socket file from an earlier run is replaced, but a path
+that exists and isn't a socket is refused, so a typo can't delete a file. The new socket is mode
+`0666`, so a tracer running as any user can connect. Restrict access with the directory's
+permissions if that's too open. `tls:` applies to `bind` only.
+
+**A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
+seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, as `datadog_in` does. A tracer
+isn't an Agent, though: it doesn't retry, and drops the payload on any non-`2xx` answer or on its
+own write timeout, commonly 2 seconds. Waiting longer wouldn't save the payload, so every `503` is
+loss, counted `logit.input.batches.dropped{reason="busy"}`. Prevent it downstream: give the sinks
+this listener feeds a `buffer:` (memory, or `disk:` for a long outage) large enough to absorb a
+stall, so the channel `datadog_trace_in` sends into keeps draining.
+
+**What to watch.** `logit.input.spans` counts spans delivered, `logit.input.requests{route, class}`
+which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
+`logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
+doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
+
 ## Prometheus remote-write: receiving, sending, and picking a version
 
 `prometheus_in` and `prometheus_out` each have two modes, chosen by which field is set:

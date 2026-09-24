@@ -19,6 +19,7 @@ use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::datadog::DatadogInput;
+use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
 use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::graphite::GraphiteInput;
@@ -396,6 +397,25 @@ fn build_spec(
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout)
                 .with_api_keys(api_keys.clone());
+            if let Some(tls) = tls {
+                input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
+            }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        // Graph rule 63 guarantees at least one of `bind`/`socket`, and `tls` only with `bind`.
+        DatadogTraceIn { bind, socket, tls, handshake_timeout, idle_timeout } => {
+            let mut input = DatadogTraceInput::new()
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                // Read twice, as on `otlp_in`: the pre-request budget and an idle close's grace.
+                .with_handshake_timeout(*handshake_timeout)
+                .with_idle_timeout(*idle_timeout);
+            if let Some(bind) = bind {
+                input = input.with_bind(bind.clone());
+            }
+            if let Some(socket) = socket {
+                input = input.with_socket(socket);
+            }
             if let Some(tls) = tls {
                 input = input.with_tls(&to_tls_server_settings(tls), base_dir)?;
             }

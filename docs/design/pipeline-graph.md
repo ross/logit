@@ -348,6 +348,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     `always_keep`, or `missing:` without `key:`.
 62. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
     whitespace.
+63. A `datadog_trace_in` with neither `bind` nor `socket`, an empty `bind`, a relative `socket`
+    path, or `tls` without `bind`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

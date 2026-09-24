@@ -15,6 +15,7 @@
 
 pub mod collectd;
 pub mod datadog;
+pub mod datadog_trace;
 pub mod docker;
 pub mod generate;
 pub mod graphite;

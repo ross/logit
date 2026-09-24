@@ -294,6 +294,10 @@
 //! | v0.7/`AgentPayload` chunk `priority` | [`traces::ATTR_CHUNK_PRIORITY`] (`I64`) on every span of the chunk, omitted when `-128` (`PriorityNone`); a v0.7 chunk with no `priority` key is 0, as in Go | -- |
 //! | chunk `origin`, `dropped_trace`, `tags` | [`traces::ATTR_CHUNK_ORIGIN`] (non-empty), [`traces::ATTR_CHUNK_DROPPED_TRACE`] (`true`), [`traces::ATTR_CHUNK_TAGS`] (`Map` of `Str`, non-empty), on every span | -- |
 //! | `TracerPayload` fields | batch resource `datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
+//! | tracer API request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Lang-Version`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `datadog.tracer.language_name`, `.language_version`, `.tracer_version`, `.container_id` (`Str`), each when non-empty; on v0.7 only where the `TracerPayload` left the field empty | -- |
+//! | `Datadog-Meta-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `Datadog-Entity-ID` | [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER`], [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR`], [`RESOURCE_ATTR_TRACER_ENTITY_ID`] (`Str`), each when non-empty | -- |
+//! | `Datadog-Client-Computed-Top-Level` (any non-empty value); `Datadog-Client-Computed-Stats` (any non-empty value but a Go `false` spelling) | [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL`], [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS`] = `Bool(true)`; absent otherwise | -- |
+//! | `Datadog-Client-Dropped-P0-Traces`, `-Spans` | [`RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES`], [`RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS`] (`U64`); a value that isn't an unsigned integer is left out | diag `bad_header` |
 //! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
 //! | `AgentPayload.idxTracerPayloads` (v1.0) | skipped | `logit.input.spans.skipped{reason="idx_payload"}`, one per payload |
 //! | a span (v0.5: wrong arity, a dictionary index out of range), trace array, or chunk that doesn't parse | dropped; the rest decodes | `skipped{reason="malformed"}` + diag `malformed_span` |
@@ -493,6 +497,41 @@ pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "datadog.tracer.runtime_id";
 pub const RESOURCE_ATTR_TRACER_ENV: &str = "datadog.tracer.env";
 pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
 pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
+/// `datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id`: a
+/// tracer's `Datadog-Meta-Lang-Interpreter`, `Datadog-Meta-Lang-Interpreter-Vendor`, and
+/// `Datadog-Entity-ID` request headers (`Str`), which no payload carries.
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER: &str = "datadog.tracer.language_interpreter";
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR: &str =
+    "datadog.tracer.language_interpreter_vendor";
+pub const RESOURCE_ATTR_TRACER_ENTITY_ID: &str = "datadog.tracer.entity_id";
+/// `datadog.tracer.client_computed_top_level` / `.client_computed_stats`: a tracer's
+/// `Datadog-Client-Computed-Top-Level` and `Datadog-Client-Computed-Stats` request headers, as
+/// `Bool(true)` when set and absent otherwise.
+pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL: &str =
+    "datadog.tracer.client_computed_top_level";
+pub const RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS: &str = "datadog.tracer.client_computed_stats";
+/// `datadog.tracer.dropped_p0_traces` / `.dropped_p0_spans`: a tracer's
+/// `Datadog-Client-Dropped-P0-Traces` and `-Spans` request headers (`U64`), the priority-0
+/// traces and spans it dropped before sending.
+pub const RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES: &str = "datadog.tracer.dropped_p0_traces";
+pub const RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS: &str = "datadog.tracer.dropped_p0_spans";
+
+/// The tracer API's request headers that carry `datadog.tracer.*` resource attributes, spelled
+/// in lowercase as `http::HeaderName` stores them. `datadog_trace_in` reads them and
+/// `datadog_trace_out` writes them back; the mapping is in this module's doc, under "Traces".
+pub const HEADER_META_LANG: &str = "datadog-meta-lang";
+pub const HEADER_META_LANG_VERSION: &str = "datadog-meta-lang-version";
+pub const HEADER_META_LANG_INTERPRETER: &str = "datadog-meta-lang-interpreter";
+pub const HEADER_META_LANG_INTERPRETER_VENDOR: &str = "datadog-meta-lang-interpreter-vendor";
+pub const HEADER_META_TRACER_VERSION: &str = "datadog-meta-tracer-version";
+pub const HEADER_CONTAINER_ID: &str = "datadog-container-id";
+pub const HEADER_ENTITY_ID: &str = "datadog-entity-id";
+pub const HEADER_CLIENT_COMPUTED_TOP_LEVEL: &str = "datadog-client-computed-top-level";
+pub const HEADER_CLIENT_COMPUTED_STATS: &str = "datadog-client-computed-stats";
+pub const HEADER_CLIENT_DROPPED_P0_TRACES: &str = "datadog-client-dropped-p0-traces";
+pub const HEADER_CLIENT_DROPPED_P0_SPANS: &str = "datadog-client-dropped-p0-spans";
+/// `X-Datadog-Trace-Count`: how many traces the tracer says the body holds.
+pub const HEADER_TRACE_COUNT: &str = "x-datadog-trace-count";
 /// `service.name` / `resource.name` / `span.type` / `span.kind`: a span's `service`, `resource`,
 /// `type`, and (a `meta` key, kept verbatim, that also sets `SpanRecord::kind`) `span.kind` — the
 /// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 8). An
