@@ -402,7 +402,7 @@ reader keeps reading under backpressure, shutdown drains a backlog) is tested in
 [ADR `trace-context-propagation-on-delivered`](../adr/trace-context-propagation-on-delivered.md)'s
 flush-side linking pairs each `Event` that `Transform::flush` emits with a bounded, best-effort
 `Vec<SpanLink>` naming its sources (`crates/logit-transforms/src/aggregate.rs`'s
-`ContributingContexts`). It took `aggregate_flush_100_series` from 2 to 6 allocations: one
+`ContributingContexts`). It took `aggregate_flush_4_series` from 2 to 6 allocations: one
 `Vec<SpanLink>` for each of the fixture's 4 series. The fixture never calls
 `observe_batch_context`, so each series holds one context (the default, all-zero one), but a
 non-empty `Vec` allocates whatever its length, so one per series is the floor, not a worst case.
@@ -417,7 +417,7 @@ exported.
 
 `series_retention > 0` (`docs/adr/aggregation-window-semantics.md`'s amendment) adds its own
 allocation cost, paid only by retained series. The default (`series_retention: 0`) path is
-untouched: `aggregate_flush_100_series` still measures **6**. `aggregate_flush_retained_gauges`
+untouched: `aggregate_flush_4_series` still measures **6**. `aggregate_flush_retained_gauges`
 isolates the retained path: 100 distinct gauge series, deliberately not trimmed by `keep` (12
 attributes each, past `AttrMap`'s 8-slot inline capacity), retained across a second flush, cost
 **209** allocations. Two costs stack, both inherent to retention:
@@ -425,7 +425,7 @@ attributes each, past `AttrMap`'s 8-slot inline capacity), retained across a sec
 - **`key.attributes.clone()`, once per retained series.** The tumbling path moves `key.attributes`
   into the emitted event and drops the key. A retained series needs its key again next window, so
   the attributes are cloned instead, and a spilled map's clone allocates: ~100 of the 209, one per
-  series. `aggregate_flush_100_series` never takes this branch, because its gauge retention is off.
+  series. `aggregate_flush_4_series` never takes this branch, because its gauge retention is off.
 - **Each group's `series` `HashMap` rebuilds its table on every flush that retains anything.**
   `flush` takes the whole map via `mem::take` and re-inserts survivors into the empty replacement,
   so the far more common tumbling path can move `key.attributes` for free instead of cloning every
