@@ -1,5 +1,5 @@
-# Sits between an application's Datadog libraries and a real Datadog Agent: the tracer-direct
-# topology of docs/plans/datadog-relay.md §14. The application talks to `logit` as if it were the
+# Sits between an application's Datadog libraries and a real Datadog Agent: docs/datadog.md's
+# Agent stand-in topology, relayed on to a real Agent. The application talks to `logit` as if it were the
 # local Agent, and `logit` relays what arrives to the Agent at `agent`: traces and client stats
 # through `datadog_trace_in` -> `datadog_trace_out`, DogStatsD through `statsd_in` -> `statsd_out`.
 # Both are lossless relays (docs/adr/datadog-agent-and-intake-relay.md), so anything added between

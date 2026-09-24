@@ -2,7 +2,8 @@
 # injection on), lifts the trace ids the tracer wrote into each line onto the log record with
 # `trace_context` under `format: datadog` (docs/adr/log-record-trace-context.md's Datadog
 # amendment), and sends the logs both to Datadog (`datadog_out`) and to an OTLP backend
-# (`otlp_out`), where they correlate with the application's traces.
+# (`otlp_out`), where they correlate with the application's traces. docs/datadog.md's "Log
+# correlation" section has the caveats.
 #
 # A dd-trace JSON log line carries the ids as decimal 64-bit numbers, or the trace id as 32 hex
 # characters when the tracer generates 128-bit ids:

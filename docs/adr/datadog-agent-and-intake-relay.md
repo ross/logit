@@ -8,6 +8,10 @@ updated: 2026-09-24
 ## Status
 Accepted
 
+Realized as of 2026-09-24: the plan's W1 through W8b built both pairs and the `statsd`
+additions this record decides; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s
+closing assessment for the proof and what stays open.
+
 ## Context
 
 `logit` sends nothing to Datadog except DogStatsD through `statsd_out`, and receives nothing
@@ -16,8 +20,9 @@ to stand in two places: in front of applications, where the Datadog Agent listen
 `:8125`, the APM API on `:8126`), and behind a fleet of Agents, where Datadog's intake listens
 (`dd_url`, `additional_endpoints` dual-shipping). Both are Datadog's own protocols, and the Agent
 is open source, so the protocols are readable even where Datadog documents nothing.
-[`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) has the survey, the trade-offs, the
-best-practice recommendation, and the workstreams; this record holds the decisions.
+[`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) has the survey and the workstreams,
+[`docs/datadog.md`](../datadog.md) the trade-offs and the best-practice recommendation; this
+record holds the decisions.
 
 Three facts from the survey drive the shape of the decision:
 
@@ -273,7 +278,7 @@ Three facts from the survey drive the shape of the decision:
 ones that bear on these decisions:
 
 - **Decision 11:** the tracer retries a `503` five times, then drops the payload. This was one
-  observation, not a recorded fixture (the corpus README's "What this settled" has the command).
+  observation, not a recorded fixture (the corpus README's "What this settled" describes it).
   The mechanism stands; decision 11 changed from "no retry" to the retry window it now states.
 - **Decision 12:** the stream socket is 4-byte little-endian length-prefixed, as decided. Both of
   the Agent's sockets are `0722`, so `datadog_trace_in` changed from `0666` to `0722`. And the

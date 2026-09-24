@@ -1,7 +1,8 @@
 # Sends DogStatsD metrics straight to Datadog's intake API, with no Datadog Agent in the path:
 # statsd/DogStatsD in, a 10s aggregation window, the host stamped on every point, and
 # `datadog_out` (docs/adr/datadog-agent-and-intake-relay.md) posting series to `/api/v2/series`
-# and timer sketches to `/api/beta/sketches`.
+# and timer sketches to `/api/beta/sketches`. docs/datadog.md compares this direct topology with
+# sending through a local Agent (datadog-via-agent.yaml).
 #
 # Point clients at it as at an Agent's DogStatsD port: `DD_AGENT_HOST=<this-host>` and
 # `DD_DOGSTATSD_PORT=8125`, or `statsd.Client("<this-host>", 8125)` for a plain statsd client.

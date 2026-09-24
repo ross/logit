@@ -1,6 +1,7 @@
 # Stands in for a Datadog Agent's two listening surfaces on the application side: DogStatsD on
 # :8125 (`statsd_in`) and the APM receiver on :8126 (`datadog_trace_in`,
-# docs/adr/datadog-agent-and-intake-relay.md). `stdio_out` prints what arrives.
+# docs/adr/datadog-agent-and-intake-relay.md). `stdio_out` prints what arrives. docs/datadog.md
+# covers when to stand in for an Agent rather than redirect one.
 #
 # Point an application's Datadog libraries at it with the settings you'd use for a local Agent:
 #

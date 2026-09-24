@@ -28,7 +28,7 @@ process, orchestrator, and profiling payloads; Datadog's v3 columnar series form
 only to Datadog URLs; a relay under any other URL receives v2); Remote Configuration and
 telemetry proxying (acknowledged, counted, not forwarded).
 
-Stream key **`dd`**: branches `dd/w0`…`dd/w8`, stacked as the workstream table says. PR stack
+Stream key **`dd`**: branches `dd/w0`…`dd/w8b`, stacked as the workstream table says. PR stack
 only: nothing is merged by this workstream; Ross directs merging. The decisions are recorded in
 [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) (W1), written
 once the sketch spike settled the one decision the codec depends on; the design sections below
@@ -183,36 +183,9 @@ The event model already carries every Datadog field either in a typed field or i
 
 ## Agent or direct: trade-offs and best practice
 
-**Through a local Agent.** For: host and container metadata, Live Containers, integrations, the
-Agent's out-of-the-box tags, APM trace metrics and remote configuration, the Agent's own retry
-and buffering, Unix-socket locality, Agent-side `h` aggregation and `d` sketches. Against: one
-more process per host; OTLP logs off by default; no HTTP log intake on the Agent (TCP lines or
-OTLP only); the Datadog dependency stays on every host for the whole migration.
-
-**Direct.** For: no Agent to run, one hop, works wherever HTTPS does, and `logit` is already the
-host collector. Against: the 1 h metric timestamp window, which rejects a disk-buffer replay
-after a long outage; no `h` aggregates unless `aggregate` produces them; distributions only as
-raw points or through the undocumented sketches route; the API payload limits; for traces,
-either the native protocol (Datadog-origin spans, with their stats relayed) or OTLP
-(OTel-origin spans, with `compute_stats=true` computing trace metrics from sampled spans
-only, and with the losses in §12).
-
-**Best practice, to Datadog.** Send directly (`datadog_out` for metrics, logs, events, checks,
-and Datadog-origin traces with their stats; `otlp_out` agentless for OTel-origin traces) when
-`logit` is already the collector on the host. Front an Agent when Datadog's host and APM
-features are wanted, or when OTel-origin traces need Agent-side sampling and ingestion controls.
-Don't send one signal both ways.
-
-**Best practice, from Datadog.**
-
-1. Dual-ship: add `logit`'s `datadog_in` to `additional_endpoints` (and the logs and APM
-   equivalents). No app or host change, reversible in one Agent config edit.
-2. Tee: fan `datadog_in` out to the new backend beside the Datadog leg, and compare.
-3. Cut over: point `dd_url` at `logit` or remove the Agent.
-
-Use the Agent stand-in (`statsd_in` + `datadog_trace_in` + `otlp_in` on the Agent's ports) only
-where there's no Agent to redirect (containers without a sidecar, serverless) or in step 3 once
-the Agent itself is going away.
+[`docs/datadog.md`](../datadog.md)'s "Which way to send" is the operator-facing account: what a
+local Agent gives and costs against sending directly, the recommendation for each direction, and
+the dual-ship, tee, and cut-over stages of a migration away from Datadog.
 
 ## Design
 
@@ -251,8 +224,8 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
   `datadog.type: rate`); `Samples` → `/api/v1/distribution_points`; `Distribution` → sketches
   (§4); `Set` → `gauge` of the estimate, the Agent's own `s` semantics. Cumulative or
   non-monotonic `Sum`, `GaugeDelta`, `Histogram`, `ExponentialHistogram`, `Summary`, and
-  `SetMembers` are skipped and counted `dropped{reason="unsupported_kind"}`, the `statsd_out`
-  pattern; `Histogram` as Datadog's `.bucket` counters is a follow-up.
+  `SetMembers` are skipped and counted `logit.output.metrics.skipped{metric_kind}`, the
+  `statsd_out` pattern; `Histogram` as Datadog's `.bucket` counters is a follow-up.
 - `datadog_in` request caps are constants sized to what the Agent sends, not config, matching
   `prometheus_in`'s `MAX_REQUEST_BYTES` decision: 5 MiB compressed on every route, and 5,242,880 B
   decompressed on every route but traces, whose cap is 16 MiB (the trace agent's own limit is
@@ -306,7 +279,8 @@ offset, it exposes no bins, and its `to_java_bytes` is a third format, neither t
   above. Every allocation tripwire held unchanged (the first bin `Vec` reserves the same 1 KiB
   the old crate's chunk did).
 
-Still UNVERIFIED for W7b: whether the intake accepts a stats sketch whose gamma isn't 1.0202. A
+Still UNVERIFIED after W7b, because nothing in `logit` sends one: whether the intake accepts a
+stats sketch whose gamma isn't 1.0202. A
 relayed stats sketch keeps its own, and that needn't be 1.0202: a recorded dd-trace-py 4.15
 computes its client stats on gamma 1.015625 with an index offset (`testdata/interop/datadog/README.md`).
 
@@ -327,16 +301,17 @@ A hand-rolled msgpack subset (`nil`, bool, int, float, str, bin, array, map) in
 ([ADR `committed-pregenerated-otlp-protobuf`](../adr/committed-pregenerated-otlp-protobuf.md)) --
 the protobuf vendoring landed in W2a; msgpack is W2b's, since only traces and stats use it.
 
-### 7. Documented recipes, not code (W8)
+### 7. Documented recipes, not code (W8b)
 
-- Agent-equivalent `h`/`ms` output: `aggregate` then a sink that renders quantiles; whether an
-  `aggregate` option should emit the Agent's five-metric set is a follow-up decided by W7b's
-  measurements.
-- Logs to an Agent: `otlp_out` with the Agent's `logs.enabled: true`, or `syslog_out` over TCP
-  to a `logs` TCP listener (W7b checks whether a JSON body inside the syslog line reaches Datadog
-  as attributes; if not, the recipe is OTLP only).
-- Apps writing JSON lines to an Agent TCP port: no plain-lines listener today. Recorded as a gap
-  with a sketch of a `lines_in` on the `TcpListener` driver; not built in this stack.
+Each lives in [`docs/datadog.md`](../datadog.md), with the gaps in `docs/known-gaps.md`:
+
+- Agent-equivalent `h`/`ms` output: `aggregate` then a sink that renders quantiles. `aggregate`
+  sends a sketch, and no option emits the Agent's five-metric set; W7b didn't need one.
+- Logs to an Agent: `otlp_out` with the Agent's `logs.enabled: true`. An Agent's `logs` TCP
+  listener takes syslog-formatted lines, but W7b didn't test whether a JSON body in one reaches
+  Datadog as attributes, so the recipe is OTLP only.
+- Apps writing JSON lines to an Agent TCP port: no plain-lines listener today. A gap, with a
+  sketch of a `lines_in` on the `TcpListener` driver; not built in this stack.
 
 ### 8. Attribute vocabulary (W2)
 
@@ -350,7 +325,7 @@ from `Event::timestamp` in milliseconds, `trace_id`/`span_id` as OTel-form hex f
 which Datadog auto-detects, unless the log already carries a `trace_id` or `span_id` attribute
 (W8a).
 
-### 9. Trace ids (W2b, W8)
+### 9. Trace ids (W2b, W8a)
 
 Decoders build 16-byte ids from a uint64 and `_dd.p.tid`; encoders emit the low 64 bits and
 write `_dd.p.tid` when the high bits are nonzero. `trace_context` gains `format: datadog` (W8a):
@@ -420,8 +395,8 @@ equivalent processor and goes out natively. A chunk without it is raw tracer out
 Agent stats and no obfuscation of SQL or URLs unless the tracer did it, and is counted
 `records.dropped{reason="needs_agent_processing"}`; a span with no Datadog span fields at all is
 `records.dropped{reason="not_datadog_origin"}`. So `datadog_trace_in` must not feed `datadog_out`
-directly (W8 documents this): the operator routes it to `datadog_trace_out` and a real Agent, or,
-once §14 exists, through that processor, which makes the same data ready by writing the same
+directly ([`docs/datadog.md`](../datadog.md) documents this): the operator routes it to
+`datadog_trace_out` and a real Agent, or, once §14 exists, through that processor, which makes the same data ready by writing the same
 marks. W7b verified the native leg against a trial org: an Agent's spans relayed by `datadog_in` and
 `datadog_out` arrived with their 128-bit ids and resource names, the relayed stats populated
 `trace.flask.request.hits`, `.errors`, and its duration distribution, and a `trace_context`-lifted
@@ -463,7 +438,7 @@ the OTel-direct topology is `otlp_out`.
 | W7a | **Landed** (`dd/w7a`). Recorded fixtures from a real Agent 7.83, dd-trace-py 4.15, and the `datadog` DogStatsD client over both Unix sockets (`script/record-fixtures datadog`, `testdata/interop/datadog/`), replayed through every decoder and both pairs; fixed what the captures contradicted: `/info`'s field types, `statsd_in`'s service-check `m:`, `datadog_trace_in`'s socket mode and stats headers, `datadog_in`'s probe routes and the logs `{}` check. | M | W5, W6 |
 | W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W7a, W8a |
 | W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 67; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
-| W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7b |
+| W8b | **Landed** (`dd/w8b`). `docs/datadog.md`, the operator doc: topologies, best practice both ways, the rules that lose data when missed, what's verified; `datadog-via-agent.yaml`; the Datadog columns in `telemetry-landscape.md`'s logs and traces matrices; `AGENTS.md`'s eight pairs; `known-gaps.md` consolidated; this plan's closing assessment and the ADR status lines. | M | W7b |
 
 Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7a → W7b → W8b, linear; W4b
 stacks after W4a to keep the stack linear even though it depends only on W0, and W8a after W6
@@ -471,13 +446,93 @@ because it needs nothing from W7. Each PR is based on and
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, W8a,
-W7a, and W7b complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and
-retargets to `main` once it merges. W7a pointed a real Agent, tracer, and DogStatsD client at W3's
-and W4's listeners, and relayed a real tracer and client through W6's and W4b's sinks to a real
-Agent's sockets. W7b pointed a real Agent at `datadog_in`, `datadog_out` at a trial org,
-`datadog_trace_out` at a real Agent's TCP port and `receiver_socket`, and W8a's `format: datadog`
-at a real `ddtrace` 4.15.2 log line.
+**Status (2026-09-24):** W0 through W8b complete on their stacked branches (W0 #309, W1 #311,
+W2a #318, W2b #330, W3 #339, W4a #341, W4b #342, W5 #343, W6 #348, W8a #349, W7b #353, W7a #354;
+the numbers follow the order the PRs were opened, not how they stack), nothing merged to `main`;
+W1 targets `dd/w0` and retargets to `main` once it merges. The [closing assessment](#closing-assessment)
+below records what the stack closed and what it left open.
+
+## Closing assessment
+
+Both new like-protocol pairs, and the DogStatsD additions to the existing `statsd` pair, relay
+losslessly modulo the permitted normalizations each codec's module doc lists
+(`crates/logit-proto/src/datadog/mod.rs`, "Permitted normalizations" under each payload family):
+
+- **`datadog_in -> datadog_out`** (Datadog's intake API): series v1 and v2 (JSON and protobuf),
+  distribution points, sketches bin-for-bin under `Mapping::agent`, service checks, events in the
+  Agent's `/intake/` envelope and the public v1 form, logs, `AgentPayload` traces with 128-bit ids
+  through `_dd.p.tid`, and `StatsPayload` APM stats relayed with their own DDSketch mapping rather
+  than recomputed. `datadog_out` sends traces natively only when an Agent has processed them
+  (§12). The permitted normalizations are whole-second metric timestamps, one point per series,
+  reordered resources and tags, `avg` recomputed from `sum`/`cnt`, a batch per `TracerPayload`,
+  and spans regrouped into one chunk per trace id, each listed with the rest in the module doc.
+- **`datadog_trace_in -> datadog_trace_out`** (the Agent's APM API): v0.4, v0.5, and v0.7 msgpack
+  traces and `/v0.6/stats`, with the tracer's request headers carried as `datadog.tracer.*` and
+  restored on the way out, over TCP or the Agent's Unix socket. v0.4, the default egress form,
+  relays a v0.4 tracer's spans with nothing lost; a v0.7 tracer's chunk and payload fields need
+  `version: v0.7`.
+- **`statsd_in -> statsd_out`, DogStatsD additions** (§10): the Agent's `dogstatsd_socket` and
+  `dogstatsd_stream_socket` as `transport: unix` and `unix_stream`, and `|e:`/`|card:` on metric,
+  event, and service-check lines, which superset requirement 14 in
+  [`telemetry-landscape.md`](../design/telemetry-landscape.md) now names.
+
+Each is proven by a test suite and by real traffic:
+
+- **Codec fixed points**: `crates/logit-proto/tests/datadog_metrics_fixed_point.rs`,
+  `datadog_logs_fixed_point.rs`, `datadog_traces_fixed_point.rs`, and
+  `datadog_stats_fixed_point.rs` check `decode(encode(x))` against each normalization list;
+  `datadog_cross_route.rs` checks that a batch fanned to every route leaves each item on the route
+  that owns it. The `DdSketch` key vectors ported from the Agent's `config_test.go` and
+  `store_test.go` pin `Mapping::agent` (§4).
+- **Pair round trips over real sockets**: `crates/logit-cli/tests/datadog_pair_round_trip.rs`
+  (`datadog_out -> datadog_in`, every route, gzip and deflate, the key check) and
+  `datadog_trace_pair_round_trip.rs` (`datadog_trace_in -> datadog_trace_out -> datadog_trace_in`,
+  TCP and Unix); `datadog_in_round_trip.rs` and `datadog_trace_in_round_trip.rs` for each
+  listener's routes, encodings, and backpressure; `statsd_round_trip.rs`'s `mod unix` and the
+  `dogstatsd-external-data-cardinality` fixtures for the `statsd` additions.
+- **Recorded interop corpus** (W7a): [`testdata/interop/datadog/`](../../testdata/interop/datadog/README.md),
+  from Agent 7.83.3, dd-trace-py 4.15.2, and the `datadog` client 0.54.0, replayed through every
+  decoder by `crates/logit-proto/tests/datadog_interop.rs`, through each listener, and through both
+  pairs. Where it contradicted the survey, the code changed; that README's "What this settled"
+  marks each change.
+- **Trial-org run** (W7b): `datadog_out` direct, a real Agent through `datadog_in` and
+  `datadog_out` (traces and stats included), `datadog_trace_out` and `statsd_out` into a real Agent
+  over every transport, log correlation, and `otlp_out` agentless, all queried back from the org
+  except service checks. Its two code fixes, uncompressed events and the Agent's `{}` series
+  probe, are ADR decision 14.
+
+What's left is tracked in [`docs/known-gaps.md`](../known-gaps.md)'s "Datadog" section, one entry
+each:
+
+- Agent-side routes `datadog_in` doesn't serve: v3 columnar series, the legacy TCP logs port, and
+  an API key in a data route's query string or path ("`datadog_in` doesn't speak every route an
+  Agent can send to").
+- `datadog_in` with no `api_keys` accepts any key, the validate routes included.
+- `datadog_trace_in` decodes no JSON trace bodies and no v1.0 string-table form (two entries).
+- The Agent-equivalent trace processor (§14): `datadog_trace_in` does none of the Agent's
+  processing, and `datadog_trace_out` derives no Datadog fields from an OTel span (two entries).
+- A libdatadog tracer sends `datadog_trace_in` no client stats.
+- `datadog_out`: size limits tighter than the intake's; not duplicate-safe; metric points older
+  than 1 hour dropped though Datadog would store them; a `202`'s `errors` array unread; an event's
+  and a service check's host sent as a tag (five entries).
+- `datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.
+- `datadog_out` sends no Agent-style `h`/`ms` aggregates and no explicit-bucket `Histogram`
+  (§7, §2).
+- No plain-lines listener for applications that write JSON lines to an Agent's TCP logs port, and
+  `syslog_out` into an Agent's `logs` listener unverified for JSON bodies (§7).
+- What neither the corpus nor the trial org exercised: a stats sketch whose gamma isn't 1.0202
+  (§4), service checks visible in the org, the Agent's dual-shipping and TLS settings against
+  `datadog_in`, and a real v0.7 tracer, `PUT` sender, or second tracer language.
+- The hand-rolled `DdSketch` store's ~4% CPU on sketch-heavy stages, accepted for bin-for-bin
+  parity.
+
+Cross-protocol egress stays best-effort under ADR `lossless-transit`: the Datadog encode rows in
+`known-gaps.md`'s "Cross-protocol semantic gaps" table (OTel-only span fields, and the metric
+kinds `datadog_out` has no route for) are counted, not closed.
+
+[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s Status, and
+[ADR `lossless-transit`](../adr/lossless-transit.md)'s seventh-and-eighth-pair amendment, now
+record this closing assessment as the realization of their decisions.
 
 ## Verification
 

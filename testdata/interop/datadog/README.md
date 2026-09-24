@@ -108,12 +108,11 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
   seconds). With `true`, it sent `/v0.6/stats` (`tracer-v04-v0-6-stats-000`). So behind
   `datadog_trace_in` the downstream Agent computes the stats.
 - **dd-trace-py 4.15.2 retries a `503` on its trace route five times, waiting 100 ms and
-  doubling, then drops the payload.** This is a one-off observation, not a recorded fixture: the
-  `datadog-tracer` producer's app (`ddtrace-run python3 python_ddtrace_app.py`) ran against
-  `raw_capture.py --proto http --port 8126 --status 503 --reply /info=/replies/info.json`, with
-  no reply file for the trace routes so they answered `503`. The sink saw six identical requests
-  over about 3 seconds, then the tracer logged `failed to send, dropping 1 traces`. ADR decision
-  11 assumed no retry. The mechanism is unchanged (a `503` still leaves the batch undelivered to
+  doubling, then drops the payload.** This was a one-off probe of dd-trace-py 4.15.2 against an
+  endpoint that answered its trace route `503`, not a recorded fixture, and its exact invocation
+  wasn't kept. The endpoint saw six identical requests over about 3 seconds (the first try and
+  five retries), then the tracer logged `failed to send, dropping 1 traces`. ADR decision 11
+  assumed no retry. The mechanism is unchanged (a `503` still leaves the batch undelivered to
   every consumer, so a retry can't duplicate it); decision 11 now gives the window within which a
   `503` defers delivery and past which it's loss.
 - **The tracer's client stats name the tracer only in headers.** `Lang` and `TracerVersion` are
@@ -163,10 +162,11 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
 
 ## What isn't covered here (yet)
 
-- **Anything Datadog's intake decides.** Whether it accepts sketches or traces from a sender that
-  isn't an Agent, zlib on distribution points, the undocumented size limits, whether it dedupes a
-  resent point, log, or span, and whether it takes a stats sketch that isn't on gamma 1.0202 all
-  need a real Datadog org. That's W7b in `docs/plans/datadog-relay.md`.
+- **Anything Datadog's intake decides.** Nothing here reached Datadog. The plan's W7b trial-org
+  run settled most of it (sketches and traces from a sender that isn't an Agent, zlib on
+  distribution points, the size limits, series dedupe), recorded in
+  `docs/plans/datadog-relay.md` and ADR `datadog-agent-and-intake-relay` rather than as fixtures. Whether the intake
+  takes a stats sketch that isn't on gamma 1.0202 is still open (`docs/known-gaps.md`).
 - **v0.7 traces, a `PUT`, and a second tracer language.** dd-trace-py sends neither v0.7 nor
   `PUT`; dd-trace-java and dd-trace-go would. The codec's fixed-point tests cover both forms.
 - **v1 series, distribution points, and the public API's JSON forms.** A current Agent sends
@@ -174,7 +174,8 @@ Each item below was UNVERIFIED in `docs/plans/datadog-relay.md` or ADR
 - **A check that sets a `device`.** The Agent ran no checks, so no series carries one, and the
   v2 serializer's handling of a v1 `device` stays as the codec documents it.
 - **A real tracer's log-correlation fields** (`dd.trace_id`, `dd.span_id`) for `trace_context`'s
-  `format: datadog`. The Flask app logs nothing through an injected formatter.
+  `format: datadog`. The Flask app logs nothing through an injected formatter. The W7b run lifted
+  one real dd-trace-py 4.15.2 line, not kept here.
 - **`Datadog-Send-Real-Http-Status: 1`**, which the tracer sends on every trace request to ask
   the Agent for real status codes. `datadog_trace_in` always answers with real ones, and
   `datadog_trace_out` doesn't carry the header on.

@@ -117,7 +117,7 @@ Native transforms live in `crates/logit-transforms`; `lua`/`lua_file` live in `c
 | `set` | stamps constant values onto event attributes and/or the batch resource | [ADR `operator-declared-resource-attributes`](docs/adr/operator-declared-resource-attributes.md) |
 | `scale` | multiplies named numeric attributes by a constant factor (unit conversion) | [ADR `scale-transform`](docs/adr/scale-transform.md) |
 | `keep_values` | clamps attribute values to a per-field allow-list | [ADR `value-allowlist-cardinality-clamp`](docs/adr/value-allowlist-cardinality-clamp.md) |
-| `trace_context` | gives a `LogRecord` a native application trace/span reference; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
+| `trace_context` | gives a `LogRecord` a native application trace/span reference, from W3C hex ids or, under `format: datadog`, a dd-trace tracer's decimal and 128-bit `dd.trace_id`/`dd.span_id`; an opt-in `span:` block turns an access log line into a real `SpanRecord` on the same event | [ADR `log-record-trace-context`](docs/adr/log-record-trace-context.md), [ADR `trace-context-span-lifting`](docs/adr/trace-context-span-lifting.md) |
 | `http_access` | normalizes web-server access logs onto OTel semconv | [ADR `http-access-normalization`](docs/adr/http-access-normalization.md) |
 | `flatten` | rewrites a nested attribute into flat, dot-joined keys | [ADR `flatten-transform`](docs/adr/flatten-transform.md) |
 | `has_signal`, `keep_signals`, `drop_signals` | forward an event carrying a listed signal; keep, or clear, the listed signals' payloads | [ADR `signal-filtering-components`](docs/adr/signal-filtering-components.md) |
@@ -209,11 +209,12 @@ Details an agent needs beyond the table:
 
 ### Lossless like-protocol relays
 
-Six like-protocol pairs must each relay losslessly, modulo a named list of permitted
+Eight like-protocol pairs must each relay losslessly, modulo a named list of permitted
 normalizations ([ADR `lossless-transit`](docs/adr/lossless-transit.md); the rule itself is under
 [Design constraints that aren't optional](#design-constraints-that-arent-optional)).
 [docs/plans/lossless-transit.md](docs/plans/lossless-transit.md) has the closing assessment for
-the first three pairs. What the model and codecs carry for them:
+the first three pairs, and [docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) for the two
+Datadog pairs. What the model and codecs carry for them:
 
 - **Model v2**: `Sum`/`Samples`/`SetMembers`/`ExponentialHistogram`, `SpanExt`, batch-level
   `Scope`, `MetricRecord.flags`.
@@ -223,11 +224,16 @@ the first three pairs. What the model and codecs carry for them:
 - **syslog**: structured data as `syslog.sd`, timestamp precedence, bytes MSG, and opt-in
   structured-data emission.
 - **statsd**: raw timers/sets, `|c:`/`|e:`/`|card:`/`|T`, and events/service checks.
+- **Datadog**: `datadog.*` carriers for every raw field without a typed home (a `rate`'s type, a
+  count's interval, resources, origin, trace chunk, tracer, and Agent fields), `DdSketch` under
+  `Mapping::agent` for the Agent's metrics sketches and `Mapping::logarithmic` for APM stats
+  sketches, 128-bit trace ids through `_dd.p.tid`, and APM stats as metric events.
 
 Residual debt lives in `docs/known-gaps.md`: post-sketch metric kinds at `statsd_out`;
 `statsd_out` carrying no `unit` and no native rename/prefix and stamping an egress timestamp only
 on a `|T`-marked line; and syslog's `event.timestamp` staying receipt time while the wire
-TIMESTAMP follows the precedence table.
+TIMESTAMP follows the precedence table. The Datadog pairs' residual debt is in the same file's
+"Datadog" section, listed by the closing assessment.
 
 Per pair:
 
@@ -302,6 +308,31 @@ Per pair:
   fixed point modulo its own named normalization list
   ([ADR `graphite-carbon-relay`](docs/adr/graphite-carbon-relay.md),
   [examples/graphite-relay.yaml](examples/graphite-relay.yaml)).
+- **`datadog_in -> datadog_out`** (Datadog's intake API): `crates/logit-proto/src/datadog/` holds
+  one codec module per payload family, and `mod.rs`'s doc is the mapping table: series v1 and v2
+  (JSON and protobuf), distribution points, sketches bin-for-bin, service checks, events (the
+  Agent's `/intake/` envelope and public v1), logs, `AgentPayload` traces, and `StatsPayload` APM
+  stats, relayed rather than recomputed. `datadog_in` decodes gzip, deflate, and zstd (`ruzstd`)
+  and answers a full pipeline `503` after a bounded wait. `datadog_out` sends a trace chunk only
+  when its root carries the Agent's `_top_level` mark, so `datadog_trace_in` must not feed it;
+  it drops stale points before sending, and isn't duplicate-safe. Normalizations include
+  whole-second metric timestamps, one point per series, `avg` recomputed from `sum`/`cnt`, and a
+  batch per `TracerPayload`
+  ([ADR `datadog-agent-and-intake-relay`](docs/adr/datadog-agent-and-intake-relay.md),
+  [examples/datadog-intake-standin.yaml](examples/datadog-intake-standin.yaml),
+  [examples/datadog-direct.yaml](examples/datadog-direct.yaml)).
+- **`datadog_trace_in -> datadog_trace_out`** (a Datadog Agent's APM API): v0.3, v0.4, v0.5,
+  and v0.7 msgpack traces and `/v0.6/stats` over TCP or the Agent's Unix socket, the tracer's
+  request headers carried as `datadog.tracer.*` resource attributes and restored as headers. v0.4
+  egress, the default, relays a v0.4 tracer losslessly; a v0.7 tracer's chunk fields need
+  `version: v0.7`. A `503` from `datadog_trace_in` defers a payload only for the tracer's short
+  retry window
+  ([examples/datadog-agent-standin.yaml](examples/datadog-agent-standin.yaml),
+  [examples/datadog-agent-relay.yaml](examples/datadog-agent-relay.yaml)).
+
+  [docs/datadog.md](docs/datadog.md) is the operator-facing account of both pairs: the four
+  topologies (direct, through a local Agent, and standing in for an Agent or for the intake),
+  best practice in each direction, and the rules that lose data when missed.
 
 ### Listener I/O
 
@@ -458,6 +489,9 @@ the operator-facing account of all of this.
 - Credit-based flow control beyond one frame in flight, and QUIC, for the native transport
   (`docs/known-gaps.md`).
 - Prometheus native histograms, skipped and counted in both directions.
+- An Agent-equivalent Datadog trace processor (normalization, `_top_level` marking, sampling, a
+  stats concentrator), so tracer spans could reach Datadog with no real Agent in the path
+  ([docs/plans/datadog-relay.md](docs/plans/datadog-relay.md) §14).
 
 ## Environment
 
@@ -608,9 +642,10 @@ not a style preference:
   the `cardinality-estimator` crate, also a real, mergeable sketch — don't replace either with a
   non-mergeable shortcut.
 - **`statsd_in -> statsd_out`, `otlp_in -> otlp_out`, `syslog_in -> syslog_out`, `prometheus_in ->
-  prometheus_out`, `collectd_in -> collectd_out`, and `graphite_in -> graphite_out` must each be a
-  lossless relay**, modulo a named list of permitted normalizations (batching, tag reordering, a
-  sink-configured dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
+  prometheus_out`, `collectd_in -> collectd_out`, `graphite_in -> graphite_out`, `datadog_in ->
+  datadog_out`, and `datadog_trace_in -> datadog_trace_out` must each be a lossless relay**,
+  modulo a named list of permitted normalizations (batching, tag reordering, a sink-configured
+  dialect change) — [ADR `lossless-transit`](docs/adr/lossless-transit.md). A
   decoder never pre-summarizes what an explicit `aggregate`/Lua stage should decide about, and a
   field a protocol can carry that `Event` can't represent is tracked debt
   ([`docs/plans/lossless-transit.md`](docs/plans/lossless-transit.md)), not an accepted codec

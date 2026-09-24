@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-09-23
+updated: 2026-09-24
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -210,3 +210,7 @@ bin-for-bin, and why traces relay over the Agent's protocol rather than OTLP, an
 [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md) for the workstreams closing them and
 their permitted normalizations (a batch boundary per `TracerPayload`; `avg` recomputed from
 `sum`/`cnt`; Datadog's own name and tag sanitization).
+
+Realized as of 2026-09-24: both pairs relay losslessly modulo the normalizations their codec's
+module doc lists; see [`docs/plans/datadog-relay.md`](../plans/datadog-relay.md)'s closing
+assessment.

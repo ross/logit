@@ -837,8 +837,8 @@ components:
   `idle_timeout:`, and the batch-assembly half of `receive:` apply, and the queue fields are
   rejected. A packet declaring more than 64 KiB closes its connection
   (`logit.input.frames.dropped{reason="oversize"}`), since a length-framed stream has no point to
-  resynchronize at. This framing hasn't yet been checked against a real Agent or client
-  ([`known-gaps.md`](known-gaps.md)).
+  resynchronize at. A recorded `datadog` Python client's stream decodes this way, and a real
+  Agent 7.83 accepted `statsd_out`'s.
 - **No TLS, and the path must be absolute.** A Unix socket is local and always plaintext, so
   `logit validate` rejects `tls:` under either Unix transport, and a relative `bind:` (rule 64),
   which a client's `unix:///` URL couldn't name.
@@ -1002,9 +1002,8 @@ components:
   fails under the sink's usual rules and the next send reconnects. Each reconnect counts
   `logit.output.reconnects`.
 - **`unix_stream` connects lazily and reconnects like TCP.** Each packet follows its length as a
-  4-byte little-endian integer (unverified against a real Agent,
-  [`known-gaps.md`](known-gaps.md)). A write that fails having accepted zero bytes is retried once
-  on a fresh connection, as on plaintext TCP.
+  4-byte little-endian integer, which a real Agent 7.83 accepted. A write that fails having
+  accepted zero bytes is retried once on a fresh connection, as on plaintext TCP.
 - **No TLS.** `logit validate` rejects `tls:` under either Unix transport, and a relative
   `endpoint:` (rule 64).
 
@@ -1338,6 +1337,9 @@ shares the page's origin instead of opening `otlp_in` to arbitrary browser origi
 
 ## `datadog_in`: standing in for Datadog's intake
 
+To choose between this and the other Datadog topologies, and for the rules that lose data when
+missed, see [`docs/datadog.md`](datadog.md). This section and the next three are the reference.
+
 `datadog_in` answers a Datadog Agent the way Datadog's intake does, so an Agent sends it series,
 sketches, service checks, events, logs, APM traces, and APM stats with nothing changed but its URLs.
 Point the Agent's `dd_url`, `logs_config.logs_dd_url`, and `apm_config.apm_dd_url` at it to replace
@@ -1433,6 +1435,9 @@ mismatch. `docs/design/internal-telemetry.md`'s `datadog_in` section has every c
 
 ## `datadog_trace_in`: standing in for the Agent's APM API
 
+[`docs/datadog.md`](datadog.md) covers when to stand in for an Agent, and where its spans must go
+next.
+
 `datadog_trace_in` answers a dd-trace tracer the way a local Datadog Agent's APM receiver does, so
 an application sends it traces and client-computed stats with nothing changed but where it points:
 `DD_AGENT_HOST` and `DD_TRACE_AGENT_PORT`, or `DD_TRACE_AGENT_URL` (`http://HOST:8126` or
@@ -1504,6 +1509,8 @@ which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
 doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
 
 ## `datadog_out`: sending straight to Datadog
+
+[`docs/datadog.md`](datadog.md) compares sending directly with sending through a local Agent.
 
 `datadog_out` posts each batch to Datadog's intake API with no Datadog Agent in the path: series
 and sketches, raw distribution values, service checks, events, logs, and Agent-processed APM traces
@@ -1635,6 +1642,8 @@ so those lines pass through uncorrelated. `format: datadog` reads them:
 `tail_in` → `json` → `flatten` → `trace_context` into both `datadog_out` and `otlp_out`.
 
 ## `datadog_trace_out`: sending to an Agent's APM API
+
+[`docs/datadog.md`](datadog.md) covers the tracer-to-Agent relay topology this sink completes.
 
 `datadog_trace_out` sends APM traces and tracer-computed stats to a real Datadog Agent's trace API,
 as a dd-trace tracer does. It's the sending half of `datadog_trace_in`: a tracer's spans pass

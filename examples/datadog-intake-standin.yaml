@@ -1,7 +1,9 @@
 # Stands in for Datadog's intake: a Datadog Agent sends this listener what it would send Datadog
 # (series, sketches, service checks, events, logs, APM traces, APM stats), and `stdio_out` prints
 # what arrives. `datadog_in` (docs/adr/datadog-agent-and-intake-relay.md) answers the Agent the
-# way the intake does, so the Agent needs no change beyond the URLs it sends to.
+# way the intake does, so the Agent needs no change beyond the URLs it sends to. It's the
+# topology a migration away from Datadog runs through: docs/datadog.md has the dual-ship, tee,
+# and cut-over stages.
 #
 # Point an Agent at it in datadog.yaml. Replacing Datadog outright:
 #
