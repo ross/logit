@@ -323,6 +323,11 @@ fn report_cursor_error(
     diag.warn_throttled("cursor_error", format!("writing cursor {}: {err}", path.display()));
 }
 
+/// Whether `path` names an existing file. Only on a failure path: a blocking `stat`.
+fn fs_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 async fn fsync_path(path: &Path) -> io::Result<()> {
     tokio::fs::File::open(path).await?.sync_data().await
 }
@@ -410,6 +415,12 @@ struct State {
     /// While it's set, nothing is written and nothing rotates. A crash is the same case, repaired
     /// at the next [`DiskQueue::open`].
     needs_repair: Option<u64>,
+    /// Set before a rotation's first `.await` and cleared once the new segment is active (or
+    /// its create failed). A rotation cancelled in between can have left the next segment on
+    /// disk, untracked and empty, as the highest-numbered file, so the next write rotates first
+    /// whatever the active segment's length: appending to the old segment instead would leave
+    /// bytes `DiskQueue::open` never validates, since it checks only the highest segment.
+    rotation_started: bool,
     read_file: Option<(u64, tokio::fs::File)>,
     last_checkpoint: Instant,
     diag: Diagnostics,
@@ -625,6 +636,7 @@ impl DiskQueue {
             head_cache: None,
             write_file: None,
             needs_repair: None,
+            rotation_started: false,
             read_file: None,
             last_checkpoint: Instant::now(),
             diag,
@@ -831,8 +843,9 @@ impl DiskQueue {
     /// producer, so nothing can be queued in between.
     ///
     /// Repairs a torn tail first, since nothing rotates past unrepaired bytes; a failed repair is
-    /// returned for `push` to count the batch dropped. A failed rotation isn't: `push` sees the
-    /// spool still full and doesn't try again.
+    /// returned for `push` to count the batch dropped, as is a rotation that must not fall back
+    /// to the old segment (see [`DiskQueue::rotate_segment`]). Any other failed rotation isn't:
+    /// `push` sees the spool still full and doesn't try again.
     async fn rotate_consumed_active_segment(&self) -> Result<(), WriteError> {
         let mut held = self.hold_write_file();
         let (seq, needs_repair) = {
@@ -842,7 +855,7 @@ impl DiskQueue {
         if let Some(before) = needs_repair {
             self.repair_torn_tail(&mut held, seq, before).await?;
         }
-        self.rotate_segment(&mut held).await;
+        self.rotate_segment(&mut held).await?;
         drop(held);
         self.roll_read_cursor();
         Ok(())
@@ -866,10 +879,12 @@ impl DiskQueue {
 
         let needs_rotate = {
             let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            state.segments.back().expect("always at least one segment").len >= self.segment_bytes
+            state.rotation_started
+                || state.segments.back().expect("always at least one segment").len
+                    >= self.segment_bytes
         };
         if needs_rotate {
-            self.rotate_segment(&mut held).await;
+            self.rotate_segment(&mut held).await?;
         }
 
         let seq = {
@@ -1001,13 +1016,20 @@ impl DiskQueue {
     /// through the retained handle, creates the new one, `fsync`s the directory, then makes the
     /// new segment active with its handle retained. Each failure is counted and diagnosed. A
     /// failed flush or `fsync` doesn't stop the rotation. A failed create leaves the old segment
-    /// active, and the next push retries.
+    /// active, and the next push retries; if the new segment's file exists anyway (left by an
+    /// earlier, cancelled rotation), it returns an error instead, so the caller drops its batch
+    /// rather than append to the old segment.
     ///
     /// The new segment opens without truncating, so a file left by a rotation cancelled after
     /// its create (always empty: nothing writes to a segment before it's active) is reused.
-    async fn rotate_segment(&self, held: &mut HeldWriteFile<'_>) {
+    /// [`State::rotation_started`] makes the next write finish such a rotation before it
+    /// appends anything. A rotation starts only once no repair is pending, so the old segment is
+    /// whole whenever the next one can exist, and `open`, validating only the highest segment,
+    /// misses nothing.
+    async fn rotate_segment(&self, held: &mut HeldWriteFile<'_>) -> Result<(), WriteError> {
         let old_seq = {
-            let state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.rotation_started = true;
             state.segments.back().expect("always at least one segment").seq
         };
         let old_path = segment_path(&self.dir, old_seq);
@@ -1035,7 +1057,14 @@ impl DiskQueue {
             Ok(file) => file,
             Err(err) => {
                 self.count_fs_error("create", format_args!("creating segment {new_seq}"), &err);
-                return;
+                // A cancelled rotation's create may already have left the file. Then the old
+                // segment must take no more writes, so the rotation stays pending and this write
+                // fails. Without one, the old segment stays active as before.
+                if fs_exists(&new_path) {
+                    return Err(WriteError::from_io(&err));
+                }
+                self.inner.lock().unwrap_or_else(|p| p.into_inner()).rotation_started = false;
+                return Ok(());
             }
         };
         if let Err(err) = fault_io!(DIR_SYNC, &self.dir, new_seq, fsync_path(&self.dir).await) {
@@ -1044,12 +1073,13 @@ impl DiskQueue {
         // No `.await` from here on, so a cancelled push can't separate the new handle from the
         // new segment.
         let old_file = held.file.replace(new_file);
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .segments
-            .push_back(Segment { seq: new_seq, len: 0 });
+        {
+            let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            state.segments.push_back(Segment { seq: new_seq, len: 0 });
+            state.rotation_started = false;
+        }
         drop(old_file);
+        Ok(())
     }
 
     /// `DropOldest` under a full queue: advances the read cursor past the head record without
@@ -1452,7 +1482,7 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{encode_context, DiskQueueConfig, CONTEXT_LEN};
+    use super::{encode_context, DiskQueue, DiskQueueConfig, CONTEXT_LEN};
     use crate::fanout::{BatchContext, TraceContext};
     use crate::queue::OverflowPolicy;
     use logit_core::{AttrMap, Event, EventBatch, Provenance, Resource, Value};
@@ -1460,6 +1490,12 @@ pub(crate) mod test_support {
     use logit_proto::native;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The active (highest tracked) segment's sequence number.
+    pub(crate) fn active_seq(q: &DiskQueue) -> u64 {
+        let state = q.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.segments.back().expect("always at least one segment").seq
+    }
 
     pub(crate) fn scratch_dir(label: &str) -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -3245,6 +3281,87 @@ mod tests {
         assert_eq!(list_segments(&dir).unwrap(), vec![1], "the consumed segment is reclaimed");
         let events = registry.drain(0);
         assert_eq!(metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, None), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A make-room rotation cancelled once segment 1's create has landed, before segment 1 is
+    /// recorded as active, as `run_output` dropping `drain_inbox` would. Segment 0 is short of
+    /// `segment_bytes`, so only the unfinished rotation says the next write must rotate first.
+    /// The next push runs on the closed store, as the shutdown sweep's does, so it never takes
+    /// the make-room path itself.
+    #[tokio::test]
+    async fn a_rotation_cancelled_after_its_create_is_finished_by_the_next_write_never_appending_to_the_old_segment(
+    ) {
+        let dir = scratch_dir("cancelled-make-room");
+        let one = raw_record(&batch("x"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.segment_bytes = 1024 * 1024;
+        cfg.max_bytes = 3 * one;
+        let (q, registry, _diag) = open_observed(cfg);
+        for label in ["a", "b", "c"] {
+            q.push((batch(label), ctx())).await;
+        }
+        deliver(&q, &["a", "b", "c"]).await;
+
+        {
+            let mut push = std::pin::pin!(q.push((batch("cancelled"), ctx())));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !segment_path(&dir, 1).exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the make-room rotation never created segment 1"
+                );
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(push.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                assert!(pending, "the push must still be inside its rotation");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        } // cancelled with segment 1 on disk but not yet active
+
+        // A retry whose create fails can't fall back to segment 0 with segment 1 on disk.
+        registry.drain(0);
+        let scope = fault::scope(&dir);
+        scope.fail_nth(SEGMENT_CREATE, 1, errno::EIO);
+        q.push((batch("refused"), ctx())).await;
+        drop(scope);
+        let events = registry.drain(0);
+        assert_eq!(
+            metric_sum(
+                &events,
+                SINK_QUEUE_METRICS.items_dropped,
+                Some(("reason", "disk_io_error"))
+            ),
+            1.0
+        );
+        assert_eq!(std::fs::metadata(segment_path(&dir, 0)).unwrap().len(), 3 * one);
+
+        q.close();
+        q.push((batch("swept"), ctx())).await;
+
+        let tracked: Vec<u64> = segment_lengths(&q, &dir).iter().map(|s| s.0).collect();
+        assert_eq!(
+            list_segments(&dir).unwrap(),
+            tracked,
+            "every file on disk is a tracked segment"
+        );
+        assert_segments_match_disk(&q, &dir);
+        assert_eq!(
+            std::fs::metadata(segment_path(&dir, 0)).unwrap().len(),
+            3 * one,
+            "nothing is appended to the segment the rotation was leaving"
+        );
+        assert_eq!(
+            std::fs::metadata(segment_path(&dir, 1)).unwrap().len(),
+            raw_record(&batch("swept"), ctx()).len() as u64,
+            "the next write lands in the segment the rotation created"
+        );
+        drop(q);
+        // The cursor last persisted inside segment 0, so its committed records may replay.
+        let reopened = open(dir.clone());
+        let delivered = drain_all(&reopened).await;
+        assert_no_loss(&delivered, &["a", "b", "c"], &["swept"], "reopen");
         std::fs::remove_dir_all(&dir).ok();
     }
 

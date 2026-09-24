@@ -20,7 +20,9 @@ use std::time::Duration;
 use proptest::prelude::*;
 use proptest::sample::Index;
 
-use crate::disk_queue::test_support::{batch, config, marker_of, metric_sum, raw_record};
+use crate::disk_queue::test_support::{
+    active_seq, batch, config, marker_of, metric_sum, raw_record,
+};
 use crate::disk_queue::{
     list_segments, segment_path, walk_segment, DiskQueue, WalkOutcome, CONTEXT_LEN,
 };
@@ -453,6 +455,14 @@ enum SpoolOp {
     /// Peeks and commits until nothing is queued. Generated only by [`bounded_spool_op`], so a
     /// following push can find a bounded spool full with nothing queued.
     ConsumeAll,
+    /// Closes the spool, as `run_output` does before its shutdown sweep: later pushes never
+    /// wait, and a push cancelled inside a make-room rotation is followed by one that doesn't
+    /// make room itself. Generated only by [`bounded_spool_op`].
+    Close,
+    /// Pushes, and cancels the push as soon as a segment newer than the active one is on disk:
+    /// inside a rotation, after its create landed and before the new segment is active.
+    /// Generated only by [`bounded_spool_op`].
+    CancelInRotation(usize),
 }
 
 const CRASH_POINTS: [Point; 9] = [
@@ -488,7 +498,12 @@ fn spool_op() -> impl Strategy<Value = SpoolOp> {
 
 /// [`spool_op`] plus [`SpoolOp::ConsumeAll`], for a spool whose `max_bytes` a few records fill.
 fn bounded_spool_op() -> impl Strategy<Value = SpoolOp> {
-    prop_oneof![6 => spool_op(), 1 => Just(SpoolOp::ConsumeAll)]
+    prop_oneof![
+        12 => spool_op(),
+        2 => Just(SpoolOp::ConsumeAll),
+        1 => Just(SpoolOp::Close),
+        2 => (0usize..300).prop_map(SpoolOp::CancelInRotation),
+    ]
 }
 
 /// How long a push may take before the model treats it as parked on a full spool.
@@ -627,6 +642,33 @@ fn push_waking_if_parked(
     .map_err(|_| TestCaseError::fail("a parked push was never woken while the consumer drained"))
 }
 
+/// Polls a push until it completes, or until a segment newer than the active one exists on disk
+/// (a rotation's create has landed), and then drops it; a push still pending after [`PARK_WAIT`]
+/// is parked on a full spool, and dropped there. Returns whether it completed.
+fn cancel_once_rotation_created(
+    rt: &tokio::runtime::Runtime,
+    dir: &Path,
+    q: &DiskQueue,
+    item: (std::sync::Arc<logit_core::EventBatch>, BatchContext),
+) -> bool {
+    let active = active_seq(q);
+    let mut push = std::pin::pin!(q.push(item));
+    let deadline = std::time::Instant::now() + PARK_WAIT;
+    while std::time::Instant::now() < deadline {
+        if list_segments(dir).unwrap().last().is_some_and(|&newest| newest > active) {
+            return false;
+        }
+        let ready = rt.block_on(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(push.as_mut(), cx).is_ready())
+        }));
+        if ready {
+            return true;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    false
+}
+
 /// Records a commit of `id`, checking that first deliveries are FIFO and that a repeat, or a
 /// push that was never counted queued, comes only after a reopen.
 fn on_commit(m: &mut Model, id: usize) -> Result<(), TestCaseError> {
@@ -700,7 +742,9 @@ fn drive_spool_model(
 
     for op in ops {
         match op {
-            SpoolOp::Push(pad) | SpoolOp::CancelPush(pad, _, _) => {
+            SpoolOp::Push(pad)
+            | SpoolOp::CancelPush(pad, _, _)
+            | SpoolOp::CancelInRotation(pad) => {
                 let id = m.pushes.len();
                 let item = (batch(&marker(id, *pad)), ctx_for_model());
                 let completed = match op {
@@ -712,6 +756,9 @@ fn drive_spool_model(
                     }
                     SpoolOp::CancelPush(_, polls, delay) => {
                         poll_then_cancel(&side, q.push(item), *polls, Duration::from_micros(*delay))
+                    }
+                    SpoolOp::CancelInRotation(_) => {
+                        cancel_once_rotation_created(&rt, dir, &q, item)
                     }
                     _ => unreachable!(),
                 };
@@ -730,6 +777,14 @@ fn drive_spool_model(
                 }
                 if queued {
                     m.depth += 1.0;
+                    // A write lands in the active segment only once any rotation a cancelled
+                    // push started is finished: nothing on disk is newer than it.
+                    let newest = list_segments(dir).unwrap().last().copied();
+                    prop_assert_eq!(
+                        newest,
+                        Some(active_seq(&q)),
+                        "a segment newer than the active one"
+                    );
                 }
                 m.pushes.push(if queued { Pushed::Queued } else { Pushed::Unconfirmed });
                 m.committed_in.push(None);
@@ -774,6 +829,7 @@ fn drive_spool_model(
                     prop_assert_eq!(depth, m.depth);
                 }
             }
+            SpoolOp::Close => q.close(),
             SpoolOp::Inject(fault) => {
                 let (op, errno) = match fault {
                     Fault::FlushEnospc => (Op::Flush, errno::ENOSPC),

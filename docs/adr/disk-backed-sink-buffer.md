@@ -411,7 +411,21 @@ segment into a closed, fully consumed one and rolls the cursor off it, which per
 and deletes the segment, then re-checks, under every overflow policy. A torn tail is repaired
 first; a failed repair drops the batch as any failed write does. If the rotation fails, the push
 doesn't retry it: `block` and `drop_oldest` write over the bound (there is nothing a consumer
-could free) and `drop_newest` drops. Two changes make a parked `block` push see this state:
+could free) and `drop_newest` drops.
+
+Before this, a rotation ran only once the active segment had reached `segment_bytes`, so the next
+write retried a cancelled one. A make-room rotation starts on a short segment, and `run_output` can
+drop `drain_inbox` inside it, after the next segment's create landed but before that segment
+became active. The shutdown sweep's push, on the closed store, never makes room itself, and would
+have appended to the old segment with an untracked, empty segment above it: bytes `DiskQueue::open`
+never validates, since it checks only the highest segment. So a rotation marks itself pending
+before its first `.await` and clears the mark once the new segment is active, and a write with a
+rotation pending rotates first, adopting the file a landed create left. If that create now fails
+while the file exists, the write drops its batch rather than fall back to the old segment. A
+rotation starts only once no torn-tail repair is pending, so the old segment is whole whenever the
+next one can exist, and `open` needs no change.
+
+Two changes make a parked `block` push see this state:
 `push` rolls the read cursor under every policy, not only `drop_oldest`, and a commit or eviction
 that leaves nothing queued notifies `not_full`.
 
@@ -426,8 +440,9 @@ abandoned-inbox sweep appends to the spool what never reached it. A batch `drain
 already received and was pushing, parked on a full `block` spool, was lost with the dropped
 future, neither spooled nor counted. `drain_inbox` now records it in an `in_hand` slot that
 `run_output` owns, cleared in the same poll its push returns, and the sweep takes it before the
-inbox: a disk store spools it and a memory store counts it `reason="shutdown"`. The sweep can so
-exceed `disk.max_bytes` by the channel's capacity plus one batch.
+inbox: a disk store spools it and a memory store counts it `reason="shutdown"`. "Shutdown" above
+bounds the overshoot by the channel's capacity; with the in-hand slot it is the channel's capacity
+plus one batch.
 
 `DiskQueue::finish` is still unbounded: its cursor persist and `fsync`s run after the shutdown
 grace. Dropping the runtime waits for blocking file work anyway, so bounding `finish` alone

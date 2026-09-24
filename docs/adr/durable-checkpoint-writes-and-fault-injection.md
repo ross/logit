@@ -308,11 +308,16 @@ script is needed. This list is filled in as each workstream lands.
       `a_drop_newest_push_makes_room_by_rotating_a_fully_consumed_active_segment`: with
       `max_bytes == segment_bytes`, a push after everything was delivered neither waits forever
       nor drops.
+    - `a_rotation_cancelled_after_its_create_is_finished_by_the_next_write_never_appending_to_the_old_segment`:
+      a make-room rotation cancelled between its create and the new segment becoming active is
+      finished by the next write, even on a closed store, and a failed retry of the create drops
+      the batch rather than append to the old segment.
   - `crates/logit-pipeline/src/disk_queue_verification.rs`:
     - `spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake`: the spool
       model under `block` with a `max_bytes` a few records fill, plus a consume-everything op. A
       parked push is woken by the consumer's commits, and a push to a full spool with nothing
-      queued finishes on its own.
+      queued finishes on its own. It also closes the spool and cancels pushes inside a
+      rotation, and checks no segment newer than the active one survives a queued push.
   - `crates/logit-pipeline/src/runtime.rs`:
     - `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled`:
       drain first, grace expiry, permanent error, and closed and empty, under both stores.
