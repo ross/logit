@@ -14,8 +14,10 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod accumulator;
+pub mod atomic_write;
 pub mod disk_queue;
 pub mod fanout;
+pub mod fault;
 pub mod graph;
 pub mod input;
 pub mod output;

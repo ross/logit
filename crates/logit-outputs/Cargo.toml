@@ -43,6 +43,8 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# Arms `logit_pipeline::fault` in this crate's tests. Dev-only, so the release binary never has it.
+logit-pipeline = { workspace = true, features = ["fault-injection"] }
 # `prometheus.rs`'s remote-write sender tests decode the request body they captured as the real
 # vendored prompb message (`logit_proto::prometheus::generated`), rather than asserting against
 # this codec's own view of what it wrote.
