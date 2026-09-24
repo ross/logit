@@ -2623,38 +2623,50 @@ mod tests {
         }))
     }
 
-    #[tokio::test]
-    async fn a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push() {
+    /// The push is polled once on a second runtime whose one blocking thread the test holds, so
+    /// its write can't land while it's polled and the push must be parked at its `flush`. Once
+    /// released, the write lands with the push never polled again, so it can't complete, and it's
+    /// dropped with its bytes on disk.
+    #[test]
+    fn a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push() {
         let dir = scratch_dir("cancel-after-landing");
         let mut cfg = config(dir.clone());
         cfg.segment_bytes = 1024 * 1024;
+        let main = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stalled = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        stalled.spawn_blocking(move || {
+            let _ = gate.recv();
+        });
         let q = open_with(cfg);
-        q.push((batch("a"), ctx())).await;
+        main.block_on(q.push((batch("a"), ctx())));
         let path = segment_path(&dir, 0);
         let before = std::fs::metadata(&path).unwrap().len();
         let record_len = raw_record(&batch("cancelled"), ctx()).len() as u64;
 
         {
             let mut push = std::pin::pin!(q.push((batch("cancelled"), ctx())));
-            // Poll only while the bytes haven't landed. The write goes to the blocking pool on
-            // the first poll, which then parks at the `flush` await until it completes.
+            assert!(poll_once_in(&stalled, push.as_mut()), "the write is parked behind the gate");
+            release.send(()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while std::fs::metadata(&path).unwrap().len() < before + record_len {
                 assert!(Instant::now() < deadline, "the write never landed");
-                let pending = std::future::poll_fn(|cx| {
-                    std::task::Poll::Ready(push.as_mut().poll(cx).is_pending())
-                })
-                .await;
-                assert!(pending, "the push must still be parked at its flush");
                 std::thread::sleep(Duration::from_millis(1));
             }
         } // dropped at the `flush` await, its bytes on disk
+        drop(stalled);
 
-        q.push((batch("b"), ctx())).await;
-        assert_segments_match_disk(&q, &dir);
-        deliver(&q, &["a", "b"]).await;
-        q.close();
-        assert!(peek_within(&q).await.is_none(), "the cancelled record was truncated away");
+        main.block_on(async {
+            q.push((batch("b"), ctx())).await;
+            assert_segments_match_disk(&q, &dir);
+            deliver(&q, &["a", "b"]).await;
+            q.close();
+            assert!(peek_within(&q).await.is_none(), "the cancelled record was truncated away");
+        });
         std::fs::remove_dir_all(&dir).ok();
     }
 
