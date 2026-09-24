@@ -6,15 +6,12 @@
 pub mod diag;
 pub mod interner;
 pub mod provenance;
-/// Consistent sampling's shared compare and its frozen key hash -- see the module's own doc
-/// comment. Namespaced like `template`, no flattened re-exports: `sampling::keep` and
-/// `sampling::hash_value` read better at a call site than bare `keep`/`hash_value` would.
+/// Consistent sampling's compare and frozen key hash. Not re-exported: `sampling::keep` reads
+/// better at a call site than a bare `keep`.
 pub mod sampling;
 pub mod telemetry;
-/// `{name}` placeholder templates -- see the module's own doc comment. Deliberately left as a
-/// namespaced module with no flattened re-exports here: `Template`/`Segment`/`Compiled` are
-/// generic enough names that `template::Template` reads better at a call site than a bare
-/// `Template` would.
+/// `{name}` placeholder templates. Not re-exported: the names are generic enough that
+/// `template::Template` reads better than `Template`.
 pub mod template;
 pub mod time;
 pub mod value;
@@ -56,8 +53,8 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
-    /// render and accept.
+    /// Every variant's lowercase name, in variant order: what the Lua API and `stdio_out` render
+    /// and accept.
     pub const NAMES: [&'static str; 6] = ["trace", "debug", "info", "warn", "error", "fatal"];
 
     /// The lowercase name the Lua API and `stdio_out` render this severity as.
@@ -72,7 +69,7 @@ impl Severity {
         }
     }
 
-    /// The inverse of [`Severity::as_str`]: an exact lowercase match, no case folding or aliases.
+    /// The inverse of [`Severity::as_str`]: lowercase only, no case folding or aliases.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "trace" => Severity::Trace,
@@ -95,8 +92,8 @@ pub enum BodyFormat {
 }
 
 impl BodyFormat {
-    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
-    /// render and accept.
+    /// Every variant's lowercase name, in variant order: what the Lua API and `stdio_out` render
+    /// and accept.
     pub const NAMES: [&'static str; 3] = ["raw", "json", "structured"];
 
     /// The lowercase name the Lua API and `stdio_out` render this format as.
@@ -108,8 +105,7 @@ impl BodyFormat {
         }
     }
 
-    /// The inverse of [`BodyFormat::as_str`]: an exact lowercase match, no case folding or
-    /// aliases.
+    /// The inverse of [`BodyFormat::as_str`]: lowercase only, no case folding or aliases.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "raw" => BodyFormat::Raw,
@@ -125,19 +121,15 @@ pub struct LogRecord {
     pub message: Value,
     pub severity: Option<Severity>,
     pub body_format: BodyFormat,
-    /// The application trace/span this log line was emitted under, if any -- distinct from
-    /// `logit`'s own pipeline trace context. `logit`'s code never sets this on its own; it only
-    /// ever carries what a codec decoded off the wire or what an operator's config/script
-    /// explicitly set (`ComponentKind::TraceContext`, `event.log.trace_id` in Lua). See
-    /// `docs/adr/log-record-trace-context.md`.
+    /// The application trace/span this log was emitted under, not `logit`'s pipeline trace. Only
+    /// a codec or an operator's config/script sets it (`trace_context`, Lua's
+    /// `event.log.trace_id`), never `logit` on its own. See `docs/adr/log-record-trace-context.md`.
     pub trace: Option<TraceRef>,
-    /// OTLP's `LogRecord.event_name` -- a short, stable identifier for the kind of event this log
-    /// represents (distinct from its free-form `message`). Produced by the OTLP codec since W4
-    /// (`docs/plans/lossless-transit.md`); readable and writable from Lua since W7.
+    /// OTLP's `LogRecord.event_name`: a stable identifier for the kind of event, distinct from
+    /// `message`.
     pub event_name: Option<Symbol>,
-    /// Unix nanoseconds this log was observed by the collector, as distinct from when it was
-    /// generated (`Event::timestamp`) -- OTLP's `LogRecord.observed_time_unix_nano`. `0` means
-    /// unset.
+    /// Unix nanoseconds when a collector observed this log, as distinct from `Event::timestamp`
+    /// (when it was generated): OTLP's `observed_time_unix_nano`. `0` means unset.
     pub observed_timestamp: i64,
     pub dropped_attributes_count: u32,
 }

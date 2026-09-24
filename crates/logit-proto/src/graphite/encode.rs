@@ -1,24 +1,19 @@
-//! Encoding a batch of events back into carbon plaintext lines or pickle frames -- the
-//! `| Model | Wire |` half of [`super`]'s module doc, which is the spec for everything here.
+//! Encoding a batch of events back into carbon plaintext lines or pickle frames: the encode half
+//! of [`super`]'s module doc, which is the spec for everything here.
 //!
-//! Pure: no socket anywhere, so every grammar, sanitization, packing and counting test runs
-//! directly against [`GraphiteEncoder`] (the split `crates/logit-outputs/src/statsd.rs` and
-//! [`crate::collectd::encode`] already use). [`GraphiteEncoder`] implements [`FramedEncoder`]
-//! rather than [`crate::Encoder`] -- see [`super`]'s "`Protocol` and `Meta`" section for why, and
-//! for what each entry's `usize` meta means.
+//! No socket, so grammar, sanitization, packing, and counting tests run directly against
+//! [`GraphiteEncoder`]. [`super`]'s "`Protocol` and `Meta`" section says why it is a
+//! [`FramedEncoder`] and what each entry's meta means.
 //!
-//! The codec emits **every one of its own** `logit.output.*` counters and diagnostics directly, at
-//! each drop site (see [`Ctx`]), through the handles
-//! [`GraphiteEncoder::with_telemetry`]/[`GraphiteEncoder::with_diagnostics`] install -- collectd's
-//! model, not statsd's. [`EncodeStats`] is returned for tests and benches; `graphite_out` (W3)
-//! discards it.
+//! The codec emits its own `logit.output.*` counters and diagnostics at each drop site (see
+//! [`Ctx`]); [`EncodeStats`] is for tests and benches, and `graphite_out` discards it.
 //!
 //! **Every per-record buffer is a struct field**, cleared and refilled rather than reallocated:
 //! the tag suffix, its arena and slot table, the sanitized path, the rendered line, the in-progress
-//! pickle frame and the one-datapoint scratch. That is what makes a warm encode allocation-free
-//! (`docs/design/memory.md` §3, and the allocation rows W3 pins). The two deliberate exceptions
-//! are named at their own call sites: `Samples::sketch()` builds a sketch per record (inherent, and
-//! shared with `influxdb_out`), and a `SetMembers` expansion needs a de-duplication buffer.
+//! pickle frame, and the one-datapoint scratch, so a warm encode allocates nothing
+//! (`docs/design/memory.md` §3). The two exceptions are named at their call sites:
+//! `Samples::sketch()` builds a sketch per record (inherent, as at `influxdb_out`), and a
+//! `SetMembers` expansion needs a de-duplication buffer.
 
 use super::pickle;
 use super::{MultiValue, Protocol, Tags};
@@ -35,78 +30,63 @@ use std::ops::Range;
 /// Nanoseconds per second -- the divisor an egress timestamp floors by.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
-/// Attribute namespaces that belong to another protocol's codec and have no business appearing as
-/// carbon tags. Skipped **uncounted**, exactly as `crates/logit-outputs/src/influxdb.rs`'s
-/// `render_tag_suffix` skips `statsd.`: these are consumed carriers, not tags anybody asked to see
-/// on this wire, so counting them as dropped would report a loss that never happened.
+/// Another protocol's consumed-carrier namespaces, skipped **uncounted** as `influxdb_out` skips
+/// `statsd.`: counting them as dropped would report a loss that never happened.
 const FOREIGN_CARRIER_PREFIXES: [&str; 2] = ["statsd.", "collectd."];
 
-/// Per-batch outcome counts from [`GraphiteEncoder::encode_into`] -- the aggregate this module's
-/// own tests and `crates/logit-bench/tests/allocations.rs` assert on exactly. Production telemetry
-/// comes from the counters the encoder emits itself, not from this struct.
+/// Per-batch outcome counts from [`GraphiteEncoder::encode_into`], for tests and benches.
+/// Production telemetry comes from the counters the encoder emits itself.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events carrying no metrics at all -- a log- or span-only event, legal under
-    /// `docs/adr/multi-payload-events.md`. Not a loss: there was nothing carbon could carry.
+    /// Events with no metrics (a log- or span-only event). Not a loss: nothing to carry.
     pub skipped_no_metrics: usize,
-    /// A multi-value metric kind under [`MultiValue::Skip`] (the default). Counted once per record,
-    /// with the kind as the counter's tag.
+    /// A multi-value metric kind under [`MultiValue::Skip`], once per record, tagged with the kind.
     pub dropped_unsupported_kind: usize,
-    /// A multi-value metric kind under [`MultiValue::Expand`]. Counted once per **record**, however
-    /// many sub-paths that record produced -- a degradation is a thing that happened to one metric,
-    /// not to each of its pieces.
+    /// A multi-value metric kind under [`MultiValue::Expand`], once per **record**, however many
+    /// sub-paths it produced.
     pub degraded_expanded_kind: usize,
-    /// A `Gauge`/`Sum` whose value is NaN or ±inf. Carbon drops a NaN on receipt itself, and there
-    /// is no wire spelling for an infinity.
+    /// A `Gauge`/`Sum` whose value is NaN or ±inf. Carbon drops a NaN on receipt, and has no
+    /// spelling for an infinity.
     pub dropped_unencodable_value: usize,
-    /// A record flagged [`MetricRecord::FLAG_NO_RECORDED_VALUE`]. Carbon has no "no reading this
-    /// interval" concept at all (unlike collectd's GAUGE NaN), so emitting the flag's default
-    /// numeric payload would fabricate a sample nobody sent.
+    /// A record flagged [`MetricRecord::FLAG_NO_RECORDED_VALUE`]. Carbon has no "no reading"
+    /// marker, so writing the default payload would fabricate a sample.
     pub dropped_no_recorded_value: usize,
-    /// A [`MetricKind::GaugeDelta`], which means a missing `aggregate` stage rather than a bad
-    /// metric.
+    /// A [`MetricKind::GaugeDelta`], which means a missing `aggregate` stage, not a bad metric.
     pub dropped_gauge_delta: usize,
-    /// An event whose timestamp floors to a non-positive second. Counted once per record the event
-    /// would have produced, so this number means the same thing as every other sink's
-    /// `metrics.skipped`.
+    /// An event whose timestamp floors to a non-positive second. Counted once per record, as
+    /// every other sink's `metrics.skipped` is.
     pub dropped_unencodable_timestamp: usize,
-    /// A record whose name sanitized to nothing -- carbon rejects an empty path, and a bare tag
-    /// segment is not a series.
+    /// A record whose name sanitized to nothing: carbon rejects an empty path.
     pub dropped_empty_name: usize,
-    /// A plaintext line longer than `max_packet_bytes`, dropped whole. Never split: half a line is
-    /// a corrupt series, not a partial one.
+    /// A plaintext line longer than `max_packet_bytes`, dropped whole, never split.
     pub dropped_oversize_line: usize,
     /// A single pickle datapoint that cannot fit an empty `max_frame_bytes` frame, dropped whole.
     pub dropped_oversize_datapoint: usize,
-    /// An attribute dropped because [`Tags::Drop`] is configured -- the operator's dialect choice,
-    /// counted so it is visible rather than silent.
+    /// An attribute dropped because [`Tags::Drop`] is configured.
     pub tags_dropped_dialect: usize,
     /// An attribute whose `Value` has no faithful carbon tag spelling (`Null`, `Bytes`, a
     /// `Timestamp`, a `Map`, or an `Array` with no representable element).
     pub tags_dropped_unrepresentable: usize,
-    /// A tag whose name or value was empty after sanitizing. Carbon's own parser rejects both, so
-    /// emitting one would take the whole line down at the far end.
+    /// A tag whose name or value was empty after sanitizing. Carbon's parser would reject the
+    /// whole line.
     pub tags_dropped_empty: usize,
     /// A tag whose rendered name collided with another's; the one whose **original** name sorts
     /// first survives.
     pub tags_dropped_collision: usize,
     /// A [`Value::Array`] rendered as its last representable element. **Lossy**, unlike every other
-    /// `*.normalized` reason: the non-last elements are genuinely discarded (the same caveat
-    /// `influxdb_out`'s identical row carries).
+    /// `*.normalized` reason: the other elements are discarded (as at `influxdb_out`).
     pub tags_normalized_multi_value: usize,
-    /// Records whose path had at least one byte substituted. Counted once per record, not once per
-    /// byte.
+    /// Records whose path had at least one byte substituted, once per record.
     pub paths_sanitized: usize,
-    /// Records whose tag segment had at least one byte substituted, in a name or a value. Counted
-    /// once per record, for the same reason.
+    /// Records whose tag segment had at least one byte substituted, once per record.
     pub tags_sanitized: usize,
-    /// Datapoints actually written -- exactly Σ of every entry's `Meta`, which is what makes the
-    /// sink's `logit.output.datapoints` and this agree by construction.
+    /// Datapoints written: Σ of every entry's `Meta`, so it matches the sink's
+    /// `logit.output.datapoints` when every entry is sent.
     pub datapoints: usize,
 }
 
-/// Encodes events as carbon plaintext lines or pickle frames. Pure -- no socket -- so
-/// `graphite_out` (W3) is only a transport wrapper over this.
+/// Encodes events as carbon plaintext lines or pickle frames. `graphite_out` is a transport
+/// wrapper over it.
 #[derive(Debug)]
 pub struct GraphiteEncoder {
     telemetry: Telemetry,
@@ -114,17 +94,14 @@ pub struct GraphiteEncoder {
     protocol: Protocol,
     tags: Tags,
     multi_value: MultiValue,
-    /// The longest single plaintext **line** this encoder will emit. `usize::MAX` (the default) is
-    /// effectively uncapped, which is what a TCP sink wants; a UDP sink passes its own
-    /// `max_packet_bytes:`. Encoder state rather than a per-call argument -- [`FramedEncoder`] has
-    /// one signature.
+    /// The longest plaintext **line** this encoder emits. `usize::MAX` (the default) is uncapped,
+    /// for TCP; a UDP sink passes its `max_packet_bytes:`.
     max_packet_bytes: usize,
-    /// The longest pickle **payload** (the bytes after carbon's 4-byte length prefix) this encoder
-    /// will pack into one frame. [`super::DEFAULT_MAX_FRAME_BYTES`] is Twisted's own
-    /// `Int32StringReceiver.MAX_LENGTH`, so a relay never writes a frame the far end refuses.
+    /// The longest pickle **payload** (after the 4-byte length prefix) packed into one frame;
+    /// defaults to [`super::DEFAULT_MAX_FRAME_BYTES`].
     max_frame_bytes: usize,
 
-    // -- per-record scratch, reused across every call; see this module's doc comment --
+    // -- per-record scratch, reused across calls (this module's doc) --
     /// `;k=v;k=v`, rebuilt once per event.
     tag_suffix: String,
     /// Arena backing [`TagSlot`]'s three ranges.
@@ -134,7 +111,7 @@ pub struct GraphiteEncoder {
     tag_value: String,
     /// The sanitized record name.
     path: String,
-    /// `path + sub-path suffix + tag suffix` -- what actually goes on the wire as the series name.
+    /// `path + sub-path suffix + tag suffix`: the series name on the wire.
     full_path: String,
     /// The current sub-path suffix under [`MultiValue::Expand`] (`.count`, `.q0_99`, ...); empty
     /// for a scalar record.
@@ -143,8 +120,8 @@ pub struct GraphiteEncoder {
     number: String,
     /// One rendered plaintext line.
     line: String,
-    /// The pickle frame being packed, **including** its 4-byte length prefix (patched in place when
-    /// the frame closes, so no second buffer and no copy).
+    /// The pickle frame being packed, **including** its 4-byte length prefix, patched in place
+    /// when the frame closes.
     frame: Vec<u8>,
     /// One encoded pickle datapoint, measured against the frame cap before being appended.
     datapoint: Vec<u8>,
@@ -190,7 +167,7 @@ impl GraphiteEncoder {
         self
     }
 
-    /// Which carbon wire protocol to write -- see [`super`]'s "`Protocol` and `Meta`" section.
+    /// Which carbon wire protocol to write ([`super`]'s "`Protocol` and `Meta`" section).
     pub fn with_protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
         self
@@ -208,13 +185,13 @@ impl GraphiteEncoder {
         self
     }
 
-    /// Caps one plaintext line -- see the field's own doc comment. `usize::MAX` means uncapped.
+    /// Caps one plaintext line; `usize::MAX` means uncapped.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         self
     }
 
-    /// Caps one pickle payload -- see the field's own doc comment.
+    /// Caps one pickle payload (excluding the length prefix).
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
         self.max_frame_bytes = max_frame_bytes;
         self
@@ -226,20 +203,17 @@ impl GraphiteEncoder {
 }
 
 impl FramedEncoder for GraphiteEncoder {
-    /// The number of datapoints each message carries: always `1` for a plaintext line, and the
-    /// frame's own datapoint count for a pickle frame. See [`super`]'s "`Protocol` and `Meta`".
+    /// The number of datapoints each message carries: `1` for a plaintext line, the frame's count
+    /// for a pickle frame.
     type Meta = usize;
     type Stats = EncodeStats;
 
     /// Encodes every event in `batch` into `out` (cleared first). Never fails: a per-record problem
-    /// is a counted drop, not an error, and there is nothing for a caller to react to beyond the
-    /// returned [`EncodeStats`].
+    /// is a counted drop.
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf<usize>) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
-        // Destructured rather than reached through `self`: the packing loop borrows most of these
-        // at once, which a chain of `&mut self` methods could not express (`collectd/encode.rs`
-        // does the same).
+        // Destructured: the packing loop borrows most of these at once.
         let Self {
             telemetry,
             diag,
@@ -282,16 +256,15 @@ impl FramedEncoder for GraphiteEncoder {
                 continue;
             }
 
-            // Whole seconds, floored -- `div_euclid` rather than `/`, so a pre-epoch instant floors
-            // downward instead of toward zero (normalization 6). Carbon has no sub-second
-            // resolution and no pre-epoch second worth writing.
+            // Whole seconds, floored with `div_euclid` so a pre-epoch instant floors downward
+            // (normalization 6); a non-positive second is dropped.
             let seconds = event.timestamp.div_euclid(NANOS_PER_SECOND);
             if seconds <= 0 {
                 ctx.drop_unencodable_timestamp(event.timestamp, event.metrics.len());
                 continue;
             }
 
-            // The tag segment is the same for every record on the event, so it is built once.
+            // Built once per event: every record shares it.
             let tags_sanitized = build_tag_suffix(
                 tag_suffix,
                 tag_text,
@@ -322,12 +295,12 @@ impl FramedEncoder for GraphiteEncoder {
     }
 }
 
-/// What a record's kind resolves to before its path is rendered. Deciding this first means a
-/// dropped kind never counts a path sanitization that was not going to reach the wire.
+/// What a record's kind resolves to before its path is rendered, so a dropped kind never counts a
+/// path sanitization.
 enum Plan {
     /// One datapoint carrying this value.
     Scalar(f64),
-    /// Several dotted sub-paths -- [`expand`] walks the kind again to emit them.
+    /// Several dotted sub-paths, which [`expand`] emits.
     Expand,
 }
 
@@ -344,19 +317,15 @@ fn encode_record(
 ) {
     let name = resolve(record.name);
 
-    // Carbon's wire has no "no reading this interval" marker, so the flag's default numeric payload
-    // must not be written as though it were a real sample (`logit_core::MetricRecord::flags`).
+    // Carbon has no "no reading" marker; the default payload is not a sample.
     if record.is_no_recorded_value() {
         ctx.drop_no_recorded_value(name);
         return;
     }
 
-    // Exhaustive, one arm per variant, no wildcard -- AGENTS.md's rule, so a new `MetricKind`
-    // fails to compile here rather than silently taking a default path.
+    // No wildcard, so a new `MetricKind` fails to compile here rather than taking a default.
     let plan = match &record.kind {
-        // Both temporalities and both monotonicities write the bare value: carbon's wire has no
-        // opinion about either, so this is normalization 12, a named drop of the model's extra
-        // facts rather than a skipped metric the way `prometheus_out`'s delta arm is.
+        // Every temporality and monotonicity writes the bare value (normalization 12).
         MetricKind::Sum(sum) => Some(Plan::Scalar(sum.value)),
         MetricKind::Gauge(v) => Some(Plan::Scalar(*v)),
         MetricKind::GaugeDelta(_) => {
@@ -424,9 +393,8 @@ fn multi(
     }
 }
 
-/// The `metric_kind` counter tag for a multi-value kind -- `&'static str`, as every tag must be.
-/// Exhaustive over the same variants [`encode_record`] matches; the scalar kinds are unreachable
-/// here because they never reach [`Plan::Expand`].
+/// The `metric_kind` counter tag for a multi-value kind. Scalar kinds never reach
+/// [`Plan::Expand`], so they are unreachable here.
 fn metric_kind_tag(kind: &MetricKind) -> &'static str {
     match kind {
         MetricKind::Samples(_) => "samples",
@@ -442,9 +410,9 @@ fn metric_kind_tag(kind: &MetricKind) -> &'static str {
     }
 }
 
-/// The [`MultiValue::Expand`] sub-path table from [`super`]'s module doc, emitted in the order it
-/// lists. Every arm adds at least one dotted suffix, which is what makes an expanded path
-/// unable to collide with the scalar path the same record would have had.
+/// The [`MultiValue::Expand`] sub-path table from [`super`]'s module doc, in its order. Every arm
+/// adds at least one dotted suffix, so an expanded path can't collide with the record's scalar
+/// path.
 fn expand(
     kind: &MetricKind,
     path: &str,
@@ -454,9 +422,8 @@ fn expand(
     ctx: &mut Ctx,
 ) {
     match kind {
-        // `sketch()` allocates a `DdSketch` per record -- inherent to re-summarizing raw
-        // observations, and exactly what `influxdb_out`/`otlp_out` already pay
-        // (`logit_core::Samples::sketch`).
+        // `sketch()` allocates a `DdSketch` per record, inherent to re-summarizing raw values
+        // (as at `influxdb_out`/`otlp_out`).
         MetricKind::Samples(samples) => {
             expand_sketch(&samples.sketch(), path, tag_suffix, seconds, sink, ctx)
         }
@@ -467,9 +434,8 @@ fn expand(
             sub(sink, ctx, path, tag_suffix, seconds, ".count", hll.estimate() as f64)
         }
         MetricKind::SetMembers(members) => {
-            // One de-duplication buffer per record. The only allocation in this function that is
-            // not inherent to the kind, and it is bounded by the record's own member count; a
-            // `SetMembers` reaching a sink unsummarized already means no `aggregate` stage ran.
+            // One de-duplication buffer per record, bounded by its member count. A `SetMembers`
+            // here means no `aggregate` ran.
             let mut distinct: Vec<&[u8]> = members.iter().map(|m| m.as_ref()).collect();
             distinct.sort_unstable();
             distinct.dedup();
@@ -492,11 +458,9 @@ fn expand(
 
 /// `.count`, `.sum`, then one `.q<q>` per [`DISTRIBUTION_QUANTILES`].
 ///
-/// `.sum` is emitted because [`DdSketch::sum`] is **exact** -- the inner crate accumulates it
-/// alongside the bins rather than deriving it from them -- unlike a quantile, which carries the
-/// sketch's relative-error bound. A quantile the sketch cannot answer (an empty sketch) or that
-/// comes back non-finite is simply not emitted: the record is already counted degraded, and a
-/// fabricated `inf` datapoint would be worse than a missing one.
+/// `.sum` is emitted because [`DdSketch::sum`] is **exact**, unlike a quantile. A quantile the
+/// sketch can't answer (an empty sketch) or that comes back non-finite is not emitted: the record
+/// is already counted degraded, and a fabricated `inf` is worse than a missing datapoint.
 fn expand_sketch(
     sketch: &DdSketch,
     path: &str,
@@ -517,9 +481,7 @@ fn expand_sketch(
 }
 
 /// `.count` (Σ bucket counts), `.sum`/`.min`/`.max` when present, then `.bucket_<bound>` per
-/// bucket. Each bucket carries its **own** count, not a cumulative running total
-/// (`logit_core::Histogram`'s own doc) -- re-deriving a cumulative series here would be a
-/// reinterpretation, not a rendering.
+/// bucket, each carrying its **own** count, not a cumulative total (`logit_core::Histogram`).
 fn expand_histogram(
     histogram: &Histogram,
     path: &str,
@@ -541,12 +503,11 @@ fn expand_histogram(
     }
 }
 
-/// `.count`, `.sum`/`.min`/`.max` when present, `.zero_count` -- and deliberately **no buckets**.
+/// `.count`, `.sum`/`.min`/`.max` when present, `.zero_count`, and **no buckets**.
 ///
-/// An exponential histogram's buckets are a `(scale, offset, counts)` encoding whose bounds are
-/// `base^i` for `base = 2^(2^-scale)`; materializing them as explicit `.bucket_<b>` sub-paths would
-/// be exactly the lossy conversion [`MetricKind::ExponentialHistogram`] exists to avoid, and would
-/// mint an unbounded number of wire paths from one record besides.
+/// Materializing the `(scale, offset, counts)` buckets as `.bucket_<b>` sub-paths would be the
+/// lossy conversion [`MetricKind::ExponentialHistogram`] exists to avoid, and would mint unbounded
+/// wire paths from one record.
 fn expand_exp_histogram(
     histogram: &ExpHistogram,
     path: &str,
@@ -562,9 +523,8 @@ fn expand_exp_histogram(
     sub(sink, ctx, path, tag_suffix, seconds, ".zero_count", histogram.zero_count as f64);
 }
 
-/// `.count`, `.sum`, then one `.q<q>` per quantile the summary itself carries -- keyed on the raw
-/// quantile rather than a rounded percentage, since rounding is not collision-free (`0.991` and
-/// `0.994` would both become `p99`, the argument `influxdb_out`'s `render_fields` makes).
+/// `.count`, `.sum`, then one `.q<q>` per quantile the summary carries, keyed on the raw quantile:
+/// rounding isn't collision-free (`0.991` and `0.994` would both become `p99`).
 fn expand_summary(
     summary: &Summary,
     path: &str,
@@ -604,8 +564,7 @@ fn sub(
     sink.emit(path, tag_suffix, value, seconds, ctx);
 }
 
-/// [`sub`] for a field the model carries as an `Option` -- absent means "the producer did not
-/// report it", which is not the same as zero and must not be written as one.
+/// [`sub`] for an `Option` field: absent means "not reported", which must not be written as zero.
 #[allow(clippy::too_many_arguments)]
 fn optional(
     sink: &mut Sink,
@@ -621,9 +580,9 @@ fn optional(
     }
 }
 
-/// The wire-writing half: everything that knows about lines, frames and size caps, so the kind
-/// walkers above never do. Holds the reusable buffers by reference; `datapoints_in_frame` is the
-/// only state that outlives one datapoint.
+/// The wire-writing half: everything that knows about lines, frames, and size caps. Holds the
+/// reusable buffers by reference; `datapoints_in_frame` is the only state that outlives one
+/// datapoint.
 struct Sink<'a> {
     protocol: Protocol,
     max_packet_bytes: usize,
@@ -651,8 +610,8 @@ impl Sink<'_> {
             Protocol::Plaintext => {
                 self.line.clear();
                 self.line.push_str(self.full_path.as_str());
-                // Rust's `{}` for `f64` is the shortest round-trip rendering (normalization 8):
-                // `3.0` writes as `3`, `1.50` as `1.5`, and re-parsing gives back the same bits.
+                // `f64`'s `{}` is the shortest round-trip rendering (normalization 8): `3.0` writes
+                // as `3`, and re-parsing gives back the same bits.
                 let _ = write!(self.line, " {value} {seconds}");
                 if self.line.len() > self.max_packet_bytes {
                     ctx.drop_oversize_line(self.line.len(), self.max_packet_bytes);
@@ -664,8 +623,7 @@ impl Sink<'_> {
             Protocol::Pickle => {
                 self.datapoint.clear();
                 pickle::write_datapoint(self.datapoint, self.full_path.as_str(), seconds, value);
-                // A datapoint that cannot fit an *empty* frame will never fit any frame, so it is
-                // dropped rather than opening a frame nothing can close under the cap.
+                // A datapoint that can't fit an *empty* frame never fits; drop it.
                 if pickle::HEADER_BYTES + self.datapoint.len() + pickle::TRAILER_BYTES
                     > self.max_frame_bytes
                 {
@@ -688,16 +646,14 @@ impl Sink<'_> {
         }
     }
 
-    /// Bytes of pickle payload currently in `frame` -- the frame buffer also carries the 4-byte
-    /// length prefix, and `max_frame_bytes` bounds the payload (Twisted's `Int32StringReceiver`
-    /// applies `MAX_LENGTH` to the declared length, not to the declaration plus the body).
+    /// Bytes of pickle payload in `frame`, excluding the 4-byte prefix: Twisted applies
+    /// `MAX_LENGTH` to the declared length, not prefix plus body.
     fn payload_len(&self) -> usize {
         self.frame.len() - pickle::LENGTH_PREFIX_BYTES
     }
 
-    /// Starts a frame: four placeholder bytes for the length prefix, then the pickle header. The
-    /// prefix is patched in place by [`Sink::close_frame`], so a frame is assembled once with no
-    /// second buffer and no copy.
+    /// Starts a frame: four placeholder bytes for the length prefix, which [`Sink::close_frame`]
+    /// patches in place, then the pickle header.
     fn open_frame(&mut self) {
         self.frame.clear();
         self.frame.extend_from_slice(&[0u8; pickle::LENGTH_PREFIX_BYTES]);
@@ -723,28 +679,25 @@ impl Sink<'_> {
 
 // -- tags -----------------------------------------------------------------------------------------
 
-/// One attribute that survived far enough to be a candidate tag. The three ranges point into the
-/// shared `tag_text` arena, so an event's whole tag set costs no per-tag allocation.
+/// One candidate tag. The ranges point into the shared `tag_text` arena, so tags cost no per-tag
+/// allocation.
 #[derive(Debug)]
 struct TagSlot {
     /// The sanitized tag name, as it will appear on the wire.
     rendered: Range<usize>,
     /// The sanitized tag value.
     value: Range<usize>,
-    /// The attribute's original, unsanitized name -- the collision tie-break, and the only thing
-    /// that makes that tie-break independent of interner order.
+    /// The attribute's original, unsanitized name: the collision tie-break, independent of
+    /// interner order.
     original: Range<usize>,
 }
 
 /// Builds `;name=value…` into `suffix` for one event, returning whether any name or value had a
 /// byte substituted.
 ///
-/// Order is ascending **rendered** name (normalization 4 -- carbon's own `TaggedSeries.format`
-/// sorts too), with the original name as the tie-break. Two attributes whose names sanitize onto
-/// one wire name are a collision: the one whose **original** name sorts first survives and the rest
-/// are dropped and counted. Resolving on the rendered and original *names* rather than on interner
-/// order is ADR `prometheus-scrape-and-exposition`'s rule, and is what makes the choice reproducible
-/// across processes.
+/// Order is ascending **rendered** name (normalization 4). On a collision after sanitizing, the
+/// attribute whose **original** name sorts first survives; the rest are dropped and counted.
+/// Resolving on names, not interner order, keeps the choice reproducible across processes.
 #[allow(clippy::too_many_arguments)]
 fn build_tag_suffix(
     suffix: &mut String,
@@ -771,9 +724,9 @@ fn build_tag_suffix(
             continue;
         }
 
-        // An `Array` renders its *last* representable element, walked backwards so a trailing
-        // unrepresentable one falls through to the element before it -- `influxdb_out`'s rule,
-        // byte for byte, so one repeated DogStatsD tag key reaches both sinks the same way.
+        // An `Array` renders its *last* representable element (walking backwards past
+        // unrepresentable ones), `influxdb_out`'s rule, so a repeated DogStatsD tag key reaches
+        // both sinks the same way.
         scratch.clear();
         let is_multi_value = matches!(value, Value::Array(_));
         let rendered = match value {
@@ -797,8 +750,7 @@ fn build_tag_suffix(
         let value_substituted = sanitize_tag_value_into(text, scratch);
         let value_end = text.len();
         if name_end == name_start || value_end == name_end {
-            // Carbon's own parser rejects an empty tag name or value, taking the whole line with
-            // it -- so the tag goes rather than the metric.
+            // Carbon rejects an empty tag name or value with the whole line; drop the tag instead.
             text.truncate(name_start);
             ctx.tag_dropped_empty();
             continue;
@@ -842,14 +794,13 @@ fn build_tag_suffix(
     sanitized
 }
 
-/// Renders one non-`Array` [`Value`] as a tag value, returning whether it has a faithful spelling
-/// at all. Carbon tags are strings, so every kind with an honest string form gets one and the type
-/// is lost; the rest are dropped rather than given an invented syntax (`Bytes` need not be UTF-8,
-/// and flattening a `Map` into one tag value would produce something nothing parses back).
+/// Renders one non-`Array` [`Value`] as a tag value, returning whether it has a faithful string
+/// form. The rest are dropped rather than given an invented syntax (`Bytes` need not be UTF-8,
+/// and nothing parses a flattened `Map` back).
 fn render_scalar(out: &mut String, value: &Value) -> bool {
     match value {
         Value::Str(_) => {
-            // `Value::Str` is always valid UTF-8 by construction (`logit_core::Value::str`).
+            // `Value::Str` is valid UTF-8 by construction.
             out.push_str(value.as_str().unwrap_or_default());
             true
         }
@@ -878,9 +829,7 @@ fn render_scalar(out: &mut String, value: &Value) -> bool {
 // -- sanitization ---------------------------------------------------------------------------------
 
 /// Appends `s` to `out` (does **not** clear it first), replacing every character `forbidden`
-/// rejects with `_`, and reports whether it replaced any. Substitution, not deletion, so distinct
-/// inputs stay distinct -- `crates/logit-outputs/src/statsd.rs`'s `sanitize_into`, which this is
-/// modelled on directly.
+/// rejects with `_`, and reports whether it replaced any.
 fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) -> bool {
     let mut substituted = false;
     for c in s.chars() {
@@ -894,9 +843,8 @@ fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) ->
     substituted
 }
 
-/// [`sanitize_into`] for a tag value, whose rule has one position-dependent case: a **leading** `~`
-/// is reserved by carbon's tag grammar, while a `~` anywhere else is an ordinary byte and rides
-/// through untouched.
+/// [`sanitize_into`] for a tag value, which also substitutes a **leading** `~` (reserved by
+/// carbon's tag grammar); a `~` elsewhere rides through.
 fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
     let mut substituted = false;
     for (i, c) in s.chars().enumerate() {
@@ -911,36 +859,28 @@ fn sanitize_tag_value_into(out: &mut String, s: &str) -> bool {
 }
 
 /// Forbidden in a path: `;` opens the tag segment, whitespace ends the field, a control byte would
-/// corrupt line framing, and `/`/`\` are whisper's **directory separators** -- a path component
-/// carrying one would create a nested directory rather than a series segment. Whitespace is
-/// [`char::is_whitespace`] rather than ASCII-only because carbon splits a decoded `str` with
-/// Python's `str.split()`, which does the same (see [`super`]'s sanitization section).
+/// corrupt line framing, and `/`/`\` are whisper's **directory separators**. Unicode whitespace,
+/// per [`super`]'s "Sanitization" section.
 fn is_forbidden_in_path(c: char) -> bool {
     matches!(c, ';' | '/' | '\\') || c.is_whitespace() || c.is_control()
 }
 
-/// Forbidden in a tag name -- carbon's own `TaggedSeries` grammar reserves `;`, `!`, `^` and `=`
-/// (the first separates tags, the last separates a name from its value, and `!`/`^` are its
-/// query-syntax operators), plus the whitespace and control bytes every field forbids.
+/// Forbidden in a tag name: carbon's `TaggedSeries` grammar reserves `;` (tag separator), `=`
+/// (name/value separator), and `!`/`^` (query operators), plus whitespace and control bytes.
 fn is_forbidden_in_tag_name(c: char) -> bool {
     matches!(c, ';' | '!' | '^' | '=') || c.is_whitespace() || c.is_control()
 }
 
-/// Forbidden anywhere in a tag value. Narrower than a tag name's set: `=` is legal in a value
-/// (carbon splits on the *first* `=`, so `k=a=b` round-trips as `k` → `a=b`), and so are `!`/`^`.
-/// The leading-`~` rule lives in [`sanitize_tag_value_into`], since it is positional.
+/// Forbidden anywhere in a tag value. `=` is legal (carbon splits on the *first* `=`, so `k=a=b`
+/// is `k` → `a=b`), and so are `!`/`^`. The leading-`~` rule is in [`sanitize_tag_value_into`].
 fn is_forbidden_in_tag_value(c: char) -> bool {
     c == ';' || c.is_whitespace() || c.is_control()
 }
 
 /// Appends `v` as a sub-path token: Rust's `{}` rendering with every `.` substituted by `_`.
 ///
-/// **Injective**, which is what makes an expanded sub-path collision-free. `Display` for `f64`
-/// emits only `-`, decimal digits, at most one `.`, and the literals `inf`/`-inf`/`NaN`, so
-/// substituting `.` is a bijection on that alphabet: `0.5 → 0_5`, `5 → 5`, `0.05 → 0_05`,
-/// `-0.5 → -0_5`, `inf → inf` are five distinct tokens for five distinct bounds. Contrast a
-/// *rounded* percentile, which `influxdb_out`'s `render_fields` rejects precisely because it is
-/// not.
+/// **Injective**, so expanded sub-paths don't collide ([`super`]'s module doc): `0.5 → 0_5`,
+/// `5 → 5`, `0.05 → 0_05`, `-0.5 → -0_5`, `inf → inf`.
 fn push_number_token(out: &mut String, scratch: &mut String, v: f64) {
     scratch.clear();
     let _ = write!(scratch, "{v}");
@@ -951,9 +891,8 @@ fn push_number_token(out: &mut String, scratch: &mut String, v: f64) {
 
 // -- counters -------------------------------------------------------------------------------------
 
-/// The telemetry/diagnostics/stats triple every drop site needs, carried together so a drop reports
-/// itself in all three places at once and can never be counted in one but not the others
-/// ([`crate::collectd::encode`]'s `Ctx`, and `crates/logit-outputs/src/statsd.rs`'s `EncodeCtx`).
+/// The telemetry/diagnostics/stats triple every drop site needs, carried together so a drop is
+/// never counted in one but not the others.
 struct Ctx<'a> {
     telemetry: &'a Telemetry,
     diag: &'a mut Diagnostics,
@@ -1032,9 +971,8 @@ impl Ctx<'_> {
         );
     }
 
-    /// `records` is how many records the dropped event carried -- `logit.output.metrics.skipped` is
-    /// a per-record figure at every other sink, and an operator summing it across sinks needs this
-    /// one to mean the same thing.
+    /// `records` is how many records the dropped event carried, since `metrics.skipped` is
+    /// per-record at every sink.
     fn drop_unencodable_timestamp(&mut self, timestamp: i64, records: usize) {
         self.stats.dropped_unencodable_timestamp += records;
         self.telemetry.count(
@@ -1156,8 +1094,7 @@ mod tests {
     }
 
     /// Encodes `batch` through a fresh encoder built by `build`, returning the raw wire messages,
-    /// their metas, the stats and the telemetry registry. **Raw bytes**, not text: a pickle frame
-    /// is binary, and a lossy UTF-8 round trip through `String` would silently change its length.
+    /// their metas, the stats, and the telemetry registry. **Raw bytes**: a pickle frame is binary.
     fn encode_raw_with(
         batch: &EventBatch,
         build: impl FnOnce(GraphiteEncoder) -> GraphiteEncoder,
@@ -1222,8 +1159,7 @@ mod tests {
         assert_eq!(stats.datapoints, 1);
     }
 
-    /// Normalization 12: carbon's wire has no temporality or monotonicity, so all four `Sum`
-    /// shapes write the bare value. Not a skip -- the number itself is carried faithfully.
+    /// Normalization 12: all four `Sum` shapes write the bare value.
     #[test]
     fn every_sum_shape_writes_its_bare_value() {
         for temporality in [Temporality::Delta, Temporality::Cumulative] {
@@ -1319,8 +1255,8 @@ mod tests {
         }
     }
 
-    /// Normalization 6 floors, and `div_euclid` floors *downward* -- a sub-second positive instant
-    /// floors to 0 and is therefore dropped, which is the same rule stated from the other side.
+    /// Normalization 6 floors *downward*, so a sub-second positive instant floors to 0 and is
+    /// dropped.
     #[test]
     fn timestamps_floor_to_whole_seconds() {
         let mut ev = event(MetricKind::Gauge(1.0));
@@ -1398,8 +1334,8 @@ mod tests {
         );
     }
 
-    /// `influxdb_out`'s rule, byte for byte: the last representable element, walked backwards so a
-    /// trailing unrepresentable one falls through.
+    /// An `Array` tag renders its last representable element, skipping trailing unrepresentable
+    /// ones.
     #[test]
     fn an_array_renders_its_last_representable_element_and_is_counted() {
         let ev = tagged(&[("team", Value::Array(vec![Value::from("a"), Value::from("b")]))]);
@@ -1430,8 +1366,7 @@ mod tests {
         assert_eq!(counted(&registry, "logit.output.tags.dropped", ("reason", "dialect")), 2.0);
     }
 
-    /// Another protocol's consumed carriers are not tags anybody asked to see here, so they are
-    /// skipped **uncounted** -- `influxdb_out`'s `statsd.` rule, widened to `collectd.` too.
+    /// `statsd.` and `collectd.` carriers are skipped **uncounted**.
     #[test]
     fn foreign_protocol_carriers_are_skipped_uncounted() {
         let ev = tagged(&[
@@ -1486,8 +1421,7 @@ mod tests {
         }
     }
 
-    /// A tag *value* forbids less than a name: `=`, `!` and `^` are all legal in it, `~` is legal
-    /// anywhere but the first position, and `;`/whitespace are not.
+    /// A tag *value* allows `=`, `!`, `^`, and a non-leading `~`, but not `;` or whitespace.
     #[test]
     fn a_tag_value_forbids_only_semicolons_whitespace_and_a_leading_tilde() {
         for (value, rendered, sanitized) in [
@@ -1531,8 +1465,7 @@ mod tests {
         );
     }
 
-    /// Two names sanitizing onto one wire name: the one whose **original** name sorts first
-    /// survives, deterministically and independent of interner order.
+    /// Of two names sanitizing onto one wire name, the **original** that sorts first survives.
     #[test]
     fn a_rendered_name_collision_keeps_the_one_whose_original_name_sorts_first() {
         let ev = tagged(&[("a;b", Value::from("semi")), ("a!b", Value::from("bang"))]);
@@ -1596,8 +1529,7 @@ mod tests {
         hll
     }
 
-    /// All seven multi-value kinds, one table: skipped by default, each under its own
-    /// `metric_kind` tag.
+    /// All seven multi-value kinds are skipped by default, each under its own `metric_kind` tag.
     #[test]
     fn every_multi_value_kind_is_skipped_by_default() {
         for (kind, tag) in [
@@ -1623,7 +1555,7 @@ mod tests {
         }
     }
 
-    /// The sub-path table from `mod.rs`, checked kind by kind against the exact paths it lists.
+    /// Each kind expands to the exact paths in `mod.rs`'s sub-path table.
     #[test]
     fn expand_produces_the_documented_sub_paths_for_every_kind() {
         let cases: Vec<(MetricKind, &str, Vec<&str>)> = vec![
@@ -1713,8 +1645,7 @@ mod tests {
         assert_eq!(lines, vec!["sys.cpu.count 2 1700000000"], "three members, two distinct");
     }
 
-    /// A sketch's `.sum` is exact (`DdSketch::sum`), so it is emitted rather than omitted the way
-    /// `prometheus_out`'s summary path omits `_sum`.
+    /// A sketch's `.sum` is emitted, since `DdSketch::sum` is exact.
     #[test]
     fn a_sketch_emits_an_exact_sum() {
         let (lines, _, _, _) = encode_with(
@@ -1725,8 +1656,7 @@ mod tests {
         assert!(lines.contains(&"sys.cpu.count 3 1700000000".to_string()), "{lines:?}");
     }
 
-    /// The injectivity claim from `mod.rs`, pinned on the five bounds most likely to collide under
-    /// a rounding scheme.
+    /// Number tokens are injective over the five bounds a rounding scheme would most likely merge.
     #[test]
     fn bucket_tokens_are_injective_over_distinct_bounds() {
         let histogram = Histogram {
@@ -1832,8 +1762,7 @@ mod tests {
             .collect()
     }
 
-    /// A pickle entry is a complete, already length-prefixed frame, so a sink's send path is one
-    /// `write_all` per entry -- and its meta is the frame's datapoint count, not `1`.
+    /// A pickle entry is a complete, length-prefixed frame whose meta is its datapoint count.
     #[test]
     fn a_pickle_entry_is_one_prefixed_frame_whose_meta_is_its_datapoint_count() {
         let events = (0..3)
@@ -1918,8 +1847,7 @@ mod tests {
         assert_eq!(decoded[0][0].0, "sys.cpu;env=prod;host=web-1");
     }
 
-    /// The reusable-buffer contract: a second batch of the same shape must not grow any of the
-    /// encoder's scratch buffers.
+    /// A second batch of the same shape doesn't grow any scratch buffer.
     #[test]
     fn a_warm_encoder_reuses_its_buffers() {
         let ev = tagged(&[("env", Value::from("prod")), ("host", Value::from("web-1"))]);
@@ -1951,8 +1879,7 @@ mod tests {
         );
     }
 
-    /// `MetricList` order is wire order -- a batch's datapoints must not be reshuffled within one
-    /// event.
+    /// `MetricList` order is wire order within one event.
     #[test]
     fn records_are_written_in_metric_list_order() {
         let mut ev = event(MetricKind::Gauge(1.0));

@@ -1,54 +1,46 @@
 //! Driving a scenario through a **real UDP socket** instead of an in-process `generate_in`.
 //!
-//! Every scenario before this one ([ADR `load-test-harness`](../../../docs/adr/load-test-harness.md))
-//! generates its events inside the process under test. That measures the graph, and deliberately
-//! measures nothing about intake: no socket is opened, no datagram is parsed, no kernel receive
-//! buffer can overflow. [ADR `udp-intake-batching-and-socket-visibility`](../../../docs/adr/udp-intake-batching-and-socket-visibility.md)
-//! needs the opposite -- the syscall/queue/decode path is the thing being changed -- so a
-//! `Driven` scenario is an ordinary `statsd_in → null_out` config with **no generator in it at
-//! all**, and the load comes from this module, running in the `logit-perf` process itself.
+//! A generated scenario measures the graph and nothing about intake: no socket, no datagram
+//! parsing, no receive buffer to overflow. A `Driven` scenario tests that intake path
+//! (docs/adr/udp-intake-batching-and-socket-visibility.md): an ordinary `statsd_in → null_out`
+//! config with **no generator**, loaded by this module from inside the `logit-perf` process.
 //!
-//! That placement is the point, not a convenience: the child's `wait4` rusage is then **pure
-//! receive-side CPU**, so `cpu_us_per_event` stays the gate `compare` already treats it as. A
-//! sender spawned as its own process would leave the two competing for the same cores with no way
-//! to tell whose microseconds were whose.
+//! The sender runs in this process so the child's `wait4` rusage is **pure receive-side CPU**,
+//! keeping `cpu_us_per_event` the gate `compare` treats it as. Pin the sender and the child to
+//! disjoint CPUs (`--pin-sender`/`--pin-child`) so they don't contend for one core's time.
 //!
 //! ## The spec, and why it is a sidecar
 //!
-//! A `logit` config says what to listen for; it says nothing about what to send. The load spec is
-//! a second file, `perf/load/<scenario>.yaml`, and it lives in its own directory because both
-//! `script/validate` and `crates/logit-cli/src/config.rs`'s `every_shipped_config_loads_and_validates`
-//! glob `perf/scenarios/*.yaml` unconditionally -- anything dropped in there is a `logit` config or
-//! it is a build failure. See `perf/load/README.md` for the format as an author sees it.
+//! A `logit` config says what to listen for, not what to send, so the load spec is a second file,
+//! `perf/load/<scenario>.yaml`. It lives in its own directory because both `script/validate` and
+//! `crates/logit-cli/src/config.rs`'s `every_shipped_config_loads_and_validates` glob
+//! `perf/scenarios/*.yaml`, where every file must be a valid `logit` config. `perf/load/README.md`
+//! has the format.
 //!
 //! ## The traffic model
 //!
-//! Ross's explicit direction ([the ADR's "Representative traffic" section](../../../docs/adr/udp-intake-batching-and-socket-visibility.md))
-//! is that the load has to look like real statsd traffic, not N copies of one line. Two weighted
+//! The load must look like real statsd traffic, not N copies of one line (the ADR's
+//! "Representative traffic, calibrated against a recorded real-client capture"). Two weighted
 //! lists carry that:
 //!
-//! - **`lines:`** (in a shared model file) -- weighted `logit_core::template` templates covering the
-//!   real metric-type mix, hierarchical dotted names, DogStatsD tags on most lines and a tagless
-//!   plain-statsd share, and a sampled minority. `{seq%N}` is the cardinality knob, exactly as
-//!   `generate_in` uses it.
-//! - **`datagram_mix:`** -- weighted packing targets: one line per datagram (an unbuffered client),
-//!   or lines packed up to a byte ceiling (a buffered one). This is the axis that decides *which
-//!   half of the pipeline* a number is about, which is why there are three scenarios rather than
-//!   one.
+//! - **`lines:`** (in a shared model file): weighted `logit_core::template` templates covering
+//!   the real metric-type mix, hierarchical dotted names, DogStatsD tags on most lines with a
+//!   tagless share, and a sampled minority. `{seq%N}` is the cardinality knob, as in
+//!   `generate_in`.
+//! - **`datagram_mix:`**: weighted packing targets, one line per datagram (an unbuffered client)
+//!   or lines packed up to a byte ceiling (a buffered one). This axis decides which half of the
+//!   pipeline a number is about, hence three scenarios.
 //!
-//! The whole thing is pre-rendered into a **ring** of finished datagrams before the blast starts
-//! (see [`Ring`]): rendering costs nothing at send time, and the ring is deterministic from the
-//! spec's `seed`, so two runs of the same spec send byte-identical traffic. Weighted choice is the
-//! *spec's* job and stays here -- `logit_core::template` is deliberately a placeholder grammar and
-//! nothing else, and teaching it about weights would be the wrong place to put this.
+//! Everything is pre-rendered into a **ring** of finished datagrams before the blast (see
+//! [`Ring`]), so rendering costs nothing at send time, and the ring is deterministic from the
+//! spec's `seed`: two runs of one spec send identical bytes. Weighted choice stays here;
+//! `logit_core::template` is only a placeholder grammar.
 //!
 //! ## The sender
 //!
-//! Plain `std` threads and blocking sockets, not tokio: this is a tight `sendmmsg(2)` loop with
-//! nothing to overlap, and an async runtime here would only add scheduling of its own to the CPU
-//! the harness process is trying not to spend. `sockets` distinct connected sockets stand in for
-//! distinct clients (distinct source ports, so the receiver sees a realistic address mix), spread
-//! over `threads` OS threads.
+//! `std` threads and blocking sockets, not tokio: a tight `sendmmsg(2)` loop has nothing to
+//! overlap, and a runtime would add its own scheduling cost. `sockets` connected sockets stand in
+//! for distinct clients (distinct source ports), spread over `threads` OS threads.
 
 use anyhow::{bail, Context};
 use logit_core::template::Compiled;
@@ -58,71 +50,60 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Datagrams per `sendmmsg(2)` call. Well under `UIO_MAXIOV` (1024), and large enough that the
-/// syscall is amortized to nothing on the sending side -- the sender must never be the bottleneck
-/// a `udp-statsd` number is actually measuring.
+/// Datagrams per `sendmmsg(2)` call: under `UIO_MAXIOV` (1024), and large enough to amortize the
+/// syscall so the sender is never the bottleneck.
 const SEND_BATCH: usize = 64;
 
 /// How many consecutive send attempts may fail with `ENOBUFS`/`EAGAIN` before the blast gives up.
-/// Generous: a real `ENOBUFS` burst clears in microseconds, so hitting this means the local send
-/// path is wedged rather than merely busy.
+/// Generous: an `ENOBUFS` burst clears in microseconds, so hitting this means the local send path
+/// is wedged.
 ///
-/// **This does not catch a dead target**, and used to claim it did. On a *connected* UDP socket the
-/// ICMP port-unreachable is a pending socket error that the next `sendmmsg` both reports and
-/// clears: the send after it succeeds, the counter resets, and a peer that is not there gets the
-/// whole blast at full pace. [`MAX_CONNECTION_REFUSED`] and the [`Abort`] probe are what actually
-/// catch that.
+/// **This does not catch a dead target.** On a connected UDP socket an ICMP port-unreachable is a
+/// pending socket error that the next `sendmmsg` reports and clears, so the send after it
+/// succeeds and this counter resets. [`MAX_CONNECTION_REFUSED`] and the [`Abort`] probe catch a
+/// dead target.
 const MAX_CONSECUTIVE_SEND_ERRORS: u64 = 100_000;
 
 /// How many `ECONNREFUSED`s **one blast** tolerates, across every sender thread, before concluding
 /// nothing is listening.
 ///
-/// Counted in total, not consecutively, precisely because the pending-error semantics above make
-/// "consecutive" meaningless here. Between the child's `ready` line and its shutdown a connected
-/// sender should see *no* port-unreachable at all; a couple are conceivable from an ICMP in flight
-/// from before the bind, so the threshold is low but not one. A steady stream of them is a socket
-/// that closed or a port nothing ever bound.
+/// Counted in total, not consecutively, because the pending-error semantics above make
+/// "consecutive" meaningless. Between `ready` and shutdown a connected sender should see none; an
+/// ICMP in flight from before the bind could produce a couple, so the threshold is low but not
+/// one. A steady stream means a closed socket or an unbound port.
 ///
-/// **Shared across the sender threads, not per thread.** A per-thread counter would make the real
-/// tolerance `MAX_CONNECTION_REFUSED × threads` -- 128 for every spec that ships, which run
-/// `threads: 2` -- while the number here, and the message quoting it, said otherwise. The threads
-/// share one [`AtomicU64`](std::sync::atomic::AtomicU64) so the documented total is the actual
-/// total. The check is `fetch_add`-then-test, so two threads crossing the line together can push
-/// the reported count up to `MAX_CONNECTION_REFUSED + threads` before the first one returns; that
-/// is the bound, and the test asserts it.
+/// **Shared across the sender threads**, through one
+/// [`AtomicU64`](std::sync::atomic::AtomicU64); a per-thread counter would multiply the
+/// tolerance by `threads`. The check is `fetch_add`-then-test, so threads crossing the line
+/// together can report up to `MAX_CONNECTION_REFUSED + threads`.
 const MAX_CONNECTION_REFUSED: u64 = 64;
 
 /// A one-shot "stop, and here's why" channel the sender polls between `sendmmsg` batches.
 ///
-/// The case it exists for is the process under test dying mid-blast: `crate::run` fills it when the
-/// child's own stderr ends. Without it the sender cheerfully finishes a multi-second blast into a
-/// socket whose peer is gone (see [`MAX_CONSECUTIVE_SEND_ERRORS`] for why the errno path does not
-/// notice), and the run fails much later with a confusing accounting mismatch instead of "the child
-/// died".
+/// `crate::run` fills it when the child's stderr ends, so a child that dies mid-blast stops the
+/// sender instead of a multi-second blast into a dead socket ending in a confusing accounting
+/// mismatch. The errno path can't notice (see [`MAX_CONSECUTIVE_SEND_ERRORS`]).
 ///
-/// A `OnceLock<String>` rather than a flag plus a fixed message, because the two things worth
-/// distinguishing -- the child exiting, and this harness failing to read its stderr -- are not
-/// known until the moment one of them happens. It is also the flag: `get()` being `Some` *is* the
-/// abort, so there is one piece of shared state rather than two that could disagree. `get()` is a
-/// relaxed atomic load on the fast path, which is what makes it cheap enough to poll per batch.
+/// A `OnceLock<String>` because the cause (the child exiting, or the harness failing to read its
+/// stderr) is known only when it happens, and `get()` being `Some` is the abort itself: one piece
+/// of shared state, not two. `get()` is a cheap atomic load, fine to poll per batch.
 #[derive(Clone, Copy)]
 pub struct Abort<'a> {
     pub cause: &'a std::sync::OnceLock<String>,
 }
 
-/// The two ways a blast gives up before sending everything it was asked to, bundled because both
-/// are shared across the sender threads and both are read on the same hot path.
+/// The two ways a blast stops early, both shared across sender threads and read per batch.
 #[derive(Clone, Copy)]
 struct StopConditions<'a> {
-    /// The process under test went away -- see [`Abort`].
+    /// The process under test went away; see [`Abort`].
     abort: Option<Abort<'a>>,
-    /// `ECONNREFUSED`s so far, across every thread -- see [`MAX_CONNECTION_REFUSED`].
+    /// `ECONNREFUSED`s so far, across every thread; see [`MAX_CONNECTION_REFUSED`].
     refused: &'a std::sync::atomic::AtomicU64,
 }
 
 impl<'a> Abort<'a> {
-    /// The cause, once there is one. Borrowed from the shared `OnceLock` (`'a`), not from `self`,
-    /// so a caller can hold the reason after the `Abort` copy it came from has gone out of scope.
+    /// The cause, once there is one, borrowed for `'a` from the shared `OnceLock` rather than from
+    /// `self`.
     fn fired(&self) -> Option<&'a str> {
         self.cause.get().map(String::as_str)
     }
@@ -134,48 +115,41 @@ impl<'a> Abort<'a> {
 
 /// One `perf/load/<scenario>.yaml`: what traffic to send, where, and how hard.
 ///
-/// Protocol-agnostic apart from the wire syntax inside the referenced model's `lines:` -- a future
-/// `syslog`/`graphite` UDP scenario is one new scenario/spec pair under the same layout with no
-/// change to this crate.
+/// Protocol-agnostic apart from the wire syntax in the model's `lines:`, so a `syslog` or
+/// `graphite` UDP scenario needs only a new scenario/spec pair.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadSpec {
-    /// The component id in the scenario config whose `bind:` is the destination. Named rather than
-    /// repeated as an address so the two files can never disagree about the port.
+    /// The component id in the scenario config whose `bind:` is the destination, named rather than
+    /// repeated as an address so the two files can't disagree about the port.
     pub target: String,
-    /// The component id whose `events.received` is the run's denominator. Optional, and omitted by
-    /// every scenario that exists today: with a single sink in the graph the harness finds it by
-    /// its `role` stamp. Only a multi-sink driven scenario needs to say which one counts -- see
-    /// `crate::attribute::delivered_at_sink`.
+    /// The component id whose `events.received` is the run's denominator. Needed only with
+    /// several sinks; a single sink is found by its `role` (`crate::attribute::delivered_at_sink`).
     #[serde(default)]
     pub sink: Option<String>,
-    /// Total datagrams to send. The run's denominator is events *delivered*, not this -- but this
-    /// is what sets how long the run takes.
+    /// Total datagrams to send. This sets the run's length; the denominator is events delivered.
     pub datagrams: u64,
-    /// Distinct connected sockets, i.e. distinct source ports ≈ distinct clients.
+    /// Distinct connected sockets: distinct source ports, standing in for distinct clients.
     #[serde(default = "default_sockets")]
     pub sockets: usize,
     /// OS threads the sockets are spread over.
     #[serde(default = "default_threads")]
     pub threads: usize,
-    /// Coarse pacing, in datagrams per second across all threads. Absent means "as fast as the
-    /// sender can go", which is what a drop-regime baseline wants; set, it is applied per
-    /// `sendmmsg` batch, which is naturally bursty in the same way a client's flush interval is.
+    /// Coarse pacing, in datagrams per second across all threads; absent means as fast as the
+    /// sender can go. Applied per `sendmmsg` batch, bursty the way a client's flush interval is.
     #[serde(default)]
     pub rate: Option<u64>,
-    /// Seeds the ring's weighted choices. Fixed in the file, so a scenario's traffic is the same
-    /// bytes on every run and across machines.
+    /// Seeds the ring's weighted choices, so a scenario sends the same bytes on every run and
+    /// machine.
     #[serde(default = "default_seed")]
     pub seed: u64,
-    /// How many distinct datagrams to pre-render. Large enough that `{seq%N}` cardinality is
-    /// actually realised inside one pass (every modulus in the model is a few hundred at most, and
-    /// a ring holds tens of thousands of lines), and prime, so cycling it never lands in lockstep
-    /// with `sockets`, `threads` or `SEND_BATCH`.
+    /// How many distinct datagrams to pre-render. The default is large enough that every
+    /// `{seq%N}` cardinality is realised in one pass, and prime so cycling it never falls into
+    /// lockstep with `sockets`, `threads`, or `SEND_BATCH`.
     #[serde(default = "default_ring_datagrams")]
     pub ring_datagrams: usize,
-    /// The shared line model, as a path relative to this spec file. A path rather than an inline
-    /// list because the three `udp-statsd*` scenarios differ *only* in `datagram_mix:` -- copying
-    /// the line list into each would be three places for one traffic model to drift apart in.
+    /// The shared line model, relative to this spec file. A path, not an inline list, because the
+    /// `udp-statsd*` scenarios differ only in `datagram_mix:` and must share one traffic model.
     pub model: PathBuf,
     /// Weighted packing targets; see [`PackingWeight`].
     pub datagram_mix: Vec<PackingWeight>,
@@ -213,9 +187,8 @@ pub struct LineModel {
     pub lines: Vec<LineWeight>,
 }
 
-/// One weighted line template. `template:` is `logit_core::template` syntax: literal text with
-/// `{seq%N}` placeholders (a bare `{seq}` is rejected -- an unbounded metric name would grow the
-/// receiver's interner without bound and measure a leak rather than a workload).
+/// One weighted line template, in `logit_core::template` syntax with `{seq%N}` placeholders (see
+/// [`SeqMod`] for why a bare `{seq}` is rejected).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LineWeight {
@@ -223,8 +196,8 @@ pub struct LineWeight {
     pub template: String,
 }
 
-/// Reads and validates one load spec. Every check here is one a malformed spec would otherwise
-/// fail at somewhere far less informative -- mid-blast, or as a run that silently sends nothing.
+/// Reads and validates one load spec, so a malformed one fails here rather than mid-blast or as
+/// a run that sends nothing.
 pub fn read_spec(path: &Path) -> anyhow::Result<LoadSpec> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -288,8 +261,8 @@ fn validate_spec(spec: &LoadSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reads and validates the line model a spec's `model:` points at, resolved against the spec file's
-/// own directory (the same rule a `logit` config's relative paths follow).
+/// Reads and validates the line model a spec's `model:` names, resolved against the spec file's
+/// directory.
 pub fn read_model(spec_path: &Path, spec: &LoadSpec) -> anyhow::Result<LineModel> {
     let dir = spec_path
         .parent()
@@ -330,11 +303,9 @@ fn validate_model(model: &LineModel) -> anyhow::Result<()> {
 
 /// The address a spec's `target` component binds, read straight out of the scenario's YAML.
 ///
-/// Read as a bare [`serde_norway::Value`] for the same reason `crate::scenario` does: this crate
-/// is not a `logit-config` dependent and does not resolve `!env`. A `bind:` that *is* an `!env`
-/// tag is therefore refused with that named, rather than misreported as a missing field -- the
-/// harness has to know the real port before the child is even spawned, and a scenario is the one
-/// place in this repo where `!env` is never used anyway.
+/// Read as a bare [`serde_norway::Value`], as `crate::scenario` reads, with no `!env`
+/// resolution. The harness needs the port before spawning the child, so an `!env` `bind:` is
+/// refused by name.
 pub fn target_addr(scenario_yaml: &str, target: &str) -> anyhow::Result<SocketAddr> {
     let value: serde_norway::Value =
         serde_norway::from_str(scenario_yaml).context("parsing the scenario YAML")?;
@@ -347,10 +318,8 @@ pub fn target_addr(scenario_yaml: &str, target: &str) -> anyhow::Result<SocketAd
         .with_context(|| format!("no component named `{target}` (the load spec's `target`)"))?;
     let bind =
         component.get("bind").with_context(|| format!("component `{target}` has no `bind:`"))?;
-    // Checked explicitly, before `as_str`: `serde_norway` reports a `!env FOO` node's *inner*
-    // scalar from `as_str`, so a tagged bind would otherwise sail through as the literal string
-    // `FOO` and fail much later as "invalid socket address" -- a message that says nothing about
-    // the actual problem.
+    // Before `as_str`, which returns a `!env FOO` node's inner scalar: a tagged bind would
+    // otherwise fail later as an "invalid socket address" `FOO`.
     if matches!(bind, serde_norway::Value::Tagged(_)) {
         bail!(
             "component `{target}`'s `bind:` carries a YAML tag (`!env`) -- this crate never \
@@ -381,10 +350,8 @@ pub fn target_addr(scenario_yaml: &str, target: &str) -> anyhow::Result<SocketAd
 // Deterministic choice
 // ---------------------------------------------------------------------------------------------
 
-/// SplitMix64 -- a handful of lines, no dependency, and good enough for weighted choice over a few
-/// thousand draws. Named for what it is rather than hidden behind "rng": the ring has to be
-/// reproducible run to run, and pulling in `rand` for this would add a dependency to a crate whose
-/// whole point is to measure something else.
+/// SplitMix64: a few lines, no `rand` dependency, reproducible run to run, and good enough for
+/// weighted choice over a few thousand draws.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -408,8 +375,8 @@ impl SplitMix64 {
     }
 }
 
-/// Running totals of `weights`, for [`SplitMix64::weighted`]. Zero-weight entries are kept in
-/// place (so indices line up with the spec's own list) and simply never selected.
+/// Running totals of `weights`, for [`SplitMix64::weighted`]. Zero-weight entries stay in place,
+/// so indices match the spec's list, and are never selected.
 fn cumulative(weights: impl Iterator<Item = u32>) -> Vec<u64> {
     let mut running = 0u64;
     weights
@@ -424,13 +391,12 @@ fn cumulative(weights: impl Iterator<Item = u32>) -> Vec<u64> {
 // Rendering
 // ---------------------------------------------------------------------------------------------
 
-/// `{seq%N}` -- the only placeholder a load template may use.
+/// `{seq%N}`, the only placeholder a load template may use.
 ///
-/// Deliberately *not* a bare `{seq}`: a statsd metric name is interned by the receiver
-/// (`StatsdDecoder`'s `intern(name)`), so an unbounded name would grow the process-wide interner
-/// for the length of the run and the scenario would be measuring a leak. This is the same rule
-/// `generate_in` applies to a templated metric name (`crates/logit-inputs/src/generate.rs`'s
-/// `resolve_metric_name_var`), for the same reason.
+/// Not a bare `{seq}`: the receiver interns every statsd metric name (`StatsdDecoder`), so an
+/// unbounded name would grow the interner for the whole run and measure a leak. `generate_in`
+/// applies the same rule to a templated metric name
+/// (`crates/logit-inputs/src/generate.rs`'s `resolve_metric_name_var`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SeqMod(u64);
 
@@ -454,13 +420,11 @@ fn resolve_var(name: &str) -> anyhow::Result<SeqMod> {
 
 /// One compiled line template, with its own sequence counter.
 ///
-/// **Per-template, not global.** Every `{seq%N}` inside one template advances together, so two
-/// placeholders in the same line are correlated (a `{seq%5}` status and a `{seq%100}` endpoint
-/// cycle in lockstep). That is a named simplification, not an oversight: what the receiver
-/// actually pays for is the number of distinct *metric names* (interner pressure), the number of
-/// distinct tag *keys* (its `KeyCache`), and the line's length -- none of which depend on whether
-/// two tag values happen to co-vary. Counters are per-template rather than shared so two templates
-/// selected at different weights don't inherit each other's phase.
+/// **Per-template, not global.** Every `{seq%N}` in one template advances together, so two
+/// placeholders in a line co-vary. That's a named simplification: the receiver's cost depends on
+/// distinct metric names (interner), distinct tag keys (its `KeyCache`), and line length, not on
+/// whether two tag values co-vary. Per-template counters keep templates chosen at different
+/// weights from sharing a phase.
 #[derive(Debug)]
 struct LineRenderer {
     compiled: Compiled<SeqMod>,
@@ -489,10 +453,9 @@ impl LineRenderer {
 
 /// How many `Event`s one rendered statsd line decodes to.
 ///
-/// Almost always 1, but not by definition: `StatsdDecoder` emits **one event per `:`-separated
-/// value** for a counter or gauge (`a:1:2:3|c` is three events), while `ms`/`h`/`d`/`s` put every
-/// value on the line into a single record. A `--verify` run asserts an exact delivered-event
-/// count, so this has to be right rather than approximately right.
+/// Usually 1, but `StatsdDecoder` emits one event per `:`-separated value for a counter or gauge
+/// (`a:1:2:3|c` is three), while `ms`/`h`/`d`/`s` keep every value in one record. `--verify`
+/// asserts an exact delivered-event count, so this must be exact.
 fn events_in_line(line: &str) -> u64 {
     let Some((_, rest)) = line.split_once(':') else { return 1 };
     let mut segments = rest.split('|');
@@ -509,15 +472,14 @@ fn events_in_line(line: &str) -> u64 {
 
 /// Every datagram the blast will send, rendered once up front and then cycled.
 ///
-/// Pre-rendering is what keeps the sender out of the measurement: at send time this is a slice
-/// handed to `sendmmsg`, with no formatting, allocation or weighted choice left to do.
+/// Pre-rendering keeps the sender cheap: at send time each datagram is a slice handed to
+/// `sendmmsg`, with no formatting, allocation, or weighted choice left.
 #[derive(Debug)]
 pub struct Ring {
     datagrams: Vec<Vec<u8>>,
-    /// Running totals, `prefix_*[i]` covering `datagrams[..i]`; `[len]` is the whole ring. What
-    /// makes "how many lines are in datagrams `start..start + count` of an endlessly cycled ring"
-    /// an O(1) question instead of an O(count) one -- and, differenced, what any one datagram's
-    /// own counts are, so the per-datagram vectors don't also need storing.
+    /// Running totals, `prefix_*[i]` covering `datagrams[..i]`; `[len]` is the whole ring. They
+    /// make a count over any stretch of the cycled ring O(1), and differenced give one datagram's
+    /// counts.
     prefix_lines: Vec<u64>,
     prefix_events: Vec<u64>,
     prefix_bytes: Vec<u64>,
@@ -549,9 +511,8 @@ impl Ring {
             loop {
                 scratch.clear();
                 renderers[rng.weighted(&line_weights)].render(&mut scratch);
-                // The `\n` a packed datagram needs between this line and the previous one. Counted
-                // before the fit check, never after: a datagram that fits only because its
-                // separator was ignored would exceed the ceiling on the wire.
+                // The `\n` between this line and the previous one, counted in the fit check or
+                // the datagram could exceed the ceiling on the wire.
                 let separator = usize::from(!buffer.is_empty());
                 if let Some(max_bytes) = packing.max_bytes {
                     if !buffer.is_empty() && buffer.len() + separator + scratch.len() > max_bytes {
@@ -612,21 +573,15 @@ impl Ring {
         self.prefix_lines[index + 1] - self.prefix_lines[index]
     }
 
-    /// Events in ring datagram `index`. Not always its line count: a multi-value counter or gauge
-    /// line decodes to one event per value.
-    ///
-    /// Test-only, deliberately. Nothing in the harness asks for one datagram's event count -- what
-    /// a run needs is the total over the stretch it sent, which is [`Ring::window`]'s O(1) prefix
-    /// lookup rather than a sum over this. It exists so a test can check that the two agree.
+    /// Events in ring datagram `index`; not always its line count, since a multi-value counter or
+    /// gauge line decodes to one event per value. Test-only: a run uses [`Ring::window`].
     #[cfg(test)]
     pub fn events_at(&self, index: usize) -> u64 {
         self.prefix_events[index + 1] - self.prefix_events[index]
     }
 
-    /// What the rendered ring actually came out as, for the line `run` prints before a driven
-    /// scenario. The weights in a spec say what was *asked* for; this says what the model, the
-    /// packing ceilings and the templates' own lengths together produced -- which is the number
-    /// worth reading next to a result.
+    /// The rendered ring's size and packing distribution, which `run` prints before a driven
+    /// scenario: what the weights, ceilings, and template lengths produced, not what was asked.
     pub fn shape(&self) -> RingShape {
         let mut sizes: Vec<usize> = self.datagrams.iter().map(Vec::len).collect();
         let mut lines: Vec<u64> = (0..self.len()).map(|index| self.lines_at(index)).collect();
@@ -643,7 +598,7 @@ impl Ring {
     }
 }
 
-/// The rendered ring's own size/packing distribution -- see [`Ring::shape`].
+/// The rendered ring's size and packing distribution; see [`Ring::shape`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingShape {
     pub min_bytes: usize,
@@ -713,9 +668,8 @@ fn window_sum(prefix: &[u64], len: usize, start: u64, count: u64) -> u64 {
 // The plan
 // ---------------------------------------------------------------------------------------------
 
-/// A spec, its rendered ring, and the address to send it to -- built once per scenario and reused
-/// across every `--repeat`, since rendering the ring is the one genuinely expensive part and it is
-/// identical every time.
+/// A spec, its rendered ring, and the target address. Built once per scenario and reused across
+/// every `--repeat`, since the ring is the expensive part and never changes.
 pub struct LoadPlan {
     pub spec: LoadSpec,
     pub spec_path: PathBuf,
@@ -725,19 +679,15 @@ pub struct LoadPlan {
 
 /// The `--rate-scale` a `--verify` run uses when the caller didn't pick one.
 ///
-/// A shipped spec is deliberately paced a few percent *above* what the receiver sustains, because
-/// the baseline wants a small non-zero drop rate to have somewhere to improve from -- which is
-/// exactly the thing `--verify`'s zero-drop expectation forbids. Scaling the rate down for a
-/// verification run is what makes the check runnable against the specs as they ship, instead of
-/// needing a hand-edited copy of each one.
+/// A shipped spec is paced a few percent above what the receiver sustains, so the baseline has a
+/// small drop rate to improve on; `--verify` forbids drops. Scaling down lets it run against the
+/// shipped specs unedited.
 ///
-/// **A quarter, measured rather than picked.** At half rate, `udp-statsd`/`-packed` verified
-/// cleanly but `udp-statsd-small` still lost 21 of 5,000,000 datagrams -- not to sustained
-/// overload (it was at ~53% of capacity) but to a single momentary receive-side stall that a 2 MiB
-/// kernel buffer couldn't ride out at 380,000 datagrams/s. A quarter puts every scenario far
-/// enough below the knee that a stall of that size has nowhere near enough backlog to overflow.
-/// The cost is only that a verification run takes four times as long as a measured one, which is
-/// the right trade for a check whose entire value is being exact.
+/// **A quarter, measured:** at half rate `udp-statsd` and `-packed` verified cleanly, but
+/// `udp-statsd-small` still lost 21 of 5,000,000 datagrams. That was at ~53% of capacity, not
+/// sustained overload: one momentary receive-side stall that a 2 MiB kernel buffer couldn't absorb
+/// at 380,000 datagrams/s. A quarter leaves room for such a stall, at four times a measured run's
+/// length.
 pub const VERIFY_RATE_SCALE: f64 = 0.25;
 
 impl LoadPlan {
@@ -752,24 +702,18 @@ impl LoadPlan {
         Ok(LoadPlan { spec, spec_path: spec_path.to_path_buf(), ring, target })
     }
 
-    /// What a complete blast would put on the wire, exactly -- the expectation a `--verify` run
-    /// holds the delivered event count to.
+    /// What a complete blast puts on the wire; `--verify` holds the delivered event count to it.
     pub fn expected(&self) -> Window {
         self.ring.window(0, self.spec.datagrams)
     }
 
-    /// Multiplies this plan's `rate` by `scale`, returning the rate the blast will actually run
-    /// at.
+    /// Multiplies this plan's `rate` by `scale`, returning the rate the blast will run at.
     ///
-    /// The point is reading a scenario at a chosen operating point without editing its spec: the
-    /// shipped rates sit just above the drop knee, which is right for a baseline whose whole job is
-    /// to have drops to improve, and wrong for reading a stable CPU µs/event. `--rate-scale 0.5`
-    /// gets the second without disturbing the first, and `--verify` is that same knob at
-    /// [`VERIFY_RATE_SCALE`] plus an exactness assertion.
+    /// Reads a scenario at a chosen operating point without editing its spec: shipped rates sit
+    /// slightly above the drop knee, right for a baseline and wrong for a stable CPU µs/event.
+    /// `--verify` is this knob at [`VERIFY_RATE_SCALE`] plus an exactness assertion.
     ///
-    /// Fails on a spec with no `rate` at all: there is nothing to scale, and an unpaced blast
-    /// saturates the receiver by construction, so both the verification and the stable-operating-
-    /// point readings it is asked for would be meaningless.
+    /// Fails on a spec with no `rate`: an unpaced blast saturates the receiver regardless.
     pub fn scale_rate(&mut self, scale: f64) -> anyhow::Result<u64> {
         if !(scale.is_finite() && scale > 0.0) {
             bail!("--rate-scale must be a finite number greater than 0, got {scale}");
@@ -782,8 +726,7 @@ impl LoadPlan {
                 self.spec_path.display()
             )
         })?;
-        // At least 1: a scale small enough to round the rate to zero would mean "send nothing",
-        // which is never what anyone meant by it.
+        // At least 1: a rate rounded to zero would send nothing.
         let scaled = ((rate as f64 * scale).round() as u64).max(1);
         self.spec.rate = Some(scaled);
         Ok(scaled)
@@ -796,9 +739,9 @@ impl LoadPlan {
 
 /// A parsed `--pin-sender`/`--pin-child` cpu list (`3`, `2,4`, `2-5`, or any comma-separated mix).
 ///
-/// Not optional decoration for a UDP scenario: this dev box has heterogeneous cores (Zen 5
-/// performance vs. Zen 5c efficiency), and an unpinned run lands on one kind or the other by
-/// scheduler luck, making every number bimodal by roughly 2×.
+/// Pin the sender and child to disjoint CPUs so they don't contend for one core's time. On a box
+/// with heterogeneous cores, an unpinned run also lands on either kind by scheduler luck, making
+/// every number bimodal by roughly 2× (`perf/load/README.md`'s "Pinning").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuSet {
     cpus: Vec<usize>,
@@ -806,9 +749,8 @@ pub struct CpuSet {
 
 /// One CPU number from a `--pin-*` list, range-checked at the point it is read.
 ///
-/// `whole` is the comma-separated entry it came from, so a bad end of a range reports the range
-/// rather than just the digits. The `CPU_SETSIZE` check lives here, before any range is expanded --
-/// see [`CpuSet::parse`].
+/// `whole` is the comma-separated entry it came from, so a bad range end reports the range. The
+/// `CPU_SETSIZE` check is here so it runs before any range is expanded (see [`CpuSet::parse`]).
 fn parse_cpu(text: &str, whole: &str) -> anyhow::Result<usize> {
     let cpu: usize =
         text.parse().with_context(|| format!("`{whole}`: `{text}` is not a CPU number"))?;
@@ -837,10 +779,8 @@ impl CpuSet {
                     if hi < lo {
                         bail!("`{part}` runs backwards");
                     }
-                    // Both ends checked *before* the range is expanded. `--pin-sender
-                    // 0-99999999999` is a plausible typo, and `extend`ing that range would try to
-                    // allocate a hundred billion `usize`s before the bound below ever looked at
-                    // the result -- a parse error has to stay a parse error, not an OOM.
+                    // Both ends were checked before expanding: `0-99999999999` would otherwise
+                    // allocate a hundred billion `usize`s, turning a typo into an OOM.
                     cpus.extend(lo..=hi);
                 }
                 None => cpus.push(parse_cpu(part, part)?),
@@ -851,9 +791,8 @@ impl CpuSet {
         if cpus.is_empty() {
             bail!("`{list}` names no CPUs");
         }
-        // A backstop, not the real check: every value reached here through `parse_cpu`, which
-        // already rejected anything out of range. Kept so a future edit that adds another way into
-        // `cpus` still can't produce a set `CPU_SET` would index out of bounds.
+        // A backstop: `parse_cpu` already rejected anything out of range. Kept so no other path
+        // into `cpus` can produce a set `CPU_SET` would index out of bounds.
         if let Some(&highest) = cpus.last() {
             if highest >= libc::CPU_SETSIZE as usize {
                 bail!("CPU {highest} is beyond CPU_SETSIZE ({})", libc::CPU_SETSIZE);
@@ -862,9 +801,8 @@ impl CpuSet {
         Ok(CpuSet { cpus })
     }
 
-    /// The `cpu_set_t` this list describes. Built here and handed around as a plain value so the
-    /// `pre_exec` path (`crate::run`) has nothing left to allocate or parse between `fork` and
-    /// `exec`.
+    /// The `cpu_set_t` this list describes, as a plain value so the `pre_exec` path
+    /// (`crate::run`) has nothing to allocate or parse between `fork` and `exec`.
     pub fn to_raw(&self) -> libc::cpu_set_t {
         // SAFETY: `cpu_set_t` is a plain bitmask struct with no padding invariants and no pointers;
         // all-zeroes is its documented "empty set" state, which `CPU_SET` below then fills in.
@@ -892,9 +830,8 @@ impl CpuSet {
         Ok(())
     }
 
-    /// The CPUs, ascending and deduplicated. What [`CpuSet`]'s own `Display` renders, so a
-    /// recorded number always states the set the harness actually applied rather than the string
-    /// somebody typed.
+    /// The CPUs, ascending and deduplicated. `Display` renders these, so output states the set
+    /// applied rather than the string typed.
     pub fn cpus(&self) -> &[usize] {
         &self.cpus
     }
@@ -911,8 +848,7 @@ impl std::fmt::Display for CpuSet {
 // The blast
 // ---------------------------------------------------------------------------------------------
 
-/// What one blast actually put on the wire. Not what was *received* -- that comes from the child's
-/// own telemetry, and the gap between the two is the entire point of a UDP scenario.
+/// What one blast put on the wire. What was received comes from the child's telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoadOutcome {
     pub sent_datagrams: u64,
@@ -926,11 +862,8 @@ pub struct LoadOutcome {
 
 /// Sends `plan.spec.datagrams` datagrams at `plan.target` and returns what happened.
 ///
-/// Blocking, and meant to be: the caller has already waited for the child's `ready` line, and
-/// `wall` for a driven scenario is exactly `ready` → this function returning.
-///
-/// `abort`, when given, is polled between batches so a child that dies mid-blast stops the sender
-/// promptly and by name -- see [`Abort`].
+/// Blocking: the caller has already waited for `ready`, and a driven scenario's `wall` is `ready`
+/// to this returning. `abort` is polled between batches (see [`Abort`]).
 pub fn blast(
     plan: &LoadPlan,
     pin: Option<&CpuSet>,
@@ -939,15 +872,11 @@ pub fn blast(
     let spec = &plan.spec;
     let sockets = open_sockets(plan.target, spec.sockets)?;
 
-    // Datagram index space split into `threads` contiguous blocks. Contiguous rather than
-    // interleaved so each thread's own window of the ring is one range -- which is what makes
-    // `Ring::window` able to account a thread's traffic exactly instead of by an average.
+    // Contiguous blocks, not interleaved, so each thread's traffic is one `Ring::window` range.
     let per_thread = spec.datagrams / spec.threads as u64;
     let remainder = spec.datagrams % spec.threads as u64;
 
-    // Shared across the sender threads, not one per thread: `MAX_CONNECTION_REFUSED`'s own doc has
-    // why the distinction matters, and what it used to get wrong. Borrowed, not moved, so every
-    // thread increments the same counter.
+    // One counter shared by every sender thread (`MAX_CONNECTION_REFUSED` has why).
     let refused = std::sync::atomic::AtomicU64::new(0);
     let stop = StopConditions { abort, refused: &refused };
 
@@ -959,8 +888,8 @@ pub fn blast(
             let count = per_thread + u64::from((thread_index as u64) < remainder);
             let start = next_start;
             next_start += count;
-            // Every socket belongs to exactly one thread: `sockets >= threads` is validated, and
-            // a socket shared across threads would serialize two senders on one fd for no gain.
+            // Each socket belongs to one thread (`sockets >= threads` is validated); a shared
+            // socket would serialize two senders on one fd.
             let mine: Vec<&UdpSocket> =
                 sockets.iter().skip(thread_index).step_by(spec.threads).collect();
             let rate = spec.rate.map(|rate| rate as f64 / spec.threads as f64);
@@ -989,10 +918,9 @@ pub fn blast(
 
 /// `count` distinct sockets, each `connect`ed to `target`.
 ///
-/// Connected, not merely bound: it makes `sendmmsg` a two-argument call with no per-datagram
-/// destination to copy, and it is what makes a target that is not listening *reportable at all* --
-/// an unconnected UDP socket silently swallows the ICMP port-unreachable, while a connected one
-/// surfaces it as `ECONNREFUSED` on a later send.
+/// Connected, not only bound: `sendmmsg` then needs no per-datagram destination, and a target
+/// that isn't listening becomes reportable, since a connected socket surfaces the ICMP
+/// port-unreachable as `ECONNREFUSED` on a later send.
 fn open_sockets(target: SocketAddr, count: usize) -> anyhow::Result<Vec<UdpSocket>> {
     let local = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     (0..count)
@@ -1033,8 +961,7 @@ fn send_block(
     let mut socket_cursor = 0usize;
 
     while done < count {
-        // Once per batch -- one relaxed load per 64 datagrams, which is nothing next to the
-        // syscall it precedes.
+        // One atomic load per batch, negligible next to the syscall.
         if let Some(cause) = stop.abort.and_then(|abort| abort.fired()) {
             bail!(
                 "stopped after {} of {count} datagrams to {target}: {cause}",
@@ -1084,8 +1011,7 @@ fn send_block(
                 )
             };
             if sent > 0 {
-                // A short return is ordinary, not an error: `sendmmsg` reports how many of the
-                // batch it accepted and leaves the rest for the caller to resubmit.
+                // A short return is ordinary: resubmit the rest.
                 let sent = sent as usize;
                 for iov in iovs.iter().skip(offset).take(sent) {
                     outcome.sent_bytes += iov.iov_len as u64;
@@ -1096,12 +1022,11 @@ fn send_block(
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                // Interrupted before anything was sent -- not an error, just retry.
+                // Interrupted before anything was sent; retry.
                 Some(libc::EINTR) => continue,
-                // ENOBUFS: the local send path is momentarily full. EAGAIN: the socket is blocking,
-                // so this shouldn't happen, but a kernel is allowed to return it and spinning
-                // briefly is the right response either way. Both clear on their own, so these are
-                // retried and only a long unbroken run of them is fatal.
+                // ENOBUFS: the local send path is momentarily full. EAGAIN shouldn't happen on a
+                // blocking socket but may. Both clear on their own, so only a long unbroken run
+                // is fatal.
                 Some(libc::ENOBUFS) | Some(libc::EAGAIN) => {
                     outcome.send_errors += 1;
                     consecutive_errors += 1;
@@ -1115,11 +1040,9 @@ fn send_block(
                     }
                     std::thread::yield_now();
                 }
-                // ECONNREFUSED: a *connected* UDP socket reports an earlier datagram's ICMP
-                // port-unreachable asynchronously, as a pending socket error that this very call
-                // both reports and **clears**. So the next send succeeds and a consecutive-failure
-                // counter never climbs, however dead the peer is -- which is why this is counted
-                // in total across the whole blast instead. See `MAX_CONNECTION_REFUSED`.
+                // ECONNREFUSED: an earlier datagram's ICMP port-unreachable, a pending error this
+                // call reports and clears, so it's counted in total across the blast rather than
+                // consecutively (`MAX_CONNECTION_REFUSED`).
                 Some(libc::ECONNREFUSED) => {
                     outcome.send_errors += 1;
                     let total = stop.refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1133,8 +1056,7 @@ fn send_block(
                             )
                         });
                     }
-                    // Deliberately no yield: the error was cleared by this call, so the resubmit
-                    // below is expected to go through.
+                    // No yield: this call cleared the error, so the resubmit should go through.
                 }
                 _ => {
                     return Err(anyhow::Error::new(err))
@@ -1147,9 +1069,8 @@ fn send_block(
         outcome.sent_datagrams += batch as u64;
 
         if let Some(rate) = rate {
-            // Coarse, per-batch pacing measured against the thread's own start: errors accumulate
-            // into the *gap* rather than the schedule, so a thread that falls behind catches up
-            // instead of drifting further out for the rest of the run.
+            // Paced against the thread's own start, not the previous batch, so a thread that
+            // falls behind catches up rather than drifting.
             let target_elapsed = Duration::from_secs_f64(done as f64 / rate);
             let elapsed = started.elapsed();
             if target_elapsed > elapsed {
@@ -1324,8 +1245,7 @@ mod tests {
             let size = ring.datagram(index).len();
             assert!(size <= 1432, "{size} exceeds the largest configured ceiling");
         }
-        // Every packed datagram holds at least two lines at these sizes, so the packing loop is
-        // genuinely packing rather than degenerating into the single-line case.
+        // At these sizes a packed datagram holds at least two lines, so the loop really packs.
         assert!((0..ring.len()).any(|index| ring.lines_at(index) > 1));
         assert_eq!(ring.shape().max_bytes, ring.shape().max_bytes.min(1432));
     }
@@ -1476,9 +1396,7 @@ mod tests {
         assert!(CpuSet::parse("1,,2").is_err());
     }
 
-    /// A CPU beyond `CPU_SETSIZE` is rejected **before** any range is expanded. Without the
-    /// up-front check `0-99999999999` tries to allocate a hundred billion `usize`s on its way to
-    /// the bound, i.e. a typo becomes an OOM instead of an error message.
+    /// A CPU beyond `CPU_SETSIZE` is rejected before any range is expanded, not after an OOM.
     #[test]
     fn an_out_of_range_cpu_is_rejected_without_expanding_the_range() {
         for list in ["0-99999999999", "99999999999", "99999999999-99999999999", "0-1023,2048"] {
@@ -1508,8 +1426,7 @@ mod tests {
         assert_eq!(rc, 0, "setsockopt(SO_RCVBUF): {}", std::io::Error::last_os_error());
     }
 
-    /// The sender against a real loopback socket, end to end: every datagram arrives, in
-    /// ring order, with the byte counts the outcome claims.
+    /// Every datagram reaches a real loopback socket in ring order, with the claimed byte counts.
     #[test]
     fn a_blast_delivers_every_datagram_to_a_real_socket() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1548,12 +1465,7 @@ mod tests {
         }
     }
 
-    /// A blast at a port nobody is listening on must fail *as that*, not run to completion.
-    ///
-    /// This is the case the old consecutive-error counter claimed to catch and could not: on a
-    /// connected UDP socket each `ECONNREFUSED` is a pending error that the failing send clears, so
-    /// the next send succeeds and a consecutive counter never climbs. Counting them in total is
-    /// what makes the claim true.
+    /// A blast at a port nobody listens on fails naming it, rather than running to completion.
     #[test]
     fn a_blast_at_a_port_nobody_listens_on_fails_naming_the_target() {
         // Bound and dropped: the port is almost certainly free, and free is what this needs.
@@ -1577,9 +1489,7 @@ mod tests {
         assert!(err.contains(&target.to_string()), "{err}");
     }
 
-    /// The refusal budget is the **blast's**, not each thread's. With a per-thread counter the real
-    /// tolerance was `MAX_CONNECTION_REFUSED × threads` -- 128 for every shipped spec, since they
-    /// all run `threads: 2` -- while the constant and the message quoting it both said 64.
+    /// The refusal budget is the blast's, not each thread's.
     #[test]
     fn the_connection_refused_budget_is_shared_across_sender_threads() {
         let target = {
@@ -1617,8 +1527,7 @@ mod tests {
         );
     }
 
-    /// The abort probe: a child that dies mid-blast stops the sender promptly and by name, rather
-    /// than letting it finish a multi-second blast into a socket whose peer is gone.
+    /// A fired abort probe stops the sender promptly and names the cause.
     #[test]
     fn a_fired_abort_probe_stops_the_blast_and_says_why() {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1682,7 +1591,7 @@ mod tests {
         assert_eq!(plan.scale_rate(0.5).unwrap(), 50_000);
         assert_eq!(plan.spec.rate, Some(50_000));
 
-        // `--verify`'s own scale is just this knob at a fixed value.
+        // `--verify`'s scale is this knob at a fixed value.
         let mut plan = plan_with_rate(Some(760_000));
         assert_eq!(plan.scale_rate(VERIFY_RATE_SCALE).unwrap(), 190_000);
     }
@@ -1779,8 +1688,7 @@ mod tests {
             );
             total_events += events.len() as u64;
         }
-        // And the harness's own per-datagram event count -- the number `--verify` holds a run to
-        // -- agrees with what the decoder actually produced, line for line.
+        // The harness's event count, which `--verify` holds a run to, matches the decoder's.
         assert_eq!(total_events, ring.window(0, 500).events);
     }
 

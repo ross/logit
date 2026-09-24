@@ -1,11 +1,9 @@
-//! `AttrMap`: the small, sorted, interned-key map that backs event attributes, plus the
-//! resource-attributes-overridden-by-event-attributes merge-join ([`merged`]) every codec and sink
-//! that renders both onto one wire representation shares.
+//! `AttrMap`: the small, sorted, interned-key map behind event attributes, plus [`merged`], the
+//! resource-then-event merge-join shared by every codec that renders both onto one wire form.
 //!
-//! Most events carry well under a dozen attributes, so a sorted `SmallVec` beats a `HashMap` on
-//! both lookup and iteration at this size, and gives deterministic ordering for free -- which the
-//! wire format's dictionary encoding and reproducible tests both depend on. See
-//! `docs/design/data-model.md`.
+//! Most events carry under a dozen attributes, where a sorted `SmallVec` beats a `HashMap` on
+//! lookup and iteration, and its deterministic order is what the wire format's dictionary encoding
+//! and reproducible tests depend on. See `docs/design/data-model.md`.
 
 use crate::interner::{intern, lookup, Symbol};
 use crate::value::Value;
@@ -24,21 +22,14 @@ impl AttrMap {
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
-        // `lookup`, not `intern`: a key that was never interned can't be in this map either
-        // (interning is monotonic and global), so a miss here returns `None` without growing the
-        // process-wide interner table for an attribute this event doesn't carry. See
-        // `docs/design/memory.md` §4.
+        // `lookup`, not `intern`: a never-interned key can't be here, and a miss mustn't grow
+        // the interner (`docs/design/memory.md` §4).
         let key = lookup(key)?;
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.0[i].1)
     }
 
-    /// Same as [`AttrMap::get`], but for a caller that already holds an interned [`Symbol`] --
-    /// skips both the `lookup` hash probe and the `resolve` such a caller would otherwise need to
-    /// reconstruct the `&str`. The [`AttrMap::insert_sym`] reasoning applied to the read side:
-    /// a matcher that interns its configured keys once, at construction, then probes those same
-    /// `Symbol`s on every event pays a plain `binary_search_by_key` instead of a hash + resolve
-    /// round trip. The interner-growth guarantee `get` documents is trivially preserved here --
-    /// the `Symbol` already exists, so there is nothing left to intern.
+    /// [`AttrMap::get`] by an already-interned [`Symbol`], skipping the interner probe: for a
+    /// component that interns its configured keys once at construction.
     pub fn get_sym(&self, key: Symbol) -> Option<&Value> {
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.0[i].1)
     }
@@ -48,11 +39,8 @@ impl AttrMap {
         self.insert_sym(key, value);
     }
 
-    /// Same as [`AttrMap::insert`], but for a caller that already holds an interned [`Symbol`] --
-    /// skips the interner lookup `insert` would otherwise redo on every call. `logit-transforms`'
-    /// `set` transform is the first caller: it interns its configured keys once, at construction,
-    /// then inserts the same `Symbol`s into every event's/resource's map on the per-event hot
-    /// path.
+    /// [`AttrMap::insert`] by an already-interned [`Symbol`], skipping the interner probe.
+    /// Overwrites an existing key.
     pub fn insert_sym(&mut self, key: Symbol, value: impl Into<Value>) {
         match self.0.binary_search_by_key(&key, |(k, _)| *k) {
             Ok(i) => self.0[i].1 = value.into(),
@@ -61,25 +49,18 @@ impl AttrMap {
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        // Same reasoning as `get`: a key never interned was never inserted, so it can't be present.
+        // As in `get`: a never-interned key was never inserted.
         let key = lookup(key)?;
         self.remove_sym(key)
     }
 
-    /// Same as [`AttrMap::remove`], but for a caller that already holds the [`Symbol`] -- the
-    /// [`AttrMap::get_sym`] reasoning applied to removal. The first callers are the `remove` ->
-    /// `insert` merge steps for a repeated key (`statsd_in`'s tags, `syslog_in`'s SD params),
-    /// which resolve the key once through a `KeyCache` and then do both halves by `Symbol`.
+    /// [`AttrMap::remove`] by an already-held [`Symbol`], skipping the interner probe.
     pub fn remove_sym(&mut self, key: Symbol) -> Option<Value> {
         self.0.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| self.0.remove(i).1)
     }
 
-    /// Empties the map, **keeping** whatever backing storage it already holds -- so a caller that
-    /// clears and refills one map per event pays no allocation for the refill once the map has
-    /// spilled. `logit-transforms`' `shape` is the first caller: it rewrites an event in place
-    /// into a measurement event, replacing the observed attributes with its own small tag set
-    /// (`docs/adr/shape-observer-component.md`), and reusing the map it is about to overwrite is
-    /// the natural way to do that.
+    /// Empties the map but keeps its backing storage, so refilling a spilled map per event
+    /// doesn't allocate.
     pub fn clear(&mut self) {
         self.0.clear();
     }
@@ -92,20 +73,14 @@ impl AttrMap {
         self.0.is_empty()
     }
 
-    /// Iterates in sorted-symbol order -- stable and deterministic, not insertion order.
+    /// Iterates in `Symbol` order (interning order, not alphabetical or insertion order).
     pub fn iter(&self) -> impl Iterator<Item = (Symbol, &Value)> {
         self.0.iter().map(|(k, v)| (*k, v))
     }
 
-    /// Consumes the map, yielding its `(Symbol, Value)` pairs in sorted order -- the owned
-    /// counterpart of [`AttrMap::iter`], for a caller that already holds this map by value and is
-    /// about to move every value out of it rather than read it. `logit-transforms`' `flatten` is
-    /// the first caller: a nested `Value::Map` reached mid-walk was `remove_sym`'d out of its
-    /// parent, so its children are about to move again into the outer map -- without this, each
-    /// would have to be cloned out of `iter()` instead, a real allocation for every nested
-    /// `Map`/`Array` child. A free function rather than `IntoIterator` because `AttrMap`
-    /// deliberately doesn't name its backing `SmallVec` in its public API, which `type IntoIter`
-    /// would otherwise have to do.
+    /// Consumes the map, yielding owned pairs in [`AttrMap::iter`]'s order, so values move out
+    /// rather than clone. A method rather than `IntoIterator`, which would expose the backing
+    /// `SmallVec` as `IntoIter`.
     pub fn into_pairs(self) -> impl Iterator<Item = (Symbol, Value)> {
         self.0.into_iter()
     }
@@ -121,17 +96,12 @@ impl FromIterator<(&'static str, Value)> for AttrMap {
     }
 }
 
-/// Iterates `resource.attributes` merged with `event.attributes`, in sorted-[`Symbol`] order, the
-/// event's value winning on an equal key. Both maps already iterate in that order
-/// ([`AttrMap::iter`]), so walking them in lockstep and preferring the event's value on a tie
-/// produces exactly the same sequence a clone-and-insert would -- without copying an `AttrMap` per
-/// event, and without the `resolve` -> `intern` round trip re-inserting every key would cost.
+/// Iterates `resource.attributes` merged with `event.attributes` in [`Symbol`] order, the event's
+/// value winning on an equal key: the same sequence as clone-and-insert, without copying a map
+/// per event.
 ///
-/// Lives here rather than in one sink: `influxdb_out`'s tags, `statsd_out`'s tags
-/// (`crates/logit-outputs/src/attrs.rs` re-exports this) and the Prometheus codec's labels
-/// (`crates/logit-proto/src/prometheus/`) all need the identical merge with a different emission
-/// format on top, and `logit-proto` cannot reach into `logit-outputs` (the dependency runs the other
-/// way).
+/// Lives here because sinks in `logit-outputs` and the Prometheus codec in `logit-proto` both need
+/// it, and `logit-proto` can't depend on `logit-outputs`.
 pub fn merged<'a>(
     resource: &'a Resource,
     event: &'a Event,
@@ -188,9 +158,7 @@ mod tests {
         assert_eq!(map.remove("does-not-exist"), None);
     }
 
-    /// Pins the fix this module exists for: `get`/`remove` on a key that was never interned must
-    /// not intern it just to find out it's absent. `nextest` runs each test in its own process
-    /// (see `docs/design/memory.md` §7), so `interner::len()` here reflects only this test.
+    /// A missed `get`/`remove` doesn't intern the key (nextest isolates `interner::len()`).
     #[test]
     fn getting_an_absent_key_does_not_grow_the_interner() {
         let map = AttrMap::new();
@@ -251,9 +219,7 @@ mod tests {
         }
     }
 
-    /// `get_sym` takes an already-interned `Symbol`, so there is nothing left for it to intern --
-    /// interning the probe key happens explicitly, before the snapshot, so this only pins
-    /// `get_sym` itself against growing the interner.
+    /// `get_sym` itself never grows the interner.
     #[test]
     fn get_sym_never_touches_the_interner() {
         let map = AttrMap::new();
@@ -300,9 +266,7 @@ mod tests {
         assert_eq!(collect(&resource, &event), vec![("region".to_string(), "us-east".to_string())]);
     }
 
-    /// [`AttrMap::iter`] orders by `Symbol` (interning order), not alphabetically -- so the property
-    /// worth pinning is that the merge-join matches what a single combined map would produce, not
-    /// any particular string ordering.
+    /// The merge-join matches a single combined map's order (interning order, not alphabetical).
     #[test]
     fn merged_order_matches_a_single_combined_attrmap() {
         let resource = resource_with(&[("zzz", "resource-only"), ("shared", "from-resource")]);

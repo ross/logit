@@ -1,150 +1,80 @@
-# A Graphite/Carbon relay: receive carbon's own wire protocols on one edge, forward them to a
-# central carbon (or to anything else that speaks either dialect) -- the topology `graphite_out`
-# exists for, and the like-for-like half of ADR `graphite-carbon-relay`
-# (docs/adr/graphite-carbon-relay.md). Point an edge fleet's `write_graphite`/carbon-relay/StatsD
-# backend at this host on port 2003, point this at the central collector, and nothing carbon-side
-# changes.
+# A Graphite/Carbon relay: receive carbon's wire protocols, forward them to a central carbon or
+# anything else that speaks either dialect (docs/adr/graphite-carbon-relay.md). Point an edge
+# fleet's `write_graphite`/carbon-relay/StatsD backend at this host on port 2003 and set
+# `endpoint` below to the central collector; nothing carbon-side changes.
 #
-# What round-trips: everything carbon's wire carries. The dotted path *is* `MetricRecord.name` (no
-# `graphite.*` carrier, unlike the collectd/syslog relays -- see the note below); `;k=v` tags are
-# event attributes and relay in ascending rendered-name order; the value is a `Gauge`; the second
-# is the event timestamp. Both wire protocols work in both directions -- plaintext (TCP or UDP,
-# port 2003) and pickle (TCP only, port 2004) -- and `protocol:`/`transport:` on this sink need not
-# match `graphite_in`'s own: relaying plaintext in as pickle out (or the reverse) is one of the
-# permitted normalizations below, not a special case.
+# The relay is lossless modulo the normalization list in `crates/logit-proto/src/graphite/mod.rs`'s
+# module doc. Anything the pair can't carry (a multi-value record under the default `multi_value:
+# skip`, a non-finite value, a timestamp that floors to zero or below) is a counted drop
+# (`logit.output.metrics.skipped`) with a throttled diagnostic. Both protocols work in both
+# directions, and this sink's `protocol:`/`transport:` need not match `graphite_in`'s.
 #
-# The relay is a fixed point modulo exactly the twelve-item normalization list in
-# `crates/logit-proto/src/graphite/mod.rs`'s module doc (identical numbering in the ADR and
-# `docs/plans/graphite-carbon-relay.md`), which `crates/logit-cli/tests/graphite_round_trip.rs`
-# pins fixture by fixture over real sockets:
+# No `aggregate`, unlike examples/statsd-to-graphite.yaml: a carbon datapoint already carries its
+# own second. Add one only when you want to re-window.
 #
-#  1. Re-framing: lines repack into datagrams/stream writes, datapoints into pickle frames of at
-#     most `max_frame_bytes`.
-#  2. An operator-chosen dialect change: plaintext <-> pickle.
-#  3. Datapoint reordering within a batch.
-#  4. Tag order canonicalizes to ascending rendered name.
-#  5. A repeated tag key collapses to its last occurrence at decode, counted.
-#  6. Timestamps floor to whole seconds on egress.
-#  7. A `-1` timestamp becomes receipt time on ingress, and leaves as that absolute second.
-#  8. Number formatting becomes the shortest round-trip `f64` rendering (`1.50` -> `1.5`).
-#  9. Field separators collapse to a single space, `\r\n` to `\n`; a TCP write terminates every
-#     line including the last, a UDP datagram terminates none.
-# 10. Sanitizer substitutions, empty-tag drops and rendered-name collision drops (all counted).
-# 11. `tags: drop` drops the tag set entirely (counted).
-# 12. A `Sum`'s temporality and monotonicity are dropped -- the value goes on the wire bare.
-#
-# Nothing else changes silently: anything this pair cannot carry (a Samples/Distribution/Histogram/
-# ExponentialHistogram/Summary/Set/SetMembers record under the default `multi_value: skip`, a
-# non-finite value, a record whose timestamp floors to zero or negative) is a counted drop
-# (`logit.output.metrics.skipped`) with a throttled diagnostic, never a quiet reinterpretation.
-#
-# **No `aggregate` here, unlike examples/statsd-to-graphite.yaml.** A carbon datapoint already
-# carries its own second; there is nothing to window on a pure relay. Add one only if you genuinely
-# want to re-window (a sub-second edge interval stored at a coarser one, say), and then say so in a
-# comment the way that file does.
-#
-# **There is no `graphite.*` namespace.** Unlike the collectd/syslog relays, a `lua`/`set` stage
-# that renames a metric between `graphite_in` and `graphite_out` silently changes the wire path --
-# there is no carrier to restore identity from if it changes downstream. That is the intended way
-# to rename a series (there is no `prefix:`/`template:` field on either component); it just means a
-# rename in the middle of this relay is wire-visible, not a display-only change. See
-# docs/deploying.md's `graphite_in`/`graphite_out` sections for the full detail, including the
-# pre-1.1-Graphite tag-corruption warning `tags: drop` exists to avoid.
-#
-# Config is a flat graph of components (docs/design/pipeline-graph.md,
-# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than sitting in
-# a fixed inputs/transforms/outputs pipeline.
+# There is no `graphite.*` namespace: the dotted path is `MetricRecord.name`, so a `lua`/`set`
+# stage that renames a metric between `graphite_in` and `graphite_out` changes the wire path. See
+# docs/deploying.md's `graphite_in`/`graphite_out` sections, including the pre-1.1 Graphite
+# tag-corruption warning that `tags: drop` exists for.
 components:
   graphite_in:
     type: graphite_in
-    # Carbon's own default plaintext port. `0.0.0.0` accepts from any sender.
+    # Carbon's default plaintext port. `0.0.0.0` accepts from any sender.
     bind: 0.0.0.0:2003
-    # tcp (default, carbon's own listener) | udp -- carbon's plaintext protocol speaks either.
-    # transport: tcp
-    # plaintext (default) | pickle -- pickle requires transport: tcp (a length-prefixed frame has
-    # no meaning in a datagram) and is carbon's other listener, conventionally on port 2004.
-    # protocol: plaintext
-    # The longest TCP plaintext line assembled before it is dropped; past the bound the line is
-    # abandoned and counted once (logit.input.frames.dropped{reason="oversize"}, diagnostic
-    # framing_error), the reader resynchronizes at the next newline, and the connection stays up --
-    # so the line after an oversize one still decodes. Ignored under transport: udp, where a
-    # datagram is already its own frame.
-    # max_line_bytes: "8192"
-    # The longest pickle payload accepted in one length-prefixed frame -- Twisted's own
-    # Int32StringReceiver.MAX_LENGTH, which carbon's own pickle receiver enforces too. A frame
-    # declaring more is counted the same way but closes the connection: a length-framed stream has
-    # no resync point to skip forward to. Ignored under protocol: plaintext.
-    # max_frame_bytes: "1MiB"
-    # transport: tcp only. How long one connection has, per pre-message phase, before it is closed
-    # and its connection-cap permit handed back: the TLS accept when tls: is set, then the wait for
-    # its very first byte. Not an idle timeout -- see idle_timeout below.
-    # handshake_timeout: 5s
-    # transport: tcp only, off by default. Bounds the gap after the first byte -- closes a
-    # connection quiet for longer than this and releases its permit. Recommended wherever
-    # consistent traffic is expected, sized above the sender's longest normal gap; think twice
-    # here since a plain carbon sender cannot detect the close (docs/adr/idle-connection-timeout.md).
-    # idle_timeout: 5m
-    # transport: tcp only, and off unless present: a tls: block turns TLS on and makes it required
-    # (there is no plaintext fallback on a TLS listener). Plain carbon senders speak no TLS, so
-    # this is for a logit-to-logit or stunnel-shaped relay hop; there is no graphite_out half.
-    # tls:
+    # transport: tcp             # tcp (default) | udp
+    # protocol: plaintext        # plaintext (default) | pickle; pickle requires transport: tcp
+    #                            # and is carbon's other listener, conventionally on port 2004
+    # max_line_bytes: "8192"     # tcp plaintext only; an oversize line is dropped and counted, the
+    #                            # reader resynchronizes at the next newline, and the connection
+    #                            # stays up
+    # max_frame_bytes: "1MiB"    # pickle only; an oversize frame is counted and closes the
+    #                            # connection, since a length-framed stream has no resync point
+    # handshake_timeout: 5s      # tcp only; per pre-message phase (TLS accept, then the first
+    #                            # byte). Not an idle timeout.
+    # idle_timeout: 5m           # tcp only, off by default; closes a connection quiet for this
+    #                            # long. Size it above the sender's longest normal gap, and note
+    #                            # a plain carbon sender can't detect the close
+    #                            # (docs/adr/idle-connection-timeout.md).
+    # tls:                       # tcp only; presence turns TLS on with no plaintext fallback. Plain
+    #                            # carbon senders speak no TLS, so this is for a logit-to-logit or
+    #                            # stunnel-shaped hop; graphite_out has no tls: half.
     #   cert_file: /etc/logit/tls/server.pem
     #   key_file: /etc/logit/tls/server.key
     #   client_ca_file: /etc/logit/tls/ca.pem   # omit for server-auth-only TLS
     #
-    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:` block
-    # is exactly the values shown here, commented out purely as a reference for tuning a real
-    # deployment. Under transport: udp the whole block applies, the same as collectd_in/statsd_in/
-    # syslog_in; under transport: tcp there is no receive queue at all (TCP's own flow control is
-    # the backpressure), so only the four batch-assembly/shutdown fields apply and the
-    # queue-bounding ones (max_datagrams, max_bytes, overflow, receive_buffer_bytes, read_batch)
-    # are a
-    # `logit validate` error naming the field, not a setting that is silently ignored.
+    # Every field below is its default; omit the block for the same effect. Under transport: tcp
+    # there is no receive queue (TCP's flow control is the backpressure), so only the batch and
+    # shutdown fields apply and a udp-only field is a `logit validate` error.
     # receive:
-    #   max_datagrams: 10000        # udp only: receive-queue depth, in datagrams
-    #   max_bytes: "32MiB"          # udp only: the other queue bound -- whichever trips first
-    #   overflow: drop_oldest       # udp only: block | drop_oldest | drop_newest once both are full
-    #   batch_max_events: 1000      # events accumulated before one send downstream
-    #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
-    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent; 0s
-    #                               # disables the timer, leaving the two bounds above as the only
-    #                               # trigger
-    #   # receive_buffer_bytes: 8MiB  # udp only: SO_RCVBUF, requested at bind
-    #   read_batch: 64              # udp only: datagrams per recvmmsg(2) read, and per receive-queue
-    #                               # pop. Linux-only effect; parsed and ignored elsewhere
-    #   shutdown_grace: 5s          # how long SIGTERM waits for in-flight connections/datagrams to
-    #                               # drain before dropping the rest
+    #   max_datagrams: 10000        # udp only: queue depth; whichever of this or max_bytes trips first
+    #   max_bytes: "32MiB"          # udp only
+    #   overflow: drop_oldest       # udp only: block | drop_oldest | drop_newest
+    #   batch_max_events: 1000
+    #   batch_max_bytes: "1MiB"
+    #   batch_flush_interval: 100ms # 0s disables the timer
+    #   # receive_buffer_bytes: 8MiB  # udp only: SO_RCVBUF
+    #   read_batch: 64              # udp only: datagrams per recvmmsg(2) read; Linux-only effect
+    #   shutdown_grace: 5s
 
   graphite_out:
     type: graphite_out
     sources: [graphite_in]
-    # `host:port`, resolved once per batch at send time rather than at config load -- a central
-    # carbon that isn't up yet is not a config error.
+    # `host:port`, resolved at send time, so a carbon that isn't up yet is not a config error.
     endpoint: central-carbon:2003
-    # Every field below defaults -- an omitted field is exactly the value shown here, commented
-    # out purely as a reference for tuning a real deployment.
-    # transport: tcp             # tcp (default) | udp -- need not match graphite_in's own
-    # protocol: plaintext        # plaintext (default) | pickle -- pickle requires transport: tcp
-    # tags: carbon                # carbon (default) renders ;name=value per attribute, ascending
-    #                              # rendered name; drop omits the tag segment entirely, counted
-    #                              # (logit.output.tags.dropped{reason="dialect"}) -- the escape
-    #                              # hatch for a pre-1.1 Graphite, whose whisper backend would
-    #                              # otherwise take the ";" into a directory name silently
-    # multi_value: skip           # skip (default) drops a Samples/Distribution/Histogram/
-    #                              # ExponentialHistogram/Summary/Set/SetMembers record whole,
-    #                              # counted (metrics.skipped{metric_kind=...}); expand renders the
-    #                              # dotted sub-paths (.count, .sum, .q0_5...q0_99, per-bucket
-    #                              # counts) documented in crates/logit-proto/src/graphite/mod.rs,
-    #                              # counted degraded instead
-    # max_packet_bytes: "1432"    # udp only: bounds one datagram's worth of packed lines, not a
-    #                              # single line's length -- the same "commodity Ethernet LAN"
-    #                              # figure statsd_out uses
-    # max_frame_bytes: "1MiB"     # bounds one pickle frame regardless of transport, since pickle
-    #                              # is tcp-only anyway -- Twisted's own MAX_LENGTH
+    # Every field below is its default; omit it for the same effect.
+    # transport: tcp             # tcp (default) | udp; need not match graphite_in's
+    # protocol: plaintext        # plaintext (default) | pickle; pickle requires transport: tcp
+    # tags: carbon                # carbon (default) renders ;name=value per attribute; drop omits
+    #                              # the tag segment, counted, for a pre-1.1 Graphite whose whisper
+    #                              # backend would take the ";" into a directory name
+    # multi_value: skip           # skip (default) drops a multi-value record whole, counted; expand
+    #                              # renders the dotted sub-paths (.count, .sum, .q0_5, per-bucket
+    #                              # counts) listed in crates/logit-proto/src/graphite/mod.rs
+    # max_packet_bytes: "1432"    # udp only: bounds one datagram, not one line
+    # max_frame_bytes: "1MiB"     # bounds one pickle frame
     # connect_timeout: 5s         # tcp only
-    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md -- max_batches 1024,
+    # buffer: (all defaults, docs/adr/buffered-sink-delivery.md -- max_batches 1024,
     #          max_bytes "64MiB", overflow block, retry_budget 60s, retry_max_delay 10s,
     #          shutdown_grace 5s, plus an optional `disk:` sub-block for durable buffering.
-    #          `delivery:` derives from the sink's own duplicate_safe(), which is true here:
-    #          whisper is last-write-wins per (path, second), so a redelivered datapoint simply
-    #          overwrites itself with the same number rather than double-counting)
+    #          `delivery:` derives from duplicate_safe(), which is true here: whisper is
+    #          last-write-wins per (path, second), so a redelivered datapoint overwrites itself)

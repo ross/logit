@@ -1187,10 +1187,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a tenant header always travels — as would `influxdb_out`'s token and a scrape URL's basic-auth
   credential. `otlp_out` and `prometheus_out`'s remote-write sender already share
   `crates/logit-outputs/src/http.rs`'s `build_client`, which turns redirects off; that helper's doc
-  comment has the reasoning and names the influxdb half as a separate gap. Not a one-line flip:
-  `influxdb_out` keeps its own `status_class`/`classify_transport_error` pair on purpose (its module
-  doc argues its classification is its own to evolve), and moving to the shared client is that
-  change.
+  comment has the reasoning, and `http.rs`'s module doc names the influxdb half as this gap. Not a
+  one-line flip: `influxdb_out` keeps its own client and its own
+  `status_class`/`is_retryable_status`/`classify_transport_error` (the same table as `http.rs`'s
+  today, as its module doc says), so closing this means moving it onto the shared client and
+  classifier.
 - **`logit.input.samples` means two different things depending on `prometheus_in`'s mode.** Scrape
   mode counts the *series* a scrape decoded (`events.len()`, one event per series,
   `crates/logit-inputs/src/prometheus.rs`'s `tick`); bind mode counts **wire samples** reaching the

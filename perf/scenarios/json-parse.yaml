@@ -1,18 +1,16 @@
-# The parse-into-attributes path (docs/plans/load-test-harness.md's scenario table): generate_in
-# renders a JSON log body, `json` merges it into attributes, `kv_metrics` derives metrics from
-# those attributes, then null_out discards. Measures the decode/parse cost `syslog_in -> json ->
-# kv_metrics` pays in the reference nginx pipeline (examples/nginx-to-influxdb.yaml), without the
-# syslog framing or the network hop around it.
+# The parse-into-attributes path: generate_in renders a JSON log body, `json` merges it into
+# attributes, `kv_metrics` derives metrics from them, null_out discards. Measures what
+# `syslog_in -> json -> kv_metrics` pays in the reference nginx pipeline
+# (examples/nginx-to-influxdb.yaml), without the syslog framing or the network hop. Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios".
 #
 #   script/perf run --scenario json-parse
 #
-# `gen`'s `log:` template is the JSON portion of `NGINX_SYSLOG_LINE`
-# (crates/logit-bench/src/fixtures.rs), copied verbatim so this scenario parses the exact same
-# shape logit-bench's own allocation tests and throughput benches already measure at the decoder
-# level -- `{{`/`}}` are the template engine's brace-escape (logit_core::template), needed here
-# because the JSON body itself is nothing but braces. No `{seq}` substitution inside it: the point
-# is measuring the parse of one representative line as fast as the runtime allows, the same
-# reasoning `fixtures.rs`'s own module doc gives for not varying it either.
+# `gen`'s `log:` is the JSON portion of `NGINX_SYSLOG_LINE` (crates/logit-bench/src/fixtures.rs)
+# verbatim, so this parses the shape logit-bench's allocation tests and benches measure at the
+# decoder level. `{{`/`}}` are logit_core::template's brace-escape, needed because a JSON body is
+# nothing but braces. No `{seq}` substitution: the point is one representative line parsed as fast
+# as the runtime allows, the reasoning fixtures.rs's module doc gives for not varying it.
 components:
   gen:
     type: generate_in
@@ -24,7 +22,7 @@ components:
     type: json
     sources: [gen]
 
-  # The exact metric specs from examples/nginx-to-influxdb.yaml / fixtures::kv_metrics(), so this
+  # The metric specs from examples/nginx-to-influxdb.yaml / fixtures::kv_metrics(), so this
   # scenario's `kv_metrics` cost matches the reference pipeline's.
   metrics:
     type: kv_metrics

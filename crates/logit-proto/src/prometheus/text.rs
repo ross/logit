@@ -1,9 +1,8 @@
 //! Prometheus text 0.0.4 and OpenMetrics 1.0 -- the syntax layer, both directions.
 //!
 //! [`parse`] turns a scrape body into [`MetricFamily`]s; [`write`] turns them back into bytes.
-//! Nothing here knows about [`logit_core::Event`] -- that mapping is the parent module's, and
-//! keeping the two apart is what lets a future remote-write module reuse the model mapping
-//! unchanged (see [`super`]'s module doc).
+//! Nothing here knows about [`logit_core::Event`]: that mapping is the parent module's, shared
+//! with [`super::remote_write`] (see [`super`]'s module doc).
 //!
 //! References: <https://prometheus.io/docs/instrumenting/exposition_formats/> and
 //! <https://github.com/OpenObservability/OpenMetrics/blob/main/specification/OpenMetrics.md>;
@@ -50,7 +49,7 @@
 //!
 //! **Timestamps are parsed digit by digit** ([`logit_core::parse_decimal_nanos`]), never through an
 //! `f64`: an epoch-nanosecond instant needs 19 significant digits and an `f64` holds 15-16, so a
-//! float round trip would silently move a sample in time. That covers the plain
+//! float round trip would move a sample in time. That covers the plain
 //! `[SIGN] DIGIT+ ["." DIGIT*]` form every real exposition emits, sign included (the exposition
 //! format's own example carries `something_weird{...} +Inf -3982045`). OpenMetrics' `realnumber`
 //! production also permits an exponent (`1.605281325e9`), which has no digit-exact reading at all,
@@ -83,16 +82,16 @@
 //! One further skip reason (`non_monotonic_buckets`, with `empty_histogram` for a bucket-less
 //! histogram) comes from the model mapping in [`super::families_to_events`] rather than from
 //! parsing: a bucket list that decreases is only *detectable* as the cumulative → per-bucket
-//! conversion runs, and that conversion is deliberately dialect-independent. One *degradation* is
+//! conversion runs, and that conversion is dialect-independent. One *degradation* is
 //! counted here: `logit.input.metrics.degraded{reason="histogram_count_mismatch"}`, when a
 //! histogram's `_count`/`_gcount` line disagrees with its `+Inf` bucket -- the `+Inf` line wins,
 //! since the model holds one total, not two.
 //!
-//! **Deliberate leniencies**, each a place a strict reading of either spec would fail the body and
-//! this parser does not, because a scraper's job is to keep what it can:
+//! **Leniencies**, each a place a strict reading of either spec would fail the body and this parser
+//! does not, because a scraper's job is to keep what it can:
 //!
 //! - a sample for a family with no `# TYPE` at all becomes an `untyped` (text) / `unknown` (OM)
-//!   family -- the OpenMetrics spec mandates exactly this, and text 0.0.4 implies it;
+//!   family -- the OpenMetrics spec mandates this, and text 0.0.4 implies it;
 //! - metadata may follow its family's samples: a `# TYPE` for an already-implicit family retypes it
 //!   in place. Samples already *routed* elsewhere are not re-homed, so a `# TYPE foo histogram`
 //!   after a bare `foo_bucket{le="1"} 1` leaves that line in its own implicit family;
@@ -145,9 +144,9 @@ impl Dialect {
         }
     }
 
-    /// The dialect a scrape response's `Content-Type` selects: OpenMetrics only when it actually
-    /// says so, text 0.0.4 for everything else (including a missing or unrecognized type) -- the
-    /// same default Prometheus itself applies.
+    /// The dialect a scrape response's `Content-Type` selects: OpenMetrics only when it says so,
+    /// text 0.0.4 for everything else (including a missing or unrecognized type) -- the same
+    /// default Prometheus applies.
     pub fn from_content_type(value: &str) -> Dialect {
         const OM: &[u8] = b"application/openmetrics-text";
         let bytes = value.trim_start().as_bytes();
@@ -347,7 +346,7 @@ fn parse_sample(line: &str, dialect: Dialect) -> Option<Sample<'_>> {
         }
         let parsed = parse_exemplar(line, i + 1, dialect)?;
         // Text 0.0.4 has no exemplars: the trailing section still has to parse (trailing junk is a
-        // malformed line either way), it just goes nowhere.
+        // malformed line either way), then is discarded.
         if dialect.is_openmetrics() {
             exemplar = Some(parsed);
         }
@@ -723,11 +722,9 @@ impl Writer<'_> {
                 self.created(series);
             }
             Point::Stale => {
-                // Prometheus' stale marker is a specific NaN payload on the wire, and neither
-                // exposition dialect has a spelling for it: writing a bare `NaN` sample would read
-                // as a real reading of NaN at every scraper, and writing nothing at all is the
-                // honest rendering of "this codec cannot say that". Under the default encoder
-                // settings this is unreachable -- only `with_stale_markers(true)` builds one.
+                // Neither exposition dialect can spell a stale marker, and a bare `NaN` sample
+                // would read as a real reading of NaN at every scraper. Only
+                // `with_stale_markers(true)` builds one.
                 self.encoder.skipped_reason("stale");
             }
             Point::Summary { quantiles, sum, count } => {
@@ -758,8 +755,8 @@ impl Writer<'_> {
     /// OpenMetrics permits exemplars on `_total` and `_bucket` samples only, so a gauge's, an
     /// `info`'s, a `stateset`'s or a summary's are dropped -- and `events_to_families` attaches
     /// whatever the record carried regardless of kind, so an `otlp_in`-sourced `Gauge` or `Summary`
-    /// really does arrive here with exemplars on it. Text 0.0.4 drops every exemplar anyway, which
-    /// is the operator's dialect choice and deliberately uncounted.
+    /// can arrive here with exemplars on it. Text 0.0.4 drops every exemplar uncounted, as the
+    /// operator's dialect choice.
     fn drop_exemplars(&mut self, series: &Series) {
         if !self.dialect.is_openmetrics() {
             return;
@@ -833,8 +830,7 @@ impl Writer<'_> {
         self.out.push(b' ');
     }
 
-    /// The trailing `[ <timestamp>][ # <exemplar>]` plus the newline -- shared by every sample line
-    /// so the dialect rules live in exactly one place.
+    /// The trailing `[ <timestamp>][ # <exemplar>]` plus the newline, shared by every sample line.
     fn trailer(&mut self, series: &Series, exemplar: Option<&Exemplar>) {
         if let Some(ts) = series.timestamp {
             self.out.push(b' ');
@@ -905,9 +901,8 @@ impl Writer<'_> {
 /// and the unit MUST be the suffix of the MetricFamily name", and Prometheus's own OpenMetrics
 /// parser fails the *entire* scrape when it isn't (`unit %q not a suffix of metric %q`) -- so a unit
 /// that doesn't fit, or one carrying anything outside `[a-zA-Z0-9_]` (`{requests}`, which would also
-/// break the line grammar), is dropped rather than emitted. Appending the unit to the metric name
-/// instead, the way Prometheus's own OTLP translation does, is a follow-up rather than something to
-/// do silently here.
+/// break the line grammar), is dropped rather than emitted. Appending the unit to the metric name,
+/// as Prometheus's own OTLP translation does, is a `docs/known-gaps.md` follow-up.
 fn unit_suffixes(name: &str, unit: &str) -> bool {
     if unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return false;
@@ -1395,8 +1390,7 @@ mod tests {
         );
     }
 
-    /// Writing is idempotent: the canonical form is a fixed point of `write(parse(..))`, not merely
-    /// something the first pass happens to produce.
+    /// Writing is idempotent: the canonical form is a fixed point of `write(parse(..))`.
     #[test]
     fn the_canonical_text_form_is_a_fixed_point() {
         assert_canonical(
@@ -1623,7 +1617,7 @@ mod tests {
     fn an_openmetrics_body_without_a_trailing_eof_is_malformed() {
         let err = parse(b"# TYPE foo gauge\nfoo 1\n", Dialect::OpenMetrics1_0).unwrap_err();
         assert!(matches!(err, CodecError::Malformed(_)), "got {err:?}");
-        // The same body is perfectly good text 0.0.4.
+        // The same body is valid text 0.0.4.
         assert!(parse(b"# TYPE foo gauge\nfoo 1\n", Dialect::Text0_0_4).is_ok());
     }
 
@@ -1656,8 +1650,7 @@ mod tests {
         );
     }
 
-    /// A nanosecond-resolution instant survives an OpenMetrics round trip exactly -- the whole
-    /// reason timestamps go through `parse_decimal_nanos` rather than an `f64`.
+    /// A nanosecond-resolution instant survives an OpenMetrics round trip exactly.
     #[test]
     fn an_openmetrics_timestamp_is_parsed_and_written_digit_exactly() {
         let families = parsed("foo 1 1520430000.123456789\n# EOF\n", Dialect::OpenMetrics1_0);
@@ -1996,12 +1989,8 @@ mod tests {
         assert!(reasons.contains(&"unknown_suffix".to_string()));
     }
 
-    /// The other half of the rule above: the suffix only belongs to a family something **declared**.
-    /// With no `# TYPE` anywhere, `foo` is an implicit untyped family -- a guess about one name,
-    /// not a statement about a family that has parts -- so `foo_total` is a family of its own
-    /// rather than a sample thrown away for not fitting a type nobody claimed. See
-    /// `assemble.rs`'s "What an assembler decides" table; a recorded real-Prometheus corpus found
-    /// this the other way round (`testdata/interop/prometheus/README.md`).
+    /// With no `# TYPE` anywhere, `foo_total` is a family of its own, not an `unknown_suffix` skip
+    /// (`assemble.rs`'s "What an assembler decides" table).
     #[test]
     fn a_suffix_never_routes_against_an_undeclared_family() {
         let (families, reasons) = parse_reasons("foo 1\nfoo_total 2\n", Dialect::Text0_0_4);
@@ -2065,7 +2054,7 @@ mod tests {
         assert!(families.is_empty());
     }
 
-    // --- review follow-ups: counted write-side degradations, dialect edges ------------------------
+    // --- counted write-side degradations, dialect edges -----------------------------------------
 
     /// Renders with counters live, returning the body and every
     /// `logit.output.metrics.degraded{reason}` count it recorded.
@@ -2097,9 +2086,7 @@ mod tests {
         family
     }
 
-    /// OpenMetrics: "an underscore and the unit MUST be the suffix of the MetricFamily name", and
-    /// Prometheus's parser fails the *entire* scrape when it isn't -- so a unit that doesn't fit is
-    /// dropped rather than poisoning every other family in the response.
+    /// A unit that doesn't suffix the family name is dropped and counted, not written.
     #[test]
     fn an_openmetrics_unit_is_written_only_when_it_suffixes_the_family_name() {
         // Legal: `_<unit>` suffixes the name -- including a name that is *exactly* `_<unit>`, which
@@ -2123,10 +2110,7 @@ mod tests {
         }
     }
 
-    /// The parser is deliberately lenient about the suffix rule -- a scraper keeps what it is given
-    /// -- so a non-conforming unit rides through the model and only the *writer* drops it. That
-    /// pairing is what makes a relay lose the unit rather than emit a body Prometheus would reject
-    /// wholesale.
+    /// A non-conforming unit parses, rides through the model, and only the *writer* drops it.
     #[test]
     fn a_non_suffix_unit_is_accepted_on_parse_and_dropped_on_write() {
         let families =
@@ -2137,8 +2121,7 @@ mod tests {
         assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)]);
     }
 
-    /// A unit like OpenMetrics' `{requests}` would break the line grammar as well as the suffix
-    /// rule, so the charset is checked too.
+    /// A unit outside `[a-zA-Z0-9_]` (OpenMetrics' `{requests}`) is dropped even as a suffix.
     #[test]
     fn an_openmetrics_unit_outside_the_name_charset_is_dropped_and_counted() {
         let (body, counts) = write_counted(
@@ -2149,8 +2132,7 @@ mod tests {
         assert_eq!(counts, vec![("unit_not_suffix".to_string(), 1.0)]);
     }
 
-    /// Text 0.0.4 never writes `# UNIT` at all, so a unit it cannot carry is the operator's dialect
-    /// choice rather than a degradation -- and must not be counted as one.
+    /// Text 0.0.4 never writes `# UNIT`, and doesn't count that as a degradation.
     #[test]
     fn a_unit_dropped_by_the_text_dialect_is_not_counted() {
         let (body, counts) =
@@ -2159,8 +2141,7 @@ mod tests {
         assert!(counts.is_empty(), "{counts:?}");
     }
 
-    /// `# EOF` terminates an OpenMetrics body and nothing else: in text 0.0.4 it is an ordinary
-    /// comment, and the exposition after it is ordinary exposition.
+    /// `# EOF` terminates only an OpenMetrics body; in text 0.0.4 it is an ordinary comment.
     #[test]
     fn a_text_0_0_4_eof_comment_does_not_terminate_the_body() {
         let families = parsed("# EOF\nfoo 1\nbar 2\n", Dialect::Text0_0_4);
@@ -2187,8 +2168,7 @@ mod tests {
         family
     }
 
-    /// A counter has one line, so OpenMetrics has room for one exemplar -- an OTLP `Sum` carrying
-    /// three loses two, counted.
+    /// A counter has room for one exemplar: an OTLP `Sum` carrying three loses two, counted.
     #[test]
     fn a_counters_extra_exemplars_are_dropped_and_counted() {
         let family = counter_with_exemplars(vec![
@@ -2201,8 +2181,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
     }
 
-    /// Two exemplars whose values land in one bucket's range: OpenMetrics allows one exemplar per
-    /// bucket, so the second has nowhere to sit.
+    /// Two exemplars whose values land in one bucket's range: the second is dropped, counted.
     #[test]
     fn two_exemplars_in_one_bucket_range_lose_one_counted() {
         let mut family = MetricFamily::new("latency", FamilyType::Histogram);
@@ -2239,8 +2218,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
     }
 
-    /// OpenMetrics caps an exemplar's label set at 128 UTF-8 code points; emitting a longer one
-    /// would make the line invalid and truncating a trace id would make it a lie.
+    /// An exemplar over OpenMetrics' 128-code-point label budget is dropped, counted.
     #[test]
     fn an_over_budget_exemplar_label_set_is_dropped_and_counted() {
         let long = "x".repeat(200);
@@ -2250,8 +2228,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
     }
 
-    /// OpenMetrics allows exemplars on `_total` and `_bucket` samples only, so a gauge's are dropped
-    /// -- and `otlp_in` really does produce them: OTLP carries exemplars on `Gauge` and on the
+    /// A gauge's exemplars are dropped, counted; `otlp_in` produces them on `Gauge` and on the
     /// non-monotonic `Sum` this codec renders as a gauge.
     #[test]
     fn a_gauges_exemplars_are_dropped_and_counted() {
@@ -2265,9 +2242,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 2.0)]);
     }
 
-    /// Same for a summary, which has no exemplar-carrying line either -- the structural reason
-    /// OTLP's own `SummaryDataPoint` has no exemplars field. `Distribution`/`Samples` reach the wire
-    /// through this arm too.
+    /// Same for a summary, including the `Distribution`/`Samples` that reach the wire as one.
     #[test]
     fn a_summarys_exemplars_are_dropped_and_counted() {
         let mut family = MetricFamily::new("rpc_seconds", FamilyType::Summary);
@@ -2283,8 +2258,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
     }
 
-    /// And for the two OpenMetrics-only gauge-shaped types, so no arm of the writer is left silently
-    /// dropping one.
+    /// Same for `info` and `stateset`.
     #[test]
     fn an_info_and_a_stateset_exemplar_are_dropped_and_counted() {
         let mut info = MetricFamily::new("build", FamilyType::Info);
@@ -2304,8 +2278,7 @@ mod tests {
         assert_eq!(counts, vec![("exemplar_dropped".to_string(), 1.0)]);
     }
 
-    /// Text 0.0.4 has no exemplars at all, so dropping every one of them is the dialect's own
-    /// doing -- a permitted normalization, not a counted degradation.
+    /// Text 0.0.4 drops every exemplar uncounted: a permitted normalization, not a degradation.
     #[test]
     fn text_0_0_4_drops_every_exemplar_without_counting_any() {
         let family = counter_with_exemplars(vec![exemplar(0.1, &[]), exemplar(0.2, &[])]);
@@ -2323,8 +2296,7 @@ mod tests {
         assert!(counts.is_empty(), "{counts:?}");
     }
 
-    /// `_total` is a legal metric name on its own (`_` is a valid leading character), and stripping
-    /// the suffix for the OpenMetrics family name would leave a nameless `# TYPE  counter` line.
+    /// A counter named `_total` keeps its suffix on the OpenMetrics family name.
     #[test]
     fn a_counter_named_total_keeps_its_whole_name_as_the_openmetrics_family_name() {
         let families = parsed("# TYPE _total counter\n_total 1\n", Dialect::Text0_0_4);
@@ -2335,8 +2307,7 @@ mod tests {
         );
     }
 
-    /// Both formats separate metadata fields with spaces or tabs interchangeably, exactly as the
-    /// sample path already does.
+    /// Metadata fields separate on spaces or tabs interchangeably.
     #[test]
     fn tab_separated_metadata_lines_are_honored() {
         let families =
@@ -2368,10 +2339,7 @@ mod tests {
         assert!(reasons.is_empty(), "{reasons:?}");
     }
 
-    /// Neither dialect can express a stale marker, so the writer drops the series and counts it --
-    /// a bare `NaN` line would read as a real reading of `NaN` at every scraper. Under the default
-    /// encoder settings `events_to_families` never builds one, so this is the belt to
-    /// `with_stale_markers`' braces.
+    /// The writer drops a `Stale` series and counts it rather than write a bare `NaN` line.
     #[test]
     fn a_stale_series_is_skipped_and_counted_in_both_dialects() {
         for dialect in [Dialect::Text0_0_4, Dialect::OpenMetrics1_0] {

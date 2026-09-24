@@ -1,202 +1,173 @@
-//! RFC 3164 / RFC 5424 syslog egress over UDP or TCP -- the mirror of `logit_inputs::syslog`, and
-//! a real relay: header fields round-trip from an event's `syslog.*` attributes when present
-//! (exactly what `SyslogDecoder` writes), falling back to configured defaults only for an event
-//! that never passed through `syslog_in`. See `docs/adr/syslog-output.md`.
+//! RFC 3164 / RFC 5424 syslog egress over UDP or TCP, the mirror of `logit_inputs::syslog`. A
+//! relay: header fields round-trip from the `syslog.*` attributes `SyslogDecoder` writes, and
+//! configured defaults apply only to an event that never passed through `syslog_in`. See
+//! `docs/adr/syslog-output.md`.
 //!
-//! Split the way `influxdb.rs`/`stdio.rs` are: a pure [`SyslogEncoder`] (no socket anywhere, every
-//! format/precedence/sanitization test runs against it directly) plus the thin [`SyslogOutput`]
-//! that owns the socket.
+//! A pure [`SyslogEncoder`] (no socket; every format, precedence, and sanitization test runs
+//! against it) plus the thin [`SyslogOutput`] that owns the socket, split as `influxdb.rs` and
+//! `stdio.rs` are.
 //!
-//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`.** The latter is
-//! `fn encode(&mut self, &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per
-//! batch, with no framing metadata -- and this sink genuinely needs per-message boundaries: one
-//! UDP datagram per message, or one octet-counted frame per message on TCP. There is no single
-//! `Bytes` that carries those boundaries without reinventing them on the other side, which is
-//! exactly the shape `FramedEncoder` exists for: [`SyslogEncoder::encode_into`] fills one
-//! [`MessageBuf`] entry per message and reports every skip/drop through [`EncodeStats`] instead
-//! of failing (ADR `framed-encoder`). `statsd_out` is the other implementor.
+//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`.** The sink needs
+//! per-message boundaries (one UDP datagram per message, one octet-counted frame per message on
+//! TCP), which one opaque `Bytes` per batch can't carry. [`SyslogEncoder::encode_into`] fills one
+//! [`MessageBuf`] entry per message and reports every skip or drop through [`EncodeStats`]
+//! instead of failing (ADR `framed-encoder`). `statsd_out` is the other implementor.
 //!
 //! ## Timestamp semantics
 //!
-//! `event.timestamp` (receipt time) is now the **fallback**, not the rule: per event, the
-//! `syslog.timestamp` attribute `syslog_in` may have left on the event takes precedence when it
-//! can be rendered without guessing, mirroring the decoder's own shapes:
+//! Per event, a `syslog.timestamp` attribute that renders without guessing wins; `event.timestamp`
+//! (receipt time) is the fallback. By the decoder's shapes:
 //!
-//! - `Value::Timestamp` (5424's parsed, unambiguous RFC 3339 TIMESTAMP) renders directly, on
-//!   *either* output format -- an origin instant survives a `5424 -> 3164` or `5424 -> 5424` relay
-//!   either way.
-//! - `Value::Str` (3164's raw, unresolvable 15-byte token -- no year, no timezone) is written
-//!   verbatim only when the *output* format is also 3164, after validating it is exactly that
-//!   shape ([`is_rfc3164_timestamp_shape`]); a 5424 output has nowhere to put a token with no
-//!   year or timezone, so it falls through to `event.timestamp` instead of reintroducing the
-//!   guess `syslog_in`'s own module doc declines to make on the way in.
-//! - `Value::Null` (5424's nil `-` TIMESTAMP) renders as `-` on a 5424 output; RFC 3164 has no
-//!   NILVALUE concept for TIMESTAMP at all, so a 3164 output falls through to `event.timestamp`.
-//! - An absent attribute, or any other `Value` variant, falls through to `event.timestamp` exactly
-//!   as before.
+//! - `Value::Timestamp` (5424's parsed RFC 3339 TIMESTAMP) renders directly on either output
+//!   format, so an origin instant survives a `5424 -> 3164` or `5424 -> 5424` relay.
+//! - `Value::Str` (3164's raw 15-byte token, no year or timezone) is written verbatim only on a
+//!   3164 output, and only if it has that shape ([`is_rfc3164_timestamp_shape`]). A 5424 output
+//!   has nowhere to put it, so it falls through rather than make the guess `syslog_in`'s module
+//!   doc declines to make on the way in.
+//! - `Value::Null` (5424's nil `-`) renders as `-` on a 5424 output. RFC 3164 has no NILVALUE
+//!   TIMESTAMP, so a 3164 output falls through.
+//! - An absent attribute, or any other variant, falls through.
 //!
-//! `event.timestamp` itself is still always receipt time (`docs/adr/decoupled-listener-io.md`) --
-//! this sink never resolves `syslog.timestamp` onto it. The opt-in `syslog_timestamp` transform
-//! `docs/known-gaps.md` already sketches remains the right place to do that explicitly, for either
-//! direction, before an event reaches this sink.
+//! `event.timestamp` stays receipt time (`docs/adr/decoupled-listener-io.md`); this sink never
+//! resolves `syslog.timestamp` onto it. The opt-in `syslog_timestamp` transform sketched in
+//! `docs/known-gaps.md` is where that would happen, before an event reaches this sink.
 //!
 //! ## Header-field precedence
 //!
 //! Per event, per field, first hit wins: the `syslog.*` attribute, then the configured default,
 //! then a format-appropriate absence (`-` for RFC 5424's NILVALUE, an omitted token for RFC 3164).
-//! `syslog.severity` deliberately outranks `log.severity`: `syslog_in`'s PRI-to-`Severity` mapping
-//! is lossy by construction (`map_severity` collapses six syslog severities onto
-//! `logit_core::Severity`'s six variants, e.g. both `notice` (5) and `info` (6) become `Info`), so
-//! preferring the raw attribute is what makes a relay byte-faithful for the severities that
-//! survive it; [`syslog_severity_of`] is only the fallback for an event whose log record came from
-//! somewhere other than `syslog_in`.
+//! `syslog.severity` outranks `log.severity` because `syslog_in`'s `map_severity` is lossy: it
+//! collapses syslog's eight severities onto five `Severity` variants (0-2 all become `Fatal`, 5 and
+//! 6 both become `Info`). Preferring the raw attribute keeps a relay byte-faithful;
+//! [`syslog_severity_of`] is the fallback for a log record that didn't come from `syslog_in`.
 //!
-//! **PROCID** (`syslog.pid`) is a `Value::U64` or, when the origin's PROCID wasn't numeric, a
-//! `Value::Str` -- [`resolve_pid`] returns the [`Pid`] enum covering both. A `Pid::Str` is
-//! sanitized with [`sanitize_5424_field`] and capped at 128 bytes (RFC 5424's own PROCID maximum)
-//! on a 5424 output; on a 3164 output it still renders as `tag[pid]` after [`sanitize_3164_token`]
-//! (3164 defines no PROCID length cap of its own, so the same 128-byte bound is reused for
-//! consistency, not because the RFC requires it).
+//! **PROCID** (`syslog.pid`) is a `Value::U64`, or a `Value::Str` when the origin's PROCID wasn't
+//! numeric; [`resolve_pid`] returns the [`Pid`] enum covering both. On a 5424 output a `Pid::Str`
+//! is sanitized with [`sanitize_5424_field`] and capped at RFC 5424's 128-byte PROCID maximum. On
+//! a 3164 output it renders as `tag[pid]` after [`sanitize_3164_token`], under the same 128-byte
+//! cap for consistency (3164 defines none).
 //!
 //! ## STRUCTURED-DATA
 //!
-//! RFC 5424's STRUCTURED-DATA field ([`write_structured_data`]) is the exact inverse of the
-//! decoder's `syslog.sd` shape: `Value::Map { "<SD-ID>" -> Value::Map { "<PARAM-NAME>" ->
-//! Value::Str | Value::Array<Value::Str> } }` renders as `[<SD-ID> <PARAM-NAME>="<value>" ...]`
-//! per element, concatenated with no separator between elements. **SD-ID and PARAM-NAME order is
-//! canonicalized by name** (sorted by name bytes, independent of interning history) -- a relay
-//! that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`; a repeated PARAM-NAME's occurrences
-//! (already grouped under one `Value::Array` by the decoder) stay grouped, so a wire `a b a`
-//! interleaving is not preserved (`docs/known-gaps.md`). PARAM-VALUEs are escaped (`"` -> `\"`,
-//! `\` -> `\\`, `]` -> `\]`, plus every C0 control character and DEL using [`sanitize_msg`]'s
-//! own mnemonics with the mnemonic's own backslash itself escaped -- see the module doc's
-//! "Injection safety" section -- all via [`push_sd_escaped`]). A repeated `Array` element emits
-//! one `PARAM-NAME="..."` per item, in order. Both SD-ID and PARAM-NAME are
-//! validated as RFC 5424 section 6.3.2's `SD-NAME` ([`is_valid_sd_name`]: 1-32 `PRINTUSASCII`
-//! characters excluding `=`, SP, `]`, `"`) -- an invalid SD-ID skips the whole element, an invalid
-//! PARAM-NAME skips just that param, both counted in [`EncodeStats::dropped_invalid_sd`] and
-//! reported via a throttled `invalid_structured_data` diagnostic. `syslog.sd` absent, not a
-//! `Value::Map`, or producing zero elements renders as `-` (NILVALUE). A non-`Str`/`Array`
-//! PARAM-VALUE (a number, a bool, a nested container) still renders, via [`render_sd_value`]'s
-//! string conversion -- the `syslog.sd` contract only requires the outer two `Value::Map` layers,
-//! not the leaf type.
+//! [`write_structured_data`] is the inverse of the decoder's `syslog.sd` shape: `Value::Map {
+//! "<SD-ID>" -> Value::Map { "<PARAM-NAME>" -> Value::Str | Value::Array<Value::Str> } }` renders
+//! as `[<SD-ID> <PARAM-NAME>="<value>" ...]` per element, concatenated with no separator.
 //!
-//! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] configures an SD-ID
-//! and the output format is 5424, every event attribute whose key does *not* start with
-//! `syslog.` is emitted as one extra SD-ELEMENT under that SD-ID (PARAM-NAME = attribute key, same
-//! validation/skip/count rule as above; the element itself is omitted entirely when no attribute
-//! qualifies). This is what closes the `syslog_in -> json -> syslog_out` gap -- an attribute a
-//! transform added along the way, not part of the original `syslog.sd`, still reaches the wire
-//! when an operator opts in. A relayed multi-valued statsd tag (`team: Value::Array[Str("a"),
-//! Str("b")]`) is exactly such an attribute -- it goes through [`write_sd_param`]'s existing
-//! `Array` arm like any other, so it emits repeated PARAM-NAMEs under that SD-ID, `team="a"
-//! team="b"`. **No default private enterprise number is shipped.** `sd_id` must
-//! contain exactly one `@` (a PEN-qualified id, e.g. `myapp@12345`), validated at
-//! `with_structured_data` construction time; RFC 5424's own `32473` example PEN is documentation
-//! only, never a shipped default -- registering a real one (or an operator supplying their own) is
-//! a decision for whoever turns this on. `syslog_in` decodes this element back into `syslog.sd`
-//! like any other -- there is no automatic re-lifting of it back into top-level attributes; that
-//! remains a transform's job. **A duplicate SD-ID is refused, not emitted twice**: when `sd_id`
-//! already names a key of the event's own `syslog.sd` (an origin element with the same id --
-//! `structured_data.sd_id` colliding with a live private enterprise number in transit), the
-//! opt-in element is skipped entirely ([`EncodeStats::dropped_invalid_sd`], a throttled
-//! `invalid_structured_data` diagnostic naming the collision) -- `syslog_in`'s own
-//! `parse_structured_data` rejects a message whose STRUCTURED-DATA repeats an SD-ID, so emitting
-//! both here would make a `syslog_in -> syslog_out -> syslog_in` relay fail on the far end.
+//! - **SD-ID and PARAM-NAME order is canonicalized by name** (sorted by name bytes, independent of
+//!   interning history): a relay that saw `[b@2 ..][a@1 ..]` re-emits `[a@1 ..][b@2 ..]`. A
+//!   repeated PARAM-NAME's occurrences, already grouped under one `Value::Array` by the decoder,
+//!   emit one `PARAM-NAME="..."` per item in order, so a wire `a b a` interleaving isn't preserved
+//!   (`docs/known-gaps.md`).
+//! - PARAM-VALUEs are escaped by [`push_sd_escaped`]: `"` -> `\"`, `\` -> `\\`, `]` -> `\]`, plus
+//!   every C0 control character and DEL (see "Injection safety").
+//! - SD-ID and PARAM-NAME must be RFC 5424 section 6.3.2 `SD-NAME`s ([`is_valid_sd_name`]: 1-32
+//!   `PRINTUSASCII` characters excluding `=`, SP, `]`, `"`). An invalid SD-ID skips the whole
+//!   element, an invalid PARAM-NAME skips that param; both count in
+//!   [`EncodeStats::dropped_invalid_sd`] and a throttled `invalid_structured_data` diagnostic.
+//! - `syslog.sd` absent, not a `Value::Map`, or producing zero elements renders as `-`.
+//! - A non-`Str`/`Array` PARAM-VALUE (number, bool, nested container) still renders, through
+//!   [`render_sd_value`]; the `syslog.sd` contract constrains only the outer two `Map` layers.
 //!
-//! **RFC 3164 output never emits STRUCTURED-DATA** -- 3164 has no such field at all, so
-//! `syslog.sd` (and the opt-in `structured_data`) is silently dropped on a `5424 -> 3164` relay.
-//! Recorded as one of the plan's permitted normalizations (a sink-configured dialect change), not
-//! data loss this sink is expected to work around.
+//! **Opt-in `structured_data`**: when [`SyslogEncoder::with_structured_data`] sets an SD-ID and the
+//! output is 5424, every event attribute whose key doesn't start with `syslog.` is emitted as one
+//! extra SD-ELEMENT under that SD-ID (PARAM-NAME = attribute key; same validation, skip, and count
+//! rule; the element is omitted when no attribute qualifies). This closes the
+//! `syslog_in -> json -> syslog_out` gap: an attribute a transform added still reaches the wire. A
+//! relayed multi-valued statsd tag (`team: Value::Array[Str("a"), Str("b")]`) takes
+//! [`write_sd_param`]'s `Array` arm and emits `team="a" team="b"`.
+//!
+//! - **No default private enterprise number ships.** `sd_id` must contain exactly one `@` (e.g.
+//!   `myapp@12345`), checked in `with_structured_data`. RFC 5424's `32473` example PEN is
+//!   documentation only; choosing a real one is the operator's decision.
+//! - `syslog_in` decodes the element back into `syslog.sd` like any other; lifting it back into
+//!   top-level attributes is a transform's job.
+//! - **A duplicate SD-ID is refused, not emitted twice.** When `sd_id` already names a key of the
+//!   event's own `syslog.sd`, the opt-in element is skipped ([`EncodeStats::dropped_invalid_sd`],
+//!   a throttled `invalid_structured_data` diagnostic naming the collision). `syslog_in`'s
+//!   `parse_structured_data` rejects a repeated SD-ID, so emitting both would make a
+//!   `syslog_in -> syslog_out -> syslog_in` relay fail at the far end.
+//!
+//! **RFC 3164 output never emits STRUCTURED-DATA**, since 3164 has no such field: `syslog.sd` and
+//! the opt-in element are dropped on a `5424 -> 3164` relay. That's a permitted normalization (a
+//! sink-configured dialect change) under `docs/adr/lossless-transit.md`.
 //!
 //! ## Injection safety
 //!
-//! `syslog_in` splits a datagram into lines on `\n`, and Grafana Alloy's `loki.source.syslog` UDP
-//! listener does the same -- so an embedded newline in a relayed message forges a second, fully
-//! attacker-controlled message at the receiver (a fabricated PRI, hostname, and app name, i.e. a
-//! fabricated Loki stream). [`sanitize_msg`] neutralizes this by escaping `\n`/`\r`/NUL and every
-//! other C0 control character and DEL, in the rendered message, regardless of transport -- so the
-//! bytes on the wire don't depend on which transport is configured. On TCP, octet-counting framing
-//! ([`frame_octet_counting`]) is already newline-transparent, making this defense-in-depth rather
-//! than the only guard on that path.
+//! `syslog_in` and Grafana Alloy's `loki.source.syslog` UDP listener both split a datagram into
+//! lines on `\n`, so an embedded newline in a relayed message forges a second, attacker-controlled
+//! message at the receiver (its own PRI, hostname, and app name, i.e. a fabricated Loki stream).
+//! [`sanitize_msg`] escapes `\n`/`\r`/NUL and every other C0 control character and DEL in the
+//! rendered message on every transport, so the wire bytes don't depend on the transport. On TCP,
+//! octet-counting ([`frame_octet_counting`]) is already newline-transparent, which makes this
+//! defense in depth there.
 //!
-//! **STRUCTURED-DATA PARAM-VALUEs get the identical control-character treatment**, via
-//! [`push_sd_escaped`] rather than [`sanitize_msg`] itself (composed with RFC 5424 section
-//! 6.3.3's own `"`/`\`/`]` escaping, since a PARAM-VALUE already sits inside a quoted string) --
-//! a `\n`/`\r`/NUL/other C0/DEL in a `syslog.sd` value or an opt-in `structured_data` attribute
-//! can no more forge a second message than one in the message body can. Like `sanitize_msg`, this
-//! is a one-way sanitizer normalization (`docs/adr/lossless-transit.md`'s permitted list): the
-//! decoder reads the escaped bytes back as the literal text `\n` (backslash, `n`), never a real
-//! newline -- same as the message body.
+//! **STRUCTURED-DATA PARAM-VALUEs get the same control-character treatment** through
+//! [`push_sd_escaped`], composed with RFC 5424 section 6.3.3's `"`/`\`/`]` escaping because a
+//! PARAM-VALUE sits inside a quoted string. Like `sanitize_msg`, it's a one-way sanitizer
+//! normalization (`docs/adr/lossless-transit.md`'s permitted list): the decoder reads the escaped
+//! bytes back as the literal text `\n` (backslash, `n`), never a real newline.
 //!
-//! **A literal backslash is deliberately not escaped.** The demo's message body is a JSON
-//! document (`access_json`'s output), where a real newline inside a JSON string is already
-//! encoded as the two characters `\` `n` on the wire -- escaping a literal backslash would double
-//! every one of them and break Loki's `| json` LogQL parsing on every line. This does mean a
-//! message that already contained the literal two characters `\` `n` is indistinguishable on the
-//! wire from one that contained a real newline; recorded in `docs/known-gaps.md`.
+//! **A literal backslash is not escaped.** The demo's message body is a JSON document, where a
+//! newline inside a string is already the two characters `\` `n`; escaping a backslash would
+//! double every one of them and break Loki's `| json` parsing on every line. The cost: a message
+//! that contained the literal two characters `\` `n` is indistinguishable on the wire from one
+//! with a real newline (`docs/known-gaps.md`).
 //!
 //! RFC 5424's HOSTNAME/APP-NAME/PROCID/MSGID are `PRINTUSASCII` with length caps
-//! ([`sanitize_5424_field`]); RFC 3164's HOSTNAME/TAG additionally forbid `:`/`[`/`]`
-//! ([`sanitize_3164_token`]), matching `syslog_in`'s own two-token header rule (a `:` in HOSTNAME
-//! would make it misread the token as TAG instead) and the same "must not end in `:`" warning
-//! `demo/hello/app.py` already carries. A non-`PRINTUSASCII` byte (including a raw space, which
-//! sits below the `PRINTUSASCII` range) becomes `_`, which is also what keeps a header field free
-//! of whitespace a downstream token-scanner could misread as a field boundary.
+//! ([`sanitize_5424_field`]). RFC 3164's HOSTNAME/TAG also forbid `:`/`[`/`]`
+//! ([`sanitize_3164_token`]), matching `syslog_in`'s two-token header rule (a `:` in HOSTNAME
+//! would make it read the token as TAG) and the "must not end in `:`" warning in
+//! `demo/hello/app.py`. A non-`PRINTUSASCII` byte, raw space included, becomes `_`, so no header
+//! field carries whitespace a receiver could read as a field boundary.
 //!
 //! ## Message body
 //!
-//! `log.message` is a `Value` and may be non-string. [`render_message`] renders `Value::Str`
-//! **verbatim** (before [`sanitize_msg`]'s control-character pass) -- the demo's case, and the
-//! one that must reach Loki unmangled for `| json` to parse it -- and deliberately does *not*
-//! reuse `stdio::render_value` for that case, since that function quotes and escapes a string for
-//! a human reading a terminal. `Value::Map`/`Value::Array` do reuse it, as a container-encoding
-//! fallback rather than a second implementation, since [`sanitize_msg`] still runs over whatever
-//! it produces. **`Value::Bytes` bypasses this entirely**: it is never lossy-UTF-8-decoded.
-//! [`sanitize_msg_bytes`] applies the same control-character escapes directly to the raw bytes,
-//! and the result is appended to the line buffer as raw bytes ([`MessageBuf::push_bytes`]) rather
-//! than through a `String` -- so a non-UTF-8 payload reaches the wire unmangled instead of losing
-//! bytes to `char::REPLACEMENT_CHARACTER`.
+//! `log.message` is a `Value`. [`render_message`] renders `Value::Str` verbatim before
+//! [`sanitize_msg`]'s pass: the demo's JSON body must reach Loki unmangled for `| json` to parse
+//! it, so this doesn't reuse `stdio::render_value`, which quotes and escapes a string for a
+//! terminal. `Value::Map`/`Value::Array` do reuse it as a container fallback, since
+//! [`sanitize_msg`] still runs over the result. **`Value::Bytes` is never lossy-UTF-8-decoded**:
+//! [`sanitize_msg_bytes`] applies the same escapes to the raw bytes, which are appended with
+//! [`MessageBuf::push_bytes`], so a non-UTF-8 payload reaches the wire without
+//! `char::REPLACEMENT_CHARACTER` substitutions.
 //!
 //! ## Sizing
 //!
-//! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG). STRUCTURED-DATA is
-//! part of the *header* for this accounting -- it is written into the line buffer before the
-//! header-length check, so a `syslog.sd`/`structured_data` element that pushes the header over the
-//! limit drops the whole message ([`EncodeStats::dropped_oversize_header`]) exactly like an
-//! oversize hostname or app-name would, rather than being truncated or silently omitted. Defaults
-//! to 8192 -- Grafana Alloy's own `loki.source.syslog` `max_message_length` default, the receiver
-//! the demo stack points this at, rather than RFC 3164 §4.1's traditional 1024 (which would
-//! truncate a JSON-bodied message on every modern relay chain). An oversize MSG is truncated on a
-//! UTF-8 character boundary for a `Value::Str` message ([`truncate_on_char_boundary`]), or a plain
-//! byte boundary for a `Value::Bytes` one ([`truncate_bytes`]; arbitrary bytes have no "character"
-//! to respect) -- counted and throttle-warned either way, truncating rather than dropping, since a
-//! truncated line still carries a correct header and a readable prefix. An oversize *header*
-//! (unreachable except with an absurdly small `max_message_bytes`) drops the whole message instead
-//! of emitting a malformed one.
+//! `max_message_bytes` bounds one whole encoded message (PRI + header + MSG). It defaults to 8192,
+//! Grafana Alloy's `loki.source.syslog` `max_message_length` default (the demo stack's receiver),
+//! rather than RFC 3164 §4.1's traditional 1024, which would truncate a JSON-bodied message on
+//! every modern relay chain.
+//!
+//! - STRUCTURED-DATA counts as header: it's written into the line buffer before the header-length
+//!   check, so an SD element that pushes the header over the limit drops the whole message
+//!   ([`EncodeStats::dropped_oversize_header`]), as an oversize hostname would, rather than being
+//!   truncated or omitted.
+//! - An oversize header (otherwise reachable only with a tiny `max_message_bytes`) drops the
+//!   message rather than emit a malformed one.
+//! - An oversize MSG is truncated, not dropped, since a truncated line still has a correct header
+//!   and a readable prefix: on a UTF-8 character boundary for `Value::Str`
+//!   ([`truncate_on_char_boundary`]), on a byte boundary for `Value::Bytes` ([`truncate_bytes`]).
+//!   Counted and throttle-warned either way.
 //!
 //! ## TLS
 //!
-//! `transport: tcp` optionally runs over TLS -- RFC 5425, syslog over TLS over TCP
-//! ([`SyslogOutput::with_tls`], `docs/plans/syslog-tls.md`). The `tls:` block's mere presence
-//! turns it on and makes it required, the `logit_out` precedent: `endpoint` is a bare `host:port`
-//! with no scheme to carry the signal, so there is nothing else to read it from and no plaintext
-//! fallback. DTLS is out of scope, so `tls:` under `transport: udp` is a config error
-//! (`logit-pipeline::graph::resolve`'s rule 44) as well as an error here. A connect *after* the
-//! first counts `logit.output.reconnects`, on TLS and plaintext alike.
+//! `transport: tcp` optionally runs over TLS, RFC 5425 ([`SyslogOutput::with_tls`],
+//! `docs/adr/syslog-tcp-ingress-and-tls.md`). A `tls:` block's presence turns it on and makes it
+//! required, the `logit_out` precedent: `endpoint` is a bare `host:port` with no scheme to carry
+//! the signal, so there's no plaintext fallback. DTLS is out of scope, so `tls:` under
+//! `transport: udp` is an error here and at config time (`logit-pipeline::graph::resolve`'s rule
+//! 44). Every connect after the first counts `logit.output.reconnects`, TLS or plaintext.
 //!
-//! TLS is **not** transparent to this sink's fault classification: a `tokio_rustls` stream's
-//! `Ok` from a write means "the session accepted these bytes", not "the kernel has them", and its
-//! `Err` is never proof that nothing left the host. [`SyslogOutput::send_tcp`]'s doc comment
-//! states the per-transport invariants and what changes because of them (no internal retry and
-//! no `Fault::Clean` after an application write on TLS, and a mandatory flush before any batch is
-//! called delivered).
+//! TLS changes this sink's fault classification: a `tokio_rustls` write's `Ok` means the session
+//! accepted the bytes, not that the kernel has them, and its `Err` never proves nothing left the
+//! host. [`SyslogOutput::send_tcp`]'s doc comment has the per-transport invariants and their
+//! consequences (on TLS, no internal retry and no `Fault::Clean` after an application write; on
+//! both, a flush before any batch is called delivered).
 
 use crate::stdio::render_value;
-// The TLS pieces this sink shares with `logit_out` (`crates/logit-outputs/src/logit.rs`), which
-// dials the same shape of connection: a bare `host:port` over raw TCP that may or may not be
-// TLS-wrapped. `AsyncStream` is what lets `Conn::Tcp` hold either without `SyslogOutput` becoming
-// generic; `host_only` derives the SNI name from an endpoint with no scheme to read.
+// Shared with `logit_out`, which dials the same bare `host:port`, optionally TLS-wrapped.
+// `AsyncStream` lets `Conn::Tcp` hold either without `SyslogOutput` becoming generic; `host_only`
+// derives the SNI name from an endpoint with no scheme.
 use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 use crate::Output;
 use anyhow::Context;
@@ -213,59 +184,50 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
-/// `crate::tls::TlsClientSettings`, re-exported here for symmetry with `crate::otlp`'s and
-/// `crate::logit`'s own paths (all three sinks share the one definition in `crate::tls`).
+/// The shared `crate::tls` type, re-exported at this path as `crate::otlp` and `crate::logit` do.
 pub use crate::tls::TlsClientSettings;
 
-/// Matches Grafana Alloy's `loki.source.syslog` `max_message_length` default -- see the module
-/// doc's "Sizing" section.
+/// Grafana Alloy's `loki.source.syslog` `max_message_length` default; see the module doc's
+/// "Sizing".
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 8192;
 
-/// TCP only -- how long a connect attempt (including a reconnect after a dropped connection) may
-/// take before `send` reports it as a failure. `logit-config` can't reference this directly
-/// (`logit-outputs` depends on it, never the reverse), so its own
-/// `default_syslog_connect_timeout` hardcodes the same 5-second value -- keep the two in sync by
-/// hand if this ever changes.
+/// TCP only: how long one connect attempt, reconnects included, may take.
+///
+/// `logit-config` can't reference this (the dependency runs the other way), so its
+/// `default_syslog_connect_timeout` hardcodes the same 5 seconds. Change both together.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Which syslog dialect [`SyslogEncoder`] emits. Deliberately its own tiny enum rather than
-/// `logit_config::SyslogFormat` -- `logit-outputs` depends on `logit-pipeline`/`logit-core`/
-/// `logit-proto`, never `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so
-/// `logit-cli::pipeline::build_spec` is the sole place a config value crosses into this type,
-/// exactly like `queue_config`/`write_config` already do for `BufferConfig`.
+/// Which syslog dialect [`SyslogEncoder`] emits.
+///
+/// Its own enum rather than `logit_config::SyslogFormat` because `logit-outputs` never depends on
+/// `logit-config` (`docs/design/pipeline-graph.md`'s "Crate layout");
+/// `logit-cli::pipeline::build_spec` does the conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Rfc3164,
     Rfc5424,
 }
 
-/// Per-batch outcome counts from [`SyslogEncoder::encode_into`] -- this sink's
-/// [`FramedEncoder::Stats`], what `SyslogOutput::send` turns into `logit.output.*` telemetry
-/// (`docs/design/internal-telemetry.md`).
+/// Per-batch outcome counts from [`SyslogEncoder::encode_into`], which `SyslogOutput::send` turns
+/// into `logit.output.*` telemetry.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no `log` record (legal under `docs/adr/multi-payload-events.md`) -- a
-    /// metric-only or span-only event has nothing to render as a syslog message. The exact
-    /// inverse of `influxdb_out`, which skips log-only/span-only events: neither sink invents a
-    /// rendering for a payload shape it can't represent.
+    /// Events with no `log` record (metric-only or span-only): nothing to render as a message.
     pub skipped_no_log: usize,
     pub truncated: usize,
     pub dropped_oversize_header: usize,
-    /// A `syslog.sd`/opt-in `structured_data` SD-ELEMENT or SD-PARAM skipped for failing
-    /// `is_valid_sd_name` -- see the module doc's "STRUCTURED-DATA" section. Reported alongside a
-    /// throttled `invalid_structured_data` diagnostic.
+    /// SD-ELEMENTs or SD-PARAMs skipped: an invalid `SD-NAME`, a non-map `syslog.sd` element, or
+    /// an opt-in SD-ID collision (module doc's "STRUCTURED-DATA").
     pub dropped_invalid_sd: usize,
 }
 
-/// The validated `sd_id` behind [`SyslogEncoder::with_structured_data`] -- see the module doc's
-/// "STRUCTURED-DATA" section.
+/// The validated `sd_id` behind [`SyslogEncoder::with_structured_data`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StructuredDataConfig {
     sd_id: String,
 }
 
-/// Encodes events as syslog messages. Pure -- no socket anywhere -- so every format/precedence/
-/// sanitization test runs directly against this, with no transport of any kind involved.
+/// Encodes events as syslog messages. Pure: no socket, so every format test runs against it.
 pub struct SyslogEncoder {
     format: Format,
     default_facility: u8,
@@ -273,31 +235,21 @@ pub struct SyslogEncoder {
     default_app_name: Option<String>,
     max_message_bytes: usize,
     diag: Diagnostics,
-    /// The header/message text being built for the event currently being encoded -- reused
-    /// across every event *and* across every `encode_into` call (a struct field, not a local, is
-    /// what makes the second half of that true: a function-local recreated on every call regrows
-    /// from empty capacity every time, which is exactly why an earlier version of this encoder
-    /// showed real reallocation cost even with `encode_into` warmed once before measurement --
-    /// warming a local's very first call doesn't help its *next* call, only within-call reuse
-    /// across events did). Cleared, never reallocated, at the top of each event.
+    /// The message being built for the current event. A field, not a local, so its capacity
+    /// survives across `encode_into` calls as well as across events: a local regrows from empty
+    /// on every call. Cleared, never reallocated, per event.
     line: String,
-    /// `render_message`'s pre-sanitize rendering of `log.message`, reused the same way as `line`.
+    /// `render_message`'s pre-sanitize rendering of `log.message`, reused like `line`.
     raw_msg: String,
-    /// Reused for every per-field sanitize call in a header (`sanitize_5424_field`/
-    /// `sanitize_3164_token`, once each for hostname/app-name/msgid), for `sanitize_msg`'s output
-    /// afterward, and for rendering one STRUCTURED-DATA PARAM-VALUE before escaping -- safe
-    /// because every use within one event is read-immediately-into-`line`-then-cleared before the
-    /// next use, never overlapping in time.
+    /// Shared by every header-field sanitize, `sanitize_msg`'s output, and one PARAM-VALUE's
+    /// rendering. Safe because each use is copied into `line` and cleared before the next.
     scratch: String,
-    /// [`sanitize_msg_bytes`]'s output for a `Value::Bytes` message -- the byte-oriented twin of
-    /// `scratch`'s use for a `Value::Str` message, so a non-UTF-8 payload never goes through
-    /// lossy conversion. Cleared, never reallocated, at the top of each `Value::Bytes` message.
+    /// [`sanitize_msg_bytes`]'s output for a `Value::Bytes` message: `scratch`'s byte twin.
     byte_scratch: Vec<u8>,
-    /// The final composed message (header bytes + separator + `byte_scratch`) for a
-    /// `Value::Bytes` message, reused across calls the same way `line` is.
+    /// Header, separator, and `byte_scratch` composed for a `Value::Bytes` message, reused like
+    /// `line`.
     line_bytes: Vec<u8>,
-    /// Set by [`SyslogEncoder::with_structured_data`] -- see the module doc's "STRUCTURED-DATA"
-    /// section.
+    /// Set by [`SyslogEncoder::with_structured_data`].
     structured_data: Option<StructuredDataConfig>,
 }
 
@@ -334,14 +286,12 @@ impl SyslogEncoder {
         self
     }
 
-    /// Opts into the extra, operator-configured STRUCTURED-DATA element -- see the module doc's
-    /// "STRUCTURED-DATA" section. Validates `sd_id` as an `SD-NAME` ([`is_valid_sd_name`])
-    /// containing exactly one `@` (a private-enterprise-number-qualified id, e.g.
-    /// `"myapp@12345"`); **no default PEN is shipped** -- RFC 5424's own `32473` example is
-    /// documentation only, and picking a real one (registering with IANA, or an operator
-    /// supplying their own) is a decision for whoever turns this on, not something to default
-    /// silently. The wiring surfaces this as a config-time error (`crates/logit-cli/src/
-    /// pipeline.rs`'s `SyslogOut` arm).
+    /// Opts into the operator-configured STRUCTURED-DATA element (module doc's
+    /// "STRUCTURED-DATA").
+    ///
+    /// Fails unless `sd_id` is an `SD-NAME` ([`is_valid_sd_name`]) with exactly one `@`, a
+    /// PEN-qualified id such as `"myapp@12345"`; no default PEN ships. `logit-cli::pipeline`'s
+    /// `SyslogOut` arm surfaces the error at config time.
     pub fn with_structured_data(mut self, sd_id: impl Into<String>) -> anyhow::Result<Self> {
         let sd_id = sd_id.into();
         if !is_valid_sd_name(&sd_id) {
@@ -368,16 +318,13 @@ impl SyslogEncoder {
 }
 
 impl FramedEncoder for SyslogEncoder {
-    /// A syslog message is self-describing: the transport frames each entry as-is (one datagram
-    /// on UDP, one octet-counted frame on TCP), so there is nothing to say about it beyond its
-    /// bytes.
+    /// None: the transport frames each message as-is (a datagram on UDP, an octet-counted frame
+    /// on TCP).
     type Meta = ();
     type Stats = EncodeStats;
 
-    /// Encodes every event in `batch` into `out` (cleared first), one message per event that
-    /// carries a `log` record. Never fails -- a per-event problem (no log record, an oversize
-    /// header) is a skip/drop counted in the returned [`EncodeStats`], not an error; there is
-    /// nothing for a caller to react to beyond what the stats already report.
+    /// One message per event carrying a `log` record, into `out` (cleared first). Never fails: a
+    /// per-event problem is a skip or drop counted in the returned [`EncodeStats`].
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
@@ -390,10 +337,9 @@ impl FramedEncoder for SyslogEncoder {
 }
 
 impl SyslogEncoder {
-    /// Encodes one event's header into `self.line` (already cleared by the caller), then its
-    /// message -- pushed into `out` as raw bytes ([`MessageBuf::push_bytes`]) for a
-    /// `Value::Bytes` message (module doc's "Message body" section), or as `self.line` itself
-    /// (via [`MessageBuf::push`]) otherwise. A skipped or dropped event pushes nothing.
+    /// Encodes one event's header into `self.line` (cleared by the caller), then its message,
+    /// pushed as raw bytes ([`MessageBuf::push_bytes`]) for `Value::Bytes` and as `self.line`
+    /// ([`MessageBuf::push`]) otherwise. A skipped or dropped event pushes nothing.
     fn encode_event(&mut self, event: &Event, stats: &mut EncodeStats, out: &mut MessageBuf) {
         let Some(log) = &event.log else {
             stats.skipped_no_log += 1;
@@ -436,10 +382,9 @@ impl SyslogEncoder {
             ),
         }
 
-        // Header alone exceeds the bound: drop the message entirely rather than truncate a
-        // header field and emit something a receiver would misparse (module doc's "Sizing").
-        // STRUCTURED-DATA is part of the header for this accounting -- it was already appended
-        // to `self.line` by `write_rfc5424_header` above.
+        // An oversize header drops the message rather than emit a truncated field a receiver
+        // would misparse. STRUCTURED-DATA is already in `self.line`, so it counts as header
+        // (module doc's "Sizing").
         if self.line.len() > self.max_message_bytes {
             self.line.clear();
             stats.dropped_oversize_header += 1;
@@ -453,16 +398,10 @@ impl SyslogEncoder {
             return;
         }
 
-        // **No RFC 5424 §6.4 BOM.** An earlier version emitted one (the symmetric choice to
-        // `syslog_in` stripping one on the way in), on the assumption that Alloy's receiver
-        // would tolerate it. Verified against the real demo stack that it does not: Loki's
-        // `| json` LogQL stage uses Go's `encoding/json`, which does not skip a leading BOM,
-        // so every relayed line silently failed to parse as JSON and every `| json`-filtered
-        // dashboard panel came back empty despite lines actually landing in Loki. Confirmed
-        // by re-running the same query with the BOM removed. See `docs/adr/syslog-output.md`.
+        // No RFC 5424 §6.4 BOM before MSG: Loki's `| json` stage (Go's `encoding/json`) doesn't
+        // skip one, so every BOM-prefixed JSON line fails to parse. `docs/adr/syslog-output.md`.
         match &log.message {
-            // Raw bytes, sanitized at the byte level so a non-UTF-8 MSG is never forced through
-            // lossy UTF-8 conversion -- module doc's "Message body" section.
+            // Sanitized as bytes, never lossy-decoded (module doc's "Message body").
             Value::Bytes(raw) => {
                 self.byte_scratch.clear();
                 sanitize_msg_bytes(&mut self.byte_scratch, raw);
@@ -477,9 +416,9 @@ impl SyslogEncoder {
         }
     }
 
-    /// Finishes a `Value::Str`-shaped (or any non-`Bytes`) message: `self.scratch` already holds
-    /// the sanitized text. Truncates on a UTF-8 character boundary. Always pushes -- the header
-    /// alone, if the message is empty or there was no room left for it.
+    /// Finishes a non-`Bytes` message from the sanitized text in `self.scratch`, truncating on a
+    /// UTF-8 character boundary. Always pushes: the header alone if the message is empty or
+    /// there's no room left for it.
     fn push_message_str(&mut self, stats: &mut EncodeStats, out: &mut MessageBuf) {
         if !self.scratch.is_empty() {
             if self.line.len() >= self.max_message_bytes {
@@ -511,11 +450,9 @@ impl SyslogEncoder {
         out.push(&self.line);
     }
 
-    /// The `Value::Bytes` twin of [`SyslogEncoder::push_message_str`]: `self.byte_scratch` already
-    /// holds the sanitized message bytes. Truncates on a plain byte boundary (arbitrary bytes have
-    /// no "character" to respect). Composes the final message into `self.line_bytes` (header,
-    /// which is always ASCII/`PRINTUSASCII`, plus a separator, plus the message bytes) and pushes
-    /// that -- `self.line` alone whenever there's no message content to append.
+    /// The `Value::Bytes` twin of [`SyslogEncoder::push_message_str`], from `self.byte_scratch`,
+    /// truncating on a byte boundary. Composes header, separator, and bytes into
+    /// `self.line_bytes`; pushes `self.line` alone when there's no message to append.
     fn push_message_bytes(&mut self, stats: &mut EncodeStats, out: &mut MessageBuf) {
         if !self.byte_scratch.is_empty() {
             if self.line.len() >= self.max_message_bytes {
@@ -560,9 +497,9 @@ fn resolve_facility(attrs: &AttrMap, default: u8) -> u8 {
     }
 }
 
-/// `syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`) -- this deliberately
-/// outranks `log.severity`; see the module doc's "Header-field precedence" section. Falls back to
-/// [`syslog_severity_of`], then `6` (info) for an event with no severity at all.
+/// `syslog.severity` if present and in range (`Value::U64(n)`, `n <= 7`), outranking
+/// `log.severity` (module doc's "Header-field precedence"). Else [`syslog_severity_of`], else `6`
+/// (info).
 fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
     if let Some(Value::U64(n)) = attrs.get("syslog.severity") {
         if *n <= 7 {
@@ -575,11 +512,9 @@ fn resolve_severity(attrs: &AttrMap, log_severity: Option<Severity>) -> u8 {
     }
 }
 
-/// The deliberately-lossy inverse of `syslog_in::map_severity`, for an event whose log record
-/// didn't come from `syslog_in` at all (or came from it but never carried a `syslog.severity`
-/// attribute -- can't happen from `syslog_in` itself, but nothing enforces that at the type
-/// level). `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable", a claim
-/// `Fatal` never makes. `Trace` has no syslog equivalent and maps to `7` (debug), same as `Debug`.
+/// The lossy inverse of `syslog_in::map_severity`, for an event with no `syslog.severity`.
+/// `Fatal` maps to `2` (crit), not `0` (emerg): `emerg` means "system unusable", a claim `Fatal`
+/// never makes. `Trace` has no syslog equivalent and maps to `7` (debug), as `Debug` does.
 fn syslog_severity_of(severity: Severity) -> u8 {
     match severity {
         Severity::Trace => 7,
@@ -591,15 +526,13 @@ fn syslog_severity_of(severity: Severity) -> u8 {
     }
 }
 
-/// A non-empty string attribute, or `None` -- an empty string is treated the same as absent, so a
-/// blank `syslog.hostname` (unlikely, but not impossible from a hand-built event) falls through to
-/// the configured default rather than encoding as a header field with nothing in it.
+/// A non-empty string attribute, or `None`. Empty counts as absent, so a blank
+/// `syslog.hostname` falls through to the configured default instead of an empty header field.
 fn resolve_str<'a>(attrs: &'a AttrMap, key: &str) -> Option<&'a str> {
     attrs.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
-/// `syslog.pid` as either shape the decoder may have left it in -- see the module doc's "PROCID"
-/// note.
+/// `syslog.pid` in either shape the decoder leaves it in (module doc's "PROCID" note).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pid<'a> {
     U64(u64),
@@ -614,10 +547,8 @@ fn resolve_pid(attrs: &AttrMap) -> Option<Pid<'_>> {
     }
 }
 
-/// `HEADER SP STRUCTURED-DATA` (no `[SP MSG]` yet -- `encode_event` appends that only if MSG is
-/// non-empty, per the grammar). STRUCTURED-DATA is rendered from `syslog.sd` and the opt-in
-/// `structured_data` element -- see the module doc's "STRUCTURED-DATA" section and
-/// [`write_structured_data`].
+/// `HEADER SP STRUCTURED-DATA`. The caller appends `[SP MSG]` only for a non-empty MSG, per the
+/// grammar.
 #[allow(clippy::too_many_arguments)]
 fn write_rfc5424_header(
     out: &mut String,
@@ -653,9 +584,7 @@ fn write_rfc5424_header(
     write_structured_data(out, scratch, attrs, structured_data, stats, diag);
 }
 
-/// Per-event RFC 5424 TIMESTAMP, following the precedence in the module doc's "Timestamp
-/// semantics" section: a resolved `syslog.timestamp` renders directly or as the NILVALUE `-`;
-/// anything unresolvable (a raw 3164 token, an absent attribute) falls through to receipt time.
+/// Per-event RFC 5424 TIMESTAMP, per the module doc's "Timestamp semantics".
 fn write_5424_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64) {
     match attrs.get("syslog.timestamp") {
         Some(Value::Timestamp(t)) => push_rfc5424_timestamp(out, *t),
@@ -664,8 +593,7 @@ fn write_5424_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64)
     }
 }
 
-/// Sanitizes `value` into `scratch` (a reused buffer -- see [`SyslogEncoder::scratch`]'s doc
-/// comment) and appends the result to `out`, or `-` (NILVALUE) if `value` is absent or sanitizes
+/// Appends `value` sanitized (through `scratch`), or `-` (NILVALUE) if it's absent or sanitizes
 /// to nothing.
 fn push_5424_field(out: &mut String, scratch: &mut String, value: Option<&str>, max_len: usize) {
     match value {
@@ -681,11 +609,10 @@ fn push_5424_field(out: &mut String, scratch: &mut String, value: Option<&str>, 
     }
 }
 
-/// RFC 5424 section 6: HOSTNAME/APP-NAME/PROCID/MSGID are all `PRINTUSASCII` (`%d33-126`), with a
-/// per-field length cap. Every non-conforming character (including a raw space, which sits below
-/// the `PRINTUSASCII` range) becomes `_` rather than being dropped, so the result is always pure
-/// ASCII and stays a fixed number of bytes per character for the subsequent byte-length
-/// truncation. Writes into `scratch` (cleared first) rather than returning a fresh `String`.
+/// RFC 5424 section 6: HOSTNAME/APP-NAME/PROCID/MSGID are `PRINTUSASCII` (`%d33-126`) with a
+/// per-field length cap. Every other character, space included, becomes `_` rather than being
+/// dropped, so the output is pure ASCII and the byte-length cap is also a character cap. Writes
+/// into `scratch`, cleared first.
 fn sanitize_5424_field(scratch: &mut String, s: &str, max_len: usize) {
     scratch.clear();
     for c in s.chars() {
@@ -696,10 +623,8 @@ fn sanitize_5424_field(scratch: &mut String, s: &str, max_len: usize) {
     }
 }
 
-/// `Mmm dd hh:mm:ss ` (space-padded day), UTC -- RFC 3164's header, no structured data, no
-/// trailing separator (`encode_event`/`write_rfc3164_header`'s callers add exactly the separators
-/// they need). HOSTNAME/TAG are omitted entirely when absent or empty after sanitization, rather
-/// than emitting an RFC 5424-style NILVALUE RFC 3164 has no concept of.
+/// RFC 3164's `<PRI>TIMESTAMP HOSTNAME TAG[PID]:` header, UTC, with no trailing separator.
+/// HOSTNAME and TAG are omitted when absent or empty after sanitization: 3164 has no NILVALUE.
 #[allow(clippy::too_many_arguments)]
 fn write_rfc3164_header(
     out: &mut String,
@@ -743,10 +668,8 @@ fn write_rfc3164_header(
     }
 }
 
-/// Per-event RFC 3164 TIMESTAMP, following the same precedence [`write_5424_timestamp`] does,
-/// with 3164's own two differences: a resolved `Value::Timestamp` renders in 3164's own
-/// `Mmm dd hh:mm:ss` shape (not RFC 3339), and there is no NILVALUE concept for TIMESTAMP at all
-/// (a `Value::Null` falls straight through to receipt time, unlike 5424's `-`).
+/// Per-event RFC 3164 TIMESTAMP, per the module doc's "Timestamp semantics": a `Value::Timestamp`
+/// renders as `Mmm dd hh:mm:ss`, and `Value::Null` falls through (3164 has no NILVALUE).
 fn write_3164_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64) {
     match attrs.get("syslog.timestamp") {
         Some(Value::Timestamp(t)) => push_rfc3164_timestamp(out, *t),
@@ -763,12 +686,9 @@ fn write_3164_timestamp(out: &mut String, attrs: &AttrMap, event_timestamp: i64)
     }
 }
 
-/// True if `s` is exactly the 15-byte RFC 3164 `Mmm dd hh:mm:ss` shape
-/// ([`push_rfc3164_timestamp`]'s own output format) -- the only shape [`write_3164_timestamp`]
-/// will emit verbatim from a raw `syslog.timestamp` `Value::Str`. Anything else (a
-/// differently-formatted string, a truncated token) falls through to receipt time instead of
-/// risking a malformed TIMESTAMP field reaching the wire. Works on bytes throughout so an
-/// adversarial non-ASCII string can never panic on a `str` char-boundary slice.
+/// True if `s` is the 15-byte RFC 3164 `Mmm dd hh:mm:ss` shape, the only raw `syslog.timestamp`
+/// [`write_3164_timestamp`] emits verbatim. Works on bytes so a non-ASCII string can't panic on a
+/// `str` char-boundary slice.
 fn is_rfc3164_timestamp_shape(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 15 {
@@ -791,11 +711,8 @@ fn is_rfc3164_timestamp_shape(s: &str) -> bool {
         && digit(14)
 }
 
-/// Like [`sanitize_5424_field`], plus `:`/`[`/`]` also become `_` -- matching `syslog_in`'s own
-/// two-token HOSTNAME/TAG rule (`crates/logit-inputs/src/syslog.rs`): a `:` in HOSTNAME would make
-/// that parser misread the token as TAG instead, and `demo/hello/app.py` carries the same warning
-/// about a trailing `:`. A raw space (below `PRINTUSASCII`) already becomes `_`, which is what
-/// keeps a token free of whitespace a receiver's token scanner could misread as a field boundary.
+/// [`sanitize_5424_field`], plus `:`/`[`/`]` become `_`: a `:` in HOSTNAME would make
+/// `syslog_in`'s two-token header rule read it as TAG (module doc's "Injection safety").
 fn sanitize_3164_token(scratch: &mut String, s: &str, max_len: usize) {
     scratch.clear();
     for c in s.chars() {
@@ -811,12 +728,9 @@ fn is_printusascii(c: char) -> bool {
     matches!(c, '\u{21}'..='\u{7e}')
 }
 
-/// RFC 5424 section 6.3.2's `SD-NAME`: 1 to 32 `PRINTUSASCII` characters, excluding `=`, `]`,
-/// `"` (SP is already excluded by `PRINTUSASCII`'s own range). Used for both SD-ID and
-/// PARAM-NAME, and for the opt-in `structured_data.sd_id`. Iterates bytes rather than `char`s --
-/// a non-ASCII byte is never `PRINTUSASCII` regardless, so this can't misclassify a multi-byte
-/// character's continuation bytes as valid, and it can't panic on one either (byte slicing, unlike
-/// `str` slicing, never has a char-boundary precondition).
+/// RFC 5424 section 6.3.2's `SD-NAME`: 1 to 32 `PRINTUSASCII` characters excluding `=`, `]`, `"`
+/// (SP is outside `PRINTUSASCII`). Checks SD-IDs, PARAM-NAMEs, and the opt-in `sd_id`. Byte-wise
+/// is exact here: no non-ASCII byte is `PRINTUSASCII`.
 fn is_valid_sd_name(s: &str) -> bool {
     (1..=32).contains(&s.len())
         && s.bytes().all(|b| {
@@ -825,11 +739,8 @@ fn is_valid_sd_name(s: &str) -> bool {
         })
 }
 
-/// Renders a STRUCTURED-DATA PARAM-VALUE's `Value` into `out`, before [`push_sd_escaped`]'s
-/// escaping pass -- the SD-specific analogue of [`render_message`]. `Str` is rendered verbatim;
-/// numbers/bools via `Display`; `Timestamp` as RFC 3339; `Bytes`/`Map`/`Array` (a shape that
-/// doesn't fit one PARAM-VALUE on its own) fall back to [`render_value`]'s container rendering,
-/// same as `render_message`'s own container fallback.
+/// Renders a PARAM-VALUE before [`push_sd_escaped`] escapes it: [`render_message`]'s SD analogue.
+/// `Bytes`/`Map`/`Array` fall back to [`render_value`].
 fn render_sd_value(out: &mut String, value: &Value) {
     match value {
         Value::Null => {}
@@ -856,15 +767,10 @@ fn render_sd_value(out: &mut String, value: &Value) {
 }
 
 /// Escapes a rendered PARAM-VALUE per RFC 5424 section 6.3.3 (`"` -> `\"`, `\` -> `\\`, `]` ->
-/// `\]` -- the exact inverse of the decoder's unescaping; any other backslash sequence is left as
-/// a literal two characters on decode, so this never produces one on its own), **plus** every C0
-/// control character and DEL, using [`sanitize_msg`]'s own mnemonics (`\n`, `\r`, `\0`, `\xNN`)
-/// with the mnemonic's own backslash then escaped by the rule above -- so a literal newline
-/// becomes the three wire bytes `\`, `\`, `n`, which `parse_param_value` unescapes back to the
-/// two-character text `\n`, never a real newline. See the module doc's "Injection safety"
-/// section: this is the same one-way sanitizer normalization `sanitize_msg` applies to the
-/// message body, applied here so an embedded control character in a `syslog.sd` value or an
-/// opt-in `structured_data` attribute can't forge a second message either.
+/// `\]`, the inverse of the decoder's unescaping), plus every C0 control character and DEL as
+/// [`sanitize_msg`]'s mnemonics (`\n`, `\r`, `\0`, `\xNN`) with the mnemonic's backslash itself
+/// escaped. A newline becomes the three wire bytes `\`, `\`, `n`, which `parse_param_value`
+/// decodes to the text `\n`, never a real newline (module doc's "Injection safety").
 fn push_sd_escaped(out: &mut String, value: &str) {
     for c in value.chars() {
         match c {
@@ -882,14 +788,12 @@ fn push_sd_escaped(out: &mut String, value: &str) {
     }
 }
 
-/// Renders the RFC 5424 STRUCTURED-DATA field: every `syslog.sd` element (the decoder's own
-/// nested `Value::Map` shape) followed by the opt-in `structured_data` element built from the
-/// event's own non-`syslog.*` attributes, if configured -- see the module doc's
-/// "STRUCTURED-DATA" section. `-` (NILVALUE) when neither produces anything. **SD-ID order is
-/// canonicalized by name** (sorted by name bytes before writing -- [`write_sd_element`] does the
-/// same for PARAM-NAMEs) -- `AttrMap` iteration order is process-global intern order, not wire
-/// order, so writing it straight through would make a relay's element order depend on interning
-/// history rather than being a pure function of the data.
+/// The RFC 5424 STRUCTURED-DATA field: every `syslog.sd` element, then the opt-in element if
+/// configured, or `-` when neither produces anything (module doc's "STRUCTURED-DATA").
+///
+/// SD-IDs are sorted by name bytes ([`write_sd_element`] sorts PARAM-NAMEs): `AttrMap` iterates
+/// in process-global intern order, so writing it through would make element order depend on
+/// interning history.
 #[allow(clippy::too_many_arguments)]
 fn write_structured_data(
     out: &mut String,
@@ -930,19 +834,13 @@ fn write_structured_data(
         }
     }
     if let Some(cfg) = structured_data {
-        // Nothing would be emitted for an event whose only attributes are `syslog.*` ones --
-        // compute that *before* checking for a collision, so an event that would never have
-        // produced the opt-in element in the first place doesn't get counted/reported as if one
-        // had been dropped.
+        // Checked before the collision, so an event with only `syslog.*` attributes, which would
+        // emit no opt-in element anyway, isn't counted as a drop.
         let has_extra_attrs =
             attrs.iter().any(|(sym, _)| !interner::resolve(sym).starts_with("syslog."));
         if has_extra_attrs {
-            // The decoder rejects a message whose STRUCTURED-DATA repeats an SD-ID
-            // (`syslog_in`'s `parse_structured_data`) -- so if the opt-in element's own `sd_id`
-            // already names a key of `syslog.sd`, emitting both would produce exactly the
-            // duplicate a `syslog_in -> syslog_out -> syslog_in` relay must never fail on. Skip
-            // the opt-in element in that case (the origin's own `syslog.sd` element wins) rather
-            // than emit a line the far end would reject outright.
+            // `syslog_in` rejects a repeated SD-ID, so on a collision the origin's element wins
+            // and the opt-in one is dropped rather than make the far end reject the line.
             let collides = matches!(
                 attrs.get("syslog.sd"),
                 Some(Value::Map(sd)) if sd.get(&cfg.sd_id).is_some()
@@ -977,15 +875,13 @@ fn write_structured_data(
     }
 }
 
-/// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. Skips the whole element (counting
-/// [`EncodeStats::dropped_invalid_sd`] and a throttled `invalid_structured_data` diagnostic) when
-/// `sd_id` itself isn't a valid `SD-NAME`; an individual invalid PARAM-NAME only skips that one
-/// param ([`write_sd_param`]). **PARAM-NAME order is canonicalized by name** (sorted by name
-/// bytes before writing) -- the caller passes params in `AttrMap`/attribute iteration order
-/// (process-global intern order), and a repeated PARAM-NAME's occurrences are already grouped
-/// under one `Value::Array` by the decoder, so sorting the (already-unique) names is enough to
-/// make the whole element's order a pure function of its data; a wire `a b a` interleaving is
-/// therefore re-emitted grouped (`a a b`), not preserved -- see `docs/known-gaps.md`.
+/// One SD-ELEMENT: `[SD-ID PARAM-NAME="value" ...]`. An invalid `sd_id` skips the whole element
+/// and an invalid PARAM-NAME skips that param ([`write_sd_param`]), each counted in
+/// [`EncodeStats::dropped_invalid_sd`] with a throttled `invalid_structured_data` diagnostic.
+///
+/// PARAM-NAMEs are sorted by name bytes. They're already unique (the decoder groups a repeated
+/// one under a `Value::Array`), so sorting makes the element a function of its data; a wire
+/// `a b a` interleaving re-emits as `a a b` (`docs/known-gaps.md`).
 fn write_sd_element<'a>(
     out: &mut String,
     scratch: &mut String,
@@ -1012,9 +908,8 @@ fn write_sd_element<'a>(
     out.push(']');
 }
 
-/// One SD-PARAM (or, for an `Array` value, one per element under the same PARAM-NAME -- the
-/// decoder's own repeated-PARAM-NAME convention). Skips (counting the same stats/diagnostic as
-/// [`write_sd_element`]) when `name` isn't a valid `SD-NAME`.
+/// One SD-PARAM, or one per item of an `Array` value (the decoder's repeated-PARAM-NAME shape).
+/// Skipped and counted, as in [`write_sd_element`], when `name` isn't a valid `SD-NAME`.
 fn write_sd_param(
     out: &mut String,
     scratch: &mut String,
@@ -1052,11 +947,9 @@ fn push_one_sd_param(out: &mut String, scratch: &mut String, name: &str, value: 
     out.push('"');
 }
 
-/// RFC 3339 with microsecond precision (`2026-09-02T14:03:11.123456Z`) -- RFC 5424 section
-/// 6.2.3.1's TIME-SECFRAC allows at most 6 digits, so this reuses
-/// `logit_core::time::format_rfc3339_utc`'s nanosecond-precision output (always exactly 9
-/// fractional digits then `Z`) and trims the last 3 fractional digits rather than reimplementing
-/// the civil-from-days conversion.
+/// RFC 3339 with microseconds (`2026-09-02T14:03:11.123456Z`): RFC 5424 section 6.2.3.1's
+/// TIME-SECFRAC allows at most 6 digits, so this trims the last 3 of `format_rfc3339_utc`'s
+/// always-9 fractional digits.
 fn push_rfc5424_timestamp(out: &mut String, nanos: i64) {
     let full = format_rfc3339_utc(nanos);
     out.push_str(&full[..full.len() - 4]);
@@ -1066,10 +959,7 @@ fn push_rfc5424_timestamp(out: &mut String, nanos: i64) {
 const MONTH_ABBR: [&str; 12] =
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
-/// `Mmm dd hh:mm:ss`, UTC, no year (RFC 3164's TIMESTAMP has none) -- shares
-/// `format_rfc3339_utc`'s civil-from-days approach (Howard Hinnant's algorithm) rather than
-/// importing it, since that function is private to `logit-core` and returns a full RFC 3339
-/// string, not the decomposed parts this shape needs.
+/// `Mmm dd hh:mm:ss` (space-padded day), UTC, no year (RFC 3164's TIMESTAMP has none).
 fn push_rfc3164_timestamp(out: &mut String, nanos: i64) {
     let (month, day, hour, minute, second) = civil_time_of(nanos);
     let _ = write!(
@@ -1079,9 +969,9 @@ fn push_rfc3164_timestamp(out: &mut String, nanos: i64) {
     );
 }
 
-/// UTC `(month, day, hour, minute, second)` for a Unix-nanosecond timestamp, deliberately dropping
-/// the year (RFC 3164 has none). See `push_rfc3164_timestamp`'s doc comment for why this doesn't
-/// call into `logit_core::time` instead.
+/// UTC `(month, day, hour, minute, second)` for a Unix-nanosecond timestamp, by Howard Hinnant's
+/// civil-from-days algorithm. Not shared with `logit_core::time`, which returns only a whole RFC
+/// 3339 string.
 fn civil_time_of(nanos: i64) -> (u32, u32, u32, u32, u32) {
     let secs = nanos.div_euclid(1_000_000_000);
     let days = secs.div_euclid(86_400);
@@ -1101,9 +991,8 @@ fn civil_time_of(nanos: i64) -> (u32, u32, u32, u32, u32) {
     (month, day, hour, minute, second)
 }
 
-/// Renders a log message's `Value` into `out`, before [`sanitize_msg`]'s control-character pass.
-/// See the module doc's "Message body" section for why `Str` is verbatim and not routed through
-/// `stdio::render_value`.
+/// Renders a log message's `Value` before [`sanitize_msg`]'s pass; `Str` is verbatim (module
+/// doc's "Message body").
 fn render_message(out: &mut String, value: &Value) {
     match value {
         Value::Null => {}
@@ -1120,26 +1009,23 @@ fn render_message(out: &mut String, value: &Value) {
             let _ = write!(out, "{f}");
         }
         Value::Timestamp(ns) => out.push_str(&format_rfc3339_utc(*ns)),
-        // RFC 5424 MSG-ANY permits arbitrary octets, but the whole receiver chain (Alloy, Loki)
-        // wants UTF-8, and `syslog_in` already rejects a non-UTF-8 line rather than emit one
-        // (`docs/known-gaps.md`) -- lossy conversion here is the symmetric choice on the way out.
+        // Unreached from `encode_event`, which sends a `Bytes` message through
+        // `sanitize_msg_bytes` instead; lossy only for a direct caller.
         Value::Bytes(b) => out.push_str(&String::from_utf8_lossy(b)),
         Value::Str(s) => {
             // `Value::Str` is constructed only from valid UTF-8 (see its own doc comment).
             let text = std::str::from_utf8(s).expect("Value::Str is always valid UTF-8");
             out.push_str(text);
         }
-        // Container fallback -- reuses `stdio::render_value` rather than a second
-        // implementation. `sanitize_msg` still runs over whatever this produces, so its own
-        // quoting is harmless, just redundant for this case.
+        // `sanitize_msg` still runs over the result, so `render_value`'s quoting is redundant
+        // here, not harmful.
         Value::Array(_) | Value::Map(_) => render_value(out, value),
     }
 }
 
-/// Neutralizes `\n`/`\r`/NUL and every other C0 control character (plus DEL) in a rendered
-/// message -- see the module doc's "Injection safety" section for why, and for why a literal
-/// backslash is deliberately left untouched. Writes into `out` (cleared first) rather than
-/// returning a fresh `String`.
+/// Escapes `\n`/`\r`/NUL, every other C0 control character, and DEL in a rendered message, and
+/// leaves a literal backslash alone (module doc's "Injection safety"). Writes into `out`, cleared
+/// first.
 fn sanitize_msg(out: &mut String, msg: &str) {
     out.clear();
     for c in msg.chars() {
@@ -1155,9 +1041,8 @@ fn sanitize_msg(out: &mut String, msg: &str) {
     }
 }
 
-/// Byte-level twin of [`sanitize_msg`] for a `Value::Bytes` message -- same escapes (`\n`/`\r`/
-/// NUL/other C0/DEL), applied to raw bytes instead of `char`s, so a non-UTF-8 payload never goes
-/// through lossy UTF-8 conversion. Writes into `out` (cleared first).
+/// [`sanitize_msg`]'s escapes over raw bytes, for a `Value::Bytes` message. Writes into `out`,
+/// cleared first.
 fn sanitize_msg_bytes(out: &mut Vec<u8>, msg: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out.clear();
@@ -1176,8 +1061,7 @@ fn sanitize_msg_bytes(out: &mut Vec<u8>, msg: &[u8]) {
     }
 }
 
-/// Truncates `s` in place to at most `budget` bytes, on a UTF-8 character boundary. Returns
-/// whether truncation actually happened.
+/// Truncates `s` to at most `budget` bytes on a UTF-8 character boundary; `true` if it cut.
 fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
     if s.len() <= budget {
         return false;
@@ -1190,9 +1074,7 @@ fn truncate_on_char_boundary(s: &mut String, budget: usize) -> bool {
     true
 }
 
-/// Byte-level twin of [`truncate_on_char_boundary`] -- arbitrary bytes have no "character
-/// boundary" concept, so this simply truncates to `budget` bytes. Returns whether truncation
-/// actually happened.
+/// [`truncate_on_char_boundary`]'s byte twin: truncates to `budget` bytes; `true` if it cut.
 fn truncate_bytes(buf: &mut Vec<u8>, budget: usize) -> bool {
     if buf.len() <= budget {
         return false;
@@ -1201,13 +1083,10 @@ fn truncate_bytes(buf: &mut Vec<u8>, budget: usize) -> bool {
     true
 }
 
-/// RFC 6587 §3.4.1 octet-counting: `MSG-LEN SP SYSLOG-MSG` per message, concatenated. Chosen over
-/// non-transparent (LF-delimited) framing because it is transparent to a literal newline inside
-/// MSG -- which [`sanitize_msg`] already escapes, but this is the framing-level half of the same
-/// defense, not a second, redundant one (a non-transparent frame would still depend on
-/// `sanitize_msg` never having a bug). Alloy/Loki's syslog receiver (built on `go-syslog`)
-/// auto-detects octet-counting from a message's leading digit, so this needs no corresponding
-/// receiver-side configuration.
+/// RFC 6587 §3.4.1 octet-counting: `MSG-LEN SP SYSLOG-MSG` per message, concatenated.
+/// Newline-transparent, so framing doesn't depend on [`sanitize_msg`] being bug-free. Alloy's
+/// `go-syslog` receiver detects it from the leading digit with no configuration
+/// (`docs/adr/syslog-output.md`).
 fn frame_octet_counting(messages: &MessageBuf, out: &mut Vec<u8>) {
     out.clear();
     for msg in messages.iter() {
@@ -1217,58 +1096,44 @@ fn frame_octet_counting(messages: &MessageBuf, out: &mut Vec<u8>) {
     }
 }
 
-/// The live half of a `syslog_out` sink: `Udp` binds eagerly (a bad local bind is a config error,
-/// matching `StreamOutput::open_path`'s "fail before anything starts listening" precedent); `Tcp`
-/// connects lazily inside `send`, since a not-yet-up downstream syslog receiver must not block
-/// `logit` from starting -- a compose-level `depends_on` on one would be equally wrong.
+/// The socket side of a `syslog_out` sink. `Udp` binds eagerly, so a bad local bind fails
+/// startup; `Tcp` connects lazily in `send`, so a receiver that isn't up yet doesn't block
+/// `logit` from starting.
 enum Conn {
     Udp(UdpSocket),
-    /// `stream` is `Box<dyn AsyncStream>`, not `TcpStream`, so the same variant covers a plaintext
-    /// and a TLS-wrapped connection without making [`SyslogOutput`] generic -- exactly
-    /// `logit_out`'s `Conn::stream` shape, and for the same reason (`logit-cli::pipeline::
-    /// build_spec` builds one concrete sink type per kind). RFC 5425 is syslog over TLS over TCP:
-    /// there is no DTLS arm here, and `logit-pipeline::graph::resolve`'s rule 44 rejects a `tls:`
-    /// block under `transport: udp` before construction.
+    /// A `Box<dyn AsyncStream>` covers plaintext and TLS without making [`SyslogOutput`]
+    /// generic, as `logit_out`'s `Conn` does. No DTLS arm: rule 44 rejects `tls:` under
+    /// `transport: udp`.
     Tcp {
         stream: Option<Box<dyn AsyncStream>>,
         connect_timeout: Duration,
     },
 }
 
-/// `logit_pipeline::Output` for `syslog_out`. Built via [`SyslogOutput::udp`] or
-/// [`SyslogOutput::tcp`] -- never a bare constructor, mirroring `StreamOutput`'s named
-/// constructors for the same reason: which one is legal depends on config
-/// (`crates/logit-cli/src/pipeline.rs::build_spec`).
+/// `logit_pipeline::Output` for `syslog_out`, built by [`SyslogOutput::udp`] or
+/// [`SyslogOutput::tcp`].
 pub struct SyslogOutput {
     endpoint: String,
     conn: Conn,
     encoder: SyslogEncoder,
     messages: MessageBuf,
-    /// TCP only, reused across `send` calls -- the octet-counted frame for the whole batch.
-    /// Never shrinks (only `clear()`ed), so one outlier batch pins its peak capacity for the rest
-    /// of the process's life -- the same trade `InfluxLineEncoder`'s own reused buffers already
-    /// make (`docs/design/memory.md`), accepted here for the same reason: reallocating back down
-    /// only to regrow on the next similarly-sized batch would trade a one-time worst case for a
-    /// recurring one.
+    /// TCP only: the batch's octet-counted frame, reused across `send` calls. Never shrinks, so
+    /// an outlier batch pins its peak capacity, the trade `InfluxLineEncoder`'s buffers make
+    /// (`docs/design/memory.md`).
     frame_buf: Vec<u8>,
-    /// TCP only (RFC 5425). `Some` exactly when a `tls:` block was configured -- its mere
-    /// presence turns TLS on, the `logit_out`/`otlp_in` precedent, since `endpoint` here is a bare
-    /// `host:port` with no scheme to select TLS from. Built once at construction
-    /// ([`SyslogOutput::with_tls`]) and shared by every connect attempt.
+    /// TCP only: `Some` exactly when a `tls:` block was configured (module doc's "TLS"). Built
+    /// once by [`SyslogOutput::with_tls`], shared by every connect.
     tls: Option<Arc<rustls::ClientConfig>>,
-    /// `true` once this sink has ever connected -- the very first connect is not a "reconnect,"
-    /// only every one after it. Mirrors `logit_out`'s field of the same name
-    /// (`logit.output.reconnects`, `docs/design/internal-telemetry.md`).
+    /// Whether this sink has connected before; only later connects count
+    /// `logit.output.reconnects`.
     has_connected_once: bool,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl SyslogOutput {
-    /// Binds an ephemeral local UDP socket eagerly. `endpoint` (the remote `host:port`) is
-    /// resolved per `send`, not here -- a DNS hiccup at bind time would otherwise be
-    /// indistinguishable from every other config error this constructor can raise, when it's
-    /// really a delivery-time condition (`Fault::Clean`).
+    /// Binds an ephemeral local UDP socket now. `endpoint` is resolved per batch instead, so a DNS
+    /// failure is a delivery-time `Fault::Clean`, not a startup error.
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .context("binding syslog_out's local UDP socket")?;
@@ -1301,24 +1166,15 @@ impl SyslogOutput {
         self
     }
 
-    /// Turns on TLS for this sink's TCP connection (`tls:` in config) -- RFC 5425, syslog over
-    /// TLS over TCP.
+    /// Turns on RFC 5425 TLS for the TCP connection (`tls:` in config).
     ///
-    /// **Presence turns it on**, the `logit_out`/`otlp_in` shape rather than `otlp_out`'s: this
-    /// sink's `endpoint` is a bare `host:port` with no scheme to read the signal from, so an
-    /// empty `tls: {}` still means "TLS, with the bundled Mozilla roots and no client
-    /// certificate" -- deliberately *not* [`TlsClientSettings::is_empty`]'s early return, which
-    /// `otlp_out` can afford only because `https://` already selected TLS for it there. A `tls:`
-    /// block therefore means TLS is *required*: there is no plaintext fallback
-    /// (`docs/plans/syslog-tls.md`).
+    /// Presence turns it on, so an empty `tls: {}` means TLS with the bundled Mozilla roots and no
+    /// client certificate. Unlike `otlp_out`, there's no [`TlsClientSettings::is_empty`] early
+    /// return: `otlp_out` has `https://` to select TLS, this sink's bare `host:port` has nothing.
     ///
-    /// Errors on the UDP arm rather than silently ignoring the setting: DTLS is out of scope, and
-    /// `logit-pipeline::graph::resolve`'s rule 44 already rejects that config before
-    /// `build_spec` ever calls this -- this is the belt-and-braces half, so a future caller that
-    /// bypasses graph validation can't quietly get an unencrypted socket.
-    ///
-    /// Every path in `settings` is resolved against `base_dir` (the config file's own directory)
-    /// and loaded here, since `graph::resolve` never touches the filesystem.
+    /// Errors on the UDP arm (no DTLS) so a caller that bypasses rule 44 can't end up with an
+    /// unencrypted socket. Paths in `settings` resolve against `base_dir`, the config file's
+    /// directory, and load here, since `graph::resolve` never touches the filesystem.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
@@ -1369,8 +1225,7 @@ impl Output for SyslogOutput {
             &[("reason", "invalid_sd_name")],
         );
         if self.messages.is_empty() {
-            // Every event in this batch was skipped or dropped -- nothing to write. Matches
-            // `influxdb_out`'s own "nothing to write" early return on an empty encoded body.
+            // Every event was skipped or dropped: nothing to write.
             return Ok(());
         }
 
@@ -1412,19 +1267,10 @@ impl Output for SyslogOutput {
         result.map(|_| ())
     }
 
-    /// Implemented explicitly (rather than relying on the default no-op) so the contract is
-    /// spelled out rather than assumed: `send` already performs one write per batch and flushes
-    /// before reporting it delivered, so in the normal case there is nothing left here at
-    /// shutdown.
-    ///
-    /// Belt-and-braces, then, rather than load-bearing: every state a connection can actually be
-    /// in here has already been flushed, because `*stream` is only ever repopulated after a
-    /// successful flush and a cancelled attempt drops its local `conn` instead of handing it back
-    /// ([`SyslogOutput::send_tcp`]'s doc comment). Kept anyway because it costs a function call
-    /// on an idle stream and spells the contract out where a default no-op would leave it
-    /// implicit -- which matters more here than it looks: on a TLS connection "flushed" is a
-    /// property of the stream rather than of the socket alone, since finished records live in the
-    /// rustls session's own buffer until something drains them.
+    /// Belt and braces: `*stream` is only repopulated after a successful flush, and a cancelled
+    /// attempt drops its connection ([`SyslogOutput::send_tcp`]), so there's normally nothing
+    /// left here. Kept explicit because on TLS "flushed" is a property of the stream, not the
+    /// socket: finished records sit in the rustls session until something drains them.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
             stream.flush().await.context("flushing syslog_out TCP stream")?;
@@ -1432,42 +1278,29 @@ impl Output for SyslogOutput {
         Ok(())
     }
 
-    /// `false` for both transports: syslog has no destination-side idempotency to lean on (unlike
-    /// `influxdb_out`'s idempotent-overwrite semantics) -- a redelivered message is a duplicated
-    /// log line at the receiver. This still lets a `Fault::Clean` retry succeed under the derived
-    /// `AtMostOnce` posture (`docs/adr/buffered-sink-delivery.md`'s table), which covers the
-    /// common outage shape (the receiver restarting) with zero duplicate risk.
+    /// `false` on both transports: a redelivered message is a duplicated log line. `AtMostOnce`
+    /// still retries a `Fault::Clean` (`docs/adr/buffered-sink-delivery.md`), which covers a
+    /// restarting receiver with no duplicate risk.
     fn duplicate_safe(&self) -> bool {
         false
     }
 }
 
 impl SyslogOutput {
-    /// One `send_to` per message -- never packed into one datagram, which would depend on the
-    /// receiver splitting on a delimiter this sink's whole "Injection safety" section exists to
-    /// stop relying on. `EMSGSIZE`/`InvalidInput` (the datagram is too large for the local path
-    /// MTU or send buffer) is a per-message data condition, not a sink failure: dropped and
-    /// counted, never classified as a `Fault` -- doing so would risk tripping
-    /// `docs/adr/buffered-sink-delivery.md`'s sustained-permanent-failure exit window on an
-    /// otherwise healthy sink. A failure on the *first* message this call attempts is
-    /// `Fault::Clean` -- nothing in this batch has left the host yet. Any later message's
-    /// failure, after at least one earlier datagram in the same batch already went out
-    /// (`sent > 0`), is `Fault::Ambiguous` instead: `Clean` is a whole-batch promise that the
-    /// destination saw none of it, and claiming that after a partial send would make the generic
-    /// writer resend the whole batch under `at_most_once`, duplicating whatever already landed
-    /// (`docs/adr/buffered-sink-delivery.md`'s duplicate-safety argument depends on `Clean`
-    /// never over-claiming this way, exactly as `influxdb_out`'s own `classify_transport_error`
-    /// doc comment stresses for its own `Clean`/`Ambiguous` split).
+    /// One `send_to` per message, never packed into one datagram, which would depend on the
+    /// receiver splitting on a delimiter (module doc's "Injection safety").
     ///
-    /// `endpoint` is resolved to one [`SocketAddr`] here, once per batch -- not once per
-    /// message. `UdpSocket::send_to` accepts anything implementing `ToSocketAddrs`, and for a
-    /// non-numeric host (`relay.internal:5141`, a representative container-DNS endpoint) tokio's
-    /// `&str` impl re-resolves
-    /// via DNS on *every* call if handed the raw string directly, which every UDP test here never
-    /// exercises since they all pass an IP literal (tokio's `SocketAddr`-parse fast path, no DNS
-    /// at all). Resolving once per `send_udp` call still re-resolves every batch rather than
-    /// caching indefinitely, so a genuine DNS change is picked up between batches -- matching
-    /// [`SyslogOutput::udp`]'s own documented intent, which this used to violate in practice.
+    /// - `EMSGSIZE`/`InvalidInput` (too large for the path MTU or send buffer) is a per-message
+    ///   data condition: dropped and counted, never a `Fault`, which could trip
+    ///   `docs/adr/buffered-sink-delivery.md`'s sustained-failure exit on a healthy sink.
+    /// - Any other failure is `Fault::Clean` only before the first datagram of the batch has gone
+    ///   out ([`udp_send_fault`]). After that it's `Fault::Ambiguous`: `Clean` promises the
+    ///   destination saw none of the batch, and over-claiming it would resend, and so duplicate,
+    ///   what already landed.
+    ///
+    /// `endpoint` resolves to one [`SocketAddr`] per batch. Passing the `&str` to `send_to` would
+    /// re-resolve a hostname by DNS on every message; the tests all use IP literals, so they
+    /// wouldn't notice. Per batch rather than cached still picks up a DNS change.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
@@ -1505,74 +1338,54 @@ impl SyslogOutput {
         Ok(sent)
     }
 
-    /// One frame (all messages octet-counted and concatenated) per **batch**, written with at
-    /// most one internal reconnect-and-retry. Two correctness properties this is built around,
-    /// both raised in review of an earlier version that got them wrong:
+    /// One frame (every message octet-counted and concatenated) per **batch**, with at most one
+    /// internal reconnect-and-retry. Built around two properties:
     ///
     /// - **Cancellation safety.** `deliver_with_retry` races every attempt against
     ///   `tokio::time::timeout` (`docs/adr/buffered-sink-delivery.md`), and
-    ///   [`AsyncWriteExt::write_all`] is explicitly documented as not cancel-safe: if the timeout
-    ///   fires mid-write, the future is dropped with an unknown number of bytes already on the
-    ///   wire. This function always `stream.take()`s the connection into a local before writing
-    ///   to it, never writing through `*stream` directly -- so a cancelled write simply drops
-    ///   (and closes) the local `TcpStream`, leaving `*stream` as `None` for the next `send` to
-    ///   reconnect fresh, rather than resuming writes into a connection whose framing this
-    ///   process can no longer account for.
-    /// - **Never resend once any byte has gone out.** The first write of each connect attempt is
-    ///   a single, non-`write_all` [`AsyncWriteExt::write`] call, which either returns `Ok(n)`
-    ///   with `n > 0` (proof delivery has *started* -- from here, any later failure is
-    ///   `Fault::Ambiguous` and the frame is never resent, since resending would duplicate
-    ///   whatever the peer already accepted) or fails having written nothing at all (proof
-    ///   nothing left this host on this attempt -- safe to reconnect once and retry the entire
-    ///   frame from scratch, and safe to classify `Fault::Clean` if that retry also fails). The
-    ///   previous version instead ran a single `write_all` per attempt and inferred "nothing was
-    ///   written" from "the connection was merely inherited from an earlier `send` call" -- which
-    ///   `write_all` cannot support: it can complete several of its own inner writes, including
-    ///   an entire earlier *message* in a multi-message batch, before a later one fails.
+    ///   [`AsyncWriteExt::write_all`] isn't cancel-safe: a timeout mid-write leaves an unknown
+    ///   number of bytes on the wire. So the connection is always `stream.take()`n into a local
+    ///   before writing; a cancelled write drops (and closes) it, leaving `*stream` `None` for the
+    ///   next `send` to reconnect, rather than resuming a connection whose framing is unknown.
+    /// - **Never resend once any byte has gone out.** Each attempt's first write is one
+    ///   [`AsyncWriteExt::write`], not `write_all`. `Ok(n)` with `n > 0` means delivery has
+    ///   started: any later failure is `Fault::Ambiguous` and the frame is never resent. A failure
+    ///   with nothing written allows one reconnect and a whole-frame retry, and `Fault::Clean` if
+    ///   that fails too. A single `write_all` can't support this: it may complete several inner
+    ///   writes, whole earlier messages included, before a later one fails.
     ///
-    /// **What "written" proves is per transport, and TLS is the weaker of the two** (review of
-    /// the RFC 5425 work, 2026-09-13; `docs/adr/syslog-tcp-ingress-and-tls.md`'s `syslog_out`
-    /// section). [`Conn::Tcp`]'s stream is a `Box<dyn AsyncStream>`, so the two cases are no
-    /// longer distinguishable from the write calls themselves and the code asks [`TcpDial`]
-    /// which one it is:
+    /// **What a write proves depends on the transport, and TLS proves less**
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`'s `syslog_out` section). Behind the boxed stream
+    /// the two look the same, so the code asks [`TcpDial::is_tls`]:
     ///
-    /// - **Plaintext.** One `write()` is one `write(2)`: `Ok(n)` means the kernel owns `n`
-    ///   bytes, and `Err` means zero bytes of *this* call were accepted (tokio only loops on
-    ///   `WouldBlock`). Both halves of the invariant above hold as written, and this transport's
-    ///   behaviour is unchanged: one internal reconnect-and-retry after a zero-byte failure, and
-    ///   `Fault::Clean` if that retry fails too.
-    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the rustls session and then
-    ///   loops socket writes until one returns `Pending`, at which point it returns `Ok(n)` with
-    ///   finished TLS records still queued in userspace -- so `Ok` proves only that the *session*
-    ///   accepted the bytes, never that they reached the peer, and `flush` is what makes them
-    ///   the kernel's. A failing `poll_write`, symmetrically, may already have completed several
-    ///   socket writes (rustls fragments at 16 KiB, and each record is a complete, length-
-    ///   prefixed syslog message under octet-counting, which a receiver keeps), so `Err` is
-    ///   never proof of a zero-byte attempt. Therefore, on TLS: no internal retry and no resend
-    ///   once an application write has been attempted at all, every such failure is
-    ///   `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
-    ///   [`TcpDial::connect`], which genuinely precede every byte of the frame.
+    /// - **Plaintext.** One `write()` is one `write(2)`: `Ok(n)` means the kernel owns `n` bytes,
+    ///   and `Err` means this call wrote nothing (tokio loops only on `WouldBlock`). Both halves
+    ///   of the rule above hold as written.
+    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the session, then writes to
+    ///   the socket until it returns `Pending`, and returns `Ok(n)` with finished records still
+    ///   queued in userspace: `Ok` proves only that the session took the bytes, and `flush` makes
+    ///   them the kernel's. A failing `poll_write` may already have completed socket writes
+    ///   (rustls fragments at 16 KiB, and each record is a complete octet-counted message a
+    ///   receiver keeps), so `Err` never proves zero bytes. So on TLS: no internal retry, no
+    ///   resend once an application write has been attempted, every such failure is
+    ///   `Fault::Ambiguous`, and `Fault::Clean` is left only for [`TcpDial::connect`] failures,
+    ///   which precede every byte of the frame.
     ///
-    /// **A reused connection is probed before the first write.** A pooled connection inherited
-    /// from an earlier `send` may have been closed by the receiver in the meantime -- a graceful
-    /// shutdown, a `logit`-side `idle_timeout:` on the far end, an stunnel hop cycling -- and
-    /// plaintext syslog has no ack and no error to tell the sender so: the write lands in the
-    /// local socket buffer, this function reports the batch delivered, and the message is gone.
-    /// So a connection that came out of `*stream` (never a freshly-dialled one) gets exactly one
-    /// non-consuming `poll_read` first ([`crate::tls::poll_pending_close`], whose doc comment has
-    /// why one poll and not a cancellable `timeout(read)`); anything but "still open" drops it
-    /// and dials a fresh one with nothing written yet. That is a plain reconnect -- counted
-    /// `logit.output.reconnects` by [`TcpDial::connect`] like any other -- and it deliberately
-    /// does not consume the one post-write-failure retry below, which is about a connection that
-    /// *was* written to. `docs/adr/idle-connection-timeout.md`.
+    /// **A reused connection is probed before the first write.** The receiver may have closed a
+    /// pooled connection since the last `send` (a graceful shutdown, a far-end `idle_timeout:`,
+    /// an stunnel hop cycling), and plaintext syslog has no ack to say so: the write lands in the
+    /// local socket buffer, the batch is reported delivered, and the message is lost. So a
+    /// connection taken from `*stream` (never a fresh one) gets one non-consuming `poll_read`
+    /// first ([`crate::tls::poll_pending_close`] has why one poll and not a timed read); anything
+    /// but "still open" drops it and dials fresh with nothing written. That's an ordinary
+    /// reconnect, counted by [`TcpDial::connect`], and it doesn't use up the post-write-failure
+    /// retry. `docs/adr/idle-connection-timeout.md`.
     ///
-    /// **The success path always `flush`es**, on both transports, before the connection goes back
-    /// into `*stream` and this returns `Ok`. Without it a TLS batch could be reported delivered
-    /// (and committed off the sink queue, `docs/adr/buffered-sink-delivery.md`) with its records
-    /// still in the rustls buffer, to be discarded with the boxed stream by the next reconnect or
-    /// cancelled attempt. A failed flush is `Fault::Ambiguous` -- some earlier record may well
-    /// have landed -- and the connection is dropped rather than reused. On plaintext this is a
-    /// no-op that costs a function call.
+    /// **Success always `flush`es**, on both transports, before the connection goes back into
+    /// `*stream` and this returns `Ok`. Otherwise a TLS batch could be committed off the sink queue
+    /// with its records still in the rustls buffer, to be discarded with the stream by the next
+    /// reconnect or cancelled attempt. A failed flush is `Fault::Ambiguous` (an earlier record may
+    /// have landed) and the connection is dropped. On plaintext it's a no-op.
     ///
     /// [`AsyncWriteExt::write_all`]: tokio::io::AsyncWriteExt::write_all
     /// [`AsyncWriteExt::write`]: tokio::io::AsyncWriteExt::write
@@ -1586,14 +1399,10 @@ impl SyslogOutput {
 
         let mut retried_after_a_zero_byte_failure = false;
         loop {
-            // Always taken out of `*stream`, never written through it directly -- see this
-            // function's doc comment's cancellation-safety point.
+            // Taken out of `*stream`, never written through it (cancellation safety, above).
             let mut conn: Box<dyn AsyncStream> = match stream.take() {
-                // A *reused* connection is polled once first -- see this function's doc
-                // comment's probe paragraph. `Eof`/`Bytes` fall through to a fresh connect with
-                // nothing written, so `retried_after_a_zero_byte_failure` is deliberately *not*
-                // consumed: this is not the one retry that follows a failed write, it is a
-                // connection that was never written to at all.
+                // The reuse probe (doc comment above). A closed connection was never written
+                // to, so replacing it doesn't consume `retried_after_a_zero_byte_failure`.
                 Some(mut conn) => {
                     let mut probe = [0u8; 1];
                     let pending = poll_pending_close(&mut *conn, &mut probe).await;
@@ -1608,11 +1417,9 @@ impl SyslogOutput {
                 None => dial.connect().await?,
             };
 
-            // `Ok(0)` from `write()` on a non-empty buffer is, in practice, as good as an error
-            // here (the stream is not accepting writes) -- normalized to a real `io::Error` so
-            // the rest of this match only has one "nothing was written" case to handle. A
-            // plaintext-only case: `tokio_rustls`' `poll_write` maps its own zero-progress
-            // outcome to `Pending`, so a TLS stream never surfaces `Ok(0)` here at all.
+            // `Ok(0)` on a non-empty buffer means the stream isn't accepting writes; normalized
+            // to an error so there's one "nothing written" case. Plaintext only: `tokio_rustls`
+            // maps zero progress to `Pending`.
             let first_write = match conn.write(frame_buf).await {
                 Ok(0) if !frame_buf.is_empty() => {
                     Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "wrote zero bytes"))
@@ -1628,10 +1435,7 @@ impl SyslogOutput {
                     } else {
                         Ok(())
                     };
-                    // Then always flush, on both transports, before this batch may be called
-                    // delivered -- see this function's doc comment's flush paragraph. On a TLS
-                    // stream this is what moves finished records out of the rustls buffer and
-                    // into the kernel's; on a plaintext one it is a no-op.
+                    // Flush before calling the batch delivered (doc comment above).
                     let rest_result = match rest_result {
                         Ok(()) => conn.flush().await,
                         Err(err) => Err(err),
@@ -1641,20 +1445,13 @@ impl SyslogOutput {
                             *stream = Some(conn);
                             Ok(messages.len())
                         }
-                        // Part of this frame may already be at the peer -- on plaintext at least
-                        // one byte reached the kernel, on TLS some earlier record may have (the
-                        // `Ok(n)` above proves only that the session accepted `n` bytes). Either
-                        // way resending could duplicate, so `Ambiguous`, and `*stream` is
-                        // deliberately left `None` (this now-partially-written connection is not
-                        // reusable).
+                        // Part of the frame may be at the peer, so resending could duplicate.
+                        // `*stream` stays `None`: a partly written connection isn't reusable.
                         Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
                     };
                 }
-                // Plaintext only: an `Err` from one `write(2)` proves zero bytes of this attempt
-                // were accepted, so `*stream` is already `None` (taken above) and the next loop
-                // iteration connects fresh and retries the whole frame exactly once. A TLS
-                // `poll_write` gives no such proof (doc comment above), so it never reaches this
-                // arm -- it falls straight through to `Ambiguous` with no resend.
+                // Plaintext only: a failed `write(2)` wrote nothing, so reconnect and retry the
+                // whole frame once. TLS gives no such proof and falls through to `Ambiguous`.
                 Err(_) if !dial.is_tls() && !retried_after_a_zero_byte_failure => {
                     retried_after_a_zero_byte_failure = true;
                     continue;
@@ -1668,35 +1465,28 @@ impl SyslogOutput {
     }
 }
 
-/// Everything [`SyslogOutput::send_tcp`] needs to open a *fresh* connection, grouped into one
-/// value rather than five more parameters on an already-long signature (`clippy`'s
-/// `too_many_arguments`). Borrowed per `send` from the sink's own fields, so `send_tcp` keeps
-/// touching nothing but the connection it is writing to.
+/// What [`SyslogOutput::send_tcp`] needs to open a fresh connection, borrowed per `send` from the
+/// sink's fields (one value rather than five more parameters).
 struct TcpDial<'a> {
     endpoint: &'a str,
     connect_timeout: Duration,
-    /// `Some` exactly when a `tls:` block was configured -- see [`SyslogOutput::tls`].
+    /// See [`SyslogOutput::tls`].
     tls: Option<&'a Arc<rustls::ClientConfig>>,
     telemetry: &'a Telemetry,
     has_connected_once: &'a mut bool,
 }
 
 impl TcpDial<'_> {
-    /// Whether this sink's connections are TLS-wrapped -- which decides what a write's outcome
-    /// proves, and so how [`SyslogOutput::send_tcp`] classifies a failure. See that function's
-    /// doc comment.
+    /// Whether connections are TLS-wrapped, which decides what a write proves
+    /// ([`SyslogOutput::send_tcp`]).
     fn is_tls(&self) -> bool {
         self.tls.is_some()
     }
 
-    /// One fresh connection: TCP connect, then -- when `tls` is set -- the RFC 5425 TLS
-    /// handshake. Each phase is raced against `connect_timeout` *separately*, exactly as
-    /// `logit_out` races every step of its own connect against `self.timeout`, so a TLS connect
-    /// can take up to twice the configured value. Both phases fault `Fault::Clean` for the same
-    /// reason: nothing of this batch can have left the host while a connection is still being
-    /// established. Copied from `logit_out`'s `connect_and_handshake`
-    /// (`crates/logit-outputs/src/logit.rs`), which dials the identical bare-`host:port`-plus-SNI
-    /// shape.
+    /// One fresh connection: TCP connect, then the RFC 5425 handshake when `tls` is set, as
+    /// `logit_out`'s `connect_and_handshake` does. Each phase gets its own `connect_timeout`, so a
+    /// TLS connect can take twice the configured value. Both are `Fault::Clean`: nothing of the
+    /// batch has left the host yet.
     async fn connect(&mut self) -> anyhow::Result<Box<dyn AsyncStream>> {
         let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.endpoint))
             .await
@@ -1724,10 +1514,8 @@ impl TcpDial<'_> {
             None => Box::new(tcp),
         };
 
-        // Only from the *second* successful connect onward -- the first connection this sink ever
-        // makes isn't a "re"-connect. Counted at connect rather than after the write, so a
-        // connection that is established and then immediately fails to write still shows up as
-        // the reconnect it was.
+        // Counted at connect, not after the write, so a reconnect whose write then fails still
+        // counts.
         if *self.has_connected_once {
             self.telemetry.count("logit.output.reconnects", 1.0, &[]);
         } else {
@@ -1737,10 +1525,8 @@ impl TcpDial<'_> {
     }
 }
 
-/// `Fault::Clean` only when nothing in this batch has left the host yet -- pulled out of
-/// `send_udp` as a pure, directly-testable function since the real network condition it encodes
-/// (a `send_to` failure *after* an earlier datagram in the same batch already went out) isn't
-/// something a unit test can reliably provoke over a real UDP socket.
+/// `Fault::Clean` only when nothing in the batch has left the host. Its own function because a
+/// mid-batch `send_to` failure can't be provoked reliably over a real socket in a test.
 fn udp_send_fault(sent: usize) -> Fault {
     if sent > 0 {
         Fault::Ambiguous
@@ -1749,12 +1535,9 @@ fn udp_send_fault(sent: usize) -> Fault {
     }
 }
 
-/// `90` is `EMSGSIZE` on Linux specifically (macOS/BSD use `40`) -- deliberately not
-/// platform-general: `logit` only ever ships and runs inside the Linux containers this repo
-/// builds (`Dockerfile`/`Dockerfile.dev`, `AGENTS.md`'s "everything runs in a container"), so a
-/// non-Linux raw errno here would be a dev-host-only false negative, never a real one in
-/// production. The `InvalidInput` fallback doesn't reliably catch other platforms' encodings of
-/// this either, which is accepted for the same reason.
+/// `90` is `EMSGSIZE` on Linux only (macOS/BSD use `40`). `logit` ships only in Linux containers,
+/// so a miss elsewhere is a dev-host false negative, and the `InvalidInput` fallback doesn't
+/// cover other platforms either.
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc_emsgsize) if libc_emsgsize == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
@@ -1814,8 +1597,7 @@ mod tests {
         (msgs, stats)
     }
 
-    /// Like [`encode_with`], but returns raw bytes instead of lossy-UTF-8 strings -- needed for
-    /// any test whose message is genuinely non-UTF-8 (`Value::Bytes`).
+    /// [`encode_with`] returning raw bytes, for a non-UTF-8 `Value::Bytes` message.
     fn encode_with_bytes(
         encoder: &mut SyslogEncoder,
         events: Vec<Event>,
@@ -1871,10 +1653,8 @@ mod tests {
         assert_eq!(msgs[0], "<134>1 1970-01-01T00:00:00.000000Z - - - - - hello world");
     }
 
-    /// No RFC 5424 §6.4 BOM before MSG -- verified against the real demo stack
-    /// (`docs/adr/syslog-output.md`) that Loki's `| json` LogQL stage silently fails to parse a
-    /// BOM-prefixed JSON body, so every relayed line's fields would be unqueryable despite
-    /// landing in Loki.
+    /// No RFC 5424 §6.4 BOM before MSG: Loki's `| json` can't parse a BOM-prefixed body
+    /// (`docs/adr/syslog-output.md`).
     #[test]
     fn no_bom_precedes_the_message_even_though_rfc_5424_section_6_4_allows_one() {
         let (msgs, _) = encode(vec![log_event(0, "hello", None)]);
@@ -2145,9 +1925,8 @@ mod tests {
     fn an_all_non_printable_hostname_becomes_nilvalue() {
         let mut attrs = AttrMap::new();
         attrs.insert("syslog.hostname", Value::str("\u{0001}\u{0002}"));
-        // sanitizes to "__", which is non-empty, so this actually checks the sanitized-but-
-        // non-empty path renders the substituted characters rather than falling back --
-        // "-" only happens when the source attribute itself is absent/empty.
+        // Despite the name: this sanitizes to the non-empty "__", which renders; "-" needs an
+        // absent or empty attribute.
         let event = Event::log(
             0,
             attrs,
@@ -2186,11 +1965,7 @@ mod tests {
         assert_eq!(stats.dropped_oversize_header, 1);
     }
 
-    /// Regression test: `max_message_bytes` exactly equal to the header's own length used to
-    /// still push a trailing separator before noticing there was no room for it, emitting one
-    /// byte over the configured cap. The RFC 5424 header for facility 16, an epoch timestamp, and
-    /// no hostname/app_name/pid/msgid attributes is exactly 44 bytes:
-    /// `<134>1 1970-01-01T00:00:00.000000Z - - - - -`.
+    /// A cap equal to the header's length (44 bytes here) emits no trailing separator past it.
     #[test]
     fn max_message_bytes_exactly_at_the_header_length_never_overflows_the_cap() {
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(44);
@@ -2200,8 +1975,7 @@ mod tests {
         assert_eq!(stats.truncated, 1);
     }
 
-    /// One byte more than the header's own length leaves room for exactly the separator and
-    /// nothing else -- still must never exceed the cap.
+    /// A cap one byte past the header fits the separator and nothing else.
     #[test]
     fn max_message_bytes_one_byte_larger_than_the_header_fits_only_the_separator() {
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16).with_max_message_bytes(45);
@@ -2256,9 +2030,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_of_only_metric_only_events_performs_no_io() {
-        // Bind to a port nothing is listening on and never receive from it -- if `send` performed
-        // any I/O here, there would be nothing to observe it failing against, which is the point:
-        // the assertion is simply that `send` returns `Ok` without needing a receiver at all.
+        // Nothing listens on this port: `Ok` means `send` needed no receiver.
         let mut output = SyslogOutput::udp("127.0.0.1:1").unwrap();
         let batch = batch_with(vec![metric_event(0)]);
         output.send(&batch).await.expect("an all-skipped batch must not attempt any I/O");
@@ -2266,19 +2038,12 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_safe_is_false() {
-        // `SyslogOutput::udp` binds via `UdpSocket::from_std`, which registers with the tokio
-        // reactor and so needs a runtime context, even though this test never awaits anything.
+        // A tokio test only because `UdpSocket::from_std` needs a runtime context.
         let output = SyslogOutput::udp("127.0.0.1:0").unwrap();
         assert!(!output.duplicate_safe());
     }
 
-    /// Regression test for a review finding: a `send_to` failure partway through a batch used to
-    /// be classified `Fault::Clean` unconditionally, which would make the generic writer resend
-    /// (and so duplicate) whatever earlier datagrams in the same batch already reached the wire.
-    /// `Clean` is a whole-batch promise the destination saw *none* of it -- only true when
-    /// nothing has sent yet. A real `send_to` failure partway through a batch isn't reliably
-    /// provokable over a loopback UDP socket in a unit test, so this pins the pure classification
-    /// function directly instead.
+    /// A mid-batch `send_to` failure is `Ambiguous`, since earlier datagrams may have landed.
     #[test]
     fn udp_send_fault_is_clean_only_before_anything_in_the_batch_has_sent() {
         assert_eq!(udp_send_fault(0), Fault::Clean);
@@ -2349,22 +2114,15 @@ mod tests {
         let batch = batch_with(vec![log_event(0, "first", None)]);
         output.send(&batch).await.expect("first send should succeed against a fresh connection");
 
-        // The very first connection a sink ever makes is not a "re"-connect -- `logit_out`'s own
-        // `first_send_connects_and_handshakes_second_reuses_the_connection` pins the same thing.
         assert_eq!(
             reconnects_in(registry.drain(0)),
             None,
             "the first connect must not be counted as a reconnect"
         );
 
-        // Deterministically break the *local* end of the inherited connection, rather than
-        // trying to provoke a genuine peer-sent RST and race its propagation back through the
-        // kernel (unreliable inside a sandboxed/virtualized loopback stack, and this repo's own
-        // discipline is exact assertions, not timing-dependent ones). `send_tcp`'s reconnect
-        // logic reacts identically to any write failure on an inherited connection regardless of
-        // its real-world cause, so shutting down our own write half is a faithful trigger for
-        // the behavior under test: the very next local `write()` on a write-shutdown socket
-        // reliably fails with `BrokenPipe`, no network round trip required.
+        // Shut down the local write half rather than race a real peer RST: the next `write()`
+        // fails with `BrokenPipe` deterministically, and `send_tcp` treats any write failure
+        // on an inherited connection alike.
         if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
             stream.shutdown().await.expect("local shutdown should succeed");
         }
@@ -2393,11 +2151,8 @@ mod tests {
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
     }
 
-    /// [`tcp_collector`], except every connection is closed the moment it has read anything at
-    /// all -- the shape a receiver with an idle timeout of its own, or one restarting, presents
-    /// to a sink holding a pooled connection between batches. A clean FIN, not an RST: the
-    /// collector has read everything before it closes, which is exactly the case a plaintext
-    /// sender cannot detect from a write.
+    /// [`tcp_collector`], except each connection closes after one read, as an idle-timing-out or
+    /// restarting receiver does. A clean FIN, which a plaintext sender can't detect from a write.
     async fn tcp_collector_that_closes_after_one_read(
     ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2424,15 +2179,9 @@ mod tests {
         (addr, received, accepts)
     }
 
-    /// The pooled-connection probe (`SyslogOutput::send_tcp`'s doc comment;
-    /// `docs/adr/idle-connection-timeout.md`): the receiver closed the connection this sink was
-    /// holding between batches, and the second message must still arrive.
-    ///
-    /// This is the loss the probe exists to prevent, and nothing else in this file can catch it:
-    /// a write into a FIN'd socket *succeeds* locally, so without the probe `send` returns `Ok`,
-    /// the batch is committed off the sink queue, and the message is simply gone -- plaintext
-    /// syslog has no ack to lose it against. Hence the assertion on the collector's second
-    /// accept and on the message's contents, not merely on `send`'s return value.
+    /// The reuse probe (`SyslogOutput::send_tcp`): a message sent after the receiver closed the
+    /// pooled connection still arrives. Asserted at the collector, since a write into a FIN'd
+    /// socket succeeds locally and `send` would return `Ok` either way.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {
@@ -2447,8 +2196,7 @@ mod tests {
             .await
             .expect("first send should succeed against a fresh connection");
 
-        // Let the collector's close land in this host's receive queue, so the probe has a FIN to
-        // find rather than a race to lose.
+        // Let the collector's FIN arrive before the probe looks for it.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         output
@@ -2476,9 +2224,7 @@ mod tests {
         );
     }
 
-    /// `logit.output.reconnects`' value out of a drained [`Registry`], or `None` if the counter
-    /// was never touched at all -- which is itself the assertion for a sink that has only ever
-    /// connected once.
+    /// `logit.output.reconnects` from a drained [`Registry`], or `None` if it was never counted.
     fn reconnects_in(events: Vec<Event>) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
@@ -2493,9 +2239,7 @@ mod tests {
     // -- Sink: TCP over TLS (RFC 5425, module doc's "TLS" section) -----------------------------
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-outputs` lives at `crates/logit-outputs`; the fixtures live at the repo root's
-        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
-        // Same helper `otlp.rs`'s own TLS tests use.
+        // The repo root's `testdata/tls` (`testdata/tls/README.md`), as in `otlp.rs`'s tests.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
@@ -2507,9 +2251,7 @@ mod tests {
 
     /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` (SANs `localhost` and
     /// `127.0.0.1`), optionally requiring a client certificate chaining to `testdata/tls/ca.pem`.
-    /// `otlp.rs`'s `test_server_tls_config` minus the ALPN protocols -- syslog over TLS has no
-    /// ALPN identifier at all (RFC 5425 predates it), so setting one here would be inventing wire
-    /// behavior the sink doesn't have.
+    /// `otlp.rs`'s `test_server_tls_config` minus ALPN, which RFC 5425 predates.
     fn server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
         use rustls_pki_types::pem::PemObject;
         use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -2542,12 +2284,9 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// [`tcp_collector`]'s TLS twin: reads every *successfully handshaken* connection to EOF and
-    /// records its plaintext bytes. The third return is the number of completed handshakes, not
-    /// of accepted TCP connections -- a rejected client (no certificate where one is required,
-    /// or plaintext bytes where a ClientHello was expected) shows up as a connection that never
-    /// counted. Each connection is served on its own task so one failed handshake can't stall
-    /// the accept loop.
+    /// [`tcp_collector`]'s TLS twin: records each handshaken connection's plaintext to EOF. The
+    /// third return counts completed handshakes, not accepts, so a rejected client never counts.
+    /// One task per connection, so a failed handshake can't stall the accept loop.
     async fn tls_tcp_collector(
         require_client_auth: bool,
     ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
@@ -2579,9 +2318,8 @@ mod tests {
         (addr, received, handshakes)
     }
 
-    /// Sends `batch` over a plaintext `syslog_out` and returns exactly the bytes that reached the
-    /// collector -- the reference the TLS tests below compare against, so "TLS changes the
-    /// transport, not the framing" is an exact byte equality rather than a `contains` check.
+    /// The bytes a plaintext `syslog_out` delivers for `batch`: the exact reference the TLS
+    /// tests compare against.
     async fn plaintext_frame_for(batch: &EventBatch) -> Vec<u8> {
         let (addr, received, _accepts) = tcp_collector().await;
         let mut output = SyslogOutput::tcp(addr.to_string(), Duration::from_secs(2));
@@ -2598,8 +2336,7 @@ mod tests {
         let expected = plaintext_frame_for(&batch).await;
 
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        // `localhost` rather than `127.0.0.1:` -- both are SANs on `testdata/tls/server.pem`, and
-        // naming the host exercises `host_only`'s split on a real (non-IP) SNI name.
+        // `localhost`, not `127.0.0.1` (both SANs), so `host_only` yields a DNS SNI name.
         let endpoint = format!("localhost:{}", addr.port());
         let mut output = SyslogOutput::tcp(endpoint, Duration::from_secs(2))
             .with_tls(&tls_settings(|t| t.ca_file = Some("ca.pem".to_string())), &testdata_dir())
@@ -2640,17 +2377,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&got[0]).contains("mutual"));
     }
 
-    /// The mutual-TLS negative: the same collector, a sink with no client certificate.
+    /// A sink with no client certificate delivers nothing to a mutual-TLS collector.
     ///
-    /// The assertion is on the *collector*, not on `send`'s return, and deliberately so. Under
-    /// TLS 1.3 the server sends its whole flight (including `Finished`) before it ever sees the
-    /// client's certificate message, so `TlsConnector::connect` completes on this side before the
-    /// server has decided to reject; the rejection arrives as an alert this sink never reads
-    /// (`syslog_out` is write-only -- there is no reply to a syslog frame). Whether the following
-    /// `write()` then fails depends on whether the peer's RST has made it back through the local
-    /// loopback stack yet, which is exactly the timing-dependent assertion this repo's discipline
-    /// rules out. What is deterministic, and is what mutual TLS actually promises, is that the
-    /// server accepted no handshake and received nothing.
+    /// Asserted at the collector, not on `send`: under TLS 1.3 the client's `connect` completes
+    /// before the server rejects its certificate, the rejection is an alert this write-only sink
+    /// never reads, and whether the next `write()` fails depends on RST timing.
     #[tokio::test]
     async fn tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector(
     ) {
@@ -2663,11 +2394,7 @@ mod tests {
                 )
                 .expect("a tls: block on the TCP transport is legal");
         let batch = batch_with(vec![log_event(0, "rejected", None)]);
-        // Empirically `Ok(())` here today, for the reason above: the frame is handed to a
-        // TLS stream whose peer has already given up on it, and this sink never reads the alert
-        // that says so. Not asserted as `Ok`, since a fast enough RST would legitimately make the
-        // write fail instead -- only that a failure, if one happens, is retryable rather than
-        // `Permanent`.
+        // Usually `Ok`, but a fast RST can fail the write; either way never `Permanent`.
         if let Err(err) = output.send(&batch).await {
             assert!(
                 matches!(logit_pipeline::classify(&err), Fault::Clean | Fault::Ambiguous),
@@ -2688,10 +2415,8 @@ mod tests {
         );
     }
 
-    /// Server-certificate verification is real: the sink trusts `other-ca.pem`, which never
-    /// signed `server.pem`, so the handshake fails on *this* side -- before any byte of the batch
-    /// has left the host, which is what makes it `Fault::Clean` (and so retryable) rather than
-    /// `Ambiguous`.
+    /// An untrusted server certificate fails the handshake before any batch byte leaves the host,
+    /// so it's `Fault::Clean`.
     #[tokio::test]
     async fn tls_tcp_against_a_server_certificate_from_an_untrusted_ca_is_a_clean_fault() {
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
@@ -2710,9 +2435,8 @@ mod tests {
         assert!(received.lock().unwrap().is_empty());
     }
 
-    /// A `tracing` subscriber that collects rendered events into a buffer, so the
-    /// `insecure_skip_verify` warning (`Diagnostics::warn`, which reports through `tracing` only
-    /// and has no telemetry counterpart) can actually be asserted on rather than assumed.
+    /// A `tracing` writer capturing rendered events, for asserting on a `Diagnostics::warn`,
+    /// which has no telemetry counterpart.
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -2745,8 +2469,7 @@ mod tests {
             .set_default();
 
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        // The bundled Mozilla roots, which never signed `server.pem` -- so this connection can
-        // only succeed because verification was skipped.
+        // The bundled Mozilla roots never signed `server.pem`, so only the skip lets this connect.
         let mut output =
             SyslogOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
                 .with_diagnostics(Diagnostics::new("syslog_out"))
@@ -2767,16 +2490,9 @@ mod tests {
         );
     }
 
-    /// A plaintext `syslog_out` pointed at a TLS collector: the frame goes out as cleartext, the
-    /// server can't parse it as a ClientHello, and the connection dies. Which `Fault` this
-    /// surfaces as isn't ours to choose -- `send_tcp`'s single first `write()` either fails
-    /// having written nothing (`Clean`, after one reconnect-and-retry) or succeeds into the
-    /// socket buffer before the peer's RST arrives, in which case the frame is never resent and
-    /// the classification is `Ambiguous` by construction. Empirically it is the latter today --
-    /// `send` returns `Ok(())`, the write having landed in the socket buffer before the server
-    /// gave up on the handshake -- so this asserts only that a failure, if one happens, is one of
-    /// the two retryable classes. The invariant worth pinning is the receiver's: TLS is
-    /// *required* on a `tls:`-configured listener, so nothing ever reaches it in cleartext.
+    /// A plaintext sink delivers nothing to a TLS collector. `send` usually returns `Ok` (the
+    /// write lands in the socket buffer before the server gives up), so only a retryable class is
+    /// asserted if it fails.
     #[tokio::test]
     async fn a_plaintext_sink_against_a_tls_collector_delivers_nothing() {
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
@@ -2800,36 +2516,27 @@ mod tests {
 
     // -- Sink: TCP over TLS, write/flush semantics --------------------------------------------
     //
-    // The invariants `send_tcp` is built around are per transport (its own doc comment), and the
-    // TLS ones can't be provoked over a real socket without depending on kernel buffer sizes:
-    // the interesting state is "the rustls session accepted the frame but the socket took only
-    // part of it", which needs a backpressured socket, which needs a known send-buffer size.
-    // These tests drive `send_tcp` against a scripted [`FakeTlsStream`] instead -- the same thing
-    // `udp_send_fault_is_clean_only_before_anything_in_the_batch_has_sent` does for the UDP
-    // classification it can't provoke either. The real-TLS tests above and below cover the
-    // socket-level behaviour.
+    // "The session took the frame but the socket took only part of it" needs a backpressured
+    // socket of known buffer size, so these drive `send_tcp` against a scripted
+    // [`FakeTlsStream`]. The real-TLS tests around them cover the socket level.
 
-    /// An [`AsyncStream`] with `tokio_rustls`' write semantics rather than a socket's: `write`
-    /// accepts bytes into a userspace buffer and reports them written (what `poll_write` does
-    /// once the socket is backpressured and finished records stay in the session), and only
-    /// `flush` hands them to the notional wire. Failures are scripted per call so each of
-    /// `send_tcp`'s arms can be reached exactly.
+    /// An [`AsyncStream`] with `tokio_rustls`' backpressured write semantics: `write` buffers and
+    /// reports success, and only `flush` puts bytes on the notional wire. Failures are scripted
+    /// per call, so each of `send_tcp`'s arms can be reached.
     #[derive(Clone, Default)]
     struct FakeTlsStream(Arc<Mutex<FakeState>>);
 
     #[derive(Default)]
     struct FakeState {
-        /// Accepted by `write`, not yet flushed -- `tokio_rustls`' `sendable_tls`.
+        /// Accepted by `write`, not yet flushed: `tokio_rustls`' `sendable_tls`.
         buffered: Vec<u8>,
-        /// What `flush` has actually put on the wire.
+        /// What `flush` has put on the wire.
         sent: Vec<u8>,
         writes: usize,
         flushes: usize,
         /// `write` fails on this 1-based call number.
         fail_write_on: Option<usize>,
-        /// The first `write` accepts one byte instead of the whole buffer, so `send_tcp` goes on
-        /// to `write_all` the remainder -- the partial-write path a real stream reaches whenever
-        /// the socket (or, on TLS, the session's send buffer) has less room than the frame needs.
+        /// The first `write` accepts one byte, so `send_tcp` takes its `write_all` path.
         short_first_write: bool,
         fail_flush: bool,
     }
@@ -2911,14 +2618,9 @@ mod tests {
     }
 
     impl tokio::io::AsyncRead for FakeTlsStream {
-        /// `Pending`, which is what a live, quiet stream really does: `syslog_out` reads exactly once,
-        /// non-blockingly, on a pooled connection before its first write
-        /// (`crate::tls::poll_pending_close`), and this fake stands in for a connection that is
-        /// still there -- an immediate `Ok(())` with nothing filled would be an EOF, i.e. "the
-        /// peer closed", and the probe would (rightly) replace it before any scripted write ever
-        /// happened. Nothing else here reads at all, and a waker is deliberately not registered:
-        /// anything that actually *awaited* a read on this would hang, which is a loud failure
-        /// rather than a silently wrong one.
+        /// `Pending`, as a live, quiet stream is, so the reuse probe
+        /// (`crate::tls::poll_pending_close`) keeps it; an empty `Ok(())` would read as EOF. No
+        /// waker is registered, so anything that awaited a read here would hang loudly.
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -2928,8 +2630,7 @@ mod tests {
         }
     }
 
-    /// An `Arc<rustls::ClientConfig>` for a [`TcpDial`] that should report `is_tls()` -- built
-    /// from default settings (the bundled roots), since no handshake ever happens in these tests.
+    /// A default client config, so a [`TcpDial`] reports `is_tls()`; no handshake ever happens.
     fn any_client_config() -> Arc<rustls::ClientConfig> {
         Arc::new(
             crate::tls::build_client_config(&TlsClientSettings::default(), &testdata_dir())
@@ -2992,18 +2693,14 @@ mod tests {
             .await
             .expect_err("a failed flush must fail the send");
 
-        // `Ambiguous`, not `Clean`: whatever the session already managed to push to the socket
-        // before the flush failed is gone with it, and there is no way to know how much that was.
+        // The session may have pushed some records to the socket before the flush failed.
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         assert!(stream.is_none(), "a stream whose flush failed must not be reused");
         assert_eq!(fake.state().writes, 1, "and must not be rewritten either");
     }
 
-    /// The TLS half of `send_tcp`'s classification split: an error from a write on a TLS stream
-    /// may have landed whole records already (rustls fragments at 16 KiB, each fragment a
-    /// complete octet-counted message a receiver keeps), so it is `Ambiguous` and the frame is
-    /// never resent -- where the identical failure on plaintext is `Clean` after one
-    /// reconnect-and-retry (the test below).
+    /// A TLS write error may follow landed records, so it's `Ambiguous` and never resent (the
+    /// plaintext counterpart is below).
     #[tokio::test]
     async fn a_tls_write_failure_is_ambiguous_and_never_resent() {
         let fake = FakeTlsStream::failing_write(1);
@@ -3012,8 +2709,7 @@ mod tests {
         let telemetry = Telemetry::default();
         let mut connected = true;
         let mut dial = TcpDial {
-            // Nothing listens here: were the TLS arm to take plaintext's reconnect-and-retry
-            // path, it would dial this and report the connect failure as `Clean` instead.
+            // Nothing listens here: a wrongful retry would surface as a `Clean` connect failure.
             endpoint: "127.0.0.1:1",
             connect_timeout: Duration::from_millis(200),
             tls: Some(&cfg),
@@ -3033,10 +2729,7 @@ mod tests {
         assert!(state.sent.is_empty());
     }
 
-    /// The partial-write path: the first `write` takes only part of the frame, and the
-    /// `write_all` of the remainder fails. `Ambiguous` on either transport -- part of the frame
-    /// is already gone (or, on TLS, may be) -- and never resent, which is the one classification
-    /// this arm has always made and the TLS work did not change.
+    /// A failure after a partial first write is `Ambiguous` and never resent.
     #[tokio::test]
     async fn a_failure_after_a_partial_write_is_ambiguous_and_never_resent() {
         let fake = FakeTlsStream::short_then_failing_write();
@@ -3065,10 +2758,8 @@ mod tests {
         assert!(state.sent.is_empty());
     }
 
-    /// The plaintext half, unchanged by the TLS work: one `write(2)` failing proves zero bytes
-    /// were accepted, so `send_tcp` reconnects once, retries the whole frame, and reports
-    /// `Fault::Clean` if that fails too. Drives the same scripted stream through the plaintext
-    /// arm (`tls: None`) so the two classifications are pinned side by side.
+    /// On plaintext a failed first write wrote nothing, so `send_tcp` reconnects once and reports
+    /// `Fault::Clean` when that fails too.
     #[tokio::test]
     async fn a_plaintext_write_failure_still_reconnects_once_and_stays_clean() {
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3100,12 +2791,8 @@ mod tests {
         );
     }
 
-    /// The socket-level companion to
-    /// `a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed`: once `send`
-    /// returns, the receiver can read the whole frame with no further write from this sink and
-    /// without the sink being dropped (which would flush and close it on the way out). That is
-    /// the contract `Delivered` implies, and the explicit flush is what makes it hold when the
-    /// socket is backpressured and records would otherwise sit in the rustls session.
+    /// Once a TLS `send` returns, the receiver can read the whole frame while the sink is still
+    /// alive (dropping it would flush on the way out).
     #[tokio::test]
     async fn after_a_tls_send_returns_the_whole_frame_is_readable_without_dropping_the_sink() {
         let batch = batch_with(vec![log_event(0, "one", None), log_event(0, "two", None)]);
@@ -3120,8 +2807,7 @@ mod tests {
             let mut tls_stream = acceptor.accept(stream).await.unwrap();
             use tokio::io::AsyncReadExt;
             let mut got = vec![0u8; want];
-            // Exactly `want` bytes, no EOF involved -- this returns only if the frame really is
-            // on the wire while the sink is still alive and holding the connection open.
+            // `want` bytes with no EOF: returns only if the frame is on the wire already.
             tls_stream.read_exact(&mut got).await.unwrap();
             got
         });
@@ -3143,11 +2829,8 @@ mod tests {
         drop(output);
     }
 
-    /// A TLS peer that takes one frame and then goes away: whatever the second `send` reports, it
-    /// must never put that frame on the wire a second time. Under the pre-review code the TLS
-    /// stream went through plaintext's reconnect-and-retry arm, so a write error there rewrote
-    /// the whole frame on a fresh connection -- a duplicated log line at the receiver, reported
-    /// as `Fault::Clean`. The collector keeps accepting, so a resend would be recorded.
+    /// After a TLS write failure the frame never reaches the wire a second time. The collector
+    /// keeps accepting, so a resend on a fresh connection would be recorded.
     #[tokio::test]
     async fn a_tls_frame_is_never_resent_after_the_peer_goes_away() {
         let (addr, received, _handshakes) = tls_tcp_collector(false).await;
@@ -3161,8 +2844,7 @@ mod tests {
 
         let batch = batch_with(vec![log_event(0, "once", None)]);
         output.send(&batch).await.expect("the first send should succeed");
-        // Close this sink's own end of the connection so the next write on it fails
-        // deterministically, the same trick (and the same reasoning) as
+        // Fails the next write deterministically, as in
         // `tcp_reconnects_after_the_peer_resets_an_inherited_connection`.
         if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
             let _ = stream.shutdown().await;
@@ -3178,15 +2860,13 @@ mod tests {
         drop(output);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let got = received.lock().unwrap();
-        // Occurrences across every connection, not connections containing one: a resend could
-        // land on a fresh connection (the reconnect arm) or, in principle, on this one.
+        // Occurrences across all connections: a resend could land on either one.
         let deliveries: usize =
             got.iter().map(|b| String::from_utf8_lossy(b).matches("once").count()).sum();
         assert_eq!(deliveries, 1, "the frame must reach the receiver exactly once: {got:?}");
     }
 
-    /// Belt-and-braces for `graph::resolve`'s rule 44: DTLS is out of scope, so a `tls:` block on
-    /// the UDP arm is an error here too rather than a silently-ignored setting.
+    /// Rule 44's check, repeated at construction: `tls:` on the UDP arm is an error.
     #[tokio::test]
     async fn with_tls_on_the_udp_transport_is_an_error() {
         let output = SyslogOutput::udp("127.0.0.1:514").unwrap();
@@ -3203,8 +2883,7 @@ mod tests {
     #[test]
     fn a_resolved_timestamp_attribute_renders_directly_on_5424() {
         let mut attrs = AttrMap::new();
-        // 2026-09-02T14:03:11Z, distinct from the event's own timestamp (0) so the test can't
-        // pass by coincidence.
+        // 2026-09-02T14:03:11Z, distinct from the event's own timestamp (0).
         attrs.insert("syslog.timestamp", Value::Timestamp(1_788_357_791_000_000_000));
         let event = log_event_with_attrs(0, Value::str("x"), None, attrs);
         let (msgs, _) = encode(vec![event]);
@@ -3408,7 +3087,7 @@ mod tests {
         let (msgs, stats) = encode(vec![event]);
         assert!(!msgs[0].contains("bad id"), "invalid SD-ID must not reach the wire: {}", msgs[0]);
         assert_eq!(stats.dropped_invalid_sd, 1);
-        // No valid element survived -> NILVALUE, exactly like the absent case.
+        // No valid element survived -> NILVALUE, as in the absent case.
         assert!(msgs[0].ends_with("- - x"), "got: {}", msgs[0]);
     }
 
@@ -3496,9 +3175,7 @@ mod tests {
         assert!(!msgs[0].as_bytes().contains(&0x1bu8));
     }
 
-    /// The decoder must invert the escaped control character back to the literal *text* form
-    /// (`\n`, i.e. the two characters backslash and `n`) rather than a real newline -- same
-    /// one-way normalization `sanitize_msg` applies to the message body.
+    /// An escaped SD newline decodes to the text `\n` (backslash, `n`), never a real newline.
     #[test]
     fn an_escaped_sd_control_char_round_trips_to_the_literal_text_form() {
         let mut attrs = AttrMap::new();
@@ -3528,11 +3205,8 @@ mod tests {
 
     // -- SD-ELEMENT/PARAM order canonicalization (module doc's "STRUCTURED-DATA" section) ----
 
-    /// Regression test for a review finding: `AttrMap`/attribute iteration order is process-global
-    /// intern order, not wire order, so encoding used to reproduce whatever order the SD-ID/
-    /// PARAM-NAME strings happened to be interned in rather than a canonical one. Interns `zz`
-    /// before `aa` here specifically so a naive (non-canonicalized) implementation would emit
-    /// `zz` before `aa` -- the bug this test guards against.
+    /// PARAM-NAMEs sort by name, not intern order: `zz` is interned first so an uncanonicalized
+    /// encoder would emit it first.
     #[test]
     fn sd_param_order_is_canonicalized_independent_of_intern_order() {
         interner::intern("zz");
@@ -3550,11 +3224,8 @@ mod tests {
 
     // -- Permitted normalization: bare-backslash canonicalization (RFC 5424 section 6.3.3) ---
 
-    /// RFC 5424 section 6.3.3 declares only `\"`, `\\`, `\]` as escapes -- a backslash before
-    /// any other byte is a literal backslash followed by that byte, not an escape. `syslog_in`
-    /// keeps it literally; `syslog_out` then re-emits that literal backslash in canonical escaped
-    /// form (`\` -> `\\`), so `p="a\xb"` relays as `p="a\\xb"` -- the same PARAM-VALUE, per
-    /// the RFC's own equivalence, just spelled the canonical way.
+    /// A backslash before a non-escape byte is literal (RFC 5424 section 6.3.3), so `p="a\xb"`
+    /// relays as the equivalent canonical `p="a\\xb"`.
     #[test]
     fn a_bare_backslash_param_value_is_re_emitted_in_canonical_escaped_form() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
@@ -3586,9 +3257,7 @@ mod tests {
         assert!(msgs[0].contains("myapp@12345"));
     }
 
-    /// W9: a relayed multi-valued statsd tag (`team: Array[Str("a"), Str("b")]`) emits repeated
-    /// PARAM-NAMEs under the opt-in SD-ID, in array order -- see module doc's "Opt-in
-    /// `structured_data`" section.
+    /// A multi-valued attribute emits a repeated PARAM-NAME per item, in array order.
     #[test]
     fn structured_data_emits_repeated_param_name_for_a_multi_valued_array_attribute() {
         let mut attrs = AttrMap::new();
@@ -3642,10 +3311,8 @@ mod tests {
         assert!(msgs[0].ends_with("- - x"), "no attributes qualify -> NILVALUE: {}", msgs[0]);
     }
 
-    /// The guard `write_structured_data` needs: `syslog_in`'s `parse_structured_data` rejects a
-    /// message whose STRUCTURED-DATA repeats an SD-ID, so a `syslog_in -> syslog_out -> syslog_in`
-    /// relay must never emit the opt-in element under an id an origin `syslog.sd` element already
-    /// uses -- the origin's element must win, and the opt-in one is dropped and counted instead.
+    /// On an SD-ID collision the origin's element wins and the opt-in one is dropped and counted,
+    /// since `syslog_in` rejects a repeated SD-ID.
     #[test]
     fn structured_data_skips_the_opt_in_element_when_its_sd_id_collides_with_an_existing_one() {
         let mut attrs = AttrMap::new();
@@ -3666,10 +3333,8 @@ mod tests {
         assert_eq!(stats.dropped_invalid_sd, 1);
     }
 
-    /// Regression test for a review finding: the collision counter/warning used to fire even for
-    /// an event with only `syslog.*` attributes (nothing the opt-in element would ever emit),
-    /// making every message on a colliding-PEN flow report a spurious drop. `has_extra_attrs` is
-    /// now checked first, so a collision that would never have produced anything isn't counted.
+    /// A collision isn't counted or warned for an event with only `syslog.*` attributes, which
+    /// would emit no opt-in element anyway.
     #[test]
     fn collision_is_not_counted_when_no_extra_attributes_would_be_emitted() {
         let registry = Registry::new();
@@ -3736,7 +3401,7 @@ mod tests {
 
     #[test]
     fn a_non_utf8_bytes_message_survives_unmangled_apart_from_escaping() {
-        // 0xff is not valid UTF-8 on its own -- `from_utf8_lossy` would replace it with U+FFFD.
+        // 0xff alone isn't valid UTF-8; `from_utf8_lossy` would turn it into U+FFFD.
         let mut raw = b"before-".to_vec();
         raw.push(0xff);
         raw.extend_from_slice(b"-after");
@@ -3748,8 +3413,7 @@ mod tests {
         );
         let mut encoder = SyslogEncoder::new(Format::Rfc5424, 16);
         let (msgs, _) = encode_with_bytes(&mut encoder, vec![event]);
-        // 0xff is >= 0x20 and not DEL, so it is not one of `sanitize_msg_bytes`'s escaped bytes --
-        // it passes through as the literal byte 0xff, proving no lossy UTF-8 conversion happened.
+        // 0xff isn't a control byte, so it passes through unescaped.
         assert!(
             msgs[0].windows(3).any(|w| w == [b'-', 0xffu8, b'-']),
             "raw byte 0xff must survive: {:?}",
@@ -3757,19 +3421,14 @@ mod tests {
         );
     }
 
-    // -- Pure-codec fixed point (W5's `docs/plans/lossless-transit.md` "Tests" bullet) ----------
+    // -- Pure-codec fixed point (`docs/plans/lossless-transit.md`'s "Tests") -------------------
     //
-    // A small RFC 5424 grammar generator, independent of any hand-picked fixture, feeding
-    // `decode -> encode -> decode -> encode` through the real decoder (`logit-inputs`, already a
-    // dev-dependency for `a_decoded_nginx_syslog_line_relays_with_facility_and_hostname_preserved`
-    // above) and the real encoder in this file. Two properties, for every generated line:
-    // `decode(encode(decode(line))) == decode(line)` (whole `EventBatch`, receipt-time
-    // `timestamp` fields normalized -- the one field a real clock, not this codec, controls), and
-    // `encode(decode(line))` is a fixed point of `encode . decode` (re-running the same
-    // decode-then-encode pass on its own output reproduces it exactly, byte for byte). Neither
-    // property depends on the generated line's own formatting surviving verbatim -- see
-    // `crates/logit-cli/tests/syslog_round_trip.rs`'s fixture corpus for the byte-for-byte-against-
-    // real-input half of this plan bullet.
+    // A small RFC 5424 grammar generator run through the real decoder and this encoder. For
+    // every generated line: `decode(encode(decode(line))) == decode(line)` (receipt-time
+    // `timestamp` fields normalized), and `encode(decode(line))` is a byte-exact fixed point of
+    // `encode . decode`. Neither needs the generated line's own formatting to survive;
+    // `crates/logit-cli/tests/syslog_round_trip.rs`'s corpus covers byte-for-byte against real
+    // input.
     mod fixed_point {
         use super::*;
         use logit_inputs::syslog::SyslogDecoder;
@@ -3777,18 +3436,15 @@ mod tests {
         use proptest::prelude::*;
         use std::collections::HashSet;
 
-        /// A HOSTNAME/APP-NAME/PROCID/MSGID candidate: `[A-Za-z0-9.-]{1,16}`, or nil (`-`) --
-        /// every character in the non-nil case is already `PRINTUSASCII` and untouched by
-        /// `sanitize_5424_field`, so a round trip can never change it.
+        /// A HOSTNAME/APP-NAME/PROCID/MSGID, or nil. Already `PRINTUSASCII`, so
+        /// `sanitize_5424_field` leaves it alone.
         fn opt_token() -> impl Strategy<Value = Option<String>> {
             prop_oneof![Just(None), "[A-Za-z0-9.-]{1,16}".prop_map(Some)]
         }
 
-        /// An RFC 3339 TIMESTAMP (`Z` or a numeric offset, 0-6 fractional digits) or nil (`-`).
-        /// The rendered digit count/offset needn't match `push_rfc5424_timestamp`'s own canonical
-        /// 6-digit-`Z` output -- the fixed-point property only requires that *encoding* a
-        /// generated line's own decode, then decoding and re-encoding that, reproduces the same
-        /// bytes the second time around, which holds regardless of the first line's own shape.
+        /// An RFC 3339 TIMESTAMP (6 fractional digits, `Z` or `+02:00`) or nil. The offset form
+        /// needn't match `push_rfc5424_timestamp`'s `Z` output: the property compares the
+        /// second encode against the first, not against the generated line.
         fn opt_timestamp() -> impl Strategy<Value = Option<String>> {
             prop_oneof![
                 Just(None),
@@ -3809,9 +3465,8 @@ mod tests {
             ]
         }
 
-        /// A `PARAM-VALUE`'s unescaped content: printable ASCII (which includes all three
-        /// escape-triggering characters `"`, `\`, `]`) plus a few printable non-ASCII characters,
-        /// so the generator exercises both `push_sd_escaped` and plain multi-byte UTF-8.
+        /// Unescaped PARAM-VALUE content: printable ASCII (including `"`, `\`, `]`) plus a few
+        /// multi-byte characters.
         fn printable_utf8(max_len: usize) -> impl Strategy<Value = String> {
             prop::collection::vec(
                 prop_oneof![
@@ -3832,11 +3487,8 @@ mod tests {
                 .prop_map(|(id, params)| (format!("{id}@32473"), params))
         }
 
-        /// 0-3 SD-ELEMENTs with distinct SD-IDs -- the decoder rejects a repeated one
-        /// (`syslog_in`'s own `structured_data_duplicate_sd_id_is_rejected`), and that rejection
-        /// path is covered there, not by this generator of valid lines. A collision (rare, given
-        /// the `[a-z]{1,8}` id alphabet) is resolved by dropping the later duplicate rather than
-        /// discarding the whole case.
+        /// 0-3 SD-ELEMENTs with distinct SD-IDs, since the decoder rejects a repeat (tested in
+        /// `syslog_in`). A duplicate is dropped rather than the whole case discarded.
         fn sd_elements() -> impl Strategy<Value = Vec<(String, Vec<(String, String)>)>> {
             prop::collection::vec(sd_element(), 0..=3).prop_map(|elements| {
                 let mut seen = HashSet::new();
@@ -3857,9 +3509,8 @@ mod tests {
             out
         }
 
-        /// Renders one syntactically valid RFC 5424 line from the generated pieces -- the
-        /// generator's own encoder, deliberately independent of `SyslogEncoder` (the thing under
-        /// test), so this isn't just `SyslogEncoder` agreeing with itself.
+        /// One valid RFC 5424 line, rendered independently of `SyslogEncoder` so the test isn't
+        /// the encoder agreeing with itself.
         #[allow(clippy::too_many_arguments)]
         fn render_line(
             pri: u8,

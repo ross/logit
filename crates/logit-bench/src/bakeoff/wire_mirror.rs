@@ -1,15 +1,21 @@
 //! A plain-data mirror of [`EventBatch`]/[`Event`], used only by the native-wire-format bake-off's
-//! `rkyv` and `postcard` arms (`docs/design/wire-protocol.md`'s "Encoding: decide with a
-//! benchmark, not up front", `docs/adr/native-wire-format-encoding.md`) -- **not** the shipped
-//! format (`logit_proto::native`, which is hand-rolled either way and doesn't use this type at
-//! all).
+//! `rkyv` and `postcard` arms (`docs/adr/native-wire-format-encoding.md`). It mirrors the event
+//! model, **not** the shipped wire format: `logit_proto::native` is hand-rolled and doesn't use
+//! this type.
 //!
-//! Holds no foreign types -- no `bytes::Bytes`, no `SmallVec`, no `lasso::Spur`, no `DDSketch`, no
-//! `cardinality_estimator::CardinalityEstimator` -- so both `rkyv` and `serde` can derive their
-//! traits directly with no remote-type wrapper plumbing. Two of the correctness rules
-//! `logit_proto::native`'s own module doc states apply here too, for a fair comparison: a `Symbol`
-//! is dictionary-indexed rather than written raw, and `MetricKind::Distribution`/`MetricKind::Set`
-//! ride as `DdSketch::to_java_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
+//! Holds no foreign types (no `bytes::Bytes`, `SmallVec`, `lasso::Spur`, `DDSketch`, or
+//! `cardinality_estimator::CardinalityEstimator`), so both `rkyv` and `serde` derive their traits
+//! directly, with no remote-type wrappers. Two of the rules `logit_proto::native`'s module doc
+//! states apply here too, so the comparison is fair: a `Symbol` is dictionary-indexed rather than
+//! written raw, and `MetricKind::Distribution`/`MetricKind::Set` ride as
+//! `DdSketch::to_java_bytes()`/`HyperLogLog::to_bytes()`'s blobs, respectively.
+//!
+//! **Keeping it current.** A change to `logit_proto::native`'s encoding needs nothing here unless
+//! it changes one of those two rules. A field added to the event model needs a matching field and
+//! conversion here. The decode side's struct literals catch most additions at compile time; one
+//! that slips past them is dropped silently by the `rkyv` and `postcard` arms, and
+//! `tests/wire_format_bakeoff.rs`'s fidelity gate and this module's round-trip tests catch that
+//! only if a fixture populates the new field.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,14 +27,12 @@ use logit_core::{
     Temporality, TraceRef, Value,
 };
 
-// `WireValue` is directly recursive (`Array`/`Map` hold more `WireValue`s), which `rkyv`'s derive
-// can't bound automatically -- `HashMap<String, JsonValue>: Archive` requiring `JsonValue:
-// Archive` requiring `HashMap<..>: Archive` again is an infinite regress the compiler reports as
-// "overflow evaluating the requirement". `#[rkyv(omit_bounds)]` on the two recursive fields below
-// stops the derive from generating that bound at all; the three attributes on the enum restate,
-// by hand, the narrower non-recursive bounds `Vec`'s own (de)serialization and validation actually
-// need. This is exactly rkyv's own documented pattern for a JSON-like recursive value type
-// (`rkyv/examples/json_like_schema.rs` in the `rkyv/rkyv` repository), applied here verbatim.
+// `WireValue` is directly recursive (`Array`/`Map` hold more `WireValue`s), so `rkyv`'s derive
+// would emit a bound that requires itself, which the compiler reports as "overflow evaluating the
+// requirement". `#[rkyv(omit_bounds)]` on the two recursive fields drops that bound, and the three
+// `#[rkyv(..)]` attributes on the enum restate the narrower, non-recursive bounds `Vec`'s
+// (de)serialization and validation need. This is rkyv's documented pattern for a JSON-like
+// recursive type (`rkyv/examples/json_like_schema.rs` in the `rkyv/rkyv` repository).
 #[derive(
     rkyv::Archive,
     rkyv::Serialize,
@@ -199,13 +203,12 @@ pub enum WireMetricKind {
     Gauge(f64),
     GaugeDelta(f64),
     Samples(WireSamples),
-    /// `DdSketch::to_java_bytes()` -- the same canonical, cross-language blob
-    /// `logit_proto::native` uses, since `DDSketch`'s fields are private with no bin iteration
+    /// `DdSketch::to_java_bytes()`: the canonical, cross-language blob `logit_proto::native` also
+    /// uses, since `DDSketch`'s fields are private with no bin iteration
     /// (`crates/logit-core/src/metric.rs`).
     Distribution(Vec<u8>),
     SetMembers(Vec<Vec<u8>>),
-    /// `HyperLogLog::to_bytes()` -- mirrors `Distribution` above; see
-    /// `crates/logit-core/src/metric.rs`.
+    /// `HyperLogLog::to_bytes()`, for the same reason as `Distribution` above.
     Set(Vec<u8>),
     Histogram(WireHistogram),
     ExponentialHistogram(WireExpHistogram),
@@ -245,11 +248,9 @@ pub struct WireMetric {
     pub description: Option<u32>,
     pub start_timestamp: i64,
     pub exemplars: Vec<WireExemplar>,
-    /// `MetricRecord::flags` -- OTLP `DataPointFlags` bitmask (see
-    /// `crates/logit-core/src/metric.rs`'s doc comment). Missing from this mirror until W4;
-    /// dropping it silently would have made this arm lossy on a flagged point, unlike
-    /// native/postcard/rkyv's stated "exact" guarantee (`tests/wire_format_bakeoff.rs`'s module
-    /// doc).
+    /// `MetricRecord::flags`, the OTLP `DataPointFlags` bitmask (`MetricRecord`'s doc in
+    /// `crates/logit-core/src/metric.rs`). Without it these arms would be lossy on a flagged point,
+    /// breaking the exact round trip `tests/wire_format_bakeoff.rs` holds them to.
     pub flags: u32,
     pub kind: WireMetricKind,
 }
@@ -912,8 +913,8 @@ mod tests {
         assert_eq!(back, batch);
     }
 
-    /// A fully-populated batch -- every metric kind, a populated `Scope`, and a `SpanExt` -- round
-    /// trips through the mirror exactly, now that `PartialEq` exists on `EventBatch`.
+    /// A fully-populated batch (every metric kind, a populated `Scope`, and a `SpanExt`) round
+    /// trips through the mirror exactly.
     #[test]
     fn round_trips_a_fully_populated_batch_through_the_mirror() {
         let mut sketch = DdSketch::new();
