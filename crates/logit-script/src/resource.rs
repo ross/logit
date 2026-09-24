@@ -1,19 +1,14 @@
-//! Exposes the incoming batch's resource to Lua as a global `resource` userdata -- readable and
+//! Exposes the incoming batch's resource to Lua as a global `resource` userdata, readable and
 //! writable, copy-on-write. See `docs/design/lua-api.md`'s "Reading and writing `resource`"
 //! section and `docs/adr/operator-declared-resource-attributes.md`.
 //!
-//! Installed unconditionally in [`crate::ScriptWorker::new`], before the script's own source
-//! runs -- same reasoning as `crate::trace`'s module doc: a top-level alias (`local r = resource`)
-//! captures whatever `resource` *is* at that instant, once, forever, and Lua resolves a
-//! function-body global lookup at call time but a top-level statement only once, during
-//! `Lua::load(source).exec()`.
+//! Installed in [`crate::ScriptWorker::new`] before the script's source runs, for the reason in
+//! `crate::trace`'s module doc.
 //!
-//! Unlike `trace` (a plain table `set_context` overwrites in place), `resource` needs proxy
-//! semantics -- it wraps a real [`Resource`]'s [`AttrMap`], the same shape `crate::proxy`'s
-//! `AttrsProxy` gives `event.attributes` -- so this mirrors that module's `__index`/`__newindex`
-//! pattern instead. State is a plain `Rc<RefCell<..>>`, not a `RegistryKey`-held table: `Resource`
-//! itself must cross back out to [`crate::ScriptWorker::set_resource`]/`take_resource` without a
-//! `&Lua` in hand, which a `Rc` clone gives for free and a registry lookup would not.
+//! Unlike `trace`, `resource` wraps a real [`Resource`]'s [`AttrMap`], so it follows
+//! `crate::proxy`'s `AttrsProxy` `__index`/`__newindex` pattern. State is an `Rc<RefCell<..>>`,
+//! not a `RegistryKey`-held table, because [`crate::ScriptWorker::set_resource`]/`take_resource`
+//! must reach it without a `&Lua`.
 
 use crate::value::{attrmap_to_lua_table, lua_to_value, lua_value_matches, value_to_lua};
 use logit_core::Resource;
@@ -22,25 +17,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Per-batch resource state, shared between [`crate::ScriptWorker`] and the installed
-/// [`ResourceProxy`] userdata through one `Rc<RefCell<..>>` -- a script mutating through the
-/// proxy is immediately visible to `take` below, with no trip back through Lua required.
+/// Per-batch resource state, shared by [`crate::ScriptWorker`] and the [`ResourceProxy`]
+/// userdata, so a script's write is visible to [`take`] without a trip through Lua.
 pub(crate) struct ResourceState {
     base: Arc<Resource>,
-    /// `Some` once a script has written at least one field since the last [`set`] -- a full copy
-    /// of `base` (attributes, `schema_url`, and `dropped_attributes_count` alike), mutated in
-    /// place from there so one clone on the first write covers every field, not just attributes.
-    /// `None` (the common case: a script that never writes `resource`) is what keeps this
-    /// allocation-free. Widened from `Option<AttrMap>` (W7): `schema_url`/`dropped_attributes_count`
-    /// are now themselves writable (`schema_url`) or need to be read back out of `modified`
-    /// (`dropped_attributes_count`, read-only but still stored here so [`take`] doesn't need to
-    /// special-case where each field comes from).
+    /// A full copy of `base`, every field included, made on the first write since the last
+    /// [`set`] and mutated in place after. `None`, a script that never writes `resource`, is
+    /// what keeps this allocation-free.
     modified: Option<Resource>,
 }
 
-/// Creates the `resource` global (starting empty, like `crate::trace::install`'s all-zero
-/// placeholder -- no batch has been seen yet) and returns the shared state [`set`]/[`take`]
-/// mutate directly.
+/// Creates the `resource` global, empty until the first [`set`], and returns its shared state.
 pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ResourceState>>> {
     let state = Rc::new(RefCell::new(ResourceState {
         base: Arc::new(Resource::default()),
@@ -51,21 +38,21 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ResourceState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` (and once before
-/// every `flush()` call, with an empty resource -- `docs/adr/lua-flush-root-context.md`) --
-/// resets `resource` to read `resource`'s attributes and clears any write left over from a
-/// previous call.
+/// Resets `resource` to read `resource` and discards any earlier write.
+///
+/// Called once per incoming batch before its events reach `process`, and before every `flush()`
+/// with an empty resource, the flush root context (`docs/adr/lua-flush-root-context.md`).
 pub(crate) fn set(state: &Rc<RefCell<ResourceState>>, resource: &Arc<Resource>) {
     let mut state = state.borrow_mut();
     state.base = resource.clone();
     state.modified = None;
 }
 
-/// `Some` if a script wrote `resource` since the last [`set`], committing that write as the new
-/// `base` so a read before the next [`set`] sees it too, and a second [`take`] returns `None`.
-/// `run_lua` calls [`set`] before every batch and before every `flush()`
-/// (`docs/adr/lua-flush-root-context.md`), so no write carries into the next call. `None` -- the
-/// common case -- costs nothing.
+/// The script's write since the last [`set`], if any.
+///
+/// Commits the write as the new `base`, so a read before the next [`set`] still sees it and a
+/// second call returns `None`. `run_lua` calls [`set`] before every batch and every `flush()`, so
+/// no write carries into the next call.
 pub(crate) fn take(state: &Rc<RefCell<ResourceState>>) -> Option<Arc<Resource>> {
     let mut state = state.borrow_mut();
     let modified = state.modified.take()?;
@@ -74,7 +61,7 @@ pub(crate) fn take(state: &Rc<RefCell<ResourceState>>) -> Option<Arc<Resource>> 
     Some(new)
 }
 
-/// The `resource` global's userdata. Shares `ResourceState` with [`install`]'s caller.
+/// The `resource` global's userdata.
 struct ResourceProxy(Rc<RefCell<ResourceState>>);
 
 impl UserData for ResourceProxy {
@@ -82,12 +69,9 @@ impl UserData for ResourceProxy {
         methods.add_meta_method(MetaMethod::Index, |lua, this, key: mlua::String| {
             let key = key.to_str()?;
             let state = this.0.borrow();
-            // Named fields take precedence over the open attribute map for these two keys -- an
-            // attribute literally named `schema_url` (or `dropped_attributes_count`) is still in
-            // `resource:to_table()`, but unreachable via `resource["schema_url"]`: the named
-            // field always wins the lookup. Documented rather than guarded against, the same
-            // trade `event`'s fixed fields (`timestamp`, `attributes`, ...) already make against
-            // an attribute of the same name.
+            // A named field wins over an attribute of the same name: an attribute called
+            // `schema_url` or `dropped_attributes_count` appears in `resource:to_table()` but not
+            // through `resource[...]`, the same trade `event`'s fixed fields make.
             match key {
                 "schema_url" => {
                     return match &state.modified {
@@ -133,10 +117,9 @@ impl UserData for ResourceProxy {
                     }
                     _ => {}
                 }
-                // Same no-op check, and the same borrow-then-release-before-`lua_to_value`
-                // ordering, as `crate::proxy::AttrsProxy::__newindex` -- a table value's `pairs()`
-                // walk inside `lua_to_value` can re-enter Lua and hit this same `__index`, so the
-                // borrow below must not still be held when that happens.
+                // Same no-op check and borrow ordering as `crate::proxy::AttrsProxy::__newindex`:
+                // `lua_to_value`'s `pairs()` walk over a table can re-enter this `__index`, so the
+                // borrow must be released before it runs.
                 let is_noop = {
                     let state = this.0.borrow();
                     let existing = match &state.modified {
@@ -161,10 +144,8 @@ impl UserData for ResourceProxy {
             },
         );
 
-        // No __pairs (unavailable under LuaJIT, same as `AttrsProxy`): `resource:to_table()` is
-        // the enumeration escape hatch. Attributes only, unchanged by the named `schema_url`/
-        // `dropped_attributes_count` fields above -- callers that want those read them directly
-        // off `resource`.
+        // LuaJIT has no `__pairs`, so `resource:to_table()` is how a script enumerates. It
+        // returns attributes only; `schema_url`/`dropped_attributes_count` are read by name.
         methods.add_method("to_table", |lua, this, ()| {
             let state = this.0.borrow();
             match &state.modified {
@@ -175,23 +156,22 @@ impl UserData for ResourceProxy {
     }
 }
 
-/// Starts `state.modified` from a clone of `state.base` if this is the first write since the
-/// last [`set`] -- shared by every write path (`__newindex`'s attribute arm and
-/// [`write_schema_url`]) so a write to one field never discards an earlier write to another
-/// within the same batch.
+/// Clones `state.base` into `state.modified` on the first write since the last [`set`].
+///
+/// Every write path goes through this, so a write to one field never discards an earlier write
+/// to another in the same batch.
 fn ensure_modified(state: &mut ResourceState) {
     if state.modified.is_none() {
         state.modified = Some((*state.base).clone());
     }
 }
 
-/// `resource.schema_url = <string|nil>` -- a nil write clears it. String-equality no-op check
-/// (not `lua_value_matches`: `schema_url` is a plain `Option<Bytes>` field, not an attribute
-/// `Value`, so there's no variant-preservation concern to guard).
+/// `resource.schema_url = <string|nil>`; `nil` clears it.
+///
+/// The no-op check is plain byte equality, not `lua_value_matches`: `schema_url` is an
+/// `Option<Bytes>`, not a `Value`, so there's no variant to preserve.
 fn write_schema_url(state: &Rc<RefCell<ResourceState>>, value: LuaValue) -> mlua::Result<()> {
-    // Borrow the Lua string's bytes for the identity check; only copy them into a `Bytes` once
-    // it's certain the write isn't a no-op -- the same allocation-free no-op path the attribute
-    // write above has.
+    // Copy into `Bytes` only once the write is known not to be a no-op.
     let new_value: Option<&[u8]> = match &value {
         LuaValue::Nil => None,
         LuaValue::String(s) => Some(s.as_bytes()),
@@ -216,12 +196,10 @@ fn write_schema_url(state: &Rc<RefCell<ResourceState>>, value: LuaValue) -> mlua
     Ok(())
 }
 
-/// `lua_to_value`, relabeled for a `resource` write: its error text says "as an event attribute
-/// value" (written for `AttrsProxy`, its only caller until now), which would be misleading for a
-/// value rejected here. A string replace rather than a parameter on the shared function -- the
-/// message is the only thing that differs, and `lua_to_value` is also called recursively from
-/// nested-table conversion, where threading a context string through adds real complexity for one
-/// cosmetic line.
+/// `lua_to_value` with its "event attribute value" error text relabeled for a `resource` write.
+///
+/// A string replace, not a parameter, because `lua_to_value` recurses through nested tables and
+/// the message is the only difference.
 fn lua_to_resource_value(value: LuaValue) -> mlua::Result<logit_core::Value> {
     lua_to_value(value).map_err(|err| match err {
         mlua::Error::RuntimeError(msg) => mlua::Error::RuntimeError(

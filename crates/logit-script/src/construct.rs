@@ -1,40 +1,40 @@
-//! `Event.new(t)`: constructs an [`Event`] from a plain Lua table in exactly the shape
-//! `event:to_table()` returns (`crate::proxy`'s `to_table`/`log_to_table`), and hands it back as
-//! an ordinary [`EventProxy`] handle. The inverse of `to_table()`, by design -- same keys, same
-//! encodings (decimal-digit strings for nanosecond timestamps, lowercase hex for ids, lowercase
-//! enum names), same nesting -- so `Event.new(e:to_table())` round-trips every lossless shape.
-//! See `docs/adr/lua-event-constructor.md` for the decision and `docs/design/lua-api.md`'s
+//! `Event.new(t)`: builds an [`Event`] from a Lua table in the shape `event:to_table()` returns
+//! (`crate::proxy`'s `to_table`/`log_to_table`) and returns an ordinary [`EventProxy`].
+//!
+//! It is `to_table()`'s inverse: same keys, same encodings (decimal-digit strings for nanosecond
+//! timestamps, lowercase hex for ids, lowercase enum names), same nesting, so
+//! `Event.new(e:to_table())` round-trips every lossless shape. See
+//! `docs/adr/lua-event-constructor.md` for the decision and `docs/design/lua-api.md`'s
 //! "Constructing events" for the script-facing contract.
 //!
-//! Three rules every parser in this module holds to, so a mistake in a script is a clear error
-//! at the call rather than a silently different event:
+//! Every parser here holds three rules, so a script's mistake is an error at the call rather than
+//! a different event:
 //!
-//! - **Strict keys.** An unknown key anywhere -- top level or a sub-table -- is
-//!   `Event.new: <path> is not a field`, the same posture the proxies take for an unknown field
-//!   on read or write. `has_log`/`has_metrics`/`has_span` are accepted (they are in `to_table()`'s
-//!   output) and must be booleans, but their values are ignored: the payload keys are the truth.
+//! - **Strict keys.** An unknown key anywhere is `Event.new: <path> is not a field`, as the
+//!   proxies report an unknown field. `has_log`/`has_metrics`/`has_span` are accepted, since
+//!   `to_table()` emits them, and must be booleans, but the payload keys decide what's present.
 //! - **Raw table access.** Keys are read with `Table::raw_get` and enumerated with `Table::pairs`,
-//!   which in mlua 0.9 walks the table with `lua_next` (`TablePairs::next`) -- raw, so neither
-//!   `__index` nor `__pairs` (which LuaJIT lacks anyway) can make the key check and the field
-//!   reads disagree about what the table holds.
-//! - **Defaults only where core already documents one** (`BodyFormat::Raw`, `observed_timestamp`
-//!   and `dropped_attributes_count` of `0`, empty `attributes`; a metric's `start_timestamp`/
-//!   `flags` of `0`, `MetricKind::counter`'s temporality and monotonicity for a bare `sum`,
+//!   which in mlua 0.9 walks the table with `lua_next` (`TablePairs::next`). Both are raw, so no
+//!   `__index` or `__pairs` (which LuaJIT lacks anyway) can make the key check and the field reads
+//!   disagree about what the table holds.
+//! - **Defaults only where core documents one** (`BodyFormat::Raw`, `observed_timestamp` and
+//!   `dropped_attributes_count` of `0`, empty `attributes`; a metric's `start_timestamp`/`flags`
+//!   of `0`, `MetricKind::counter`'s temporality and monotonicity for a bare `sum`,
 //!   `Samples::new`'s `sample_rate` of `1.0`; a span's `SpanKind::Internal`/`SpanStatus::Unset`,
-//!   an `end_timestamp` equal to its start, `SpanExt`'s zeros, empty `events`/`links`);
-//!   `timestamp`, `log.message`, a metric's `name`/`kind` and its kind's own payload, and a
-//!   span's `trace_id`/`span_id`/`name` are required, exactly as the ADR lists.
+//!   an `end_timestamp` equal to its start, `SpanExt`'s zeros, empty `events`/`links`).
+//!   `timestamp`, `log.message`, a metric's `name`/`kind` and its kind's payload, and a span's
+//!   `trace_id`/`span_id`/`name` are required, as the ADR lists.
 //!
 //! Every error is an `mlua::Error::RuntimeError` prefixed `Event.new: <path> ...` down to the
-//! field; the one exception is a malformed value *inside* a nested attribute table, which reports
-//! the shared attribute-conversion error (`lua_to_value`'s, unprefixed), since nested tables
-//! convert through the same helper the proxy write path uses. The shared helpers at the bottom
-//! take the path as an argument so the log, metric and span parsers reuse them unchanged.
+//! field. The exception is a malformed value inside a nested attribute table, which reports
+//! `lua_to_value`'s unprefixed error, because nested tables convert through the proxy write path's
+//! helper.
+//!
 //! `metrics` builds the four raw kinds (`sum`, `gauge`, `samples`, `set_members`) and the three
 //! pre-aggregated ones (`histogram`, `exponential_histogram`, `summary`), exemplars included; the
-//! two sketches and `gauge_delta` are never constructible, and each says so. `span` builds a
-//! whole [`SpanRecord`], its `events` and `links` included -- the one way a script mints a span,
-//! since `event.span` itself stays read-only in place (`crate::proxy`'s `SpanProxy`).
+//! two sketches and `gauge_delta` are never constructible, and each says so. `span` builds a whole
+//! [`SpanRecord`], `events` and `links` included. It's the one way a script makes a span, since
+//! `event.span` is read-only (`crate::proxy`'s `SpanProxy`).
 
 use crate::proxy::{EventProxy, TargetTable};
 use crate::value::{lua_to_value, validated_sequence_len};
@@ -120,18 +120,17 @@ const SPAN_EVENT_KEYS: &[&str] = &["timestamp", "name", "attributes", "dropped_a
 const SPAN_LINK_KEYS: &[&str] =
     &["trace_id", "span_id", "trace_state", "flags", "dropped_attributes_count", "attributes"];
 
-/// The kinds the unknown-`kind` error names: every kind `Event.new` builds -- deliberately *not*
-/// the sketches or `gauge_delta`, which are never constructible and get their own message each.
+/// The kinds the unknown-`kind` error names. Not the sketches or `gauge_delta`, which each get
+/// their own message.
 const CONSTRUCTIBLE_KINDS: &str =
     "sum, gauge, samples, set_members, histogram, exponential_histogram, summary";
 
-/// Installs the `Event` global -- a table holding one function, `new` -- following
-/// `telemetry::install`'s shape. `targets` is the worker's routing table *cell*
-/// (`ScriptWorker::targets`): the closure reads through it on every call rather than capturing
-/// the table itself, so a constructed event resolves `event:to(id)` against whatever
-/// `ScriptWorker::with_targets` installed by the time `Event.new` actually runs -- inside
-/// `process()`/`flush()`, the list the component declared; at script top level (during
-/// `ScriptWorker::new`'s `.exec()`, before `with_targets` can have been called), the empty list.
+/// Installs the `Event` global, a table holding `new`.
+///
+/// `targets` is the worker's routing-table cell (`ScriptWorker::targets`), read on every call, so
+/// an event resolves `event:to(id)` against the component's `targets:` inside
+/// `process()`/`flush()`, and against the empty list at script top level, which runs before
+/// `ScriptWorker::with_targets` can.
 pub(crate) fn install(lua: &Lua, targets: Rc<RefCell<Rc<TargetTable>>>) -> mlua::Result<()> {
     let table = lua.create_table()?;
     let new = lua.create_function(move |_, arg: LuaValue| {
@@ -141,8 +140,8 @@ pub(crate) fn install(lua: &Lua, targets: Rc<RefCell<Rc<TargetTable>>>) -> mlua:
                 arg.type_name()
             )));
         };
-        // An `Rc` bump, never an allocation -- and released before `event_from_table` runs so a
-        // constructor error can't leave the cell borrowed.
+        // An `Rc` bump, not an allocation, released before `event_from_table` so a constructor
+        // error can't leave the cell borrowed.
         let targets = targets.borrow().clone();
         event_from_table(t).map(|event| EventProxy::with_targets(event, targets))
     })?;
@@ -160,25 +159,22 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
     };
     let attributes = attributes_field(t.raw_get("attributes")?, "", "attributes")?;
     for key in ["has_log", "has_metrics", "has_span"] {
-        // Accepted because `to_table()` emits them; ignored because the payload keys below are
-        // the truth (ADR `lua-event-constructor`). Still type-checked, so a script that wrote
-        // `has_log = "yes"` hears about it.
+        // Accepted because `to_table()` emits them, ignored because the payload keys decide, and
+        // still type-checked so `has_log = "yes"` is an error.
         boolean_field(&t, "", key)?;
     }
     let metrics = match t.raw_get::<_, LuaValue>("metrics")? {
         LuaValue::Nil => MetricList::new(),
         LuaValue::Table(metrics) => match validated_sequence_len(&metrics)? {
-            // `to_table()` always emits `metrics`, empty when the event carries none, so the
-            // empty sequence is accepted (and costs nothing: `with_capacity(0)` stays inline,
-            // as does the one-record case `MetricList`'s inline slot is sized for).
+            // `to_table()` always emits `metrics`, so the empty sequence is accepted. It costs
+            // nothing: `with_capacity(0)` stays inline, as does one record.
             Some(len) => {
                 let mut list = MetricList::with_capacity(len);
                 for i in 1..=len {
                     match metrics.raw_get::<_, LuaValue>(i)? {
-                        // One small `String` per metric for its path: every field error
-                        // beneath needs `metrics[i]` as a prefix, and building it once here is
-                        // cheaper than threading the index through every helper. Accounted
-                        // for in the `lua: Event.new gauge event ..` pin.
+                        // One `String` per metric for its `metrics[i]` path, cheaper than
+                        // threading the index through every helper. Counted in the
+                        // `lua: Event.new gauge event ..` allocation pin.
                         LuaValue::Table(m) => {
                             list.push(metric_from_table(m, &format!("metrics[{i}]"))?)
                         }
@@ -198,9 +194,8 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
     };
     let span = match t.raw_get::<_, LuaValue>("span")? {
         LuaValue::Nil => None,
-        // The event's `timestamp` is the span's start (`SpanRecord::end_timestamp`'s doc), so the
-        // span parser gets it: it is the `end_timestamp` default and the floor `end_timestamp`
-        // is checked against.
+        // The event's `timestamp` is the span's start (`SpanRecord::end_timestamp`'s doc): the
+        // `end_timestamp` default and its floor.
         LuaValue::Table(span) => Some(span_from_table(span, "span", timestamp)?),
         other => {
             return Err(runtime_error(format!(
@@ -231,8 +226,8 @@ pub(crate) fn event_from_table(t: Table) -> mlua::Result<Event> {
 fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
     expect_keys(&t, LOG_KEYS, path)?;
     let message = match t.raw_get::<_, LuaValue>("message")? {
-        // `to_table()` emits a `Value::Null` message as an absent key, so it comes back as
-        // missing here -- the ADR's recorded residual, not fixed by inventing a default.
+        // `to_table()` emits a `Value::Null` message as an absent key, so it comes back missing:
+        // a residual the ADR records, not one to paper over with a default.
         LuaValue::Nil => return Err(required(path, "message")),
         value => value_field(value, path, "message")?,
     };
@@ -280,10 +275,9 @@ fn log_from_table(t: Table, path: &str) -> mlua::Result<LogRecord> {
 /// Builds a [`MetricRecord`] from a table in `metric_to_table`'s shape. `path` is the table's
 /// own path (`metrics[i]`).
 fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
-    // `kind` first: it decides which payload keys are fields at all, so an unknown kind is
-    // reported as such rather than as its payload keys "not being fields", and a `sum`'s
-    // `monotonic` is a field while a `gauge`'s is not. `to_string_lossy` borrows a valid UTF-8
-    // Lua string, so the name costs nothing on the success path.
+    // `kind` first, because it decides which payload keys are fields: an unknown kind is
+    // reported as itself, not as its payload keys "not being fields". `to_string_lossy` borrows
+    // a valid UTF-8 string, so this costs nothing on the success path.
     let kind_name = match t.raw_get::<_, LuaValue>("kind")? {
         LuaValue::Nil => return Err(required(path, "kind")),
         LuaValue::String(s) => s,
@@ -315,10 +309,10 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
         value => nanos_string(value, path, "start_timestamp")?,
     };
     let mut flags = u32_field(t.raw_get("flags")?, path, "flags")?;
-    // `is_no_recorded_value` is sugar for the flag bit (ADR `lua-event-constructor`): `true`
-    // ORs it on, `false` is a no-op rather than a clear, so `to_table()`'s `{flags = 1,
-    // is_no_recorded_value = true}` rebuilds as exactly `flags == 1` and a script that sets
-    // `flags` by hand isn't second-guessed.
+    // `is_no_recorded_value` is sugar for the flag bit (`docs/adr/lua-event-constructor.md`):
+    // `true` sets it and `false` doesn't clear it, so `to_table()`'s
+    // `{flags = 1, is_no_recorded_value = true}` rebuilds as `flags == 1` and a hand-set `flags`
+    // stands.
     match t.raw_get::<_, LuaValue>("is_no_recorded_value")? {
         LuaValue::Nil | LuaValue::Boolean(false) => {}
         LuaValue::Boolean(true) => flags |= MetricRecord::FLAG_NO_RECORDED_VALUE,
@@ -333,8 +327,7 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
     let exemplars = match t.raw_get::<_, LuaValue>("exemplars")? {
         LuaValue::Nil => Vec::new(),
         LuaValue::Table(list) => match validated_sequence_len(&list)? {
-            // `with_capacity(0)` is `Vec::new()`: the empty list `to_table()` always emits
-            // costs nothing to rebuild.
+            // `with_capacity(0)` doesn't allocate, so the empty list `to_table()` emits is free.
             Some(len) => {
                 let mut exemplars = Vec::with_capacity(len);
                 for j in 1..=len {
@@ -357,8 +350,8 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
     };
     let kind = match kind {
         Kind::Sum => {
-            // The defaults are `MetricKind::counter`'s -- delta, monotonic -- so
-            // `{kind = "sum", value = 1}` is exactly the counter `kv_metrics`/`statsd_in` emit.
+            // `MetricKind::counter`'s defaults (delta, monotonic), so `{kind = "sum", value = 1}`
+            // is the counter `kv_metrics`/`statsd_in` emit.
             let value = finite_field(t.raw_get("value")?, path, "value")?;
             let temporality = enum_field(
                 t.raw_get("temporality")?,
@@ -384,9 +377,8 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
         }
         Kind::Gauge => MetricKind::Gauge(finite_field(t.raw_get("value")?, path, "value")?),
         Kind::Samples => {
-            // `Samples::new`'s `sample_rate` of `1.0` is the default core documents; `values`
-            // are pushed straight onto the record's own `SmallVec`, so up to `SAMPLES_INLINE`
-            // of them allocate nothing beyond the record.
+            // `values` go straight onto the record's `SmallVec`, so up to `SAMPLES_INLINE` of
+            // them allocate nothing beyond the record.
             let mut samples = Samples::new(std::iter::empty());
             match t.raw_get::<_, LuaValue>("values")? {
                 LuaValue::Nil => {}
@@ -440,9 +432,8 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
             MetricKind::SetMembers(members)
         }
         Kind::Histogram => {
-            // `buckets` is required even when empty: `to_table()` always emits it, and an empty
-            // histogram round-trips as one. Each row is `{bound, count}`, checked strictly;
-            // the rows' layout is then checked (and the overflow bucket appended) as a whole.
+            // `buckets` is required even when empty, as `to_table()` always emits it. Rows are
+            // checked one by one, then their layout as a whole (`validate_buckets`).
             let mut buckets =
                 sequence_field(t.raw_get("buckets")?, path, "buckets", bucket_from_row)?;
             validate_buckets(&mut buckets, path)?;
@@ -480,10 +471,8 @@ fn metric_from_table(t: Table, path: &str) -> mlua::Result<MetricRecord> {
     Ok(MetricRecord { name, unit, description, start_timestamp, exemplars, flags, kind })
 }
 
-/// The metric kinds `Event.new` builds -- the four raw, pre-aggregation ones and the three
-/// pre-aggregated ones a scrape or OTLP input carries whole -- and the payload keys each adds to
-/// [`METRIC_KEYS`]. [`Kind::parse`] is where every kind that *isn't* one of these gets its own
-/// message.
+/// The metric kinds `Event.new` builds: four raw kinds and the three pre-aggregated ones a scrape
+/// or OTLP input carries whole. [`Kind::parse`] gives every other kind its own message.
 #[derive(Clone, Copy)]
 enum Kind {
     Sum,
@@ -505,9 +494,9 @@ impl Kind {
             "histogram" => Kind::Histogram,
             "exponential_histogram" => Kind::ExponentialHistogram,
             "summary" => Kind::Summary,
-            // `to_table()` is deliberately lossy for the two sketches (a `count`, an `estimate`
-            // -- never the DDSketch or HyperLogLog state), so there is no shape to invert; the
-            // raw kind `aggregate` folds into each is the way to get one.
+            // `to_table()` emits a sketch's `count`/`estimate`, never its DDSketch or
+            // HyperLogLog state, so there is no shape to invert; `aggregate` over the raw kind
+            // is how a script gets one.
             "distribution" => {
                 return Err(not_constructible(
                     path,
@@ -570,9 +559,8 @@ fn not_constructible(path: &str, name: &str, why: &str) -> mlua::Error {
     ))
 }
 
-/// A `histogram`'s or `exponential_histogram`'s `temporality`: the one enum field that is
-/// *required*, because core documents no default for it (ADR `lua-event-constructor` -- a `sum`
-/// has `MetricKind::counter`'s delta, these have nothing to fall back on).
+/// A `histogram`'s or `exponential_histogram`'s `temporality`: the one required enum field,
+/// because core documents no default for these kinds (a `sum` has `MetricKind::counter`'s).
 fn temporality_field(t: &Table, path: &str) -> mlua::Result<Temporality> {
     enum_field(
         t.raw_get("temporality")?,
@@ -585,9 +573,8 @@ fn temporality_field(t: &Table, path: &str) -> mlua::Result<Temporality> {
     .ok_or_else(|| required(path, "temporality"))
 }
 
-/// One `{bound=, count=}` row of a `histogram`'s `buckets` (`metric_to_table`'s `Histogram`
-/// arm). `path` yields the row's own path (`metrics[i].buckets[k]`); it is built once here since
-/// `expect_keys` needs it up front -- the same one-`String`-per-row cost the exemplar loop pays.
+/// One `{bound=, count=}` row of a `histogram`'s `buckets`. The row's path is built up front
+/// because `expect_keys` needs it, one `String` per row as in the exemplar loop.
 fn bucket_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(f64, u64)> {
     let row = row_table(value, path)?;
     let path = path();
@@ -597,9 +584,9 @@ fn bucket_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(
     Ok((bound, count))
 }
 
-/// One `{quantile=, value=}` row of a `summary`'s `quantiles`. `quantile` is held to `[0, 1]`,
-/// the range OTLP gives `SummaryDataPoint.ValueAtQuantile.quantile` and the only one a quantile
-/// means anything in. The rows need not be sorted: neither `Summary` nor OTLP orders them.
+/// One `{quantile=, value=}` row of a `summary`'s `quantiles`. `quantile` is held to `[0, 1]`, as
+/// OTLP's `SummaryDataPoint.ValueAtQuantile.quantile` is. Rows need not be sorted: neither
+/// `Summary` nor OTLP orders them.
 fn quantile_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result<(f64, f64)> {
     let row = row_table(value, path)?;
     let path = path();
@@ -615,23 +602,20 @@ fn quantile_from_row(value: LuaValue, path: &dyn Fn() -> String) -> mlua::Result
     Ok((quantile, value))
 }
 
-/// The layout `Histogram` documents and `logit-proto`'s OTLP encoder relies on, checked over the
-/// parsed `buckets` of the metric at `path` once every row has passed [`bucket_from_row`]:
-/// bounds strictly increasing, and `math.huge` only as the last row's bound. The encoder splits
-/// the rows into `explicit_bounds` (the finite bounds) and `bucket_counts` (every count), and
-/// OTLP requires the latter to be exactly one longer than the former with the extra count last:
-/// a `+Inf` row anywhere else would shift every count after it onto the wrong bound on the wire,
-/// and a missing one would ship equal-length arrays no receiver accepts. A duplicate or
-/// out-of-order bound is caught here rather than left for `aggregate`'s bitwise layout match to
-/// silently never merge.
+/// Checks the parsed `buckets` against the layout `Histogram` documents and `logit-proto`'s OTLP
+/// encoder relies on: bounds strictly increasing, and `math.huge` only as the last bound.
 ///
-/// A non-empty sequence whose last bound is finite gets `(f64::INFINITY, 0)` appended: the
-/// overflow bucket with no observations. This is the one normalisation the constructor performs.
-/// It loses nothing -- a script that listed only finite bounds observed nothing above the last
-/// one, so the count it would have written is 0 -- and it is what keeps the OTLP shape valid.
-/// `to_table()` always emits the `+Inf` row, so `Event.new(e:to_table())` never takes this path;
-/// an *empty* `buckets` stays empty, because that is what `to_table()` emits for an empty
-/// histogram and appending to it would break that round-trip.
+/// The encoder splits rows into `explicit_bounds` (finite bounds) and `bucket_counts` (every
+/// count), and OTLP needs one more count than bounds, the extra one last. A `+Inf` row elsewhere
+/// would shift later counts onto the wrong bounds; a missing one ships arrays no receiver
+/// accepts. A duplicate or out-of-order bound would never match in `aggregate`'s bitwise layout
+/// comparison, so it's rejected here.
+///
+/// A non-empty list whose last bound is finite gets `(f64::INFINITY, 0)` appended, the
+/// constructor's one normalization. It loses nothing, since a script that listed only finite
+/// bounds observed nothing above the last. `to_table()` always emits the `+Inf` row, so a
+/// round trip never takes this path, and an empty `buckets` stays empty, as `to_table()` emits
+/// for an empty histogram.
 fn validate_buckets(buckets: &mut Vec<(f64, u64)>, path: &str) -> mlua::Result<()> {
     let len = buckets.len();
     let mut prev: Option<f64> = None;
@@ -675,9 +659,8 @@ fn row_table<'lua>(value: LuaValue<'lua>, path: &dyn Fn() -> String) -> mlua::Re
     }
 }
 
-/// An `exponential_histogram`'s `positive`/`negative` table, `exp_buckets_table`'s
-/// `{offset=, counts=[...]}`: required, strict about its keys, and `counts` is required even
-/// when empty (an empty side is what `to_table()` emits for one).
+/// An `exponential_histogram`'s `positive`/`negative` table, `{offset=, counts=[...]}`:
+/// required, with `counts` required even when empty, as `to_table()` emits it.
 fn exp_buckets_from_table(value: LuaValue, path: &str, key: &str) -> mlua::Result<(i32, Vec<u64>)> {
     let table = match value {
         LuaValue::Nil => return Err(required(path, key)),
@@ -719,11 +702,10 @@ fn exemplar_from_table(t: Table, path: &str) -> mlua::Result<Exemplar> {
     Ok(Exemplar { timestamp, value, trace, filtered_attributes })
 }
 
-/// Builds a [`SpanRecord`] from a table in `span_to_table`'s shape. `path` is the table's own
-/// path (`span`); `start` is the event's already-parsed `timestamp`, which is the span's start
-/// (`SpanRecord::end_timestamp`'s doc) -- the default for `end_timestamp` and the floor it is
-/// checked against, the same `end < start` rule `trace_context`'s `span:` block applies to a
-/// lifted span (`crates/logit-transforms/src/trace_context.rs`).
+/// Builds a [`SpanRecord`] from a table in `span_to_table`'s shape.
+///
+/// `start` is the event's `timestamp`, the span's start: the `end_timestamp` default and its
+/// floor, the same `end < start` rule `trace_context`'s `span:` block applies.
 fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord> {
     expect_keys(&t, SPAN_KEYS, path)?;
     let trace_id = required_hex_id(t.raw_get("trace_id")?, path, "trace_id", parse_trace_id)?;
@@ -731,8 +713,7 @@ fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord>
     let parent_span_id =
         hex_id_field(t.raw_get("parent_span_id")?, path, "parent_span_id", parse_span_id, true)?;
     let name = match t.raw_get::<_, LuaValue>("name")? {
-        // As `log.message`: a `Value::Null` name is an absent key in `to_table()`'s output and
-        // comes back as missing -- the ADR's recorded residual.
+        // As `log.message`, a `Value::Null` name comes back missing: the ADR's residual.
         LuaValue::Nil => return Err(required(path, "name")),
         value => value_field(value, path, "name")?,
     };
@@ -759,9 +740,8 @@ fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord>
         )));
     }
     let flags = u32_field(t.raw_get("flags")?, path, "flags")?;
-    // `SpanExt` is boxed only when something in it is non-default -- `crates/logit-proto`'s
-    // `ext_from_wire` rule -- so a minimal constructed span costs what a minimal decoded one
-    // does, and `to_table()`'s `nil`/`0` for an `ext`-less span rebuilds as `ext: None`.
+    // `SpanExt` is boxed only when non-default, `logit-proto`'s `ext_from_wire` rule, so a
+    // minimal span costs what a decoded one does and an `ext`-less span rebuilds as `ext: None`.
     let ext = SpanExt {
         status_message: bytes_field(t.raw_get("status_message")?, path, "status_message")?,
         trace_state: bytes_field(t.raw_get("trace_state")?, path, "trace_state")?,
@@ -782,9 +762,8 @@ fn span_from_table(t: Table, path: &str, start: i64) -> mlua::Result<SpanRecord>
         )?,
     };
     let ext = (ext != SpanExt::default()).then(|| Box::new(ext));
-    // Each row's parser needs its `span.events[i]`/`span.links[i]` path up front for
-    // `expect_keys`, so it is built once per row -- the same one-`String`-per-row cost the
-    // exemplar and bucket loops pay -- while every scalar beneath stays lazy.
+    // Each row's path is built up front for `expect_keys`, one `String` per row as in the
+    // exemplar and bucket loops; scalar paths beneath stay lazy.
     let events = optional_sequence_field(t.raw_get("events")?, path, "events", |value, path| {
         span_event_from_table(row_table(value, path)?, &path())
     })?;
@@ -824,10 +803,8 @@ fn span_event_from_table(t: Table, path: &str) -> mlua::Result<SpanEvent> {
     Ok(SpanEvent { timestamp, name, attributes, dropped_attributes_count })
 }
 
-/// Builds a [`SpanLink`] from a table in `span_link_to_table`'s shape. `path` is the row's own
-/// path (`span.links[i]`). Unlike a log's or exemplar's trace context, a link's `trace_id` and
-/// `span_id` are both required: a link *is* a reference to another span, so there is no
-/// "trace only" shape for it.
+/// Builds a [`SpanLink`] from a table in `span_link_to_table`'s shape. Unlike a log's trace
+/// context, both `trace_id` and `span_id` are required: a link references a span.
 fn span_link_from_table(t: Table, path: &str) -> mlua::Result<SpanLink> {
     expect_keys(&t, SPAN_LINK_KEYS, path)?;
     let trace_id = required_hex_id(t.raw_get("trace_id")?, path, "trace_id", parse_trace_id)?;
@@ -842,11 +819,9 @@ fn span_link_from_table(t: Table, path: &str) -> mlua::Result<SpanLink> {
 
 // -- shared helpers -----------------------------------------------------------------------------
 //
-// Each takes the `path` of the table it's reading (`""` at the top level) and the `key` within
-// it separately, and only joins them (`dotted`) on the error path: a constructed event's
-// success path allocates nothing for messages it never raises (the `lua: Event.new ..` pins in
-// `crates/logit-bench/tests/allocations.rs`), and the metric/exemplar/span parsers pass
-// `metrics[i]`, `metrics[i].exemplars[j]`, `span`, `span.events[i]`, ... as `path` unchanged.
+// Each takes the table's `path` (`""` at the top level) and the `key` separately and joins them
+// (`dotted`) only on the error path, so a successful construction allocates nothing for messages
+// (the `lua: Event.new ..` pins in `crates/logit-bench/tests/allocations.rs`).
 
 fn runtime_error(message: String) -> mlua::Error {
     mlua::Error::RuntimeError(message)
@@ -856,9 +831,7 @@ fn required(path: &str, key: &str) -> mlua::Error {
     runtime_error(format!("Event.new: {} is required", dotted(path, key)))
 }
 
-/// A field that must be a sequence (`validated_sequence_len`'s contiguous-from-one rule) but is
-/// either a non-table or a table with other keys: `metrics`, a metric's `exemplars`/`values`/
-/// `members`/`buckets`/`quantiles`, an exponential histogram side's `counts`.
+/// The error for a field that must be a `1..=n` sequence (`validated_sequence_len`) but isn't.
 fn not_a_sequence(path: &str, key: &str) -> mlua::Error {
     runtime_error(format!("Event.new: {} must be a contiguous array-like table", dotted(path, key)))
 }
@@ -929,9 +902,8 @@ fn describe(path: &str) -> &str {
     }
 }
 
-/// Rejects any key of `t` that isn't in `allowed` -- `Event.new: <path>.<key> is not a field`
-/// -- and any non-string key at all. Iterates with `Table::pairs`, which is raw in mlua 0.9
-/// (`lua_next` under the hood, see the module doc), matching the `raw_get` reads that follow.
+/// Rejects any key of `t` not in `allowed`, and any non-string key. `Table::pairs` is raw in
+/// mlua 0.9 (see the module doc), matching the `raw_get` reads that follow.
 fn expect_keys(t: &Table, allowed: &[&str], path: &str) -> mlua::Result<()> {
     expect_keys_of(t, &[allowed], path)
 }
@@ -956,9 +928,8 @@ fn expect_keys_of(t: &Table, allowed: &[&[&str]], path: &str) -> mlua::Result<()
     Ok(())
 }
 
-/// The `event.timestamp` rule and wording (`crate::proxy`'s `__newindex`): a string of decimal
-/// digits, never a Lua number, since an IEEE-754 double can't hold a unix-nanos value exactly.
-/// The caller handles `nil` (required or defaulted, per field).
+/// The `event.timestamp` write rule: a string of decimal digits, never a Lua number, which can't
+/// hold a unix-nanos value exactly. The caller handles `nil`.
 fn nanos_string(value: LuaValue, path: &str, key: &str) -> mlua::Result<i64> {
     let LuaValue::String(s) = value else {
         return Err(runtime_error(format!(
@@ -988,9 +959,8 @@ fn boolean_field(t: &Table, path: &str, key: &str) -> mlua::Result<()> {
     }
 }
 
-/// A non-negative integer that fits a `u32`, defaulting to `0` for `nil`. A Lua integer or an
-/// integral float (LuaJIT's dual-number mode usually canonicalizes the latter to the former
-/// already, but a value that arrives as a `Number` is still accepted when it's whole).
+/// A non-negative integer that fits a `u32`, `0` for `nil`. A whole `Number` is accepted too:
+/// LuaJIT usually hands one back as an integer, but not always.
 fn u32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u32> {
     let reject = |got: String| {
         runtime_error(format!(
@@ -1009,10 +979,8 @@ fn u32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u32> {
     }
 }
 
-/// A *required* non-negative integer that fits a `u64` (a histogram bucket's or a summary's
-/// `count`, an exponential histogram's `zero_count`/`count`): `nil` is "is required", and
-/// anything else goes through [`count`]. Unlike [`u32_field`], no default: core documents none
-/// for any of these.
+/// A required non-negative `u64` (a bucket's or summary's `count`, an exponential histogram's
+/// `zero_count`/`count`). No default, unlike [`u32_field`]: core documents none.
 fn count_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u64> {
     match value {
         LuaValue::Nil => Err(required(path, key)),
@@ -1020,10 +988,9 @@ fn count_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<u64> {
     }
 }
 
-/// [`u32_field`]'s rule widened to `u64` and with a lazily built field name (an exponential
-/// histogram's `counts[k]` element costs no `format!` on the success path): a Lua integer that
-/// is `>= 0`, or an integral float in `[0, 2^64)`. `to_table()` emits every count `as i64`, so
-/// a round-trip arrives as a Lua integer; the float arm is for a script that computed one.
+/// [`u32_field`]'s rule widened to `u64`, with a lazy field name so a `counts[k]` element costs
+/// no `format!` on success: an integer `>= 0`, or an integral float in `[0, 2^64)`.
+/// `to_table()` emits counts as integers; the float arm is for a script that computed one.
 fn count(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<u64> {
     let reject = |got: String| {
         runtime_error(format!("Event.new: {} must be a non-negative integer, got {got}", field()))
@@ -1040,9 +1007,8 @@ fn count(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<u64> {
     }
 }
 
-/// An `exponential_histogram`'s `scale`: an [`i32_field`] further held to `[-10, 20]`, the range
-/// OTLP gives `ExponentialHistogramDataPoint.scale` (the parse error names `i32`'s range, so
-/// the range check has its own message).
+/// An `exponential_histogram`'s `scale`: an [`i32_field`] held to `[-10, 20]`, OTLP's range for
+/// `ExponentialHistogramDataPoint.scale`, with its own message.
 fn scale_field(value: LuaValue, path: &str) -> mlua::Result<i32> {
     let scale = i32_field(value, path, "scale")?;
     if !(-10..=20).contains(&scale) {
@@ -1054,8 +1020,7 @@ fn scale_field(value: LuaValue, path: &str) -> mlua::Result<i32> {
     Ok(scale)
 }
 
-/// A *required* integer that fits an `i32` (an exponential histogram's `scale`, a side's
-/// `offset`): a Lua integer or an integral float within `i32`'s range, negatives included.
+/// A required integer, or integral float, that fits an `i32` (`scale`, a side's `offset`).
 fn i32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<i32> {
     let reject = |got: String| {
         runtime_error(format!(
@@ -1078,12 +1043,12 @@ fn i32_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<i32> {
     }
 }
 
-/// An enum-valued field named by its lowercase name: `nil` is `None` (the caller decides whether
-/// that is a default or `required`), a string is looked up through `parse` (one of the
-/// `from_name`s `logit-core` provides), anything else is an error listing `names` (the matching
-/// `NAMES` table) so the message can't drift from the enum. `optional` says whether the messages
-/// offer `nil`: a *required* field ([`temporality_field`]) must not tell the author nil is
-/// allowed and then reject it as missing.
+/// An enum field given by lowercase name, parsed with a core `from_name`; `nil` is `None` for the
+/// caller to default or require.
+///
+/// An unknown name's error lists `names`, the enum's `NAMES`, so the message can't drift from the
+/// enum. `optional` decides whether the messages offer `nil`, so a required field
+/// ([`temporality_field`]) doesn't suggest `nil` and then reject it.
 fn enum_field<T>(
     value: LuaValue,
     path: &str,
@@ -1114,11 +1079,9 @@ fn enum_field<T>(
     }
 }
 
-/// The log proxy's trace-context rule, applied to three fields read at once: `trace_id` is the
-/// gate (absent means no [`TraceRef`] at all), `span_id`/`trace_flags` without it are the same
-/// error `event.log.span_id = ..` raises before a `trace_id` is set, and each id goes through
-/// [`hex_id_field`]. `path` is the record's path (`log`, `metrics[i].exemplars[j]`), not a
-/// field's.
+/// The log proxy's trace-context rule over three fields at once: no `trace_id` means no
+/// [`TraceRef`], and `span_id`/`trace_flags` without one is the error
+/// `event.log.span_id = ..` raises. `path` is the record's (`log`, `metrics[i].exemplars[j]`).
 fn trace_ref_from_fields(
     trace_id: LuaValue,
     span_id: LuaValue,
@@ -1156,11 +1119,9 @@ fn trace_ref_from_fields(
     Ok(Some(TraceRef { trace_id, span_id, flags }))
 }
 
-/// A hex id field -- a trace id or a span id, `parse` being `logit_core::trace`'s
-/// `parse_trace_id`/`parse_span_id` (exact length, hex, not all-zero): `nil` is `None`, and the
-/// caller decides whether that is a default (a log's trace context, a span's `parent_span_id`)
-/// or "is required" ([`required_hex_id`]). `optional` only shapes the wording, so a required
-/// id's error doesn't offer `nil` as a choice.
+/// A hex trace or span id, parsed by `logit_core::trace`'s `parse_trace_id`/`parse_span_id`
+/// (exact length, hex, not all-zero). `nil` is `None`; `optional` only shapes the wording, so a
+/// required id's ([`required_hex_id`]) error doesn't offer `nil`.
 fn hex_id_field<const N: usize>(
     value: LuaValue,
     path: &str,
@@ -1197,9 +1158,8 @@ fn required_hex_id<const N: usize>(
     hex_id_field(value, path, key, parse, false)?.ok_or_else(|| required(path, key))
 }
 
-/// An optional opaque-bytes field (a span's `status_message`/`trace_state`, a link's
-/// `trace_state`): `nil` is `None`, a Lua string is copied as-is, UTF-8 or not -- `to_table()`
-/// emits these straight from the record's `Bytes`, so this is the exact inverse.
+/// An optional opaque-bytes field (`status_message`, `trace_state`): a Lua string is copied
+/// as-is, UTF-8 or not, the inverse of `to_table()`'s straight copy of the record's `Bytes`.
 fn bytes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<Bytes>> {
     match value {
         LuaValue::Nil => Ok(None),
@@ -1212,17 +1172,15 @@ fn bytes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<By
     }
 }
 
-/// A field holding an arbitrary [`Value`] (`log.message`, a span's and a span event's `name`),
-/// converted the way a fresh attribute write is (`lua_to_value`) -- so a Lua string becomes
-/// `Str`, an integer `I64`, an empty table an empty `Map`: the flattening ADR
-/// `lua-event-constructor` records. The one thing checked up front is the Lua *type*, so the
-/// error names this field rather than `lua_to_value`'s generic "attribute value" wording.
+/// A field holding any [`Value`] (`log.message`, a span's or span event's `name`), converted as
+/// a fresh attribute write is (`lua_to_value`): a string becomes `Str`, an integer `I64`, `{}` a
+/// `Map`, the flattening `docs/adr/lua-event-constructor.md` records. The Lua type is checked
+/// first so the error names this field.
 fn value_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Value> {
     value_at(value, || dotted(path, key))
 }
 
-/// [`value_field`] with a lazily built field name, the split [`finite`] makes for the same
-/// reason: an attribute entry costs no `format!` on the success path.
+/// [`value_field`] with a lazy field name, so an attribute entry costs no `format!` on success.
 fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Value> {
     match value {
         LuaValue::Nil
@@ -1239,9 +1197,8 @@ fn value_at(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<Val
     }
 }
 
-/// An optional interned-string field (`log.event_name`, a metric's `unit`/`description`):
-/// `nil` is `None`, a string is interned -- the same cardinality caution the proxy's writes to
-/// these fields carry.
+/// An optional interned-string field (`log.event_name`, a metric's `unit`/`description`). The
+/// string is interned, with the cardinality caution the proxy's writes to these carry.
 fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<Symbol>> {
     match value {
         LuaValue::Nil => Ok(None),
@@ -1254,9 +1211,7 @@ fn symbol_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<S
     }
 }
 
-/// A required finite number (a `sum`/`gauge`/exemplar `value`, a summary's `sum`, an
-/// exponential histogram's `zero_threshold`): `nil` is "is required", and anything else goes
-/// through [`finite`].
+/// A required finite number (a `value`, a summary's `sum`, `zero_threshold`).
 fn finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     match value {
         LuaValue::Nil => Err(required(path, key)),
@@ -1264,9 +1219,7 @@ fn finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     }
 }
 
-/// An optional finite number (a histogram's or exponential histogram's `sum`/`min`/`max`, which
-/// `to_table()` emits as `nil` when the record has `None`): `nil` is `None`, anything else goes
-/// through [`finite`].
+/// An optional finite number (a histogram's `sum`/`min`/`max`, `nil` in `to_table()` for `None`).
 fn optional_finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Option<f64>> {
     match value {
         LuaValue::Nil => Ok(None),
@@ -1274,11 +1227,9 @@ fn optional_finite_field(value: LuaValue, path: &str, key: &str) -> mlua::Result
     }
 }
 
-/// A histogram bucket's `bound`: required, and the one field anywhere in `Event.new` that may
-/// be non-finite -- but only as `+inf`. `Histogram`'s last bucket is conventionally
-/// `(f64::INFINITY, n)` (Prometheus's `+Inf` bucket, OTLP's implicit overflow bucket), and
-/// `to_table()` emits that bound as the Lua number `math.huge`, so it has to come back in for
-/// the round-trip to hold. NaN and `-math.huge` are rejected as everywhere else.
+/// A histogram bucket's required `bound`, the one field that may be non-finite, and only as
+/// `math.huge`: `to_table()` emits the overflow bucket's bound (Prometheus's `+Inf`, OTLP's
+/// implicit overflow) that way. NaN and `-math.huge` are rejected.
 fn bound_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     match value {
         LuaValue::Nil => Err(required(path, key)),
@@ -1291,10 +1242,9 @@ fn bound_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<f64> {
     }
 }
 
-/// The rule `crate::proxy`'s `require_finite_number` applies to a `value` write, with a lazily
-/// built field name so a `values[k]` element costs no `format!` on the success path: a Lua
-/// integer or number that is finite. NaN and the infinities are rejected as loudly as a string
-/// is, rather than stored into a metric a sink or `aggregate` would then have to defend against.
+/// `crate::proxy`'s `require_finite_number` rule, with a lazy field name so a `values[k]` element
+/// costs no `format!` on success. NaN and the infinities are errors, not values a sink or
+/// `aggregate` must then defend against.
 fn finite(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<f64> {
     let v = match value {
         LuaValue::Integer(i) => i as f64,
@@ -1316,8 +1266,7 @@ fn finite(value: LuaValue, field: impl FnOnce() -> String) -> mlua::Result<f64> 
     Ok(v)
 }
 
-/// An optional attributes table (the top level's `attributes`, an exemplar's): `nil` is empty,
-/// a table goes through [`attributes_from_table`].
+/// An optional attributes table; `nil` is empty.
 fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<AttrMap> {
     match value {
         LuaValue::Nil => Ok(AttrMap::new()),
@@ -1330,16 +1279,14 @@ fn attributes_field(value: LuaValue, path: &str, key: &str) -> mlua::Result<Attr
     }
 }
 
-/// An [`AttrMap`] from a table of string keys. Stricter than `event.attributes.x = {..}`'s
-/// `lua_table_to_attrmap`, which coerces a numeric key to its decimal string the way mlua's
-/// `String` conversion does and surfaces a non-UTF-8 key as mlua's own conversion error: a
-/// constructor's input is `to_table()`'s output, where every attribute key is a UTF-8 string,
-/// so either is a mistake worth naming with the table's path. One raw pass: each key is checked,
-/// then its value goes through [`value_at`] so a bad value is `Event.new: <path>.<key>.<k>
-/// ...` too -- every path here is built only on an error path, so the walk allocates nothing
-/// beyond the map itself (the `lua:` pin in `crates/logit-bench/tests/allocations.rs` holds it
-/// to that). A nested table still converts through the shared `lua_to_value`, so a malformed
-/// value *inside* one reports that helper's unprefixed attribute-conversion error.
+/// An [`AttrMap`] from a table of UTF-8 string keys.
+///
+/// Stricter than `lua_table_to_attrmap`, which coerces a numeric key to a string: `to_table()`
+/// only emits UTF-8 string keys, so any other key is a mistake worth naming with its path. A bad
+/// value reports `Event.new: <path>.<key>.<k> ...` through [`value_at`]. Paths are built only on
+/// error, so the walk allocates nothing beyond the map (the `lua:` pins in
+/// `crates/logit-bench/tests/allocations.rs`). A value inside a nested table reports
+/// `lua_to_value`'s unprefixed error.
 fn attributes_from_table(t: Table, path: &str, key: &str) -> mlua::Result<AttrMap> {
     let mut map = AttrMap::new();
     for pair in t.pairs::<LuaValue, LuaValue>() {
@@ -1392,8 +1339,7 @@ mod tests {
         }
     }
 
-    /// As `lib.rs`'s own `process_err` helper -- `ProcessOutcome` isn't `Debug`, so
-    /// `Result::unwrap_err` doesn't work directly on `ScriptWorker::process`'s return value.
+    /// `unwrap_err` for `process`, whose `ProcessOutcome` isn't `Debug`.
     fn process_err(w: &ScriptWorker, event: Event) -> String {
         match w.process(event) {
             Err(err) => err.to_string(),
@@ -1422,11 +1368,9 @@ mod tests {
         }
     }
 
-    /// Attributes whose every `Value` variant survives `to_table()` and back unchanged: `Str`,
-    /// `I64`, a *fractional* `F64` (an integral one is canonicalized to a Lua integer by LuaJIT
-    /// and comes back `I64`), `Bool`. The shapes that flatten (`U64`, `Timestamp`, UTF-8
-    /// `Bytes`, an `I64` past 2^53, an integral `F64`) are the ADR's recorded residuals -- see
-    /// the two tests named for them below.
+    /// Attributes of the variants that survive `to_table()` and back: `Str`, `I64`, a fractional
+    /// `F64`, `Bool`. The ones that flatten (`U64`, `Timestamp`, UTF-8 `Bytes`, an `I64` past
+    /// 2^53, an integral `F64`) are the ADR's residuals, tested below.
     fn round_trippable_attributes() -> AttrMap {
         let mut attrs = AttrMap::new();
         attrs.insert("host", "web-01");
@@ -1444,10 +1388,8 @@ mod tests {
         )
     }
 
-    /// `proxy.rs`'s `metric_record`: non-default values on every kind-independent field (unit,
-    /// description, start_timestamp, flags, one exemplar carrying a full trace context --
-    /// `flags` included, which is what `exemplar_to_table`'s `trace_flags` exists for -- and an
-    /// attribute) -- callers fill in `kind`.
+    /// `proxy.rs`'s `metric_record`: every kind-independent field non-default, including one
+    /// exemplar with a full trace context (flags too) and an attribute. Callers fill in `kind`.
     fn metric_record(kind: MetricKind) -> MetricRecord {
         let mut record = MetricRecord::new(intern("test.metric"), kind);
         record.unit = Some(intern("ms"));
@@ -1490,8 +1432,7 @@ mod tests {
     }
 
     /// `proxy.rs`'s `histogram_kind` plus the trailing `+Inf` bucket a Prometheus/OTLP
-    /// histogram carries: `to_table()` emits that bound as `math.huge`, and the round-trip
-    /// below is what proves `bound_field` lets it back in.
+    /// histogram carries, which `to_table()` emits as `math.huge`.
     fn histogram_kind() -> MetricKind {
         MetricKind::Histogram(Histogram {
             buckets: vec![(1.0, 3), (5.0, 7), (f64::INFINITY, 2)],
@@ -1526,9 +1467,8 @@ mod tests {
     }
 
     /// `proxy.rs`'s `span_record_with_everything`: every `SpanRecord` field non-default, `ext`
-    /// fully populated, one event and one link each carrying attributes. Every value in it is
-    /// one `to_table()` emits losslessly (`Value::str` names; `Str`/`Bool` attributes), so the
-    /// whole-event round-trip below can `assert_eq!` against it.
+    /// full, one event and one link with attributes, every value one `to_table()` emits
+    /// losslessly.
     fn span_record_with_everything() -> SpanRecord {
         SpanRecord {
             trace_id: [1; 16],
@@ -1598,7 +1538,7 @@ mod tests {
     }
 
     /// `process()`'s result for `Event.new{timestamp = "5", span = {<the minimal ids and name>,
-    /// <fields>}}` -- the span-side twin of [`mint_metric`].
+    /// <fields>}}`.
     fn mint_span(fields: &str) -> Event {
         let w = worker(&format!(
             r#"function process(event) return Event.new{{timestamp = "5", span = {{trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "minimal", {fields}}}}} end"#
@@ -1606,15 +1546,12 @@ mod tests {
         emitted(w.process(Event::empty(0, AttrMap::new())).unwrap())
     }
 
-    /// The error for `Event.new{timestamp = "5", span = {<fields>}}` -- no ids or name filled
-    /// in, so a test names exactly the fields it means to.
+    /// The error for `Event.new{timestamp = "5", span = {<fields>}}`, no ids or name filled in.
     fn span_err(fields: &str) -> String {
         new_err(&format!(r#"{{timestamp = "5", span = {{{fields}}}}}"#))
     }
 
-    /// A one-record metric event with `name = "m"` and the given literal fields, minted from
-    /// `timestamp = "1"` and no attributes -- the shape every "this literal yields this record"
-    /// test below asserts against.
+    /// A one-record metric event with `name = "m"` and the given fields, at `timestamp = "1"`.
     fn minted_metric(record: MetricRecord) -> Event {
         Event::metric(1, AttrMap::new(), record)
     }
@@ -1643,10 +1580,8 @@ mod tests {
         assert_eq!(out, log_event());
     }
 
-    /// The flattening residual ADR `lua-event-constructor` records: a constructed value has no
-    /// existing `Value` to compare against, so the no-op-assignment identity rule
-    /// (`docs/adr/lua-value-identity-preservation.md`) can't apply -- a `U64` attribute comes
-    /// back as the `I64` any fresh Lua integer becomes.
+    /// A recorded residual: a constructed value has no existing `Value` for the no-op rule to
+    /// compare against, so a `U64` attribute comes back `I64`.
     #[test]
     fn new_of_to_table_flattens_a_u64_attribute_to_i64() {
         let w = worker(REBUILD);
@@ -1656,10 +1591,9 @@ mod tests {
         assert_eq!(out.attributes.get("count"), Some(&Value::I64(5)));
     }
 
-    /// The other two attribute residuals `docs/design/lua-api.md` lists: an `I64` past 2^53 is
-    /// emitted by `to_table()` as a decimal string (`exact_i64_to_lua`'s fallback, the branch
-    /// `Timestamp` takes) and comes back `Str`; an integral `F64` is a Lua number LuaJIT's
-    /// dual-number mode canonicalizes to an integer, so it comes back `I64`.
+    /// Two more residuals `docs/design/lua-api.md` lists: an `I64` past 2^53 reaches Lua as a
+    /// string and comes back `Str`; an integral `F64` reaches it as an integer and comes back
+    /// `I64`.
     #[test]
     fn new_of_to_table_flattens_a_wide_i64_to_str_and_an_integral_f64_to_i64() {
         let w = worker(REBUILD);
@@ -1784,10 +1718,8 @@ mod tests {
         assert_eq!(flushed[0].1, Some(0));
     }
 
-    /// The documented top-level caveat: `Event.new` during the script's own top-level run sees
-    /// the empty target list `with_targets` has not yet replaced, so the event it built can't be
-    /// routed later even on a router -- the same "declares no targets" wording an unrouted
-    /// component gives.
+    /// The documented caveat: an `Event.new` in top-level code sees the empty target list, so
+    /// the event can't be routed later, with the "declares no targets" wording.
     #[test]
     fn a_top_level_constructed_event_sees_the_empty_target_list() {
         let w = routing_worker(
@@ -1967,8 +1899,7 @@ mod tests {
         assert!(err.contains("Event.new: attributes has a non-UTF-8 key"), "got: {err}");
     }
 
-    /// A bad attribute *value* is prefixed and located like every other mistake, rather than
-    /// surfacing `lua_to_value`'s bare "can't use a Lua function as an event attribute value".
+    /// A bad attribute value gets the `Event.new: <path>` prefix, not `lua_to_value`'s bare error.
     #[test]
     fn a_bad_attribute_value_names_its_dotted_path() {
         let err = new_err(r#"{timestamp = "1", attributes = {cb = tostring}}"#);
@@ -2006,9 +1937,8 @@ mod tests {
         assert_eq!(out, metric_event(gauge_kind()));
     }
 
-    /// The non-finite residual `docs/design/lua-api.md` records: `prometheus_in` and `otlp_in`
-    /// both admit a NaN/infinite point, `to_table()` emits the raw float, and the finiteness
-    /// rule refuses it on the way back -- a rebuild must fix or drop the value.
+    /// A recorded residual: `prometheus_in`/`otlp_in` admit a NaN or infinite point that
+    /// `to_table()` emits and `Event.new` refuses, so a rebuild must fix or drop it.
     #[test]
     fn new_of_to_table_rejects_a_non_finite_gauge_value() {
         let w = worker(REBUILD);
@@ -2044,10 +1974,7 @@ mod tests {
         assert_eq!(out.metrics[1].kind, gauge_kind());
     }
 
-    /// The `exemplar_to_table` addition this workstream makes: without `trace_flags` in the
-    /// table, a flagged exemplar would rebuild with `flags: 0` and the whole-event round-trips
-    /// above would fail. Proven from a literal too, so the field is known to be *read*, not
-    /// just emitted.
+    /// An exemplar's `trace_flags` is read from a literal, not only emitted by `to_table()`.
     #[test]
     fn an_exemplar_round_trips_its_trace_flags() {
         let out = mint_metric(
@@ -2319,8 +2246,7 @@ mod tests {
 
     #[test]
     fn new_of_to_table_round_trips_a_histogram_metric_event_whole() {
-        // The fixture's last bucket is `(f64::INFINITY, _)`, so this also proves `math.huge`
-        // makes it back in as a bound.
+        // The fixture's last bound is `math.huge`, so this also covers `bound_field`.
         let w = worker(REBUILD);
         let out = emitted(w.process(metric_event(histogram_kind())).unwrap());
         assert_eq!(out, metric_event(histogram_kind()));
@@ -2409,8 +2335,7 @@ mod tests {
 
     #[test]
     fn a_summary_quantile_must_lie_in_the_unit_interval() {
-        // OTLP's `ValueAtQuantile.quantile` range; both ends are in, and the rows need not be
-        // sorted.
+        // Both ends of `[0, 1]` are in, and the rows need not be sorted.
         for q in ["1.5", "-0.1"] {
             let err = metric_err(&format!(
                 r#"name = "m", kind = "summary", quantiles = {{{{quantile = {q}, value = 3}}}}, count = 1, sum = 3"#
@@ -2512,8 +2437,7 @@ mod tests {
             ),
             "got: {err}"
         );
-        // Two `+Inf` rows: the first is the one that isn't last, and that is the message --
-        // not a confusing "inf must be greater than inf".
+        // Two `+Inf` rows report the one that isn't last, not "inf must be greater than inf".
         let err = histogram_buckets_err(
             "{{bound = 1, count = 1}, {bound = math.huge, count = 2}, {bound = math.huge, count = 3}}",
         );
@@ -2528,8 +2452,7 @@ mod tests {
 
     #[test]
     fn a_histogram_without_an_overflow_bucket_gets_an_empty_one_appended() {
-        // The constructor's one normalisation: only-finite bounds observed nothing above the
-        // last one, so the `+Inf` row OTLP needs is added with count 0.
+        // The one normalization: an only-finite list gets a `+Inf` row with count 0.
         assert_eq!(
             histogram_buckets("{{bound = 1, count = 3}, {bound = 5, count = 2}}"),
             vec![(1.0, 3), (5.0, 2), (f64::INFINITY, 0)]
@@ -2545,8 +2468,7 @@ mod tests {
 
     #[test]
     fn the_pre_aggregated_kinds_are_constructible_and_name_their_first_missing_field() {
-        // The W3 "is not constructible yet" arm is gone: a bare kind now gets as far as its
-        // own required payload.
+        // A bare kind is constructible and fails on its first required payload field.
         for (kind, field) in
             [("histogram", "buckets"), ("exponential_histogram", "scale"), ("summary", "quantiles")]
         {
@@ -2721,8 +2643,6 @@ mod tests {
 
     #[test]
     fn new_of_to_table_round_trips_a_span_event_whole() {
-        // Every `ext` field, `parent_span_id`, a non-default kind/status, an event and a link
-        // with attributes and a `trace_state` -- all of it back, field for field.
         let w = worker(REBUILD);
         let out = emitted(w.process(span_event()).unwrap());
         assert_eq!(out, span_event());
@@ -2771,8 +2691,7 @@ mod tests {
 
     #[test]
     fn an_end_timestamp_equal_to_the_start_is_accepted() {
-        // A zero-duration span is legal (`trace_context` accepts `end == start` too); only an
-        // end *before* the start is rejected.
+        // A zero-duration span is legal, as in `trace_context`.
         let out = mint_span(r#"end_timestamp = "5""#);
         assert_eq!(out.span.as_ref().unwrap().end_timestamp, 5);
     }
@@ -2826,8 +2745,8 @@ mod tests {
 
     #[test]
     fn new_of_to_table_round_trips_a_mixed_event_whole() {
-        // A log, a gauge and a span on one event (`docs/adr/multi-payload-events.md`): the
-        // three parsers compose, and the event's `timestamp` serves as the span's start.
+        // A log, a gauge, and a span on one event (`docs/adr/multi-payload-events.md`); the
+        // event's `timestamp` is the span's start.
         let mut event = log_event();
         event.metrics.push(metric_record(gauge_kind()));
         event.span = Some(span_record_with_everything());
@@ -2836,10 +2755,9 @@ mod tests {
         assert_eq!(out, event);
     }
 
-    /// The two wire-decodable span shapes `docs/design/lua-api.md`'s `### span` residual note
-    /// records: a decoder carries an out-of-order `end_timestamp` and an all-zero id through
-    /// unchecked, `to_table()` emits them as they are, and the constructor's rules refuse them on
-    /// the way back -- a rebuild must fix or drop the field.
+    /// A recorded residual (`docs/design/lua-api.md`'s `### span` note): a decoded span can carry
+    /// an `end_timestamp` before its start or an all-zero id, which `Event.new` refuses, so a
+    /// rebuild must fix or drop the field.
     #[test]
     fn new_of_to_table_rejects_a_wire_span_whose_end_precedes_its_start() {
         let w = worker(REBUILD);
@@ -2923,8 +2841,7 @@ mod tests {
 
     #[test]
     fn an_unknown_span_key_is_not_a_field() {
-        // `attributes` in particular: a span has none of its own (`event.attributes` is the
-        // span's), so it isn't a field here any more than on `event.span`.
+        // A span has no `attributes` of its own; `event.attributes` is the span's.
         let err = span_err(
             r#"trace_id = string.rep("09", 16), span_id = string.rep("08", 8), name = "x", attributes = {}"#,
         );
@@ -2960,8 +2877,6 @@ mod tests {
 
     #[test]
     fn an_empty_span_table_is_missing_its_trace_id() {
-        // The W2 "is not constructible yet" arm is gone: a bare `span = {}` now gets as far as
-        // its own first required field.
         let err = span_err("");
         assert!(!err.contains("not constructible"), "got: {err}");
         assert!(err.contains("Event.new: span.trace_id is required"), "got: {err}");
