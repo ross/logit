@@ -464,7 +464,7 @@ disk-backed sink:
 | `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with an in-memory queue still non-empty — never emitted for a disk-backed sink, which drops nothing at shutdown), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown — never emitted for a disk-backed sink, which spools them all), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
 
 Disk-backed sinks (`DiskQueue`) also emit:
 

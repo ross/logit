@@ -384,3 +384,52 @@ which `segment_bytes` close to `max_bytes` allows, the push evicts every queued 
 past `max_bytes`. `docs/deploying.md` advises keeping `segment_bytes` well under `max_bytes`.
 [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
 "Running it" section lists the tests that pin all of this.
+
+## Amendment: open cleans leaked segments, and a full spool with nothing queued rotates to make room (2026-09-24)
+
+Two ways for `total_bytes` to count bytes no consumer would ever free, and one way for
+"Shutdown" above to lose a batch, closed together.
+
+**`open` removes segments behind the cursor.** `roll_read_cursor` drops a segment from memory
+once the cursor leaves it, even when its unlink fails, and counts the failure
+`disk.errors{op="unlink"}` ([ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+decision 5 says why that's safe). The leaked file used to be re-listed by the next
+`DiskQueue::open`, counted toward `max_bytes`, and never deleted, so enough of them filled the
+bound. `open` now leaves every segment whose sequence number is below the recovered cursor's out
+of `total_bytes` and the segment count, and unlinks it once the cursor is persisted. A failed
+unlink is counted `op="unlink"` and diagnosed under `disk_fs_error`, and the next `open` tries
+again.
+
+**A full spool with nothing queued rotates to make room.** Once the reader has consumed every
+record, the active segment's bytes still count toward `max_bytes`, and the active segment is never
+deleted. With `segment_bytes` close to `max_bytes`, which validation allows, a push whose record
+didn't fit then waited forever under `block`: the full check runs before a push would rotate, so
+the reader parked on `not_empty` and the push on `not_full`, and nothing woke either. Under
+`drop_newest` every later push was dropped. Now a push that finds the spool full with nothing
+queued (the read cursor at the end of the active segment, no head reserved) rotates the active
+segment into a closed, fully consumed one and rolls the cursor off it, which persists the cursor
+and deletes the segment, then re-checks, under every overflow policy. A torn tail is repaired
+first; a failed repair drops the batch as any failed write does. If the rotation fails, the push
+doesn't retry it: `block` and `drop_oldest` write over the bound (there is nothing a consumer
+could free) and `drop_newest` drops. Two changes make a parked `block` push see this state:
+`push` rolls the read cursor under every policy, not only `drop_oldest`, and a commit or eviction
+that leaves nothing queued notifies `not_full`.
+
+This supersedes the last sentence of the previous amendment's `drop_oldest` paragraph: with the
+head segment active, one push still evicts every queued record, but then rotates the consumed
+segment away and writes within the bound. The eviction burst is what `segment_bytes` well under
+`max_bytes` keeps small. Graph validation still accepts `segment_bytes == max_bytes`; it's now
+safe, only bursty under `drop_oldest`.
+
+**The batch a dropped `drain_inbox` was pushing is swept too.** "Shutdown" above says the
+abandoned-inbox sweep appends to the spool what never reached it. A batch `drain_inbox` had
+already received and was pushing, parked on a full `block` spool, was lost with the dropped
+future, neither spooled nor counted. `drain_inbox` now records it in an `in_hand` slot that
+`run_output` owns, cleared in the same poll its push returns, and the sweep takes it before the
+inbox: a disk store spools it and a memory store counts it `reason="shutdown"`. The sweep can so
+exceed `disk.max_bytes` by the channel's capacity plus one batch.
+
+`DiskQueue::finish` is still unbounded: its cursor persist and `fsync`s run after the shutdown
+grace. Dropping the runtime waits for blocking file work anyway, so bounding `finish` alone
+wouldn't bound exit. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+"Running it" section lists the tests that pin this amendment.

@@ -180,8 +180,8 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | findings → #328 |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | findings → #328 |
 | [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | findings → #331 |
-| [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | in-progress (dur/w5) |
-| [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | in-progress (dur/w5) |
+| [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | findings → dur/w5 |
+| [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | findings → dur/w5 |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs:174-536` | unreviewed |
 | [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs:198-232` | unreviewed |
 | [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs:573-744` | unreviewed |
@@ -2257,14 +2257,22 @@ surveyor's.
   `overflow_oldest`, and with the head segment active it evicts every queued record and then
   writes past `max_bytes`. Pinned by
   `drop_oldest_reclaims_space_a_whole_head_segment_at_a_time_and_counts_every_eviction` and
-  `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_writes_over_bound`, and
+  `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_rotates_to_make_room`, and
   documented in the disk ADR and `docs/deploying.md` (keep `segment_bytes` well under
   `max_bytes`). The model proptest `spool_model_every_push_is_delivered_dropped_or_queued` checks
   that every push counts exactly one of queued or dropped. The `Block` concern is confirmed, not
   refuted: when the reader has consumed the active segment and that segment's length plus the next
   record exceeds `max_bytes` (reachable with `segment_bytes` equal to `max_bytes`), the push parks
   on `not_full` and the reader on `not_empty`, and nothing wakes either, because the full check
-  runs before the push would rotate and the active segment is never deleted. Fixed in `dur/w5`.
+  runs before the push would rotate and the active segment is never deleted.
+- **Fixed in `dur/w5` (F5):** a push that finds the spool full with nothing queued now rotates the
+  consumed active segment away and deletes it, under every policy, and a commit that leaves
+  nothing queued wakes a parked push. `push` rolls the cursor under every policy (the "F1 gating"
+  is gone). So with the head segment active, a `drop_oldest` push still evicts every queued record
+  but then writes within `max_bytes`; the W4 pin is renamed
+  `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_rotates_to_make_room`.
+  Pinned by `a_blocked_push_makes_room_by_rotating_a_fully_consumed_active_segment`, its
+  `drop_newest` twin, and `spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake`.
 
 ---
 
@@ -2306,6 +2314,19 @@ surveyor's.
 - **Suggested verification approach:** crash injection at each of {cursor rename, each unlink} with a subsequent
   reopen, asserting no record is lost (duplicates allowed); proptest over multi-segment overshoot.
 - **Priority:** P0 — this is the commit point of the at-least-once contract; an off-by-one deletes undelivered data.
+- **Verified 2026-09-24 (`dur/w5`):** a freeze at every recorded step of a roll (the cursor's
+  write, fsync, rename, and directory fsync, then the unlink) and of `finish`, followed by a reopen
+  and a drain, loses no uncommitted record; only committed ones replay
+  (`a_crash_at_any_point_of_a_segment_roll_loses_no_uncommitted_record`,
+  `a_crash_at_any_point_of_finish_loses_nothing`). Recorded hits show every unlink after the
+  cursor's directory fsync, for a commit, a `drop_oldest` eviction, a rotation to make room, and
+  `open` (`a_segment_is_unlinked_only_after_the_cursor_leaving_it_is_durable`); a failed persist
+  before an unlink costs replay only (`a_failed_cursor_persist_before_an_unlink_loses_nothing_on_reopen`).
+  One finding, fixed: a segment whose unlink failed was re-listed at the next `open`, counted
+  toward `max_bytes`, and never deleted (F4). `open` now leaves every segment behind the cursor out
+  of the bound and unlinks it after persisting the cursor, counted `op="unlink"` on failure
+  (`a_segment_left_behind_by_a_failed_unlink_is_removed_at_the_next_open`). The blocking cursor
+  write inside `commit` is unchanged and still unmeasured.
 
 ---
 
@@ -2438,6 +2459,20 @@ surveyor's.
   a full spool under `overflow: block`.
 - **Priority:** P0 — the shutdown path decides whether spooled data survives, and the ordering here has already
   been fixed once (F3).
+- **Verified 2026-09-24 (`dur/w5`):**
+  `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled` runs drain
+  first, grace expiry, permanent error, and closed and empty under both stores: batches sent equal
+  delivered plus `send_failed` plus `shutdown` plus spooled, and a disk store never counts
+  `shutdown` (so no batch is both spooled and counted). A grace expiry leaves the peeked head
+  uncommitted and it replays (`finish_after_a_peek_without_commit_replays_the_peeked_head_on_reopen`).
+  `Dropped ⇒ commit` is pinned for a disk sink
+  (`a_disk_sink_commits_a_batch_dropped_after_its_retry_budget_so_it_never_replays`) and recorded
+  as decision 7 of the durability ADR. One finding, fixed: a batch `drain_inbox` was pushing into a
+  full `block` store was lost uncounted when `run_output` dropped the future (F3). `drain_inbox`
+  now records it in an `in_hand` slot the sweep takes first
+  (`a_batch_parked_in_a_blocked_push_when_the_drain_is_abandoned_is_spooled_by_the_sweep`; the
+  memory twin now counts 3, not 2). This overlaps cluster 3 (RT-03, lead 11); its fix lives here.
+  `finish` stays unbounded after the grace, documented in the disk ADR's amendment.
 
 ---
 

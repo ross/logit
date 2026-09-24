@@ -226,7 +226,8 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
   temporarily down destination never trips this; only a failure `logit` can identify as a
   configuration problem does.
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
-  Anything still queued at that deadline is dropped and counted.
+  Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
+  counted (a disk-backed sink spools it instead).
 
 ### Sink buffer sizing: `max_bytes` × number of sinks
 
@@ -259,7 +260,7 @@ buffering:
   destination; under `block`, it is also back-pressuring intake.
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
   (a `drop_*` policy dropped something), `send_failed` (retry gave up on a batch), or `shutdown`
-  (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate is data
+  (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 
@@ -287,12 +288,14 @@ real `write` per batch (a `logit_proto::native` encode plus one file append) tha
 queue never pays. Validation rejects a non-default `buffer.max_batches`/`buffer.max_bytes`
 alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it.
 
-**Keep `segment_bytes` well under `max_bytes`,** as the defaults (64MiB and 1GiB) do. The spool
-frees space only by deleting a whole consumed segment. Under `overflow: drop_oldest`, one push
+**Under `overflow: drop_oldest`, keep `segment_bytes` well under `max_bytes`,** as the defaults
+(64MiB and 1GiB) do. The spool frees space only by deleting a whole consumed segment, so one push
 against a full spool can evict every record in the oldest segment, each counted
-`batches.dropped{reason="overflow_oldest"}`, before any space comes back. When the oldest segment
-is also the one being written, which a `segment_bytes` close to `max_bytes` allows, that push
-evicts every queued record and then writes past `max_bytes`.
+`batches.dropped{reason="overflow_oldest"}`, before any space comes back. With `segment_bytes`
+close to `max_bytes`, the oldest segment is also the one being written, and that one push evicts
+every queued record. Any `segment_bytes` is safe under every policy: a push that finds the spool
+full with nothing left to deliver rotates the consumed segment away and deletes it instead of
+waiting or dropping.
 
 **Put the spool directory on a volume that survives the container.** An ephemeral container
 filesystem defeats the point, as it would for any durable state (`tail_in`'s checkpoint file in
