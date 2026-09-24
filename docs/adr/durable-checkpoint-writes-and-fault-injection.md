@@ -192,7 +192,20 @@ script is needed. This list is filled in as each workstream lands.
 
 - **`dur/w1`, the seam, the helper, and spool I/O observability (DISK-04):** to be listed when
   `dur/w1` lands.
-- **`dur/w2`, frame fixed-point properties (DISK-13):** to be listed when `dur/w2` lands.
+- **`dur/w2`, frame fixed-point properties (DISK-13):**
+  `crates/logit-proto/tests/frame_fixed_point.rs`:
+  - `write_then_read_round_trips_every_payload_under_both_compressions` — write/read is the
+    identity on codec, flags, compression, and payload, over generated payloads up to 256 KiB.
+  - `concatenated_frames_read_back_in_order_with_nothing_left_over` — one to eight frames read
+    back in the order they were written, with nothing left in the buffer.
+  - `lz4_expansion_on_incompressible_payloads_stays_within_n_plus_n_over_255_plus_16` — pins the
+    private `MAX_SANE_COMPRESSED_LEN` cap formula from outside the module.
+  - `a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none` — a full 64 MiB payload
+    round-trips at the cap; one byte past it is rejected.
+  - `a_compressed_len_corrupted_below_the_cap_reads_as_truncated` — pins finding F1's premise: a
+    `compressed_len` corrupted below the sanity cap reads as `Truncated`, not `Malformed`.
+  - `a_compressed_len_corrupted_over_the_cap_reads_as_malformed` — the complement: over the cap
+    is always `Malformed`.
 - **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):** to be listed when `dur/w3`
   lands.
 - **`dur/w4`, the spool write path (DISK-03, DISK-05):** to be listed when `dur/w4` lands.
