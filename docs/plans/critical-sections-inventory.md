@@ -221,7 +221,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | in-progress (dur/w4) |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
-| [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | findings → dur/w7 |
+| [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | findings → #326 |
 | [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | in-progress (dur/w2) |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs:874-928` | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs:167-414` | unreviewed |
@@ -2430,7 +2430,7 @@ surveyor's.
   `max_files` (graph rule) if the syscall-storm concern is confirmed.
 - **Priority:** P1 — custom retention logic with real delete/rename ordering, but the commit-point-first redesign
   is already well covered by tests.
-- **Verified 2026-09-24** (dur/w7): every rotation step now runs behind a `logit_pipeline::fault` check, and
+- **Verified 2026-09-24** (#326): every rotation step now runs behind a `logit_pipeline::fault` check, and
   `a_crash_at_any_rotation_step_loses_no_line_and_duplicates_none_after_restart` freezes at each one in turn for
   `max_files` 2 and 3, restarts, and finds no retained file touched before the commit point, no line lost beyond
   retention or duplicated, and no orphan left; the design needed no change.
