@@ -53,7 +53,7 @@ Three facts from the survey drive the shape of the decision:
    recompute stats. It decides readiness from the data, not the source component: a chunk whose
    root span carries the Agent-written `_top_level` metric has been through an Agent or an
    equivalent processor and goes out natively; one without it is counted
-   `skipped{reason="needs_agent_processing"}`, so `datadog_trace_in` must not feed `datadog_out`
+   `records.dropped{reason="needs_agent_processing"}`, so `datadog_trace_in` must not feed `datadog_out`
    directly. `otlp_out` remains the path for OTel-origin spans.
 
 3. **`DdSketch` is hand-rolled** (`crates/logit-core/src/sketch.rs`), replacing

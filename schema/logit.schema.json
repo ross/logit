@@ -1732,6 +1732,80 @@
           }
         },
         {
+          "description": "Sends logs, metrics, events, service checks, APM traces, and APM stats straight to Datadog's intake API, one request per route a batch needs. Host, service, source, and tags come from each event's attributes and resource, so stamp them upstream with `set`. Points older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service checks) are dropped and counted before sending. Traces go out only once a Datadog Agent has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.",
+          "type": "object",
+          "required": [
+            "api_key",
+            "type"
+          ],
+          "properties": {
+            "api_key": {
+              "description": "The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it from the environment (`!env DD_API_KEY`) rather than writing it into the file. An empty key, or one with leading or trailing whitespace, is rejected.",
+              "type": "string"
+            },
+            "compression": {
+              "description": "How request bodies are compressed. `gzip`, the default, gzips every route except distribution points, which Datadog accepts only zlib-deflated; `none` sends every body uncompressed.",
+              "default": "gzip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogCompression"
+                }
+              ]
+            },
+            "endpoints": {
+              "description": "Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to point this sink at another `logit`'s `datadog_in`.",
+              "default": {
+                "api": null,
+                "logs": null,
+                "traces": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/DatadogEndpoints"
+                }
+              ]
+            },
+            "headers": {
+              "description": "Extra headers sent on every request, a proxy's authorization header, say. A value is a plain string, so `!env` works on it. A name this sink sets itself (`dd-api-key`, `content-type`, `content-encoding`, `content-length`, `host`, `user-agent`) or an HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "site": {
+              "description": "The Datadog site your organization is on: `datadoghq.com` (the default), `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`, `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no scheme and no `/`.",
+              "default": "datadoghq.com",
+              "type": "string"
+            },
+            "timeout": {
+              "description": "Timeout for one request. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS for every `https://` request: a private CA, a client certificate, or no verification. A non-default block is rejected when every intake is a plain `http://` `endpoints` override.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "datadog_out"
+              ]
+            }
+          }
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -2468,6 +2542,56 @@
         "none",
         "lz4"
       ]
+    },
+    "DatadogCompression": {
+      "description": "How `datadog_out` compresses its request bodies.",
+      "oneOf": [
+        {
+          "description": "gzip on every route but distribution points, which get zlib-wrapped deflate.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "Every body uncompressed.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "DatadogEndpoints": {
+      "description": "`datadog_out`'s per-intake base URLs (`endpoints:` in config). Each is an absolute `http://` or `https://` URL with a host and an optional path prefix, and replaces the host `site` derives for its intake; an omitted one keeps the derived `https://` host.",
+      "type": "object",
+      "properties": {
+        "api": {
+          "description": "Replaces `https://api.<site>`: series, distribution points, sketches, service checks, and events.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logs": {
+          "description": "Replaces `https://http-intake.logs.<site>`: logs.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "traces": {
+          "description": "Replaces `https://trace.agent.<site>`: APM traces and stats.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "DeliveryPosture": {
       "description": "Whether re-delivering an already-delivered batch is acceptable for a sink's destination. `at_least_once` retries as aggressively as fault classification allows and risks a duplicate; `at_most_once` is the conservative posture.",

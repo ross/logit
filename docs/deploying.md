@@ -1491,6 +1491,105 @@ which routes arrive, `logit.input.batches.dropped{reason="busy"}` loss, and
 `logit.input.requests.rejected{reason="unsupported_route"}` a tracer trying a feature this listener
 doesn't speak. `docs/design/internal-telemetry.md`'s `datadog_trace_in` section has every counter.
 
+## `datadog_out`: sending straight to Datadog
+
+`datadog_out` posts each batch to Datadog's intake API with no Datadog Agent in the path: series
+and sketches, raw distribution values, service checks, events, logs, and Agent-processed APM traces
+and stats, each to its own route. [`examples/datadog-direct.yaml`](../examples/datadog-direct.yaml)
+runs DogStatsD through `aggregate` into it.
+
+```yaml
+components:
+  datadog:
+    type: datadog_out
+    sources: [host]
+    api_key: !env DD_API_KEY
+    site: datadoghq.eu     # default datadoghq.com
+```
+
+**Hosts.** Requests go to three hosts on your organization's site: `https://api.<site>` (series,
+distribution points, sketches, service checks, events), `https://http-intake.logs.<site>` (logs),
+and `https://trace.agent.<site>` (traces and stats). Set `site` to the one your organization uses:
+`datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`,
+`ap2.datadoghq.com`, `uk1.datadoghq.com`, `ddog-gov.com`, or `us2.ddog-gov.com`. A key from one
+site gets `403` on another.
+
+**The key.** `api_key` is sent as `DD-API-KEY` on every request. Take it from the environment with
+`!env DD_API_KEY`. A key with leading or trailing whitespace is rejected at startup, because a key
+file read with a trailing newline would otherwise reach Datadog as a different key. The key is never
+logged: a `403` is reported as a throttled `api_key_rejected` warning that names the URL, and any
+response text quoted in a log line or error has the key replaced with `<redacted>`.
+
+**Host, service, and tags come from the data.** There's no `host:` or `tags:` field on the sink.
+Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
+and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`.
+
+**Compression.** `compression: gzip`, the default, gzips every body except distribution points,
+which Datadog documents as accepting deflate only, so those go zlib-deflated. `compression: none`
+sends every body uncompressed.
+
+**Stale data is dropped before sending.** Datadog rejects or discards data outside its windows, so
+`datadog_out` drops it and counts `logit.output.records.dropped{reason="stale"}`, measured from the
+moment of sending:
+
+| Data | Dropped when |
+|---|---|
+| metrics (series, distribution points, sketches) | older than 1 hour, or more than 10 minutes in the future |
+| logs, events | older than 18 hours |
+| service checks | older than 10 minutes |
+| traces, stats | never |
+
+**A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
+batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
+past 18 hours are dropped as stale, not sent. For an outage longer than those windows, the data is
+lost at Datadog's end either way; the buffer delivers only what Datadog would still accept. Watch
+`records.dropped{reason="stale"}` after a replay to see how much.
+
+**Traces must have been through an Agent.** Datadog's trace intake expects spans an Agent has
+normalized, obfuscated, and marked, with the Agent's APM stats sent beside them. `datadog_out`
+sends a trace chunk only when its root span carries the Agent's `_top_level` mark. A chunk without
+it is counted `records.dropped{reason="needs_agent_processing"}`, and a span with no Datadog
+attributes at all (an OTel span) `reason="not_datadog_origin"`. So:
+
+- **Don't feed `datadog_trace_in` straight into `datadog_out`.** Its spans are raw tracer output
+  and would all be dropped. Send them to `datadog_trace_out` in front of a real Agent instead.
+- **Send OTel spans to Datadog with `otlp_out`**, not `datadog_out`.
+- **Relaying an Agent's traffic works:** what `datadog_in` receives on `/api/v0.2/traces` and
+  `/api/v0.2/stats` came from an Agent and goes out unchanged.
+
+**Size limits.** Each route's events are cut into requests under Datadog's documented limits. An
+event too large to send alone is dropped and counted `records.dropped{reason="oversize"}`.
+
+| Route | Per request |
+|---|---|
+| series | 10,000 points, 5,242,880 bytes uncompressed, 512,000 bytes compressed |
+| distribution points, sketches | the series limits (Datadog documents none) |
+| logs | 1,000 logs, 5,000,000 bytes uncompressed |
+| events | one event |
+| traces | 3,200,000 bytes uncompressed |
+
+**Delivery.** One batch is up to eight requests, sent one after another. The first that fails
+stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
+and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
+retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded, so the
+default is at-most-once and a `5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to
+retry instead and accept the duplicates.
+
+**Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
+is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:
+
+```yaml
+    endpoints:
+      api: http://collector:8080
+      logs: http://collector:8080
+      traces: http://collector:8080
+```
+
+**What to watch.** `logit.output.requests{route, class}` shows each route's answers,
+`logit.output.records{route}` what Datadog accepted, and `logit.output.records.dropped{route,
+reason}` everything held back. `docs/design/internal-telemetry.md`'s `datadog_out` section has every
+counter.
+
 ## Prometheus remote-write: receiving, sending, and picking a version
 
 `prometheus_in` and `prometheus_out` each have two modes, chosen by which field is set:

@@ -401,8 +401,8 @@ writes `_dd.top_level`, which the Agent converts), and its stats concentrator an
 key on it, so a chunk whose root span carries `_top_level` has been through an Agent or an
 equivalent processor and goes out natively. A chunk without it is raw tracer output, with no
 Agent stats and no obfuscation of SQL or URLs unless the tracer did it, and is counted
-`skipped{reason="needs_agent_processing"}`; a span with no Datadog span fields at all is
-`skipped{reason="not_datadog_origin"}`. So `datadog_trace_in` must not feed `datadog_out`
+`records.dropped{reason="needs_agent_processing"}`; a span with no Datadog span fields at all is
+`records.dropped{reason="not_datadog_origin"}`. So `datadog_trace_in` must not feed `datadog_out`
 directly (W8 documents this): the operator routes it to `datadog_trace_out` and a real Agent, or,
 once §14 exists, through that processor, which makes the same data ready by writing the same
 marks. The native leg is verified against the trial org in W7 (spans visible, service
@@ -440,7 +440,7 @@ the OTel-direct topology is `otlp_out`.
 | W3 | **Landed** (`dd/w3`). `datadog_in` on `otlp_in`'s accept loop: every intake route, `DD-API-KEY` allowlist, gzip/deflate/zstd (`ruzstd`, multi-frame, window-capped), a bounded wait then `503` under backpressure; graph rule 62; schema; `datadog-intake-standin.yaml` and `DD_API_KEY` in the shipped-config `!env` map, pulled forward from W8. | M | W2b |
 | W4a | **Landed** (`dd/w4a`). `datadog_trace_in` on TCP and a Unix socket: v0.3/v0.4/v0.5/v0.7 msgpack traces and `/v0.6/stats`, tracer headers as `datadog.tracer.*`, a keep-everything rate reply, `/info`, `404`s and `200` stubs for the rest, a 2 s bounded wait then `503`; `datadog_in`'s request helpers moved into `crate::http`; graph rule 63; schema; `datadog-agent-standin.yaml`, pulled forward from W8. | M | W2b |
 | W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
-| W5 | `datadog_out`: direct API client, stale filter, graph rules, schema | M | W3 |
+| W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
 | W6 | `datadog_trace_out`: Agent client | S | W4a |
 | W7 | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); trial-org end-to-end for `datadog_out`, including the `/api/v0.2/traces` leg and the stale window; pair fixed-point tests over the corpus; UNVERIFIED items resolved in this plan | M | W5, W6 |
 | W8 | `trace_context` 64-bit and decimal ids; `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
@@ -450,10 +450,11 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, and W4b complete on
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, and W5 complete on
 their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once
 it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real Agent,
-tracer, or client; W7 does that.
+tracer, or client, and W5's `datadog_out` has sent only to `datadog_in`, never to Datadog; W7 does
+both.
 
 ## Verification
 

@@ -352,6 +352,9 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
     path, or `tls` without `bind`.
 64. A `statsd_in` `bind` or `statsd_out` `endpoint` that isn't an absolute path under
     `transport: unix`/`unix_stream`, or `tls:` under either Unix transport.
+65. A `datadog_out` with an empty or whitespace-padded `api_key`, an empty `site` or one with a
+    scheme or `/`, an `endpoints` entry that isn't an absolute `http://`/`https://` URL,
+    `timeout: 0s`, a reserved or colliding header, or a bad `tls`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

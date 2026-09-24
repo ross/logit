@@ -921,6 +921,41 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     byte-level comparison against a real client's output could differ.
   - **Revisit trigger:** W7 records a client (datadog-go v5.6+ or a current dd-trace library) that
     sends the two fields.
+- **`datadog_out`'s sketches route is UNVERIFIED for a sender that isn't an Agent.** It posts
+  `Distribution` records to `/api/beta/sketches` with an API key, as Vector's `datadog_metrics`
+  sink does, but the route isn't in Datadog's public API spec.
+  - **Consequence:** if the intake refuses it, every sketch is a failed request, and
+    `aggregate`'s `distributions: sketch` output never reaches Datadog.
+  - **Workaround:** `distributions: samples` on `aggregate`, which sends raw values to the
+    documented `/api/v1/distribution_points`.
+  - **Revisit trigger:** W7's trial-org run.
+- **`datadog_out`'s trace route is UNVERIFIED for a sender that isn't an Agent.**
+  `/api/v0.2/traces` and `/api/v0.2/stats` are the Agent's own outbound protocol, which Datadog
+  doesn't document for third parties
+  ([plan §12](plans/datadog-relay.md#12-traces-to-datadog-the-agents-protocol-not-otlp-for-datadog-origin-spans-w5-w7)).
+  - **Consequence:** if the intake refuses a third-party `AgentPayload`, relayed traces don't reach
+    Datadog; the pair test against `datadog_in` still holds.
+  - **Revisit trigger:** W7 sends traces and stats to the trial org and checks the service pages.
+- **`datadog_out` sends distribution points zlib-deflated, UNVERIFIED.** The public API survey
+  records `/api/v1/distribution_points` as accepting `deflate` only, so that route alone isn't
+  gzipped.
+  - **Consequence:** if the intake also accepts gzip, nothing is lost; if it wants raw deflate
+    rather than zlib-wrapped, every distribution-points request fails.
+  - **Revisit trigger:** W7's trial-org run.
+- **`datadog_out`'s per-request size limits are partly UNVERIFIED.** The series (10,000 points,
+  512,000 B compressed, 5,242,880 B uncompressed), logs (1,000 entries, 5,000,000 B), and traces
+  (3,200,000 B) limits come from Datadog's docs or the Agent's source; distribution points and
+  sketches reuse the series limits because none are documented, and service checks and stats are
+  sent uncapped.
+  - **Consequence:** a limit set too high draws a `413`, which drops the request's entries as
+    `oversize`; one set too low only costs extra requests.
+  - **Revisit trigger:** W7, or a `413` from a real intake.
+- **`datadog_out` isn't duplicate-safe until the intake is shown to dedupe.** A batch is several
+  requests, and whether Datadog overwrites a resent series point (it's documented for series, not
+  for logs, events, or spans) is UNVERIFIED.
+  - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
+    `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
+  - **Revisit trigger:** W7 resends a request to the trial org and checks what Datadog shows.
 - ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
   unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
   (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the

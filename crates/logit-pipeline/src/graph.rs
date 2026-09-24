@@ -184,6 +184,11 @@
 //!     `transport: unix`/`unix_stream` (a client names the socket as `unix:///<path>`), or `tls:`
 //!     under either: a Unix socket is always plaintext. `unix` is a datagram transport for 17/18/57
 //!     and 45/53, `unix_stream` a stream one (`docs/adr/datadog-agent-and-intake-relay.md`).
+//! 65. A `datadog_out` with an empty `api_key` or one with leading or trailing whitespace, an
+//!     empty `site` or one with a scheme or `/`, an `endpoints` entry that isn't an absolute
+//!     `http://`/`https://` URL, `timeout: 0s`, a `headers:` name 22 would reject against
+//!     `RESERVED_DATADOG_HEADERS`, or a `tls` failing 24's checks, the scheme one only when no
+//!     intake is `https://` (`docs/adr/datadog-agent-and-intake-relay.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -280,6 +285,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Route { .. } => Role::Transform,
         InfluxDbOut { .. }
         | OtlpOut { .. }
+        | DatadogOut { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -342,6 +348,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Route { .. } => "route",
         InfluxDbOut { .. } => "influxdb_out",
         OtlpOut { .. } => "otlp_out",
+        DatadogOut { .. } => "datadog_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -437,6 +444,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Sample { .. }
             | ComponentKind::InfluxDbOut { .. }
             | ComponentKind::OtlpOut { .. }
+            | ComponentKind::DatadogOut { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -551,6 +559,12 @@ const RESERVED_REMOTE_WRITE_HEADERS: &[&str] = &[
     "x-prometheus-remote-write-version",
     "user-agent",
 ];
+
+/// Header names `datadog_out` sets itself (rule 65): the ones `DatadogOutput` inserts over the
+/// operator's map (`crates/logit-outputs/src/datadog.rs`'s "The wire"), plus `content-length`
+/// and `host`, which `reqwest` sets. Compared case-insensitively.
+const RESERVED_DATADOG_HEADERS: &[&str] =
+    &["dd-api-key", "content-type", "content-encoding", "content-length", "host", "user-agent"];
 
 /// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
 /// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
@@ -2731,6 +2745,115 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             anyhow::bail!(
                 "component '{id}': {kind_name} 'tls:' needs 'transport: tcp' -- a Unix socket \
                  ('transport: {transport_name}') is always plaintext"
+            );
+        }
+    }
+
+    // Rule 65: `datadog_out` (`docs/adr/datadog-agent-and-intake-relay.md`). The key gets rule
+    // 62's whitespace check from the sending side: HTTP strips a header value's surrounding
+    // whitespace, so a key read by `!env` from a file with a trailing newline would reach Datadog
+    // as a different key, or fail to build as a header at all. `site` is spliced into three
+    // `https://<prefix>.<site>` hosts, so a scheme or path there would build a broken URL. The
+    // headers get rule 22's checks against this sink's own reserved set, and `tls` rule 24's,
+    // except that the scheme check fails only when no intake is `https://`: an omitted
+    // `endpoints` entry derives an `https://` host from `site`.
+    for (id, component) in &components {
+        let ComponentKind::DatadogOut { api_key, site, endpoints, timeout, headers, tls, .. } =
+            &component.kind
+        else {
+            continue;
+        };
+        if api_key.is_empty() {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'api_key' must not be empty -- Datadog rejects \
+                 every request without one; take it from the environment with !env DD_API_KEY"
+            );
+        }
+        if api_key.trim() != api_key {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'api_key' has leading or trailing whitespace, \
+                 which HTTP strips from the DD-API-KEY header -- check the value (a key file's \
+                 trailing newline, say)"
+            );
+        }
+        if site.trim().is_empty() {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'site' must not be empty -- give your Datadog \
+                 site, 'datadoghq.com' or 'datadoghq.eu', say"
+            );
+        }
+        if site.contains("://") || site.contains('/') {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'site' must be a bare domain ('datadoghq.eu', \
+                 say), got {site:?} -- to send somewhere other than Datadog's own hosts, set \
+                 'endpoints'"
+            );
+        }
+        for (intake, url) in
+            [("api", &endpoints.api), ("logs", &endpoints.logs), ("traces", &endpoints.traces)]
+        {
+            if let Some(url) = url {
+                if !is_absolute_http_url(url) {
+                    anyhow::bail!(
+                        "component '{id}': datadog_out 'endpoints.{intake}' must be an absolute \
+                         http:// or https:// URL with a host, got {url:?}"
+                    );
+                }
+            }
+        }
+        if timeout.is_zero() {
+            anyhow::bail!(
+                "component '{id}': datadog_out 'timeout: 0s' would fail every request before it \
+                 was sent"
+            );
+        }
+        let mut seen_lowercase = BTreeSet::new();
+        for name in headers.keys() {
+            if name.is_empty() {
+                anyhow::bail!("component '{id}': 'headers' has an empty header name");
+            }
+            if name.starts_with(':') {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                     (starting with ':') can't be set as a custom header"
+                );
+            }
+            let lowercase = name.to_ascii_lowercase();
+            if RESERVED_DATADOG_HEADERS.contains(&lowercase.as_str()) {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?}, which datadog_out sets itself \
+                     -- it can't be overridden"
+                );
+            }
+            if !seen_lowercase.insert(lowercase) {
+                anyhow::bail!(
+                    "component '{id}': 'headers' names {name:?}, which differs only in case from \
+                     another entry -- HTTP header names are case-insensitive, so which value \
+                     would actually be sent is undefined"
+                );
+            }
+        }
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+        let any_https = [&endpoints.api, &endpoints.logs, &endpoints.traces]
+            .iter()
+            .any(|url| url.as_ref().is_none_or(|u| u.to_ascii_lowercase().starts_with("https://")));
+        if !tls.is_empty() && !any_https {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but every 'endpoints' entry is plain http:// -- \
+                 TLS is selected by each URL's scheme, so a 'tls:' block here would have no \
+                 effect"
             );
         }
     }
@@ -5063,6 +5186,136 @@ mod tests {
         }
         let err = datadog_in_err(kind);
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
+    // ---- rule 65: datadog_out --------------------------------------------------------------
+
+    /// A `datadog_out` with every optional field at its default, the shape rule 65 reads.
+    fn datadog_out(api_key: &str) -> ComponentKind {
+        ComponentKind::DatadogOut {
+            api_key: api_key.to_string(),
+            site: logit_config::default_datadog_site(),
+            endpoints: logit_config::DatadogEndpoints::default(),
+            compression: logit_config::DatadogCompression::default(),
+            timeout: logit_config::default_datadog_timeout(),
+            headers: HashMap::new(),
+            tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    fn datadog_out_err(kind: ComponentKind) -> String {
+        expect_err(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+    }
+
+    /// Edits one field of a default `datadog_out`.
+    fn datadog_out_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        let mut kind = datadog_out("key");
+        edit(&mut kind);
+        kind
+    }
+
+    #[test]
+    fn a_datadog_out_with_defaults_or_endpoint_overrides_resolves() {
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], datadog_out("key"))]))
+            .expect("an api_key alone is a valid datadog_out");
+        let kind = datadog_out_with(|k| {
+            if let ComponentKind::DatadogOut { endpoints, headers, tls, .. } = k {
+                endpoints.api = Some("http://127.0.0.1:8080".into());
+                endpoints.logs = Some("http://127.0.0.1:8080/prefix".into());
+                headers.insert("Proxy-Authorization".into(), "Basic x".into());
+                // `traces` still derives an `https://` host, so `tls` has something to tune.
+                tls.insecure_skip_verify = true;
+            }
+        });
+        resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], kind)]))
+            .expect("http:// overrides, a custom header, and tls with one https intake are valid");
+    }
+
+    /// Rule 65: the key must be sendable as-is.
+    #[test]
+    fn a_datadog_out_api_key_that_is_empty_or_padded_is_rejected() {
+        let err = datadog_out_err(datadog_out(""));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'api_key' must not be empty"), "got: {err}");
+        let err = datadog_out_err(datadog_out("key\n"));
+        assert!(err.contains("leading or trailing whitespace"), "got: {err}");
+        assert!(!err.contains("key\n"), "the message never quotes the key: {err}");
+    }
+
+    /// Rule 65: `site` is a bare domain spliced into three hosts.
+    #[test]
+    fn a_datadog_out_site_with_a_scheme_or_path_or_nothing_is_rejected() {
+        for bad in ["https://datadoghq.eu", "datadoghq.eu/", ""] {
+            let err = datadog_out_err(datadog_out_with(|k| {
+                if let ComponentKind::DatadogOut { site, .. } = k {
+                    *site = bad.into();
+                }
+            }));
+            assert!(err.contains("'site'"), "{bad:?}: {err}");
+        }
+    }
+
+    /// Rule 65: an `endpoints` override is an absolute http(s) URL with a host.
+    #[test]
+    fn a_datadog_out_endpoint_that_isnt_an_absolute_url_is_rejected() {
+        for bad in ["127.0.0.1:8080", "ftp://host", "http://"] {
+            let err = datadog_out_err(datadog_out_with(|k| {
+                if let ComponentKind::DatadogOut { endpoints, .. } = k {
+                    endpoints.traces = Some(bad.into());
+                }
+            }));
+            assert!(err.contains("'endpoints.traces' must be an absolute"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_datadog_out_with_a_zero_timeout_is_rejected() {
+        let err = datadog_out_err(datadog_out_with(|k| {
+            if let ComponentKind::DatadogOut { timeout, .. } = k {
+                *timeout = Duration::ZERO;
+            }
+        }));
+        assert!(err.contains("'timeout: 0s'"), "got: {err}");
+    }
+
+    /// Rule 65: rule 22's header checks, against this sink's own reserved names.
+    #[test]
+    fn a_datadog_out_reserved_or_colliding_header_is_rejected() {
+        for name in ["DD-API-KEY", "content-encoding", "User-Agent", ":path", ""] {
+            let err = datadog_out_err(datadog_out_with(|k| {
+                if let ComponentKind::DatadogOut { headers, .. } = k {
+                    headers.insert(name.into(), "x".into());
+                }
+            }));
+            assert!(err.contains("'headers'"), "{name:?}: {err}");
+        }
+        let err = datadog_out_err(datadog_out_with(|k| {
+            if let ComponentKind::DatadogOut { headers, .. } = k {
+                headers.insert("X-Proxy".into(), "a".into());
+                headers.insert("x-proxy".into(), "b".into());
+            }
+        }));
+        assert!(err.contains("differs only in case"), "got: {err}");
+    }
+
+    /// Rule 65: rule 24's `tls` checks, the scheme one only when every intake is `http://`.
+    #[test]
+    fn a_datadog_out_tls_block_that_cant_take_effect_is_rejected() {
+        let err = datadog_out_err(datadog_out_with(|k| {
+            if let ComponentKind::DatadogOut { tls, .. } = k {
+                tls.cert_file = Some("client.pem".into());
+            }
+        }));
+        assert!(err.contains("must both be set"), "got: {err}");
+        let err = datadog_out_err(datadog_out_with(|k| {
+            if let ComponentKind::DatadogOut { endpoints, tls, .. } = k {
+                endpoints.api = Some("http://a".into());
+                endpoints.logs = Some("http://a".into());
+                endpoints.traces = Some("http://a".into());
+                tls.insecure_skip_verify = true;
+            }
+        }));
+        assert!(err.contains("every 'endpoints' entry is plain http://"), "got: {err}");
     }
 
     /// A `datadog_trace_in` with every optional field at its default, the shape rule 63 reads.

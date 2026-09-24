@@ -1459,6 +1459,31 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
 There's no `logit.output.request.duration`; layer 2's `logit.component.send.duration` times each
 attempt.
 
+##### `datadog_out`
+
+`crates/logit-outputs/src/datadog.rs`, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md).
+One `send` is up to eight routes' requests, so every point carries `route`: `series`,
+`distribution_points`, `sketches`, `check_run`, `events`, `logs`, `traces`, or `stats`.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{route, class}` | count | one per request; `class` is the status class (`status_class`), or `network_error` for a transport error or timeout |
+| `logit.output.request.duration{route}` | timing | one per request |
+| `logit.output.request.bytes{route}` | count | the body as sent, after compression |
+| `logit.output.records{route}` | count | entries in a request Datadog accepted: series points, samples records, and sketches by record; logs, events, checks, spans, and stats groups by event |
+| `logit.output.records.dropped{route, reason="stale"}` | count | a record outside Datadog's window when sent: a metric more than 1h old or 10 min ahead, a log or event more than 18h old, a check more than 10 min old |
+| `logit.output.records.dropped{route, reason="oversize"}` | count | an event whose body alone is over the route's byte limit, or every entry of a request Datadog answered `413` |
+| `logit.output.records.dropped{route="traces", reason="needs_agent_processing"\|"not_datadog_origin"}` | count | a span whose chunk's root has no `_top_level` mark: raw tracer output, or not a Datadog span at all |
+
+A dropped record is never sent, so a `buffer.disk:` replay after a long outage shows up here as
+`stale`, not as a delivery. The codec's own points (`logit.output.metrics.skipped`, including
+every kind no route carries; `metrics.degraded`, `tags.dropped`, `spans.degraded`, `stats.*`) are
+the `datadog` codec's, under [Codecs](#codecs), and this sink doesn't repeat them.
+
+`Diagnostics` keys, each throttled: `api_key_rejected` (a `403`: Datadog refused the key; the key
+itself is never logged), `request_rejected` (any other non-retryable `4xx` or `3xx`, quoting 256
+bytes of the body with the key redacted), and `oversize` (an event dropped for its size).
+
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,

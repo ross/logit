@@ -496,6 +496,45 @@ impl OtlpPaths {
     }
 }
 
+/// `datadog_out`'s per-intake base URLs (`endpoints:` in config). Each is an absolute
+/// `http://` or `https://` URL with a host and an optional path prefix, and replaces the host
+/// `site` derives for its intake; an omitted one keeps the derived `https://` host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DatadogEndpoints {
+    /// Replaces `https://api.<site>`: series, distribution points, sketches, service checks,
+    /// and events.
+    #[serde(default)]
+    pub api: Option<String>,
+    /// Replaces `https://http-intake.logs.<site>`: logs.
+    #[serde(default)]
+    pub logs: Option<String>,
+    /// Replaces `https://trace.agent.<site>`: APM traces and stats.
+    #[serde(default)]
+    pub traces: Option<String>,
+}
+
+/// How `datadog_out` compresses its request bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DatadogCompression {
+    /// gzip on every route but distribution points, which get zlib-wrapped deflate.
+    #[default]
+    Gzip,
+    /// Every body uncompressed.
+    None,
+}
+
+/// `datadog_out`'s default `site:`, Datadog's US1 site.
+pub fn default_datadog_site() -> String {
+    "datadoghq.com".to_string()
+}
+
+/// `datadog_out`'s default per-request `timeout:`.
+pub fn default_datadog_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
 /// `internal`'s `span_sample_rate` default, taken from `logit-core` so the two crates can't
 /// drift. The one place `logit-config` depends on `logit-core`.
 fn default_span_sample_rate() -> f64 {
@@ -1498,6 +1537,50 @@ pub enum ComponentKind {
         compression: OtlpCompression,
         /// Tunes TLS on an `https://` endpoint. A non-default block under a plain
         /// `http://`/`grpc://` endpoint is rejected.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
+    /// Sends logs, metrics, events, service checks, APM traces, and APM stats straight to
+    /// Datadog's intake API, one request per route a batch needs. Host, service, source, and tags
+    /// come from each event's attributes and resource, so stamp them upstream with `set`. Points
+    /// older than Datadog accepts (1h for metrics, 18h for logs and events, 10m for service
+    /// checks) are dropped and counted before sending. Traces go out only once a Datadog Agent
+    /// has processed them: send `datadog_trace_in`'s output to `datadog_trace_out` instead.
+    DatadogOut {
+        /// The Datadog API key, sent as `DD-API-KEY` on every request and never logged. Take it
+        /// from the environment (`!env DD_API_KEY`) rather than writing it into the file. An
+        /// empty key, or one with leading or trailing whitespace, is rejected.
+        api_key: String,
+        /// The Datadog site your organization is on: `datadoghq.com` (the default),
+        /// `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`, `ap1.datadoghq.com`,
+        /// `ap2.datadoghq.com`, `ddog-gov.com`, and so on. Requests go to `https://api.<site>`,
+        /// `https://http-intake.logs.<site>`, and `https://trace.agent.<site>`. A bare domain: no
+        /// scheme and no `/`.
+        #[serde(default = "default_datadog_site")]
+        site: String,
+        /// Base URLs that replace the hosts `site` derives, one per intake: for a proxy, or to
+        /// point this sink at another `logit`'s `datadog_in`.
+        #[serde(default)]
+        endpoints: DatadogEndpoints,
+        /// How request bodies are compressed. `gzip`, the default, gzips every route except
+        /// distribution points, which Datadog accepts only zlib-deflated; `none` sends every body
+        /// uncompressed.
+        #[serde(default)]
+        compression: DatadogCompression,
+        /// Timeout for one request. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_datadog_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every request, a proxy's authorization header, say. A value is a
+        /// plain string, so `!env` works on it. A name this sink sets itself (`dd-api-key`,
+        /// `content-type`, `content-encoding`, `content-length`, `host`, `user-agent`) or an
+        /// HTTP/2 pseudo-header starting with `:` is rejected, as are two keys naming the same
+        /// header once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Tunes TLS for every `https://` request: a private CA, a client certificate, or no
+        /// verification. A non-default block is rejected when every intake is a plain `http://`
+        /// `endpoints` override.
         #[serde(default)]
         tls: TlsClientConfig,
     },
@@ -4524,6 +4607,51 @@ mod tests {
             }
             other => panic!("expected OtlpIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn datadog_out_needs_only_an_api_key() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "datadog_out", "api_key": "k"}"#).unwrap();
+        match component.kind {
+            ComponentKind::DatadogOut {
+                api_key,
+                site,
+                endpoints,
+                compression,
+                timeout,
+                headers,
+                tls,
+            } => {
+                assert_eq!(api_key, "k");
+                assert_eq!(site, "datadoghq.com");
+                assert_eq!(endpoints, DatadogEndpoints::default());
+                assert_eq!(compression, DatadogCompression::Gzip);
+                assert_eq!(timeout, Duration::from_secs(10));
+                assert!(headers.is_empty());
+                assert!(tls.is_empty());
+            }
+            other => panic!("expected DatadogOut, got {other:?}"),
+        }
+        let component: Component = serde_json::from_str(
+            r#"{"type": "datadog_out", "api_key": "k", "site": "datadoghq.eu",
+                "endpoints": {"logs": "http://127.0.0.1:8080"}, "compression": "none"}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::DatadogOut { site, endpoints, compression, .. } => {
+                assert_eq!(site, "datadoghq.eu");
+                assert_eq!(endpoints.logs.as_deref(), Some("http://127.0.0.1:8080"));
+                assert_eq!(endpoints.api, None);
+                assert_eq!(compression, DatadogCompression::None);
+            }
+            other => panic!("expected DatadogOut, got {other:?}"),
+        }
+        // A misspelled intake name is an error, not a silently ignored override.
+        assert!(serde_json::from_str::<Component>(
+            r#"{"type": "datadog_out", "api_key": "k", "endpoints": {"log": "http://x"}}"#,
+        )
+        .is_err());
     }
 
     #[test]

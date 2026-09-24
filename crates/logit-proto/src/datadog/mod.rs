@@ -352,6 +352,17 @@
 //! 6. a 128-bit trace id with no `_dd.p.tid` gains one on its chunk's first span;
 //! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`.
 //!
+//! ## Readiness for the intake
+//!
+//! The intake's `/api/v0.2/traces` expects what an Agent sends: spans normalized and marked, with
+//! the stats the Agent computed sent beside them. [`trace_readiness`] decides per trace chunk, from
+//! the data rather than the source component (ADR decision 2): a chunk whose root carries
+//! [`METRIC_TOP_LEVEL`] is [`TraceReadiness::Ready`]; one whose root has other Datadog span
+//! attributes ([`is_datadog_span`]) but no `_top_level` is raw tracer output
+//! ([`TraceReadiness::NeedsAgentProcessing`]); anything else is
+//! [`TraceReadiness::NotDatadogOrigin`]. Senders count the latter two under
+//! [`TraceReadiness::drop_reason`].
+//!
 //! # APM stats (`stats`)
 //!
 //! Two routes, both msgpack under the Agent's Go field names (`ClientStatsPayload` and friends
@@ -445,7 +456,9 @@ pub mod traces_proto;
 
 pub mod stats;
 
-use logit_core::{Diagnostics, Event, MetricKind, Resource, Telemetry, Value};
+use logit_core::interner::resolve;
+use logit_core::{Diagnostics, Event, EventBatch, MetricKind, Resource, Telemetry, Value};
+use std::collections::{HashMap, HashSet};
 
 /// `host.name`: the Datadog host of a series/sketch/log, as an event attribute.
 pub const ATTR_HOST_NAME: &str = "host.name";
@@ -551,22 +564,149 @@ fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option
 /// A service check: `statsd.service_check.name` present and a `Gauge` first metric, exactly what
 /// [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone; the
 /// metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.
-pub(super) fn is_service_check(resource: &Resource, event: &Event) -> bool {
+pub fn is_service_check(resource: &Resource, event: &Event) -> bool {
     matches!(event.metrics.first().map(|m| &m.kind), Some(MetricKind::Gauge(_)))
         && merged_get(resource, event, service_checks::ATTR_SERVICE_CHECK_NAME).is_some()
 }
 
 /// A Datadog (or DogStatsD) event: a `log` carrying `statsd.event.title`, exactly what
 /// [`DatadogEncoder::encode_events`] sends. The logs route skips it.
-pub(super) fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
+pub fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
     event.log.is_some() && merged_get(resource, event, events::ATTR_EVENT_TITLE).is_some()
 }
 
 /// APM stats: `datadog.stats.name` present (the event's, else the resource's), exactly what
 /// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
 /// Every metrics route skips such an event whole: its records are a stats group's, not series.
-pub(super) fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
+pub fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
     merged_get(resource, event, stats::ATTR_STATS_NAME).is_some()
+}
+
+/// `_top_level`: the span metric the Agent writes (`1`) on every root, orphan, and
+/// service-boundary span (`traceutil.ComputeTopLevel`), decoded verbatim into an `F64` attribute.
+/// [`is_agent_processed`] reads it on a chunk's root.
+pub const METRIC_TOP_LEVEL: &str = "_top_level";
+
+/// `_sampling_priority_v1`: the tracer's sampling decision, a span `metrics` entry decoded
+/// verbatim. One of the marks [`is_datadog_span`] reads.
+pub const METRIC_SAMPLING_PRIORITY: &str = "_sampling_priority_v1";
+
+/// What a sender of the intake's `/api/v0.2/traces` does with one span, decided per trace chunk
+/// by [`trace_readiness`] (ADR `datadog-agent-and-intake-relay` decision 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceReadiness {
+    /// The chunk's root carries [`METRIC_TOP_LEVEL`]: an Agent, or a processor doing its job, has
+    /// been through it, so it goes out natively.
+    Ready,
+    /// The root carries Datadog span attributes ([`is_datadog_span`]) but no `_top_level`: raw
+    /// tracer output, with no Agent stats, normalization, or obfuscation behind it.
+    NeedsAgentProcessing,
+    /// The root carries no Datadog span attribute: an OTel or `logit`-made span, whose path to
+    /// Datadog is `otlp_out`.
+    NotDatadogOrigin,
+}
+
+impl TraceReadiness {
+    /// The `reason` tag a sender counts an unsent span under; `None` for `Ready`.
+    pub fn drop_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Ready => None,
+            Self::NeedsAgentProcessing => Some("needs_agent_processing"),
+            Self::NotDatadogOrigin => Some("not_datadog_origin"),
+        }
+    }
+}
+
+/// Whether `root` (a chunk's root span) carries a nonzero numeric [`METRIC_TOP_LEVEL`]. Read from
+/// the event's own attributes: `_top_level` is a per-span `metrics` entry, never a resource
+/// attribute.
+pub fn is_agent_processed(root: &Event) -> bool {
+    match root.attributes.get(METRIC_TOP_LEVEL) {
+        Some(Value::F64(f)) => *f != 0.0,
+        Some(Value::I64(i)) => *i != 0,
+        Some(Value::U64(u)) => *u != 0,
+        _ => false,
+    }
+}
+
+/// Whether `event`'s span carries an attribute only a Datadog span has: on the event,
+/// `resource.name`, `span.type`, `datadog.span.error`, a `datadog.chunk.*` carrier,
+/// [`METRIC_SAMPLING_PRIORITY`], [`METRIC_TOP_LEVEL`], or a key starting `_dd.` (the tracer's and
+/// Agent's own `meta`/`metrics` namespace, `_dd.p.tid` and `_dd.p.dm` included); on the batch
+/// resource, a `datadog.tracer.*` or `datadog.agent.*` carrier. `service.name` alone doesn't
+/// count: every OTel resource carries it.
+pub fn is_datadog_span(resource: &Resource, event: &Event) -> bool {
+    const SPAN_KEYS: [&str; 9] = [
+        ATTR_RESOURCE_NAME,
+        ATTR_SPAN_TYPE,
+        traces::ATTR_SPAN_ERROR,
+        traces::ATTR_CHUNK_PRIORITY,
+        traces::ATTR_CHUNK_ORIGIN,
+        traces::ATTR_CHUNK_DROPPED_TRACE,
+        traces::ATTR_CHUNK_TAGS,
+        METRIC_SAMPLING_PRIORITY,
+        METRIC_TOP_LEVEL,
+    ];
+    let on_event = event.attributes.iter().any(|(sym, _)| {
+        let key = resolve(sym);
+        SPAN_KEYS.contains(&key) || key.starts_with("_dd.")
+    });
+    on_event
+        || resource.attributes.iter().any(|(sym, _)| {
+            let key = resolve(sym);
+            key.starts_with("datadog.tracer.") || key.starts_with("datadog.agent.")
+        })
+}
+
+/// Every event's [`TraceReadiness`], by index into `batch.events`; `None` for an event with no
+/// span. Spans group into chunks by 128-bit trace id, as [`DatadogEncoder::encode_agent_payload`]
+/// groups them, and every span of a chunk takes its root's verdict, so a chunk is sent whole or
+/// not at all.
+///
+/// The root is the Agent's own choice (`traceutil.GetRoot`): scanning from the last span, the
+/// first with no parent; failing that, the first span in chunk order whose parent isn't in the
+/// chunk; failing that (a parent cycle), the last span.
+pub fn trace_readiness(batch: &EventBatch) -> Vec<Option<TraceReadiness>> {
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut index: HashMap<[u8; 16], usize> = HashMap::new();
+    for (i, event) in batch.events.iter().enumerate() {
+        let Some(span) = &event.span else { continue };
+        let chunk = *index.entry(span.trace_id).or_insert_with(|| {
+            chunks.push(Vec::new());
+            chunks.len() - 1
+        });
+        chunks[chunk].push(i);
+    }
+    let mut out = vec![None; batch.events.len()];
+    for members in &chunks {
+        let root = &batch.events[chunk_root(batch, members)];
+        let verdict = if is_agent_processed(root) {
+            TraceReadiness::Ready
+        } else if is_datadog_span(&batch.resource, root) {
+            TraceReadiness::NeedsAgentProcessing
+        } else {
+            TraceReadiness::NotDatadogOrigin
+        };
+        for &i in members {
+            out[i] = Some(verdict);
+        }
+    }
+    out
+}
+
+/// The index into `batch.events` of the root of the chunk `members`, by [`trace_readiness`]'s
+/// rule. `members` is non-empty and every member carries a span.
+fn chunk_root(batch: &EventBatch, members: &[usize]) -> usize {
+    let span_of = |i: usize| batch.events[i].span.as_ref().expect("chunk members carry a span");
+    if let Some(&i) = members.iter().rev().find(|&&i| span_of(i).parent_span_id.is_none()) {
+        return i;
+    }
+    let ids: HashSet<[u8; 8]> = members.iter().map(|&i| span_of(i).span_id).collect();
+    members
+        .iter()
+        .copied()
+        .find(|&i| span_of(i).parent_span_id.is_some_and(|p| !ids.contains(&p)))
+        .unwrap_or(*members.last().expect("a chunk has at least one span"))
 }
 
 /// Decodes Datadog intake bodies, one per route. Carries its [`Diagnostics`] and [`Telemetry`]
@@ -622,5 +762,110 @@ impl DatadogEncoder {
     pub fn with_default_source(mut self, source: impl Into<String>) -> Self {
         self.default_source = Some(source.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logit_core::{AttrMap, SpanKind, SpanRecord, SpanStatus};
+    use std::sync::Arc;
+
+    fn span(trace: u8, id: u8, parent: Option<u8>, attrs: &[(&str, Value)]) -> Event {
+        let mut attributes = AttrMap::new();
+        for (key, value) in attrs {
+            attributes.insert(key, value.clone());
+        }
+        Event::span(
+            1,
+            attributes,
+            SpanRecord {
+                trace_id: [trace; 16],
+                span_id: [id; 8],
+                parent_span_id: parent.map(|p| [p; 8]),
+                name: Value::str("op"),
+                kind: SpanKind::Internal,
+                status: SpanStatus::Unset,
+                events: Vec::new(),
+                links: Vec::new(),
+                end_timestamp: 2,
+                flags: 0,
+                ext: None,
+            },
+        )
+    }
+
+    fn batch(events: Vec<Event>) -> EventBatch {
+        EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
+    }
+
+    /// A root with `_top_level` makes its whole chunk ready, children included; a Datadog root
+    /// without it holds its chunk back; a span with no Datadog attribute is not Datadog-origin;
+    /// a non-span event has no verdict.
+    #[test]
+    fn a_chunk_takes_its_roots_verdict() {
+        let dd = (ATTR_RESOURCE_NAME, Value::str("GET /"));
+        let top = (METRIC_TOP_LEVEL, Value::F64(1.0));
+        let b = batch(vec![
+            // Chunk 1: the child arrives first; only the root carries `_top_level`.
+            span(1, 2, Some(1), std::slice::from_ref(&dd)),
+            span(1, 1, None, &[dd.clone(), top]),
+            // Chunk 2: a raw tracer root.
+            span(2, 3, None, &[dd.clone(), ("_dd.p.dm", Value::str("-0"))]),
+            // Chunk 3: an OTel span.
+            span(3, 4, None, &[("http.route", Value::str("/"))]),
+            Event::metric(
+                1,
+                AttrMap::new(),
+                logit_core::MetricRecord::new(
+                    logit_core::interner::intern("m"),
+                    MetricKind::Gauge(1.0),
+                ),
+            ),
+        ]);
+        use TraceReadiness::*;
+        assert_eq!(
+            trace_readiness(&b),
+            vec![
+                Some(Ready),
+                Some(Ready),
+                Some(NeedsAgentProcessing),
+                Some(NotDatadogOrigin),
+                None
+            ]
+        );
+        assert_eq!(NeedsAgentProcessing.drop_reason(), Some("needs_agent_processing"));
+        assert_eq!(NotDatadogOrigin.drop_reason(), Some("not_datadog_origin"));
+        assert_eq!(Ready.drop_reason(), None);
+    }
+
+    /// `_top_level: 0` isn't the mark, and a `datadog.tracer.*` resource makes an otherwise bare
+    /// span Datadog-origin.
+    #[test]
+    fn a_zero_top_level_is_unprocessed_and_a_tracer_resource_marks_the_origin() {
+        assert!(!is_agent_processed(&span(1, 1, None, &[(METRIC_TOP_LEVEL, Value::F64(0.0))])));
+        assert!(is_agent_processed(&span(1, 1, None, &[(METRIC_TOP_LEVEL, Value::I64(1))])));
+
+        let mut resource = Resource::default();
+        resource.attributes.insert(RESOURCE_ATTR_TRACER_LANGUAGE_NAME, Value::str("python"));
+        let b = EventBatch {
+            resource: Arc::new(resource),
+            scope: None,
+            events: vec![span(1, 1, None, &[])],
+        };
+        assert_eq!(trace_readiness(&b), vec![Some(TraceReadiness::NeedsAgentProcessing)]);
+    }
+
+    /// With no parentless span, the root is the first span whose parent is outside the chunk,
+    /// not the first span.
+    #[test]
+    fn an_orphan_chunks_root_is_the_span_whose_parent_is_missing() {
+        let top = (METRIC_TOP_LEVEL, Value::F64(1.0));
+        let dd = (ATTR_SPAN_TYPE, Value::str("web"));
+        let b = batch(vec![
+            span(1, 3, Some(2), std::slice::from_ref(&dd)),
+            span(1, 2, Some(9), &[dd, top]),
+        ]);
+        assert_eq!(trace_readiness(&b), vec![Some(TraceReadiness::Ready); 2]);
     }
 }

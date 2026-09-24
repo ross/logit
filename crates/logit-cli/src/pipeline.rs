@@ -31,6 +31,10 @@ use logit_inputs::statsd::StatsdInput;
 use logit_inputs::syslog::SyslogInput;
 use logit_inputs::tail::TailInput;
 use logit_outputs::collectd::CollectdOutput;
+use logit_outputs::datadog::{
+    DatadogCompression as DatadogOutCompression, DatadogEndpoints as DatadogOutEndpoints,
+    DatadogOutput,
+};
 use logit_outputs::file::{RotateInterval as OutputRotateInterval, RotatePolicy};
 use logit_outputs::graphite::{GraphiteOutput, Transport as GraphiteOutTransport};
 use logit_outputs::influxdb::InfluxDbOutput;
@@ -736,6 +740,29 @@ fn build_spec(
                 .with_headers(headers)?
                 .with_paths(to_signal_paths(paths))
                 .with_compression(to_otlp_compression(*compression))
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
+        DatadogOut { api_key, site, endpoints, compression, timeout, headers, tls } => {
+            let output = DatadogOutput::new(api_key)?
+                .with_site(site.clone())
+                .with_endpoints(DatadogOutEndpoints {
+                    api: endpoints.api.clone(),
+                    logs: endpoints.logs.clone(),
+                    traces: endpoints.traces.clone(),
+                })
+                .with_compression(match compression {
+                    logit_config::DatadogCompression::Gzip => DatadogOutCompression::Gzip,
+                    logit_config::DatadogCompression::None => DatadogOutCompression::None,
+                })
+                .with_timeout(*timeout)
+                .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
                 .with_tls(&to_tls_client_settings(tls), base_dir)?;
