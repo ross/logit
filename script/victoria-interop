@@ -40,7 +40,8 @@ ENV_FILE="${RUN_DIR}/compose.env"
 } >"${ENV_FILE}"
 
 vi_compose() {
-    ${DOCKER} compose -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" --env-file "${ENV_FILE}" "$@"
+    ${DOCKER} compose --progress quiet -p "${PROJECT}" -f "${TOOLS_DIR}/compose.yaml" \
+        --env-file "${ENV_FILE}" "$@"
 }
 
 STARTED=0
