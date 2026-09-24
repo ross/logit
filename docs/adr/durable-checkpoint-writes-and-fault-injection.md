@@ -59,7 +59,37 @@ DISK-09, DISK-10, DISK-13, TAIL-05). Reading them against their ADRs found this:
   between a `rename` and the next syscall. `crates/logit-cli/tests/durable_buffer_restart.rs`
   covers one `SIGKILL` at one point. `FileTarget::rotate_with` injects a failing opener and
   nothing else. The inventory's rule is that each entry ends in a committed, executable
-  artifact, so the cluster needs a way to fail or freeze any single filesystem operation from an ordinary test.
+  artifact, so the cluster needs a way to fail or freeze any single filesystem operation from an
+  ordinary test.
+
+Planning the `dur` stack also found four spool defects, each reproducible from the code. They're
+labelled here so later records can cite them; the workstream named on each closes it.
+
+- **F1: an in-cap corrupt `compressed_len` reads as a torn tail.** A `compressed_len` below
+  `logit_proto::frame`'s sanity cap (just over 64 MiB) but past the bytes present reads as
+  `CodecError::Truncated`. That's correct at the frame layer, where it's indistinguishable from a
+  short read, but `DiskQueue` mishandles it twice. `walk_segment` stops there, so
+  `DiskQueue::open` truncates every real record after it in the active segment. On a closed
+  segment, `read_record_at` returns nothing at end of file, so `peek` retries forever. The disk
+  ADR's "Recovery" section credits the cap with preventing this; it only covers lengths above it.
+  Closed by `dur/w3`.
+- **F2: a cancelled `push` can land its bytes after the repair.** A `push` future dropped at its
+  `flush` await leaves tokio's already-spawned blocking write running: `poll_write` hands the
+  bytes to the blocking pool through `spawn_mandatory_blocking` and returns `Poll::Ready(Ok(n))`,
+  and nothing cancels that task (tokio 1.53.1, `src/fs/file.rs`, `File::poll_write`). The next
+  `write_record`'s torn-tail repair truncates through a fresh file descriptor that doesn't wait
+  for it, so the orphaned bytes can land after the truncate and the file gets ahead of the
+  in-memory segment length. Closed by `dur/w4`.
+- **F3: a batch parked in a blocked `push` is lost uncounted at shutdown.** Under
+  `overflow: block`, `drain_inbox` can hold a batch it already took from the inbox inside a
+  pending `store.push`. When `run_output` drops `drain_inbox` at shutdown, that batch is in
+  neither the inbox (so the abandoned-inbox sweep never sees it) nor the store, and nothing counts
+  it dropped. The memory store has the same hole. Closed by `dur/w5`.
+- **F4: a failed segment unlink leaks the segment for good.** `roll_read_cursor` removes a
+  segment from memory whether or not its unlink succeeded. At the next `DiskQueue::open`,
+  `list_segments` lists it again and counts it in `total_bytes`, and nothing deletes it, because
+  only a segment the read cursor leaves is ever unlinked. Enough leaks fill `disk.max_bytes`.
+  Closed by `dur/w5`.
 
 ## Decision
 
@@ -244,7 +274,22 @@ script is needed. This list is filled in as each workstream lands.
     - `a_failed_segment_unlink_is_counted`: `op="unlink"`, with the segment left on disk.
     - `a_persistently_failing_cursor_write_is_counted_every_time`: `op="cursor"` and `cursor_error`
       on every persist, and a restart replays rather than loses.
-- **`dur/w2`, frame fixed-point properties (DISK-13):** to be listed when `dur/w2` lands.
+- **`dur/w2`, frame fixed-point properties (DISK-13):**
+  `crates/logit-proto/tests/frame_fixed_point.rs`:
+  - `write_then_read_round_trips_every_payload_under_both_compressions` — write/read is the
+    identity on codec, flags, compression, and payload, over generated payloads up to 256 KiB.
+  - `concatenated_frames_read_back_in_order_with_nothing_left_over` — one to eight frames read
+    back in the order they were written, with nothing left in the buffer.
+  - `lz4_expansion_on_incompressible_payloads_stays_within_n_plus_n_over_255_plus_16` — checks
+    that lz4's real worst-case output stays within the `n + n/255 + 16` bound
+    `MAX_SANE_COMPRESSED_LEN` is built on (it doesn't pin the constant itself: changing it leaves
+    this test green; only the over-the-cap test below would notice).
+  - `a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none` — a full 64 MiB payload
+    round-trips at the cap; one byte past it is rejected.
+  - `a_compressed_len_corrupted_below_the_cap_reads_as_truncated` — pins finding F1's premise: a
+    `compressed_len` corrupted below the sanity cap reads as `Truncated`, not `Malformed`.
+  - `a_compressed_len_corrupted_over_the_cap_reads_as_malformed` — the complement: over the cap
+    is always `Malformed`.
 - **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):**
   - `crates/logit-pipeline/src/disk_queue_verification.rs`:
     - `walk_segment_recovers_every_record_outside_the_mutated_range`: a proptest over real

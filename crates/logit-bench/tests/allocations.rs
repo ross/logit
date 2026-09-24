@@ -1370,8 +1370,11 @@ fn aggregate_absorb_without_keep() {
 /// context, and `into_links()` collects it into its own `Vec`. A non-empty `Vec` always
 /// allocates, so one per series is the floor, and more contributors (up to the cap) don't add to
 /// it.
+///
+/// The 100 nginx events collapse into 4 series because `keep` bounds the tag set to one series
+/// per metric name.
 #[test]
-fn aggregate_flush_100_series() {
+fn aggregate_flush_4_series() {
     let resource = fixtures::resource();
     let mut keep = fixtures::keep();
     let mut agg = fixtures::aggregator();
