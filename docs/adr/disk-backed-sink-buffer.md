@@ -175,12 +175,10 @@ actual code; each is resolved as follows.
    `disk.path` strings as written, sorted for a deterministic error message the way rule 13
    already does for `internal` components. `DiskQueue::open`'s exclusive lock catches the aliased
    case (`./spool` vs `spool`) at startup instead.
-4. **A torn write is repaired on the next push, not left to `resync` alone.** A push that finds
-   an unconfirmed write truncates the active segment back to its length before that write, through
-   the segment's one retained write handle, before appending anything. `frame::resync` remains the
-   crash-time fallback, where no in-memory state survived. See
-   [Amendment: one retained write handle, and what a failed repair does](#amendment-one-retained-write-handle-and-what-a-failed-repair-does-2026-09-24)
-   for why the handle matters and what a failed truncate does.
+4. **A torn write is repaired on the next push, not left to `resync` alone.** There is exactly one
+   producer per spool, so `DiskQueue` tracks a `write_in_flight` flag and the last known-good
+   segment length; a push that finds the flag set truncates back to that length before appending.
+   `frame::resync` remains the crash-time fallback, where no in-memory state survived.
 5. **An oversized frame is rejected at push, never written.** See "Push cost" above.
 
 ## Alternatives considered
@@ -331,10 +329,18 @@ this change.
 
 ## Amendment: one retained write handle, and what a failed repair does (2026-09-24)
 
-Correction 4 above, and the `write_in_flight` sentence under "Bound and overflow", described a
-repair that truncated the active segment through a freshly opened file descriptor and ignored the
-result. Both halves could leave a segment longer on disk than in memory, and the reader skips
-everything past the in-memory length when it rolls to the next segment.
+Correction 4 above says `DiskQueue` "tracks a `write_in_flight` flag and the last known-good
+segment length; a push that finds the flag set truncates back to that length before appending."
+That repair truncated through a freshly opened file descriptor and ignored the result. Either half
+could leave a segment longer on disk than in memory, and the reader skips everything past the
+in-memory length when it rolls to the next segment. The repair now waits for any write still
+running and truncates through the segment's one retained write handle, as described below, and
+`write_in_flight` is gone: `State::needs_repair` holds the length before an unconfirmed write.
+
+"Bound and overflow" above says "`write_in_flight` still gets set so the next push repairs any
+partial bytes the failed attempt left behind, exactly as a cancelled push does." The field no
+longer exists. A failed write leaves `needs_repair` set, and the next push repairs through the
+retained handle, exactly as after a cancelled push.
 
 **A cancelled push's write keeps running.** `tokio::fs::File::poll_write` copies the bytes, hands
 the write to a blocking thread with `spawn_mandatory_blocking`, and returns `Ready` at once
@@ -355,10 +361,13 @@ once it's recorded as the active segment. `finish` flushes through the handle, w
 orphaned write, and leaves any torn tail for `DiskQueue::open` to truncate.
 
 **The repair waits, then truncates through that handle.** `State::needs_repair` holds the active
-segment's length before any write that wasn't confirmed. The next push flushes the retained handle
-and discards the result (this waits for an orphaned write and clears a stored error), then
-`set_len`s back through the same handle. It opens a handle, `append` without `create`, only if
-none is retained.
+segment's length before any write that wasn't confirmed. The next push flushes the retained handle,
+which waits for an orphaned write and surfaces and clears a stored error, then `set_len`s back
+through the same handle. A failed flush is counted `op="flush"` and the repair goes on, because
+`set_len` still waits for the orphaned write. It opens a handle, `append` without `create`, only if
+none is retained. No test exercises the flush's error-clearing role: the `fault` seam fails an
+operation instead of running it, so nothing makes a real write fail inside tokio, and that role
+rests on tokio's source (`last_write_err`, `file.rs:1096`, `:1104`).
 
 **A failed repair drops the batch and writes nothing.** A failed truncate is counted
 `logit.component.buffer.disk.errors{op="truncate"}`, diagnosed under `disk_fs_error`, and drops
