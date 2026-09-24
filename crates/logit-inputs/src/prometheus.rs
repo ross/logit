@@ -1,10 +1,10 @@
 //! `prometheus_in`: **two modes on one kind.** `scrape_targets:` scrapes Prometheus `/metrics`
-//! endpoints on an interval, the way Prometheus's own server does; `bind:` is a Prometheus
-//! **remote-write receiver**, accepting 1.0 and 2.0 requests on one listener. Exactly one of the
-//! two is configured -- graph rule 55, which also rejects a field belonging to the other mode
-//! rather than ignoring it. See [ADR `prometheus-scrape-and-exposition`](../../../docs/adr/prometheus-scrape-and-exposition.md)
-//! and [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md) for the full
-//! designs; this module doc is the implementation's own spec.
+//! endpoints on an interval; `bind:` is a Prometheus **remote-write receiver**, accepting 1.0 and
+//! 2.0 requests on one listener. Exactly one of the two is configured: graph rule 55, which also
+//! rejects a field belonging to the other mode rather than ignoring it. The designs are
+//! [ADR `prometheus-scrape-and-exposition`](../../../docs/adr/prometheus-scrape-and-exposition.md)
+//! and [ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md); this module
+//! doc is the implementation's spec.
 //!
 //! ## Config
 //!
@@ -28,61 +28,60 @@
 //!   ttl: 10m
 //! ```
 //!
-//! Named `scrape_targets`, not `targets` -- `Component.targets` (`docs/adr/
-//! target-components.md`) claims the bare name at the flattened top level. The TLS keys are
-//! `scrape_tls`/`bind_tls`, never a bare `tls`: this kind has a TLS-shaped role on each side --
-//! client TLS dialling out, server TLS terminating in -- and each key names the socket it governs.
+//! `scrape_targets`, not `targets`: `Component.targets` (`docs/adr/target-components.md`) claims
+//! the bare name at the flattened top level. The TLS keys are `scrape_tls`/`bind_tls`, never a
+//! bare `tls`: each mode has its own TLS role (client TLS dialling out, server TLS terminating
+//! in), and each key names the socket it governs.
 //!
 //! # Scrape mode
 //!
 //! ## Modeled on `internal.rs`
 //!
 //! Interval-driven, like [`crate::internal::InternalInput`]: [`Input::run`] owns a
-//! `tokio::time::interval` ticker, swallows its immediate first tick (so the first real scrape
-//! happens after one full `interval` has elapsed, not at t=0), and calls [`PrometheusInput::tick`]
-//! -- a plain, non-trait method, directly testable without a runtime harness. Unlike `internal`,
-//! there is no `bind` override: a scrape client has no socket of its own to open ahead of time.
+//! `tokio::time::interval` ticker, swallows its immediate first tick (so the first scrape happens
+//! one full `interval` after start, not at t=0), and calls [`PrometheusInput::tick`], a plain
+//! method testable without a runtime harness. There is no `bind` override: a scrape client has no
+//! socket to open ahead of time.
 //!
-//! One deliberate difference from `internal.rs`: the ticker's missed-tick behavior is set to
-//! `Delay`, not the default `Burst`. `internal`'s own tick never does network I/O, so `Burst`
-//! (fire every missed tick back-to-back the moment a stall clears) is harmless there; this tick
-//! awaits `sink.send` (bounded-channel backpressure) plus a per-target request timeout, so a
-//! downstream stall lasting several intervals is ordinary here, and `Burst` would turn it into N
-//! full scrape rounds fired in a row -- `Delay` resumes on a fixed cadence instead, matching
+//! The ticker's missed-tick behavior is `Delay`, not the default `Burst`. `internal`'s tick does
+//! no network I/O, so `Burst` (fire every missed tick back-to-back once a stall clears) is
+//! harmless there. This tick awaits `sink.send` (bounded-channel backpressure) plus a per-target
+//! request timeout, so a downstream stall lasting several intervals is ordinary, and `Burst` would
+//! turn it into N full scrape rounds in a row. `Delay` resumes on a fixed cadence, matching
 //! Prometheus's own scrape scheduler, which skips a missed scrape rather than bursting to catch up.
 //!
 //! ## Dialect negotiation
 //!
 //! Every request carries `Accept: application/openmetrics-text;version=1.0.0,text/plain;
-//! version=0.0.4;q=0.5,*/*;q=0.1` and `User-Agent: logit/<CARGO_PKG_VERSION>` -- but, per the ADR,
-//! this input never *forces* a dialect: which one a target actually sent is read back off the
-//! response's own `Content-Type` via [`Dialect::from_content_type`] (`application/
-//! openmetrics-text` selects OpenMetrics; anything else, including a missing header, is text
-//! 0.0.4), so a target that ignores `Accept` entirely and always answers in text 0.0.4 still
-//! decodes correctly.
+//! version=0.0.4;q=0.5,*/*;q=0.1` and `User-Agent: logit/<CARGO_PKG_VERSION>`, but this input
+//! never *forces* a dialect: the one a target sent is read off the response's own `Content-Type`
+//! via [`Dialect::from_content_type`] (`application/openmetrics-text` selects OpenMetrics;
+//! anything else, including a missing header, is text 0.0.4). A target that ignores `Accept` and
+//! always answers in text 0.0.4 still decodes.
 //!
 //! ## Resource identity
 //!
-//! Built once per target in [`PrometheusInput::new`], never per scrape: an unprefixed `instance`
-//! (`host:port` -- port defaulted to 80/443 when the target URL omits one, exactly matching
-//! Prometheus's own scrape) via [`logit_proto::prometheus::LABEL_INSTANCE`], and
-//! [`logit_proto::prometheus::ATTR_TARGET`], the scrape URL with its userinfo (`user:pass@`, a
-//! legitimate way to put HTTP basic-auth credentials in a scrape URL) and query string stripped
-//! ([`redact_url`]) -- unlike `instance`, this attribute rides on every event this target
-//! produces, reaching whatever sink the pipeline routes it to, so it must never carry a
-//! credential in cleartext. Both ride on every batch this target ever produces, including its
-//! synthetic metrics, which is what keeps two targets exposing the same exporter from colliding
-//! once relayed onward.
+//! Built once per target in [`PrometheusInput::new`], never per scrape:
+//!
+//! - an unprefixed `instance` ([`logit_proto::prometheus::LABEL_INSTANCE`]): `host:port`, the port
+//!   defaulted to 80/443 when the target URL omits one, matching Prometheus's own scrape;
+//! - [`logit_proto::prometheus::ATTR_TARGET`]: the scrape URL with its userinfo and query string
+//!   stripped ([`redact_url`]). A scrape URL may carry a credential (`user:pass@` is a legitimate
+//!   way to configure basic auth), and this attribute reaches whatever sink the pipeline routes
+//!   to.
+//!
+//! Both ride on every batch the target produces, synthetic metrics included, which keeps two
+//! targets exposing the same exporter from colliding once relayed onward.
 //!
 //! ## Synthetic scrape metrics
 //!
-//! Every tick, every target -- scrape failures included -- gets exactly three synthetic series
+//! Every tick, every target, scrape failures included, gets exactly three synthetic series
 //! appended to its batch, on that target's resource, with no wire timestamp marker: `up`
-//! (`Gauge(0|1)`), `scrape_duration_seconds` (`Gauge`, wall-clock seconds for that target's own
-//! request), and `scrape_samples_scraped` (`Gauge`, the number of series successfully decoded --
-//! `0` on any failure). See the ADR's "Synthetic scrape metrics" section for why these three, and
-//! why they're always on. **Bind mode synthesizes none of them**: a receiver performed no scrape,
-//! so there is no `up` to report and nothing whose duration to measure.
+//! (`Gauge(0|1)`), `scrape_duration_seconds` (`Gauge`, wall-clock seconds for that target's
+//! request), and `scrape_samples_scraped` (`Gauge`, the number of series decoded, `0` on any
+//! failure). The ADR's "Synthetic scrape metrics" section says why these three, and why they're
+//! always on. **Bind mode synthesizes none of them**: a receiver performed no scrape, so there is
+//! no `up` to report and no duration to measure.
 //!
 //! ## Counters
 //!
@@ -90,22 +89,21 @@
 //! `other` (HTTP response classes), `network_error`, `timeout`, `parse_error` (a 2xx response body
 //! that failed to parse), or `oversize` (a response body that exceeded [`MAX_SCRAPE_BYTES`]).
 //! `logit.input.scrape.duration` -- a timing sample per target per tick, recorded regardless of
-//! outcome. `logit.input.samples` -- the number of series decoded, summed across every target
-//! (`0` contributes nothing but is still a well-formed call). A scrape failure also reports
-//! `Diagnostics::warn_throttled("scrape_failed", ..)`, with the failing target's [`redact_url`]ed
-//! form in the message text only -- never a tag (a target URL isn't `&'static` and isn't safe to
-//! intern per-target, `AGENTS.md`'s tag-cardinality convention) and never the raw URL, which may
-//! carry a credential.
+//! outcome. `logit.input.samples` -- the number of series decoded, summed across every target.
+//! A scrape failure also reports `Diagnostics::warn_throttled("scrape_failed", ..)` with the
+//! target's [`redact_url`]ed form in the message text only: never a tag (a target URL isn't
+//! `&'static` and isn't safe to intern per target, `logit_core::telemetry::Tag`'s convention),
+//! and never the raw URL, which may carry a credential.
 //!
 //! # Bind mode: the remote-write receiver
 //!
-//! [`PrometheusReceiver`] is an HTTP listener, not a client: `bind:` opens a `TcpListener`
-//! ([`Input::bind`], idempotent), `run` is an accept loop, and each accepted connection is served
-//! by [`hyper_util::server::conn::auto::Builder`] -- HTTP/1.1 and h2c off the same socket, since a
-//! remote-write sender may be either. Both wire versions are accepted on that one listener,
+//! [`PrometheusReceiver`] is an HTTP listener: `bind:` opens a `TcpListener` ([`Input::bind`],
+//! idempotent), `run` is an accept loop, and each connection is served by
+//! [`hyper_util::server::conn::auto::Builder`], HTTP/1.1 and h2c off the same socket, since a
+//! remote-write sender may speak either. Both wire versions are accepted on that one listener,
 //! chosen **per request** from its own `Content-Type` with nothing to configure: the 2.0 spec
-//! requires a 2.0-capable receiver to keep accepting 1.0, and a `logit` receiver is worth pointing
-//! a mixed-version fleet at.
+//! requires a 2.0-capable receiver to keep accepting 1.0, and a mixed-version fleet can then
+//! share one receiver.
 //!
 //! ## Routes
 //!
@@ -119,57 +117,52 @@
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
 //! | Snappy or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
 //!
-//! **`405` is a deliberate divergence from `otlp_in`**, which answers `404` for a non-`POST`.
-//! `prometheus_out`'s exposition server already answers `405` for a wrong method on `/metrics`,
-//! and this receiver lives on the same kind pair, so it matches its sibling rather than the
-//! unrelated input whose accept loop it copied. A reader diffing the two inputs finds the reason
-//! here rather than a bug.
+//! **`405` diverges from `otlp_in`**, which answers `404` for a non-`POST`. `prometheus_out`'s
+//! exposition server answers `405` for a wrong method on `/metrics`, and this receiver matches
+//! that sibling on the same kind pair rather than the unrelated input whose accept loop it
+//! copied. A reader diffing the two inputs finds the reason here rather than a bug.
 //!
-//! **A missing `Content-Type` is a `415`, not a default.** `otlp_in` treats an absent type as
-//! protobuf, deliberately, because every client predating its JSON support sent none. Remote-write
-//! has no such history: both specs require the header, so guessing 1.0 would turn a 2.0 sender's
-//! misconfiguration into a wall of protobuf decode errors instead of the one status the spec has
-//! for exactly this.
+//! **A missing `Content-Type` is a `415`, not a default.** `otlp_in` reads an absent type as
+//! protobuf because every client predating its JSON support sent none. Both remote-write specs
+//! require the header, so guessing 1.0 would turn a 2.0 sender's misconfiguration into a wall of
+//! protobuf decode errors instead of the one status the spec has for it.
 //!
 //! **The `-Written` headers.** A 2.0 request's response carries
 //! `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written`, on `4xx` as well as `2xx`
-//! as 2.0 requires, reporting what this receiver actually stored -- zeros on a rejection, and
-//! always `0` histograms, since native histograms are skipped and counted rather than stored
+//! as 2.0 requires, reporting what this receiver stored: zeros on a rejection, and always `0`
+//! histograms, since native histograms are skipped and counted rather than stored
 //! (`docs/known-gaps.md`). A 1.0 request gets none: 1.0 defines none.
 //!
-//! *Samples-written is measured on the way out, not on the way in.* The codec's own accepted count
-//! is a statement about what the assembler took, and the model mapping that runs afterwards can
-//! still drop a whole series (an empty histogram, a histogram whose bucket counts decrease). So
-//! the number reported is every decoded series' wire samples minus the ones belonging to a series
-//! that mapping dropped, both measured by [`logit_proto::prometheus::remote_write::wire_samples`]
-//! -- which reads the [`logit_proto::prometheus::Point`], and so still sees the `Option`s the wire
-//! had (a summary sent as quantiles alone is two samples, not four). A request whose every series
-//! was dropped answers `204` with `Samples-Written: 0` and sends no batch, which is the honest
-//! report of having stored nothing.
+//! *Samples-written is measured on the way out, not on the way in.* The codec's accepted count is
+//! what the assembler took, and the model mapping that runs afterwards can still drop a whole
+//! series (an empty histogram, a histogram whose bucket counts decrease). So the number reported
+//! is every decoded series' wire samples minus those of each series the mapping dropped, both
+//! measured by [`logit_proto::prometheus::remote_write::wire_samples`], which reads the
+//! [`logit_proto::prometheus::Point`] and so still sees the `Option`s the wire had (a summary sent
+//! as quantiles alone is two samples, not four). A request whose every series was dropped answers
+//! `204` with `Samples-Written: 0` and sends no batch.
 //!
 //! ## What a decoded request becomes
 //!
 //! **One `EventBatch` per request**, with an **empty `Resource`** and `received_at` = now, built
 //! by concatenating [`families_to_events`] over the decoded timestamp groups. A request that
-//! decodes to no events at all sends no batch -- a `204` and nothing downstream.
+//! decodes to no events sends no batch: a `204` and nothing downstream.
 //!
-//! **Labels stay labels.** `instance` and `job` arrive as ordinary labels -- both are optional per
-//! spec, neither is structurally distinguished on the wire -- and stay ordinary event attributes,
-//! verbatim. Nothing is lifted into `Resource` and no `prometheus.target` is stamped. This is the
-//! opposite of what scrape mode does, and the difference is a fact about what each mode knows: a
-//! scrape connected to the target it names, while a receiver observed a TCP connection from a
-//! sender that may be relaying for thousands of targets. Promoting a payload label to resource
-//! identity would invent structure the wire did not carry, and would silently change the label set
-//! a remote-write → remote-write relay re-emits. An operator who wants resource identity gets it
-//! from a downstream `set` component or Lua, which is where a claim about *this* deployment's
-//! topology belongs.
+//! **Labels stay labels.** `instance` and `job` arrive as ordinary labels (both optional per spec,
+//! neither structurally distinguished on the wire) and stay ordinary event attributes, verbatim.
+//! Nothing is lifted into `Resource` and no `prometheus.target` is stamped, the opposite of scrape
+//! mode, because each mode knows something different: a scrape connected to the target it names,
+//! while a receiver observed a TCP connection from a sender that may be relaying for thousands of
+//! targets. Promoting a payload label to resource identity would invent structure the wire did
+//! not carry and change the label set a remote-write → remote-write relay re-emits. An operator
+//! who wants resource identity adds it with a downstream `set` component or Lua.
 //!
 //! **Timestamps and timestamp groups.** A remote-write `TimeSeries` is one label set and N
 //! samples; a `Series` holds one point and one timestamp. So the codec partitions a request's
 //! samples by timestamp and returns one family list per distinct timestamp in ascending order
 //! (`logit_proto::prometheus::remote_write`'s own doc), and this receiver concatenates them into
-//! one batch -- N events per series, in timestamp order. `Event::timestamp` comes from the sample,
-//! and the decoder runs with `with_timestamp_marker(false)` so **no `prometheus.timestamp: true`
+//! one batch: N events per series, in timestamp order. `Event::timestamp` comes from the sample,
+//! and the decoder runs with `with_timestamp_marker(false)`, so **no `prometheus.timestamp: true`
 //! attribute is set**: that marker records a *producer's choice* to expose a timestamp on an
 //! exposition line, and a transport that mandates one is not that choice. Setting it would make a
 //! remote-write → exposition relay stamp an explicit timestamp on every line it writes, which no
@@ -177,19 +170,19 @@
 //!
 //! ## Metadata cache
 //!
-//! **Why there is one at all.** Remote-write carries a family's type, `# HELP` and `# UNIT` as
-//! *metadata*, and 1.0 puts it in `WriteRequest.metadata[]` -- which Prometheus's own sender ships
-//! in **separate requests**, on its own schedule (`metadata_config`, by default once a minute),
-//! rather than attached to the samples it describes. A receiver that remembers nothing therefore
-//! sees, for nearly every 1.0 request, a bag of flat series with no type anywhere in the message:
-//! every family decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count`
-//! arrive as three unrelated series instead of one histogram. Nothing is lost -- the samples and
-//! labels are exact, and a relay back out to remote-write is still a fixed point -- but the model
-//! kinds are flatter than the producer's, which is what the cache fixes.
+//! **Why there is one.** Remote-write carries a family's type, `# HELP` and `# UNIT` as
+//! *metadata*, and 1.0 puts it in `WriteRequest.metadata[]`, which Prometheus's own sender ships
+//! in **separate requests** on its own schedule (`metadata_config`, by default once a minute)
+//! rather than attached to the samples it describes. A receiver that remembers nothing sees, for
+//! nearly every 1.0 request, flat series with no type anywhere in the message: every family
+//! decodes as `unknown`, and `http_request_duration_seconds_bucket`/`_sum`/`_count` arrive as
+//! three unrelated series instead of one histogram. Nothing is lost (the samples and labels are
+//! exact, and a relay back out to remote-write is still a fixed point), but the model kinds are
+//! flatter than the producer's, which is what the cache fixes.
 //!
 //! [`MetadataCache`] holds `family name -> (type, help, unit, last seen)`, seeded into every decode
 //! ([`remote_write::decode_with`]) and learned from every request's own
-//! [`Decoded::declarations`](remote_write::Decoded::declarations) -- 1.0's `metadata[]` and 2.0's
+//! [`Decoded::declarations`](remote_write::Decoded::declarations): 1.0's `metadata[]` and 2.0's
 //! inline `Metadata` alike, so a mixed-version fleet fills one table and a 2.0 sender's
 //! declarations type a 1.0 sender's series.
 //!
@@ -197,85 +190,82 @@
 //! wins, per family name; the cache answers only for a family that request said nothing about. A
 //! sender that retypes a family retypes it immediately, however stale the remembered entry.
 //!
-//! **What a TTL expiry means.** An expired family stops being typed -- its next samples decode as
-//! `unknown` and its `_bucket`/`_sum`/`_count` series come apart again -- until the sender's next
-//! metadata request re-declares it. That is the bound working, not a fault: a sender that has
-//! stopped writing should stop costing memory, and a remembered type nothing has reasserted within
-//! the TTL is a guess about a series that may no longer exist. The default 10m is an order of
-//! magnitude over Prometheus's own metadata cadence, so a live sender has to miss ten refreshes
-//! running to lapse.
+//! **What a TTL expiry means.** An expired family stops being typed (its next samples decode as
+//! `unknown` and its `_bucket`/`_sum`/`_count` series come apart again) until the sender's next
+//! metadata request re-declares it. That is the bound working: a sender that has stopped writing
+//! should stop costing memory, and a remembered type nothing has reasserted within the TTL is a
+//! guess about a series that may no longer exist. The default 10m is an order of magnitude over
+//! Prometheus's own metadata cadence, so a live sender has to miss ten refreshes running to lapse.
 //!
 //! **Bounds.** `max_families` caps the table; over it, the **least-recently-seen** family is
 //! evicted first (ties broken by name, so it is a function of the data rather than of map order),
-//! the same policy and the same one-pass shape `prometheus_out`'s exposition `max_series:` uses.
-//! A family's `# HELP` and `# UNIT` are each cut to [`MAX_METADATA_TEXT_BYTES`] as they are
-//! remembered, counted `logit.input.metadata_cache.truncated` -- the request cap bounds a request,
-//! not a table that keeps things. `max_families: 0` is not a zero-size cache but no cache at all:
-//! nothing is allocated, no lock is taken, and requests decode through the stateless
-//! [`remote_write::decode`] exactly as they did before this existed. Rule 55 rejects `ttl: 0s`,
-//! which would be the pointless version of that.
+//! the same policy and one-pass shape as `prometheus_out`'s exposition `max_series:`. A family's
+//! `# HELP` and `# UNIT` are each cut to [`MAX_METADATA_TEXT_BYTES`] as they are remembered,
+//! counted `logit.input.metadata_cache.truncated`: the request cap bounds a request, not a table
+//! that keeps things. `max_families: 0` is not a zero-size cache but no cache at all: nothing is
+//! allocated, no lock is taken, and requests decode through the stateless
+//! [`remote_write::decode`]. Rule 55 rejects `ttl: 0s`, the pointless version of that.
 //!
-//! **Whose table it is.** One per component, not one per sender: every peer that can `POST` to this
-//! listener writes to the same table, is typed from the same table, and is evicted by the same
-//! `last_seen` order. So a peer's declarations are visible to every other peer -- which is the
-//! point, since it is what lets a 2.0 sender type a 1.0 one -- and a peer that declares a great
-//! many families evicts everyone else's, counted `evicted{reason="cardinality"}` but not
-//! attributed. Repeated faster than the victims' own metadata cadence, that keeps well-behaved
-//! senders permanently untyped. The cache does not *drop* their samples -- a remembered type gives
-//! way to a sample it cannot place rather than rejecting it ([`remote_write::decode_with`]) -- but
-//! flat families are what they get. Nothing here authenticates a sender, so this is the
-//! "Security posture" section's rule again rather than a new one: do not point this listener at
-//! untrusted senders. An operator who has to, and would rather have flat families than a table
-//! anyone can churn, sets `max_families: 0` -- which turns the sharing off along with the typing.
+//! **Whose table it is.** One per component, not one per sender: every peer that can `POST` to
+//! this listener writes to the same table, is typed from it, and is evicted by the same
+//! `last_seen` order. So a peer's declarations are visible to every other peer (the point, since
+//! that is what lets a 2.0 sender type a 1.0 one), and a peer that declares a great many families
+//! evicts everyone else's, counted `evicted{reason="cardinality"}` but not attributed. Repeated
+//! faster than the victims' own metadata cadence, that keeps well-behaved senders permanently
+//! untyped. The cache does not *drop* their samples (a remembered type gives way to a sample it
+//! cannot place rather than rejecting it, [`remote_write::decode_with`]), but flat families are
+//! what they get. Nothing here authenticates a sender, so this is the "Security posture" rule
+//! again: do not point this listener at untrusted senders. An operator who has to, and would
+//! rather have flat families than a table anyone can churn, sets `max_families: 0`, which turns
+//! the sharing off along with the typing.
 //!
-//! **Concurrency, and what a request actually pays.** One `std::sync::Mutex` guards the table,
-//! taken to build the seed and taken again to learn, **never held across the decode** -- a
-//! connection's requests are served concurrently and the decode is the expensive part. A blocking
-//! mutex parks the Tokio worker thread of anyone waiting on it, so the rule here is that the held
-//! section is `O(1)` unless something really changed:
+//! **Concurrency, and what a request pays.** One `std::sync::Mutex` guards the table, taken to
+//! build the seed and again to learn, **never held across the decode**: a connection's requests
+//! are served concurrently and the decode is the expensive part. A blocking mutex parks the Tokio
+//! worker thread of anyone waiting on it, so the held section is `O(1)` unless the table changed:
 //!
 //! - the seed handed to the codec is an `Arc` of the table in the codec's own shape, rebuilt only
-//!   when the table's *contents* change -- re-declaring what is already remembered (which is what
+//!   when the table's *contents* change; re-declaring what is already remembered (which
 //!   Prometheus does every `send_interval`, from every shard) touches `last_seen` and nothing else;
 //! - the expiry sweep is *checked* per request, not performed: the table carries the earliest
 //!   instant at which any entry could go, so until then expiry costs one comparison;
-//! - a request that declares nothing -- nearly every 1.0 request -- does not take the lock a second
-//!   time at all.
+//! - a request that declares nothing (nearly every 1.0 request) does not take the lock a second
+//!   time.
 //!
 //! So a sample-only request pays a lock, a comparison and a refcount bump, and the passes that
-//! scale with what is remembered happen only when an entry is really added, retyped or expired.
+//! scale with the table happen only when an entry is added, retyped or expired.
 //!
 //! ## Size, concurrency, and shutdown
 //!
 //! [`MAX_REQUEST_BYTES`] (4 MiB) bounds the **decompressed** body, checked against Snappy's own
 //! `decompress_len` before a byte is expanded, so a compression bomb is rejected rather than
-//! inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once --
-//! past it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
+//! inflated. [`MAX_CONCURRENT_CONNECTIONS`] bounds how many connections are served at once; past
+//! it a connection is rejected, not queued (`logit.input.connections.rejected{reason="limit"}`).
 //! [`HANDSHAKE_TIMEOUT`] bounds each connection's pre-request phase: its TLS accept on a TLS
-//! listener, its first byte on a plaintext one. None of the three is a config field; the first two
-//! are denial-of-service bounds rather than tuning knobs, and the third is a constant here because
-//! graph rule 45's `handshake_timeout:` does not cover this kind.
+//! listener, its first byte on a plaintext one. None of the three is a config field: the first
+//! two are denial-of-service bounds rather than tuning knobs, and graph rule 45's
+//! `handshake_timeout:` does not cover this kind.
 //!
 //! `idle_timeout:` closes a connection that sits with no request in flight, via the shared
-//! tracker in [`crate::http`] -- `otlp_in`'s module doc holds the reasoning (why the clock is at
+//! tracker in [`crate::http`]; `otlp_in`'s module doc holds the reasoning (why the clock is at
 //! the service rather than the socket, why it resets on request *completion*, and why the close is
 //! `graceful_shutdown` plus a bounded grace rather than a drop). A request whose *body* stalls gets
-//! the narrower per-frame bound instead and answers `408` -- **derived from the same field, so it
-//! exists only where `idle_timeout:` is set.** It is off by default, and a default `bind:`
-//! therefore has no bound on a half-uploaded request at all: it holds its
-//! [`MAX_CONCURRENT_CONNECTIONS`] permit until the sender goes away. Set it on any listener a real
-//! fleet writes to ([ADR `idle-connection-timeout`](../../../docs/adr/idle-connection-timeout.md)'s
-//! "recommend it on wherever consistent traffic is expected"; `examples/prometheus-remote-write-receive.yaml`
+//! the narrower per-frame bound instead and answers `408`, **derived from the same field, so it
+//! exists only where `idle_timeout:` is set.** It is off by default, so a default `bind:` has no
+//! bound on a half-uploaded request: it holds its [`MAX_CONCURRENT_CONNECTIONS`] permit until the
+//! sender goes away. Set it on any listener a real fleet writes to
+//! ([ADR `idle-connection-timeout`](../../../docs/adr/idle-connection-timeout.md)'s "recommend it
+//! on wherever consistent traffic is expected"; `examples/prometheus-remote-write-receive.yaml`
 //! ships a value). There is no listener-level graceful shutdown here or anywhere else in this
 //! repo: shutdown is per connection.
 //!
 //! ## Security posture
 //!
 //! `bind_tls:` gives transport security and nothing else. **The receiver has no authentication of
-//! any kind** -- no bearer token, no basic auth, no mutual-TLS identity check beyond `rustls`
-//! accepting a client certificate chain when `client_ca_file` is set -- so anything that can reach
-//! the socket can write series into the pipeline. The same gap `admin:` and `prometheus_out`'s
-//! exposition `bind:` already carry, tracked in `docs/known-gaps.md`: front it with something that
+//! any kind** (no bearer token, no basic auth, no mutual-TLS identity check beyond `rustls`
+//! accepting a client certificate chain when `client_ca_file` is set), so anything that can reach
+//! the socket can write series into the pipeline. `admin:` and `prometheus_out`'s exposition
+//! `bind:` carry the same gap, tracked in `docs/known-gaps.md`: front it with something that
 //! authenticates, or keep it on a trusted network.
 //!
 //! ## Counters
@@ -283,26 +273,27 @@
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
 //! `method`, `unsupported`, `oversize`, `timeout`, or `bad_request`. `logit.input.write.duration`
 //! -- a timing sample per request, recorded regardless of outcome. `logit.input.samples` --
-//! reused from scrape mode, counting the wire samples that actually reached the `Fanout` -- every
-//! decoded series' worth minus every series the model mapping then dropped, exactly the number the
-//! `-Written` header reports. Deliberately the same number: a counter and a header disagreeing
-//! about one request would be a puzzle with no right answer. The connection
-//! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
+//! reused from scrape mode, counting the wire samples that reached the `Fanout`: every decoded
+//! series' worth minus every series the model mapping then dropped, the number the `-Written`
+//! header reports. The same number on purpose: a counter and a header disagreeing about one
+//! request would be a puzzle with no right answer.
+//!
 //! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
 //! whenever the table changes (a transition, like `logit.input.connections`, not a per-request
 //! restatement). `logit.input.metadata_cache.evicted{reason}` -- `expired` for a family whose `ttl`
 //! ran out, `cardinality` for one pushed out of `max_families` by a newer one.
-//! `logit.input.metadata_cache.replaced` -- one count per family a request retyped, which is the
-//! counter to watch when a sender's model kinds look wrong: a healthy fleet retypes almost nothing,
-//! and a steady stream here is two senders disagreeing about one family name.
+//! `logit.input.metadata_cache.replaced` -- one count per family a request retyped: the counter to
+//! watch when a sender's model kinds look wrong, since a healthy fleet retypes almost nothing and
+//! a steady stream here is two senders disagreeing about one family name.
 //! `logit.input.metadata_cache.truncated` -- one count per help or unit string cut to
 //! [`MAX_METADATA_TEXT_BYTES`] on its way into the table; the type is still remembered exactly, so
-//! this bounds what one entry costs rather than what it types. The connection
-//! counters are `otlp_in`'s spelling verbatim (`logit.input.connections{,.rejected,.closed}`),
-//! since this is the same accept loop. A rejected request also reports
-//! `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address in the message text
-//! only -- never a tag (a peer address isn't `&'static` and isn't safe to intern per-peer,
-//! `AGENTS.md`'s tag-cardinality convention). The decoder's own
+//! this bounds what one entry costs rather than what it types.
+//!
+//! The connection counters are `otlp_in`'s spelling verbatim
+//! (`logit.input.connections{,.rejected,.closed}`), since this is the same accept loop. A rejected
+//! request also reports `Diagnostics::warn_throttled("write_rejected", ..)` with the peer address
+//! in the message text only, never a tag (a peer address isn't `&'static` and isn't safe to intern
+//! per peer, `logit_core::telemetry::Tag`'s convention). The decoder's own
 //! `logit.input.metrics.skipped{reason}` counts what it stepped over, native histograms included.
 
 use crate::http::{
@@ -339,33 +330,27 @@ use tokio::task::JoinSet;
 // Scrape mode: the interval-driven scrape client
 // -------------------------------------------------------------------------------------------------
 
-/// Hard cap on one scrape response's body, read incrementally via [`reqwest::Response::chunk`] --
+/// Hard cap on one scrape response's body, read incrementally via [`reqwest::Response::chunk`], so
 /// a hostile or misconfigured exporter can't grow this input's memory unboundedly. 32 MiB is
-/// generous for even a very large `/metrics` page while still being a real bound; an exporter that
-/// legitimately needs more is a config problem to fix at the source, not something to raise this
-/// for silently.
+/// generous for a very large `/metrics` page; an exporter that needs more is a problem to fix at
+/// the source, not a reason to raise this.
 const MAX_SCRAPE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Never forces a dialect (per the ADR's "Dialects and negotiation" section) -- this just tells a
-/// target that speaks either that OpenMetrics is preferred, for a target that bothers to read
-/// `Accept` at all. Which dialect a response is actually in is always read back off its own
-/// `Content-Type`, never assumed from this header.
+/// A preference, never a forced dialect (the ADR's "Dialects and negotiation" section): the
+/// dialect a response is in is always read off its own `Content-Type`, never assumed from this.
 const ACCEPT_HEADER_VALUE: &str =
     "application/openmetrics-text;version=1.0.0,text/plain;version=0.0.4;q=0.5,*/*;q=0.1";
 
-/// `logit/<CARGO_PKG_VERSION>` -- a compile-time constant, so sending it costs no per-request
-/// allocation.
+/// `logit/<CARGO_PKG_VERSION>`, a compile-time constant, so sending it allocates nothing.
 const USER_AGENT_VALUE: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
 
-/// `crate::tls::TlsClientSettings`, re-exported at this path -- kept reachable as
-/// `prometheus::TlsClientSettings` so `logit-cli::pipeline::build_spec` has one obvious path to
-/// import, the same convention `otlp::TlsServerSettings` already follows.
+/// `crate::tls::TlsClientSettings`, re-exported so `logit-cli::pipeline::build_spec` imports it
+/// from this module, as it does `otlp::TlsServerSettings`.
 pub use crate::tls::TlsClientSettings;
 
-/// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for anything that
-/// isn't the request itself -- diagnostics text, `prometheus.target`), and the `Resource` every
-/// batch built from it carries. Built once in [`PrometheusInput::new`] -- see this module's doc
-/// comment.
+/// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for everything that
+/// isn't the request itself: diagnostics text, `prometheus.target`), and the `Resource` every
+/// batch built from it carries. Built once in [`PrometheusInput::new`].
 #[derive(Clone)]
 struct Target {
     url: String,
@@ -373,15 +358,14 @@ struct Target {
     resource: Arc<Resource>,
 }
 
-/// `host:port` of `url`'s authority, port defaulted to the scheme's well-known one (80/443) when
-/// absent -- exactly what Prometheus's own `instance` label holds, and what
-/// [`logit_proto::prometheus::LABEL_INSTANCE`] documents. Falls back to [`redact_url`]'s own
-/// `index`-keyed placeholder if `url` doesn't parse -- graph validation's rule 40 only checks
-/// scheme plus a non-empty authority (a cheap, `reqwest`-free approximation, since
-/// `logit-pipeline` can't depend on it), not a full URL grammar, so a target like
-/// `http://999.999.999.999/metrics` or `http://[::1/metrics` passes rule 40 but still fails
-/// `reqwest::Url::parse` here -- a real path, not merely defensive. Never the raw `url` itself,
-/// which may carry a `user:pass@` credential this fallback must not leak.
+/// `host:port` of `url`'s authority, the port defaulted to the scheme's (80/443) when absent: what
+/// Prometheus's own `instance` label holds ([`logit_proto::prometheus::LABEL_INSTANCE`]).
+///
+/// Falls back to [`redact_url`]'s `index`-keyed placeholder if `url` doesn't parse, and that path
+/// is reachable: rule 40 checks only scheme plus a non-empty authority (a `reqwest`-free
+/// approximation, since `logit-pipeline` can't depend on it), so `http://999.999.999.999/metrics`
+/// or `http://[::1/metrics` passes it and still fails `reqwest::Url::parse`. Never the raw `url`,
+/// which may carry a `user:pass@` credential.
 fn instance_of(index: usize, url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(parsed) => {
@@ -395,35 +379,28 @@ fn instance_of(index: usize, url: &str) -> String {
     }
 }
 
-/// `url` with its userinfo (`user:pass@`) and query string stripped -- what every place that
-/// isn't the actual scrape request itself (the `prometheus.target` resource attribute, every
-/// `scrape_failed` diagnostic) must use instead of the raw target. A scrape URL can legitimately
-/// carry HTTP basic-auth credentials (`http://user:pass@host/metrics`) -- `reqwest` turns that
-/// into an `Authorization` header and never puts it on the wire itself, but the raw `String` this
-/// input was configured with still holds it in memory, and `prometheus.target` rides on every
-/// event's resource, reaching whatever sink the pipeline is configured with (InfluxDB tags,
-/// statsd tag sets, a forwarded OTLP resource, a stdout/file render) -- rendering the password in
-/// cleartext into every one of them if not stripped first. The query string goes too, since a
-/// bearer-token-in-query auth scheme (`?token=...`) is just as real a credential shape; the
-/// fragment is *not* stripped -- `url` crate parsing means this also normalizes the result (the
-/// host is lowercased, and a port matching the scheme's default is dropped), which is harmless
-/// for an already-valid absolute URL.
+/// `url` with its userinfo (`user:pass@`) and query string stripped: what everything but the
+/// scrape request itself (`prometheus.target`, every `scrape_failed` diagnostic) uses. `reqwest`
+/// turns `http://user:pass@host/metrics` into an `Authorization` header, but the configured
+/// `String` still holds the password, and `prometheus.target` reaches every sink the pipeline
+/// routes to (InfluxDB tags, statsd tag sets, a forwarded OTLP resource, a stdout/file render).
+/// The query string goes too, since `?token=...` is as real a credential shape. The fragment is
+/// kept. Parsing also normalizes the result (host lowercased, a default port dropped), which is
+/// harmless for a valid absolute URL.
 ///
-/// Falls back to `<unparseable target #{index}>` -- never the raw `url`, and never a placeholder
-/// shared across targets -- if `url` doesn't parse at all. Rule 40 (`logit-pipeline::graph`) only
-/// approximates a real URL grammar (scheme plus non-empty authority), so a target like
-/// `http://999.999.999.999/metrics`, `http://[::1/metrics`, `http://host:99999/metrics`, or a
-/// host containing a space or an invalid percent-escape reaches this function despite passing
-/// that check; `index` (this target's position in the configured `targets` list) is what keeps
-/// two such targets from colliding onto the same `instance`/`prometheus.target` and silently
-/// merging their series.
+/// Falls back to `<unparseable target #{index}>`, never the raw `url` and never a placeholder
+/// shared across targets. Rule 40 (`logit-pipeline::graph`) only approximates a URL grammar
+/// (scheme plus non-empty authority), so `http://999.999.999.999/metrics`,
+/// `http://[::1/metrics`, `http://host:99999/metrics`, or a host with a space or an invalid
+/// percent-escape reaches this function; `index` (the target's position in `scrape_targets`)
+/// keeps two such targets from colliding onto one `instance`/`prometheus.target` and merging
+/// their series.
 fn redact_url(index: usize, url: &str) -> String {
     match reqwest::Url::parse(url) {
         Ok(mut parsed) => {
-            // `Url::set_username`/`set_password` only fail for a URL kind that can't have
-            // userinfo at all (`cannot-be-a-base`, e.g. `data:`) -- never true for an absolute
-            // `http`/`https` URL, which is all rule 40 ever lets through; the `Result` is
-            // discarded rather than propagated for exactly that reason.
+            // `Url::set_username`/`set_password` fail only for a URL that can't have userinfo
+            // (`cannot-be-a-base`, e.g. `data:`), never an absolute `http`/`https` URL, which is
+            // all rule 40 lets through.
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
             parsed.set_query(None);
@@ -455,10 +432,9 @@ fn now_nanos() -> i64 {
         .as_nanos() as i64
 }
 
-/// A coarse HTTP response-status bucket -- see `logit_outputs::otlp::status_class`'s identical
-/// reasoning; duplicated rather than shared, same as that module's own note on why (independently
-/// evolving crates). `1xx`/`3xx` fold into `other` -- a scrape response is never legitimately
-/// either, so there's no value in a finer bucket for them.
+/// A coarse HTTP response-status bucket, modelled on `logit_outputs::http::status_class` rather
+/// than shared across crates, except that `1xx`/`3xx` fold into `other`: a scrape response is
+/// never legitimately either.
 fn status_class(status: reqwest::StatusCode) -> &'static str {
     match status.as_u16() / 100 {
         2 => "2xx",
@@ -468,9 +444,8 @@ fn status_class(status: reqwest::StatusCode) -> &'static str {
     }
 }
 
-/// The outcome of one target's scrape attempt -- what [`scrape_target`] returns, and what
-/// [`PrometheusInput::tick`] classifies into a `logit.input.scrapes{class}` count and either a
-/// decoded batch or a failed one.
+/// One target's scrape outcome, which [`PrometheusInput::tick`] classifies into a
+/// `logit.input.scrapes{class}` count and a decoded or failed batch.
 enum ScrapeStatus {
     Ok { dialect: Dialect, body: Vec<u8> },
     Http(reqwest::StatusCode),
@@ -479,11 +454,10 @@ enum ScrapeStatus {
     Oversize,
 }
 
-/// Scrapes one target: builds the request (extra `headers` first, then the fixed `Accept`/
-/// `User-Agent` pair inserted after -- so they always win even if a misconfigured `headers` entry
-/// named one of them, the same defense-in-depth `logit_outputs::otlp::OtlpOutput::send_http` uses
-/// for `Content-Type`), reads the response body incrementally via [`reqwest::Response::chunk`]
-/// capped at [`MAX_SCRAPE_BYTES`].
+/// Scrapes one target, reading the body incrementally via [`reqwest::Response::chunk`] capped at
+/// [`MAX_SCRAPE_BYTES`]. The fixed `Accept`/`User-Agent` pair is inserted after the extra
+/// `headers`, so it wins even over a `headers` entry naming one of them, the same defense
+/// `logit_outputs::otlp::OtlpOutput::send_http` uses for `Content-Type`.
 async fn scrape_target(
     client: reqwest::Client,
     url: String,
@@ -535,17 +509,16 @@ pub struct PrometheusInput {
     timeout: Duration,
     headers: HeaderMap,
     client: reqwest::Client,
-    /// Kept across ticks (not rebuilt per scrape) so the decoder's own throttled diagnostics
-    /// (a malformed line, non-monotonic histogram buckets) accumulate their occurrence counts
-    /// across the whole component's lifetime, the same as every other decoder-holding input.
+    /// Kept across ticks so the decoder's throttled diagnostics (a malformed line, non-monotonic
+    /// histogram buckets) accumulate occurrence counts over the component's lifetime.
     decoder: PrometheusDecoder,
     telemetry: Telemetry,
     diag: Diagnostics,
 }
 
 impl PrometheusInput {
-    /// `targets` become this input's scrape list, each with a `Resource` built once here (see this
-    /// module's doc comment's "Resource identity" section) -- never rebuilt per tick.
+    /// `targets` become the scrape list, each with a `Resource` built once here (this module's
+    /// "Resource identity" section).
     pub fn new(targets: Vec<String>, interval: Duration) -> Self {
         let targets = targets
             .into_iter()
@@ -568,21 +541,19 @@ impl PrometheusInput {
         }
     }
 
-    /// Overrides the default 10s per-request timeout, applied per scrape via
-    /// `RequestBuilder::timeout` -- unlike `otlp_out`'s client-wide timeout, this needs no client
-    /// rebuild, so it composes with [`PrometheusInput::with_tls`] in either call order.
+    /// Overrides the default 10s per-request timeout. Applied per scrape via
+    /// `RequestBuilder::timeout`, not baked into the client, so it composes with
+    /// [`PrometheusInput::with_tls`] in either call order.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Sets the extra headers sent on every scrape request (`headers:` in config). Fails on the
-    /// same shape `otlp_out`'s `with_headers` does: an illegal header name/value, or two names
-    /// colliding once HTTP's case-insensitivity is applied -- `logit-pipeline::graph::resolve`'s
-    /// rule 40 rejects a header this input sets itself (`accept`, `user-agent`, and the other
-    /// protocol-owned names) before construction ever sees it; this catches the lexical shape
-    /// `graph` can't. [`scrape_target`] still inserts `Accept`/`User-Agent` *after* cloning these
-    /// in, so they always win even if that rule were ever bypassed.
+    /// Sets the extra headers sent on every scrape request (`headers:` in config). Fails, as
+    /// `otlp_out`'s `with_headers` does, on an illegal name or value, or two names that collide
+    /// case-insensitively. Rule 40 already rejects a header this input sets itself (`accept`,
+    /// `user-agent`, the other protocol-owned names); this catches the lexical faults the graph
+    /// can't, and [`scrape_target`] still inserts `Accept`/`User-Agent` last.
     pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
         let mut map = HeaderMap::with_capacity(headers.len());
         for (name, value) in headers {
@@ -604,11 +575,9 @@ impl PrometheusInput {
         Ok(self)
     }
 
-    /// Sets client-side TLS tuning (`scrape_tls:` in config) for any `https://` target -- a
-    /// no-op if
-    /// `settings` is empty. Built entirely on `reqwest`'s own PEM loaders
-    /// ([`crate::tls::apply_client_tls`]); no `rustls` type appears in this crate's HTTP-client
-    /// path.
+    /// Sets client-side TLS (`scrape_tls:` in config) for any `https://` target; a no-op if
+    /// `settings` is empty. Built on `reqwest`'s PEM loaders ([`crate::tls::apply_client_tls`]), so
+    /// no `rustls` type appears in this crate's HTTP-client path.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
@@ -643,18 +612,15 @@ impl PrometheusInput {
         self
     }
 
-    /// One scrape cycle: every target concurrently (a [`JoinSet`], since the number of targets is
-    /// only known at runtime), then -- sequentially, back on this method's own task, so nothing
-    /// here needs to synchronize concurrent access to `self.decoder`/`self.diag`/`self.telemetry`
-    /// -- one `EventBatch` sent per target, decoded series plus the three synthetic metrics
-    /// together. A non-trait method, directly callable from a test with a canned server and a
-    /// bare `Fanout`, the same shape as `internal.rs`'s own `tick`.
+    /// One scrape cycle: every target fetched concurrently (a [`JoinSet`]), then one `EventBatch`
+    /// per target, decoded series plus the three synthetic metrics, built and sent sequentially on
+    /// this task so `self.decoder`/`self.diag`/`self.telemetry` need no synchronization. A plain
+    /// method, callable from a test with a canned server and a bare `Fanout`, like `internal.rs`'s
+    /// `tick`.
     async fn tick(&mut self, sink: &Fanout) {
         let received_at = now_nanos();
-        // A local clone of the target list, not `&self.targets` -- lets the loop below hold
-        // `&mut self.decoder`/`&mut self.diag` at the same time as reading each target's own
-        // fields, with no borrow-checker conflict over disjoint parts of `self`. Cheap: a handful
-        // of `String` + `Arc<Resource>` clones per tick, not a hot path.
+        // Cloned, not borrowed, so the loop below can hold `&mut self.decoder`/`&mut self.diag`
+        // while reading each target. A few `String` + `Arc<Resource>` clones per tick.
         let targets = self.targets.clone();
 
         let mut set = JoinSet::new();
@@ -673,10 +639,9 @@ impl PrometheusInput {
         let mut outcomes: Vec<Option<(ScrapeStatus, Duration)>> =
             (0..targets.len()).map(|_| None).collect();
         while let Some(joined) = set.join_next().await {
-            // A `JoinError` only ever means the spawned task panicked -- nothing in
-            // `scrape_target` does, so this is unreachable in practice; treated as a network
-            // error (no batch, `up: 0`) rather than propagating the panic, matching this
-            // component's "one target's failure can't take down the others" contract.
+            // A `JoinError` means the task panicked, which `scrape_target` doesn't. It falls
+            // through as a network error (`up: 0`) below rather than propagating: one target's
+            // failure can't take down the others.
             if let Ok((idx, status, elapsed)) = joined {
                 outcomes[idx] = Some((status, elapsed));
             }
@@ -767,18 +732,12 @@ impl PrometheusInput {
 impl Input for PrometheusInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let mut ticker = tokio::time::interval(self.interval);
-        // `Delay`, not the default `Burst`: unlike `internal.rs`'s own tick (which never does
-        // network I/O), a tick here awaits `sink.send` (bounded-channel backpressure) plus a
-        // per-target request timeout, so a downstream stall lasting several intervals is
-        // ordinary, not exceptional. `Burst` would fire every missed tick back-to-back the moment
-        // the stall clears -- N full scrape rounds in a row, each target hit N times with
-        // near-identical `received_at`, inflating `logit.input.scrapes`/`samples` and the
-        // synthetic series. `Delay` instead resumes on a fixed cadence from whenever the last
-        // tick actually completed, matching Prometheus's own scrape scheduler, which skips rather
-        // than bursts.
+        // `Delay`, not `Burst`: a multi-interval downstream stall is ordinary here, and `Burst`
+        // would then hit each target N times back-to-back with near-identical `received_at`,
+        // inflating `logit.input.scrapes`/`samples` and the synthetic series. The module doc's
+        // "Modeled on `internal.rs`" section has the rest.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Swallow the immediate first tick, `internal.rs`'s own pattern -- the first real scrape
-        // happens after one full `interval` has elapsed, not at t=0.
+        // Swallow the immediate first tick: the first scrape is one `interval` after start.
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -791,34 +750,30 @@ impl Input for PrometheusInput {
 // Bind mode: the remote-write receiver
 // -------------------------------------------------------------------------------------------------
 
-/// Hard cap on one remote-write request's **decompressed** body -- checked against Snappy's own
-/// `decompress_len`, read out of the block header, *before* a byte is expanded, so a compression
-/// bomb is rejected rather than inflated. The same number and the same hardcoded-not-configurable
-/// posture as `otlp_in`'s own cap (`crates/logit-inputs/src/otlp.rs`): a denial-of-service bound is
-/// not a workload tuning knob, and Prometheus's default `max_samples_per_send` of 2000 puts a real
-/// request orders of magnitude under it. An operator who hits this has a misconfigured sender.
+/// Hard cap on one remote-write request's **decompressed** body, checked against Snappy's
+/// `decompress_len` (read from the block header) *before* a byte is expanded, so a compression
+/// bomb is rejected rather than inflated. The same number and hardcoded posture as `otlp_in`'s
+/// cap: a denial-of-service bound, not a tuning knob. Prometheus's default
+/// `max_samples_per_send` of 2000 puts a real request orders of magnitude under it, so an
+/// operator who hits this has a misconfigured sender.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
-/// Bounds the number of connections [`PrometheusReceiver`] serves at once, so the per-request cap
-/// [`MAX_REQUEST_BYTES`] bounds this listener's whole worst case rather than one connection's. The
-/// same 1024 `otlp_in`, `logit_in` and `syslog_in` use -- there is no protocol reason for a
-/// remote-write receiver to differ, and one shared figure is one thing for an operator to learn. A
-/// connection past the cap is **rejected, not queued**, exactly as on those three.
+/// Bounds the connections [`PrometheusReceiver`] serves at once, so [`MAX_REQUEST_BYTES`] bounds
+/// the listener's worst case rather than one connection's. The same 1024 as `otlp_in`,
+/// `logit_in` and `crate::tcp`'s listeners: no protocol reason to differ, and one figure for an
+/// operator to learn. A connection past the cap is **rejected, not queued**, as on those.
 const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
-/// How long a connection has, per pre-request phase, before this listener gives up on it and
-/// releases its [`MAX_CONCURRENT_CONNECTIONS`] permit: its TLS accept on a TLS listener, its first
-/// byte on a plaintext one. The same 5s every other TCP listener here defaults to.
+/// How long a connection has, per pre-request phase, before this listener releases its
+/// [`MAX_CONCURRENT_CONNECTIONS`] permit: its TLS accept on a TLS listener, its first byte on a
+/// plaintext one. The same 5s every other TCP listener here defaults to.
 ///
-/// **Not an operator-facing field**, unlike `otlp_in`'s `handshake_timeout:` -- graph rule 45
-/// enumerates the kinds that carry one and `prometheus_in` is not among them. A constant rather
-/// than a silently-ignored config key; a field can be added if a deployment ever needs one.
+/// **Not an operator-facing field**, unlike `otlp_in`'s `handshake_timeout:`: `prometheus_in` has
+/// no such field for graph rule 45 to check. A field can be added if a deployment needs one.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `crate::tls::TlsServerSettings`, re-exported at this path -- the receiver's `bind_tls:` block,
-/// the server-side twin of this module's [`TlsClientSettings`] re-export. Same convention
-/// `otlp::TlsServerSettings` already follows, so `logit-cli::pipeline::build_spec` has one obvious
-/// path to import per socket.
+/// `crate::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
+/// server-side twin of [`TlsClientSettings`] above, same convention as `otlp::TlsServerSettings`.
 pub use crate::tls::TlsServerSettings;
 
 const METADATA_CACHE_SIZE: &str = "logit.input.metadata_cache.size";
@@ -826,25 +781,22 @@ const METADATA_CACHE_EVICTED: &str = "logit.input.metadata_cache.evicted";
 const METADATA_CACHE_REPLACED: &str = "logit.input.metadata_cache.replaced";
 const METADATA_CACHE_TRUNCATED: &str = "logit.input.metadata_cache.truncated";
 
-/// The longest `# HELP` or `# UNIT` text this receiver will *remember* for one family. Past it the
-/// text is truncated on a `char` boundary and the cut is counted
-/// `logit.input.metadata_cache.truncated`.
+/// The longest `# HELP` or `# UNIT` text this receiver *remembers* for one family. Past it the
+/// text is truncated on a `char` boundary, counted `logit.input.metadata_cache.truncated`.
 ///
-/// Not a statement about what a description may be -- the decode keeps whatever the request
-/// carried, and this bounds only the copy that outlives the request. Without it the cache's
-/// resident size is `max_families x` the *request* cap: nothing else on the path bounds a
-/// description, so 10 000 individually-legal metadata-only requests, each declaring one family
-/// with a multi-megabyte help (a few KB once Snappy has seen the repeated bytes), would take the
-/// process down while `metadata_cache.size` read a healthy 10 000. 1 KiB is an order of magnitude
-/// past the longest `# HELP` any real exporter writes.
+/// The decode keeps whatever the request carried; this bounds only the copy that outlives the
+/// request. Without it the cache's resident size is `max_families x` the *request* cap: 10 000
+/// individually-legal metadata-only requests, each declaring one family with a multi-megabyte
+/// help (a few KB once Snappy has seen the repeated bytes), would take the process down while
+/// `metadata_cache.size` read a healthy 10 000. 1 KiB is an order of magnitude past the longest
+/// `# HELP` any real exporter writes.
 const MAX_METADATA_TEXT_BYTES: usize = 1024;
 
 /// One remembered family declaration. The family's own name is the map key, not a field here.
 ///
-/// `Arc<str>` rather than `String` so that rebuilding the seed -- which happens whenever the table
-/// changes and produces a whole second copy of it for in-flight requests to hold -- shares this
-/// text instead of copying it. The cache and every seed generation alive at once then cost one
-/// description each, not one per generation.
+/// `Arc<str>` rather than `String` so a seed rebuild (a second copy of the table for in-flight
+/// requests to hold) shares this text instead of copying it: the cache and every live seed
+/// generation cost one description each, not one per generation.
 #[derive(Debug, Clone)]
 struct CachedFamily {
     kind: FamilyType,
@@ -856,9 +808,9 @@ struct CachedFamily {
     last_seen: Instant,
 }
 
-/// What the receiver remembers about metric types between requests -- `metadata_cache:` in config.
-/// See this module's "Metadata cache" doc section for why it exists and what its bounds mean; this
-/// type is the table and the two operations a request performs on it.
+/// What the receiver remembers about metric types between requests (`metadata_cache:` in config):
+/// the table and the two operations a request performs on it. This module's "Metadata cache"
+/// section says why it exists and what its bounds mean.
 ///
 /// Built only when the cache is on: `max_families: 0` leaves [`PrometheusReceiver::metadata_cache`]
 /// `None`, and nothing here is allocated, locked or swept.
@@ -867,18 +819,16 @@ struct MetadataCache {
     max_families: usize,
     ttl: Duration,
     state: Mutex<CacheState>,
-    /// Test-only: how many times the expiry sweep has actually walked the table. Not otherwise
-    /// observable -- a sweep that expires nothing leaves behind no counter and no rebuild -- and
-    /// "a sample-only request does not sweep" is the property [`CacheState::next_expiry`] exists
-    /// for.
+    /// Test-only: how many times the expiry sweep has walked the table. A sweep that expires
+    /// nothing leaves no other trace, and "a sample-only request does not sweep" is the property
+    /// [`CacheState::next_expiry`] exists for.
     #[cfg(test)]
     sweeps: std::sync::atomic::AtomicU64,
 }
 
 /// Everything behind the one lock. `families` is authoritative; `seed` is the same content in the
-/// codec's own shape, rebuilt only when `families` changes, so the overwhelmingly common request --
-/// samples, no declarations -- hands the decoder a refcount bump rather than a copy of every
-/// remembered family.
+/// codec's shape, rebuilt only when `families` changes, so the common request (samples, no
+/// declarations) hands the decoder a refcount bump rather than a copy of the table.
 #[derive(Default)]
 struct CacheState {
     families: HashMap<String, CachedFamily>,
@@ -888,15 +838,15 @@ struct CacheState {
     ///
     /// A **lower bound**, never an over-estimate, which is the whole of its correctness: a sweep
     /// skipped because `now` has not reached this cannot have missed an expiry. Every sweep
-    /// recomputes it exactly; a learn only ever *lowers* it, because an entry whose `last_seen`
-    /// moves forward can only expire later than this said it would. Cap eviction may leave it
-    /// early, which costs one sweep that finds nothing and recomputes.
+    /// recomputes it; a learn only *lowers* it, because an entry whose `last_seen` moves forward
+    /// can only expire later. Cap eviction may leave it early, which costs one sweep that finds
+    /// nothing and recomputes.
     next_expiry: Option<Instant>,
 }
 
 impl CacheState {
-    /// Recomputes [`CacheState::next_expiry`] exactly, from every entry still in the table. One
-    /// pass, and only ever from a sweep -- which has just made one anyway.
+    /// Recomputes [`CacheState::next_expiry`] from every entry still in the table. One pass, called
+    /// only from a sweep, which has just made one anyway.
     fn recompute_expiry(&mut self, ttl: Duration) {
         self.next_expiry =
             self.families.values().filter_map(|family| family.last_seen.checked_add(ttl)).min();
@@ -912,8 +862,8 @@ impl CacheState {
         });
     }
 
-    /// The table in the codec's own shape. The family names are copied (a `Declarations` owns its
-    /// keys); the descriptions, which are the bulk of it, are `Arc` clones.
+    /// The table in the codec's shape. Family names are copied (a `Declarations` owns its keys);
+    /// the descriptions, the bulk of it, are `Arc` clones.
     fn rebuild_seed(&mut self) {
         let mut seed = remote_write::Declarations::default();
         for (name, family) in &self.families {
@@ -923,13 +873,12 @@ impl CacheState {
     }
 }
 
-/// `text` bounded to [`MAX_METADATA_TEXT_BYTES`], cut on a `char` boundary so the result is still a
-/// string rather than a broken one, and whether it had to cut at all.
+/// `text` bounded to [`MAX_METADATA_TEXT_BYTES`], cut on a `char` boundary, and whether it was cut.
 fn bounded_text(text: &Option<Arc<str>>) -> (Option<Arc<str>>, bool) {
     let Some(text) = text else { return (None, false) };
     if text.len() <= MAX_METADATA_TEXT_BYTES {
-        // The overwhelmingly common path, and the reason this takes a reference: a description
-        // within the bound is shared with the request that carried it, never copied.
+        // The common path, and why this takes a reference: a description within the bound is
+        // shared with the request that carried it, never copied.
         return (Some(Arc::clone(text)), false);
     }
     let mut end = MAX_METADATA_TEXT_BYTES;
@@ -953,12 +902,11 @@ impl MetadataCache {
     /// Expires what the TTL has run out on, then hands back the table to decode this request
     /// against. Counted `logit.input.metadata_cache.evicted{reason="expired"}`.
     ///
-    /// Expiry is checked per request rather than on a timer of its own -- this input has no clock
-    /// task, and a receiver nothing is writing to has nothing to spend memory on either way -- but
-    /// it is *checked*, not performed: [`CacheState::next_expiry`] says when the first entry could
-    /// possibly go, so until then this is one comparison and a refcount bump. A pass over the whole
-    /// table on every request would be a cost that scales with what is remembered rather than with
-    /// the request, which is exactly the shape the seed is an `Arc` to avoid.
+    /// Expiry is checked per request rather than on a timer (this input has no clock task, and a
+    /// receiver nothing writes to has no memory to reclaim), but *checked*, not performed:
+    /// [`CacheState::next_expiry`] says when the first entry could go, so until then this is one
+    /// comparison and a refcount bump. A pass over the table per request would scale with what is
+    /// remembered rather than with the request, the cost the seed is an `Arc` to avoid.
     fn seed(&self, now: Instant, telemetry: &Telemetry) -> Arc<remote_write::Declarations> {
         let mut state = self.lock();
         if state.next_expiry.is_some_and(|earliest| now > earliest) {
@@ -968,7 +916,7 @@ impl MetadataCache {
     }
 
     /// One pass, dropping every entry the TTL has run out on and recomputing the watermark from
-    /// what is left. Allocation-free; the rebuild below it happens only if something actually went.
+    /// what is left. Allocation-free; the seed is rebuilt only if something expired.
     fn sweep(&self, state: &mut CacheState, now: Instant, telemetry: &Telemetry) {
         #[cfg(test)]
         self.sweeps.fetch_add(1, Ordering::Relaxed);
@@ -987,13 +935,11 @@ impl MetadataCache {
         }
     }
 
-    /// Folds one request's own declarations in -- the newest statement about a family wins, and a
-    /// *retype* is counted `logit.input.metadata_cache.replaced` -- then evicts back down to the
-    /// cap.
+    /// Folds one request's declarations in (the newest statement about a family wins, and a
+    /// *retype* is counted `logit.input.metadata_cache.replaced`), then evicts down to the cap.
     ///
-    /// Returns before taking the lock when the request declared nothing, which is nearly every 1.0
-    /// request: there is no entry to touch, nothing can have grown past the cap, and the alternative
-    /// is a lock per request to learn an empty table.
+    /// Returns before taking the lock when the request declared nothing, as nearly every 1.0
+    /// request does: no entry to touch, and nothing can have grown past the cap.
     fn learn(
         &self,
         declarations: &remote_write::Declarations,
@@ -1006,14 +952,14 @@ impl MetadataCache {
         let mut state = self.lock();
         let mut replaced = 0u64;
         let mut truncated = 0u64;
-        // Whether the *seed* has to be rebuilt -- which a re-declaration of what is already
-        // remembered does not. Prometheus re-sends a family's metadata every `send_interval` from
-        // every shard, so "identical to what is already there" is the common case, and rebuilding
-        // for it would copy the whole table under the lock once a minute per shard.
+        // Whether the *seed* has to be rebuilt, which re-declaring what is already remembered
+        // does not require. Prometheus re-sends a family's metadata every `send_interval` from
+        // every shard, so "identical to what is there" is the common case, and rebuilding for it
+        // would copy the whole table under the lock once a minute per shard.
         let mut changed = false;
         for (name, declaration) in declarations.iter() {
-            // Bounded on the way in, not on the way out: what is remembered is what outlives the
-            // request, and the request's own cap does not bound a table that keeps entries.
+            // Bounded on the way in: what is remembered outlives the request, and the request
+            // cap does not bound a table that keeps entries.
             let (help, help_cut) = bounded_text(&declaration.help);
             let (unit, unit_cut) = bounded_text(&declaration.unit);
             truncated += u64::from(help_cut) + u64::from(unit_cut);
@@ -1022,8 +968,8 @@ impl MetadataCache {
                     let retyped = existing.kind != declaration.kind;
                     if retyped {
                         // Two senders disagreeing about one family name, or one that changed its
-                        // mind. Either way the newest statement is the one to keep -- the alternative
-                        // is typing a live sender's series from a declaration nothing has repeated.
+                        // mind. Keep the newest: the alternative types a live sender's series from
+                        // a declaration nothing has repeated.
                         replaced += 1;
                     }
                     if retyped || existing.help != help || existing.unit != unit {
@@ -1032,15 +978,13 @@ impl MetadataCache {
                         existing.unit = unit;
                         changed = true;
                     }
-                    // Assigned only on a real change, deliberately: an identical re-declaration
-                    // (the common case -- Prometheus re-sends a family's metadata every
-                    // `send_interval`, from every shard) must leave the entry's own `Arc`s where
-                    // they are. The seed the decoder reads shares them, and it is not rebuilt for
-                    // a no-op, so adopting the request's clones here would quietly leave the two
-                    // holding equal strings in separate allocations.
+                    // Assigned only on a real change: an identical re-declaration (the common
+                    // case) must leave the entry's `Arc`s where they are. The seed shares them and
+                    // is not rebuilt for a no-op, so adopting the request's clones would leave the
+                    // two holding equal strings in separate allocations.
                     //
-                    // Touched whether or not anything else moved: the TTL measures how long ago a
-                    // sender last said this, and it just said it again.
+                    // `last_seen` moves regardless: the TTL measures how long ago a sender last
+                    // said this, and it just said it again.
                     existing.last_seen = now;
                 }
                 None => {
@@ -1059,9 +1003,8 @@ impl MetadataCache {
             telemetry.count(METADATA_CACHE_TRUNCATED, truncated as f64, &[]);
         }
         changed |= self.enforce_cap(&mut state, telemetry);
-        // Every entry this touched expires at `now + ttl` at the latest, which can only be later
-        // than whatever the table already held -- unless it was empty, which is the case this is
-        // here for.
+        // Every entry this touched expires at `now + ttl`, no earlier than the table's existing
+        // watermark unless the table was empty, which is the case this is here for.
         state.note_expiry(now, self.ttl);
         if changed {
             state.rebuild_seed();
@@ -1070,14 +1013,12 @@ impl MetadataCache {
     }
 
     /// Evicts least-recently-seen families until at most `max_families` remain, in **one pass over
-    /// the table** however many have to go -- `prometheus_out`'s `Registry::enforce_cap` one crate
-    /// over, for its reasoning: being over the cap is the steady state the cap exists for, so a
-    /// `while len() > max` loop calling `min_by` would re-scan and re-allocate every candidate once
-    /// per eviction, exactly when cardinality is what is being diagnosed.
+    /// the table** however many go, for `prometheus_out`'s `Registry::enforce_cap` reason: over the
+    /// cap is the steady state the cap exists for, so a `while len() > max` loop calling `min_by`
+    /// would re-scan every candidate per eviction, just when cardinality is being diagnosed.
     ///
-    /// The tie-break past `last_seen` is the family's own name, so which of two families declared
-    /// in one request goes is a function of the data rather than of `Instant` resolution or map
-    /// iteration order.
+    /// The tie-break past `last_seen` is the family's name, so which of two families declared in
+    /// one request goes is a function of the data, not of `Instant` resolution or map order.
     fn enforce_cap(&self, state: &mut CacheState, telemetry: &Telemetry) -> bool {
         let total = state.families.len();
         if total <= self.max_families {
@@ -1096,46 +1037,42 @@ impl MetadataCache {
             state.families.remove(&name);
         }
         telemetry.count(METADATA_CACHE_EVICTED, excess as f64, &[("reason", "cardinality")]);
-        // The watermark may now point at an entry that is gone -- the oldest are exactly the ones
-        // evicted -- which costs one sweep that finds nothing and recomputes it.
+        // The watermark may now point at an evicted entry (the oldest are the ones evicted),
+        // which costs one sweep that finds nothing and recomputes it.
         true
     }
 
-    /// The lock, unpoisoned. Nothing here can panic while it is held -- the body is map operations
-    /// on owned data -- and a receiver that stopped remembering metric types because one request
-    /// panicked would be a worse failure than the one that caused it.
+    /// The lock, unpoisoned. Nothing panics while it is held (map operations on owned data), and a
+    /// receiver that stopped typing metrics because one request panicked would be a worse failure
+    /// than the panic.
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
-/// `prometheus_in` in **bind mode**: a Prometheus remote-write receiver. See this module's doc
-/// comment for the config table, the routes table, and every mapping decision; this type is the
-/// accept loop and the request handler that implement them.
+/// `prometheus_in` in **bind mode**: a Prometheus remote-write receiver. The module doc has the
+/// config, the routes table, and every mapping decision; this type is the accept loop and the
+/// request handler that implement them.
 pub struct PrometheusReceiver {
     bind: String,
-    /// The one path this receiver answers `POST`s on. An `Arc<str>` because every connection's
-    /// service closure captures it and every request compares against it -- cloned per connection,
-    /// never per request, and never re-allocated.
+    /// The one path this receiver answers `POST`s on. An `Arc<str>`: cloned per connection, never
+    /// per request, and never re-allocated.
     path: Arc<str>,
     tls: Option<Arc<rustls::ServerConfig>>,
-    /// Set by [`Input::bind`], taken back out by [`Input::run`] -- `Input::bind`'s own contract.
-    /// `None` after a run, so a second run rebinds.
+    /// Set by [`Input::bind`], taken by [`Input::run`]. `None` after a run, so a second run
+    /// rebinds.
     listener: Option<tokio::net::TcpListener>,
-    /// `None` -- the default -- means no idle timeout at all. See this module's "Shutdown and
-    /// connection lifetime" doc section.
+    /// `None`, the default, means no idle timeout. See this module's "Size, concurrency, and
+    /// shutdown" section.
     idle_timeout: Option<Duration>,
-    /// The one piece of state this receiver holds across requests, and `None` unless an operator
-    /// asked for it -- `metadata_cache: {max_families: 0}`, and every config predating the field,
-    /// leaves the stateless decode path exactly as it was. Shared by every connection, hence the
-    /// `Arc`; see this module's "Metadata cache" doc section.
+    /// The one state this receiver holds across requests; `None` under
+    /// `metadata_cache: {max_families: 0}`, which keeps the stateless decode path. Shared by every
+    /// connection, hence the `Arc`; see this module's "Metadata cache" section.
     metadata_cache: Option<Arc<MetadataCache>>,
     handshake_timeout: Duration,
     max_connections: usize,
-    /// The empty `Resource` every batch this receiver builds carries, allocated once. A receiver
-    /// observed a TCP connection from a sender that may be relaying for thousands of targets, so
-    /// it has no target identity of its own to stamp -- this module's "Labels stay labels" doc
-    /// section.
+    /// The empty `Resource` every batch this receiver builds carries, allocated once (this
+    /// module's "Labels stay labels").
     resource: Arc<Resource>,
     diag: Diagnostics,
     telemetry: Telemetry,
@@ -1160,15 +1097,14 @@ impl PrometheusReceiver {
         }
     }
 
-    /// The address actually bound, once [`Input::bind`] has run -- lets a test learn the
-    /// OS-assigned port without a bind-drop-rebind race, exactly as `otlp_in`'s own does.
+    /// The address bound, once [`Input::bind`] has run, so a test can learn the OS-assigned port
+    /// without a bind-drop-rebind race.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.listener.as_ref().and_then(|l| l.local_addr().ok())
     }
 
-    /// Turns on TLS termination for this listener (`bind_tls:` in config). Both ALPN protocols the
-    /// auto builder can serve are advertised, so a TLS client's own negotiation picks the same one
-    /// the plaintext path would otherwise have to sniff.
+    /// Turns on TLS termination (`bind_tls:` in config). Both ALPN protocols the auto builder can
+    /// serve are advertised, so a TLS client's negotiation picks what the plaintext path sniffs.
     pub fn with_bind_tls(
         mut self,
         settings: &TlsServerSettings,
@@ -1180,18 +1116,16 @@ impl PrometheusReceiver {
     }
 
     /// Bounds how long a connection may sit with no request in flight before this listener closes
-    /// it -- `idle_timeout:` in config, and off (`None`) when never called. Graph rule 53 rejects
-    /// `Some(0s)` before it can reach here. Takes the `Option` rather than a bare `Duration`, like
-    /// every other listener's own `with_idle_timeout`.
+    /// it (`idle_timeout:` in config; off when `None` or never called). Graph rule 53 rejects
+    /// `Some(0s)`. Takes the `Option`, like every other listener's `with_idle_timeout`.
     pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
         self.idle_timeout = idle_timeout;
         self
     }
 
-    /// Turns on the metadata cache -- `metadata_cache:` in config, whose defaults this takes
-    /// verbatim. `max_families == 0` is the operator's "off", and leaves this receiver on the
-    /// stateless decode path rather than building a table it would never put anything in. Graph
-    /// rule 55 rejects a zero `ttl` before it can reach here.
+    /// Turns on the metadata cache (`metadata_cache:` in config). `max_families == 0` is the
+    /// operator's "off" and leaves this receiver on the stateless decode path. Graph rule 55
+    /// rejects a zero `ttl`.
     pub fn with_metadata_cache(mut self, max_families: usize, ttl: Duration) -> Self {
         self.metadata_cache =
             (max_families > 0).then(|| Arc::new(MetadataCache::new(max_families, ttl)));
@@ -1208,17 +1142,16 @@ impl PrometheusReceiver {
         self
     }
 
-    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`] -- opening 1025 real connections to
-    /// exercise the cap would be slow and flaky; this makes it reachable with two. `otlp_in`'s own
-    /// test-only override, one listener over.
+    /// Test-only override of [`MAX_CONCURRENT_CONNECTIONS`], so the cap is reachable with two
+    /// connections instead of 1025.
     #[cfg(test)]
     fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
         self
     }
 
-    /// Test-only override of [`HANDSHAKE_TIMEOUT`], so a test can watch a silent connection
-    /// actually be closed without a multi-second sleep.
+    /// Test-only override of [`HANDSHAKE_TIMEOUT`], so a test can watch a silent connection close
+    /// without a multi-second sleep.
     #[cfg(test)]
     fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
@@ -1238,35 +1171,33 @@ impl Input for PrometheusReceiver {
         Ok(())
     }
 
-    /// `otlp_in`'s accept loop, one listener over: a permit per connection acquired before any TLS
-    /// accept, the handshake (or the plaintext first-byte peek) bounded inside the spawned task,
-    /// and `hyper_util`'s auto builder serving HTTP/1.1 and h2c off the same socket. Copied rather
-    /// than shared because the loop's telemetry, its handler and its dispatch are each listener's
-    /// own; what *is* shared is the idle machinery it hands off to ([`crate::http`]).
+    /// `otlp_in`'s accept loop: a permit per connection acquired before any TLS accept, the
+    /// handshake (or plaintext first-byte peek) bounded inside the spawned task, and `hyper_util`'s
+    /// auto builder serving HTTP/1.1 and h2c off one socket. Copied rather than shared because the
+    /// telemetry, handler and dispatch are each listener's own; the idle machinery it hands off to
+    /// is shared ([`crate::http`]).
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         self.bind().await?;
         let listener = self.listener.take().expect("bind() leaves a listener behind");
         let connection_limit = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
-        // Built once outside the loop -- `TlsAcceptor::from` just wraps the `Arc<ServerConfig>`,
-        // so cloning it per connection is an `Arc` clone, not a config rebuild.
+        // `TlsAcceptor::from` wraps the `Arc<ServerConfig>`, so a per-connection clone is an `Arc`
+        // clone, not a config rebuild.
         let tls_acceptor = self.tls.clone().map(tokio_rustls::TlsAcceptor::from);
         let live_connections = Arc::new(AtomicI64::new(0));
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
         let metadata_cache = self.metadata_cache.clone();
-        // `crate::tcp`'s accept-queue gauges, shared rather than reimplemented: the same
-        // `accept()` this loop already awaited, plus `logit.input.accept_queue.depth`/
-        // `.utilization` sampled before each accept and once a second while waiting for one.
+        // `crate::tcp`'s accept-queue gauges: `logit.input.accept_queue.depth`/`.utilization`,
+        // sampled before each accept and once a second while waiting for one.
         let mut accept_queue =
             crate::tcp::AcceptQueueSampler::new(self.telemetry.clone(), self.diag.clone());
         loop {
             let (stream, peer) = accept_queue.accept(&listener).await?;
 
-            // Non-blocking (`try_acquire_owned`): at capacity the connection is closed immediately
-            // rather than queued behind a permit that may never come, and closed *before* any TLS
-            // accept -- remote-write has no in-band "try later" of its own to deliver, so there is
-            // nothing to say and no reason to spend a handshake saying it. A sender that gets its
-            // connection closed retries on its own queue, which is the protocol's own flow control.
+            // Non-blocking (`try_acquire_owned`): at capacity the connection is closed rather than
+            // queued behind a permit that may never come, and *before* any TLS accept, since
+            // remote-write has no in-band "try later" to spend a handshake delivering. The sender
+            // retries from its own queue, which is the protocol's flow control.
             let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
                 self.telemetry.count(
                     "logit.input.connections.rejected",
@@ -1288,14 +1219,14 @@ impl Input for PrometheusReceiver {
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime; released on drop
 
-                // Published from the read-modify-write's own return value, not a separate `load`:
+                // Published from the read-modify-write's return value, not a separate `load`:
                 // `Telemetry::gauge` is last-write-wins per key, so two tasks interleaving an add
                 // and a load would leave the stale one published until the next transition.
                 let live = live_connections.fetch_add(1, Ordering::Relaxed) + 1;
                 telemetry.gauge("logit.input.connections", live as f64, &[]);
 
                 let result = match tls_acceptor {
-                    // No first-byte peek on this arm: `acceptor.accept` is already waiting on this
+                    // No first-byte peek on this arm: `acceptor.accept` already waits on this
                     // connection's first bytes under the same budget.
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
@@ -1321,11 +1252,10 @@ impl Input for PrometheusReceiver {
                             )),
                         }
                     }
-                    // The plaintext arm's equivalent budget. `peek` is `recv(..., MSG_PEEK)`: it
-                    // waits for the first byte to be *available* and consumes nothing, so the auto
-                    // builder's own `ReadVersion` sniff still sees a pristine stream. A *clean*
-                    // close before the first byte (`Ok(0)`) is a TCP health check, not a fault --
-                    // the same call `otlp_in` and `crate::tcp` make.
+                    // The plaintext arm's budget. `peek` is `recv(..., MSG_PEEK)`: it consumes
+                    // nothing, so the auto builder's `ReadVersion` sniff still sees a pristine
+                    // stream. A clean close before the first byte (`Ok(0)`) is a TCP health
+                    // check, not a fault, as in `otlp_in` and `crate::tcp`.
                     None => {
                         let first_byte =
                             tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
@@ -1368,9 +1298,9 @@ impl Input for PrometheusReceiver {
     }
 }
 
-/// Serves one already-accepted (and, on a TLS listener, already-handshaken) connection to
-/// completion -- generic over the IO type so the plaintext and TLS cases share every line below
-/// `run`'s own `tls_acceptor` branch, exactly as `otlp_in`'s twin does.
+/// Serves one accepted (and, on a TLS listener, handshaken) connection to completion. Generic
+/// over the IO type so the plaintext and TLS cases share everything below `run`'s
+/// `tls_acceptor` branch.
 #[allow(clippy::too_many_arguments)]
 async fn serve_write_connection<IO>(
     io: IO,
@@ -1387,18 +1317,17 @@ async fn serve_write_connection<IO>(
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    // One tracker per connection, shared between the service (which stamps it as requests start
-    // and finish) and the driver below (which reads it). The body-frame stall bound is
-    // `idle_timeout` too: a connection with no idle bound configured gets no per-frame one either.
+    // One tracker per connection: the service stamps it as requests start and finish, the driver
+    // below reads it. The body-frame stall bound is `idle_timeout` too, so a connection with no
+    // idle bound gets no per-frame one either.
     let activity = Arc::new(Activity::new());
     let svc = service_fn({
         let activity = Arc::clone(&activity);
         let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
         let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
         move |req| {
-            // `enter` here rather than inside the returned future: hyper calls the service the
-            // moment a request head is parsed, so the in-flight count rises then, not whenever the
-            // future first happens to be polled.
+            // `enter` here, not inside the returned future: hyper calls the service as soon as a
+            // request head is parsed, so the in-flight count rises then, not at first poll.
             let in_flight = activity.enter();
             let (sink, telemetry, diag) = (sink.clone(), telemetry.clone(), diag.clone());
             let (path, resource) = (Arc::clone(&path), Arc::clone(&resource));
@@ -1437,10 +1366,8 @@ where
     .await
 }
 
-/// One request, timed and counted. The outcome classification lives in [`write_response`]; this
-/// wrapper exists so that *every* exit from it -- including the early rejections -- contributes
-/// exactly one `logit.input.writes{class}` count and one `logit.input.write.duration` timing,
-/// the way `tick`'s own `logit.input.scrapes`/`scrape.duration` pair does per scrape.
+/// One request, timed and counted: every exit from [`write_response`], early rejections included,
+/// contributes one `logit.input.writes{class}` count and one `logit.input.write.duration` timing.
 #[allow(clippy::too_many_arguments)]
 async fn handle_write(
     req: http::Request<Incoming>,
@@ -1491,10 +1418,8 @@ async fn write_response(
     if req.uri().path() != path {
         return ("not_found", text_response(None, StatusCode::NOT_FOUND, "not found"));
     }
-    // `405 + Allow: POST`, where `otlp_in` answers `404` for a wrong method. Deliberate: this
-    // receiver's sibling on the same kind pair -- `prometheus_out`'s exposition server -- already
-    // answers `405` on `/metrics`, and matching it is more useful to an operator than matching the
-    // unrelated input this accept loop was copied from.
+    // `405 + Allow: POST` where `otlp_in` answers `404`: this matches `prometheus_out`'s
+    // exposition server (the module doc's "Routes" section).
     if req.method() != Method::POST {
         let mut response = text_response(
             None,
@@ -1505,8 +1430,8 @@ async fn write_response(
         return ("method", response);
     }
 
-    // Both specs mandate Snappy *block* compression on every request; there is no identity mode to
-    // fall back to, so a missing header is as unusable as a wrong one.
+    // Both specs mandate Snappy *block* compression on every request, with no identity mode, so a
+    // missing header is as unusable as a wrong one.
     let encoding = header_str(req.headers(), http::header::CONTENT_ENCODING);
     if !encoding.eq_ignore_ascii_case(remote_write::CONTENT_ENCODING_SNAPPY) {
         let message = format!(
@@ -1520,11 +1445,8 @@ async fn write_response(
         );
         return ("unsupported", text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message));
     }
-    // Which version the body is, per request, from the request's own `Content-Type` -- no
-    // configuration. An absent header is `""`, which no version claims, so it lands here rather
-    // than defaulting to 1.0 the way `otlp_in` defaults an absent type to protobuf: 1.0's own spec
-    // requires the header, and guessing would turn a 2.0 sender's misconfiguration into a wall of
-    // protobuf decode errors instead of the `415` the spec has for exactly this.
+    // The version comes from this request's own `Content-Type`. An absent header is `""`, which no
+    // version claims, so it is a `415` rather than a 1.0 default (the module doc's "Routes").
     let content_type = header_str(req.headers(), CONTENT_TYPE);
     let Some(version) = remote_write::Version::from_content_type(content_type) else {
         let message = format!(
@@ -1540,22 +1462,19 @@ async fn write_response(
         return ("unsupported", text_response(None, StatusCode::UNSUPPORTED_MEDIA_TYPE, &message));
     };
 
-    // The helpers that attach 2.0's `-Written` headers take an `Option<Version>`, because the
-    // rejections above happen before a version is known at all; from here on it is always known.
+    // The `-Written` helpers take an `Option<Version>` because the rejections above precede
+    // knowing it; from here on it is known.
     let seen = Some(version);
 
     let limited = Limited::new(req.into_body(), MAX_REQUEST_BYTES);
     let compressed = match collect_with_stall_bound(limited, stall).await {
         Ok(bytes) => bytes,
         // A body that stopped arriving is the sender's clock, not its size. `drive_with_idle`
-        // applies no deadline while a request is in flight, so without this bound a half-uploaded
-        // request would hold its connection-limit permit forever; the connection closes once this
-        // response is out rather than waiting for the whole-connection deadline.
+        // applies no deadline while a request is in flight, so without this a half-uploaded
+        // request would hold its permit forever; the connection closes once this response is out.
         //
-        // Reachable only where `idle_timeout:` is set: `stall` is derived from it, and a connection
-        // with no idle bound configured gets no per-frame one either. `idle_timeout:` is off by
-        // default, so a default `bind:` has no stall bound at all -- the module doc's routes table
-        // and the ADR both say so, and the shipped example sets a value.
+        // Reachable only where `idle_timeout:` is set, since `stall` is derived from it; a
+        // default `bind:` has no stall bound (the module doc's "Routes").
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
             let message = format!("request body stalled for {stall:?}");
@@ -1575,8 +1494,8 @@ async fn write_response(
         }
     };
 
-    // The decompressed size is read out of the Snappy block header and checked *before* a byte is
-    // expanded -- a compression bomb is rejected, never inflated.
+    // The decompressed size is read from the Snappy block header and checked *before* a byte is
+    // expanded, so a compression bomb is rejected, never inflated.
     let declared = match snap::raw::decompress_len(&compressed) {
         Ok(declared) => declared,
         Err(err) => {
@@ -1611,19 +1530,17 @@ async fn write_response(
         }
     };
 
-    // Built per request rather than kept on the receiver: a connection's requests are served
-    // concurrently, so a shared `&mut` decoder would need a lock on the hot path for no gain --
-    // the decoder's own throttled diagnostics accumulate through the shared `Diagnostics` counts
-    // regardless of how many decoders exist, and its telemetry is a clone of one registry handle.
-    // `with_timestamp_marker(false)` is the one non-default: every remote-write sample carries a
-    // timestamp, so its presence is no producer choice worth recording.
+    // Built per request: requests are served concurrently, so a shared `&mut` decoder would need a
+    // lock on the hot path, and nothing is lost, since throttled diagnostics accumulate in the
+    // shared `Diagnostics` and telemetry is a clone of one registry handle.
+    // `with_timestamp_marker(false)`: every remote-write sample carries a timestamp, so its
+    // presence is no producer choice worth recording.
     let mut decoder = PrometheusDecoder::new()
         .with_timestamp_marker(false)
         .with_telemetry(telemetry.clone())
         .with_diagnostics(diag.clone());
-    // The cache's lock is taken to build the seed and taken again below to learn, never held
-    // across the decode -- a connection's requests are served concurrently and the decode is the
-    // expensive part. With no cache configured this is the stateless `decode` verbatim.
+    // The cache's lock is taken for the seed and again below to learn, never held across the
+    // decode (the module doc's "Metadata cache").
     let seeded = metadata_cache.map(|cache| cache.seed(Instant::now(), telemetry));
     let result = match &seeded {
         Some(seed) => remote_write::decode_with(&body, version, &mut decoder, seed),
@@ -1641,23 +1558,19 @@ async fn write_response(
         }
     };
     // Learned from what *this* request declared, never from the seed: a cache that refreshed
-    // entries out of its own memory would never let one expire. A malformed request teaches
-    // nothing, which is why this sits after the `400` above rather than beside the seed.
+    // entries from its own memory would never let one expire. After the `400` above, so a
+    // malformed request teaches nothing.
     if let Some(cache) = metadata_cache {
         cache.learn(&decoded.declarations, Instant::now(), telemetry);
     }
 
-    // One batch per request, on an empty `Resource`, built by concatenating the timestamp groups
-    // in ascending order -- this module's "Timestamps and timestamp groups" doc section.
+    // One batch per request, on an empty `Resource`, concatenating the timestamp groups in
+    // ascending order (the module doc's "Timestamps and timestamp groups").
     //
-    // The samples-kept count is built here rather than read off `Decoded::samples`, because that
-    // is the count the *assembler* accepted and the model mapping below runs after it: a series
-    // whose point has no model kind (an empty histogram, a histogram whose cumulative bucket
-    // counts decrease) is dropped here, having already been counted there. `-Written` is the one
-    // thing 2.0 defines as a report of what the receiver *kept*, so it is every decoded series'
-    // wire samples minus the ones belonging to series this mapping then dropped -- both sides
-    // measured by the codec's own `wire_samples`, which reads the `Point` and so still sees the
-    // `Option`s the wire had.
+    // The kept count is built here, not read off `Decoded::samples`, which is what the
+    // *assembler* accepted: the model mapping below can still drop a series with no model kind
+    // (an empty histogram, decreasing cumulative bucket counts). `-Written` reports what was
+    // kept (the module doc's "The `-Written` headers").
     let received_at = now_nanos();
     let mut total: u64 = 0;
     let mut dropped: u64 = 0;
@@ -1677,29 +1590,27 @@ async fn write_response(
             },
         ));
     }
-    // `saturating_sub` only because a panic is a poor way to learn that the callback fired for a
-    // series the loop above did not count -- it cannot, since both walk the same `decoded.groups`.
+    // Both sides walk the same `decoded.groups`, so this cannot underflow; `saturating_sub` only
+    // so a bug there is not a panic.
     let written = total.saturating_sub(dropped);
     telemetry.count("logit.input.samples", written as f64, &[]);
     if !events.is_empty() {
-        // **Before** the response is built, the ordering `otlp_in` uses: channel backpressure
-        // delays the `204` and the sender's own queue throttles, which is remote-write's own
-        // flow-control model working as designed rather than a stalled receiver.
+        // **Before** the response is built, as in `otlp_in`: channel backpressure delays the
+        // `204` and the sender's queue throttles, remote-write's own flow-control model.
         sink.send(EventBatch { resource, scope: None, events }).await;
     }
     ("ok", no_content(seen, written, decoded.exemplars))
 }
 
-/// `""` for an absent or non-ASCII header -- both are "this header said nothing this receiver can
-/// use", and the caller's message quotes whatever came back.
+/// `""` for an absent or non-ASCII header: either way it says nothing usable, and the caller's
+/// message quotes what came back.
 fn header_str(headers: &HeaderMap, name: http::header::HeaderName) -> &str {
     headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-/// `204 No Content`, plus 2.0's `-Written` report of what this receiver actually stored --
-/// `samples` is the wire samples of the series that reached the fanout, never the assembler's own
-/// accepted total. Native histograms are skipped, so the histogram count is always `0` -- an
-/// honest report, not a placeholder.
+/// `204 No Content`, plus 2.0's `-Written` report of what this receiver stored: `samples` is the
+/// wire samples of the series that reached the fanout, never the assembler's accepted total.
+/// Native histograms are skipped, so the histogram count is always `0`.
 fn no_content(
     version: Option<remote_write::Version>,
     samples: u64,
@@ -1724,9 +1635,8 @@ fn text_response(
 }
 
 /// 2.0 requires the three `-Written` headers on `4xx` as well as `2xx`, so a sender can tell a
-/// partially-applied write from one that stored nothing. A rejection stored nothing, hence the
-/// zeros; a 1.0 request (or one rejected before its version was even known) gets no headers at
-/// all, since 1.0 defines none.
+/// partially-applied write from one that stored nothing; a rejection stored nothing, hence the
+/// zeros. A 1.0 request, or one rejected before its version was known, gets none.
 fn with_written_headers(
     builder: http::response::Builder,
     version: Option<remote_write::Version>,
@@ -1759,9 +1669,8 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
-    /// What a canned connection does with each request it accepts -- one variant per scenario
-    /// this module's tests need a server for. `Clone` so one value can back every connection a
-    /// test's (usually single-request) server accepts.
+    /// What a canned server does with each request. `Clone` so one value backs every connection
+    /// the server accepts.
     #[derive(Clone)]
     enum CannedResponse {
         Body {
@@ -1769,15 +1678,12 @@ mod tests {
             content_type: Option<&'static str>,
             body: Bytes,
         },
-        /// Accepts the connection and reads the request, but never writes a response -- what
-        /// drives this input's own per-request timeout rather than a connection-level one.
+        /// Reads the request but never responds, driving this input's per-request timeout.
         Hang,
     }
 
-    /// A real `hyper` HTTP/1.1 server (`otlp_in`'s own server-side stack, `hyper::server::conn::
-    /// http1` + `hyper_util::rt::TokioIo`) bound to an ephemeral port, answering every request
-    /// with `response` and recording each request's headers. Returns the bound address and the
-    /// captured-headers list.
+    /// A real `hyper` HTTP/1.1 server on an ephemeral port, answering every request with
+    /// `response`. Returns the bound address and each request's captured headers.
     async fn canned_server(response: CannedResponse) -> (SocketAddr, Arc<Mutex<Vec<HeaderMap>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1864,9 +1770,9 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a '{name}' synthetic metric in the batch"))
     }
 
-    /// Reads one counter's value out of an already-drained event list -- `Registry::drain` empties
-    /// its buffers on every call, so a test asserting on more than one counter must drain exactly
-    /// once and look up every value from that same snapshot, not call this once per counter.
+    /// Reads one counter out of an already-drained event list. `Registry::drain` empties its
+    /// buffers, so a test asserting on several counters drains once and reads them all from that
+    /// snapshot.
     fn counter_in(events: &[Event], metric: &str, tag: (&str, &str)) -> Option<f64> {
         events.iter().find_map(|e| {
             if e.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1) {
@@ -1884,8 +1790,8 @@ mod tests {
         })
     }
 
-    /// [`counter_in`] for a gauge -- `Telemetry::gauge` records a `MetricKind::Gauge`, which that
-    /// helper deliberately does not match (a counter read as a gauge would hide a spelling bug).
+    /// [`counter_in`] for a gauge, which that helper does not match (a counter read as a gauge
+    /// would hide a spelling bug).
     fn gauge_in(events: &[Event], metric: &str, tag: (&str, &str)) -> Option<f64> {
         events.iter().find_map(|e| {
             if e.attributes.get(tag.0).and_then(|v| v.as_str()) != Some(tag.1) {
@@ -2012,18 +1918,15 @@ mod tests {
         assert_eq!(synthetic_value(&batch, "up"), 0.0);
     }
 
-    // ---- TLS: a canned `tokio-rustls`-wrapped scrape target -- mirrors
-    // `logit_outputs::otlp`'s own `canned_tls_http_server`/`test_server_tls_config` test pattern,
-    // since `PrometheusInput::with_tls` is a client the same shape `OtlpOutput::with_tls` is. ----
+    // ---- TLS: a canned `tokio-rustls`-wrapped scrape target ----
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-inputs` lives at `crates/logit-inputs`; the fixtures live at the repo root's
-        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        // The repo root's `testdata/tls` (`testdata/tls/README.md`), two levels up.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
-    /// Builds a `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` -- no client
-    /// certificate required, since `PrometheusInput` doesn't (yet) support mutual TLS.
+    /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}`, requiring no client
+    /// certificate.
     fn test_server_tls_config() -> Arc<rustls::ServerConfig> {
         let dir = testdata_dir();
         let chain: Vec<rustls_pki_types::CertificateDer<'static>> =
@@ -2042,8 +1945,7 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// A TLS-wrapped `canned_server`: replies with a fixed text-0.0.4 body over a real TLS
-    /// handshake against `testdata/tls/server.pem`.
+    /// A TLS-wrapped `canned_server` replying with a fixed text-0.0.4 body.
     async fn canned_tls_server() -> SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let acceptor = tokio_rustls::TlsAcceptor::from(test_server_tls_config());
@@ -2091,17 +1993,12 @@ mod tests {
         );
     }
 
-    /// Alongside the success case above, proves `ca_file` is actually *honored* -- a CA that
-    /// doesn't sign the server's leaf (`other-ca.pem` signs nothing here, `testdata/tls/
-    /// README.md`) is rejected, not silently ignored. This does **not** exercise
-    /// `apply_client_tls`'s `tls_built_in_root_certs(false)` call: `testdata/tls/server.pem` is
-    /// signed by a private test CA that no bundled public root chains to either, so the handshake
-    /// fails here whether or not the built-in roots are disabled -- a discriminating test would
-    /// need a leaf the *bundled* roots would otherwise accept, which isn't reproducible offline.
-    /// `tls_built_in_root_certs(false)`'s replacement guarantee (a configured `ca_file` trusted
-    /// *instead of*, not *alongside*, the bundled Mozilla set) is documented behavior of the
-    /// underlying `reqwest::ClientBuilder::tls_built_in_root_certs` call itself, taken on trust
-    /// from its own doc comment rather than re-verified by a test here.
+    /// `ca_file` is honored: a CA that doesn't sign the server's leaf (`other-ca.pem`,
+    /// `testdata/tls/README.md`) fails the handshake. This does **not** exercise
+    /// `tls_built_in_root_certs(false)`: no bundled root chains to the private test CA either, so
+    /// the handshake fails regardless, and a discriminating leaf isn't reproducible offline. That
+    /// `ca_file` replaces rather than joins the bundled set is taken on trust from `reqwest`'s
+    /// `ClientBuilder::tls_built_in_root_certs` doc.
     #[tokio::test]
     async fn an_untrusted_ca_file_rejects_an_https_scrape() {
         let addr = canned_tls_server().await;
@@ -2124,8 +2021,7 @@ mod tests {
 
         let batch = recv_batch(&mut rx).await;
         assert_eq!(synthetic_value(&batch, "up"), 0.0, "an untrusted CA should reject the scrape");
-        // `up == 0` alone can't distinguish a TLS handshake failure from a timeout or a 5xx --
-        // assert the actual class too, so this test only passes for the failure mode it names.
+        // `up == 0` alone can't tell a handshake failure from a timeout or a 5xx.
         let events = registry.drain(0);
         assert_eq!(
             counter_in(&events, "logit.input.scrapes", ("class", "network_error")),
@@ -2159,11 +2055,8 @@ mod tests {
         );
     }
 
-    /// The regression test for the credential-leak fix: `prometheus.target` rides on every event
-    /// this target produces, reaching whatever sink the pipeline routes to (InfluxDB tags, statsd
-    /// tag sets, a forwarded OTLP resource, a stdout render) -- it must never carry a scrape URL's
-    /// userinfo or query string in cleartext, even though the *request itself* still needs and
-    /// uses them (a scrape URL's `user:pass@` is a legitimate way to configure HTTP basic auth).
+    /// `prometheus.target` never carries a scrape URL's userinfo or query string, while the request
+    /// itself still authenticates with them.
     #[tokio::test]
     async fn the_prometheus_target_attribute_strips_userinfo_and_query() {
         let (addr, captured) = canned_server(CannedResponse::Body {
@@ -2186,8 +2079,8 @@ mod tests {
         assert!(!target.contains("pass"), "got: {target}");
         assert!(!target.contains("token"), "got: {target}");
 
-        // The request itself still authenticates: `reqwest` turns the URL's userinfo into a real
-        // `Authorization` header, which this redaction must not have broken.
+        // `reqwest` turns the URL's userinfo into an `Authorization` header, which redaction must
+        // not break.
         let headers = captured.lock().unwrap();
         let auth = headers[0].get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
         assert!(auth.is_some(), "expected an Authorization header from the URL's userinfo");
@@ -2206,9 +2099,8 @@ mod tests {
     fn redact_url_falls_back_to_an_index_keyed_placeholder_on_an_unparseable_url() {
         assert_eq!(redact_url(3, "not a url"), "<unparseable target #3>");
         assert_eq!(instance_of(3, "not a url"), "<unparseable target #3>");
-        // Two malformed targets at different configured positions must not collapse onto the
-        // same placeholder -- see `an_unparseable_targets_placeholder_is_keyed_by_index` for the
-        // end-to-end version of this property (distinct `Resource`s, not just distinct strings).
+        // Two malformed targets must not share a placeholder; the end-to-end version is
+        // `an_unparseable_targets_placeholder_is_keyed_by_index`.
         assert_ne!(redact_url(0, "not a url"), redact_url(1, "not a url"));
     }
 
@@ -2338,12 +2230,9 @@ mod tests {
         assert_eq!(instance_of(0, "http://example.com:9100/metrics"), "example.com:9100");
     }
 
-    /// The regression test for the placeholder-collision fix: rule 40's `is_absolute_http_url`
-    /// only approximates a real URL grammar, so a config can carry more than one target that
-    /// passes it but still fails `reqwest::Url::parse` (`redact_url`'s own doc comment lists the
-    /// shapes) -- without the configured index folded into the placeholder, two such targets
-    /// would build byte-identical `instance`/`prometheus.target` attributes and their `up=0`
-    /// series would collapse onto one another downstream.
+    /// Two targets that pass rule 40 but fail `reqwest::Url::parse` (`redact_url`'s doc lists the
+    /// shapes) get distinct `instance`/`prometheus.target` values, so their `up=0` series don't
+    /// collapse downstream.
     #[test]
     fn two_unparseable_targets_get_distinct_resources() {
         let input = PrometheusInput::new(
@@ -2368,17 +2257,16 @@ mod tests {
 
     // ---- bind mode: the remote-write receiver -------------------------------------------------
     //
-    // One row of this module's routes table per test, both wire versions, driven over a real
-    // socket with hand-written HTTP/1.1 -- `otlp_in`'s own `post_raw` shape, which needs no HTTP
-    // client crate and lets a test hold a keep-alive connection open across requests (what the
-    // idle-timeout and backpressure cases below are actually about).
+    // One row of the routes table per test, both wire versions, over a real socket with
+    // hand-written HTTP/1.1 (`otlp_in`'s `post_raw` shape), which lets a test hold a keep-alive
+    // connection open across requests, as the idle-timeout and backpressure cases need.
 
     use logit_proto::prometheus::{
         FamilyType, MetricFamily, Point, PrometheusEncoder, Series, ATTR_TIMESTAMP, ATTR_TYPE,
     };
 
-    /// A bound receiver plus the address it is listening on. `Input::bind` makes the port live
-    /// before `run` is ever spawned, so there is no bind-drop-rebind race to lose.
+    /// A bound receiver plus its address. `Input::bind` makes the port live before `run` is
+    /// spawned, so there is no bind-drop-rebind race.
     async fn bound_receiver(path: &str) -> (PrometheusReceiver, String) {
         let mut receiver = PrometheusReceiver::new("127.0.0.1:0", path);
         receiver.bind().await.expect("binding an ephemeral port should succeed");
@@ -2386,9 +2274,8 @@ mod tests {
         (receiver, addr)
     }
 
-    /// Spawns `receiver`'s accept loop and returns the `Fanout` receiving end. `capacity` is the
-    /// channel bound -- `1` with nothing draining it is how the backpressure test parks a handler
-    /// inside `Fanout::send`.
+    /// Spawns `receiver`'s accept loop and returns the `Fanout` receiving end. `capacity` `1` with
+    /// nothing draining it parks a handler inside `Fanout::send`.
     fn spawn_receiver(
         mut receiver: PrometheusReceiver,
         capacity: usize,
@@ -2403,8 +2290,8 @@ mod tests {
         snap::raw::Encoder::new().compress_vec(body).expect("compressing a test body never fails")
     }
 
-    /// One remote-write request body: protobuf through W2's codec, then Snappy **block**
-    /// compression -- exactly what a real sender puts on the wire.
+    /// One remote-write request body: protobuf through the codec, then Snappy **block**
+    /// compression, as a real sender puts it on the wire.
     fn request_body(groups: &[Vec<MetricFamily>], version: remote_write::Version) -> Vec<u8> {
         let mut encoder = PrometheusEncoder::new();
         snappy(&remote_write::encode(groups, version, &mut encoder))
@@ -2422,23 +2309,20 @@ mod tests {
         family
     }
 
-    /// Unix nanoseconds on a whole-millisecond boundary -- remote-write timestamps are
-    /// milliseconds, so anything finer would come back truncated and make an assertion about
-    /// equality a statement about rounding instead.
+    /// Unix nanoseconds on a whole-millisecond boundary: remote-write timestamps are milliseconds,
+    /// so anything finer would come back truncated.
     fn millis(ms: i64) -> i64 {
         ms * 1_000_000
     }
 
-    /// The protocol headers a well-formed request carries, ready to splice into [`post_raw`].
-    /// `Connection: close` so [`post_raw`]'s `read_to_end` terminates on the response rather than
-    /// on a keep-alive connection's own lifetime -- a test that needs the connection kept alive
-    /// uses [`keep_alive_write_headers`] instead.
+    /// The protocol headers a well-formed request carries, for [`post_raw`]. `Connection: close`
+    /// so `read_to_end` ends with the response; [`keep_alive_write_headers`] omits it.
     fn write_headers(version: remote_write::Version) -> String {
         format!("{}Connection: close\r\n", keep_alive_write_headers(version))
     }
 
-    /// [`write_headers`] without the `Connection: close`, so HTTP/1.1's own default (keep-alive)
-    /// applies and the *listener* is the only thing that can end the connection.
+    /// [`write_headers`] without `Connection: close`, so HTTP/1.1's keep-alive default applies and
+    /// only the *listener* can end the connection.
     fn keep_alive_write_headers(version: remote_write::Version) -> String {
         format!(
             "Content-Type: {}\r\nContent-Encoding: {}\r\n{}: {}\r\nUser-Agent: test\r\n",
@@ -2473,9 +2357,8 @@ mod tests {
         post_raw(addr, path, &write_headers(version), body).await
     }
 
-    /// Reads exactly one response head (through the blank line) off a keep-alive connection --
-    /// `read_to_end` would block until the *connection* ends, which is the thing some of these
-    /// tests are holding open on purpose. `None` on the deadline rather than a panic, so the
+    /// Reads one response head (through the blank line) off a keep-alive connection, where
+    /// `read_to_end` would block until the connection ends. `None` on the deadline, so the
     /// backpressure test can assert that no response has arrived *yet*.
     async fn read_head<S: tokio::io::AsyncRead + Unpin>(
         stream: &mut S,
@@ -2604,8 +2487,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
     }
 
-    /// The documented divergence from `otlp_in`, which answers `404` for a wrong method: this
-    /// receiver matches its sibling `prometheus_out`'s exposition server instead.
+    /// A wrong method is `405` + `Allow: POST`, matching `prometheus_out`, not `otlp_in`'s `404`.
     #[tokio::test]
     async fn a_non_post_on_the_write_path_is_405_with_an_allow_header() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2670,9 +2552,8 @@ mod tests {
         assert!(response.contains("some.other.Message"), "got: {response}");
     }
 
-    /// `otlp_in` reads an absent `Content-Type` as protobuf, for compatibility with clients that
-    /// predate its JSON support. Remote-write has no such history and both specs require the
-    /// header, so an absent one is the `415` the spec has for exactly this rather than a guess.
+    /// An absent `Content-Type` is a `415`, not a guessed version (unlike `otlp_in`'s protobuf
+    /// default).
     #[tokio::test]
     async fn a_request_with_no_content_type_is_415() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2687,15 +2568,13 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 415"), "got: {response}");
     }
 
-    /// The compression-bomb bound: the decompressed size is read out of the Snappy block header
-    /// and compared against `MAX_REQUEST_BYTES` *before* a byte is expanded, so this is rejected
-    /// without the receiver ever holding the 5 MiB it would have become.
+    /// The compression-bomb bound: Snappy's declared decompressed size is checked against
+    /// `MAX_REQUEST_BYTES` *before* a byte is expanded.
     #[tokio::test]
     async fn a_body_that_would_decompress_over_the_cap_is_413() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
         let _rx = spawn_receiver(receiver, 4);
-        // Highly compressible, so the *compressed* body stays far under the cap and only the
-        // declared decompressed length can catch it -- which is the check under test.
+        // Highly compressible, so only the declared decompressed length can catch it.
         let bomb = snappy(&vec![0u8; MAX_REQUEST_BYTES + 1024]);
         assert!(
             bomb.len() < MAX_REQUEST_BYTES,
@@ -2719,16 +2598,11 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
     }
 
-    /// A body that decompresses fine but is not protobuf at all: a truncated varint, which no
-    /// message can be. Sent as 2.0 so this also pins the `-Written` report a rejection owes a 2.0
-    /// sender -- zeros, on a `4xx`, which is exactly what 2.0 asks for.
+    /// A body that decompresses but is not protobuf (a truncated varint) is a `400`. Sent as 2.0,
+    /// so this also pins the zero `-Written` report 2.0 requires on a `4xx`.
     ///
-    /// A *valid 1.0* body under a 2.0 `Content-Type` is the more realistic mistake, and on this
-    /// branch's base it still answers `204` with nothing stored (proto3 field numbers overlap
-    /// enough for it to decode as an empty 2.0 `Request`). `rw/w2`'s own follow-up
-    /// `fix(proto): bound remote-write decode and place its exemplars honestly` makes that a
-    /// `CodecError`; once the lead syncs this stack onto it, add the case here -- a `V1`
-    /// `request_body` posted with `Version::V2`'s headers, asserting `400`.
+    /// A *valid 1.0* body under a 2.0 `Content-Type` is also a `CodecError` now
+    /// (`logit_proto::prometheus::remote_write`'s module doc), but no test here posts one.
     #[tokio::test]
     async fn a_body_that_is_not_the_promised_message_is_400() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2740,7 +2614,7 @@ mod tests {
             post_write(&addr, "/api/v1/write", remote_write::Version::V2, &truncated).await;
 
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
-        // 2.0 wants the `-Written` report on a 4xx too -- zeros, because nothing was stored.
+        // 2.0 wants the `-Written` report on a 4xx too: zeros, since nothing was stored.
         assert!(
             response
                 .to_ascii_lowercase()
@@ -2749,10 +2623,8 @@ mod tests {
         );
     }
 
-    /// The timestamp-group rule end to end: one request carrying three samples of one series
-    /// becomes **one** batch of three events, in ascending timestamp order, and none of them
-    /// carries the `prometheus.timestamp` marker -- remote-write mandates a timestamp, so its
-    /// presence is not the producer choice that marker records.
+    /// Three samples of one series become **one** batch of three events in ascending timestamp
+    /// order, none carrying the `prometheus.timestamp` marker.
     #[tokio::test]
     async fn a_multi_timestamp_request_becomes_one_ordered_batch_with_no_timestamp_marker() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2788,8 +2660,7 @@ mod tests {
     }
 
     /// Labels stay labels: `job`/`instance` ride as ordinary event attributes and the batch's
-    /// `Resource` is empty. A receiver never touched the target those labels name, so it has no
-    /// resource identity of its own to stamp -- the opposite call scrape mode makes, deliberately.
+    /// `Resource` is empty.
     #[tokio::test]
     async fn the_batch_carries_an_empty_resource_and_labels_stay_labels() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2811,10 +2682,9 @@ mod tests {
         );
     }
 
-    /// What a receiver with **no** metadata cache does with Prometheus's own 1.0 sender, which
-    /// ships `MetricMetadata` in *separate* requests: a request carrying only samples decodes as
-    /// `Unknown` families. The samples themselves are exact. `metadata_cache:` is what closes
-    /// this -- see the cache's own tests below, which are this test with a table behind it.
+    /// With **no** metadata cache, a 1.0 request carrying only samples (Prometheus ships
+    /// `MetricMetadata` separately) decodes as `Unknown` families with exact samples. The cache
+    /// tests below are this test with a table behind it.
     #[tokio::test]
     async fn a_1_0_request_without_metadata_decodes_as_unknown_families() {
         use logit_proto::prometheus::generated::prometheus as pb1;
@@ -2822,9 +2692,8 @@ mod tests {
 
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
         let mut rx = spawn_receiver(receiver, 4);
-        // Hand-built rather than round-tripped through `remote_write::encode`, which always writes
-        // a `metadata[]` entry -- the shape under test is precisely the one that carries none.
-        // Labels are sorted by byte order, as both specs require of a sender.
+        // Hand-built: `remote_write::encode` always writes a `metadata[]` entry, and the shape
+        // under test carries none. Labels sorted by byte order, as both specs require.
         let request = pb1::WriteRequest {
             timeseries: vec![pb1::TimeSeries {
                 labels: vec![
@@ -2852,8 +2721,7 @@ mod tests {
         );
     }
 
-    /// An empty request is a `204` and nothing downstream -- a real sender's heartbeat write
-    /// should not manufacture an empty batch for every component below this one to walk.
+    /// An empty request is a `204` and nothing downstream, not an empty batch.
     #[tokio::test]
     async fn an_empty_request_answers_204_and_sends_no_batch() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2867,14 +2735,12 @@ mod tests {
     }
 
     /// The batch reaches the `Fanout` **before** the response is built, so a full downstream
-    /// delays the `204` and the sender's own queue throttles -- remote-write's flow-control model
-    /// working as designed, which is only true if the ordering is this way round.
+    /// delays the `204` and the sender's own queue throttles.
     #[tokio::test]
     async fn backpressure_delays_the_204_until_the_channel_drains() {
         use tokio::io::AsyncWriteExt;
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
-        // Capacity 1, nothing draining: the first request's batch fills it and the second's
-        // `Fanout::send` parks.
+        // Capacity 1, nothing draining: the first batch fills it and the second parks.
         let mut rx = spawn_receiver(receiver, 1);
         let body = request_body(
             &[vec![gauge_family("queue_depth", ("job", "api"), 1.0, millis(1))]],
@@ -2906,12 +2772,9 @@ mod tests {
         recv_batch_async(&mut rx).await;
     }
 
-    /// A histogram whose cumulative bucket counts *decrease* is not a cumulative histogram at all,
-    /// so `families_to_events` drops the whole series after the assembler has already accepted its
-    /// samples. The report has to follow the events, not the assembler: nothing reached the
-    /// `Fanout`, so `Samples-Written` is `0` and `logit.input.samples` counts nothing -- otherwise
-    /// the one header 2.0 defines as "what the receiver kept" would be claiming three samples this
-    /// receiver threw away.
+    /// A histogram whose cumulative bucket counts *decrease* is dropped by `families_to_events`
+    /// after the assembler accepted its samples, so `Samples-Written` is `0` and
+    /// `logit.input.samples` counts nothing: the report follows the events, not the assembler.
     #[tokio::test]
     async fn a_request_whose_only_series_is_dropped_reports_zero_samples_written() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2953,16 +2816,15 @@ mod tests {
             Some(0.0),
             "and the counter agrees with the header"
         );
-        // The decoder's own skip counter is where the loss is visible, which is the point of it.
+        // The decoder's skip counter is where the loss is visible.
         assert_eq!(
             counter_in(&events, "logit.input.metrics.skipped", ("reason", "non_monotonic_buckets")),
             Some(1.0)
         );
     }
 
-    /// A well-formed classic histogram, for the other half of the same property: a single series
-    /// that the wire spelled as several samples reports all of them, so the fix above is not
-    /// simply "count events".
+    /// The other half: one classic-histogram series spelled as several wire samples reports all
+    /// of them, so the count is not "count events".
     #[tokio::test]
     async fn a_kept_histogram_reports_every_wire_sample_it_was_spelled_as() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2996,11 +2858,9 @@ mod tests {
         assert_eq!(batch.events.len(), 1, "four wire samples, one model series");
     }
 
-    /// A summary sent as quantiles alone -- no `_sum`, no `_count` -- is two wire samples, and the
-    /// report has to say two. This is the case a count derived from the built `MetricRecord` could
-    /// not get right: `logit_core::Summary`'s `sum`/`count` are plain numbers, so the model has
-    /// forgotten that the wire omitted them, while the codec's `Point::Summary` still carries the
-    /// `Option`s and `wire_samples` reads them.
+    /// A summary sent as quantiles alone (no `_sum`, no `_count`) reports two samples. A count from
+    /// the built `MetricRecord` would say four: `logit_core::Summary`'s `sum`/`count` are plain
+    /// numbers, while the codec's `Point::Summary` keeps the `Option`s `wire_samples` reads.
     #[tokio::test]
     async fn a_quantiles_only_summary_reports_only_its_quantiles() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3038,10 +2898,9 @@ mod tests {
         assert_eq!(counter_in(&events, "logit.input.samples", ("component", "receive")), Some(2.0));
     }
 
-    /// 1.0 spells a created timestamp as a `_created` sample of its own, which the codec counts and
-    /// this receiver keeps (as `Series::created`) -- so both of the request's samples are reported.
-    /// Hand-built, because `remote_write::encode` drops `created` on 1.0, 1.0 having no field for
-    /// it: the shape under test only exists on the wire.
+    /// 1.0 spells a created timestamp as a `_created` sample of its own, which this receiver keeps
+    /// (as `Series::created`), so both samples are reported. Hand-built: `remote_write::encode`
+    /// drops `created` on 1.0, which has no field for it.
     #[tokio::test]
     async fn a_1_0_created_sample_is_reported_as_a_sample_it_kept() {
         use logit_proto::prometheus::generated::prometheus as pb1;
@@ -3064,8 +2923,8 @@ mod tests {
                 series("requests_total", 7.0),
                 series("requests_created", 1_699_000_000.0),
             ],
-            // A `_created` sample only means anything once something says the family is a counter;
-            // without metadata `requests_created` is just another untyped series.
+            // A `_created` sample means something only once the family is declared a counter;
+            // without metadata `requests_created` is another untyped series.
             metadata: vec![pb1::MetricMetadata {
                 r#type: pb1::metric_metadata::MetricType::Counter as i32,
                 metric_family_name: "requests".to_string(),
@@ -3092,10 +2951,8 @@ mod tests {
         );
     }
 
-    /// The `408` row of the routes table, and the whole reason `collect_with_stall_bound` was
-    /// hoisted: `drive_with_idle` applies no deadline while a request is in flight, so a peer that
-    /// sends a head and then stops mid-body would otherwise hold its connection-limit permit
-    /// forever. `otlp_in`'s own stalled-body test, one listener over.
+    /// The routes table's `408` row: `drive_with_idle` applies no deadline while a request is in
+    /// flight, so a peer that stops mid-body would otherwise hold its permit forever.
     #[tokio::test]
     async fn a_body_that_stops_arriving_is_408_and_closes_the_connection() {
         use tokio::io::AsyncWriteExt;
@@ -3104,8 +2961,7 @@ mod tests {
         let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
         let receiver = receiver
             .with_telemetry(telemetry)
-            // The per-frame body bound is `idle_timeout` too -- a listener with no idle bound
-            // configured gets no per-frame one either.
+            // The per-frame body bound is derived from `idle_timeout`.
             .with_idle_timeout(Some(Duration::from_millis(100)))
             // The grace `drive_with_idle` gives hyper to write the 408 out and close.
             .with_handshake_timeout(Duration::from_millis(200));
@@ -3116,9 +2972,7 @@ mod tests {
         );
 
         // A `Content-Length` promising the whole body, then half of it and silence. Sent
-        // **keep-alive** -- no `Connection: close` -- so nothing but this listener's own
-        // `Activity::request_close` can end the connection, which is what makes the close below an
-        // assertion about the code under test rather than about the request this test wrote.
+        // **keep-alive**, so only the listener's `Activity::request_close` can end the connection.
         let mut stalled = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let head = format!(
             "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{}\r\n",
@@ -3128,9 +2982,8 @@ mod tests {
         stalled.write_all(head.as_bytes()).await.unwrap();
         stalled.write_all(&body[..body.len() / 2]).await.unwrap();
 
-        // `read_to_end` *completing* is the close: `Activity::request_close` ends the connection
-        // once the 408 is out rather than leaving it to the whole-connection deadline, so this
-        // both reads the response and proves the socket went away. `otlp_in`'s own shape.
+        // `read_to_end` completing is the close: it reads the response and proves the socket
+        // went away.
         let mut buf = Vec::new();
         {
             use tokio::io::AsyncReadExt;
@@ -3215,11 +3068,9 @@ mod tests {
         assert_eq!(gauge_value_of(&batch, "queue_depth"), Some(5.0));
     }
 
-    /// `otlp_in`'s idle-timeout test one listener over, and the reason the helpers were hoisted
-    /// rather than copied: a pooled keep-alive connection that finished its write and went quiet
-    /// gives its connection-cap permit back instead of holding it forever. Proven under
-    /// `with_max_connections(1)`, so the follow-up request can only be served if the permit
-    /// genuinely came back -- and the close is counted, never diagnosed.
+    /// A keep-alive connection that finished its write and went quiet gives its permit back. Under
+    /// `with_max_connections(1)` the follow-up request is served only if it did; the close is
+    /// counted, never diagnosed. `otlp_in` has the same test over the same `crate::http` helpers.
     #[tokio::test]
     async fn an_idle_keep_alive_connection_is_closed_and_releases_its_permit() {
         use tokio::io::AsyncWriteExt;
@@ -3239,8 +3090,7 @@ mod tests {
             remote_write::Version::V1,
         );
 
-        // One complete write, keep-alive, so the connection settles idle inside hyper with the
-        // first-byte peek long behind it -- the idle clock is the only thing that can end it.
+        // One complete write, keep-alive, so only the idle clock can end the connection.
         let mut keep_alive = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let request = format!(
             "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: \
@@ -3278,8 +3128,7 @@ mod tests {
         drop(keep_alive);
     }
 
-    /// A connection that completes its TCP connect and then says nothing must not pin a
-    /// connection-cap permit forever -- the plaintext arm's first-byte peek is what bounds it.
+    /// A connection that connects and says nothing is closed by the plaintext first-byte bound.
     #[tokio::test]
     async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3300,8 +3149,8 @@ mod tests {
         drop(silent);
     }
 
-    /// `recv_batch`'s awaiting twin -- the receiver answers on a spawned task, so a batch may not
-    /// have landed by the time the response has been read.
+    /// `recv_batch`, awaiting: the receiver answers on a spawned task, so a batch may land after
+    /// the response is read.
     async fn recv_batch_async(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
         let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -3313,8 +3162,7 @@ mod tests {
         }
     }
 
-    /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`, presenting no client certificate --
-    /// `otlp_in`'s own `tls_connector` for the no-mTLS case.
+    /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`, presenting no client certificate.
     fn test_tls_connector() -> tokio_rustls::TlsConnector {
         let dir = testdata_dir();
         let mut roots = rustls::RootCertStore::empty();
@@ -3336,18 +3184,16 @@ mod tests {
 
     // ---- bind mode: the metadata cache --------------------------------------------------------
     //
-    // The 1.0 shape these are all about: one request declares a family and carries no samples,
-    // later requests carry its samples and declare nothing. `remote_write::encode` never produces
-    // either half on its own -- it writes a `metadata[]` entry for every family it has series for
-    // -- so the wire messages here are hand-built, exactly as `a_1_0_request_without_metadata_…`
-    // builds its own.
+    // The 1.0 shape: one request declares a family and carries no samples, later requests carry
+    // its samples and declare nothing. `remote_write::encode` produces neither half alone (it
+    // writes a `metadata[]` entry for every family it has series for), so these are hand-built.
 
     use logit_proto::prometheus::generated::io::prometheus::write::v2 as pb2;
     use logit_proto::prometheus::generated::prometheus as pb1;
     use prost::Message as _;
 
-    /// A 1.0 request that declares `foo` and carries nothing else -- what Prometheus's sender
-    /// writes on its `metadata_config` schedule.
+    /// A 1.0 request that declares `foo` and carries nothing else, as Prometheus's sender writes on
+    /// its `metadata_config` schedule.
     fn v1_metadata_only(kind: pb1::metric_metadata::MetricType, help: &str, unit: &str) -> Vec<u8> {
         let request = pb1::WriteRequest {
             timeseries: Vec::new(),
@@ -3398,10 +3244,9 @@ mod tests {
         })
     }
 
-    /// The whole point of the feature, end to end over a socket: a metadata-only request teaches
-    /// the receiver what `foo` is, and the samples-only request that follows -- carrying no
-    /// metadata whatsoever, which is every request a real 1.0 sender writes -- decodes as one
-    /// typed `Histogram` with its help and unit, instead of three unrelated `unknown` series.
+    /// A metadata-only request teaches the receiver what `foo` is, and the samples-only request
+    /// that follows decodes as one typed `Histogram` with its help and unit, not three `unknown`
+    /// series.
     #[tokio::test]
     async fn a_metadata_only_request_types_the_samples_only_request_that_follows() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3452,9 +3297,8 @@ mod tests {
         );
     }
 
-    /// `max_families: 0` is not a zero-size cache but no cache: the receiver stays on the
-    /// stateless decode path, so the same pair of requests decodes exactly as it did before this
-    /// feature existed -- and nothing is counted, since there is nothing there to count.
+    /// `max_families: 0` is no cache: the same pair of requests decodes flat, and nothing is
+    /// counted.
     #[tokio::test]
     async fn a_disabled_metadata_cache_leaves_the_stateless_decode_path_alone() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3488,9 +3332,8 @@ mod tests {
         );
     }
 
-    /// A request's own metadata beats the remembered entry, per family name: the sender said `foo`
-    /// is a gauge *now*, however long the receiver has been treating it as a histogram -- and the
-    /// retype is counted, since a steady stream of them is two senders disagreeing about one name.
+    /// A request's own metadata beats the remembered entry, per family name, and the retype is
+    /// counted.
     #[tokio::test]
     async fn a_request_declaration_overrides_a_cached_one() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3540,10 +3383,9 @@ mod tests {
         );
     }
 
-    /// 2.0's inline `Metadata` fills the same table, so a fleet migrating version by version gets
-    /// its 1.0 senders typed by its 2.0 ones -- the family a 2.0 series declares is the base its
-    /// type implies (`foo_bucket` under `HISTOGRAM` declares `foo`), which is exactly the key a
-    /// 1.0 `metadata[]` entry uses.
+    /// 2.0's inline `Metadata` types a 1.0 sender's series: a 2.0 series declares the base family
+    /// its type implies (`foo_bucket` under `HISTOGRAM` declares `foo`), the key a 1.0
+    /// `metadata[]` entry uses.
     #[tokio::test]
     async fn a_2_0_request_fills_the_cache_for_a_later_1_0_sender() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3602,9 +3444,8 @@ mod tests {
 
     // ---- the table itself, against a clock a test owns ----------------------------------------
     //
-    // `Instant` is a parameter of `seed`/`learn` rather than read inside them, so the expiry and
-    // eviction rules are testable without sleeping through a real TTL -- `prometheus_out`'s
-    // exposition registry takes the same shape for the same reason.
+    // `Instant` is a parameter of `seed`/`learn`, so expiry and eviction are testable without
+    // sleeping through a real TTL.
 
     fn declarations(entries: &[(&str, FamilyType)]) -> remote_write::Declarations {
         let mut declarations = remote_write::Declarations::default();
@@ -3620,9 +3461,8 @@ mod tests {
         names
     }
 
-    /// A family nothing has re-declared within the TTL stops being typed -- its next samples come
-    /// back `unknown` -- and the drop is counted. That is the bound working: a remembered type
-    /// nothing has reasserted is a guess about a series that may no longer exist.
+    /// A family nothing has re-declared within the TTL stops being typed (its next samples come
+    /// back `unknown`), and the drop is counted.
     #[test]
     fn a_cached_family_expires_once_its_ttl_has_run_out() {
         let registry = Registry::new();
@@ -3681,9 +3521,8 @@ mod tests {
         );
     }
 
-    /// One request declaring several families over the cap evicts them all in one pass, and the
-    /// tie-break past `last_seen` is the family's own name -- so which of two families declared in
-    /// the same request survives is a function of the data, not of hash order.
+    /// One request declaring several families over the cap evicts them in one pass, tie-broken by
+    /// family name rather than hash order.
     #[test]
     fn one_over_cap_request_evicts_in_a_single_pass_and_ties_break_by_name() {
         let registry = Registry::new();
@@ -3711,9 +3550,8 @@ mod tests {
         );
     }
 
-    /// Re-declaring a family the same way is not a retype: `replaced` is the counter an operator
-    /// watches when model kinds look wrong, and a 1.0 sender repeating itself once a minute
-    /// forever must not move it.
+    /// Re-declaring a family the same way is not a retype: a 1.0 sender repeating itself every
+    /// minute must not move `replaced`.
     #[test]
     fn relearning_the_same_declaration_is_not_counted_as_a_replacement() {
         let registry = Registry::new();
@@ -3745,11 +3583,9 @@ mod tests {
         );
     }
 
-    /// The federation case the cache must not make worse: a Prometheus relaying someone else's
-    /// series declares them `UNKNOWN`, which is the metadata enum's "no type given". That must not
-    /// overwrite a remembered `HISTOGRAM` -- if it did, the real sender's `_bucket`/`_sum`/`_count`
-    /// would come apart every time the federating one wrote. `UNKNOWN` is not learned at all
-    /// (`remote_write::decode_v1`), so there is nothing to replace with.
+    /// A federating Prometheus declares relayed series `UNKNOWN` ("no type given"), which must not
+    /// overwrite a remembered `HISTOGRAM`, or the real sender's `_bucket`/`_sum`/`_count` would
+    /// come apart on every federated write. `UNKNOWN` is not learned (`remote_write::decode_v1`).
     #[tokio::test]
     async fn an_unknown_declaration_cannot_replace_a_cached_type() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -3784,7 +3620,7 @@ mod tests {
             &snappy(&federated.encode_to_vec()),
         )
         .await;
-        // Its own sample survives -- the remembered histogram gives way rather than rejecting it.
+        // Its own sample survives: the remembered histogram gives way rather than rejecting it.
         let batch = recv_batch_async(&mut rx).await;
         assert_eq!(gauge_value_of(&batch, "foo"), Some(1.0));
 
@@ -3807,12 +3643,8 @@ mod tests {
         );
     }
 
-    /// What is remembered is what outlives the request, and the 4 MiB request cap does not bound a
-    /// table that keeps entries: without this, 10 000 individually-legal metadata-only requests
-    /// each carrying a multi-megabyte `# HELP` would take the process down while
-    /// `metadata_cache.size` read a healthy 10 000. The description is cut to
-    /// [`MAX_METADATA_TEXT_BYTES`] on a `char` boundary -- so the survivor is still a string -- and
-    /// the cut is counted.
+    /// A remembered description is cut to [`MAX_METADATA_TEXT_BYTES`] on a `char` boundary, and the
+    /// cut is counted.
     #[test]
     fn a_remembered_description_is_bounded_and_cut_on_a_char_boundary() {
         let registry = Registry::new();
@@ -3852,10 +3684,8 @@ mod tests {
         );
     }
 
-    /// Prometheus re-sends a family's metadata every `send_interval`, from every shard, so
-    /// "identical to what is already remembered" is the common write. Rebuilding the seed for it
-    /// would copy the whole table under the lock on every one -- so the seed handed out must be the
-    /// *same* `Arc`, which is the only way to observe that no rebuild happened.
+    /// An identical re-declaration (the common write) does not rebuild the seed: the seed handed
+    /// out is the *same* `Arc`, the only way to observe that no rebuild happened.
     #[test]
     fn re_declaring_what_is_already_remembered_does_not_rebuild_the_seed() {
         let registry = Registry::new();
@@ -3881,14 +3711,10 @@ mod tests {
         assert!(!Arc::ptr_eq(&second, &third), "a retype is a change");
     }
 
-    /// The other half of the rule above, and the one the seed's own identity cannot see: on a no-op
-    /// re-declaration the **entry** must keep its `Arc<str>`s too, not adopt the request's clones.
-    ///
-    /// The seed is not rebuilt for a no-op (the test above), so it goes on holding the originals --
-    /// and if `learn` overwrote the entry anyway, cache and seed would hold equal strings in two
-    /// separate allocations, one more pair per shard per `send_interval`, for as long as nothing
-    /// really changed. `declarations()` above deliberately inserts `help: None`, which is why this
-    /// case needs its own builder: with no description there is no per-entry `Arc<str>` to observe.
+    /// On a no-op re-declaration the **entry** keeps its `Arc<str>`s too, rather than adopting the
+    /// request's clones; otherwise cache and un-rebuilt seed would hold equal strings in separate
+    /// allocations. Its own builder, because `declarations()` above inserts `help: None`, leaving
+    /// no per-entry `Arc<str>` to observe.
     #[test]
     fn re_declaring_what_is_already_remembered_keeps_the_entrys_own_arc() {
         let registry = Registry::new();
@@ -3910,8 +3736,7 @@ mod tests {
             .and_then(|(_, declaration)| declaration.help.clone())
             .expect("the entry was learned with a help string");
 
-        // A *fresh* `Arc` carrying the same text, which is what a second identical request brings:
-        // the bytes match, the allocation does not.
+        // A *fresh* `Arc` with the same text, as a second identical request brings.
         cache.learn(&described("Total requests."), start + Duration::from_secs(60), &telemetry);
         let after = cache.seed(start + Duration::from_secs(60), &telemetry);
         assert!(Arc::ptr_eq(&seed, &after), "nothing changed, so nothing was rebuilt");
@@ -3942,10 +3767,8 @@ mod tests {
         );
     }
 
-    /// The expiry sweep is checked per request, not performed: until the earliest entry could
-    /// possibly have expired there is nothing to find, and walking the table anyway would be a
-    /// per-request cost that scales with what is remembered. Only the sweep's own counter can see
-    /// this -- one that finds nothing leaves no counter and no rebuild behind.
+    /// The expiry sweep is checked per request, not performed: no walk until the earliest entry
+    /// could have expired. Only the test-only sweep counter can see this.
     #[test]
     fn a_request_before_the_watermark_does_not_sweep() {
         use std::sync::atomic::Ordering;
@@ -3965,7 +3788,7 @@ mod tests {
         }
         assert_eq!(cache.sweeps.load(Ordering::Relaxed), 0, "nothing could have expired yet");
 
-        // Past it, once -- and the watermark it recomputes is `None`, the table now being empty.
+        // Past it, once, and the recomputed watermark is `None`, the table now being empty.
         let seed = cache.seed(start + Duration::from_secs(601), &telemetry);
         assert_eq!(cache.sweeps.load(Ordering::Relaxed), 1);
         assert!(seed.is_empty());

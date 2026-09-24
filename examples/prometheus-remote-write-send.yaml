@@ -1,21 +1,14 @@
-# Push metrics into a remote-write receiver -- Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a
-# Prometheus started with `--web.enable-remote-write-receiver`: `prometheus_out`'s `endpoint:` mode
-# is a remote-write **sender** (docs/adr/prometheus-remote-write.md). This is the direction scrape
-# cannot serve at all: none of those will scrape a logit edge instance living behind a NAT or in a
-# short-lived container, so pushing is the only way its series get out.
+# Pushes metrics into a remote-write receiver (Mimir, Thanos, VictoriaMetrics, Grafana Cloud, or a
+# Prometheus started with `--web.enable-remote-write-receiver`): `prometheus_out` with `endpoint:`
+# is the remote-write sender (docs/adr/prometheus-remote-write.md). Pushing is how a `logit`
+# behind a NAT or in a short-lived container gets its series out. Change `endpoint` to your
+# receiver and set `PROMETHEUS_REMOTE_WRITE_AUTHORIZATION` in the environment.
 #
-# `statsd_in -> aggregate -> prometheus_out` rather than a scrape source, so this runs against the
-# `statsd` port the dev stack already uses and needs nothing external on the ingress side.
-#
-# NOTE ON TEMPORALITY -- why the `aggregate` stage is not optional here, exactly as in
-# examples/prometheus-expose.yaml. Prometheus counters are cumulative, and `prometheus_out` never
-# accumulates deltas itself: that is summarization, which docs/adr/lossless-transit.md reserves for
-# a stage named in the config rather than something a sink does silently on the way out. statsd
-# counters arrive as delta `Sum`s, and a delta `Sum`/`Histogram` reaching this sink is skipped and
-# counted (logit.output.metrics.skipped{metric_kind="delta_sum"}). `temporality: cumulative` is
-# that named stage -- it keeps a per-series running total alive across window boundaries and emits
-# `Sum{Cumulative}` with `start_timestamp` set, which remote-write 2.0 carries as
-# `Sample.start_timestamp` and a receiver reads as the counter's own reset marker.
+# `statsd_in -> aggregate -> prometheus_out`, so this runs against the dev stack's statsd port with
+# nothing external on the ingress side. The `aggregate` is not optional: Prometheus counters are
+# cumulative, `prometheus_out` never accumulates a delta (a delta `Sum`/`Histogram` reaching it is
+# skipped and counted), and `temporality: cumulative` is the named stage that keeps the running
+# total, as in examples/prometheus-expose.yaml.
 components:
   app_metrics:
     type: statsd_in
@@ -26,44 +19,33 @@ components:
     sources: [app_metrics]
     interval: 10s
     temporality: cumulative
-    # `series_retention` and `max_retained_series` both default to a non-zero value, which
-    # `temporality: cumulative` requires (graph rule 39): they are what keeps a running total alive
-    # across the window boundary.
+    # `series_retention` and `max_retained_series` stay at their non-zero defaults, which
+    # `temporality: cumulative` requires: they keep a running total alive across windows.
 
   remote_write:
     type: prometheus_out
     sources: [windowed]
-    # An absolute http(s) URL, **path included** -- the receiver's write path lives here, not in a
-    # `path:` field (that one belongs to the exposition mode and is rejected alongside `endpoint:`).
-    # `/api/v1/write` is what Prometheus, Mimir and Thanos all default to.
+    # An absolute http(s) URL, path included; `/api/v1/write` is what Prometheus, Mimir, and
+    # Thanos default to. `path:` belongs to the exposition mode and is rejected with `endpoint:`.
     endpoint: http://127.0.0.1:9090/api/v1/write
-    # 1 (`prometheus.WriteRequest`, the default) or 2 (`io.prometheus.write.v2.Request`). There is
-    # no negotiation and no fallback: pick what the receiver speaks, exactly as a scrape target's
-    # dialect is picked for it. 1 is what every deployed receiver accepts; 2 adds an interned symbol
-    # table, inline per-series metadata, and a created timestamp per sample -- so a counter's start
-    # time survives, which on 1 it cannot (that version has no field for it).
+    # 1 (`prometheus.WriteRequest`, the default) or 2 (`io.prometheus.write.v2.Request`). No
+    # negotiation and no fallback: pick what your receiver speaks. Only 2 carries a counter's start
+    # time.
     version: 1
-    # Extra headers on every request -- `X-Scope-OrgID` for a multi-tenant Mimir, an
-    # `Authorization` for anything token-guarded. A value is a plain string like any other field,
-    # so `!env` works on it (docs/adr/env-yaml-tag.md); the variable holds the *whole* header
-    # value, `Bearer ` prefix included, because `!env` substitutes a field rather than
-    # interpolating into one. A name the protocol owns (content-type, content-encoding,
-    # content-length, x-prometheus-remote-write-version, user-agent) is rejected at startup rather
-    # than silently overridden.
+    # Extra headers on every request: `X-Scope-OrgID` for a multi-tenant Mimir, `Authorization`
+    # for anything token-guarded. `!env` substitutes the whole value, so the variable holds the
+    # `Bearer ` prefix too (docs/adr/env-yaml-tag.md). A header the protocol owns (content-type,
+    # content-encoding, content-length, x-prometheus-remote-write-version, user-agent) is rejected
+    # at startup.
     headers:
       Authorization: !env PROMETHEUS_REMOTE_WRITE_AUTHORIZATION
     # timeout: 10s                # per-request timeout on the POST
-    # endpoint_tls:               # client TLS tuning for an https:// endpoint -- TLS is selected by
-    #                             # the endpoint's own scheme, so this block under a plain http://
-    #                             # endpoint is a config error rather than a silently ignored one.
-    #                             # Omitted entirely, an https:// endpoint still gets TLS, verified
-    #                             # against the bundled Mozilla root set.
+    # endpoint_tls:               # client TLS tuning for an https:// endpoint; a config error under
+    #                             # http://. Omitted, an https:// endpoint still verifies against
+    #                             # the bundled Mozilla roots
     #   ca_file: ca.pem           # resolved against this config file's directory; a private CA
-    #   cert_file: client.pem     # client certificate, for a receiver that wants mutual TLS
+    #   cert_file: client.pem     # cert_file/key_file together, for mutual TLS
     #   key_file: client.key
-    # buffer: (all defaults, see docs/adr/buffered-sink-delivery.md). The sink itself does not
-    #         retry -- one `send` is one request -- so the buffer's retry budget is what covers a
-    #         receiver returning 429 or 5xx, both classified ambiguous because the request reached
-    #         the server and may have been partially applied. A replayed remote-write request is an
-    #         idempotent overwrite (a sample's identity is its label set plus its timestamp), which
-    #         is what makes retrying one safe.
+    # buffer: (all defaults, docs/adr/buffered-sink-delivery.md). The sink itself never retries;
+    #         the buffer's retry budget covers a 429 or 5xx, and a replayed request is an
+    #         idempotent overwrite.

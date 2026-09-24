@@ -146,11 +146,11 @@ On `200` it prints the status word and exits 0. Otherwise it exits 1 and prints 
 server returned, or the connection error if nothing is listening (for example, `admin:` isn't
 configured).
 
-### What to watch
+### What to watch on `/readyz`
 
 - **`/readyz` stuck at `503 degraded`** means a node has failed, not that a sink is retrying. See
-  [Sink delivery buffering](#sink-delivery-buffering)'s failure semantics for what does and doesn't
-  trip it.
+  [Sink failure semantics](#sink-failure-semantics-degrade-to-dropping-dont-exit) for what does
+  and doesn't trip it.
 - **`/readyz` never returning `200` within the orchestrator's startup timeout** means a listener,
   or a listening sink like `prometheus_out`, can't bind, or a Lua script fails to load. Check the
   `starting`/`bound`/`ready` lifecycle log lines in [Self-logging](#self-logging).
@@ -210,7 +210,7 @@ To tune it, add a `buffer:` block to the sink; see the commented example in
 `buffer:` on anything but a sink. Every field has a default, so omitting `buffer:` gives the values
 in this section. To make the queue survive a restart, see [Durable buffering](#durable-buffering).
 
-### Failure semantics: degrade to dropping, don't exit
+### Sink failure semantics: degrade to dropping, don't exit
 
 A sink that can't reach its destination drops and counts batches; it doesn't end `logit run`:
 
@@ -228,7 +228,7 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
   Anything still queued at that deadline is dropped and counted.
 
-### Sizing: `max_bytes` × number of sinks
+### Sink buffer sizing: `max_bytes` × number of sinks
 
 **`buffer.max_bytes` (64MiB default) bounds one sink's queue**, in RAM for the in-memory default
 or on disk for `buffer.disk:`. When you size the container's memory (or disk) limit, multiply it
@@ -248,7 +248,7 @@ backpressure all the way back to intake instead of silently losing data. `drop_o
 `drop_newest` trade data loss for keeping intake unblocked. For a destination you know is
 unreliable, pick a policy deliberately instead of leaving the default.
 
-### What to watch
+### What to watch for sink buffering
 
 Every component exposes its delivery metrics once the config has an `internal` component
 (`docs/design/internal-telemetry.md`); there's no other opt-in. The two most actionable for
@@ -321,8 +321,8 @@ or backed-up destination downstream is ridden out.
 To tune it, add a `receive:` block to the listener; see the commented example in
 [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field has a
 default, so omitting `receive:` gives the values below. Validation rejects `receive:` on any kind
-except a datagram listener or a tail listener (`tail_in`/`docker_in`). A tail listener has no
-receive *queue*, so only its four batch-assembly fields apply; see
+except a datagram listener, a TCP listener, or a tail listener (`tail_in`/`docker_in`). A TCP or
+tail listener has no receive *queue*, so only the four batch-assembly fields apply to it; see
 [Tailing files and Docker logs](#tailing-files-and-docker-logs).
 
 A TCP listener has no receive queue either; see
@@ -330,7 +330,7 @@ A TCP listener has no receive queue either; see
 [`idle_timeout` on a TCP listener](#idle_timeout-on-a-tcp-listener) for the connection bounds it
 has instead.
 
-### Failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
+### Listener failure semantics: `drop_oldest`, not `block` — the opposite default from `buffer:`
 
 **Leave `receive.overflow` at its default, `drop_oldest`, unless you specifically want
 backpressure to reach the sender.** This is the opposite of `buffer:`'s `block` default, for a
@@ -353,7 +353,7 @@ can't report the second number at all.
   deliver what's still queued. Anything still queued at that deadline is dropped **uncounted**,
   because nothing is left running to count it.
 
-### Sizing, and `SO_RCVBUF`
+### Listener sizing and `SO_RCVBUF`
 
 The receive queue holds undecoded bytes, not decoded events, and is bounded by
 `receive.max_bytes` (32MiB default) and `receive.max_datagrams` (10,000 default), whichever trips
@@ -428,7 +428,7 @@ The loss is bounded and happens only on the shutdown path.
 A `read_batch` larger than `receive.max_datagrams` is legal. A batch that can't fit is admitted
 item by item under the configured `overflow` policy, as a sequence of single pushes would be.
 
-### What to watch
+### What to watch for listener intake
 
 For a UDP listener:
 
@@ -997,7 +997,7 @@ O(containers on the host) work for every log line written anywhere on the host, 
 see [ADR
 `docker-container-identity-and-minimal-watches`](adr/docker-container-identity-and-minimal-watches.md).
 
-### What to watch
+### What to watch for file tailing
 
 - `logit.input.files.open` (gauge): how many files this listener has open. **Alert on this to tell
   "nothing is flowing" from "nothing to flow yet."** It is zero, without an error, when a
@@ -1395,7 +1395,7 @@ components:
 ```
 
 `http://`/`grpc://` (or a bare `host:port` under `protocol: grpc`) stays plaintext regardless of
-`tls:`. A non-empty `tls:` block under a plaintext endpoint is a config error (rule 22), not
+`tls:`. A non-empty `tls:` block under a plaintext endpoint is a config error (rule 24), not
 silently ignored, since it would have no effect. `ca_file`/`cert_file`/`key_file` paths resolve
 relative to the config file's own directory, like `lua_file`, and, like any other field, accept
 `!env` if the certificate material comes from the environment instead of a mounted file
@@ -1451,7 +1451,7 @@ nothing TLS-specific beyond that. `docs/known-gaps.md` tracks two open items: **
 read once at startup, so a renewed certificate needs a restart**, not a live reload; and `otlp_out`
 has no `server_name` override for an endpoint reached by IP or through a proxy.
 
-### syslog (RFC 5425)
+### Syslog over TLS (RFC 5425)
 
 `syslog_in`/`syslog_out` can speak TLS too: RFC 5425, syslog framed per RFC 6587 over TLS over TCP
 ([ADR `syslog-tcp-ingress-and-tls`](adr/syslog-tcp-ingress-and-tls.md)). As with
@@ -1547,7 +1547,7 @@ Which component takes which block:
 
 | Component | Block | Turned on by | Notes |
 |---|---|---|---|
-| `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 22 |
+| `otlp_out` | `TlsClientConfig` | an `https://` `endpoint` | `tls:` under a plaintext endpoint is rule 24 |
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |

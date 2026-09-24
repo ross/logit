@@ -1,8 +1,9 @@
 #!/bin/bash
 # Regenerates this directory's test-only TLS fixtures. Run from inside the dev container
 # (script/console) or any host with openssl 3.x -- these are never used at runtime, only by
-# logit-outputs/logit-inputs test suites, so there's no "no host toolchain needed" concern (ADR
-# containerized-development) in running this by hand when the fixtures need to change.
+# logit-outputs/logit-inputs/logit-cli test suites, so there's no "no host toolchain needed"
+# concern (ADR containerized-development) in running this by hand when the fixtures need to
+# change.
 #
 # 100-year validity, PKCS#8 keys, no passphrase -- same "generated once, committed" precedent as
 # docs/adr/committed-pregenerated-otlp-protobuf.md. Never rotate these for "expiry"; only

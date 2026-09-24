@@ -1,7 +1,11 @@
-//! The shared read/rotate/checkpoint/shutdown loop [`TailInput`](super::TailInput) and
-//! `crate::docker::DockerInput` both reduce to -- generic over the decoder and how a matched
-//! path becomes one, the only things those two ever differ in (the same shape
-//! `crate::udp::UdpListener<D>` already established for the datagram listeners).
+//! The read/rotate/checkpoint/shutdown loop shared by [`TailInput`](super::TailInput) and
+//! `crate::docker::DockerInput`, generic over the decoder and the factory that builds one per
+//! matched path.
+//!
+//! A file's identity is its [`FileId`]. On each `scan`, a discovered path whose inode differs from
+//! the one tracked under it is a rotation: the old inode is read to EOF and closed, and the new one
+//! opened at the beginning. A tracked file whose size is below the offset already read was
+//! truncated in place: it's re-read from `0` with its partial-line state discarded.
 
 use super::checkpoint::{CheckpointStore, FileId};
 use super::line::{LineSplitter, TailDecoder};
@@ -16,84 +20,66 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::watch;
 
-/// One read off a tracked file at a time -- large enough to amortize the syscall over a busy
-/// file, small enough that one file being read never starves the round-robin `drain` loop for
-/// long. Not configurable: it's an internal batching detail, not something an operator has a
-/// reason to tune (`docs/design/memory.md`'s "expose only what's actually load-bearing" bar).
+/// One read off a tracked file: large enough to amortize the syscall, small enough that one busy
+/// file can't starve the others in `drain`'s round robin. Not configurable.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Turns a matched path into a decoder -- the one thing `TailInput`'s [`LineDecoderFactory`
-/// (`super::LineDecoderFactory`)] and `docker_in`'s decoder factory differ in. [`accept`] runs
-/// first and may reject a path outright (`docker_in`'s container filter); [`open`] then builds
-/// the actual decoder for a path this factory has already accepted.
+/// Turns a matched path into a decoder. [`DecoderFactory::accept`] may reject the path
+/// (`docker_in`'s container filter); [`DecoderFactory::open`] then builds the decoder.
 pub(crate) trait DecoderFactory<D: TailDecoder>: Send {
-    /// Whether this path should be tailed at all. `tail_in`'s own factory always returns `true`
-    /// -- every path a configured pattern matches is, by definition, wanted. `docker_in`'s
-    /// factory reads the sibling `config.v2.json` and applies the configured container filter
-    /// here, which is also why this takes `&mut self`: a factory may cache what it read to avoid
-    /// re-reading it on every `scan`.
+    /// Whether to tail this path. `&mut self` so a factory can cache what it read (`docker_in`'s
+    /// `config.v2.json`) across scans.
     fn accept(&mut self, path: &Path) -> bool;
 
-    /// Builds the decoder for a path [`DecoderFactory::accept`] has already approved. An error
-    /// here is diagnosed (`open_error`) and the path is simply not tailed this cycle -- retried
-    /// on the next `scan` rather than treated as fatal to the whole listener.
+    /// Builds the decoder for an accepted path. An error is diagnosed `open_error` and the path
+    /// retried on the next `scan`.
     fn open(&mut self, path: &Path) -> anyhow::Result<D>;
 
-    /// Re-checks an already-tracked file's identity and selection -- called once per tracked file
-    /// per `scan`, the only place a factory gets a say about a file after [`DecoderFactory::open`]
-    /// already built its decoder. Given the decoder itself (not asked to hand back a value) so a
-    /// factory that rebuilds a resource installs it directly, keeping the swapped value private to
-    /// the module that defines the decoder -- `docker_in`'s own use, see `docker.rs`. Default:
-    /// nothing this factory tracks can change (`tail_in`'s own factory never overrides this).
+    /// Re-checks a tracked file's identity and selection, once per tracked file per `scan`.
+    ///
+    /// Takes the decoder so a factory that rebuilds a resource installs it directly, keeping the
+    /// resource type private to the decoder's module (`docker.rs`). Default: nothing can change.
     fn refresh(&mut self, _path: &Path, _decoder: &mut D) -> Refresh {
         Refresh::Unchanged
     }
 
-    /// End of one `scan`: every currently-discovered path has had exactly one `accept` or
-    /// `refresh` call since the previous `end_scan`. A caching factory uses this to evict entries
-    /// for paths no longer discovered. Default: nothing cached, nothing to evict.
+    /// End of one `scan`: every discovered path has had one `accept` or `refresh` call since the
+    /// previous `end_scan`, so a caching factory can evict the rest. Default: nothing cached.
     fn end_scan(&mut self) {}
 }
 
 /// What one [`DecoderFactory::refresh`] call decided about a file the [`Tailer`] already tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refresh {
-    /// Nothing changed, or nothing this factory tracks can change -- the default, and the only
-    /// outcome `tail_in`'s own factory ever produces.
+    /// Nothing changed. The only outcome `tail_in` produces.
     Unchanged,
-    /// The factory re-read this file's identity and has already installed a new resource on the
-    /// decoder it was handed. Nothing further for the driver to do: `BatchAccumulator::absorb`
-    /// sees an `Arc` that isn't `ptr_eq` to the one it's accumulating under on the next decoded
-    /// line and flushes the old batch itself (`FlushReason::ResourceChange`).
+    /// The factory installed a new resource on the decoder. The driver does nothing more:
+    /// `BatchAccumulator::absorb` sees a non-`ptr_eq` `Arc` on the next line and flushes the old
+    /// batch (`FlushReason::ResourceChange`).
     Identity,
-    /// This file is no longer selected (`docker_in`'s container filter, after a rename moved it
-    /// out of `containers:`). The factory does *not* swap the decoder's resource for this outcome
-    /// -- whatever is flushed on the way out should carry the identity this listener actually
-    /// read the remaining lines under, not the new one it's no longer allowed to follow. The
-    /// driver stops reading the file immediately (`FileState::Deselected`, not `Draining`: the
-    /// container is still running, so there is no EOF to drain to) and retains its offset by
-    /// inode in case it's selected again later.
+    /// No longer selected (`docker_in`, after a rename moved the container out of
+    /// `containers:`). The factory must not swap the resource: what's flushed on the way out
+    /// carries the identity its lines were read under. The driver stops reading at once
+    /// (`FileState::Deselected`; a running container has no EOF to drain to) and keeps the offset
+    /// by inode in case it's selected again.
     Deselected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileState {
     Active,
-    /// No longer matched by any pattern (renamed away, removed) or superseded by a new inode at
-    /// the same path (rotated) -- read to EOF, flush, close; never written to `by_path` again.
+    /// No pattern matches it any more (renamed away, removed), or a new inode took its path
+    /// (rotated): read to EOF, flush, close. Revived to `Active` only by a rebind in
+    /// `Tailer::open_tracked`.
     Draining,
-    /// Selected away by [`Refresh::Deselected`] -- unlike `Draining`, the file still exists and
-    /// is still being written (the container is still running), so there is no EOF to drain to
-    /// and no more of it should be read. `read_one` returns immediately for a file in this state;
-    /// `reap_drained` still flushes and closes it exactly as a `Draining` file, but retains its
-    /// offset (`Tailer::resume`) rather than letting it go, since the same inode may be selected
-    /// again later.
+    /// Selected away by [`Refresh::Deselected`]. The file is still being written, so nothing
+    /// more is read (`read_one` returns at once). `reap_drained` closes it like a `Draining` file
+    /// but keeps its offset in `Tailer::resume`.
     Deselected,
 }
 
-/// What the runtime loop's own `select!` decided happened -- kept as a plain value with no
-/// borrowed data, specifically so every `select!` arm can produce one without itself containing
-/// an `.await` (see [`Tailer::run_until_shutdown`]'s comment on why that matters).
+/// What the run loop's `select!` resolved to: a plain value, so no arm has to `.await` (see
+/// [`Tailer::run_until_shutdown`]).
 enum Outcome {
     Shutdown,
     Wake(super::watch::Wake),
@@ -105,8 +91,7 @@ enum Outcome {
 enum StartOffset {
     Beginning,
     End,
-    /// Clamped to the file's current length by the caller if the checkpoint's own offset is now
-    /// past it (the file was truncated between the checkpoint write and this restart).
+    /// An offset past the file's current length (truncated while stopped) restarts at `0`.
     Resume(u64),
 }
 
@@ -119,22 +104,15 @@ struct TrackedFile<D> {
     decoder: D,
     accumulator: BatchAccumulator,
     state: FileState,
-    /// This file's own `inotify` watch, registered at open (`Tailer::open_tracked`) and released
-    /// wherever the file stops being tracked (`Tailer::reap_drained`) -- `None` under
-    /// `WatchMode::Poll`, or if the `inotify_add_watch` call itself failed (non-fatal; the file
-    /// is still tailed, just relying on `poll_interval` alone for it, same as `watch: poll`
-    /// always does -- diagnosed `watch_error` at that point, not swallowed). Never re-registered
-    /// on a rebind (`open_tracked`'s "same inode, new name" branch): an `inotify` watch follows
-    /// the inode, not the path, so a rename needs no change to the *kernel* watch at all.
+    /// This file's `inotify` watch, added in `Tailer::open_tracked` and removed in
+    /// `Tailer::reap_drained`. `None` under `WatchMode::Poll`, or if `inotify_add_watch` failed
+    /// (diagnosed `watch_error`; the file then relies on `poll_interval`). Not re-registered on a
+    /// rebind: the kernel watch follows the inode, not the path.
     ///
-    /// It does leave the watcher's own recorded path stale, though, and that is only benign
-    /// because of something outside this struct: the rotated-away inode's later `IN_MODIFY`
-    /// arrives as a `Wake::Data` under its **old** name, which `on_data_wake` resolves through a
-    /// `by_path` entry the replacement may already own. That is a no-op today (the stale-inode
-    /// check returns early before the reconciling `scan`, and the same check `scan` runs anyway
-    /// after it), and the bytes are read regardless because `drain` round-robins every tracked
-    /// file after every loop iteration whatever woke it. A refactor that made draining
-    /// wake-driven would break that coupling, not this field.
+    /// A rebind leaves the watcher's recorded path stale, so a rotated-away inode's `IN_MODIFY`
+    /// arrives as `Wake::Data` under its **old** name, which the replacement may own in `by_path`.
+    /// That's harmless only because `on_data_wake`'s inode check returns early, and because `drain`
+    /// reads every tracked file after every wake. Making draining wake-driven would break this.
     watch: Option<super::watch::WatchId>,
 }
 
@@ -145,22 +123,18 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     files: HashMap<FileId, TrackedFile<D>>,
     by_path: HashMap<PathBuf, FileId>,
     checkpoint: Option<CheckpointStore>,
-    /// The offset an inode should resume from when next discovered -- populated at `bind` from
-    /// the checkpoint file (if configured), and by `reap_drained` for a [`FileState::Deselected`]
-    /// file this process itself closed (`docs/adr/docker-container-identity-and-minimal-watches.
-    /// md`). Either way, `open_tracked`'s `None` arm consults this before falling back to
-    /// `read_from`, so a de-selected container renamed back into the selection resumes rather
-    /// than replaying its whole log from byte 0 -- process-local for the de-selection case, since
-    /// nothing in this map survives past the next checkpoint write once its file is gone from
-    /// `self.files`.
+    /// The offset an inode resumes from when next discovered, consulted before `read_from`.
+    ///
+    /// Filled at `bind` from the checkpoint, and by `reap_drained` for a
+    /// [`FileState::Deselected`] file, so a container renamed back into the selection resumes
+    /// instead of replaying. Those entries are process-local, since the checkpoint writes only
+    /// tracked files (`docs/adr/docker-container-identity-and-minimal-watches.md`).
     resume: HashMap<FileId, (PathBuf, u64)>,
     diag: Diagnostics,
     telemetry: Telemetry,
     watched_dirs: HashSet<PathBuf>,
-    /// Set by [`Tailer::bind`], taken back out by [`Tailer::run_until_shutdown`]
-    /// (`docs/plans/operator-surface.md`, workstream B). `Option`, not a plain field: `Watcher`
-    /// has no meaningful "not yet opened" value, and taking it back out restores the exact local
-    /// variable this loop had before `bind` existed -- see that method's own comment.
+    /// Set by [`Tailer::bind`] and taken into a local by [`Tailer::run_until_shutdown`].
+    /// `Option` because `Watcher` has no "not yet opened" value.
     watcher: Option<super::watch::Watcher>,
 }
 
@@ -199,20 +173,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         &self.config
     }
 
-    /// Test-only: how many files this `Tailer` is currently tracking -- lets a test confirm
-    /// [`Tailer::bind`]'s initial scan actually discovered something, without going through a
-    /// full `run_until_shutdown` + `Fanout` round trip just to prove that.
+    /// How many files are tracked, so a test can check [`Tailer::bind`]'s initial scan.
     #[cfg(test)]
     pub(crate) fn tracked_len(&self) -> usize {
         self.files.len()
     }
 
-    /// Loads the checkpoint (if configured), opens the platform watcher, and performs the
-    /// initial directory scan -- everything [`Tailer::run_until_shutdown`] used to do inline
-    /// before this method existed, moved here so `crate::runtime::run_with_telemetry`'s bind
-    /// pre-pass (`docs/plans/operator-surface.md`, workstream B) can do it *before* any task is
-    /// spawned. Idempotent: a second call is a no-op, per [`logit_pipeline::Input::bind`]'s
-    /// contract -- `self.watcher` already being `Some` is how it knows.
+    /// Loads the checkpoint, opens the watcher, and runs the initial scan, so
+    /// `logit_pipeline::runtime::run_with_telemetry`'s bind pre-pass fails startup before any
+    /// task is spawned. Idempotent (`self.watcher` is `Some`), per
+    /// [`logit_pipeline::Input::bind`].
     pub async fn bind(&mut self) -> anyhow::Result<()> {
         if self.watcher.is_some() {
             return Ok(());
@@ -240,14 +210,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         sink: Fanout,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        // `bind` normally already ran, in `run_with_telemetry`'s pre-pass, before this task was
-        // even spawned; a caller driving a `Tailer` directly (this module's own tests,
-        // `spawn_tailer`) gets it here instead -- `Input::bind`'s documented lazy fallback.
+        // A no-op after the runtime's pre-pass; binds here for a caller that skipped it (tests).
         self.bind().await?;
-        // Back into a local, exactly the shape this loop had before `bind` existed: `watcher` is
-        // borrowed `&mut` by both this `select!` and by `scan`/`reconcile_watches` below, while
-        // `self` is separately borrowed mutably by those same calls -- `take()` keeps every one
-        // of those borrows a plain, direct-field access rather than reaching through `self`.
+        // A local, not `self.watcher`: `select!` and `scan` borrow it `&mut` while `self` is
+        // borrowed mutably too.
         let mut watcher = self.watcher.take().expect("bind() leaves a watcher behind");
 
         let mut next_poll = tokio::time::Instant::now() + self.config.poll_interval;
@@ -260,15 +226,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             .map(|_| tokio::time::Instant::now() + self.config.checkpoint_interval);
 
         loop {
-            // Every arm below produces a plain `Outcome` value with no `.await` inside it --
-            // deliberately: an arm that awaits something *after* `shutdown.wait_for(..)` has
-            // already been offered as a sibling branch makes the whole `select!` future hold a
-            // `tokio::sync::watch::Ref` (a lock guard, not `Send`) live across that further
-            // await, which `#[async_trait]`'s `Send`-bound boxing then rejects at compile time.
-            // Keeping every arm's body a single, immediately-ready expression and doing all
-            // actual async work below, after the `select!` has already resolved, sidesteps that
-            // entirely -- the same reason `crate::udp::read_loop`'s own two `shutdown.wait_for`
-            // uses never do anything past a bare `break`/value inside their arms either.
+            // No arm body may `.await`: `shutdown.wait_for` yields a `watch::Ref` (a non-`Send`
+            // lock guard) that would then live across the await, and `#[async_trait]`'s `Send`
+            // bound rejects that at compile time. All async work runs after the `select!`.
             let outcome = tokio::select! {
                 _ = shutdown.wait_for(|&due| due) => Outcome::Shutdown,
                 wake = watcher.next_wake() => Outcome::Wake(wake),
@@ -280,15 +240,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             match outcome {
                 Outcome::Shutdown => break,
                 Outcome::Wake(wake) => match wake {
-                    // The one file this wake names had its content change -- no `scan`, just
-                    // a truncation check for that file; `drain` (always called below) reads
-                    // whatever new bytes are actually there.
+                    // One file's content changed: a truncation check only, no `scan`. `drain`
+                    // below reads the new bytes.
                     super::watch::Wake::Data(path) => {
                         self.count_wake("inotify");
                         self.on_data_wake(&path).await;
                     }
-                    // Something appeared or departed under a watched directory (`root`, for
-                    // `docker_in`) -- only a full `scan` can tell what.
+                    // An entry came or went under a watched directory; only a `scan` can say
+                    // which. The payload is ignored.
                     super::watch::Wake::Discover(_) => {
                         self.count_wake("inotify");
                         self.scan(false, &mut watcher).await;
@@ -298,13 +257,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         self.telemetry.count("logit.input.watch.overflows", 1.0, &[]);
                         self.scan(false, &mut watcher).await;
                     }
-                    // The wake source itself gave up (at most once per process -- the watcher
-                    // parks afterwards rather than resolving again). Deliberately *not* counted
-                    // as an `inotify` wake: `watch.wakes{source="inotify"}` flatlining while
-                    // `{source="poll"}` carries on is precisely the signal an operator alerts on
-                    // for this, and counting the death as a wake would blunt its own edge. The
-                    // loop carries on unchanged: the poll tick and `drain` below were always the
-                    // backstop, so this is a latency regression, not a data one.
+                    // The wake source gave up; the watcher parks afterwards, so this arm runs at
+                    // most once. Not counted as an `inotify` wake: that series flatlining while
+                    // `{source="poll"}` continues is the operator's alert signal. The poll tick
+                    // and `drain` carry on, so this costs latency, not data.
                     super::watch::Wake::Dead(reason) => {
                         self.diag.warn_throttled(
                             "watch_error",
@@ -326,11 +282,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         Some(tokio::time::Instant::now() + self.config.batching.flush_interval);
                 }
                 Outcome::Checkpoint => {
-                    // Flush before persisting: once every accumulator has been flushed, every
-                    // decoded event is already with `Fanout`, so the offset this is about to
-                    // write can never outrun delivery. The two timers stay independent as
-                    // *timers* (this doesn't touch `next_flush`) -- they're just correctly
-                    // ordered on the tick where the checkpoint one fires.
+                    // Flush first, so the offset written never covers an event still in an
+                    // accumulator. `next_flush` is left alone.
                     self.flush_all(&sink, FlushReason::Interval).await;
                     self.write_checkpoint(false).await;
                     next_checkpoint =
@@ -349,39 +302,27 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         Ok(())
     }
 
-    /// Which wake source actually fired. `inotify` flatlining while `poll` carries on is the one
-    /// externally visible signal that the low-latency path has stopped working
-    /// (`docs/deploying.md`'s "What to watch").
+    /// Counts `logit.input.watch.wakes{source}`. `inotify` flatlining while `poll` continues is
+    /// the visible sign the low-latency path stopped (`docs/deploying.md`'s "What to watch for
+    /// file tailing").
     fn count_wake(&self, source: &'static str) {
         self.telemetry.count("logit.input.watch.wakes", 1.0, &[("source", source)]);
     }
 
-    /// Brings the set of watched directories in line with what the patterns currently reach --
-    /// `unwatch_dir` on anything gone, then `watch_dir` on **every** directory they reach, not
-    /// just newly-appearing ones. Called at the top of every `scan`, before discovery. For
-    /// `docker_in` this is just `root` (`PathPattern::dir`) -- Docker's per-container state
-    /// directories are direct children of it, so watching `root` alone already catches a
-    /// container arriving or leaving; the log file appearing a moment later inside an
-    /// already-existing container directory rides `poll_interval` instead, exactly like a
-    /// rotation or a `config.v2.json` change
+    /// Unwatches directories no pattern reaches, then `watch_dir`s **every** pattern directory,
+    /// at the top of every `scan`. For `docker_in` that's only `root`
     /// (`docs/adr/docker-container-identity-and-minimal-watches.md`). A no-op under
-    /// `WatchMode::Poll` (both `Watcher` methods are).
+    /// `WatchMode::Poll`.
     ///
-    /// **Re-arming unconditionally is the point, not redundancy.** Arming only the set difference
-    /// made every failure permanent: `self.patterns` is assigned once in [`Tailer::new`] and
-    /// never mutated, so the difference is empty from the second `scan` onwards and a directory
-    /// that was missing at `bind` (a log volume mounted after start, an app that creates its own
-    /// log directory), or that was deleted and recreated, or renamed away, never got another
-    /// chance -- discovery in it silently fell back to `poll_interval` for the life of the
-    /// process, under a mode whose documented contract is the opposite of silent degradation.
-    /// Re-arming every scan costs one `inotify_add_watch(2)` per pattern directory per scan --
-    /// one directory, for both kinds -- and the kernel makes the common case a no-op returning
-    /// the same `wd` (see `InotifyWatcher::watch_dir`).
+    /// **Re-arming every directory every scan is required, not redundant.** The patterns never
+    /// change, so arming only the difference would leave a directory missing at `bind` (a volume
+    /// mounted later, an app creating its own log directory), or deleted and recreated, on
+    /// `poll_interval` for the life of the process. The cost is one `inotify_add_watch(2)` per
+    /// pattern directory per scan, which the kernel makes a no-op returning the same `wd` for a
+    /// live inode (`InotifyWatcher::watch_dir`).
     ///
-    /// `watched_dirs` therefore records what is actually *armed*, not what was wanted: a
-    /// directory whose `watch_dir` failed is diagnosed (`watch_dir_error`, carrying the errno --
-    /// its own key, since it recurs every scan; see the call site), left out of the set, and
-    /// tried again on the next scan.
+    /// `watched_dirs` records what's armed, not what's wanted: a failed directory is diagnosed
+    /// `watch_dir_error`, left out, and retried next scan.
     fn reconcile_watches(&mut self, watcher: &mut super::watch::Watcher) {
         let desired: HashSet<PathBuf> =
             self.patterns.iter().map(|p| p.dir().to_path_buf()).collect();
@@ -395,13 +336,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     armed.insert(dir);
                 }
                 Err(err) => {
-                    // Its own throttle key, not `watch_error`: this fires on *every* scan for as
-                    // long as the directory is missing (a `paths:` whose directory does not exist
-                    // yet is ordinary, and lasts as long as it lasts), and `warn_throttled` logs
-                    // a key only at powers of two of its running count. Sharing the key would
-                    // let a missing directory push the count into the tens of thousands per day
-                    // and silence the one-shot `watch_error`s -- a per-file `ENOSPC`, the wake
-                    // source dying -- that an operator actually needs to see logged.
+                    // Its own key, not `watch_error`: it recurs every scan while the directory
+                    // is missing, and `warn_throttled` logs a key only at powers of two of its
+                    // count. Sharing the key would bury the one-shot `watch_error`s (a per-file
+                    // `ENOSPC`, the wake source dying).
                     self.diag.warn_throttled(
                         "watch_dir_error",
                         super::watch::watch_error_message(&dir, &err),
@@ -412,10 +350,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.watched_dirs = armed;
     }
 
-    /// Discovers matched files, opens newly-seen ones, and reconciles rotation/truncation/
-    /// removal for ones already tracked. `first` is `true` only for the very first call --
-    /// files present then follow `config.read_from`; every later discovery starts at the
-    /// beginning, since a file that didn't exist yet has no "before startup" to skip.
+    /// Discovers matched files, opens new ones, and reconciles rotation, truncation, and removal
+    /// for tracked ones.
+    ///
+    /// Only files found on the `first` scan follow `read_from`; a later discovery starts at the
+    /// beginning, since it has no "before startup" to skip. A checkpoint entry wins over both.
+    /// A path missing from this scan (including a failed `read_dir`) starts draining its file.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
         let mut discovered: HashMap<PathBuf, std::fs::Metadata> = HashMap::new();
@@ -455,13 +395,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     self.open_tracked(path, id, StartOffset::Beginning, watcher).await;
                 }
                 None => {
-                    // Peeked, not removed: `open_tracked` may still bail out below (a `refresh_
-                    // cache` at `end_scan` aside, `accept` can reject this path -- most
-                    // concretely, a de-selected container that hasn't been re-selected yet). A
-                    // `remove` here would discard the entry on that very first failed attempt,
-                    // permanently losing the retained offset before it's ever actually used;
-                    // `open_tracked` itself removes it, but only once `accept` has already
-                    // succeeded and the offset is genuinely about to be applied.
+                    // Peeked, not removed: `accept` may still reject this path (a de-selected
+                    // container not yet re-selected), and removing here would lose the retained
+                    // offset. `open_tracked` removes it once `accept` succeeds.
                     let start = match self.resume.get(&id) {
                         Some(&(_, offset)) => StartOffset::Resume(offset),
                         None if first => match self.config.read_from {
@@ -477,19 +413,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
         self.factory.end_scan();
         self.telemetry.gauge("logit.input.files.open", self.files.len() as f64, &[]);
-        // The watched directory (0 or 1 -- `watched_dirs.len()`, not a hardcoded 1: `Watcher::
-        // Poll` reconciles the same set without ever calling `inotify_add_watch`, and a
-        // directory whose arm failed is left out of the set entirely) plus one entry per
-        // currently-open file that actually has one (`None` under `Poll`, or on a failed
-        // `inotify_add_watch` -- see `TrackedFile::watch`'s doc comment) -- this is the number
-        // that makes "the watch set stays proportional to what's tailed, not to what's running
-        // on the host" checkable from outside.
+        // Armed directories plus files holding a watch: what makes "the watch set is
+        // proportional to what's tailed" checkable from outside. Under `Poll` it counts the same
+        // set with no kernel watches behind it.
         //
-        // Still the *intended* set rather than the live kernel one, and the gap is narrower than
-        // it was but real: a `Draining` file whose inode is already gone has had its descriptor
-        // purged by `IN_IGNORED` while `TrackedFile::watch` still holds the number, and two
-        // spellings of one directory alias a single kernel watch. `docs/deploying.md` says so;
-        // `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping` is what pins the
+        // It's the intended set, not the live kernel one: a `Draining` file whose inode is gone
+        // had its descriptor purged by `IN_IGNORED` while `TrackedFile::watch` still holds it,
+        // and two spellings of one directory alias one kernel watch (`docs/deploying.md` says
+        // so). `the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping` pins the
         // watcher's own maps against `/proc/self/fdinfo`.
         let file_watches = self.files.values().filter(|f| f.watch.is_some()).count();
         self.telemetry.gauge(
@@ -499,10 +430,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         );
     }
 
-    /// Gives the factory a chance to notice this already-tracked file's identity changed
-    /// (`docker_in`'s `config.v2.json`) -- called for every discovered path already in
-    /// `self.files`, once per `scan`. `tail_in`'s own factory never returns anything but
-    /// `Refresh::Unchanged`, so this is a no-op for it beyond the trait call itself.
+    /// Runs [`DecoderFactory::refresh`] for a tracked path found by `scan` and applies the
+    /// outcome.
     fn refresh_identity(&mut self, id: FileId, path: &Path) {
         let Some(tracked) = self.files.get_mut(&id) else { return };
         match self.factory.refresh(path, &mut tracked.decoder) {
@@ -512,23 +441,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             Refresh::Deselected => {
                 tracked.state = FileState::Deselected;
-                // Load-bearing, not tidiness: the path is still discovered every scan (the
-                // container behind it is still running), so leaving this binding behind would
-                // send the very next scan straight back into this same arm for a file that's
-                // closing. Once `reap_drained` drops it from `self.files`, an orphaned binding
-                // would keep this path out of `scan`'s `None` arm forever -- the container could
-                // never be re-selected even if the rename is reversed.
+                // Required: the path is still discovered every scan, and once `reap_drained`
+                // drops the file, a leftover binding would keep the path out of `scan`'s `None`
+                // arm forever, so a reversed rename could never re-select it.
                 self.by_path.remove(path);
                 self.telemetry.count("logit.input.files.deselected", 1.0, &[]);
             }
         }
     }
 
-    /// Shared by `scan` (checked for every already-tracked path it discovers) and
-    /// [`Tailer::on_data_wake`] (checked for the one file a `Wake::Data` names): if `len` -- the
-    /// file's current on-disk size -- is now less than what `id` has already read, its content
-    /// was truncated in place. Seeks back to `0` and resets both halves of decode state; a no-op
-    /// when `len >= tracked.offset`.
+    /// If `len`, the file's current size, is below the offset already read, the file was
+    /// truncated in place: seek to `0` and reset the splitter and decoder. `len` must come from
+    /// the same inode as `id`. Called by `scan` and [`Tailer::on_data_wake`].
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
@@ -541,15 +465,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
         let prev_offset = tracked.offset;
         tracked.offset = 0;
-        // The pre-truncation generation's partial (or a stale `dropping = true`) belongs to file
-        // content that no longer exists -- reset the splitter along with the offset so it isn't
-        // spliced onto (or, mid-drop, swallows) the first line of the new generation. The held
-        // partial is discarded, not emitted: it's an unterminated fragment, and emitting it as if
-        // it were a whole line is worse than dropping a fragment the writer itself never
-        // terminated. The decoder can hold the exact same kind of cross-line state of its own --
-        // `docker_in`'s `DockerDecoder` reassembles a Docker json-file entry split across more
-        // than one line, in `partial`/`dropping` fields that mirror this splitter's own -- so it
-        // gets the same reset, for the same reason.
+        // Discard, not emit, the held partial (or a stale `dropping`): it belongs to content
+        // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The
+        // decoder gets the same reset for its own cross-line state (`docker_in`'s partial-entry
+        // reassembly); see `TailDecoder::reset`.
         tracked.splitter = LineSplitter::new(max_line_bytes);
         tracked.decoder.reset();
         let path = tracked.path.clone();
@@ -557,29 +476,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
     }
 
-    /// Handles a `Wake::Data` for `path` -- the one file this listener already has open notified
-    /// a content change. Checked for truncation (shared with `scan`'s own per-discovered-path
-    /// check via [`Tailer::reconcile_truncation`], since a write and an in-place truncation both
-    /// surface as "this file's content changed" and are told apart only by comparing length
-    /// against the offset already read) but nothing else runs: no `scan`, no readdir, no
-    /// `accept`. Reading whatever new bytes are actually there is `Tailer::drain`'s job, already
-    /// called unconditionally after every loop iteration
-    /// (`Tailer::run_until_shutdown`) -- this is what keeps the cost of one write to one tracked
-    /// file O(1) rather than the O(containers) a directory-level wake used to cost
-    /// (`docs/adr/docker-container-identity-and-minimal-watches.md`).
+    /// Handles a `Wake::Data` for a tracked `path`: a truncation check only. A write and an
+    /// in-place truncation look the same until the length is compared with the offset. No `scan`,
+    /// `read_dir`, or `accept`, so one write costs O(1), not O(containers)
+    /// (`docs/adr/docker-container-identity-and-minimal-watches.md`). `drain` reads the bytes.
     ///
-    /// The `id`/`len` pair handed to `reconcile_truncation` has to come from the *same* inode, so
-    /// the freshly-stat'd identity is checked against the tracked one before anything else --
-    /// `scan` gets this for free (it derives both from one `metadata` call, and only reconciles
-    /// under its own `existing_id == id` arm), but here `id` comes from `by_path`, which only
-    /// `scan` refreshes. Across an ordinary rotation -- rename the old file away, create a new
-    /// one at the same name, exactly what logrotate and Docker's json-file driver do -- a
-    /// `Wake::Data` queued for the old inode can be handled before any `scan` has noticed, and
-    /// under this ADR's watch set a rotation *inside* a container directory produces no
-    /// `Wake::Discover` at all, so the stale mapping stands until the next `poll_interval` tick.
-    /// Pairing the old inode's offset with the new file's near-empty length would read as a
-    /// truncation for virtually every rotation -- seeking the rotated-away handle back to `0` and
-    /// re-emitting everything it had already read, as duplicates.
+    /// The inode is re-checked first because `by_path` is only refreshed by `scan`. After a
+    /// rotation (rename away, recreate at the same name, as logrotate and Docker do), a
+    /// `Wake::Data` can arrive before any `scan`, and a rotation inside a container directory
+    /// raises no `Wake::Discover` at all. Pairing the old inode's offset with the new file's small
+    /// length would look like a truncation, rewinding the old handle and re-emitting it all.
     async fn on_data_wake(&mut self, path: &Path) {
         let Some(&id) = self.by_path.get(path) else { return }; // no longer tracked; ignore
         let Ok(meta) = std::fs::metadata(path) else { return }; // raced with removal; `scan` will notice
@@ -589,15 +495,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.reconcile_truncation(id, meta.len()).await;
     }
 
-    /// Opens a newly-discovered `(path, id)` pair at `start` -- unless `id` is already tracked
-    /// under a different path, in which case that existing entry is rebound to `path` instead of
-    /// being reopened. This happens when one configured pattern matches a file both before and
-    /// after a rename (`app.log*` matching both `app.log` and `app.log.1`): the same inode is then
-    /// discovered a second time under its new name in the same `scan`. The existing entry is
-    /// authoritative -- it holds the correct offset, the in-flight `LineSplitter` partial, decoder
-    /// state, and a possibly non-empty accumulator -- so the only thing that actually changed is
-    /// the name the inode is reachable under; re-opening at offset 0 would throw all of that away
-    /// and re-emit the whole file.
+    /// Opens a newly discovered `(path, id)` at `start`, or rebinds `id` to `path` if it's
+    /// already tracked under another name.
+    ///
+    /// A rebind happens when a pattern matches a file both before and after a rename (`app.log*`
+    /// matching `app.log` and `app.log.1`). The existing entry holds the offset, the splitter's
+    /// partial, decoder state, and the accumulator; reopening at `0` would re-emit the file.
     async fn open_tracked(
         &mut self,
         path: PathBuf,
@@ -607,30 +510,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ) {
         if let Some(tracked) = self.files.get_mut(&id) {
             if tracked.state == FileState::Deselected {
-                // On its way out, but not reaped yet this iteration -- `reap_drained` runs later,
-                // after `drain`, and the path is still discovered every scan since the container
-                // behind it is still running. Must not be revived the way a renamed-but-still-
-                // wanted inode is below: once `reap_drained` removes this entry, this arm is no
-                // longer reached for `id`, and a later scan's own `accept` call re-admits it if
-                // the rename is reversed.
+                // Not reaped yet, but must not be revived like a rebind below: after
+                // `reap_drained` removes it, a later scan's `accept` re-admits it if the rename
+                // is reversed.
                 return;
             }
-            // Same inode, new name: adopt the existing entry rather than reopening. Reviving a
-            // `Draining` entry back to `Active` is correct here -- the inode is once again matched
-            // by a configured pattern under a real name, so it should keep being tailed, not
-            // reaped; reap is for inodes no pattern reaches any more.
+            // Same inode, new name. A `Draining` entry goes back to `Active`: a pattern reaches
+            // it again, and reaping is for inodes no pattern reaches.
             let old_path = std::mem::replace(&mut tracked.path, path.clone());
             tracked.state = FileState::Active;
-            // Removing the stale `by_path` entry is load-bearing, not tidiness -- but only if it
-            // still belongs to this inode. `discovered` iteration order is nondeterministic: a
-            // rotation replacement discovered earlier in the same `scan` may already have claimed
-            // `old_path` for a different id (e.g. `app.log*` matching both the rotated `app.log`
-            // and its replacement, with the replacement's arm running first). Removing the entry
-            // unconditionally would then delete that other inode's freshly-inserted binding,
-            // orphaning it from `by_path` while it stays `Active` in `self.files` -- and since the
-            // stale-detection loop only walks `by_path.keys()`, an orphaned live inode can never be
-            // marked `Draining` or reaped. Checking ownership first makes both iteration orders
-            // converge on the same result without ever evicting a binding this rebind doesn't own.
+            // Remove the old binding only if this inode still owns it. `discovered` iterates in
+            // no fixed order, so the rotation replacement may already have claimed `old_path`.
+            // Removing its binding would orphan a live inode: `scan`'s stale check walks only
+            // `by_path`, so it could never be drained or reaped.
             if self.by_path.get(&old_path) == Some(&id) {
                 self.by_path.remove(&old_path);
             }
@@ -644,8 +536,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if !self.factory.accept(&path) {
             return;
         }
-        // Committed to actually using `start` now -- safe to discard the resume entry it came
-        // from, if any (a no-op when `start` didn't come from one).
+        // Accepted: `start` will be applied, so its resume entry (if any) is spent.
         self.resume.remove(&id);
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
@@ -680,14 +571,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return;
             }
         };
-        // Registered before the file is inserted into `self.files` -- a failed
-        // `inotify_add_watch` is non-fatal (`Watcher::watch_file`'s own doc comment), leaving
-        // this file to rely on `poll_interval` alone for its data wakes, same as `watch: poll`.
-        // Non-fatal, but not invisible: at scale the likely cause is `ENOSPC` against
-        // `fs.inotify.max_user_watches`, which turns a low-latency tailer into a polling one one
-        // file at a time with nothing but this line to say so. Not retried either -- the watch is
-        // registered exactly once per tracked inode, when it is opened
-        // (`docs/known-gaps.md`).
+        // A failure is non-fatal (the file relies on `poll_interval`) but diagnosed: at scale
+        // it's `ENOSPC` against `fs.inotify.max_user_watches`, and this diagnostic is the only
+        // sign. Registered once per tracked inode and never retried (`docs/known-gaps.md`).
         let watch = match watcher.watch_file(&path) {
             Ok(watch) => watch,
             Err(err) => {
@@ -715,12 +601,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// One round-robin pass over every tracked file, reading and decoding whatever is currently
-    /// available, repeating until no file made progress -- so a burst of writes to one file is
-    /// fully drained in one call rather than waiting for the next external wake. Draining files
-    /// that reach EOF are closed. Returns `true` if shutdown fired mid-drain (checked between
-    /// files, not mid-read: one file's own read+decode is small and bounded, so this never waits
-    /// long past shutdown even without an internal race).
+    /// Round-robin reads every tracked file, one chunk each per pass, until a pass makes no
+    /// progress, so a burst is read without waiting for another wake. Closes `Draining` and
+    /// `Deselected` files that made no progress. Returns `true` if shutdown fired; that's checked
+    /// between files, and one chunk's read and decode is bounded.
     async fn drain(
         &mut self,
         sink: &Fanout,
@@ -748,12 +632,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// Reads one chunk from the tracked file `id`, decodes every complete line it yields, and
-    /// emits any batch that reaches a bound. Returns whether it actually read anything --
-    /// `false` means this file is at EOF for now (nothing more to do until the next wake), or
-    /// that it's [`FileState::Deselected`] and this driver has stopped reading it regardless of
-    /// how much unread content remains -- either way, `drain`'s caller treats it the same:
-    /// eligible for [`Tailer::reap_drained`] on this pass.
+    /// Reads one chunk from `id`, decodes its complete lines, and emits any batch that reaches a
+    /// bound. Returns `false` (eligible for [`Tailer::reap_drained`]) at EOF, on a read error,
+    /// or for a [`FileState::Deselected`] file.
     async fn read_one(&mut self, id: FileId, sink: &Fanout) -> bool {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
             return false;
@@ -801,8 +682,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
             match tracked.decoder.decode_line(line, read_at, &mut scratch) {
                 Ok(resource) => {
-                    // No scope: tail/docker line decoders carry no OTLP instrumentation-scope
-                    // concept, same as every other batch this input synthesizes from nothing.
+                    // No scope: a tailed line has no instrumentation scope.
                     if let Some((batch, reason)) =
                         tracked.accumulator.absorb(resource, None, &mut scratch)
                     {
@@ -821,18 +701,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         true
     }
 
-    /// Closes every tracked file marked [`FileState::Draining`] whose own `read_one` returned
-    /// nothing on the *current* pass (`at_eof`, built by [`Tailer::drain`]) -- not every Draining
-    /// file unconditionally. `read_one` reads at most one [`READ_CHUNK_BYTES`] chunk per call, so
-    /// a file marked Draining with a large unread backlog must be given as many passes as it takes
-    /// to actually reach EOF before it's reaped; reaping it after just one chunk would lose the
-    /// rest, unrecoverably (the entry is also pruned from the next checkpoint write). A read
-    /// *error* also counts as EOF here (`read_one` returns `false` for it too, deliberately): an
-    /// erroring handle will never drain on its own, and waiting for it to would starve every other
-    /// tracked file. Gives the reaped decoder a chance to emit anything held back, flushes its
-    /// accumulator (`FlushReason::Closed`), and drops it from the tracked set (which is also what
-    /// makes it disappear from the next checkpoint write -- see `CheckpointStore::write`'s doc
-    /// comment).
+    /// Closes each [`FileState::Draining`] or [`FileState::Deselected`] file whose `read_one`
+    /// returned `false` on this pass (`at_eof`).
+    ///
+    /// Only those: a draining file with a backlog gets as many passes as it takes to reach EOF,
+    /// since reaping it earlier loses the rest for good (it also leaves the next checkpoint). A
+    /// read error counts as EOF, or an erroring handle would never be reaped. Emits held decoder
+    /// state, flushes the accumulator (`FlushReason::Closed`), and drops the file.
     async fn reap_drained(
         &mut self,
         at_eof: &[FileId],
@@ -859,29 +734,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 emit(sink, &self.telemetry, batch, FlushReason::Closed).await;
             }
             if deselected {
-                // Unlike `Draining` (whose inode is gone and could be recycled by Docker for an
-                // unrelated container), this inode is still very much alive -- just no longer
-                // wanted. Retaining its offset here, in the same map a checkpoint resume already
-                // populates, is what lets a rename back into the selection resume instead of
-                // replaying the whole log from byte 0 (`Tailer::open_tracked`'s `None` arm
-                // already consults `resume` first). `tracked.offset`, not minus any pending
-                // partial bytes: `close_decoder` above has already drained the splitter's held
-                // partial through `take_partial`, so every byte counted in `offset` has already
-                // produced an event.
+                // This inode is alive, only unselected (a `Draining` one may be gone and its
+                // number reused), so keep its offset for a rename back into the selection. The
+                // full `offset`: `close_decoder` already emitted the held partial.
                 self.resume.insert(id, (tracked.path.clone(), tracked.offset));
             }
         }
     }
 
-    /// Gives every still-tracked decoder -- not just [`FileState::Draining`] ones -- a chance to
-    /// emit anything held back, as part of shutdown. Without this, a last line that was read (and
-    /// already counted in the checkpoint offset -- `read_one` advances `offset` per chunk, not
-    /// per decoded line) but never newline-terminated would simply be lost: still sitting in
-    /// [`LineSplitter`]'s `partial` buffer when the process exits, with no future restart ever
-    /// re-reading those bytes to recover it. Deliberately does *not* remove entries from
-    /// `self.files` the way [`Tailer::reap_drained`] does: [`Tailer::write_checkpoint`] runs right
-    /// after this and still needs every file's current offset, and these files aren't actually
-    /// going away -- only the component reading them is.
+    /// At shutdown, emits every tracked file's held partial line and decoder state, so an
+    /// unterminated last line isn't lost (with no checkpoint, nothing would re-read it). Unlike
+    /// [`Tailer::reap_drained`], files stay tracked: [`Tailer::write_checkpoint`] runs next and
+    /// needs their offsets.
     async fn close_all_for_shutdown(&mut self, sink: &Fanout) {
         let ids: Vec<FileId> = self.files.keys().copied().collect();
         for id in ids {
@@ -903,14 +767,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     async fn write_checkpoint(&mut self, force: bool) {
         let Some(checkpoint) = &mut self.checkpoint else { return };
-        // Subtract each file's held partial: those bytes are already counted in `offset` (`
-        // read_one` advances it per chunk, not per decoded line) but haven't produced an event, so
-        // persisting them would let a restart skip a line nothing downstream has seen. A file
-        // that's `dropping` an oversized line deliberately contributes nothing here either -- an
-        // empty `partial` while `dropping` -- since those bytes belong to a line already dropped
-        // for exceeding `max_line_bytes`, and replaying them on restart simply re-drops it. At
-        // shutdown this is moot: `close_all_for_shutdown` drains every partial via `take_partial`
-        // before `write_checkpoint(true)` runs, so `pending_bytes()` is already 0 by then.
+        // Subtract the held partial: `offset` advances per chunk, so it includes bytes that
+        // haven't produced an event yet. A file mid-drop holds no partial, so its offset lands
+        // inside the dropped line, and a restart there treats the rest of it as a new line. At
+        // shutdown `close_all_for_shutdown` has already emitted every partial, so this is `0`.
         let entries = self
             .files
             .values()
@@ -919,12 +779,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 }
 
-/// Gives `tracked`'s decoder a chance to emit anything held back -- an unterminated last line
-/// ([`LineSplitter::take_partial`]) plus whatever [`TailDecoder::close`] itself produces
-/// (`docker_in`'s dangling reassembled entry) -- absorbing both into `tracked`'s own accumulator
-/// and flushing immediately if that reaches a bound. Shared by [`Tailer::reap_drained`] (a file
-/// that's actually going away) and [`Tailer::close_all_for_shutdown`] (files that are still
-/// tracked, just no longer being read).
+/// Emits a file's unterminated last line ([`LineSplitter::take_partial`]) and whatever
+/// [`TailDecoder::close`] produces into its accumulator, flushing if a bound is reached. Used by
+/// [`Tailer::reap_drained`] and [`Tailer::close_all_for_shutdown`].
 async fn close_decoder<D: TailDecoder>(
     tracked: &mut TrackedFile<D>,
     sink: &Fanout,
@@ -959,9 +816,8 @@ async fn close_decoder<D: TailDecoder>(
     }
 }
 
-/// Validates `line` as UTF-8, lossily converting (and diagnosing) it if it isn't --
-/// `Value::Str`'s own invariant requires valid UTF-8, so this is what upholds that for a
-/// decoder, rather than every `TailDecoder` implementation having to.
+/// Lossily converts (and diagnoses `invalid_utf8`) a line that isn't UTF-8, upholding
+/// `Value::Str`'s invariant for every [`TailDecoder`].
 fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
     match std::str::from_utf8(&line) {
         Ok(_) => line,
@@ -975,9 +831,8 @@ fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
     }
 }
 
-/// The `truncated` diagnostic's text. A free function purely so a test can assert it reports the
-/// *pre*-truncation offset -- the number an operator needs to know how much was in flight -- and
-/// not the freshly-reset one.
+/// The `truncated` diagnostic's text. It reports the *pre*-truncation offset, which tells an
+/// operator how much was in flight; a free function so a test can assert that.
 fn truncated_message(path: &Path, prev_offset: u64, len: u64) -> String {
     format!(
         "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the beginning",
@@ -990,10 +845,7 @@ async fn emit(sink: &Fanout, telemetry: &Telemetry, batch: EventBatch, reason: F
     sink.send(batch).await;
 }
 
-/// `tokio::time::sleep_until` doesn't accept `Option<Instant>` directly -- this is the same
-/// "sleep forever if there's nothing to wait for" idiom `crate::udp::decode_loop` uses via
-/// `tokio::time::timeout`, spelled as a sleep instead since this loop's `select!` needs every
-/// branch to be a plain future, not a wrapped one.
+/// `sleep_until` for an optional deadline: `None` never resolves.
 async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -1018,9 +870,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// The `tail_in` factory, reimplemented here rather than reused from `super::super` --
-    /// `LineDecoderFactory` (`tail/mod.rs`) is private to that module, and pulling in its own
-    /// `Diagnostics`-carrying shape would add nothing these tests need over this trivial stand-in.
+    /// A stand-in for `tail_in`'s private `LineDecoderFactory`.
     struct LineFactory;
 
     impl DecoderFactory<LineDecoder> for LineFactory {
@@ -1033,12 +883,9 @@ mod tests {
         }
     }
 
-    /// A `tail_in`-shaped factory whose selection is driven by a shared flag, standing in for
-    /// `docker_in`'s real container filter -- lets a test flip a file's selection mid-run without
-    /// needing a real `config.v2.json`/`ContainerFilter` round trip. `accept` and `refresh` are
-    /// kept consistent with each other deliberately: a real selection filter answers the same way
-    /// to both, and a de-selected-then-reselected file must be `accept`-able again once the flag
-    /// flips back.
+    /// A factory whose selection follows a shared flag, standing in for `docker_in`'s container
+    /// filter. `accept` and `refresh` must agree, as a real filter's do, so a re-selected file is
+    /// accepted again.
     struct SelectiveFactory {
         deselected: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -1066,8 +913,8 @@ mod tests {
         (Fanout::new(vec![tx]), rx)
     }
 
-    /// Short poll/checkpoint/flush intervals so every test observes real ticks within a couple
-    /// hundred milliseconds rather than waiting out this crate's production defaults (seconds).
+    /// Poll/checkpoint/flush intervals short enough for a test to see real ticks within a couple
+    /// hundred milliseconds.
     fn fast_config(read_from: ReadFrom) -> TailConfig {
         TailConfig {
             checkpoint_path: None,
@@ -1094,8 +941,7 @@ mod tests {
         (tx, handle)
     }
 
-    /// Signals shutdown and waits for the task to exit -- bounded, so a regression that makes
-    /// shutdown hang fails this test instead of the whole suite.
+    /// Signals shutdown and waits up to 5s, so a hang fails the test rather than the suite.
     async fn shutdown(
         tx: watch::Sender<bool>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -1108,9 +954,7 @@ mod tests {
             .expect("tailer should exit cleanly");
     }
 
-    /// Receives batches until at least `n` events have accumulated, flattening them into arrival
-    /// order. Bounded by an internal timeout so a stuck driver fails the test instead of hanging
-    /// the suite.
+    /// Receives at least `n` events in arrival order, waiting up to 5s per batch.
     async fn expect_events(rx: &mut mpsc::Receiver<Delivered>, n: usize) -> Vec<Event> {
         let mut events = Vec::new();
         while events.len() < n {
@@ -1130,9 +974,7 @@ mod tests {
             .collect()
     }
 
-    /// The most recent value of gauge `name` across everything currently buffered on `registry` --
-    /// draining is destructive, so this is only meaningful as a one-shot check at a point where
-    /// the test already knows nothing else is racing to re-set it.
+    /// The latest buffered value of gauge `name`. Drains `registry`, so it's a one-shot check.
     fn gauge_value(registry: &Registry, name: &str) -> Option<f64> {
         registry.drain(0).into_iter().rev().find_map(|e| {
             e.metrics.iter().find_map(|m| {
@@ -1148,10 +990,9 @@ mod tests {
         })
     }
 
-    // -- workstream B: `Tailer::bind` (docs/plans/operator-surface.md) --
+    // -- `Tailer::bind` --
 
-    /// `bind()` performs the initial directory scan on its own, before `run_until_shutdown` is
-    /// ever called -- the same discovery `run_until_shutdown`'s prologue used to do inline.
+    /// `bind()` runs the initial scan before `run_until_shutdown`.
     #[tokio::test]
     async fn bind_discovers_matching_files_before_run() {
         let dir = scratch_dir("bind-scans-first");
@@ -1170,9 +1011,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A second `bind()` call is a no-op, per [`logit_pipeline::Input::bind`]'s idempotency
-    /// contract -- it must not re-scan (which could otherwise double-open an already-tracked
-    /// file).
+    /// A second `bind()` doesn't re-scan ([`logit_pipeline::Input::bind`]'s idempotency).
     #[tokio::test]
     async fn a_second_bind_is_a_no_op() {
         let dir = scratch_dir("bind-idempotent");
@@ -1191,9 +1030,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `run_until_shutdown` still binds on its own when the caller never called `bind()` first --
-    /// [`logit_pipeline::Input::bind`]'s documented lazy fallback, and the reason no existing
-    /// direct-`run_until_shutdown` test in this module needed to change for this workstream.
+    /// `run_until_shutdown` binds if the caller didn't ([`logit_pipeline::Input::bind`]).
     #[tokio::test]
     async fn run_until_shutdown_binds_when_the_caller_did_not() {
         let dir = scratch_dir("run-binds-itself");
@@ -1259,8 +1096,7 @@ mod tests {
             Tailer::new(vec![PathPattern::new(&path)], LineFactory, fast_config(ReadFrom::End));
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Let the initial scan (which applies `read_from`) settle before appending -- otherwise a
-        // scheduling race could have the append land before the file was ever opened.
+        // Let the initial scan open the file before appending, or the append could be skipped.
         tokio::time::sleep(Duration::from_millis(45)).await;
         std::fs::OpenOptions::new()
             .append(true)
@@ -1292,8 +1128,7 @@ mod tests {
     async fn a_file_created_after_startup_is_discovered_and_read_from_the_beginning() {
         let dir = scratch_dir("new-file");
         let (fanout, mut rx) = recording_fanout(8);
-        // `read_from: end` -- proving this only governs files present at startup; a file that
-        // doesn't exist yet always starts at the beginning once it appears.
+        // `read_from: end` governs only files present at startup.
         let tailer = Tailer::new(
             vec![PathPattern::new(dir.join("*.log"))],
             LineFactory,
@@ -1328,9 +1163,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["before"]);
 
-        // Rename away, then recreate fresh at the same path -- both fast enough to land within
-        // one scan, so the driver sees the same path under a new inode rather than a transient
-        // removal.
+        // Both land within one scan, so the driver sees a new inode at the path, not a removal.
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
@@ -1345,11 +1178,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The `inotify` mirror of the rotation test above: proves the *watch* itself moves to the
-    /// new inode, not just the tracked/checkpoint state. `open_tracked`'s "new file" branch
-    /// registers a fresh watch on the replacement (the old inode's own watch, if it had one, is
-    /// left alone until that entry is reaped -- see `TrackedFile::watch`'s doc comment), so a
-    /// further write to the *new* file is delivered promptly via *its own* watch.
+    /// Under `inotify`, a rotation's replacement is discovered and read without the 30s poll.
     #[tokio::test]
     async fn under_inotify_a_rotation_registers_a_fresh_watch_on_the_new_inode() {
         let dir = scratch_dir("inotify-rotation-watch");
@@ -1372,8 +1201,8 @@ mod tests {
         let events2 = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["after"]);
 
-        // A further append to the *new* inode must still be delivered promptly -- via its own
-        // fresh watch, not the old (rotated-away) inode's, which never sees this write at all.
+        // The new inode's watch raises `IN_MODIFY`, but the 15ms flush tick also runs `drain`,
+        // so prompt delivery here doesn't prove the watch fired.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(b"more\n").unwrap();
@@ -1406,8 +1235,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["aaaaaaaaaa"]);
 
-        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter
-        // length -- genuine truncation, not a rotation.
+        // `O_TRUNC` on the existing path: same inode, shorter length.
         std::fs::write(&path, b"new\n").unwrap();
 
         let events2 = expect_events(&mut rx, 1).await;
@@ -1453,10 +1281,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `logit.input.watch.watches` counts the watched directory plus one entry per currently-open
-    /// file with its own watch -- the number `docs/adr/docker-container-identity-and-minimal-
-    /// watches.md`'s whole design is meant to keep proportional to what's tailed. `WatchMode::
-    /// Inotify` so watches are real, not the `Poll` no-op.
+    /// `logit.input.watch.watches` counts the watched directory plus each open file's watch.
     #[tokio::test]
     async fn watch_watches_counts_the_directory_and_each_open_file() {
         let dir = scratch_dir("watch-count");
@@ -1493,13 +1318,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // -- W3: selection follows the rename (docs/adr/docker-container-identity-and-minimal-
-    // watches.md) --
+    // -- selection follows the rename (docs/adr/docker-container-identity-and-minimal-watches.md)
 
-    /// The regression test for `FileState::Deselected` existing as its own state rather than
-    /// reusing `Draining`: a busy file marked `Draining` keeps draining (and therefore emitting)
-    /// until it reaches EOF, which a still-growing file never does. A de-selected file must stop
-    /// being read immediately instead, even while more is being appended to it.
+    /// A de-selected file stops being read at once; as `Draining` it would never reach EOF.
     #[tokio::test]
     async fn a_deselected_file_stops_emitting_immediately_even_while_still_written_to() {
         let dir = scratch_dir("deselect-stop");
@@ -1535,13 +1356,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A container renamed back into the selection resumes from where it was closed -- not from
-    /// byte 0 -- including lines written while it was away, which are delivered (under the
-    /// identity current at the time they're finally read) once it's selected again. Also the
-    /// regression test for `open_tracked`'s revival guard: without it, the very next scan after
-    /// de-selection would find the still-present `Deselected` entry and silently revive it before
-    /// `reap_drained` ever runs, and this test's first `rx.recv()` after re-selecting would see
-    /// `"one"` replayed instead of nothing followed by `"two"`.
+    /// A re-selected file resumes at its retained offset, delivering what was written while
+    /// away; also pins `open_tracked`'s guard against reviving a `Deselected` entry.
     #[tokio::test]
     async fn a_reselected_file_resumes_at_the_retained_offset_rather_than_replaying() {
         let dir = scratch_dir("deselect-resume");
@@ -1561,7 +1377,7 @@ mod tests {
         deselected.store(true, std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(60)).await; // time to reap
 
-        // Written while de-selected -- must not be lost, only deferred.
+        // Written while de-selected: deferred, not lost.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(b"two\n").unwrap();
@@ -1600,7 +1416,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["line one"]);
 
-        // Give at least one interval tick a chance to fire now that reading made the store dirty.
+        // At least one checkpoint tick after the read dirtied the store.
         tokio::time::sleep(Duration::from_millis(70)).await;
         assert!(
             checkpoint_path.exists(),
@@ -1609,8 +1425,7 @@ mod tests {
 
         shutdown(shutdown_tx, handle).await;
 
-        // A fresh tailer resuming from that checkpoint must not replay "line one" -- only content
-        // appended after the checkpoint was written.
+        // A fresh tailer resumes from the checkpoint: only the appended line arrives.
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -1647,7 +1462,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = fast_config(ReadFrom::End); // must be ignored -- the resume entry wins
+        let mut config = fast_config(ReadFrom::End); // ignored: the resume entry wins
         config.checkpoint_path = Some(checkpoint_path);
 
         let (fanout, mut rx) = recording_fanout(8);
@@ -1705,10 +1520,8 @@ mod tests {
         let checkpoint_path = dir.join("checkpoint.json");
 
         let mut config = fast_config(ReadFrom::Beginning);
-        // A batch bound and flush interval this test will never reach on its own -- only
-        // shutdown's own final flush should ever deliver anything. The checkpoint interval must
-        // be pushed out too: a checkpoint tick now flushes before it persists, so a short one
-        // (fast_config's default) would flush this batch early and defeat the point of this test.
+        // Only shutdown's final flush may deliver. The checkpoint interval is pushed out too,
+        // because a checkpoint tick flushes before it writes.
         config.batching.max_events = 1_000;
         config.batching.flush_interval = Duration::from_secs(60);
         config.checkpoint_interval = Duration::from_secs(60);
@@ -1718,7 +1531,7 @@ mod tests {
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Give the initial scan+read time to happen, well before any interval flush would fire.
+        // Time for the initial scan and read; both intervals are 60s away.
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -1752,12 +1565,11 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["complete"]);
 
-        // Nothing more should arrive while the last line has no trailing newline.
+        // Held while unterminated.
         let more = tokio::time::timeout(Duration::from_millis(80), rx.recv()).await;
         assert!(more.is_err(), "an unterminated line must not be emitted before it closes");
 
-        // Shutdown gives the decoder a chance to close, flushing the held partial even though no
-        // newline ever arrived.
+        // Shutdown emits the held partial.
         shutdown(shutdown_tx, handle).await;
         let delivered = rx.try_recv().expect("the held partial line should flush on shutdown");
         let events2 = unwrap_batch(delivered).events;
@@ -1780,8 +1592,7 @@ mod tests {
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Don't read from `rx` at all for a while -- the tailer must simply stop making
-        // progress, never drop anything.
+        // Don't read `rx` yet: the tailer must stall, not drop.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         let mut received = Vec::new();
@@ -1836,9 +1647,8 @@ mod tests {
         let dir = scratch_dir("round-robin");
         let busy_path = dir.join("busy.log");
         let quick_path = dir.join("quick.log");
-        // Comfortably larger than one read chunk (64 KiB) so draining `busy.log` takes more than
-        // one `read_one` call -- if the driver read one file to EOF before ever touching the
-        // next, `quick.log`'s single line would only arrive after every one of these.
+        // More than one 64 KiB read chunk, so reading one file to EOF first would put
+        // `quick.log`'s line after all of these.
         let busy_content: String = (0..8_000).map(|i| format!("busy-{i:05}\n")).collect();
         assert!(busy_content.len() > 64 * 1024, "fixture must exceed one read chunk");
         std::fs::write(&busy_path, busy_content.as_bytes()).unwrap();
@@ -1854,10 +1664,8 @@ mod tests {
         );
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Drains every event from both files to completion (rather than stopping the moment
-        // "quick line" is seen) -- the tailer itself keeps running regardless of what this test
-        // asserts, and with a one-event fanout capacity of 64 it would simply block forever on a
-        // full channel if this stopped consuming early.
+        // Consume everything: stopping at "quick line" would leave the tailer blocked on a full
+        // channel.
         let mut seen_before_quick = 0usize;
         let mut quick_found = false;
         let mut busy_seen = 0usize;
@@ -1887,14 +1695,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The whole point of workstream B: `inotify` discovers a *new* file well before the next
-    /// `poll_interval` tick would ever fire -- `poll_interval` here (30s) is set far longer than
-    /// this test's own timeout, so a discovery at all proves it came from the wake source, not
-    /// from polling. (Reading more bytes appended to an *already-tracked* file isn't gated by
-    /// either `poll_interval` or the watch mode at all -- `drain`'s round-robin read runs after
-    /// every loop iteration regardless of what woke it, since an already-open file handle simply
-    /// sees new bytes on its next `read()`. `poll_interval`/`inotify` only govern *discovering*
-    /// a path -- new files, rotation, truncation -- which is what these two tests exercise.)
+    /// Under `inotify`, a new file is discovered long before the 30s `poll_interval`, so only the
+    /// wake source can explain it.
     #[tokio::test]
     async fn under_inotify_a_new_file_is_discovered_well_before_the_poll_interval() {
         let dir = scratch_dir("inotify-latency");
@@ -1906,8 +1708,7 @@ mod tests {
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Give the initial scan a moment to run (and start watching `dir`) before the file
-        // appears.
+        // Let the initial scan start watching `dir` first.
         tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
@@ -1922,12 +1723,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The mirror image: under `poll` (never `auto`/`inotify`), the same new file is only ever
-    /// discovered on the next `poll_interval` tick -- nothing wakes the driver early. The default
-    /// `flush_interval` (15ms) stays on: it can only ever *deliver* what `scan` has already
-    /// discovered (`Outcome::Flush` never calls `scan` itself), so it can't make this test pass
-    /// by accident -- it's what lets the discovered line actually reach `rx` promptly once the
-    /// poll tick does fire, the same as any other test in this module.
+    /// Under `poll`, a new file waits for the `poll_interval` tick. The 15ms flush timer can't
+    /// discover a file (`Outcome::Flush` never scans), so it can't make this pass by accident.
     #[tokio::test]
     async fn under_poll_a_new_file_is_discovered_only_after_the_poll_interval() {
         let dir = scratch_dir("poll-latency");
@@ -1942,7 +1739,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(dir.join("app.log"), b"woke\n").unwrap();
 
-        // Nothing should arrive well before the poll tick.
+        // Nothing before the 300ms tick.
         let too_soon = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
         assert!(
             too_soon.is_err(),
@@ -1956,12 +1753,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `docs/adr/docker-container-identity-and-minimal-watches.md`: a write to an
-    /// *already-tracked* file wakes as `Wake::Data`, which skips `scan` entirely and goes
-    /// straight to a truncation check plus the ordinary drain -- this is what keeps the cost of
-    /// one write O(1) rather than a full rescan. Proven here the same way the new-file/poll-tick
-    /// pair above prove discovery latency: a long `poll_interval` the test would blow through if
-    /// delivery were secretly poll-bound, with `WatchMode::Inotify` doing the real work.
+    /// Under `inotify`, a write to a tracked file arrives well inside the 30s `poll_interval`.
+    /// The 15ms flush tick also runs `drain`, so this doesn't isolate `Wake::Data`.
     #[tokio::test]
     async fn under_inotify_a_write_to_an_already_tracked_file_is_delivered_promptly() {
         let dir = scratch_dir("inotify-data-wake");
@@ -1978,8 +1771,7 @@ mod tests {
         let first = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&first), vec!["first"]);
 
-        // `O_APPEND`, not a fresh `std::fs::write` -- this must land as `IN_MODIFY` on the file's
-        // own watch, not as any kind of create/rename event.
+        // `O_APPEND`, so the only event is `IN_MODIFY` on the file's own watch.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(b"second\n").unwrap();
@@ -1996,16 +1788,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The truncation half of the same property: an in-place truncation of an already-tracked
-    /// file is still noticed promptly under `inotify`, but now via the file's *own* watch
-    /// (`IN_MODIFY` fires on `O_TRUNC` the same as any other write) rather than a directory watch
-    /// that no longer exists for `tail_in`'s own pattern directory content events either.
+    /// Under `inotify`, an in-place truncation is noticed through the file's own `IN_MODIFY`:
+    /// `DIR_MASK` has no content bits, and `drain` alone never rewinds. `std::fs::write`'s
+    /// `O_TRUNC` open and its write each raise `IN_MODIFY`; this can't tell which woke it.
     #[tokio::test]
     async fn under_inotify_a_truncation_is_noticed_via_the_files_own_watch() {
         let dir = scratch_dir("inotify-truncate-data-wake");
         let path = dir.join("app.log");
-        // Deliberately longer than the replacement below -- truncation is detected by comparing
-        // on-disk length against the offset already read, so the second write must be shorter.
+        // Longer than the replacement: truncation means length below the offset read.
         std::fs::write(&path, b"a-longer-first-line\n").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
@@ -2018,8 +1808,7 @@ mod tests {
         let first = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&first), vec!["a-longer-first-line"]);
 
-        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter
-        // length, a real truncation.
+        // `O_TRUNC` on the existing path: same inode, shorter length.
         std::fs::write(&path, b"short\n").unwrap();
 
         let second =
@@ -2033,24 +1822,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// White-box regression for the other half of that pair: `on_data_wake` takes `id` from
-    /// `by_path` -- refreshed only by `scan` -- but `len` from its own fresh `metadata(path)`
-    /// call, so the two can describe different inodes. An ordinary rotation (rename the old file
-    /// away, create a new one at the same name -- logrotate's default, and Docker's json-file
-    /// driver) leaves that mapping stale until the next `scan`, and under this ADR's watch set a
-    /// rotation inside a container directory produces no `Wake::Discover` to shorten the window.
-    /// Pairing the rotated-away inode's offset with the replacement's near-empty length reads as
-    /// a truncation for virtually every rotation: the old handle is seeked back to `0` and the
-    /// drain that follows every wake re-emits every line it had already read. Driven directly
-    /// rather than through `run_until_shutdown`, for the same reason the rebind test below is:
-    /// the next `scan` reconciles the rotation either way, so only this one interleaving -- a
-    /// data wake handled *before* the scan that follows it -- tells the bug from the fix.
+    /// A `Wake::Data` for a path a new inode now owns isn't read as a truncation of the old one
+    /// (`Tailer::on_data_wake`). Driven by hand: only a data wake handled before the next `scan`
+    /// exposes the difference.
     #[tokio::test]
     async fn a_data_wake_for_a_path_a_new_inode_now_owns_is_not_a_truncation() {
         let dir = scratch_dir("data-wake-rotation");
         let path = dir.join("app.log");
-        // Deliberately longer than the replacement written below, so a stale-`id` reconcile would
-        // classify it as a truncation (`len < offset`) rather than passing as a harmless no-op.
+        // Longer than the replacement, so a stale-`id` reconcile would see `len < offset`.
         std::fs::write(&path, b"a-longer-first-line\n").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
@@ -2070,8 +1849,7 @@ mod tests {
         let read_offset = tailer.files.get(&old).unwrap().offset;
         assert_eq!(read_offset, 20, "the whole first line should already have been read");
 
-        // The rotation itself, with no `scan` in between -- exactly the window a `Wake::Data`
-        // queued for the old inode lands in.
+        // Rotate with no `scan` in between: the window a queued `Wake::Data` lands in.
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"new\n").unwrap();
         assert_ne!(
@@ -2087,8 +1865,7 @@ mod tests {
             "a data wake naming a path another inode now owns must not rewind the tracked file"
         );
 
-        // The observable half: the unconditional drain that follows every wake finds nothing to
-        // re-read, so nothing is emitted twice.
+        // The drain after every wake re-emits nothing.
         let _ = tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
         tailer.flush_all(&fanout, FlushReason::Interval).await;
         assert!(
@@ -2107,20 +1884,17 @@ mod tests {
         assert!(content.len() > 64 * 1024, "fixture must exceed one read chunk");
         std::fs::write(&path, content.as_bytes()).unwrap();
 
-        // A capacity-1 fanout with one event per batch stalls the driver inside `emit` almost
-        // immediately, so only a small prefix has been read by the time the file is removed --
-        // this is what makes the test deterministic rather than racing the reader.
+        // A capacity-1 fanout and one event per batch stall the driver in `emit` almost at once,
+        // so most of the file is unread when it's removed.
         let (tx, mut rx) = mpsc::channel(1);
         let fanout = Fanout::new(vec![tx]);
         let mut config = fast_config(ReadFrom::Beginning);
         config.batching.max_events = 1;
-        // A directory glob -- so the removal below is what makes the tracked path stale, driving
-        // it into `FileState::Draining`, rather than the pattern itself no longer matching.
+        // A glob, so the removal is what drives the file into `FileState::Draining`.
         let tailer = Tailer::new(vec![PathPattern::new(dir.join("*.log"))], LineFactory, config);
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Don't consume `rx` at all -- the driver stalls with the vast majority of the file still
-        // unread.
+        // Don't consume `rx` yet.
         tokio::time::sleep(Duration::from_millis(60)).await;
         std::fs::remove_file(&path).unwrap();
         // A poll tick marks the file `Draining` while it is still mostly unread.
@@ -2149,9 +1923,8 @@ mod tests {
     async fn a_truncation_discards_the_partial_line_held_from_the_previous_generation() {
         let dir = scratch_dir("truncate-partial");
         let path = dir.join("app.log");
-        // No trailing newline -- the trailing fragment "partialpartial" is held in the splitter's
-        // `partial` buffer, and is long enough that the post-truncation length (10) is strictly
-        // less than the tracked offset (18), so `scan` classifies this as a truncation at all.
+        // "partialpartial" is held as a partial, and makes the offset (18) exceed the
+        // post-truncation length (10), so `scan` sees a truncation.
         std::fs::write(&path, b"a\nb\npartialpartial").unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
@@ -2165,9 +1938,7 @@ mod tests {
         let events = expect_events(&mut rx, 2).await;
         assert_eq!(messages(&events), vec!["a", "b"]);
 
-        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, 10 < 18 bytes
-        // -- a real truncation, exactly as `truncation_seeks_to_zero_and_reports_truncated` does
-        // it.
+        // `O_TRUNC` on the existing path: same inode, 10 < 18 bytes.
         std::fs::write(&path, b"restarted\n").unwrap();
 
         let events2 = expect_events(&mut rx, 1).await;
@@ -2200,20 +1971,18 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["before"]);
 
-        // Both the rotated-away file and the fresh replacement now match the same `app.log*`
-        // pattern -- the exact scenario that used to re-open the rotated-away inode from byte 0.
+        // `app.log*` now matches both the rotated-away file and its replacement.
         std::fs::rename(&path, dir.join("app.log.1")).unwrap();
         std::fs::write(&path, b"after\n").unwrap();
 
         let events2 = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events2), vec!["after"]);
 
-        // The actual regression: the bug re-emits "before" from byte 0 of `app.log.1`.
+        // `app.log.1` must be rebound, not reopened at byte 0 (re-emitting "before").
         let extra = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
         assert!(extra.is_err(), "the renamed inode must not be re-read from byte 0");
 
-        // The entry must have been rebound and kept Active, not silently dropped -- appending to
-        // the renamed file must still be followed under its new name.
+        // Rebound and still `Active`: an append under the new name is followed.
         std::fs::OpenOptions::new()
             .append(true)
             .open(dir.join("app.log.1"))
@@ -2227,15 +1996,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// White-box regression for the `by_path` orphaning bug in `open_tracked`'s rebind branch:
-    /// removing the old `path -> id` entry whenever `old_path != path` (rather than only when
-    /// that entry still belongs to this inode) could delete a replacement inode's freshly-inserted
-    /// binding if that replacement's `scan` arm ran first. This can't be pinned by driving the
-    /// spawned tailer's event stream -- the very next `scan` rediscovers the orphaned inode under
-    /// its own name and re-adds the `by_path` entry, so the observable events self-heal either way
-    /// and look identical whether the bug is present or fixed. Only inspecting `by_path`/`files`
-    /// state directly, at the one problematic iteration order, distinguishes them -- so this test
-    /// calls `scan`/`open_tracked` directly instead of spawning `run_until_shutdown`.
+    /// A rebind in `open_tracked` never removes a `by_path` entry another inode owns. Checked on
+    /// state, not events: the next `scan` would re-add an orphaned binding, hiding the difference.
     #[tokio::test]
     async fn rebinding_a_renamed_inode_never_removes_a_by_path_entry_another_inode_now_owns() {
         let dir = scratch_dir("rebind-by-path-ownership");
@@ -2256,11 +2018,9 @@ mod tests {
         let b = FileId::from_metadata(&std::fs::metadata(dir.join("app.log")).unwrap());
         assert_ne!(a, b, "test is vacuous if the filesystem reused the old inode for the new file");
 
-        // Replay, by hand, the one iteration order of `scan`'s `discovered` map that trips the
-        // bug: the rotation-replacement arm for `app.log` (now inode `b`) runs before the
-        // rebind arm for the renamed-away `app.log.1` (still inode `a`). `discovered` is a
-        // `HashMap`, so the real `scan` picks either order nondeterministically; this pins the
-        // one where the bug is observable.
+        // Replay the `discovered` order that matters: the replacement arm for `app.log` (inode
+        // `b`) before the rebind arm for `app.log.1` (inode `a`). A real `scan`'s `HashMap`
+        // order may be either.
         tailer.files.get_mut(&a).unwrap().state = FileState::Draining;
         tailer.by_path.remove(&dir.join("app.log"));
         let mut watcher = crate::tail::watch::Watcher::Poll;
@@ -2296,8 +2056,7 @@ mod tests {
         std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
 
         let mut config = fast_config(ReadFrom::Beginning);
-        // Only the checkpoint tick's own flush can ever deliver anything -- same trick
-        // `shutdown_flushes_every_accumulator_and_writes_the_checkpoint_within_grace` uses.
+        // Only the checkpoint tick's flush can deliver within the test.
         config.batching.flush_interval = Duration::from_secs(60);
         config.batching.max_events = 1_000;
         config.checkpoint_interval = Duration::from_millis(25);
@@ -2307,8 +2066,7 @@ mod tests {
         let tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config);
         let (shutdown_tx, handle) = spawn_tailer(tailer, fanout);
 
-        // Before the fix, nothing is ever delivered within `expect_events`' 5s bound, because the
-        // only flush is 60s out -- the checkpoint tick itself must be the one that flushes.
+        // The flush timer is 60s out, so only the checkpoint tick can deliver within 5s.
         let events = expect_events(&mut rx, 3).await;
         assert_eq!(messages(&events), vec!["one", "two", "three"]);
 
@@ -2320,8 +2078,7 @@ mod tests {
     async fn a_checkpoint_offset_never_covers_a_line_still_held_as_a_partial() {
         let dir = scratch_dir("checkpoint-partial");
         let path = dir.join("app.log");
-        // Complete-line prefix is 14 bytes ("one\ntwo\nthree\n"); the rest is an unterminated
-        // trailing line that must never be counted in a persisted offset.
+        // 14 bytes of complete lines, then an unterminated line the offset must not cover.
         const COMPLETE_PREFIX_LEN: usize = 14;
         std::fs::write(&path, b"one\ntwo\nthree\nnot-terminated").unwrap();
 
@@ -2335,8 +2092,7 @@ mod tests {
         let _ = expect_events(&mut rx, 3).await;
         tokio::time::sleep(Duration::from_millis(70)).await; // let a checkpoint tick land
 
-        // Read the checkpoint file while the tailer is still running -- `shutdown` would drain
-        // the partial and legitimately advance the offset, masking the bug.
+        // Read while running: shutdown emits the partial and legitimately advances the offset.
         let text = std::fs::read_to_string(&checkpoint_path).unwrap();
         // `serde_json::to_vec_pretty` puts a space after the colon.
         assert!(
@@ -2355,14 +2111,10 @@ mod tests {
         assert!(!msg.contains("offset of 0 bytes"));
     }
 
-    // -- the pattern directory's own watch: armed on every scan, not once
-    //    (`docs/plans/critical-sections-inventory.md`, TAIL-07) --------------------------------
+    // -- the pattern directory's watch is re-armed on every scan -----------------------------
 
-    /// A `Tailer` and a real `inotify` `Watcher` driven directly, rather than through
-    /// `run_until_shutdown`. Direct on purpose: every test below turns on what a *second* `scan`
-    /// leaves armed, and under the 30s `poll_interval` these configure (long enough that only
-    /// `inotify` could explain any promptness) a second scan would otherwise never happen inside
-    /// the test's own lifetime.
+    /// A `Tailer` and a real `inotify` `Watcher`, driven by hand: these tests turn on what a
+    /// second `scan` leaves armed, and under the 30s `poll_interval` none would run otherwise.
     #[cfg(target_os = "linux")]
     fn inotify_tailer(
         pattern: PathPattern,
@@ -2382,8 +2134,8 @@ mod tests {
         (tailer, watcher)
     }
 
-    /// Whether a `Diagnostics` key was reported at all -- `warn_throttled` counts
-    /// `logit.component.diagnostics{key}` on every occurrence, not just the ones it logs.
+    /// Whether a `Diagnostics` key was reported; `warn_throttled` counts
+    /// `logit.component.diagnostics{key}` on every occurrence, logged or not.
     #[cfg(target_os = "linux")]
     fn diagnosed(registry: &Registry, key: &str) -> bool {
         registry.drain(0).into_iter().any(|event| {
@@ -2395,11 +2147,8 @@ mod tests {
         })
     }
 
-    /// Proves a directory's watch is *live*, not merely recorded: a file created in it must
-    /// produce that directory watch's own `Wake::Discover`, off this watcher's real fd. A watch
-    /// that was never (re-)armed produces nothing at all, so this times out rather than
-    /// mis-reporting. Tolerates a few leading wakes left over from whatever churn the test just
-    /// did to the directory itself.
+    /// Proves a directory watch is live: creating `path` must yield its `Wake::Discover` off the
+    /// real fd. Skips a few leftover wakes from the test's own directory churn.
     #[cfg(target_os = "linux")]
     async fn expect_discover(watcher: &mut crate::tail::watch::Watcher, path: &Path) {
         std::fs::write(path, b"hello\n").unwrap();
@@ -2417,16 +2166,13 @@ mod tests {
         panic!("never saw {want:?} among this watcher's wakes");
     }
 
-    /// A pattern directory that doesn't exist when the listener starts -- a log volume mounted
-    /// after the process, an application that creates its own log directory -- must be armed once
-    /// it appears, not written off. Arming only the newly-desired set made this permanent: the
-    /// failed `inotify_add_watch` was recorded as watched anyway and never retried, so discovery
-    /// in that directory silently ran at `poll_interval` for the life of the process.
+    /// A pattern directory missing at bind is diagnosed, not recorded as watched, and armed once
+    /// it exists.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn under_inotify_a_pattern_directory_missing_at_bind_is_armed_once_it_exists() {
         let dir = scratch_dir("inotify-late-dir");
-        let sub = dir.join("sub"); // deliberately not created yet
+        let sub = dir.join("sub"); // not created yet
         let registry = Registry::new();
         let (mut tailer, mut watcher) =
             inotify_tailer(PathPattern::new(sub.join("*.log")), &registry);
@@ -2453,11 +2199,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The redeploy shape: the watched directory is removed and recreated (a volume recreate, a
-    /// tmpfs remount, `logrotate`'s `olddir` applied to the directory itself). The new inode is a
-    /// new watch, and reaching it needed two independent fixes -- re-arming on every scan, and
-    /// purging the reverse index on `IN_IGNORED` so the re-arm is not short-circuited by a
-    /// descriptor the kernel already invalidated. Either one alone leaves this dead.
+    /// A watched directory deleted and recreated is re-armed on the new inode. Needs both the
+    /// every-scan re-arm and the `IN_IGNORED` purge, which stops a dead `wd` short-circuiting it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn under_inotify_a_watched_directory_deleted_and_recreated_is_rearmed() {
@@ -2470,8 +2213,7 @@ mod tests {
         assert_eq!(watcher.tracked_watch_count(), 1);
         expect_discover(&mut watcher, &dir.join("first.log")).await;
 
-        // No `.await` between the two: the driver cannot observe the gap, exactly as a real
-        // redeploy's `rm -rf` + `mkdir` is over before anything reacts to it.
+        // No `.await` between the two, so the driver can't observe the gap.
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -2483,10 +2225,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The other way a directory stops being the directory at that path: a rename. The kernel
-    /// sends no `IN_IGNORED` for it -- the watch stays perfectly valid on the moved inode -- so
-    /// without `IN_MOVE_SELF` in `DIR_MASK` nothing even reports it, and the watch quietly
-    /// follows the old directory under a name it no longer has.
+    /// A watched directory renamed away and replaced is re-armed. A rename raises no
+    /// `IN_IGNORED` (the watch stays valid on the moved inode), so only `IN_MOVE_SELF` in
+    /// `DIR_MASK` reports it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn under_inotify_a_watched_directory_renamed_away_and_replaced_is_rearmed() {
@@ -2510,12 +2251,9 @@ mod tests {
         std::fs::remove_dir_all(&parent).ok();
     }
 
-    /// The leak detector `logit.input.watch.watches` can't be, since it counts the *intended*
-    /// watch set. Twenty rotate-and-delete cycles, then the kernel's own answer
-    /// (`/proc/self/fdinfo/<inotify fd>` carries one `inotify wd:` line per live watch) checked
-    /// against this watcher's bookkeeping and against what the driver believes it holds. A `wd`
-    /// left behind in `watches` after its inode is gone, or a kernel watch never released, shows
-    /// up here as a mismatch that grows with the cycle count.
+    /// After 20 rotate-and-delete cycles, the kernel's live watch count (`inotify wd:` lines in
+    /// `/proc/self/fdinfo/<fd>`) matches the watcher's and the driver's bookkeeping; a leak in
+    /// either direction grows with the cycle count.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_live_kernel_watch_count_matches_this_watchers_own_bookkeeping() {
@@ -2534,9 +2272,8 @@ mod tests {
             tailer.scan(false, &mut watcher).await;
             tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;
 
-            // Rotate it out of the pattern's reach (`*.log` never matches `app.log.1`), drain and
-            // reap it, then delete the rotated inode outright -- one watch registered and one
-            // released per cycle, plus one `IN_IGNORED` the kernel queues on the way out.
+            // Rotate out of `*.log`'s reach, reap, then delete: one watch added and one removed
+            // per cycle, plus a queued `IN_IGNORED`.
             std::fs::rename(&path, dir.join("app.log.1")).unwrap();
             tailer.scan(false, &mut watcher).await;
             tailer.drain(&fanout, &mut shutdown_rx, &mut watcher).await;

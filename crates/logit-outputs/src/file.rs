@@ -1,14 +1,16 @@
-//! The rotating half of `crate::stdio::StreamOutput`'s file target: size- and/or calendar-
-//! interval-triggered rotation with logrotate-style numbered-suffix retention
-//! (`docs/adr/rotating-file-output.md`). `stdio_out`'s plain file target and `file_out`'s rotating
-//! one are both a [`FileTarget`], differing only in [`RotatePolicy`] -- see `crate::stdio`'s
-//! module doc comment.
+//! `file_out`: the rotating half of `crate::stdio::StreamOutput`'s file target
+//! (`docs/adr/rotating-file-output.md`). `stdio_out`'s file target and `file_out` are both a
+//! [`FileTarget`], differing only in [`RotatePolicy`].
 //!
-//! [`RotatePolicy`]/[`RotateInterval`] are local mirrors of `logit_config::RotateConfig`/
-//! `RotateInterval` -- `logit-outputs` must not depend on `logit-config`
-//! (`docs/design/pipeline-graph.md`'s crate layout), the same reason `crate::syslog::Format`
-//! mirrors `logit_config::SyslogFormat`; `crates/logit-cli/src/pipeline.rs::build_spec` is the
-//! sole place a config value crosses into this type.
+//! Rotation fires on size, on a UTC calendar boundary, or both, and is checked before each batch's
+//! write. Retention is logrotate-style: the active file is `path`, rotated files are `path.1`
+//! (newest) through `path.{max_files - 1}`, and the oldest is removed once it would fall off the
+//! end. `max_files: 1` truncates in place. There is no `fsync`; each batch is flushed to the OS.
+//! [`FileTarget::rotate`] has the crash-safety order and the per-failure handling.
+//!
+//! [`RotatePolicy`]/[`RotateInterval`] mirror `logit_config`'s types because `logit-outputs` must
+//! not depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate layout");
+//! `build_spec` is the one place a config value crosses into them.
 
 use anyhow::Context;
 use logit_core::Diagnostics;
@@ -17,11 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
-/// Which calendar boundary [`RotationState::should_rotate`] rotates on. Calendar periods, not a
-/// `Duration`: a duration measured from an arbitrary start (process start, first write) drifts
-/// against the wall clock, which is the opposite of what a daily log file is for. UTC only, never
-/// the host's local zone -- matching the reasoning already recorded at
-/// `docs/known-gaps.md`'s syslog-timestamp-resolution entry.
+/// Which UTC calendar boundary [`RotationState::should_rotate`] rotates on. Not a `Duration`: one
+/// measured from process start or the first write drifts against the wall clock. Never the host's
+/// local zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateInterval {
     Hourly,
@@ -37,9 +37,8 @@ impl RotateInterval {
     }
 }
 
-/// A file target's rotation policy. Both triggers can be set together -- either firing rotates.
-/// `max_files` counts *every* file the target maintains, active plus rotated, so
-/// `max_files * max_bytes` reads as a disk budget an operator can compute directly.
+/// A file target's rotation policy; either trigger firing rotates. `max_files` counts the active
+/// file too, so `max_files * max_bytes` is the disk budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotatePolicy {
     pub max_bytes: Option<u64>,
@@ -48,45 +47,35 @@ pub struct RotatePolicy {
 }
 
 impl RotatePolicy {
-    /// No rotation at all -- what `stdio_out`'s plain file target uses.
-    /// [`RotationState::should_rotate`] always returns `false` under this policy, regardless of
-    /// `now_unix`/`incoming`. `max_files: 1` is never consulted (nothing can trigger a rotation to
-    /// retain), but kept at a shape that would be safe if it ever were.
+    /// No rotation: `stdio_out`'s file target. `max_files: 1` is never consulted.
     pub fn never() -> Self {
         Self { max_bytes: None, interval: None, max_files: 1 }
     }
 }
 
-/// `t` as whole Unix seconds, or `None` when the conversion fails (`t` predates the epoch --
-/// never true for a real mtime or the real clock). The one conversion path both [`now_unix`] (the
-/// real clock) and [`FileTarget::open`] (an existing file's mtime) go through.
+/// `t` as whole Unix seconds, or `None` if it predates the epoch. Shared by [`now_unix`] and
+/// [`FileTarget::open`]'s mtime read.
 fn unix_seconds(t: SystemTime) -> Option<i64> {
     t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
 }
 
-/// Current Unix time in whole seconds, UTC -- the clock [`crate::stdio::StreamOutput::send`]
-/// passes into [`RotationState::should_rotate`]/[`RotationState::note_written`]. A free function
-/// rather than a method so a test can call those directly with an arbitrary injected `now_unix`
-/// instead of racing the real clock, mirroring `logit_pipeline::Transform::flush(now)`'s
-/// injected-clock precedent.
+/// Current Unix time in whole seconds, the clock `StreamOutput::send` passes to
+/// [`RotationState::should_rotate`]/[`RotationState::note_written`]. Read by the caller, not
+/// inside them, so a test can inject any `now_unix`.
 pub(crate) fn now_unix() -> i64 {
     unix_seconds(SystemTime::now()).unwrap_or_default()
 }
 
-/// The rotation bookkeeping for one active file, with **no file handle or path of its own** --
-/// deliberately separated from [`FileTarget`] so every rotation-trigger decision is a plain
-/// synchronous unit test against this struct alone, with no real file or clock involved. See
-/// [`RotationState::should_rotate`]'s own doc comment for the trigger semantics.
+/// Rotation bookkeeping for the active file, with no handle or path, so every trigger decision
+/// is a synchronous unit test with no real file or clock.
 #[derive(Debug, Clone, Copy)]
 struct RotationState {
-    /// Bytes written to the active file so far. Seeded from the file's length at open, not 0 --
-    /// restarting against an already-large file must not get another full `max_bytes` for free.
+    /// Bytes in the active file. Seeded from its length at open, so a restart against a large
+    /// file doesn't get another full `max_bytes`.
     written: u64,
-    /// The calendar period (`RotateInterval::period_seconds`-sized bucket of `now_unix`) the
-    /// active file belongs to. `None` until either [`RotationState::seed_period`] (an existing
-    /// file's mtime, at open) or the first write after open/rotation sets it -- a freshly opened
-    /// *empty* file still starts `None`, so its very first batch never spuriously rotates just
-    /// because no period was known yet -- see [`RotationState::should_rotate`].
+    /// The calendar period (`now_unix / period_seconds`) the active file belongs to. `None` until
+    /// [`RotationState::seed_period`] or the first write sets it, so an empty file's first batch
+    /// never rotates.
     period: Option<i64>,
     policy: RotatePolicy,
 }
@@ -101,16 +90,10 @@ impl RotationState {
         self.period = None;
     }
 
-    /// Seeds `period` from an already-existing file's own last-modified time, at
-    /// [`FileTarget::open`] -- mirrors how `written` is already seeded from the file's length.
-    /// Without this, restarting against a file under an `interval` policy would forget which
-    /// calendar period it was last written in: either merging two periods' events into the same
-    /// file (silently breaking "the rolled file holds exactly the previous period's events" across
-    /// a restart), or never noticing a boundary already crossed while the process was down. Only
-    /// sets `period` when `written > 0` -- the same guard [`RotationState::should_rotate`] itself
-    /// uses -- since an empty file (created but never written to) has no previous period's events
-    /// to protect, mirroring the reasoning that keeps a freshly opened file's very first batch
-    /// from spuriously rotating.
+    /// Seeds `period` from an existing file's mtime at [`FileTarget::open`], as `written` is
+    /// seeded from its length. Without it, a restart under an `interval` policy would merge two
+    /// periods into one file, or miss a boundary crossed while the process was down. Skipped for
+    /// an empty file, which has no previous period to protect.
     fn seed_period(&mut self, mtime_unix: i64) {
         if self.policy.interval.is_some() && self.written > 0 {
             self.period = Some(self.period_for(mtime_unix));
@@ -122,17 +105,14 @@ impl RotationState {
     ///   active file was last written in, or
     /// - `max_bytes` is set and this write would cross it.
     ///
-    /// **`max_bytes` is a threshold, not a hard cap.** A single batch larger than `max_bytes` is
-    /// written whole into its own file rather than split -- tearing an event block across two
-    /// files would produce a file no reader can parse, which is strictly worse than one oversized
-    /// file. The `self.written > 0` guard is what makes that work: an empty active file never
-    /// rotates before its first (possibly oversized) batch lands.
+    /// **`max_bytes` is a threshold, not a hard cap.** A batch larger than `max_bytes` is written
+    /// whole into its own file, since a block torn across two files is unparseable. The
+    /// `self.written > 0` guard is what allows that: an empty file never rotates before its first
+    /// batch.
     ///
-    /// **Time rotation is write-triggered, not boundary-triggered.** `Output` gets no periodic
-    /// tick (`write_loop`'s `select!` has only a queue-peek arm and a shutdown-grace arm,
-    /// `crates/logit-pipeline/src/runtime.rs`), so an idle target rolls on its *next* write after
-    /// the boundary, not at it. The rolled file still holds exactly the previous period's events,
-    /// so this delays when a file appears, not what ends up in it.
+    /// **Time rotation is write-triggered.** An `Output` gets no periodic tick, so an idle target
+    /// rolls on its first write after the boundary. The rolled file still holds only the previous
+    /// period's events; only when it appears is delayed.
     fn should_rotate(&self, now_unix: i64, incoming: usize) -> bool {
         if let Some(period) = self.period {
             if self.period_for(now_unix) != period {
@@ -147,13 +127,8 @@ impl RotationState {
         false
     }
 
-    /// Records that `len` bytes were just written at `now_unix` -- called once per `send`, after
-    /// any rotation `should_rotate` triggered has already happened. Sets `period` on the first
-    /// call after open/rotation (see the field's own doc comment) when it isn't already set --
-    /// covers a freshly-*created* file, which has nothing for [`RotationState::seed_period`] to
-    /// seed from at open time. An existing file's period is seeded from its mtime at open instead
-    /// (`FileTarget::open`), so this only actually sets `period` here for a file that had none to
-    /// begin with.
+    /// Records `len` bytes written at `now_unix`, once per `send` after any rotation. Sets
+    /// `period` if unset: the first write to a new or just-rotated file.
     fn note_written(&mut self, now_unix: i64, len: usize) {
         if self.policy.interval.is_some() && self.period.is_none() {
             self.period = Some(self.period_for(now_unix));
@@ -169,11 +144,9 @@ impl RotationState {
     }
 }
 
-/// The result of a [`FileTarget::rotate`] call. `NotRotated` is the documented "the active file's
-/// rename failed, so the target kept writing to the file it already had open" case -- not an
-/// error (nothing on disk was touched, and the existing handle, if any, is still perfectly good to
-/// keep writing to), but it must never be counted as an actual rotation
-/// (`StreamOutput::send`'s `logit.output.file.rotations`).
+/// The result of [`FileTarget::rotate`]. `NotRotated`: the active file's rename failed, nothing
+/// on disk changed, and the target keeps writing to its open handle. Not an error, but never
+/// counted in `logit.output.file.rotations`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum RotateOutcome {
@@ -181,12 +154,8 @@ pub enum RotateOutcome {
     NotRotated,
 }
 
-/// Opens the active file at `path` -- shared by [`FileTarget::open`] (the initial open) and
-/// [`FileTarget::rotate_inner`]'s two re-open sites (truncate-in-place under `max_files: 1`, and
-/// the fresh file after a committed rename). `truncate` selects which: `true` discards the
-/// existing content in place (there is no `.1` to rename into under `max_files: 1`), `false`
-/// appends (the normal case -- `path` was just renamed away, or never existed, so a fresh `create`
-/// starts empty regardless).
+/// Opens the active file at `path`, creating it if needed. `truncate: true` is `max_files: 1`'s
+/// in-place rotation; otherwise it appends.
 fn open_active(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true);
@@ -198,18 +167,13 @@ fn open_active(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
-/// The open file `Target::File` writes to (`crate::stdio`), plus everything needed to decide when
-/// and how to rotate it. Opened eagerly via [`FileTarget::open`], exactly like `stdio_out`'s
-/// previous standalone `open_path` did -- called from `build_spec` at config-build time, so a bad
-/// path or a permissions error is a config error that fails before anything starts listening.
+/// The open file `Target::File` writes to, plus its rotation state. Opened eagerly at
+/// config-build time, so a bad path or permissions error fails startup.
 #[derive(Debug)]
 pub struct FileTarget {
     path: PathBuf,
-    /// The open handle to `path`. `None` only between a committed rotation rename (the instant
-    /// `path` is renamed away) and a successful re-open at the same path -- never a handle to an
-    /// already-rotated-away file, since the handle is dropped at exactly that rename, not lazily
-    /// discovered stale afterward. [`FileTarget::write_all`]/[`FileTarget::flush`] re-open it
-    /// lazily via `ensure_open` on the next write if it's still `None`.
+    /// The handle to `path`. `None` only between a committed rotation rename and a successful
+    /// re-open; never a handle to a rotated-away file. [`FileTarget::write_all`] re-opens it.
     file: Option<tokio::fs::File>,
     state: RotationState,
 }
@@ -235,12 +199,9 @@ impl FileTarget {
         })
     }
 
-    /// Lazily (re-)opens the active file when `self.file` is `None` -- only ever true between a
-    /// committed rotation rename and a successful re-open (see the `file` field's own doc
-    /// comment). This is what lets a write that arrives after a failed re-open self-heal on its
-    /// own, rather than needing `rotate` itself to have succeeded synchronously. Attaches
-    /// `Fault::Clean` on failure -- see [`FileTarget::rotate`]'s doc comment for why a failure here
-    /// is always safe to retry.
+    /// Re-opens the active file if `self.file` is `None`, so a write after a failed post-rotation
+    /// re-open heals itself. A failure is `Fault::Clean` for the reason [`FileTarget::rotate`]
+    /// gives.
     fn ensure_open(&mut self) -> anyhow::Result<&mut tokio::fs::File> {
         if self.file.is_none() {
             let std_file = open_active(&self.path, false)
@@ -251,16 +212,13 @@ impl FileTarget {
         Ok(self.file.as_mut().expect("just set to Some above if it was None"))
     }
 
-    /// Writes `bytes` to the active file, re-opening it first if a previous rotation's re-open
-    /// failed and left `self.file` as `None`. Replaces the old `file_mut().write_all(...)` call
-    /// site now that the handle isn't always present.
+    /// Writes `bytes` to the active file, re-opening it first if a rotation's re-open failed.
     pub async fn write_all(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.ensure_open()?.write_all(bytes).await?;
         Ok(())
     }
 
-    /// Flushes the active file -- a no-op when there is no open handle (nothing buffered to
-    /// flush), rather than forcing a re-open just to flush nothing.
+    /// Flushes the active file to the OS (no `fsync`); a no-op with no open handle.
     pub async fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(file) = self.file.as_mut() {
             file.flush().await?;
@@ -284,27 +242,21 @@ impl FileTarget {
         PathBuf::from(name)
     }
 
-    /// Transient staging path used only between the commit-point rename in [`FileTarget::rotate`]
-    /// and its promotion to `.1` in [`FileTarget::promote_staged`]. An orphan left behind by a
-    /// process killed in that window is picked up and promoted on the *next* rotation, never lost.
-    /// Like a `.1`-suffixed file, this is never matched by `tail_in`'s anchored wildcard (ADR
-    /// `file-tailing-and-docker-json-logs`, "Rotation and truncation") -- a `.rotating` suffix is
-    /// just as much a non-match as a numeric one.
+    /// `path.rotating`: holds the rotated file between [`FileTarget::rotate`]'s commit-point
+    /// rename and [`FileTarget::promote_staged`]. An orphan from a kill in that window is promoted
+    /// on the next rotation. `tail_in`'s anchored wildcard never matches it, as with `.1`
+    /// (`docs/adr/file-tailing-and-docker-json-logs.md`, "Rotation and truncation").
     fn staging_path(&self) -> PathBuf {
         let mut name = self.path.clone().into_os_string();
         name.push(".rotating");
         PathBuf::from(name)
     }
 
-    /// Promotes a staged file (at [`FileTarget::staging_path`]) to `.1`, cascading every currently
-    /// retained rotated file up one suffix first (dropping the oldest if it would fall off the end
-    /// of `max_files`). A no-op when there is no staging file to promote. Called twice from
-    /// [`FileTarget::rotate_inner`]: once before this rotation's own commit-point rename, to
-    /// recover a staging file orphaned by a process killed between a *previous* run's rename and
-    /// its promotion; once after, to promote what this rotation just staged. Only ever reached
-    /// when `max_files >= 2` -- the `max_files == 1` case returns before ever staging anything.
-    /// Every failure here is `retention_failure`: it only risks losing history, not correctness,
-    /// so it's reported (throttled) and skipped rather than failing the whole rotation.
+    /// Promotes the staged file to `.1`, first shifting each retained `.N` up one and removing
+    /// `.{max_files - 1}`. A no-op with nothing staged; only reached when `max_files >= 2`.
+    ///
+    /// Every failure is a throttled `retention_failure` and is skipped: it risks losing history,
+    /// not correctness.
     fn promote_staged(&self, diag: &mut Diagnostics) {
         let staging = self.staging_path();
         if !staging.exists() {
@@ -343,51 +295,39 @@ impl FileTarget {
         }
     }
 
-    /// Rotates the active file, **commit-point first**: the active file is renamed to a transient
-    /// staging path (see [`FileTarget::staging_path`]) *before* anything retained is touched, so a
-    /// process killed mid-rotation leaves at most an orphaned staging file -- recovered on the next
-    /// rotation -- rather than ever risking a `.1`/`.2`/... while the rename that would feed it is
-    /// still in flight. Order:
+    /// Rotates the active file, **commit point first**: the active file is renamed to its staging
+    /// path before anything retained is touched, so a kill mid-rotation leaves at most an orphaned
+    /// staging file, recovered on the next rotation. Order:
     ///
     /// 1. Flush the active handle, if any.
-    /// 2. `max_files == 1`: no room to keep any rotated file at all, so "rotating" means
-    ///    truncating the active file in place rather than ever creating a `.1` -- no staging, no
-    ///    cascade.
-    /// 3. Otherwise, [`FileTarget::promote_staged`] first, recovering any staging file orphaned by
-    ///    a process killed mid-rotation on a *previous* run, before this rotation stages a new one.
+    /// 2. `max_files == 1`: truncate the active file in place; no staging, no cascade.
+    /// 3. Otherwise, [`FileTarget::promote_staged`], recovering an orphan from a previous run.
     /// 4. **Commit point:** rename the active file to its staging path.
     /// 5. Drop the handle and reset rotation state.
     /// 6. Re-open `path` fresh.
-    /// 7. [`FileTarget::promote_staged`] again -- cascades retained files up one suffix, then
-    ///    promotes the just-staged file to `.1` -- unconditionally, regardless of whether step 6
-    ///    succeeded, so the previous period's events reach `.1` either way.
+    /// 7. [`FileTarget::promote_staged`] again, whether or not step 6 succeeded, so the previous
+    ///    period's events reach `.1` either way.
     ///
-    /// Failure policy, deliberately asymmetric:
+    /// Failure policy:
     ///
-    /// | Failure | Handling |
-    /// |---|---|
-    /// | Flushing the active file before rotating | Fatal -- bubbles as `Err` |
-    /// | Renaming the active file to its staging path (or truncating under `max_files: 1`) | `rotate_failure`, [`RotateOutcome::NotRotated`] -- nothing on disk touched, state left unchanged so the next write retries safely |
-    /// | Re-opening `path` after a committed rename (or truncate) | `Err`, classified [`Fault::Clean`] |
-    /// | Cascading/promoting a *retained* file | `retention_failure`, continue |
+    /// - Flushing before rotating: unclassified `Err`.
+    /// - Renaming the active file to its staging path: `rotate_failure` and
+    ///   [`RotateOutcome::NotRotated`]; nothing on disk or in state changed, so the next write
+    ///   retries.
+    /// - Re-opening `path` after the rename, or the `max_files: 1` truncate: `Err` with
+    ///   [`Fault::Clean`].
+    /// - Cascading or promoting a retained file: `retention_failure`, continue.
     ///
-    /// The re-open failure is classified `Fault::Clean`, not left to default to `Permanent`: the
-    /// bytes provably never reached any file, so retrying the batch is safe under either delivery
-    /// posture, and per `logit_pipeline::output`'s `is_explicitly_permanent` doc comment, a
-    /// transient condition like this (most likely ENOSPC/EMFILE-class) must never count toward
-    /// `write_loop`'s sustained-permanent-failure exit window the way a real configuration error
-    /// would. See `docs/adr/rotating-file-output.md`'s "Retention" section for the full reasoning.
+    /// A re-open failure is `Fault::Clean`: the batch provably reached no file, so a retry is safe
+    /// under either delivery posture, and a likely-transient ENOSPC/EMFILE-class failure isn't a
+    /// configuration error (`docs/adr/rotating-file-output.md`, "Retention").
     pub async fn rotate(&mut self, diag: &mut Diagnostics) -> anyhow::Result<RotateOutcome> {
         self.rotate_inner(diag, open_active).await
     }
 
-    /// The actual rotation logic behind [`FileTarget::rotate`], parameterized over how the active
-    /// file gets (re-)opened so a test can inject a failing opener. This seam exists because, once
-    /// `path` has been renamed away by the commit-point rename below, a `create` at that
-    /// now-freed name in a writable directory can't be made to fail through any path or permission
-    /// trick available to a test -- the real failure mode there is ENOSPC/EMFILE-class, which a
-    /// unit test can't induce on demand either, so injection is the only way to exercise it. A
-    /// plain `fn` pointer, not `impl Fn`, so the returned future stays `Send`.
+    /// [`FileTarget::rotate`] with an injectable opener: once `path` is renamed away, no test can
+    /// make a `create` there fail, so injection is the only way to exercise that path. A `fn`
+    /// pointer, not `impl Fn`, so the future stays `Send`.
     async fn rotate_inner(
         &mut self,
         diag: &mut Diagnostics,
@@ -401,8 +341,7 @@ impl FileTarget {
 
         let max_files = self.state.policy.max_files.max(1);
         if max_files == 1 {
-            // No room to keep any rotated file -- "rotating" a single-file policy means starting
-            // a fresh, empty file in place rather than ever creating a `.1`.
+            // No room for a `.1`: start an empty file in place.
             return match open(&self.path, true) {
                 Ok(std_file) => {
                     self.file = Some(tokio::fs::File::from_std(std_file));
@@ -415,15 +354,11 @@ impl FileTarget {
             };
         }
 
-        // Recover any staging file orphaned by a process killed mid-rotation on a previous run,
-        // before this rotation creates a new one.
+        // Recover an orphaned staging file before this rotation stages a new one.
         self.promote_staged(diag);
 
-        // Commit point: everything before this line is read-only with respect to what's already
-        // on disk. A failure here means rotation didn't happen at all -- the safest response is to
-        // keep the existing, already-flushed handle open and retry on the next write (the
-        // throttled diagnostic bounds how often this actually reports), not to error the whole
-        // sink over what might be a transient permissions issue.
+        // Commit point. On failure nothing rotated: keep the flushed handle and retry on the
+        // next write rather than failing the sink over a possibly transient permissions issue.
         let staging = self.staging_path();
         if let Err(e) = std::fs::rename(&self.path, &staging) {
             diag.warn_throttled(
@@ -446,9 +381,7 @@ impl FileTarget {
                 .context(Fault::Clean),
         };
 
-        // Cascades retained files up one suffix, then promotes the file just staged above to
-        // `.1` -- unconditionally, regardless of whether the re-open above succeeded, so the
-        // previous period's events reach `.1` either way.
+        // Whether or not the re-open succeeded, so the staged file still reaches `.1`.
         self.promote_staged(diag);
 
         reopened.map(|()| RotateOutcome::Rotated)
@@ -469,10 +402,8 @@ pub(crate) mod test_support {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    // This crate has no `tempfile` dependency (`docs/adr/file-tailing-and-docker-json-logs.md`'s
-    // Alternatives), so tests build and tear down their own unique scratch directories by hand,
-    // following `crates/logit-cli/src/pipeline.rs`'s own `std::env::temp_dir()`-based precedent
-    // (`crates/logit-inputs/src/tail/mod.rs::test_support::scratch_dir` is the same helper).
+    // No `tempfile` dependency (`docs/adr/file-tailing-and-docker-json-logs.md`, Alternatives),
+    // so tests make unique scratch directories by hand, as `logit-inputs`' tail tests do.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn scratch_dir(label: &str) -> PathBuf {
@@ -516,9 +447,7 @@ mod tests {
         file.set_modified(time).expect("set_modified");
     }
 
-    /// The `key` attribute of every diagnostic `warn_throttled` reported into `registry`, in
-    /// report order -- lets a test assert *which* failure key fired (`rotate_failure` vs.
-    /// `retention_failure`) rather than just that something did.
+    /// The `key` of every diagnostic reported into `registry`, in report order.
     fn reported_diagnostic_keys(registry: &Registry) -> Vec<String> {
         registry
             .drain(0)
@@ -527,9 +456,7 @@ mod tests {
             .collect()
     }
 
-    // ---------------------------------------------------------------------------------------
-    // RotationState::should_rotate -- pure, synchronous, no real files or clocks involved.
-    // ---------------------------------------------------------------------------------------
+    // --- RotationState::should_rotate: no real files or clocks ---
 
     #[test]
     fn never_policy_never_rotates_for_any_input() {
@@ -572,7 +499,7 @@ mod tests {
 
     #[test]
     fn the_first_write_ever_never_rotates_even_under_an_interval_policy() {
-        // `period` starts `None` -- there is nothing to compare `now_unix`'s period against yet.
+        // `period` starts `None`, so there is nothing to compare against yet.
         let state = RotationState::new(0, interval_policy(RotateInterval::Daily));
         assert!(!state.should_rotate(0, 10));
         assert!(!state.should_rotate(999_999_999, 10));
@@ -619,9 +546,7 @@ mod tests {
         assert!(!state.should_rotate(0, 10), "the first write into a fresh file must not rotate");
     }
 
-    // ---------------------------------------------------------------------------------------
-    // rotate / write_all / flush -- real files, real filesystem state.
-    // ---------------------------------------------------------------------------------------
+    // --- rotate / write_all / flush: real files ---
 
     #[tokio::test]
     async fn a_size_rotation_moves_the_old_content_to_dot_1_and_starts_fresh() {
@@ -649,9 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_larger_than_max_bytes_lands_whole_in_one_file_never_split() {
-        // should_rotate is checked *before* the write in `StreamOutput::send`, not enforced here
-        // -- this pins that a target itself never splits a write; the sink is what decides not to
-        // call `rotate` mid-write.
+        // The target never splits a write; `StreamOutput::send` decides when to rotate.
         let dir = scratch_dir("oversized-batch");
         let path = dir.join("events.log");
         let mut target = FileTarget::open(&path, size_policy(10)).expect("open");
@@ -763,9 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_clean_rotation_reports_no_diagnostics() {
-        // `FileTarget` doesn't hold a `Telemetry` handle of its own -- `logit.output.file.
-        // rotations` is `StreamOutput`'s to count (exercised in `stdio.rs`'s own tests). This
-        // just pins that a clean rotation reports nothing via `Diagnostics`.
+        // `logit.output.file.rotations` is `StreamOutput`'s to count (`stdio.rs`'s tests).
         let dir = scratch_dir("clean-rotate");
         let path = dir.join("events.log");
         let mut target = FileTarget::open(&path, size_policy(1)).expect("open");
@@ -783,9 +704,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---------------------------------------------------------------------------------------
-    // F1: commit-point-first rotation -- a failed active-file rename touches nothing retained.
-    // ---------------------------------------------------------------------------------------
+    // --- Commit point first: a failed active-file rename touches nothing retained ---
 
     #[tokio::test]
     async fn a_failed_active_file_rename_leaves_every_retained_file_completely_untouched() {
@@ -794,7 +713,6 @@ mod tests {
         let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 3 };
         let mut target = FileTarget::open(&path, policy).expect("open");
 
-        // Two real rotations to populate .1 and .2 with known content.
         target.write_all(b"a").await.unwrap();
         target.note_written(0, 1);
         assert_eq!(
@@ -808,9 +726,8 @@ mod tests {
             RotateOutcome::Rotated
         );
 
-        // Now .1 == "b", .2 == "a". Unlink the active file out from under the still-open handle
-        // -- the fd stays valid (writes still land, just nowhere `path` can see), but the
-        // commit-point rename below has nothing at `path` to rename any more.
+        // Now .1 == "b", .2 == "a". The fd stays valid after the unlink, but the commit-point
+        // rename has nothing at `path`.
         target.write_all(b"c").await.unwrap();
         std::fs::remove_file(&path).unwrap();
 
@@ -870,8 +787,7 @@ mod tests {
     async fn a_stale_staging_file_from_a_killed_process_is_promoted_on_the_next_rotation() {
         let dir = scratch_dir("stale-staging-promoted");
         let path = dir.join("events.log");
-        // Simulate a process killed exactly between the commit-point rename and its promotion on
-        // a previous run: `path` doesn't exist yet, but a staging file from that rename does.
+        // A previous run killed between the commit-point rename and its promotion.
         std::fs::write(dir.join("events.log.rotating"), b"orphan").unwrap();
 
         let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 3 };
@@ -898,9 +814,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---------------------------------------------------------------------------------------
-    // F2: Option<File> + Fault::Clean reopen classification.
-    // ---------------------------------------------------------------------------------------
+    // --- A failed re-open: `file: None` and `Fault::Clean` ---
 
     #[tokio::test]
     async fn a_failed_reopen_after_a_committed_rename_never_writes_into_the_rotated_file() {

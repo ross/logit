@@ -1187,10 +1187,11 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   a tenant header always travels — as would `influxdb_out`'s token and a scrape URL's basic-auth
   credential. `otlp_out` and `prometheus_out`'s remote-write sender already share
   `crates/logit-outputs/src/http.rs`'s `build_client`, which turns redirects off; that helper's doc
-  comment has the reasoning and names the influxdb half as a separate gap. Not a one-line flip:
-  `influxdb_out` keeps its own `status_class`/`classify_transport_error` pair on purpose (its module
-  doc argues its classification is its own to evolve), and moving to the shared client is that
-  change.
+  comment has the reasoning, and `http.rs`'s module doc names the influxdb half as this gap. Not a
+  one-line flip: `influxdb_out` keeps its own client and its own
+  `status_class`/`is_retryable_status`/`classify_transport_error` (the same table as `http.rs`'s
+  today, as its module doc says), so closing this means moving it onto the shared client and
+  classifier.
 - **`logit.input.samples` means two different things depending on `prometheus_in`'s mode.** Scrape
   mode counts the *series* a scrape decoded (`events.len()`, one event per series,
   `crates/logit-inputs/src/prometheus.rs`'s `tick`); bind mode counts **wire samples** reaching the
@@ -1335,9 +1336,9 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   /srv/app/logs/*.log]` over a symlink registers one watch and reports two. Harmless: a
   `Wake::Discover` may name the other spelling, but the driver discards its payload before
   rescanning, and the `IN_IGNORED` purge drops both entries together. Only the gauge over-reports,
-  and `docs/deploying.md`'s "What to watch" says so. Normalizing the desired set (or passing
-  `IN_DONT_FOLLOW`) would change which paths a config can name — a config-surface decision, not a
-  bug fix.
+  and `docs/deploying.md`'s "What to watch for file tailing" says so. Normalizing the desired set
+  (or passing `IN_DONT_FOLLOW`) would change which paths a config can name — a config-surface
+  decision, not a bug fix.
 - **`parse_events` discards the rest of a `read` buffer after a malformed event**, rather than
   resynchronizing. Unreachable from a real inotify fd (the kernel never returns a partial event,
   and `len` is always 0 or a multiple of 16 — both pinned in the ADR), and acceptable because the

@@ -151,7 +151,7 @@
       "id": 7,
       "type": "stat",
       "title": "logit.process.interner.strings",
-      "description": "docs/known-gaps.md's interner-size observability hook -- the interner never evicts, so this only ever grows.",
+      "description": "Distinct strings in the process-wide interner. The interner never evicts, so this only ever grows.",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 32 },
       "datasource": { "type": "influxdb", "uid": "influxdb" },
       "targets": [

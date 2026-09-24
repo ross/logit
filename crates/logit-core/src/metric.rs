@@ -3,10 +3,8 @@ use crate::trace::TraceRef;
 use crate::AttrMap;
 use smallvec::SmallVec;
 
-/// Whether a series reports fresh increments since the last report (`Delta`) or a running total
-/// since a fixed start time (`Cumulative`) -- OTLP's own `AggregationTemporality`, now a real field
-/// on [`Sum`]/[`Histogram`]/[`ExpHistogram`] instead of a decode-only well-known attribute the way
-/// it used to (`docs/adr/lossless-transit.md`).
+/// Whether a series reports increments since the last report (`Delta`) or a running total since a
+/// fixed start time (`Cumulative`): OTLP's `AggregationTemporality`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Temporality {
     Delta,
@@ -14,8 +12,8 @@ pub enum Temporality {
 }
 
 impl Temporality {
-    /// Every variant's lowercase name, in variant order -- the names the Lua API and `stdio_out`
-    /// render and accept.
+    /// Every variant's lowercase name, in variant order: what the Lua API and `stdio_out` render
+    /// and accept.
     pub const NAMES: [&'static str; 2] = ["delta", "cumulative"];
 
     /// The lowercase name the Lua API and `stdio_out` render this temporality as.
@@ -26,8 +24,7 @@ impl Temporality {
         }
     }
 
-    /// The inverse of [`Temporality::as_str`]: an exact lowercase match, no case folding or
-    /// aliases.
+    /// The inverse of [`Temporality::as_str`]: lowercase only, no case folding or aliases.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "delta" => Temporality::Delta,
@@ -42,40 +39,37 @@ pub struct MetricRecord {
     pub name: Symbol,
     pub unit: Option<Symbol>,
     pub description: Option<Symbol>,
-    /// Unix nanoseconds this series started accumulating at; `0` means unknown -- OTLP's own
-    /// convention for an absent `start_time_unix_nano`, which avoids an `Option<i64>` here.
+    /// Unix nanoseconds this series started accumulating at; `0` means unknown, OTLP's convention
+    /// for an absent `start_time_unix_nano`, which avoids an `Option<i64>` here.
     pub start_timestamp: i64,
-    /// Empty `Vec` allocates nothing on the common no-exemplars path.
+    /// Empty on the common path, where it allocates nothing.
     pub exemplars: Vec<Exemplar>,
-    /// OTLP `DataPointFlags` bitmask, `0` default -- exists so a data point flagged
-    /// `NO_RECORDED_VALUE` (bit 0, [`MetricRecord::FLAG_NO_RECORDED_VALUE`], see
-    /// [`MetricRecord::is_no_recorded_value`]) round-trips as a flagged point carrying its type's
-    /// default value, rather than being silently skipped the way the OTLP codec used to treat it
-    /// (`docs/adr/metrics-model-v2.md`'s W4 amendment). `otlp_out` keeps and re-encodes a flagged
-    /// point unchanged -- that's the fixed point `docs/adr/lossless-transit.md` requires for
-    /// `otlp_in -> otlp_out`. `collectd_out` re-encodes a flagged `Gauge` as a GAUGE `NaN`, which is
-    /// collectd's *own* no-value marker (`crates/logit-proto/src/collectd/mod.rs`'s module doc, and
-    /// `docs/adr/collectd-binary-relay.md`'s "NaN is a flagged point, not a dropped one") -- the
-    /// second wire with a real concept for this, and the reason that ADR narrows this rule to
-    /// "every sink whose wire has no no-value concept" rather than "every non-OTLP sink." So: every
-    /// sink whose wire format has **no** such concept, and `aggregate`'s fold, must instead treat a
-    /// flagged record as carrying no genuine reading -- skip it (counted) at a sink, pass it through
-    /// unmerged (counted) at `aggregate`, rather than fold its default numeric payload in as though
-    /// it were a real sample (`docs/known-gaps.md`'s cross-protocol table has the one-row summary).
-    /// Fills the 4 bytes of padding that already followed the three `Symbol`s above, so
-    /// [`MetricRecord`] stays 224 bytes -- see `crates/logit-core/tests/type_sizes.rs`.
+    /// OTLP `DataPointFlags` bitmask, `0` by default.
+    ///
+    /// A point flagged `NO_RECORDED_VALUE` ([`MetricRecord::FLAG_NO_RECORDED_VALUE`], checked by
+    /// [`MetricRecord::is_no_recorded_value`]) is kept as a flagged record carrying its kind's
+    /// default value. Two wires have their own no-value concept and carry it: `otlp_out`
+    /// re-encodes the point unchanged (the `otlp_in -> otlp_out` fixed point
+    /// `docs/adr/lossless-transit.md` requires), and `collectd_out` writes a flagged `Gauge` as a
+    /// GAUGE `NaN` (`docs/adr/collectd-binary-relay.md`'s "NaN is a flagged point, not a dropped
+    /// one"). Every other sink, and `aggregate`'s fold, must treat a flagged record as carrying no
+    /// reading: skip it (counted) at a sink, pass it through unmerged (counted) at `aggregate`.
+    /// Folding in the default numeric payload would fabricate a sample. `docs/known-gaps.md`'s
+    /// cross-protocol table has the per-sink summary.
+    ///
+    /// Occupies padding after the three `Symbol`s, so it costs [`MetricRecord`] no size
+    /// (`crates/logit-core/tests/type_sizes.rs`).
     pub flags: u32,
     pub kind: MetricKind,
 }
 
 impl MetricRecord {
-    /// OTLP `DataPointFlags::FLAG_NO_RECORDED_VALUE` (bit 0) -- the point has no recorded value;
-    /// its numeric payload should be treated as absent rather than a genuine `0`/empty reading.
+    /// OTLP `DataPointFlags::FLAG_NO_RECORDED_VALUE` (bit 0): the numeric payload is absent, not
+    /// a real `0`/empty reading.
     pub const FLAG_NO_RECORDED_VALUE: u32 = 1 << 0;
 
-    /// A record carrying just a name and a kind -- `unit`/`description` `None`, `start_timestamp`
-    /// `0` (unknown), `exemplars` empty, `flags` `0`. What most producers and nearly every test
-    /// want.
+    /// A record with only a name and a kind: no unit or description, `start_timestamp` `0`
+    /// (unknown), no exemplars, no flags.
     pub fn new(name: Symbol, kind: MetricKind) -> Self {
         MetricRecord {
             name,
@@ -88,70 +82,56 @@ impl MetricRecord {
         }
     }
 
-    /// Whether this record carries `FLAG_NO_RECORDED_VALUE` -- see the doc on [`Self::flags`]
-    /// above for who must check this and what to do about it.
+    /// Whether this record carries `FLAG_NO_RECORDED_VALUE`; [`Self::flags`] says who must check
+    /// it and what to do.
     pub fn is_no_recorded_value(&self) -> bool {
         self.flags & Self::FLAG_NO_RECORDED_VALUE != 0
     }
 }
 
-/// Metric kinds are chosen to be *mergeable*: the split-collection topology (`docs/OVERVIEW.md`)
-/// means two edge nodes' aggregates may need combining downstream, and that has to be exact where
-/// the math allows it (`Sum`, `Gauge`, `Set`) and correctly error-bounded where it can't
-/// (`Distribution`). See `docs/design/data-model.md`.
+/// Metric kinds are mergeable: in the split-collection topology (`docs/OVERVIEW.md`) two edge
+/// nodes' aggregates may be combined downstream, and that must be exact where the math allows
+/// (`Sum`, `Gauge`, `Set`) and correctly error-bounded where it can't (`Distribution`). See
+/// `docs/design/data-model.md`.
 ///
-/// `Samples`/`SetMembers` carry raw, unsummarized observations exactly as a protocol like statsd
-/// hands them over (`ms`/`h`/`d` timings, `s` set members) -- `docs/adr/lossless-transit.md`'s
-/// "summarization is opt-in and named" rule: a decoder never pre-summarizes what an explicit
-/// `aggregate` stage should decide about. `Distribution`/`Set` are the *summarized* counterparts,
-/// produced only by `aggregate`. `ExponentialHistogram` is kept distinct from `Histogram` rather
-/// than always materializing explicit buckets on decode, specifically so an OTLP
-/// `ExponentialHistogram` round-trips through `otlp_in -> otlp_out` as a fixed point, not a lossy
-/// conversion.
+/// `Samples`/`SetMembers` carry raw observations as a protocol like statsd hands them over; a
+/// decoder never pre-summarizes (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
+/// named" rule). `Distribution`/`Set` are the summarized counterparts, produced only by
+/// `aggregate`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricKind {
-    /// Replaces the old `Counter` -- a counter is `Sum { temporality: Delta, monotonic: true }`,
-    /// via [`MetricKind::counter`].
+    /// A counter is `Sum { temporality: Delta, monotonic: true }`; see [`MetricKind::counter`].
     Sum(Sum),
     Gauge(f64),
-    /// A *relative* adjustment to a gauge's previous value (statsd/DogStatsD's leading `+`/`-`
-    /// syntax, `crates/logit-inputs/src/statsd.rs`) -- **unresolved**. This variant must never
-    /// reach a sink; it is resolved into an ordinary [`MetricKind::Gauge`] by the `aggregate`
-    /// transform (`crates/logit-transforms/src/aggregate.rs`), which is the only component that
-    /// carries the running gauge value a delta needs to apply against. See
-    /// `docs/adr/relative-gauge-adjustments.md`.
+    /// An unresolved relative adjustment to a gauge's previous value (statsd's leading `+`/`-`).
+    /// Must never reach a sink: `aggregate`, the only component holding the running gauge value,
+    /// resolves it into a [`MetricKind::Gauge`] (`docs/adr/relative-gauge-adjustments.md`).
     GaugeDelta(f64),
-    /// Raw observations, as statsd `ms`/`h`/`d` values arrive -- `statsd_in` decodes `ms`/`h`/`d`
-    /// to it since W3 (`docs/plans/lossless-transit.md`), and `kv_metrics` derives its
-    /// `distributions:` entries to it, one value per event
-    /// (`docs/adr/kv-metrics-semantics.md`).
+    /// Raw observations: statsd `ms`/`h`/`d`, and `kv_metrics`' `distributions:` entries.
     Samples(Samples),
     /// Produced only by `aggregate`, merging a run of [`MetricKind::Samples`].
     Distribution(DdSketch),
-    /// Raw set members, as statsd `s` arrives -- `statsd_in` decodes `s` to it since W3.
+    /// Raw set members, as statsd `s` arrives.
     SetMembers(Vec<bytes::Bytes>),
-    /// Produced only by `aggregate`, merging a run of [`MetricKind::SetMembers`] into a real,
-    /// mergeable cardinality estimate -- see [`HyperLogLog`].
+    /// Produced only by `aggregate`, merging a run of [`MetricKind::SetMembers`].
     Set(HyperLogLog),
-    /// Fixed, explicit bucket bounds, e.g. a Prometheus-style scrape input or an OTLP
-    /// `HistogramDataPoint`.
+    /// Explicit bucket bounds, e.g. a Prometheus scrape or an OTLP `HistogramDataPoint`.
     Histogram(Histogram),
-    /// OTLP/Prometheus-native base-2 exponential bucketing -- kept distinct from [`Histogram`] so
-    /// `otlp_in -> otlp_out` is a fixed point, not a lossy conversion.
+    /// OTLP/Prometheus-native base-2 exponential bucketing. Kept distinct from [`Histogram`]
+    /// rather than materialized into explicit buckets so `otlp_in -> otlp_out` is a fixed point.
     ExponentialHistogram(ExpHistogram),
-    /// Pre-computed quantiles, e.g. some scrape inputs or OTLP `SummaryDataPoint`s report these
-    /// directly.
+    /// Pre-computed quantiles, e.g. a Prometheus summary or an OTLP `SummaryDataPoint`.
     Summary(Summary),
 }
 
 impl MetricKind {
-    /// A monotonic delta sum -- what the old `MetricKind::Counter(v)` meant.
+    /// A monotonic delta sum: a counter increment.
     pub fn counter(v: f64) -> Self {
         MetricKind::Sum(Sum { value: v, temporality: Temporality::Delta, monotonic: true })
     }
 
-    /// The lowercase snake_case name of this variant -- the `kind` the Lua API and `stdio_out`
-    /// render. There is no `from_name`: a name alone cannot construct a kind's payload.
+    /// The snake_case variant name the Lua API and `stdio_out` render as `kind`. There is no
+    /// `from_name`: a name alone can't construct a payload.
     pub fn name(&self) -> &'static str {
         match self {
             MetricKind::Sum(_) => "sum",
@@ -175,19 +155,14 @@ pub struct Sum {
     pub monotonic: bool,
 }
 
-/// Sized to keep [`MetricKind`] at its existing 176-byte size. `SAMPLES_INLINE` is measured, not
-/// guessed: `size_of::<DdSketch>()` is 176 (a `sketches_ddsketch::DDSketch` inlined directly, no
-/// `Box`), and `MetricKind::Distribution(DdSketch)` fits in exactly 176 bytes with no extra
-/// discriminant byte -- rustc niche-fills the outer enum tag into spare bit patterns inside
-/// `DDSketch`'s own layout. `SmallVec<[f64; N]>` under this workspace's `union` feature costs
-/// `max(24, N * 8 + 8)` bytes (confirmed by direct measurement, not the smallvec docs), so
-/// `Samples { values, sample_rate: f64 }` costs `N * 8 + 16`. That niche-filling trick is specific
-/// to `DDSketch`'s own layout, not available to `Samples`, so once a `Samples` variant is exactly
-/// 176 bytes too, `MetricKind` needs a real discriminant on top and grows to 184 -- measured
-/// directly (`N = 20` gives `size_of::<Samples>() == 176` and `size_of::<MetricKind>() == 184`).
-/// `N = 19` is the largest value that leaves room for that discriminant: `size_of::<Samples>() ==
-/// 168`, `size_of::<MetricKind>()` stays the required 176. Both are asserted exactly in
-/// `crates/logit-core/tests/type_sizes.rs`.
+/// The largest inline capacity that keeps [`MetricKind`] at 176 bytes, the size of its inlined
+/// [`DdSketch`] (measured).
+///
+/// `Distribution(DdSketch)` needs no discriminant byte: rustc niche-fills the tag into spare bit
+/// patterns inside `DDSketch`'s layout. `Samples` has no such niche. Under the workspace's
+/// smallvec `union` feature, `Samples` costs `N * 8 + 16` bytes: `N = 20` makes it 176 and grows
+/// `MetricKind` to 184 for the tag, while `N = 19` makes it 168 and leaves room for the tag.
+/// `crates/logit-core/tests/type_sizes.rs` asserts both sizes.
 pub const SAMPLES_INLINE: usize = 19;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,21 +173,20 @@ pub struct Samples {
 
 impl Samples {
     /// Upper bound on [`Samples::weight`]: a `@0.0001` rate would otherwise turn one observation
-    /// into ten thousand, and the rate is attacker-influenced wire input. Mirrors
-    /// `crates/logit-inputs/src/statsd.rs`'s `MAX_SAMPLE_WEIGHT`, which W3 folds into this one.
+    /// into ten thousand, and the rate is attacker-influenced wire input.
     pub const MAX_WEIGHT: u64 = 1000;
 
-    /// `sample_rate` defaults to `1.0` -- unsampled, the common case.
+    /// Unsampled: `sample_rate` is `1.0`.
     pub fn new(values: impl IntoIterator<Item = f64>) -> Self {
         Samples { values: SmallVec::from_iter(values), sample_rate: 1.0 }
     }
 
-    /// How many observations each value in `values` stands for: `round(1 / sample_rate)`,
-    /// clamped to `[1, MAX_WEIGHT]` -- the extrapolation a consumer sketching these applies per
-    /// value (`DdSketch::add_weighted`). A non-finite or non-positive rate (nothing upstream
-    /// validates `sample_rate`; the native decoder reads a bare `f64`) degrades to `1`, i.e.
-    /// unweighted, rather than to `0`: `f64::clamp` propagates NaN and `NaN as u64` is `0`,
-    /// which `add_weighted` treats as a no-op -- every observation would silently vanish.
+    /// How many observations each value stands for: `round(1 / sample_rate)`, clamped to
+    /// `[1, MAX_WEIGHT]`.
+    ///
+    /// A non-finite or non-positive rate (nothing upstream validates it; the native decoder reads
+    /// a bare `f64`) degrades to `1`, never `0`: `NaN as u64` is `0`, and
+    /// [`DdSketch::add_weighted`] with `0` is a no-op, so every observation would vanish.
     pub fn weight(&self) -> u64 {
         if !(self.sample_rate.is_finite() && self.sample_rate > 0.0) {
             return 1;
@@ -225,13 +199,9 @@ impl Samples {
         }
     }
 
-    /// Sketches these raw observations into a fresh [`DdSketch`], weighting each value by
-    /// [`Samples::weight`] -- what every consumer that needs to summarize a `Samples` does
-    /// (`crates/logit-proto/src/otlp/metrics.rs`, `crates/logit-outputs/src/influxdb.rs`, and
-    /// `aggregate`'s `Samples`-mode fallback), pulled into one place so the three call sites agree
-    /// by construction rather than by convention. `weight()` is already NaN-safe and clamped to
-    /// `[1, MAX_WEIGHT]`, so this never silently drops or explodes a value regardless of how
-    /// `sample_rate` arrived.
+    /// Sketches these observations into a fresh [`DdSketch`], each weighted by
+    /// [`Samples::weight`]. Every consumer that summarizes a `Samples` (`aggregate`, and the OTLP,
+    /// Prometheus, and Graphite encoders) goes through this, so they agree by construction.
     pub fn sketch(&self) -> DdSketch {
         let weight = self.weight();
         let mut sketch = DdSketch::new();
@@ -248,9 +218,8 @@ impl Default for Samples {
     }
 }
 
-/// Fixed-bucket histogram, e.g. a Prometheus-style scrape input or an OTLP `HistogramDataPoint`.
-/// Each `(bound, count)` pair is that bucket's own count, not a cumulative running total up to
-/// `bound`.
+/// Fixed-bucket histogram. Each `(bound, count)` is that bucket's own count, not a cumulative
+/// total up to `bound` (unlike Prometheus's `le` buckets).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Histogram {
     pub buckets: Vec<(f64, u64)>,
@@ -260,10 +229,8 @@ pub struct Histogram {
     pub max: Option<f64>,
 }
 
-/// OTLP's base-2 exponential histogram shape, carried 1:1 rather than materialized into explicit
-/// [`Histogram`] buckets on decode -- see [`MetricKind::ExponentialHistogram`]'s doc comment.
-/// `positive`/`negative` are each `(offset, bucket_counts)`, mirroring
-/// `ExponentialHistogramDataPoint.positive`/`.negative`.
+/// OTLP's base-2 exponential histogram, carried 1:1. `positive`/`negative` are each
+/// `(offset, bucket_counts)`, mirroring `ExponentialHistogramDataPoint.positive`/`.negative`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpHistogram {
     pub scale: i32,
@@ -278,8 +245,7 @@ pub struct ExpHistogram {
     pub max: Option<f64>,
 }
 
-/// Pre-computed quantiles, e.g. some scrape inputs or an OTLP `SummaryDataPoint` report these
-/// directly.
+/// Pre-computed `(quantile, value)` pairs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
     pub quantiles: Vec<(f64, f64)>,
@@ -287,10 +253,8 @@ pub struct Summary {
     pub sum: f64,
 }
 
-/// A single sampled measurement backing a metric point -- OTLP's exemplar concept: the specific
-/// trace a particular observation happened under, plus whatever attributes were dropped from the
-/// point's own attribute set to reach it. Produced by the OTLP codec since W4
-/// (`docs/plans/lossless-transit.md`).
+/// An OTLP exemplar: one observation behind a metric point, the trace it happened under, and the
+/// attributes filtered out of the point's own set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Exemplar {
     pub timestamp: i64,
@@ -299,10 +263,11 @@ pub struct Exemplar {
     pub filtered_attributes: AttrMap,
 }
 
-/// A mergeable quantile sketch, wrapping `sketches_ddsketch::DDSketch` (per
-/// `docs/design/data-model.md` -- merges with a guaranteed relative-error bound, unlike naive
-/// percentile-of-percentiles, which is load-bearing for the split-collection topology in
-/// `docs/OVERVIEW.md`).
+/// A mergeable quantile sketch wrapping `sketches_ddsketch::DDSketch`.
+///
+/// It merges with a guaranteed relative-error bound (1%, `Config::defaults()`), unlike a naive
+/// percentile of percentiles; the split-collection topology (`docs/OVERVIEW.md`) depends on that.
+/// See `docs/design/data-model.md`. Don't replace it with a non-mergeable shortcut.
 #[derive(Clone)]
 pub struct DdSketch(sketches_ddsketch::DDSketch);
 
@@ -313,9 +278,8 @@ impl std::fmt::Debug for DdSketch {
     }
 }
 
-/// `sketches_ddsketch::DDSketch` has no `PartialEq` of its own (no bin iteration exposed, see this
-/// struct's own doc comment) -- compare via [`DdSketch::to_java_bytes`], the only lossless view
-/// the wrapped crate exposes, and therefore the only faithful equality check available.
+/// `DDSketch` has no `PartialEq` and exposes no bins, so compare [`DdSketch::to_java_bytes`], the
+/// only lossless view it offers.
 impl PartialEq for DdSketch {
     fn eq(&self, other: &Self) -> bool {
         self.to_java_bytes() == other.to_java_bytes()
@@ -331,25 +295,19 @@ impl DdSketch {
         self.0.add(value);
     }
 
-    /// Adds `value` as `count` weighted samples -- e.g. what a sampled statsd timing/histogram
-    /// line needs to extrapolate `100|ms|@0.1` into ten samples rather than one
-    /// (`crates/logit-inputs/src/statsd.rs`). Delegates directly to
-    /// `sketches_ddsketch::DDSketch::add_with_count`, which computes the target bin once and
-    /// increments its stored count by `count` in constant time -- not a loop calling `add`
-    /// `count` times, and not a single-bucket sketch `merge`-d in via binary doubling either:
-    /// both would cost real, avoidable work (an O(count) loop, or O(log count) allocations for
-    /// the merge alternative) that `add_with_count` doesn't pay. Same zero-additional-allocation
-    /// property either way -- the bin `Vec` is allocated once, the first time any sample ever
-    /// lands in this sketch -- but O(1) instead of O(count) in CPU cost, which matters because
-    /// `count` can be attacker-influenced (a sampled statsd line's extrapolated weight). `count
-    /// == 0` is a no-op (`add_with_count`'s own contract).
+    /// Adds `value` as `count` samples, e.g. `100|ms|@0.1` as ten. `count == 0` is a no-op.
+    ///
+    /// O(1) via `DDSketch::add_with_count`. Keep it that way: `count` is attacker-influenced (a
+    /// sampled statsd line's weight), and an `add` loop is O(count) while a doubling `merge` costs
+    /// O(log count) allocations.
     pub fn add_weighted(&mut self, value: f64, count: u64) {
         self.0.add_with_count(value, count);
     }
 
-    /// Merges `other` into `self`. Every `DdSketch` in this codebase is built with
-    /// `Config::defaults()` (via [`DdSketch::new`]), so the mismatched-config failure case this
-    /// can't-actually-happen -- if that stops being true, this needs a real `Result`.
+    /// Merges `other` into `self`.
+    ///
+    /// Never panics today: every `DdSketch` is built with `Config::defaults()` via
+    /// [`DdSketch::new`], so configs always match. A second config would need a real `Result`.
     pub fn merge(&mut self, other: &DdSketch) {
         self.0.merge(&other.0).expect("DdSketch configs always match (Config::defaults())");
     }
@@ -362,42 +320,30 @@ impl DdSketch {
         self.0.count()
     }
 
-    /// The exact sum of every value ever added to this sketch -- **not** an estimate, unlike
-    /// [`DdSketch::quantile`]. `sketches_ddsketch` accumulates it as a plain `f64` alongside the
-    /// bins (and adds the two sums on `merge`), so it never goes through the bucketing that gives
-    /// a quantile its 1% relative-error bound.
+    /// The exact sum of every value added, not an estimate like [`DdSketch::quantile`].
     ///
-    /// Exact for a decoded sketch too: the "java bytes" format
-    /// ([`DdSketch::to_java_bytes`]) is DataDog's `DDSketchWithExactSummaryStatistics` encoding,
-    /// which carries the sum as its own little-endian `f64` field, so the native wire codec
-    /// (`logit_proto::native`) and the disk spool built on it already round-trip this value
-    /// byte-for-byte with no change to the format. (It's also why [`DdSketch`]'s `PartialEq`,
-    /// which compares those same bytes, already distinguishes two sketches whose bins agree but
-    /// whose sums don't.)
+    /// The inner crate keeps it as a plain `f64` beside the bins and adds the two on `merge`. The
+    /// java-bytes format ([`DdSketch::to_java_bytes`], DataDog's
+    /// `DDSketchWithExactSummaryStatistics`) carries it as its own `f64`, so it survives the
+    /// native wire and disk spool exactly, and `PartialEq` tells apart sketches whose sums differ.
     ///
-    /// `0.0` for an empty sketch -- the inner crate returns `None` there, but the sum of no
-    /// values is the additive identity, and every caller is accumulating a Σ (the per-node
-    /// `process.duration`/`send.blocked.duration` totals `logit-perf attribute` reports,
-    /// `docs/design/performance.md`), where `None` and `0.0` mean the same thing. Use
-    /// [`DdSketch::count`] when "empty" needs telling apart from "sums to zero".
+    /// `0.0` for an empty sketch, where the inner crate returns `None`: callers accumulate a total,
+    /// where the two mean the same. Use [`DdSketch::count`] to tell "empty" from "sums to zero".
     pub fn sum(&self) -> f64 {
         self.0.sum().unwrap_or(0.0)
     }
 
-    /// Serializes to DataDog's canonical "java bytes" sketch format -- a compact, cross-language
-    /// binary encoding, not specific to any JVM. This is how a `Distribution` survives a wire or
-    /// disk round trip losslessly: `DDSketch`'s own fields are private with no bin iteration
-    /// (see this struct's own doc comment), so a codec has no way to reconstruct one from parts --
-    /// this blob is the only lossless path in or out. `logit_proto::native`'s wire format uses it
-    /// directly; see `docs/design/wire-protocol.md`.
+    /// Serializes to DataDog's cross-language "java bytes" sketch format (not JVM-specific).
+    ///
+    /// `DDSketch`'s fields are private and expose no bins, so this blob is the only lossless way
+    /// in or out; `logit_proto::native` carries it as-is (`docs/design/wire-protocol.md`).
     pub fn to_java_bytes(&self) -> Vec<u8> {
         self.0.to_java_bytes()
     }
 
-    /// The inverse of [`DdSketch::to_java_bytes`]. Fails only on a genuinely malformed blob (wrong
-    /// magic, truncated, or an encoding this crate's `sketches_ddsketch` version doesn't
-    /// recognize) -- never on a value-range or precision issue, since the format carries the
-    /// sketch's bins directly rather than re-deriving them from samples.
+    /// The inverse of [`DdSketch::to_java_bytes`]. Fails only on a malformed blob (bad magic,
+    /// truncated, or an unrecognized encoding), never on value range or precision: the format
+    /// carries the bins directly.
     pub fn from_java_bytes(bytes: &[u8]) -> Result<Self, sketches_ddsketch::DecodeError> {
         sketches_ddsketch::DDSketch::from_java_bytes(bytes).map(Self)
     }
@@ -409,38 +355,25 @@ impl Default for DdSketch {
     }
 }
 
-/// A mergeable HyperLogLog cardinality estimator, wrapping
-/// `cardinality_estimator::CardinalityEstimator<[u8]>`. Real state now
-/// (`docs/plans/lossless-transit.md`'s W2 -- previously a stub with no cardinality to carry). Merges
-/// (unions) exactly by construction, which `Set` needs for the same distributed-aggregation reason
-/// [`DdSketch`] needs a real error bound: the split-collection topology (`docs/OVERVIEW.md`) means
-/// two edge nodes' `Set` aggregates may need combining downstream, and a union of two independently
-/// built HyperLogLogs is the algorithm's whole point, not an approximation layered on top of one.
-/// See `docs/design/data-model.md`. Since W3, `crates/logit-inputs/src/statsd.rs` decodes statsd's
-/// `s` (set) metric type straight to [`MetricKind::SetMembers`], and `aggregate` (W2) merges it
-/// into a real [`MetricKind::Set`].
+/// A mergeable HyperLogLog cardinality estimator wrapping
+/// `cardinality_estimator::CardinalityEstimator<[u8]>`.
 ///
-/// **`from_bytes` depends on a capacity invariant, not just a byte layout.** `cardinality-estimator`
-/// 1.0.3's `Array::from_vec` (its `src/array.rs`) reconstitutes the wrapped crate's own heap
-/// allocation from a plain `Vec<u32>` via `mem::forget` + a raw-parts slice, and later frees it with
-/// `Box::from_raw` sized to a *rounded* length -- if the `Vec` we hand it has more spare capacity
-/// than that rounded length, the dealloc uses the wrong `Layout` (undefined behavior). `HllBytesReader`
-/// below works around this by making `Vec::with_capacity`'s hint exactly match the capacity the
-/// crate will free; see its own doc comment for the full mechanism. Don't change `from_bytes`'s
-/// `SeqAccess::size_hint` without re-reading that comment -- it isn't a cosmetic hint here, the byte
-/// codec's soundness depends on it. See also `docs/known-gaps.md`'s entry for this.
+/// `merge` is a real union of two independently built estimators, which `Set` needs for the same
+/// reason [`DdSketch`] needs its error bound: the split-collection topology (`docs/OVERVIEW.md`)
+/// combines edge nodes' aggregates downstream. See `docs/design/data-model.md`. Don't replace it
+/// with a non-mergeable shortcut.
 ///
-/// **Serialization** goes through the wrapped type's own `serde`-based `Serialize`/`Deserialize`
-/// impl (enabled by this crate's `with_serde` feature) -- `CardinalityEstimator` has no `as_bytes`/
-/// `to_bytes` of its own, and its fields are otherwise unreachable from outside its crate. That impl
-/// always writes exactly a `(data: u64, members: Option<Vec<u32>>)` shape (its `serde.rs` source),
-/// so [`HyperLogLog::to_bytes`]/[`HyperLogLog::from_bytes`] drive it through a small hand-rolled byte
-/// `Serializer`/`Deserializer` pair below, purpose-built for that one shape, rather than pulling in
-/// a general data-format crate (`postcard`/`serde_json`/...) just to get bytes out. The resulting
-/// bytes are **pinned to this crate's `cardinality-estimator` dependency version** -- there is no
-/// cross-version compatibility guarantee, which is fine pre-release (unlike [`DdSketch::to_java_bytes`],
-/// this was never meant to be a portable interchange format, just this process's own wire/disk
-/// representation of a value it already owns).
+/// **`from_bytes` depends on a capacity invariant as well as a byte layout.**
+/// `cardinality-estimator` 1.0.3's `Array::from_vec` frees its buffer with a `Layout` computed
+/// from a rounded length; a `Vec` with more spare capacity than that is undefined behavior on
+/// drop. `HllBytesReader`'s size hint prevents it (its doc has the mechanism), so don't change
+/// that hint without reading it. `docs/known-gaps.md` tracks the upstream bug.
+///
+/// **Serialization** drives the wrapped type's `serde` impl (the `with_serde` feature; the crate
+/// has no `to_bytes` and private fields) through the small hand-rolled byte codec below, built
+/// for its one `(data, members: Option<Vec<u32>>)` shape. The bytes are tied to the locked
+/// `cardinality-estimator` version, with no cross-version guarantee: unlike
+/// [`DdSketch::to_java_bytes`], this isn't an interchange format.
 pub struct HyperLogLog(cardinality_estimator::CardinalityEstimator<[u8]>);
 
 impl HyperLogLog {
@@ -448,54 +381,39 @@ impl HyperLogLog {
         HyperLogLog(cardinality_estimator::CardinalityEstimator::new())
     }
 
-    /// Adds one member to the set. Idempotent per distinct byte string: inserting the same member
-    /// any number of times never inflates the estimate.
+    /// Adds one member. Re-inserting a member never inflates the estimate.
     pub fn insert(&mut self, member: &[u8]) {
         self.0.insert(member);
     }
 
-    /// Unions `other` into `self` -- the operation that makes this type mergeable: `self`'s
-    /// estimate afterward is (approximately) the cardinality of the union of both sets, so members
-    /// the two estimators share don't get double-counted the way summing two estimates would.
+    /// Unions `other` into `self`: shared members aren't double-counted, as summing two estimates
+    /// would.
     pub fn merge(&mut self, other: &HyperLogLog) {
         self.0.merge(&other.0);
     }
 
-    /// The estimated number of distinct members inserted so far -- `0` for a fresh, empty
-    /// estimator.
+    /// The estimated number of distinct members; `0` when empty.
     pub fn estimate(&self) -> u64 {
         self.0.estimate() as u64
     }
 
-    /// This estimator's own memory footprint in bytes -- `cardinality_estimator::CardinalityEstimator::size_of`,
-    /// exposed here so `event.rs`'s `metric_record_heap_bytes` can count a `Set`'s real allocation
-    /// instead of the `0` it used while this type was a zero-sized stub.
+    /// The estimator's memory footprint in bytes (`CardinalityEstimator::size_of`).
     pub fn heap_bytes(&self) -> u64 {
         self.0.size_of() as u64
     }
 
-    /// See this type's own doc comment for the wire shape, and [`HyperLogLog`]'s `PartialEq` impl
-    /// for why the leading `data` word is canonicalized here rather than left as
-    /// `cardinality_estimator` writes it.
+    /// Serializes in the codec's wire layout (see the codec section below), with the leading
+    /// `data` word canonicalized so [`HyperLogLog`]'s `PartialEq` can compare bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = HllBytesWriter::default();
         serde::Serialize::serialize(&self.0, &mut out)
             .expect("HyperLogLog encoding writes to a Vec<u8> and never fails");
         let mut bytes = out.0;
-        // Canonicalize `data` (the first 8 bytes) when a `members` list follows (presence byte at
-        // index 8 is `1`: the "array"/"HyperLogLog" representations). `cardinality_estimator`'s
-        // own `representation.rs` packs its representation tag into `data`'s low 2 bits
-        // (`REPRESENTATION_MASK = 0x3`: `0` small, `1` array, `3` HLL) and, for those two
-        // representations, `Representation::try_from(data, opt_vec)` reads *only* `data &
-        // REPRESENTATION_MASK` -- every other bit is a raw pointer into the spilled allocation
-        // `opt_vec`'s `Vec<u32>` becomes, discarded on decode. Masking down to just the tag bits
-        // here (before this blob ever reaches a decoder) makes two independently-built-or-decoded
-        // estimators holding the same members serialize to identical bytes regardless of
-        // allocation address -- `from_bytes` still reconstructs a fully working estimator, since
-        // `try_from` never looks at the discarded bits anyway. When `members` is `None` (the
-        // "small" representation, presence byte `0`), `data` *is* the entire logical content --
-        // small values are encoded directly into it, no separate allocation -- so it's left
-        // untouched.
+        // When a `members` list follows (presence byte 8 is `1`: array or HLL representation),
+        // `data`'s low 2 bits are the representation tag and the rest is a raw heap pointer that
+        // `Representation::try_from` discards on decode. Zero the pointer bits so equal estimators
+        // serialize identically regardless of allocation address. In the small representation
+        // (presence `0`), `data` is the whole content and stays untouched.
         if bytes.get(8) == Some(&1) {
             bytes[0] &= 0x3;
             for b in &mut bytes[1..8] {
@@ -505,8 +423,7 @@ impl HyperLogLog {
         bytes
     }
 
-    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or otherwise malformed blob;
-    /// see [`HllDecodeError`].
+    /// The inverse of [`HyperLogLog::to_bytes`]. Fails on a truncated or malformed blob.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HllDecodeError> {
         let mut reader = HllBytesReader::new(bytes);
         let inner: cardinality_estimator::CardinalityEstimator<[u8]> =
@@ -527,37 +444,27 @@ impl Clone for HyperLogLog {
     }
 }
 
-// `cardinality_estimator::CardinalityEstimator` doesn't implement `Debug` -- summarize as its
-// estimate instead, the same precedent `DdSketch` follows with `count()`.
+// `CardinalityEstimator` doesn't implement `Debug`; summarize as the estimate.
 impl std::fmt::Debug for HyperLogLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HyperLogLog").field("estimate", &self.estimate()).finish()
     }
 }
 
-/// A plain `to_bytes() == to_bytes()` comparison -- the same precedent [`DdSketch`]'s `PartialEq`
-/// follows via `to_java_bytes`. This only works because [`HyperLogLog::to_bytes`] canonicalizes
-/// the volatile part of `cardinality_estimator`'s serialized form first (see that method's own doc
-/// comment): without that, two independently-decoded-but-logically-equal estimators would compare
-/// unequal, since the raw `data` word `cardinality_estimator` writes embeds an allocation pointer
-/// once cardinality spills past the inline "small" representation.
+/// Compares [`HyperLogLog::to_bytes`], which strips the allocation pointer from the `data` word
+/// so equal estimators produce equal bytes.
 ///
-/// One real limitation this still inherits from the wrapped crate: both the "small" `data`
-/// encoding and the "array"/"HyperLogLog" `members` ordering are insertion-order-dependent, not a
-/// sorted/canonical form -- two estimators holding the same members inserted in a different order
-/// can compare unequal here even though [`HyperLogLog::estimate`] would agree. Acceptable
-/// pre-release, and consistent with `DdSketch`'s own `PartialEq` (bin layout there is
-/// insertion-history-dependent too). Every test in this module that checks equality controls
-/// insertion order for exactly this reason.
+/// Still insertion-order-dependent: the small `data` encoding and the array/HLL `members` order
+/// aren't canonical, so the same members inserted in a different order can compare unequal while
+/// [`HyperLogLog::estimate`] agrees. Tests that check equality control insertion order.
 impl PartialEq for HyperLogLog {
     fn eq(&self, other: &Self) -> bool {
         self.to_bytes() == other.to_bytes()
     }
 }
 
-/// The error [`HyperLogLog::from_bytes`] returns on a blob its hand-rolled codec can't decode --
-/// truncated input, or (in principle) a shape mismatch if a future `cardinality-estimator` version
-/// changed what its `Serialize` impl writes.
+/// A blob [`HyperLogLog::from_bytes`] can't decode: truncated, out-of-range, or a shape a
+/// different `cardinality-estimator` version wrote.
 #[derive(Debug)]
 pub struct HllDecodeError(String);
 
@@ -575,9 +482,7 @@ impl serde::de::Error for HllDecodeError {
     }
 }
 
-// The hand-rolled `Serializer` below shares this same error type -- `to_bytes` never actually
-// fails (writing to a growable `Vec<u8>` can't), but `serde::ser::Serializer::Error` still has to
-// name a concrete type satisfying `serde::ser::Error`.
+// The `Serializer` needs a concrete error type too, though writing to a `Vec<u8>` never fails.
 impl serde::ser::Error for HllDecodeError {
     fn custom<T: std::fmt::Display>(msg: T) -> Self {
         HllDecodeError(msg.to_string())
@@ -586,19 +491,12 @@ impl serde::ser::Error for HllDecodeError {
 
 // -- A minimal hand-rolled `serde` codec for `CardinalityEstimator`'s tuple shape --------------
 //
-// `cardinality_estimator::CardinalityEstimator`'s `serde` module (behind this crate's
-// `with_serde` feature) implements `Serialize`/`Deserialize` by always writing one 2-tuple:
-// `(data: usize, members: Option<Vec<u32>>)` -- `None` for its "small" inline representation,
-// `Some` for its "array"/"HyperLogLog" representations (both of which are really a `&[u32]`
-// underneath). That's the only shape this codec ever needs to carry, so every other
-// `serde::Serializer`/`Deserializer` method below is unreachable for this type in practice and
-// returns [`HllDecodeError`] if it's ever hit -- the only way to reach one is a future
-// `cardinality-estimator` version changing its `serde.rs` source to write something else, which
-// this crate's version pin (see this module's `Cargo.toml` comment) is what actually guards
-// against.
+// `CardinalityEstimator`'s `serde` impl always writes one 2-tuple, `(data: usize, members:
+// Option<Vec<u32>>)`: `None` for the small representation, `Some` for array or HLL. Every other
+// `Serializer`/`Deserializer` method returns `HllDecodeError`; only a `cardinality-estimator`
+// upgrade that changes that shape could reach one.
 //
-// Wire layout (little-endian, self-contained -- meant only for this pair to read back, not as a
-// portable interchange format):
+// Wire layout (little-endian, read back only by this pair):
 //   data:    8 bytes, `data as u64`
 //   members: 1 byte presence (`0` = `None`, `1` = `Some`), then if `Some`: 4 bytes length
 //            (`u32`, little-endian) followed by that many little-endian `u32` elements.
@@ -776,92 +674,57 @@ impl serde::ser::SerializeTuple for &mut HllBytesWriter {
     }
 }
 
-// `cardinality_estimator::Representation::from_data`'s own tag bits (`REPRESENTATION_MASK = 0x3`)
-// -- mirrored here because they're `pub(crate)` in that crate, unreachable from outside it. Only
-// the two tags that ever carry a `members: Some(Vec<u32>)` payload matter to this reader; the
-// "small" tag (`0`) never reaches `deserialize_seq` for a well-formed blob (see `tag`'s own doc
-// comment on `HllBytesReader`).
+// `cardinality_estimator`'s representation tags in `data`'s low 2 bits (`pub(crate)` upstream).
+// Only the two that carry a `members` list matter here; small (`0`) never reaches
+// `deserialize_seq` in a well-formed blob.
 const CE_REPRESENTATION_ARRAY: u8 = 1;
 const CE_REPRESENTATION_HLL: u8 = 3;
 
-// Mirrors `cardinality_estimator::array::MAX_CAPACITY` (`pub(crate)`, unreachable from here) --
-// `Representation::try_from`'s own array-length check (`crates/.../representation.rs`) rejects
-// anything outside `3..=128`, so `HllBytesReader` rejects the same range *before* allocating a
-// `Vec<u32>` for it (see `validate_members_len`'s doc comment for why "before" matters).
+// Mirrors `cardinality_estimator::array::MAX_CAPACITY` (`pub(crate)` upstream):
+// `Representation::try_from` rejects an array length outside `3..=128`, and
+// `validate_members_len` rejects the same range before allocating.
 const CE_ARRAY_MAX_CAPACITY: usize = 128;
 
-// `cardinality_estimator::hyperloglog::HyperLogLog::<P, W>::HLL_SLICE_LEN` for this crate's fixed
-// `CardinalityEstimator<[u8]>` instantiation, which uses that type's default `P = 12, W = 6` (see
-// `HyperLogLog`'s own struct definition upstream and this workspace's root `Cargo.toml` pin
-// comment) -- `M * W / 32 + 3` where `M = 1 << P`, i.e. `4096 * 6 / 32 + 3`. `HLL_SLICE_LEN` is
-// itself `pub(crate)` upstream, unreachable from here, so this is a literal, cross-checked against
-// the crate's own computation by `hll_slice_len_matches_upstream_constant` below (recomputed from
-// the same `P`/`W`, not just restated) -- a `cardinality-estimator` upgrade that changes either
-// constant, or `CardinalityEstimator`'s default `P`/`W`, needs this literal updated in lockstep, and
-// that test would catch a mismatch first.
+// Mirrors upstream's `pub(crate)` `HLL_SLICE_LEN` for `CardinalityEstimator<[u8]>`'s default
+// `P = 12, W = 6`: `(1 << P) * W / 32 + 3`. `hll_slice_len_matches_upstream_constant` recomputes
+// it; an upgrade that changes `P`, `W`, or the formula must update this in lockstep.
 const CE_HLL_SLICE_LEN: usize = 771;
 
-/// The upstream bug this reader works around, and the mechanism: `cardinality-estimator` 1.0.3's
-/// `Array::from_vec(vec, len)` (`crates/.../array.rs`) computes `cap =
-/// len.next_power_of_two().max(arr.len())`, calls `arr.resize(cap, 0)`, then leaks the `Vec` with
-/// `mem::forget` and keeps only a raw pointer + `cap` as the slice length. Later, freeing that
-/// representation (`Array::drop`, and structurally the same in `HyperLogLog::drop` for the HLL
-/// representation) reconstructs a boxed slice of exactly `cap` elements via `Box::from_raw` and lets
-/// its `Drop` deallocate -- which computes the *layout* (size, for the allocator) from that `cap`,
-/// not from whatever capacity the original `Vec` actually had. If the `Vec` we hand `from_vec`
-/// carries spare capacity beyond `cap` (e.g. serde's blanket `Vec<T>` deserializer building one via
-/// `Vec::with_capacity(seq.size_hint())`, called with the *actual* element count rather than the
-/// rounded one -- three members round up to a capacity-4 array, but a freshly allocated
-/// capacity-3 `Vec` can come back from the allocator with usable capacity 6, and `resize`'s internal
-/// `reserve` is then a no-op, so the excess survives to the final value untouched), the eventual
-/// `Box::from_raw`/`dealloc` uses a 4-element layout to free a 6-element allocation: undefined
-/// behavior, silently (it doesn't reliably crash; ASan/Miri catch it, a release build often just
-/// corrupts the allocator's bookkeeping instead). `HyperLogLog::from`'s HLL-representation path
-/// doesn't itself round anything (`HLL_SLICE_LEN` is used directly, no `resize`), but the same class
-/// of mismatch is still possible one layer up, in whatever `Vec` this reader hands it, for exactly
-/// the same "requested capacity != allocator's actual capacity" reason.
+/// The deserializer behind [`HyperLogLog::from_bytes`], which works around an allocation-layout
+/// bug in `cardinality-estimator` 1.0.3.
 ///
-/// The fix lives entirely on our side, in `deserialize_seq` below: since serde's `Vec<T>`
-/// deserializer allocates with `Vec::with_capacity(seq.size_hint().unwrap_or(0))` *before* reading
-/// any elements, reporting the *rounded* capacity as the size hint (`len.next_power_of_two()` for
-/// the array representation; `CE_HLL_SLICE_LEN` itself for the HLL one, since that path never
-/// rounds) makes the initial allocation already exactly the size `from_vec`/`resize` will settle on
-/// -- so `resize` finds enough spare capacity and never reallocates, and the `Vec`'s capacity when
-/// it's later forgotten is exactly the rounded length the crate will eventually free. This only
-/// works because we know which representation we're decoding: `tag`, stashed by `deserialize_u64`
-/// when it reads `data` (this wire shape's only `u64`, always element 0 of the outer tuple, always
-/// decoded before the `members` field that might need this). See `validate_members_len` for the
-/// companion half of this fix (bounding the untrusted length before it ever reaches
-/// `Vec::with_capacity` at all).
+/// Upstream's `Array::from_vec(vec, len)` resizes the `Vec` to
+/// `cap = len.next_power_of_two().max(vec.len())`, leaks it with `mem::forget`, and later frees
+/// it with `Box::from_raw` of `cap` elements, so the dealloc `Layout` comes from `cap`, not from
+/// the `Vec`'s real capacity. serde's `Vec<T>` deserializer allocates
+/// `Vec::with_capacity(size_hint)` before reading elements; with the true count as the hint, three
+/// members can come back with usable capacity 6, `resize` to 4 doesn't reallocate, and a
+/// 6-element allocation is freed as 4: undefined behavior that rarely crashes (Miri and ASan
+/// catch it). The HLL representation doesn't round, but the same requested-versus-actual capacity
+/// mismatch applies.
 ///
-/// Pinned to `cardinality-estimator` 1.0.3 (this workspace's root `Cargo.toml`); the upstream fix
-/// would be for `Array::from_vec` to call `into_boxed_slice()` (or `shrink_to_fit()` before taking
-/// the raw parts) so the `Vec`'s capacity and the freed layout are always the same value by
-/// construction, regardless of what capacity the input `Vec` started with. If a future version of
-/// that crate does this, `hll_slice_len_matches_upstream_constant` and the round-trip tests below
-/// still pass either way -- this workaround is extra care, not a correctness requirement this crate
-/// could detect the absence of.
+/// The fix: `deserialize_seq` reports the capacity upstream will free as the size hint
+/// (`len.next_power_of_two()` for array, `CE_HLL_SLICE_LEN` for HLL), so the first allocation is
+/// already that size and `resize` never reallocates. That needs the representation, which
+/// `deserialize_u64` stashes in `tag` when it reads `data`. `validate_members_len` is the other
+/// half: it bounds the untrusted length before any allocation.
+///
+/// The upstream fix would be `into_boxed_slice()` (or `shrink_to_fit()`) in `Array::from_vec`.
+/// No test here would notice that fix landing: the workaround stays correct either way.
 struct HllBytesReader<'a> {
     bytes: &'a [u8],
-    /// The representation tag (`CE_REPRESENTATION_ARRAY`/`_HLL`, or the small-representation `0`)
-    /// decoded from `data`'s low 2 bits, stashed by `deserialize_u64` the moment `data` -- this wire
-    /// shape's only `u64`, always the outer tuple's first element -- is read. `None` only before
-    /// that happens, which no valid call sequence through this reader ever observes: `deserialize_seq`
-    /// (the only reader of this field) is reachable only via the `members: Option<Vec<u32>>` tuple
-    /// element, which always decodes after `data`.
+    /// `data`'s representation tag, set by `deserialize_u64`. `data` is the wire shape's only
+    /// `u64` and always decodes before `members`, so `deserialize_seq` never sees `None` for a
+    /// well-formed blob.
     tag: Option<u8>,
 }
 
-/// Bounds an untrusted members-list length *before* any `Vec` is allocated for it -- the other half
-/// of the `HllBytesReader` workaround (see its doc comment for the allocation-layout bug this whole
-/// reader exists to avoid). Even with `deserialize_seq`'s corrected size hint, a hostile or corrupt
-/// blob could still claim an enormous length; rejecting anything `Representation::try_from` would
-/// also reject (`crates/.../representation.rs`'s own array `3..=128` and HLL `== HLL_SLICE_LEN`
-/// checks) here, before `Vec::with_capacity` ever runs, means a bad blob fails cleanly with
-/// [`HllDecodeError`] instead of attempting a multi-gigabyte allocation first. Returns the
-/// `Vec::with_capacity` hint to use (the *rounded* capacity `from_vec`/`resize` will settle on for
-/// the array representation; the length itself for the HLL one, which never rounds -- see
-/// `HllBytesReader`'s doc comment).
+/// Rejects a members-list length that `Representation::try_from` would also reject (array
+/// `3..=128`, HLL `== HLL_SLICE_LEN`) before any `Vec` is allocated, so a hostile length fails
+/// cleanly instead of attempting a huge allocation.
+///
+/// Returns the `Vec::with_capacity` hint `HllBytesReader` needs: the rounded capacity for array,
+/// the length itself for HLL.
 fn validate_members_len(tag: Option<u8>, len: usize) -> Result<usize, HllDecodeError> {
     match tag {
         Some(CE_REPRESENTATION_ARRAY) => {
@@ -921,20 +784,13 @@ impl<'a> HllBytesReader<'a> {
     }
 }
 
-/// A `SeqAccess`/tuple `SeqAccess` over this reader -- both a tuple's fixed-arity walk and a
-/// `Vec<u32>`'s length-prefixed walk use the same shape here (a known element count, each element
-/// read by re-entering the `Deserializer`), so one type serves both call sites.
+/// A `SeqAccess` with a known element count, serving both the outer tuple and the members
+/// `Vec<u32>`.
 struct HllSeqAccess<'a, 'b> {
     reader: &'b mut HllBytesReader<'a>,
     remaining: usize,
-    /// What `size_hint` reports, separate from `remaining` (the true element count still to read).
-    /// For the outer 2-tuple, equal to `remaining` -- serde's tuple deserializer reads elements
-    /// straight into a fixed slot each, never allocating a `Vec` from this hint, so its value is
-    /// moot there. For the members `Vec<u32>` specifically, this is the *rounded* capacity
-    /// `validate_members_len` computed, deliberately not equal to `remaining` -- see
-    /// `HllBytesReader`'s doc comment for why serde's `Vec::with_capacity(size_hint)` needs that
-    /// rounded value rather than the true count to avoid the allocation-layout bug this whole reader
-    /// exists to work around.
+    /// What `size_hint` reports. For the members `Vec<u32>` it's `validate_members_len`'s rounded
+    /// capacity, not `remaining`, per `HllBytesReader`'s doc; for the tuple it's moot.
     cap: usize,
 }
 
@@ -1017,9 +873,7 @@ impl<'de> serde::de::Deserializer<'de> for &mut HllBytesReader<'de> {
         visitor: V,
     ) -> Result<V::Value, HllDecodeError> {
         let v = self.take_u64()?;
-        // `data` is this wire shape's only `u64` (see this reader's own doc comment) -- stash its
-        // representation tag now so `deserialize_seq`, reached next for the `members` field, can
-        // size and bound that allocation correctly.
+        // `data` is the only `u64`: stash its tag for `deserialize_seq` to size `members`.
         self.tag = Some((v & 0x3) as u8);
         visitor.visit_u64(v)
     }
@@ -1100,10 +954,8 @@ impl<'de> serde::de::Deserializer<'de> for &mut HllBytesReader<'de> {
         visitor: V,
     ) -> Result<V::Value, HllDecodeError> {
         let len = self.take_u32()? as usize;
-        // This reader's only sequence is the members `Vec<u32>` -- `validate_members_len` both
-        // rejects an out-of-range length before any allocation happens for it, and reports the
-        // rounded `Vec::with_capacity` hint the wrapped crate needs (see `HllBytesReader`'s doc
-        // comment for why `len` itself, unrounded, is unsound to report here).
+        // The only sequence is `members`. Reporting the unrounded `len` as the hint is unsound;
+        // see `HllBytesReader`.
         let tag = self.tag;
         let cap = validate_members_len(tag, len)?;
         visitor.visit_seq(HllSeqAccess { reader: self, remaining: len, cap })
@@ -1113,8 +965,6 @@ impl<'de> serde::de::Deserializer<'de> for &mut HllBytesReader<'de> {
         len: usize,
         visitor: V,
     ) -> Result<V::Value, HllDecodeError> {
-        // The outer 2-tuple: `cap` is irrelevant here (see `HllSeqAccess::cap`'s doc comment), so
-        // it's just `len`.
         visitor.visit_seq(HllSeqAccess { reader: self, remaining: len, cap: len })
     }
     fn deserialize_tuple_struct<V: serde::de::Visitor<'de>>(
@@ -1217,8 +1067,7 @@ mod tests {
         }
     }
 
-    /// `add_weighted(v, 1)` is the `count == 1` case a sample-rate-1 statsd line always takes --
-    /// it must be indistinguishable from the plain `add(v)` path it replaces there.
+    /// `add_weighted(v, 1)` is indistinguishable from `add(v)`.
     #[test]
     fn add_weighted_with_count_one_matches_plain_add() {
         let mut weighted = DdSketch::new();
@@ -1232,12 +1081,8 @@ mod tests {
         assert_eq!(weighted.quantile(0.99), plain.quantile(0.99));
     }
 
-    /// `add_weighted(v, 100)` extrapolates one sample into a hundred identical ones -- `count()`
-    /// reports the extrapolated population, and every quantile (not just the median) lands within
-    /// `DdSketch`'s documented 1% relative-error bound of `v`, since all 100 samples fall in the
-    /// same bucket. Not *exactly* `v`: DDSketch is a bucketed approximation by construction --
-    /// `quantile` returns a bucket boundary estimate, not the stored value -- so even a sketch fed
-    /// nothing but identical samples doesn't round-trip them exactly.
+    /// A weight of 100 counts 100 samples, and every quantile lands within 1% of `v` (not exactly
+    /// `v`: `quantile` returns a bucket estimate).
     #[test]
     fn add_weighted_with_large_count_extrapolates_count_and_every_quantile() {
         let mut sketch = DdSketch::new();
@@ -1254,8 +1099,6 @@ mod tests {
         }
     }
 
-    /// `add_weighted(v, 0)` must be a true no-op -- the clamp in `statsd.rs` never produces a
-    /// zero weight, but the method's own contract should hold regardless of the caller.
     #[test]
     fn add_weighted_with_zero_count_is_a_no_op() {
         let mut sketch = DdSketch::new();
@@ -1264,9 +1107,7 @@ mod tests {
         assert_eq!(sketch.quantile(0.5), None);
     }
 
-    /// A weighted add still respects `Config::defaults()`'s documented 1% relative-accuracy bound
-    /// (`sketches_ddsketch::Config::defaults()`: alpha = 0.01) -- extrapolating via repeated `add`
-    /// must not degrade the sketch's error guarantee versus the same number of genuine samples.
+    /// A weighted add keeps `Config::defaults()`'s 1% relative-error bound (alpha = 0.01).
     #[test]
     fn add_weighted_quantile_stays_within_the_configured_relative_error_bound() {
         let mut sketch = DdSketch::new();
@@ -1280,9 +1121,7 @@ mod tests {
         );
     }
 
-    /// `sum` is exact where `quantile` is bucketed: the values go in, the arithmetic sum comes
-    /// back, with no relative-error bound in the way. Weighted adds multiply, a merge adds the
-    /// two sums, and an empty sketch is `0.0` rather than the inner crate's `None`.
+    /// `sum` is exact through plain adds, weighted adds, and a merge, and `0.0` when empty.
     #[test]
     fn ddsketch_sum_is_exact_and_survives_a_merge() {
         let mut sketch = DdSketch::new();
@@ -1302,11 +1141,7 @@ mod tests {
         assert_eq!(sketch.count(), 7);
     }
 
-    /// The property `logit-perf attribute` depends on when it reads a `Distribution` back out of
-    /// a `format: native` dump rather than building it locally: DataDog's "java bytes" encoding
-    /// carries the sum as its own `f64` field, so a round trip through the only lossless view of
-    /// a sketch the wrapped crate exposes -- the one `logit_proto::native` uses -- preserves it
-    /// exactly, with no wire-format change needed.
+    /// The sum survives java bytes exactly; `logit-perf attribute` reads it from native dumps.
     #[test]
     fn ddsketch_sum_round_trips_through_java_bytes() {
         let mut sketch = DdSketch::new();
@@ -1351,8 +1186,7 @@ mod tests {
         assert_eq!(&s.values[..], &[1.0, 2.0, 3.0]);
     }
 
-    /// The weight must never be `0` -- `add_weighted(v, 0)` is a no-op, so a `0` here would
-    /// silently discard every observation. NaN is the case a plain `clamp` gets wrong.
+    /// The weight is never `0` (which would discard every observation), NaN rate included.
     #[test]
     fn samples_weight_is_never_zero_and_is_clamped() {
         let with_rate = |rate: f64| Samples { values: SmallVec::new(), sample_rate: rate };
@@ -1378,10 +1212,7 @@ mod tests {
         assert_eq!(record.flags, 0);
     }
 
-    /// `Samples::sketch` must count every value even when the sketched-into `DdSketch`'s own
-    /// `count()` is the only thing being checked -- a NaN-rate `Samples` degrades `weight()` to
-    /// `1` (never `0`), so every value still lands as exactly one weighted sample rather than
-    /// silently vanishing (the bug `Samples::weight`'s own doc comment already guards against).
+    /// A NaN rate sketches every value once rather than dropping them.
     #[test]
     fn sketch_of_a_nan_rate_samples_still_counts_every_value() {
         let mut s = Samples::new([1.0, 2.0, 3.0, 4.0]);
@@ -1406,9 +1237,7 @@ mod tests {
         assert_eq!(hll.estimate(), 0);
     }
 
-    /// Inserting the same 1,000 distinct members twice must not change the estimate -- and the
-    /// estimate itself must land within a few percent of the true cardinality, DDSketch/HLL's
-    /// whole reason for existing over an exact `HashSet` at scale.
+    /// 1,000 members estimate within 5%, and re-inserting them doesn't move the estimate.
     #[test]
     fn hyperloglog_estimate_is_accurate_within_a_few_percent_on_1k_distinct_members() {
         let mut hll = HyperLogLog::new();
@@ -1419,16 +1248,13 @@ mod tests {
         let relative_error = (estimate as f64 - 1000.0).abs() / 1000.0;
         assert!(relative_error <= 0.05, "estimate {estimate} is more than 5% away from 1000");
 
-        // Re-inserting the same members again must not move the estimate.
         for i in 0..1000u32 {
             hll.insert(&i.to_le_bytes());
         }
         assert_eq!(hll.estimate(), estimate, "re-inserting existing members must be a no-op");
     }
 
-    /// A merge is a set union: two disjoint member sets add (roughly) linearly, but overlapping
-    /// members don't get double-counted -- the property that makes this mergeable across a
-    /// split-collection topology in the first place.
+    /// Disjoint sets add under merge; overlapping members aren't double-counted.
     #[test]
     fn hyperloglog_merge_is_a_union_not_a_sum() {
         let mut a = HyperLogLog::new();
@@ -1447,7 +1273,6 @@ mod tests {
             "disjoint union estimate {disjoint_estimate} is more than 5% away from 1000"
         );
 
-        // Now merge in a set that fully overlaps `b` -- the estimate must not grow.
         let mut c = HyperLogLog::new();
         for i in 500..1000u32 {
             c.insert(&i.to_le_bytes());
@@ -1475,8 +1300,7 @@ mod tests {
         assert_eq!(hll.estimate(), decoded.estimate());
     }
 
-    /// An empty estimator round-trips too -- the "small" representation, which serializes with no
-    /// `Some(Vec<u32>)` payload at all.
+    /// The empty (small-representation, no `members`) estimator round-trips.
     #[test]
     fn hyperloglog_empty_round_trips() {
         let hll = HyperLogLog::new();
@@ -1505,10 +1329,7 @@ mod tests {
         hll
     }
 
-    /// The property `to_bytes`'s canonicalization exists for: two *independently decoded* copies
-    /// of a spilled (non-"small") estimator must serialize byte-identically and compare equal --
-    /// each representation that actually spills to a separate allocation (`array`, then `hll`
-    /// once cardinality outgrows `array`'s capacity), so both get their own case here.
+    /// Two independent decodes of an array (10) or HLL (200) blob serialize identically.
     #[test]
     fn hyperloglog_independently_decoded_copies_of_a_spilled_estimator_are_byte_identical() {
         for n in [10u32, 200u32] {
@@ -1526,8 +1347,7 @@ mod tests {
         }
     }
 
-    /// `to_bytes -> from_bytes -> to_bytes` is a fixed point for every representation
-    /// (`small` at 0 members, `array` at 10, `hll` at 200 once cardinality outgrows `array`).
+    /// `to_bytes` is a fixed point across a round trip for small (0), array (10), and HLL (200).
     #[test]
     fn hyperloglog_to_bytes_is_a_fixed_point_across_a_round_trip_for_every_representation() {
         for n in [0u32, 10u32, 200u32] {
@@ -1539,21 +1359,13 @@ mod tests {
         }
     }
 
-    /// `data`'s low 2 bits are `cardinality_estimator`'s own representation tag (`0` small, `1`
-    /// array, `3` hll -- `2` is never assigned and its own decoder rejects it as
-    /// `InvalidRepresentation`); a `members: Some(..)` list paired with the `small` tag is
-    /// likewise rejected (`SmallRepresentationInvalid` -- small never has a members list). Both
-    /// are malformed-input cases this codec must surface as an error, not a panic or silent
-    /// misdecode.
+    /// The unassigned tag `2`, and a small tag with a `members` list, are errors, not panics.
     #[test]
     fn hyperloglog_from_bytes_rejects_bad_representation_tags() {
-        // Tag `2`: valid-looking `data` (arbitrary non-zero high bits are fine, only the low 2
-        // bits are the tag) with no members list.
         let mut invalid_tag = vec![0u8; 9];
         invalid_tag[0] = 2;
         assert!(HyperLogLog::from_bytes(&invalid_tag).is_err());
 
-        // Tag `0` (small) but with a `Some` members list -- small never has one.
         let mut small_with_members = Vec::new();
         small_with_members.extend_from_slice(&0u64.to_le_bytes());
         small_with_members.push(1); // presence: Some
@@ -1571,15 +1383,9 @@ mod tests {
         assert!(debug.contains("estimate"), "debug output was {debug:?}");
     }
 
-    // -- P1 pinning tests: `HllBytesReader`'s capacity-invariant workaround -----------------
+    // -- `HllBytesReader`'s capacity-invariant workaround ------------------------------------
 
-    /// Non-power-of-two array-representation member counts, plus a count past `Array`'s
-    /// `MAX_CAPACITY` that upgrades to the `hll` representation -- exactly the shapes that used to
-    /// reach `cardinality-estimator`'s `Array::from_vec` with a `Vec` whose spare capacity didn't
-    /// match the length it would round up to and free (`HllBytesReader`'s doc comment has the full
-    /// mechanism). `to_bytes` must reach a fixed point and `estimate()` must survive the round trip
-    /// unchanged for every one of them; run under Miri (or a debug build with the allocator's own
-    /// debug assertions) this also catches the original UB directly, not just a wrong answer.
+    /// Non-power-of-two array counts and HLL counts round-trip; under Miri this catches the UB.
     #[test]
     fn hyperloglog_round_trips_non_power_of_two_member_counts() {
         for n in [3u32, 5, 9, 17, 100, 300] {
@@ -1595,10 +1401,7 @@ mod tests {
         }
     }
 
-    /// A blob claiming an array member count above `cardinality-estimator`'s own `MAX_CAPACITY`
-    /// (128, mirrored here as `CE_ARRAY_MAX_CAPACITY`) must be rejected by `validate_members_len`
-    /// before `Vec::with_capacity` ever allocates for it -- mirrors `Representation::try_from`'s own
-    /// `ArrayRepresentationInvalid` check, just enforced earlier.
+    /// An array count above `CE_ARRAY_MAX_CAPACITY` is rejected.
     #[test]
     fn hyperloglog_from_bytes_rejects_array_count_over_max_capacity() {
         let count = CE_ARRAY_MAX_CAPACITY as u32 + 1;
@@ -1612,9 +1415,7 @@ mod tests {
         assert!(HyperLogLog::from_bytes(&bytes).is_err());
     }
 
-    /// A blob claiming an HLL member count off by one from the crate's fixed `HLL_SLICE_LEN`
-    /// (mirrored here as `CE_HLL_SLICE_LEN`) must likewise be rejected before allocating -- mirrors
-    /// `Representation::try_from`'s own `HllRepresentationInvalid` check.
+    /// An HLL count off by one from `CE_HLL_SLICE_LEN` is rejected.
     #[test]
     fn hyperloglog_from_bytes_rejects_hll_count_off_by_one() {
         for bad_len in [CE_HLL_SLICE_LEN - 1, CE_HLL_SLICE_LEN + 1] {
@@ -1632,12 +1433,7 @@ mod tests {
         }
     }
 
-    /// `CE_HLL_SLICE_LEN` mirrors `cardinality_estimator::hyperloglog::HyperLogLog::<P,
-    /// W>::HLL_SLICE_LEN`, a `pub(crate)` constant in that crate this module can't reference
-    /// directly -- recomputed here from the same formula (`M * W / 32 + 3`, `M = 1 << P`) with this
-    /// crate's pinned instantiation's default `P = 12, W = 6`, rather than just restating the
-    /// literal, so a `cardinality-estimator` upgrade that changes either constant (or the defaults)
-    /// is caught here rather than silently mis-sizing every HLL-representation `from_bytes` call.
+    /// `CE_HLL_SLICE_LEN` matches upstream's formula at the default `P = 12, W = 6`.
     #[test]
     fn hll_slice_len_matches_upstream_constant() {
         const P: usize = 12;

@@ -1,12 +1,8 @@
-//! `logit-perf`: the out-of-CI load-test harness's CLI (docs/adr/load-test-harness.md,
-//! docs/plans/load-test-harness.md). Spawns the real, release-profile `logit` binary against
-//! `perf/scenarios/*.yaml` and measures throughput, CPU per event, and peak RSS -- see `run.rs`
-//! for the measurement itself, `compare.rs` for before/after diffing, and `scenario.rs` for what
-//! it reads out of a scenario file.
+//! `logit-perf`: the out-of-CI load-test harness's CLI (docs/adr/load-test-harness.md).
 //!
-//! Deliberately not run by `script/cibuild` (`script/perf`'s own header comment says why, the
-//! same reason `script/bench` gives): this loads the machine heavily and its numbers are only
-//! meaningful uncontended.
+//! Spawns the real `logit` binary against `perf/scenarios/*.yaml` and measures throughput, CPU
+//! per event, and peak RSS. `script/cibuild` never runs it: it loads the machine heavily, and its
+//! numbers mean something only uncontended.
 
 mod attribute;
 mod compare;
@@ -33,86 +29,59 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build the binary under test, then spawn it once per scenario per repeat, writing a results
-    /// file under `perf/results/`.
+    /// Build the binary under test, run each scenario `--repeat` times, and write a results file
+    /// under `perf/results/`.
     Run {
-        /// Restrict to these scenario names (repeatable); default is every scenario under
-        /// `perf/scenarios/`.
+        /// Run only this scenario (repeatable); the default is every scenario in `perf/scenarios/`.
         #[arg(long = "scenario")]
         scenario: Vec<String>,
-        /// Repeats per scenario -- `median`/`min` in the results file are computed across these.
+        /// Repeats per scenario; the results file's `median` and `min` are taken across them.
         #[arg(long, default_value_t = 3)]
         repeat: u32,
         /// A free-text label carried in the results file and appended to its filename.
         #[arg(long)]
         label: Option<String>,
-        /// How long to wait after a scenario's completion line before sending SIGTERM, for a
-        /// scenario whose graph doesn't self-exit (`scenario::Scenario::needs_sigterm`).
+        /// How long to wait after the load ends before sending SIGTERM to a scenario that doesn't
+        /// exit on its own (at least 3s for a real-socket scenario).
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         settle: Duration,
-        /// How long to wait for a scenario's `generation complete` line before giving up on it as
-        /// hung. Generous by default: scenarios target 5-10s
-        /// (docs/plans/load-test-harness.md), so two minutes is a wide margin for a slow/loaded
-        /// dev box, not a tight bound tuned to the fast case.
+        /// How long to wait for a scenario's `generation complete` (or, for a real-socket
+        /// scenario, `ready`) line before failing it as hung.
         #[arg(long, default_value = "120s", value_parser = parse_duration)]
         timeout: Duration,
-        /// How long to wait for the process to actually exit -- after `--settle`/SIGTERM for a
-        /// scenario that needs it, or after the completion line for one that self-exits -- before
-        /// force-killing it. A hung drain must not hang `logit-perf run` forever.
+        /// How long to wait for the process to exit after the load ends (and any SIGTERM) before
+        /// killing it.
         #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
         shutdown_timeout: Duration,
-        /// Skip the `cargo build` step -- use an already-built binary as is.
+        /// Skip the `cargo build` step and use the already-built binary.
         #[arg(long)]
         no_build: bool,
-        /// The cargo profile to build (and locate the binary under `target/<profile>/`, `dev`
-        /// mapping to `target/debug` as cargo itself does).
+        /// The cargo profile to build and measure, found under `target/<profile>/` (`dev` under
+        /// `target/debug`).
         #[arg(long, default_value = "release")]
         profile: String,
-        /// Measure this binary instead of building one; implies `--no-build`. A relative path
-        /// resolves against the repo root, not the current directory. The results file records
-        /// its sha256 and, when a `<path>.json` sidecar sits beside it (`script/vm build`'s own
-        /// output, `docs/adr/disposable-azure-perf-vm.md`), the source ref/commit it was built
-        /// from -- this is what a multi-source VM session drives instead of the `docker
-        /// cp`-into-the-target-volume choreography an earlier session had to invent by hand.
+        /// Measure this binary instead of building one (relative to the repo root), recording
+        /// its sha256 and any `<path>.json` sidecar's source ref and commit.
         #[arg(long = "logit-bin")]
         logit_bin: Option<PathBuf>,
-        /// The run-time telemetry leg's drain cadence, for real-socket scenarios. Shorter captures
-        /// more of the run before the final drain, at the cost of more work inside the process
-        /// being measured -- the same trade `attribute --interval` makes.
+        /// Drain interval of the telemetry leg attached to real-socket scenarios; shorter adds
+        /// work inside the measured process.
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         interval: Duration,
-        /// Pin the load sender's threads to these CPUs (`3`, `2,4`, `2-5`). Real-socket scenarios
-        /// only. Not optional in practice on a box with heterogeneous cores -- see
-        /// docs/design/performance.md's "Driven scenarios" note.
+        /// Pin a real-socket scenario's load sender to these CPUs (`3`, `2,4`, `2-5`), disjoint
+        /// from `--pin-child`.
         #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
         pin_sender: Option<load::CpuSet>,
-        /// Pin the spawned `logit` process to these CPUs, applied between `fork` and `exec` so
-        /// every thread it creates inherits the mask. Pick CPUs disjoint from `--pin-sender`.
+        /// Pin the spawned `logit` process and all its threads to these CPUs, disjoint from
+        /// `--pin-sender`.
         #[arg(long = "pin-child", value_parser = parse_cpu_list)]
         pin_child: Option<load::CpuSet>,
-        /// Hold every real-socket scenario to the strict expectation -- zero drops, and an
-        /// exactly-equal delivered event count -- instead of only checking that the datagram
-        /// accounting closes. A spec with no `rate` at all is rejected rather than asked to be
-        /// lossless.
-        ///
-        /// Implies `--rate-scale 0.25`, since a shipped spec is paced deliberately *above* what
-        /// the receiver sustains. An explicit `--rate-scale` overrides **that derate only**, never
-        /// the exactness assertion -- so `--verify --rate-scale 1.0` asks "is this spec's own rate
-        /// loss-free?" and is expected to fail whenever anything drops. That is the point of it,
-        /// not a misuse.
+        /// Fail a real-socket scenario unless it drops nothing and delivers the exact event count;
+        /// implies `--rate-scale 0.25` unless one is given.
         #[arg(long)]
         verify: bool,
-        /// Multiply every real-socket spec's `rate` by this factor. The shipped rates sit just
-        /// above the drop knee, which is what a baseline wants and what reading a stable CPU
-        /// µs/event does not -- `--rate-scale 0.5` moves the operating point without editing any
-        /// spec. Recorded in the results file, and `compare` warns when two runs used different
-        /// ones, because they are different points on the load curve rather than a before and
-        /// after.
-        ///
-        /// Given alongside `--verify` it replaces that flag's own 0.25 derate but leaves its
-        /// exact-delivery assertion in place, which is how one asks whether a particular rate is
-        /// loss-free: `--verify --rate-scale 1.0` holds the spec's shipped rate to zero drops, and
-        /// fails if it drops anything.
+        /// Multiply every real-socket spec's `rate` by this factor, recorded in the results file
+        /// (with `--verify`, replaces its 0.25 derate but keeps the exactness check).
         #[arg(long = "rate-scale")]
         rate_scale: Option<f64>,
     },
@@ -120,32 +89,27 @@ enum Command {
     Compare {
         before: PathBuf,
         after: PathBuf,
-        /// Percent regression threshold on events/s (a drop) and CPU us/event (a rise).
+        /// Percent drop in events/s, or rise in CPU us/event, that counts as a regression.
         #[arg(long, default_value_t = 5.0)]
         threshold: f64,
-        /// Percent growth threshold on peak RSS; omitted means RSS is reported but never gates
-        /// the exit code.
+        /// Percent peak-RSS growth that counts as a regression; without it, RSS never fails.
         #[arg(long = "rss-threshold")]
         rss_threshold: Option<f64>,
     },
-    /// List discovered scenarios: how each one is loaded (an in-process `generate_in` or a real
-    /// socket), the size of that load, and whether it needs SIGTERM to stop.
+    /// List scenarios with their load source (`generate_in` or a real socket), size, and
+    /// shutdown.
     List,
-    /// Run one scenario with a temporary `internal` telemetry leg attached, then decode the dump
-    /// into a per-node breakdown of where its time went.
+    /// Run one scenario with a temporary telemetry leg and print where its time went, per node.
     Attribute {
         #[arg(long)]
         scenario: String,
-        /// The appended `internal` component's drain cadence -- shorter captures more of the run
-        /// but does more work inside the process being measured.
+        /// Drain interval of the telemetry leg; shorter adds work inside the measured process.
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         interval: Duration,
-        /// How long to wait after the completion line before SIGTERM. An `internal` leg never
-        /// self-exits, so this path is always taken.
+        /// How long to wait after the load ends before sending SIGTERM.
         #[arg(long, default_value = "1s", value_parser = parse_duration)]
         settle: Duration,
-        /// How long to wait for the `generation complete` line before giving up on the run as
-        /// hung -- see `run --timeout`.
+        /// How long to wait for the completion (or `ready`) line before failing the run as hung.
         #[arg(long, default_value = "120s", value_parser = parse_duration)]
         timeout: Duration,
         #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
@@ -154,30 +118,26 @@ enum Command {
         no_build: bool,
         #[arg(long, default_value = "release")]
         profile: String,
-        /// Measure this binary instead of building one -- see `run --logit-bin`'s doc, same
-        /// semantics.
+        /// Measure this binary instead of building one (relative to the repo root).
         #[arg(long = "logit-bin")]
         logit_bin: Option<PathBuf>,
-        /// Pin the load sender's threads to these CPUs -- real-socket scenarios only, ignored by a
-        /// generator-driven one, which has no sender of its own.
+        /// Pin a real-socket scenario's load sender to these CPUs, disjoint from `--pin-child`.
         #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
         pin_sender: Option<load::CpuSet>,
-        /// Pin the spawned `logit` process to these CPUs.
+        /// Pin the spawned `logit` process and all its threads to these CPUs.
         #[arg(long = "pin-child", value_parser = parse_cpu_list)]
         pin_child: Option<load::CpuSet>,
     },
-    /// Profile one scenario with `perf record` and render the capture as a flamegraph SVG. Needs
-    /// the profiling image (`script/perf flamegraph ...`), which is where `perf`/`inferno` live.
+    /// Profile one scenario with `perf record` into a flamegraph SVG (run via
+    /// `script/perf flamegraph`).
     Flamegraph {
         #[arg(long)]
         scenario: String,
         /// Defaults to `perf/results/<scenario>.svg`.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Also keep the collapsed stacks at this path -- the `inferno-collapse-perf` output the
-        /// SVG is rendered from, one `a;b;c <count>` line per unique stack. This is what a
-        /// share-of-samples summary is computed from (`perf/folded_share.py`); the SVG is a
-        /// picture of the same data and a poor thing to compute against.
+        /// Also write the collapsed stacks (`a;b;c <count>` per line, for `perf/folded_share.py`)
+        /// to this path.
         #[arg(long)]
         folded: Option<PathBuf>,
         /// `perf record -F` sampling frequency, in Hz.
@@ -189,10 +149,10 @@ enum Command {
         timeout: Duration,
         #[arg(long = "shutdown-timeout", default_value = "30s", value_parser = parse_duration)]
         shutdown_timeout: Duration,
-        /// Skip the `cargo build --profile profiling` step -- use an already-built binary as is.
+        /// Skip the `cargo build --profile profiling` step and use the already-built binary.
         #[arg(long)]
         no_build: bool,
-        /// Pin the load sender's threads to these CPUs -- real-socket scenarios only.
+        /// Pin a real-socket scenario's load sender to these CPUs, disjoint from `--pin-child`.
         #[arg(long = "pin-sender", value_parser = parse_cpu_list)]
         pin_sender: Option<load::CpuSet>,
         /// Pin the profiled process to these CPUs.
@@ -322,10 +282,8 @@ fn run_list(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--pin-sender`/`--pin-child`'s parser. `clap`'s `value_parser` wants a `String` error, while
-/// [`load::CpuSet::parse`] reports an `anyhow::Error` like everything else in this crate --
-/// rendered here with `{:#}` so the whole chain (which part of the list, and why) reaches the user
-/// rather than only its outermost sentence.
+/// `--pin-sender`/`--pin-child`'s parser: renders [`load::CpuSet::parse`]'s error with `{:#}` so
+/// the whole chain, not only its outermost sentence, reaches the user.
 fn parse_cpu_list(list: &str) -> Result<load::CpuSet, String> {
     load::CpuSet::parse(list).map_err(|err| format!("{err:#}"))
 }
@@ -336,16 +294,14 @@ fn read_report(path: &Path) -> anyhow::Result<result::RunReport> {
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Renders an optional field the way every "unknown" value in this CLI's output reads -- never a
-/// bare Rust `None`/`null`.
+/// Renders an optional field as `unknown` when absent, never a bare `None`/`null`.
 fn display_optional<T: std::fmt::Display>(value: &Option<T>) -> String {
     value.as_ref().map(T::to_string).unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `, binary sha256 <short>[ <source>[ @ <short sha>]]` -- appended to `compare`'s header lines,
-/// empty when the results file predates `RunReport::binary`. `git.sha` above already names the
-/// checkout; this names the binary that was actually spawned, which a `--logit-bin` run can leave
-/// pointing at a different source entirely (`result::BinaryInfo`'s own doc).
+/// `, binary sha256 <short>[ (<source>[ @ <short sha>])]` for `compare`'s header lines; empty
+/// when the results file has no `binary`. Under `--logit-bin` the binary can come from a
+/// different source than `git.sha` names (`result::BinaryInfo`).
 fn format_binary_provenance(binary: &Option<result::BinaryInfo>) -> String {
     let Some(binary) = binary else { return String::new() };
     let short_sha256: String = binary.sha256.chars().take(12).collect();
@@ -404,17 +360,14 @@ fn run_compare(
                     deltas.events_per_s_pct,
                     deltas.cpu_us_per_event_pct,
                     deltas.max_rss_bytes_pct,
-                    // Percentage *points*, and never gated -- `Deltas::drop_rate_points` has why.
+                    // Percentage points, never gated (`Deltas::drop_rate_points`).
                     deltas
                         .drop_rate_points
                         .map(|points| format!("{points:+.2} pts"))
                         .unwrap_or_else(|| "-".to_string()),
                     if regressed { "  REGRESSED" } else { "" },
                 );
-                // Warned, never gated (`Deltas::startup_regressed`'s own doc has why): startup is
-                // spawn -> ready process bring-up, not the graph's own per-event cost, so it's
-                // worth a human's attention without failing a `compare --threshold` gate meant for
-                // throughput/CPU/RSS.
+                // Warned, never gated (`Deltas::startup_regressed`).
                 if deltas.startup_regressed(threshold) {
                     eprintln!(
                         "warning: scenario `{}`: startup_s rose {:+.1}% (spawn -> ready; not \
@@ -450,9 +403,8 @@ fn run_compare(
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
-    // `-` is allowed in the numeric portion (not just digits/`.`) purely so a negative value
-    // parses through to `Duration::try_from_secs_f64` below and fails there with a clear message,
-    // instead of being rejected here as "no unit" and hiding what was actually wrong with it.
+    // `-` is accepted here so a negative value reaches `Duration::try_from_secs_f64` and fails
+    // with a clear message, not a misleading "no unit".
     let (number, unit) = s
         .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
         .map(|idx| s.split_at(idx))
@@ -470,12 +422,9 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         .map_err(|err| format!("`{s}` is not a valid duration: {err}"))
 }
 
-/// The repository root, resolved from this crate's own manifest directory at compile time
-/// (`crates/logit-perf` -> repo root) rather than the process's current directory -- `script/perf`
-/// already `cd`s to the repo root before running (`script/common.sh`), but resolving it this way
-/// means `logit-perf` behaves the same run from anywhere. Only `run`/`list` need it (both walk
-/// `perf/scenarios/` relative to it); `compare` takes two explicit file paths and never touches
-/// it, so it's resolved lazily at each call site rather than once up front in `main`.
+/// The repository root, from this crate's manifest directory at compile time rather than the
+/// cwd, so `logit-perf` behaves the same run from anywhere. `compare` doesn't need it, so each
+/// subcommand resolves it at its call site.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

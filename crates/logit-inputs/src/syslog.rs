@@ -1,125 +1,141 @@
-//! RFC 3164 / RFC 5424 syslog over UDP or TCP -- the log-producing input the nginx integration
-//! rests on (nginx's `access_log syslog:` writer speaks this, over UDP).
+//! RFC 3164 / RFC 5424 syslog over UDP or TCP, the input half of the `syslog_in -> syslog_out`
+//! lossless-relay pair (`docs/adr/lossless-transit.md`). nginx's `access_log syslog:` writer
+//! speaks it over UDP.
 //!
-//! **Both transports, one decoder.** UDP is the default, and is what the nginx integration uses;
-//! `transport: tcp` (`docs/adr/syslog-tcp-ingress-and-tls.md`) runs this same [`SyslogDecoder`]
-//! behind [`crate::tcp::TcpListener`] instead of [`crate::udp::UdpListener`], which is what adds
-//! an accept loop, RFC 6587 framing (octet-counting or LF-delimited, auto-detected from each
-//! connection's first byte) and, with a `tls:` block, TLS termination -- RFC 5425 syslog over TLS
-//! being nothing more than RFC 6587 framing carried over TLS over TCP. The decoder itself differs
-//! in exactly one respect between the two: **line splitting**. A UDP datagram may carry several
-//! LF-separated messages, so the UDP arm splits on `\n`; a TCP frame is already exactly one
-//! message, and an octet-counted one may legally *contain* a `\n` as ordinary MSG content, so
-//! [`SyslogInput::tcp`] turns splitting off ([`SyslogDecoder::with_line_splitting`]) and lets the
-//! framer be the sole delimiter.
+//! ## Transports and framing
 //!
-//! **Dialect disambiguation** happens per message, right after `<PRI>`: a leading version digit
-//! followed by a space (`1 `) means RFC 5424; anything else is parsed as RFC 3164. This sniff is
-//! necessarily a guess -- RFC 5424's VERSION grammar allows any of `1`-`999`, so a tag-less RFC
-//! 3164 line whose MSG happens to start with a digit and a space (`4 requests failed`) also
-//! matches it. A failed RFC 5424 parse with version `1` (the only version any real sender emits)
-//! is treated as genuinely malformed RFC 5424 and rejected as such; a failed parse with any other
-//! digit is treated as a false-positive sniff and falls back to reparsing the whole line as RFC
-//! 3164 (whose grammar is permissive enough to never itself fail) rather than dropping it, with a
-//! throttled `sniff_fallback` diagnostic -- quiet against today's traffic (the fallback only fires
-//! on a false positive), but observable the day RFC 5424 defines a version past `1` and a real
-//! sender's lines start hitting it.
+//! **Both transports, one decoder.** UDP is the default. `transport: tcp`
+//! (`docs/adr/syslog-tcp-ingress-and-tls.md`) runs the same [`SyslogDecoder`] behind
+//! [`crate::tcp::TcpListener`] instead of [`crate::udp::UdpListener`], adding an accept loop, RFC
+//! 6587 framing and, with a `tls:` block, TLS termination. RFC 5425 syslog over TLS is RFC 6587
+//! framing carried over TLS.
 //!
-//! **Timestamp semantics.** Every emitted [`Event`]'s `timestamp` is *receipt* time -- the
-//! `received_at` passed into [`SyslogDecoder::decode_into`], captured by the read half at the
-//! moment the datagram came off the socket (`docs/adr/decoupled-listener-io.md`), not
-//! whenever decode happens to run -- never the sender's own timestamp. RFC 3164's timestamp
-//! carries no year and no timezone, so resolving it
-//! to an instant means guessing both; doing that only for RFC 5424 (whose timestamp *is*
-//! unambiguous) would silently give two senders on one listener different timestamp semantics.
-//! The sender's own timestamp is not discarded -- it lands in the `syslog.timestamp` attribute
-//! (a [`Value::Timestamp`] for RFC 5424's RFC 3339 form, the raw [`Value::Str`] for RFC 3164's,
-//! which can't be resolved without guessing). A nil RFC 5424 TIMESTAMP (`-`) now stamps
-//! `syslog.timestamp` as an explicit [`Value::Null`], rather than leaving the attribute simply
-//! absent -- `syslog_out` (and any Lua script) can then tell "the sender said no timestamp" apart
-//! from "this dialect never carries one at all" (RFC 3164's own timestamp-absent case, which still
-//! omits the attribute entirely, since there's no nil marker to distinguish "absent" from "not
-//! present in this grammar"). See `docs/known-gaps.md` for the full writeup and the sketch of an
-//! opt-in `syslog_timestamp` transform that would make the RFC 3164 guesswork explicit. A
-//! well-formed RFC 5424 TIMESTAMP that names an instant outside the representable `i64`-nanosecond
-//! range is kept as [`TimestampError::OutOfRange`] -- the event is emitted with `syslog.timestamp`
-//! omitted and a throttled diagnostic, not discarded ([`Malformed`](TimestampError::Malformed) is
-//! reserved for a TIMESTAMP that doesn't parse at all).
+//! The TCP framing is auto-detected from each connection's first byte and latched for its life:
+//! an ASCII digit starts an **octet count** (`MSG-LEN SP MSG`), and anything else is
+//! **non-transparent** (LF-delimited), since such a frame always starts with `<`. A final
+//! LF-framed message with no terminator is emitted on a clean close, as RFC 6587 §3.4.2 permits;
+//! after an abrupt close or a shutdown it is counted `truncated`. A frame past the driver's 64 KiB
+//! [`MAX_FRAME_BYTES`](crate::tcp::MAX_FRAME_BYTES) closes the connection, counted
+//! `logit.input.frames.dropped{reason="oversize"}`, under either framing, since octet counting has
+//! no resync point; an octet-counted frame cut short by a close is
+//! `logit.input.frames.dropped{reason="truncated"}`. As in `statsd_in`, only `receive:`'s
+//! batch-assembly fields and `shutdown_grace` apply under TCP (graph rule 17).
 //!
-//! **RFC 5424 STRUCTURED-DATA is parsed into `syslog.sd`, not merely balanced-and-skipped.**
-//! [`parse_structured_data`] is a real, quote-aware RFC 5424 section 6.3 parser: the nil marker
-//! `-` produces no attribute at all; one or more `[SD-ID SP PARAM-NAME="PARAM-VALUE" ...]`
-//! SD-ELEMENTs produce `syslog.sd` = a [`Value::Map`] of `"<SD-ID>"` to a nested [`Value::Map`] of
-//! `"<PARAM-NAME>"` to [`Value::Str`] (or [`Value::Array`] of [`Value::Str`] for a PARAM-NAME
-//! repeated within one element) -- nested rather than flattened, because `SD-NAME` may itself
-//! contain `.`, which would make a flattened `syslog.sd.<id>.<param>` key ambiguous to reassemble;
-//! see the ADR at `../../../docs/adr/syslog-structured-data-convention.md` for the full rationale.
-//! `SD-NAME` (both `SD-ID` and `PARAM-NAME`) is 1..=32 bytes of PRINTUSASCII (`%d33-126`) excluding
-//! `=`, SP, `]`, and `"`; an `SD-ID` repeated within one message is a grammar violation (there's no
-//! defined merge for two elements sharing an id, so this project rejects rather than silently
-//! picking one), while a `PARAM-NAME` repeated *within one element* is legal and becomes the
-//! `Value::Array` above, in the order encountered. `PARAM-VALUE` is a quoted UTF-8 string in which
-//! exactly three sequences are escapes -- `\"`, `\\`, `\]` -- unescaped on decode; a backslash
-//! before any other byte is kept literally, along with that byte, rather than being treated as an
-//! unrecognized escape. Any STRUCTURED-DATA grammar violation rejects the whole line (a `bad_line`
-//! diagnostic naming what was violated and its byte offset), the same strictness every other
-//! malformed RFC 5424 field on this line already gets.
+//! The decoder differs between the transports only in **line splitting**. A UDP datagram may carry
+//! several LF-separated messages, so the UDP arm splits on `\n`. A TCP frame is already one
+//! message, and an octet-counted one may contain `\n` as MSG content, so [`SyslogInput::tcp`] turns
+//! splitting off ([`SyslogDecoder::with_line_splitting`]) and the framer is the sole delimiter.
 //!
-//! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, not left to leak into
-//! `log.message` as U+FEFF -- it's a `MSG-UTF8` signal, not payload. It's stripped only when the
-//! whole MSG (BOM included) is valid UTF-8, since the BOM's own bytes are themselves valid UTF-8
-//! and there is no `Value::Str` to strip a signal byte from otherwise (see the non-UTF-8 MSG case
-//! below). nginx never emits one.
+//! ## Telemetry and diagnostics
 //!
-//! **Header fields are parsed off raw bytes and validated individually; only MSG may hold
-//! non-UTF-8 bytes.** [`SyslogDecoder::decode_into`] splits the raw datagram into lines on the
-//! `\n` byte; no whole-line UTF-8 validation happens anywhere any more. PRI, the RFC 3164
-//! timestamp token, HOSTNAME, TAG/APP-NAME, PROCID, MSGID, and STRUCTURED-DATA are all
-//! PRINTUSASCII by grammar (a strict subset of UTF-8), and each is validated as such where it's
-//! extracted; a violation in an RFC 5424 field rejects the whole line exactly as before (RFC
-//! 3164's own header parse stays deliberately permissive and never itself fails, since the
-//! dialect-sniff fallback above depends on that -- an RFC 3164 HOSTNAME candidate that somehow
-//! isn't valid UTF-8 is simply not stamped as an attribute, rather than failing the line). MSG
-//! alone gets UTF-8-validated on its own, independent of every other field: valid UTF-8 decodes to
-//! [`Value::Str`] as always; invalid UTF-8 decodes to [`Value::Bytes`] instead of rejecting the
-//! line -- a non-UTF-8 payload (arbitrary binary MSG-ANY content RFC 5424 itself explicitly
-//! allows) is exactly the case this exists for.
+//! The drivers own every `logit.input.*` counter, as for `statsd_in` (`crate::statsd`'s
+//! "Telemetry and diagnostics"). **A malformed message is skipped and reported as a throttled
+//! `bad_line`**, and the rest of its datagram still decodes. `decode_into` never fails, so the
+//! drivers' `bad_datagram`/`bad_frame` never fire here. The decoder's other diagnostics keep the
+//! event: `sniff_fallback`, `timestamp_out_of_range`, and `hostname_not_utf8`, each described
+//! below.
 //!
-//! **`syslog.pid`** is [`Value::U64`] when PROCID (RFC 5424) or a `tag[pid]` bracket (RFC 3164)
-//! parses as one, and [`Value::Str`] of the raw token otherwise -- RFC 5424's PROCID is a
-//! free-form PRINTUSASCII string, not necessarily numeric, and this project now keeps it either
-//! way rather than dropping a non-numeric one. [`is_tag_shaped`] mirrors this for RFC 3164:
-//! bracket content that isn't all-digit still counts as TAG-shaped as long as it's PRINTUSASCII
-//! without `]` (so the bracket still unambiguously balances), rather than causing the whole token
-//! to be reclassified as "not TAG-shaped" and the `[...]` silently absorbed into the message body.
+//! ## Dialect disambiguation
+//!
+//! Per message, right after `<PRI>`: a digit then a space (`1 `) means RFC 5424, anything else
+//! RFC 3164. This sniff is a guess, since RFC 5424's VERSION allows `1`-`999` and a tag-less RFC
+//! 3164 line whose MSG starts `4 requests failed` matches it too. A failed RFC 5424 parse with
+//! version `1` (the only version real senders emit) is rejected as malformed RFC 5424. A failed
+//! parse with any other digit is taken for a false-positive sniff: the line is reparsed as RFC
+//! 3164 (whose parse never fails) with a throttled `sniff_fallback` diagnostic, which would
+//! surface a future RFC 5424 version. So each RFC 5424 field rejection below rejects a version-`1`
+//! line and sends any other version to the RFC 3164 fallback.
+//!
+//! ## Mapping
+//!
+//! PRI must be 1-3 digits with no leading zero (except `<0>`) and at most 191, or the line is
+//! malformed. It yields `syslog.facility` and `syslog.severity` ([`Value::U64`]) and a
+//! [`Severity`] (see `map_severity`). The other attributes:
+//!
+//! - `syslog.timestamp`: the sender's TIMESTAMP (below).
+//! - `syslog.hostname`: HOSTNAME.
+//! - `syslog.tag`: RFC 3164's TAG name or RFC 5424's APP-NAME.
+//! - `syslog.pid`: RFC 3164's `tag[pid]` bracket or RFC 5424's PROCID (below).
+//! - `syslog.msgid`: RFC 5424's MSGID.
+//! - `syslog.sd`: RFC 5424's STRUCTURED-DATA (below).
+//!
+//! An RFC 5424 nil (`-`) or empty HOSTNAME/APP-NAME/PROCID/MSGID stamps nothing.
+//!
+//! **Timestamp semantics.** Every [`Event`]'s `timestamp` is *receipt* time: the `received_at`
+//! passed to [`SyslogDecoder::decode_into`], captured when the datagram came off the socket
+//! (`docs/adr/decoupled-listener-io.md`), not when decode runs and never the sender's own. RFC
+//! 3164's timestamp has no year and no timezone, so resolving it means guessing both, and resolving
+//! only RFC 5424's would give two senders on one listener different semantics. The sender's
+//! timestamp lands in `syslog.timestamp` instead:
+//!
+//! - RFC 5424's RFC 3339 form is a [`Value::Timestamp`].
+//! - RFC 3164's is the raw [`Value::Str`], since resolving it needs a guess.
+//! - A nil RFC 5424 TIMESTAMP (`-`) is an explicit [`Value::Null`], so `syslog_out` or a Lua script
+//!   can tell "the sender said no timestamp" from RFC 3164's absent timestamp, which omits the
+//!   attribute.
+//! - A well-formed RFC 5424 TIMESTAMP outside the `i64`-nanosecond range
+//!   ([`TimestampError::OutOfRange`]) keeps the event, omits `syslog.timestamp`, and reports a
+//!   throttled `timestamp_out_of_range`. One that doesn't parse
+//!   ([`Malformed`](TimestampError::Malformed)) rejects the line.
+//!
+//! `docs/known-gaps.md`'s syslog entry "`event.timestamp` is still receipt time" has the full
+//! writeup and a sketched opt-in `syslog_timestamp` transform.
+//!
+//! **RFC 5424 STRUCTURED-DATA becomes `syslog.sd`.** [`parse_structured_data`] is a quote-aware
+//! RFC 5424 §6.3 parser (`docs/adr/syslog-structured-data-convention.md` has the rationale):
+//!
+//! - The nil marker `-` produces no attribute.
+//! - One or more `[SD-ID SP PARAM-NAME="PARAM-VALUE" ...]` SD-ELEMENTs produce `syslog.sd` = a
+//!   [`Value::Map`] of `"<SD-ID>"` to a nested [`Value::Map`] of `"<PARAM-NAME>"` to
+//!   [`Value::Str`]. It nests rather than flattening because `SD-NAME` may contain `.`, which would
+//!   make a `syslog.sd.<id>.<param>` key ambiguous.
+//! - `SD-NAME` (`SD-ID` and `PARAM-NAME`) is 1..=32 bytes of PRINTUSASCII (`%d33-126`) excluding
+//!   `=`, SP, `]`, and `"`.
+//! - A repeated `SD-ID` in one message is a grammar violation, since two elements sharing an id
+//!   have no defined merge. A `PARAM-NAME` repeated within one element is legal and becomes a
+//!   [`Value::Array`] of [`Value::Str`] in wire order.
+//! - `PARAM-VALUE` is a quoted UTF-8 string in which only `\"`, `\\`, and `\]` are escapes,
+//!   unescaped on decode; a backslash before any other byte is kept, with that byte.
+//! - Any violation rejects the line, with a `bad_line` naming the rule and its byte offset.
+//!
+//! **A leading RFC 5424 §6.4 UTF-8 BOM (`EF BB BF`) on MSG is stripped**, so it doesn't leak into
+//! `log.message` as U+FEFF: it is a `MSG-UTF8` signal, not payload. It is stripped only when the
+//! whole MSG is valid UTF-8; a non-UTF-8 MSG has no `Value::Str` to strip it from.
+//!
+//! **Header fields are parsed off raw bytes and validated one by one; only MSG may hold non-UTF-8
+//! bytes.** [`SyslogDecoder::decode_into`] splits on the `\n` byte with no whole-line UTF-8 check.
+//! PRI, the RFC 3164 timestamp, HOSTNAME, TAG/APP-NAME, PROCID, MSGID, and STRUCTURED-DATA are
+//! PRINTUSASCII by grammar and validated where extracted. A violation in an RFC 5424 field rejects
+//! the line. RFC 3164's header parse never fails, because the sniff fallback depends on that: a
+//! non-UTF-8 RFC 3164 HOSTNAME candidate is left unstamped with a throttled `hostname_not_utf8`.
+//! MSG is validated on its own: valid UTF-8 becomes [`Value::Str`], and invalid UTF-8 becomes
+//! [`Value::Bytes`] rather than rejecting the line, since RFC 5424 allows arbitrary binary MSG-ANY.
+//!
+//! **`syslog.pid`** is [`Value::U64`] when PROCID or a `tag[pid]` bracket parses as one, and
+//! [`Value::Str`] of the raw token otherwise: RFC 5424's PROCID is free-form PRINTUSASCII. For RFC
+//! 3164, [`is_tag_shaped`] accepts non-numeric bracket content that is PRINTUSASCII without `]`
+//! (so the bracket still balances), so the `[...]` isn't absorbed into the message body.
 //!
 //! ## The RFC 3164 header
 //!
-//! nginx's `nohostname` option omits a field RFC 3164 says is mandatory, and the MSG body here is
-//! JSON full of `": "` sequences -- so the header can't be parsed by scanning for the first
-//! `: ` or assuming HOSTNAME is always present. The rule implemented in [`parse_3164`]:
+//! nginx's `nohostname` option omits a field RFC 3164 calls mandatory, and nginx's MSG is JSON full
+//! of `": "`, so the header can't be parsed by scanning for the first `: ` or assuming HOSTNAME is
+//! present. [`parse_3164`]'s rule:
 //!
-//! 1. `<PRI>` -- `<`, 1-3 digits, `>`. A missing or non-numeric PRI is a malformed line (skip and
-//!    continue, per [`crate::statsd::StatsdDecoder`]'s precedent).
-//! 2. The `Mmm dd hh:mm:ss` timestamp (exactly 15 bytes), if present; absent is tolerated.
-//! 3. **At most the next two whitespace-delimited tokens** are candidates for HOSTNAME and TAG.
-//!    If the *first* candidate is TAG-shaped, there is no hostname. Otherwise, if the *second*
-//!    candidate is TAG-shaped, the first is the hostname. Everything after the TAG token (minus
-//!    one leading space) is MSG.
-//! 4. If neither candidate is TAG-shaped, there is no tag: the whole remainder is MSG, with no
-//!    `syslog.tag` attribute. **Bounding the search to two tokens is what makes this safe** -- an
-//!    unbounded "find the first `: `" scan would find one *inside* a JSON body on a tag-less
-//!    message and silently truncate the log line.
-//! 5. `tag[pid]:` splits into `syslog.tag` + `syslog.pid` (`Value::U64` when the bracket content
-//!    parses as one, `Value::Str` otherwise -- see above).
+//! 1. `<PRI>`: `<`, 1-3 digits, `>`. A missing or non-numeric PRI is a malformed line.
+//! 2. The `Mmm dd hh:mm:ss` timestamp (15 bytes), if present; absent is tolerated.
+//! 3. **At most the next two whitespace-delimited tokens** are HOSTNAME/TAG candidates. If the
+//!    first is TAG-shaped, there is no hostname. Otherwise, if the second is TAG-shaped, the first
+//!    is the hostname. Everything after the TAG token (minus one leading space) is MSG.
+//! 4. If neither is TAG-shaped, there is no tag: the whole remainder is MSG, with no `syslog.tag`.
+//!    **The two-token bound is what makes this safe**: an unbounded "find the first `: `" scan
+//!    would find one inside a JSON body on a tag-less message and truncate the log line.
+//! 5. `tag[pid]:` splits into `syslog.tag` + `syslog.pid`.
 //!
-//! [`is_tag_shaped`] is deliberately stricter than "ends in `:` or `]:`" read literally: it also
-//! requires the token's body to look like a process name (letters, digits, `_`, `-`, `.`, `/`,
-//! optionally followed by a bracketed PID). Without that restriction, a tag-less message whose
-//! first JSON key happens to have a space after its colon (`{"status": 200, ...}`) would see its
-//! very first whitespace-delimited token (`{"status":`) misclassified as TAG-shaped, since it does
-//! technically end in `:` -- silently eating part of the body as a fake tag. Restricting the
-//! character class rules that out: `{"status"` contains `{`/`"`, which no real tag ever does.
+//! [`is_tag_shaped`] is stricter than "ends in `:` or `]:`": the token's body must also look like a
+//! process name (letters, digits, `_`, `-`, `.`, `/`, optionally a bracketed PID). Otherwise a
+//! tag-less message starting `{"status": 200, ...}` would have `{"status":` taken for a tag and
+//! part of its body eaten; no real tag contains `{` or `"`.
 
 use crate::tcp::{TcpListener, TcpListenerConfig, TlsServerSettings};
 use crate::udp::{UdpListener, UdpListenerConfig};
@@ -137,29 +153,24 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::watch;
 
-/// Which driver a [`SyslogInput`] is wrapping. Chosen once, by `transport:`
-/// (`crates/logit-cli/src/pipeline.rs`'s `SyslogIn` arm), and never changed afterwards -- an enum
-/// rather than a `Box<dyn Input>` so each arm keeps its own concrete builder surface
-/// ([`TcpListener::with_tls`], [`UdpListener::with_config`]) reachable through this wrapper.
+/// Which driver a [`SyslogInput`] wraps, chosen once by `transport:`. An enum rather than a
+/// `Box<dyn Input>` so each arm's concrete builders ([`TcpListener::with_tls`],
+/// [`UdpListener::with_config`]) stay reachable.
 enum Inner {
     Udp(UdpListener<SyslogDecoder>),
     Tcp(TcpListener<SyslogDecoder>),
 }
 
-/// Thin wrapper over [`UdpListener<SyslogDecoder>`] or [`TcpListener<SyslogDecoder>`] -- the
-/// read/decode split and datagram-\>batch assembly (`docs/adr/decoupled-listener-io.md`), and on
-/// the TCP side the accept loop, RFC 6587 framing and TLS termination
-/// (`docs/adr/syslog-tcp-ingress-and-tls.md`), all live in the drivers; this type is just the
-/// decoder choice plus the public constructor/builder surface `logit-cli::pipeline` and this
-/// module's own tests already depend on.
+/// The `syslog_in` listener: a [`SyslogDecoder`] over [`UdpListener`] or [`TcpListener`].
+///
+/// All transport behavior lives in the drivers; see this module's "Transports and framing".
 pub struct SyslogInput {
     inner: Inner,
 }
 
 impl SyslogInput {
-    /// A UDP listener -- the default transport, and what every caller that doesn't ask for TCP
-    /// gets. The decoder keeps its line splitting: one datagram may carry several LF-separated
-    /// messages.
+    /// A UDP listener, the default transport, with line splitting on: one datagram may carry
+    /// several LF-separated messages.
     pub fn new(bind: impl Into<String>) -> Self {
         Self {
             inner: Inner::Udp(UdpListener::new(
@@ -172,13 +183,10 @@ impl SyslogInput {
 
     /// A TCP listener (`transport: tcp`), plaintext until [`Self::with_tls`] is called.
     ///
-    /// The decoder is built with [`SyslogDecoder::with_line_splitting`] **off**: on this path the
-    /// framer has already delimited exactly one message per frame, and an octet-counted frame's
-    /// MSG may legally contain a `\n` that re-splitting would shred into spurious events (see
-    /// this module's own doc comment and `docs/adr/syslog-tcp-ingress-and-tls.md`). That holds
-    /// for both RFC 6587 framings, not just octet-counting -- under LF framing the `\n` is gone
-    /// by the time the decoder sees the frame anyway, so splitting could only ever be a no-op or
-    /// a bug.
+    /// Line splitting is **off** ([`SyslogDecoder::with_line_splitting`]): the framer delimits one
+    /// message per frame, and an octet-counted MSG may contain a `\n` that re-splitting would shred
+    /// into spurious events. Under LF framing the `\n` is already gone, so splitting could only be
+    /// a no-op or a bug there too.
     pub fn tcp(bind: impl Into<String>) -> Self {
         Self {
             inner: Inner::Tcp(TcpListener::new(
@@ -189,16 +197,12 @@ impl SyslogInput {
         }
     }
 
-    /// Attaches a component id to this listener's diagnostics -- and to the [`SyslogDecoder`] it
-    /// wraps, so both report under the same id. Both halves matter on either transport: the
-    /// driver's own `diag` is what a transport-level failure reports through (`decode_loop`'s
-    /// `bad_datagram`, the TCP driver's `framing_error`/`connection_error`); the decoder's own
-    /// `diag` field is what a rejected syslog message reports through (`bad_line`) -- for a whole
-    /// frame on TCP just as much as for one line inside a multi-line datagram, since
-    /// [`Decoder::decode_into`] is infallible here and never hands the driver a frame to report
-    /// as its own `bad_frame` (that key is for a fallible decoder). Two distinct `Diagnostics`
-    /// values that must both carry the same id and telemetry handle, or one class of decode
-    /// failure silently reports under no component id and with telemetry disabled.
+    /// Attaches a component id to the driver's diagnostics and to the wrapped [`SyslogDecoder`]'s.
+    ///
+    /// Both must carry it: the driver reports transport failures (`framing_error`/
+    /// `connection_error` on TCP) and the decoder reports every rejected message as `bad_line`,
+    /// on either transport, since [`Decoder::decode_into`] never fails here. Miss one and that
+    /// class of failure reports under no component id with telemetry disabled.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.inner = match self.inner {
             Inner::Udp(listener) => Inner::Udp(
@@ -211,10 +215,9 @@ impl SyslogInput {
         self
     }
 
-    /// Attaches a telemetry handle -- component-specific detail beyond the runtime's uniform
-    /// layer-2 metrics (`docs/design/internal-telemetry.md`'s "layer 3"): how many datagrams and
-    /// bytes actually arrived on the wire (UDP), or how many connections and frames (TCP),
-    /// mirroring `StatsdInput`'s own worked example.
+    /// Attaches a telemetry handle for the drivers' layer-3 counters
+    /// (`docs/design/internal-telemetry.md`): datagrams and bytes on UDP, connections and frames on
+    /// TCP.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.inner = match self.inner {
             Inner::Udp(listener) => Inner::Udp(listener.with_telemetry(telemetry)),
@@ -223,18 +226,12 @@ impl SyslogInput {
         self
     }
 
-    /// Overrides a **UDP** listener's receive-queue/batching/shutdown-grace knobs from a
-    /// `receive:` config block (`docs/adr/decoupled-listener-io.md`). Defaults to
-    /// [`UdpListenerConfig::default`] when never called.
+    /// Sets a **UDP** listener's `receive:` block (`docs/adr/decoupled-listener-io.md`); leaves a
+    /// TCP listener untouched.
     ///
-    /// Two transport-specific setters rather than one taking an either-or enum: the two configs
-    /// genuinely aren't interchangeable -- a TCP listener has no receive queue at all, which is
-    /// why graph rule 17 rejects `receive:`'s queue fields on one outright -- so a single setter
-    /// would have to decide at runtime what to do with a queue bound its listener cannot honour.
-    /// The one production caller (`crates/logit-cli/src/pipeline.rs`'s `SyslogIn` arm) already
-    /// branches on `transport:` to pick a constructor, so it picks the matching setter in the
-    /// same `match`. This one leaves a TCP listener untouched; [`Self::with_tcp_receive`] is its
-    /// counterpart.
+    /// Two transport-specific setters because the configs aren't interchangeable: a TCP listener
+    /// has no receive queue (graph rule 17), so one setter would have to decide at runtime what to
+    /// do with a queue bound it can't honour. [`Self::with_tcp_receive`] is the counterpart.
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         if let Inner::Udp(listener) = self.inner {
             self.inner = Inner::Udp(listener.with_config(config));
@@ -242,8 +239,7 @@ impl SyslogInput {
         self
     }
 
-    /// [`Self::with_receive`]'s TCP counterpart -- see its doc comment for why these are two
-    /// methods. Leaves a UDP listener untouched.
+    /// [`Self::with_receive`]'s TCP counterpart; leaves a UDP listener untouched.
     pub fn with_tcp_receive(mut self, config: TcpListenerConfig) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_config(config));
@@ -251,17 +247,12 @@ impl SyslogInput {
         self
     }
 
-    /// Overrides a **TCP** listener's per-phase pre-message budget (`handshake_timeout:` in
-    /// config): the TLS accept when `tls:` is set, and the wait for the connection's first byte.
-    /// Delegates straight to [`TcpListener::with_handshake_timeout`], whose own doc comment and
-    /// this module's driver ("Pre-handshake timeout") describe what each phase covers.
+    /// Sets a **TCP** listener's per-phase pre-message budget (`handshake_timeout:`): the TLS
+    /// accept and the wait for the first byte (`crate::tcp`'s "Pre-handshake timeout").
     ///
-    /// A UDP listener is left untouched rather than failing, exactly like [`Self::with_receive`]/
-    /// [`Self::with_tcp_receive`]: there is no connection on that transport for the value to
-    /// bound, so there is nothing to apply and nothing to refuse. Graph rule 45 is what tells an
-    /// operator who set a non-default value under `transport: udp` that it could never take
-    /// effect -- unlike `tls:`, whose [`Self::with_tls`] arm does fail, because `tls:` has no
-    /// default and its mere presence is an instruction.
+    /// A UDP listener is left untouched rather than failing, since it has no connection to bound;
+    /// graph rule 45 rejects a non-default value there. `tls:` differs ([`Self::with_tls`] fails):
+    /// it has no default, so its presence is an instruction.
     pub fn with_handshake_timeout(mut self, handshake_timeout: std::time::Duration) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_handshake_timeout(handshake_timeout));
@@ -269,16 +260,12 @@ impl SyslogInput {
         self
     }
 
-    /// Bounds how long a **TCP** connection may stay quiet once it is past its first byte
-    /// (`idle_timeout:` in config) before this listener closes it and hands its permit back --
-    /// delegates straight to [`TcpListener::with_idle_timeout`], whose doc comment and the
-    /// driver module's "Idle timeout" section describe what resets the clock. `None` (the
-    /// default) is no idle timeout at all.
+    /// Bounds how long a **TCP** connection may stay quiet past its first byte (`idle_timeout:`)
+    /// before it is closed and its permit returned; `None` (the default) disables it. See
+    /// `crate::tcp`'s "Idle timeout" for what resets the clock.
     ///
-    /// A UDP listener is left untouched for exactly the reason
-    /// [`Self::with_handshake_timeout`] leaves it untouched: there is no connection on that
-    /// transport to time out. Graph rule 53 is what tells an operator who set the field under
-    /// `transport: udp` that it could never take effect.
+    /// A UDP listener is left untouched, as in [`Self::with_handshake_timeout`]; graph rule 53
+    /// rejects the field there.
     pub fn with_idle_timeout(mut self, idle_timeout: Option<std::time::Duration>) -> Self {
         if let Inner::Tcp(listener) = self.inner {
             self.inner = Inner::Tcp(listener.with_idle_timeout(idle_timeout));
@@ -286,11 +273,8 @@ impl SyslogInput {
         self
     }
 
-    /// Test-only override of the driver's connection cap -- opening 1025 real TCP connections in
-    /// a test to exercise it would be slow and flaky; this makes the cap reachable with two. The
-    /// same helper [`crate::statsd::StatsdInput`] and [`crate::graphite::GraphiteInput`] carry,
-    /// for the same reason: proving a permit really came back needs a cap a test can fill. A UDP
-    /// listener has no connections and is left untouched.
+    /// Test-only override of the driver's connection cap, so a test reaches it with two
+    /// connections rather than 1025. A UDP listener is left untouched.
     #[cfg(test)]
     fn with_max_connections(mut self, max_connections: usize) -> Self {
         if let Inner::Tcp(listener) = self.inner {
@@ -299,14 +283,12 @@ impl SyslogInput {
         self
     }
 
-    /// Terminates TLS on a TCP listener (`tls:` in config, RFC 5425) -- delegates straight to
-    /// [`TcpListener::with_tls`], which resolves every path in `settings` against `base_dir`.
+    /// Terminates TLS (RFC 5425) on a TCP listener (`tls:`); paths in `settings` resolve against
+    /// `base_dir`.
     ///
-    /// A UDP listener fails here rather than ignoring the block: DTLS (RFC 6012) is out of scope
-    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives), so there is nothing this could
-    /// mean. Graph rule 43 rejects the same combination at config-validation time and is what an
-    /// operator actually sees; this arm is the belt-and-braces backstop for a caller that skipped
-    /// validation, not the primary diagnostic.
+    /// Fails on a UDP listener: DTLS (RFC 6012) is out of scope
+    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives). Graph rule 43 is what an operator
+    /// sees; this arm backstops a caller that skipped validation.
     pub fn with_tls(
         mut self,
         settings: &TlsServerSettings,
@@ -322,10 +304,8 @@ impl SyslogInput {
         Ok(self)
     }
 
-    /// Passthrough to the wrapped driver's own `local_addr` -- lets a caller (`crates/
-    /// logit-cli/tests/syslog_round_trip.rs`) learn the real ephemeral port after `bind()`,
-    /// mirroring `otlp_round_trip.rs`'s own `Input::bind`-then-`local_addr` readiness pattern,
-    /// with no bind-drop race.
+    /// The bound address after `bind()`, so a caller learns an ephemeral port with no bind-drop
+    /// race.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match &self.inner {
             Inner::Udp(listener) => listener.local_addr(),
@@ -362,27 +342,21 @@ impl Input for SyslogInput {
     }
 }
 
-/// Decodes raw syslog bytes into an [`EventBatch`]. Split out from [`SyslogInput`] so the parsing
-/// logic is directly unit-testable without a socket.
+/// Decodes syslog bytes into events; testable without a socket.
 ///
-/// `Clone` because [`TcpListener`] hands every accepted connection its own decoder
-/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing" doc section). This one holds
-/// no per-connection state to speak of: its clonable state is a *shared handle*, since a
-/// `Diagnostics` clone shares its original's throttle counts (`logit_core::Diagnostics`' type
-/// doc). So `bad_line` is throttled listener-wide -- which is what it has to be, for the same
-/// reason the driver's own `framing_error` is: a peer looping connect / send-one-bad-message /
-/// close would otherwise report its "1st" occurrence once per connection forever.
+/// `Clone` because [`TcpListener`] gives every connection its own decoder
+/// (`crates/logit-inputs/src/tcp.rs`'s "`D: Clone` is load-bearing"). A clone shares its
+/// `Diagnostics` throttle counts (`logit_core::Diagnostics`' type doc), so `bad_line` throttles
+/// listener-wide. It must: a peer looping connect, one bad message, close would otherwise report
+/// its "1st" occurrence once per connection forever.
 #[derive(Clone)]
 pub struct SyslogDecoder {
     resource: Arc<Resource>,
     diag: Diagnostics,
     /// See [`Self::with_line_splitting`].
     line_splitting: bool,
-    /// RFC 5424 SD-IDs and PARAM-NAMEs seen so far, memoised `&str -> Symbol`
-    /// (`logit_core::interner::KeyCache`): structured data repeats the same few element ids and
-    /// parameter names on every line that carries it, so after the first each is one `memcmp`
-    /// instead of a probe of the process-wide interner. The fixed `syslog.*` carrier keys don't
-    /// go through this -- they are process constants, interned once in `KEYS`.
+    /// SD-IDs and PARAM-NAMEs memoised `&str -> Symbol`: they repeat on every line, so after the
+    /// first each is a `memcmp`, not an interner probe. The `syslog.*` carrier keys are in `KEYS`.
     keys: KeyCache,
 }
 
@@ -396,26 +370,22 @@ impl SyslogDecoder {
         self
     }
 
-    /// Whether [`Decoder::decode_into`] splits its input on `\n` into several messages (the
-    /// default, and what UDP needs) or treats the whole buffer as exactly one
-    /// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+    /// Whether [`Decoder::decode_into`] splits its input on `\n` (the default, for UDP) or treats
+    /// it as one message (`docs/adr/syslog-tcp-ingress-and-tls.md`).
     ///
-    /// Off is for a caller whose transport has *already* delimited the message -- today
-    /// [`SyslogInput::tcp`], whose [`crate::tcp::Framer`] does RFC 6587 framing. Splitting there
-    /// would be actively wrong, not merely redundant: an octet-counted frame's MSG may contain a
-    /// `\n` as ordinary content, and re-splitting on it would turn one multiline message into
-    /// several half-messages, most of them missing a PRI and so dropped as `bad_line`.
+    /// Off is for a transport that already delimits messages, [`SyslogInput::tcp`]'s RFC 6587
+    /// [`crate::tcp::Framer`]. Splitting there would be wrong: an octet-counted MSG may contain
+    /// `\n`, and re-splitting would turn one multiline message into half-messages, most of them
+    /// missing a PRI and dropped as `bad_line`.
     pub fn with_line_splitting(mut self, line_splitting: bool) -> Self {
         self.line_splitting = line_splitting;
         self
     }
 
-    /// Parses one already-delimited message and appends it to `out`, or reports it as a
-    /// throttled `bad_line`. Shared by both arms of [`Decoder::decode_into`] so a split line and
-    /// a whole frame go through identical parsing, error handling and diagnostics.
+    /// Parses one delimited message into `out`, or reports a throttled `bad_line`; both arms of
+    /// [`Decoder::decode_into`] use it.
     fn absorb_line(&mut self, line: Bytes, received_at: i64, out: &mut Vec<Event>) {
-        // Only a truly empty record (a bare newline used as a separator, or an empty frame) is
-        // skipped here -- *not* whitespace-only content, which is real MSG data, not framing.
+        // Only an empty record is skipped; whitespace-only content is MSG data, not framing.
         if line.is_empty() {
             return;
         }
@@ -427,8 +397,8 @@ impl SyslogDecoder {
         }
     }
 
-    /// Test-only: confirms `SyslogInput::with_diagnostics` actually reached this decoder's own
-    /// `diag`, not just `UdpListener`'s.
+    /// Test-only: confirms `SyslogInput::with_diagnostics` reached this decoder, not only the
+    /// driver.
     #[cfg(test)]
     pub(crate) fn diag(&self) -> &Diagnostics {
         &self.diag
@@ -442,24 +412,15 @@ impl Decoder for SyslogDecoder {
         received_at: i64,
         out: &mut Vec<Event>,
     ) -> Result<(Arc<Resource>, Option<Arc<Scope>>), CodecError> {
-        // Splitting happens on the raw bytes; there is no whole-line UTF-8 validation here any
-        // more -- `parse_line` validates each header field individually and only MSG is allowed
-        // to carry non-UTF-8 bytes (see the module doc).
+        // Split on raw bytes, with no UTF-8 check: `parse_line` validates each field (module doc).
         if !self.line_splitting {
-            // One message, already delimited by the caller's framer
-            // (`Self::with_line_splitting`). The only bytes to remove are a terminator the
-            // sender counted *inside* the frame: an octet-counted MSG-LEN may legally cover a
-            // trailing `\r\n`, and taking it off here is what makes such a frame decode
-            // identically to the same line arriving in a UDP datagram. One `\n`, then one `\r`
-            // behind it -- exactly what the splitting arm below does at each line break, and
-            // what `crate::tcp::Framer` does for LF framing.
+            // One framed message. An octet-counted MSG-LEN may cover a trailing `\r\n`; strip one
+            // `\n`, then one `\r` behind it, so it decodes as the same line over UDP would (the
+            // splitting arm and `crate::tcp::Framer`'s LF framing strip the same).
             //
-            // The `\r` comes off **only** when an `\n` did. An LF-framed frame reaches here
-            // already terminator-free (the framer consumed the `\n` and one `\r`), so a `\r`
-            // still at its end is payload -- a message genuinely ending in CR, sent as
-            // `...msg\r\r\n` -- and stripping it unconditionally would eat a byte on TCP that
-            // the same bytes keep over UDP. (A counted lone `\r` with no `\n` is therefore kept
-            // too; nothing in RFC 6587 makes a bare CR a terminator.)
+            // The `\r` comes off **only** when an `\n` did. An LF-framed frame arrives
+            // terminator-free, so a `\r` still at its end is payload (`...msg\r\r\n`) that UDP
+            // would keep. A counted lone `\r` is kept too: RFC 6587 has no bare-CR terminator.
             let mut line = bytes;
             if line.ends_with(b"\n") {
                 line = line.slice(..line.len() - 1);
@@ -470,9 +431,8 @@ impl Decoder for SyslogDecoder {
             self.absorb_line(line, received_at, out);
             return Ok((self.resource.clone(), None));
         }
-        // Per line, not per datagram -- exactly `StatsdDecoder::decode_into`'s precedent. nginx's
-        // `escape=json` guarantees no raw newline inside an access-log body, so this split is
-        // safe for the target workload.
+        // Per line, not per datagram. nginx's `escape=json` guarantees no raw newline in an
+        // access-log body, so this split is safe for it.
         let mut start = 0usize;
         while start <= bytes.len() {
             let nl = bytes[start..].iter().position(|&b| b == b'\n');
@@ -487,18 +447,17 @@ impl Decoder for SyslogDecoder {
                 None => break,
             }
         }
-        // syslog datagrams carry no OTLP instrumentation-scope concept -- `None`, always.
+        // syslog has no instrumentation scope.
         Ok((self.resource.clone(), None))
     }
 }
 
-/// Reconstructs a `Bytes` sharing `line`'s underlying allocation for `sub`, a byte slice derived
-/// from `line` through ordinary slicing (never copied or reconstructed) -- so `sub`'s pointer
-/// always lands inside `line`'s allocation, and the offset computed here is always non-negative
-/// and in-bounds. See `docs/design/data-model.md`'s "`bytes::Bytes` everywhere strings and blobs
-/// appear" -- this is what keeps every extracted field a zero-copy slice of the original
-/// datagram. Not used for anything derived by unescaping (RFC 5424 STRUCTURED-DATA's PARAM-VALUE)
-/// -- that content isn't a subslice of anything and is wrapped directly via `Bytes::from` instead.
+/// Rebuilds `sub` as a `Bytes` sharing `line`'s allocation, by pointer arithmetic.
+///
+/// `sub` must be a slice of `line`, never a copy, so the offset is in bounds. This keeps every
+/// extracted field a zero-copy slice of the datagram (`docs/design/data-model.md`'s
+/// "`bytes::Bytes` everywhere strings and blobs appear"). An unescaped PARAM-VALUE is not a slice
+/// and goes through `Bytes::from` instead.
 fn slice_of(line: &Bytes, sub: &[u8]) -> Bytes {
     let line_start = line.as_ptr() as usize;
     let sub_start = sub.as_ptr() as usize;
@@ -506,11 +465,8 @@ fn slice_of(line: &Bytes, sub: &[u8]) -> Bytes {
     line.slice(start..start + sub.len())
 }
 
-/// Splits `s` at the first ASCII space, returning `(token, rest)` with the space itself consumed.
-/// `rest` is an empty slice positioned at the end of `s` when there is no more space in `s` (the
-/// whole of `s` becomes the token) -- deliberately `&s[s.len()..]` rather than the literal `b""`,
-/// so `rest` is always a genuine subslice of `s` with a pointer inside `s`'s allocation, which
-/// [`slice_of`]'s precondition depends on.
+/// Splits `s` at the first ASCII space into `(token, rest)`, consuming the space. With no space,
+/// `rest` is `&s[s.len()..]`, not `b""`, so it stays a subslice of `s` as [`slice_of`] requires.
 fn split_first_token(s: &[u8]) -> (&[u8], &[u8]) {
     match s.iter().position(|&b| b == b' ') {
         Some(i) => (&s[..i], &s[i + 1..]),
@@ -518,7 +474,7 @@ fn split_first_token(s: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// Maps a syslog PRI's severity nibble (0-7, i.e. `pri % 8`) onto [`Severity`].
+/// Maps a PRI's severity (`pri % 8`) onto [`Severity`].
 /// `0 emerg`/`1 alert`/`2 crit` -> `Fatal`; `3 err` -> `Error`; `4 warning` -> `Warn`;
 /// `5 notice`/`6 info` -> `Info`; `7 debug` -> `Debug`. `Trace` has no syslog equivalent.
 fn map_severity(n: u32) -> Severity {
@@ -537,19 +493,16 @@ fn is_printusascii_byte(b: u8) -> bool {
     (33..=126).contains(&b)
 }
 
-/// `true` when every byte of `b` is PRINTUSASCII -- the character class RFC 5424 uses for
-/// HOSTNAME, APP-NAME, PROCID, MSGID, and (further restricted below) `SD-NAME`.
+/// `true` when every byte of `b` is PRINTUSASCII, RFC 5424's class for HOSTNAME, APP-NAME,
+/// PROCID, MSGID, and (narrowed) `SD-NAME`.
 fn is_printusascii(b: &[u8]) -> bool {
     b.iter().all(|&c| is_printusascii_byte(c))
 }
 
-/// The eight `syslog.*` carrier keys, interned exactly once per process. Every decoded line used
-/// to `AttrMap::insert(&str)` each of them -- a hash and a shard lock on the process-wide interner
-/// per key per line for a set of strings that never changes -- where `insert_sym` by a `Symbol`
-/// held here is a plain sorted insert. `crates/logit-proto/src/collectd/decode.rs`'s `AttrKeys`
-/// is the same pattern as a decoder field; a `LazyLock` here because `parse_3164`/`parse_5424`
-/// are free functions and the keys are process constants, not per-decoder state. `KEYS.x` is one
-/// acquire load after the first use.
+/// The `syslog.*` carrier keys, interned once per process so each line pays a sorted
+/// `insert_sym`, not an interner hash and shard lock. A `LazyLock` rather than a decoder field
+/// (as collectd's `AttrKeys` is) because the parsers are free functions; `KEYS.x` is one acquire
+/// load after first use.
 static KEYS: LazyLock<SyslogKeys> = LazyLock::new(|| SyslogKeys {
     facility: intern("syslog.facility"),
     severity: intern("syslog.severity"),
@@ -572,11 +525,9 @@ struct SyslogKeys {
     sd: Symbol,
 }
 
-/// Parses one non-empty line, already isolated as a `Bytes` slice of the original datagram by
-/// [`SyslogDecoder::decode_into`] -- not yet validated as UTF-8 anywhere; that validation now
-/// happens field-by-field below (PRINTUSASCII for every header field, UTF-8-or-`Bytes` for MSG
-/// alone). `diag` is threaded down to [`parse_5424`], which uses it to report a
-/// well-formed-but-unrepresentable TIMESTAMP without failing the whole line over it.
+/// Parses one non-empty message, a slice of the datagram not yet validated as UTF-8. `diag`
+/// reports the diagnostics that keep the event (`sniff_fallback`, `timestamp_out_of_range`,
+/// `hostname_not_utf8`).
 fn parse_line(
     line: &Bytes,
     recv_ts: i64,
@@ -600,10 +551,8 @@ fn parse_line(
     if !digits.iter().all(|b| b.is_ascii_digit()) {
         return Err(malformed());
     }
-    // RFC 3164 and RFC 5424 both define PRI as facility*8+severity in 0..=191, encoded with no
-    // leading zero except the literal value `0`. `<013>` and `<192>..<999>` are therefore
-    // malformed, not merely unusual: accepting them would attach an impossible facility/severity
-    // (e.g. facility 124 for `<999>`) to the event.
+    // PRI is facility*8+severity in 0..=191 with no leading zero except `0` itself, so `<013>`
+    // and `<192>..<999>` are malformed: they'd attach an impossible facility (124 for `<999>`).
     if digits.len() > 1 && digits[0] == b'0' {
         return Err(malformed());
     }
@@ -618,8 +567,7 @@ fn parse_line(
     let severity_num = pri % 8;
     let severity = map_severity(severity_num);
 
-    // Disambiguate: a leading version digit followed by a space means RFC 5424; anything else is
-    // RFC 3164.
+    // Dialect sniff (module doc, "Dialect disambiguation").
     let is_5424_after = match (after_pri.first(), after_pri.get(1)) {
         (Some(&c0), Some(&b' ')) if c0.is_ascii_digit() => Some((c0 as char, &after_pri[2..])),
         _ => None,
@@ -638,24 +586,13 @@ fn parse_line(
                 keys,
             ) {
                 Ok(event) => Ok(event),
-                // The sniff above only checks "digit, then space" -- RFC 5424's VERSION is
-                // `NONZERO-DIGIT 0*2DIGIT`, so a tag-less RFC 3164 line whose MSG happens to start
-                // with a digit and a space (`4 requests failed`) also matches it. `1` is the only
-                // version any real sender emits, so a failure with that exact version is treated
-                // as a genuine, malformed RFC 5424 line -- the same skip-and-continue a bad
-                // TIMESTAMP or PRI gets, per the previous review round's fix. Any *other* digit
-                // failing is far more likely a false-positive sniff than a real, currently
-                // undefined version, so it falls back to reparsing the whole `after_pri` as RFC
-                // 3164 (whose grammar is permissive enough to never itself fail) instead of
-                // dropping the line outright.
+                // Version `1` is the only one real senders emit, so its failure is malformed RFC
+                // 5424. Any other digit failing is likely a tag-less RFC 3164 MSG starting with a
+                // digit and a space, so reparse as RFC 3164, which never fails.
                 Err(err) if version == '1' => Err(err),
                 Err(err) => {
-                    // Every other skip/recover path in this decoder (a bad PRI, a bad line, a bad
-                    // TIMESTAMP, an out-of-range one) reports through `diag`; this one shouldn't
-                    // be the exception. Quiet today -- the fallback only fires on a false-positive
-                    // sniff against current traffic -- but if RFC 5424 ever defines a version past
-                    // `1`, a real sender's lines would otherwise be silently reparsed as RFC 3164
-                    // with nothing anywhere saying so.
+                    // Reported so a future RFC 5424 version past `1` doesn't get reparsed as RFC
+                    // 3164 unnoticed.
                     diag.warn_throttled(
                         "sniff_fallback",
                         format_args!(
@@ -671,10 +608,9 @@ fn parse_line(
     }
 }
 
-/// Checks the `Mmm dd hh:mm:ss` shape at the start of `s` (exactly 15 bytes: 3-letter month, ' ',
-/// a space- or zero-padded day, ' ', `hh:mm:ss`). Returns `(timestamp, rest)` with exactly one
-/// following space consumed from `rest` when present; `None` when absent -- tolerated, per
-/// nginx's occasional omission of fields RFC 3164 calls mandatory.
+/// Matches the 15-byte `Mmm dd hh:mm:ss` shape (day space- or zero-padded) at the start of `s`,
+/// returning `(timestamp, rest)` with one following space consumed. `None` when absent, which is
+/// tolerated: nginx omits fields RFC 3164 calls mandatory.
 fn parse_3164_timestamp(s: &[u8]) -> Option<(&[u8], &[u8])> {
     if s.len() < 15 {
         return None;
@@ -703,10 +639,9 @@ fn parse_3164_timestamp(s: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((ts, after.strip_prefix(b" ").unwrap_or(after)))
 }
 
-/// A token qualifies as a syslog TAG if it ends in `:` (which includes `name[pid]:`, since that
-/// ends in `]:`... followed by `:`) *and* everything before that trailing colon looks like a
-/// process name -- see the module doc comment for why this is stricter than "ends in `:`" read
-/// literally.
+/// A token is a TAG if it ends in `:` (`name[pid]:` included) and what precedes the colon looks
+/// like a process name; the module doc's "The RFC 3164 header" says why this is stricter than
+/// "ends in `:`".
 fn is_tag_shaped(token: &[u8]) -> bool {
     let Some(body) = token.strip_suffix(b":") else { return false };
     if body.is_empty() {
@@ -720,13 +655,8 @@ fn is_tag_shaped(token: &[u8]) -> bool {
         if pid.is_empty() {
             return false;
         }
-        // A numeric PID that fits `u64` (what `syslog.pid` stores it as when it parses) is the
-        // common case. RFC 5424's own PROCID grammar allows any PRINTUSASCII string though, and
-        // this project keeps a non-numeric PROCID as `Value::Str` rather than dropping it -- so a
-        // 3164 sender's non-numeric bracket content is accepted here too (as long as it's
-        // PRINTUSASCII without `]`, so the bracket still unambiguously balances), rather than
-        // causing the whole token to be reclassified as "not TAG-shaped" and the `[...]` silently
-        // absorbed into the message body. See the module doc's `syslog.pid` section.
+        // Numeric fitting `u64`, or PRINTUSASCII without `]` so the bracket still balances
+        // (module doc, `syslog.pid`).
         let numeric_fits_u64 = pid.iter().all(|b| b.is_ascii_digit())
             && std::str::from_utf8(pid).is_ok_and(|s| s.parse::<u64>().is_ok());
         if !numeric_fits_u64 && !pid.iter().all(|&b| is_printusascii_byte(b) && b != b']') {
@@ -762,8 +692,7 @@ fn parse_3164(
         if is_tag_shaped(token2) {
             (Some(token1), Some(token2), after2)
         } else {
-            // Neither candidate is TAG-shaped: no tag, no hostname -- the whole remainder
-            // (starting from `after_ts`, not `after1`/`after2`) is MSG.
+            // No tag, no hostname: MSG starts at `after_ts`, not `after1`/`after2`.
             (None, None, after_ts)
         }
     };
@@ -772,20 +701,13 @@ fn parse_3164(
     attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
     if let Some(ts) = ts_token {
-        // ASCII by construction -- `parse_3164_timestamp` only accepts alphabetic/digit/space/
-        // colon bytes.
+        // ASCII by construction in `parse_3164_timestamp`.
         attrs.insert_sym(KEYS.timestamp, Value::Str(slice_of(line, ts)));
     }
     if let Some(host) = hostname {
         if !host.is_empty() {
-            // RFC 3164 parsing never fails outright (the version-sniff fallback in `parse_line`
-            // depends on that): a HOSTNAME candidate that somehow isn't valid UTF-8 is simply not
-            // stamped as an attribute, rather than rejecting the whole line or violating
-            // `Value::Str`'s "always valid UTF-8" invariant -- reported through a throttled
-            // `hostname_not_utf8` diagnostic instead, so the skip stays observable (before
-            // `syslog.sd` parsing existed, a non-UTF-8 line failed whole-line UTF-8 validation
-            // and was rejected with its own diagnostic; this keeps that observability for what is
-            // now a partial, per-field loss instead of a whole-line rejection).
+            // RFC 3164 parsing never fails (the sniff fallback depends on it), and `Value::Str`
+            // must be valid UTF-8, so a non-UTF-8 HOSTNAME is skipped and reported instead.
             if std::str::from_utf8(host).is_ok() {
                 attrs.insert_sym(KEYS.hostname, Value::Str(slice_of(line, host)));
             } else {
@@ -809,8 +731,7 @@ fn parse_3164(
             attrs.insert_sym(KEYS.tag, Value::Str(slice_of(line, name)));
             match std::str::from_utf8(pid_bytes).ok().and_then(|s| s.parse::<u64>().ok()) {
                 Some(n) => attrs.insert_sym(KEYS.pid, Value::U64(n)),
-                // `is_tag_shaped` guarantees `pid_bytes` is PRINTUSASCII (hence valid UTF-8) when
-                // it isn't a `u64`, so this `Value::Str` construction can't violate its invariant.
+                // `is_tag_shaped` guarantees a non-`u64` PID is PRINTUSASCII, so valid UTF-8.
                 None => attrs.insert_sym(KEYS.pid, Value::Str(slice_of(line, pid_bytes))),
             }
         } else {
@@ -834,8 +755,7 @@ fn parse_3164(
     )
 }
 
-/// `-` (the RFC 5424 nil value) or an empty field both mean "absent" -- every nillable field
-/// (HOSTNAME, APP-NAME, PROCID, MSGID, TIMESTAMP) is treated identically.
+/// `-` (RFC 5424's nil) or an empty field means absent, for every nillable field.
 fn nil_or(field: &[u8]) -> Option<&[u8]> {
     if field.is_empty() || field == b"-" {
         None
@@ -844,10 +764,8 @@ fn nil_or(field: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// Validates and slices one non-nil RFC 5424 header field (HOSTNAME, APP-NAME, or MSGID -- PROCID
-/// is handled separately in [`parse_5424`] since it has a numeric/string split `syslog.pid`
-/// cares about). `label` names the field in the error message. A field that isn't PRINTUSASCII is
-/// a grammar violation, consistent with this dialect's strictness elsewhere.
+/// Validates and slices a HOSTNAME, APP-NAME, or MSGID (PROCID has its own numeric split in
+/// [`parse_5424`]). Non-PRINTUSASCII is a grammar violation; `label` names the field in the error.
 fn field_value(line: &Bytes, field: &[u8], label: &str) -> Result<Option<Value>, CodecError> {
     match nil_or(field) {
         None => Ok(None),
@@ -863,10 +781,8 @@ fn field_value(line: &Bytes, field: &[u8], label: &str) -> Result<Option<Value>,
     }
 }
 
-/// Builds the MSG [`Value`]: valid UTF-8 becomes [`Value::Str`] (stripping a leading BOM when
-/// `strip_bom` is set and the BOM is followed by more valid UTF-8 -- see the module doc); invalid
-/// UTF-8 becomes [`Value::Bytes`], raw, with no BOM handling (there is no `MSG-UTF8` signal to
-/// strip from bytes that were never `MSG-UTF8` to begin with).
+/// Builds the MSG [`Value`]: valid UTF-8 is a [`Value::Str`], minus a leading BOM when
+/// `strip_bom` is set; invalid UTF-8 is a raw [`Value::Bytes`], BOM and all (module doc).
 fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
     match std::str::from_utf8(msg) {
         Ok(s) => {
@@ -877,9 +793,8 @@ fn message_value(line: &Bytes, msg: &[u8], strip_bom: bool) -> Value {
     }
 }
 
-/// One RFC 5424 STRUCTURED-DATA grammar violation, with a byte offset relative to the start of
-/// the slice [`parse_structured_data`] was called with -- the caller adds its own base offset
-/// within the line to produce an absolute position for its `bad_line` diagnostic.
+/// One STRUCTURED-DATA grammar violation. `offset` is relative to [`parse_structured_data`]'s
+/// input; the caller adds its base for the `bad_line` message.
 #[derive(Debug)]
 struct SdError {
     offset: usize,
@@ -892,14 +807,12 @@ impl SdError {
     }
 }
 
-/// `true` for every byte RFC 5424's `SD-NAME` grammar allows: PRINTUSASCII excluding `=`, `]`,
-/// and `"` (space is already excluded by the PRINTUSASCII range itself).
+/// `true` for an `SD-NAME` byte: PRINTUSASCII (which already excludes space) minus `=`, `]`, `"`.
 fn is_sd_name_byte(b: u8) -> bool {
     is_printusascii_byte(b) && !matches!(b, b'=' | b']' | b'"')
 }
 
-/// Parses one `SD-NAME` (an `SD-ID` or `PARAM-NAME`): 1..=32 bytes of [`is_sd_name_byte`].
-/// Advances `*pos` past the name and returns its byte slice.
+/// Parses one `SD-NAME` (1..=32 bytes of [`is_sd_name_byte`]), advancing `*pos` past it.
 fn parse_sd_name<'a>(s: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SdError> {
     let start = *pos;
     while s.get(*pos).is_some_and(|&b| is_sd_name_byte(b)) {
@@ -922,11 +835,9 @@ fn parse_sd_name<'a>(s: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SdError> 
     Ok(name)
 }
 
-/// Parses one `PARAM-VALUE`'s content after the opening `"`, up to and consuming the closing `"`.
-/// Unescapes RFC 5424 section 6.3.3's three escapes (`\"`, `\\`, `\]`); a backslash before any
-/// other byte is kept literally, along with that byte, rather than treated as an error or a
-/// no-op. Returns the unescaped bytes; the caller validates them as UTF-8 (`PARAM-VALUE` is
-/// defined as `UTF-8-STRING`).
+/// Parses a `PARAM-VALUE` from after its opening `"` through its closing `"`, unescaping RFC 5424
+/// §6.3.3's `\"`, `\\`, `\]`; any other backslash is kept with its byte. The caller validates the
+/// result as UTF-8.
 fn parse_param_value(s: &[u8], pos: &mut usize) -> Result<Vec<u8>, SdError> {
     let mut out = Vec::new();
     loop {
@@ -966,10 +877,8 @@ fn parse_param_value(s: &[u8], pos: &mut usize) -> Result<Vec<u8>, SdError> {
     }
 }
 
-/// Inserts one `PARAM-NAME`/value pair into `inner`. A repeated `PARAM-NAME` within the same
-/// SD-ELEMENT becomes a `Value::Array` of `Value::Str`, in the order encountered -- RFC 5424
-/// doesn't forbid repetition, and this project's `syslog.sd` convention keeps every occurrence
-/// rather than the last-write-wins an ordinary `AttrMap::insert` would give.
+/// Inserts one PARAM into `inner`; a repeated `PARAM-NAME` folds into a `Value::Array` in wire
+/// order rather than the last write winning.
 fn insert_param(inner: &mut AttrMap, name: Symbol, value: Bytes) {
     let value = Value::Str(value);
     let merged = match inner.remove_sym(name) {
@@ -983,12 +892,8 @@ fn insert_param(inner: &mut AttrMap, name: Symbol, value: Bytes) {
     inner.insert_sym(name, merged);
 }
 
-/// Parses RFC 5424 STRUCTURED-DATA (section 6.3): the nil marker `-`, or one or more concatenated
-/// `[SD-ID SP PARAM-NAME="PARAM-VALUE" ...]` SD-ELEMENTs. Returns the parsed `syslog.sd` value
-/// (`None` for nil) and the byte offset into `s` where MSG begins, having consumed exactly one
-/// following space when present -- the same "consumed one following space" contract
-/// [`skip_structured_data`](self) (this function's predecessor) used. An `Err` names what grammar
-/// rule was violated and where, relative to the start of `s`.
+/// Parses RFC 5424 §6.3 STRUCTURED-DATA into `syslog.sd` (`None` for nil) and the offset into `s`
+/// where MSG begins, one following space consumed. The module doc has the grammar and shape.
 fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>, usize), SdError> {
     if let Some(rest) = s.strip_prefix(b"-") {
         return Ok((None, 1 + usize::from(rest.first() == Some(&b' '))));
@@ -1005,12 +910,10 @@ fn parse_structured_data(s: &[u8], keys: &mut KeyCache) -> Result<(Option<Value>
         let id_bytes = parse_sd_name(s, &mut pos)?;
         let id = std::str::from_utf8(id_bytes)
             .expect("parse_sd_name only accepts PRINTUSASCII, always valid UTF-8");
-        // `AttrMap::get`, not an interned probe: `id` is unvalidated here -- the SD-ELEMENT it
-        // opens may still be rejected below, and `parse_line`'s any-digit RFC 5424 sniff routes
-        // plain RFC 3164 lines whose MSG happens to contain a `[token` through this function
-        // before falling back. Interning at this point would retain producer-controlled text in
-        // the process-wide table for the life of the process, outside `docs/design/memory.md`
-        // §4's accepted exposure. The intern happens once, at the successful insert below.
+        // `AttrMap::get`, not an intern: the element may still be rejected, and the sniff
+        // routes RFC 3164 lines containing `[token` through here before falling back. Interning
+        // now would keep producer-controlled text for the process's life, outside
+        // `docs/design/memory.md` §4's accepted exposure; it happens at the insert below.
         if sd.get(id).is_some() {
             return Err(SdError::new(elem_start, format!("duplicate SD-ID {id:?}")));
         }
@@ -1081,10 +984,8 @@ fn parse_5424(
     let (app_field, rest) = split_first_token(rest);
     let (procid_field, rest) = split_first_token(rest);
     let (msgid_field, rest) = split_first_token(rest);
-    // Base offset of the STRUCTURED-DATA field within `line`, used only to translate an `SdError`
-    // (relative to `rest`) into an absolute byte offset for the `bad_line` diagnostic. `rest` is
-    // always a genuine subslice of `line` (built entirely through `split_first_token`), so this
-    // pointer subtraction is sound the same way `slice_of`'s is.
+    // For an absolute `SdError` offset. `rest` is a subslice of `line` via `split_first_token`,
+    // so the subtraction is sound as in `slice_of`.
     let sd_base = rest.as_ptr() as usize - line.as_ptr() as usize;
     let (sd_value, sd_offset) = parse_structured_data(rest, keys).map_err(|e| {
         malformed(format!("STRUCTURED-DATA at byte {}: {}", sd_base + e.offset, e.message))
@@ -1094,15 +995,8 @@ fn parse_5424(
     let mut attrs = AttrMap::new();
     attrs.insert_sym(KEYS.facility, Value::U64(facility as u64));
     attrs.insert_sym(KEYS.severity, Value::U64(severity_num as u64));
-    // A nil TIMESTAMP (`-`) now stamps an explicit `Value::Null` -- distinct from "this decoder
-    // never looked" -- but a non-nil TIMESTAMP that fails to parse is not "absent", it's
-    // malformed input, and must take the same skip-and-continue path a bad PRI does rather than
-    // silently landing on the floor with no `syslog.timestamp` attribute and no diagnostic. A
-    // TIMESTAMP that *does* parse but names an instant outside the `i64` nanosecond range
-    // `Value::Timestamp` uses is a different condition from malformed, though: the line and every
-    // other field on it are still good, so it's kept, with `syslog.timestamp` omitted and a
-    // throttled diagnostic instead of the whole record being discarded over one unrepresentable
-    // field.
+    // Nil is an explicit `Value::Null`; unparseable rejects the line like a bad PRI; parseable
+    // but out of `i64`-nanosecond range keeps the event without the attribute (module doc).
     match nil_or(ts_field) {
         None => {
             attrs.insert_sym(KEYS.timestamp, Value::Null);
@@ -1137,9 +1031,7 @@ fn parse_5424(
         attrs.insert_sym(KEYS.tag, v);
     }
     if let Some(pid) = nil_or(procid_field) {
-        // PROCID is a free-form PRINTUSASCII string per RFC 5424 (it need not be numeric).
-        // `syslog.pid` keeps it as `Value::U64` when it parses as one, `Value::Str` otherwise --
-        // see the module doc's `syslog.pid` section.
+        // Free-form PRINTUSASCII: `U64` when numeric, else `Str` (module doc, `syslog.pid`).
         if !is_printusascii(pid) {
             return Err(malformed(format!(
                 "PROCID {:?} is not PRINTUSASCII",
@@ -1193,10 +1085,8 @@ mod tests {
         decoder.decode(Bytes::from(datagram)).expect("decode should succeed").events
     }
 
-    /// Regression: `SyslogInput::with_diagnostics` used to only set `UdpListener`'s own `diag`,
-    /// never reaching the wrapped `SyslogDecoder`'s -- so a malformed *line* (as opposed to a
-    /// whole malformed datagram) reported through a permanently unnamed, telemetry-disabled
-    /// `Diagnostics::default()`, regardless of what the component was actually configured with.
+    /// `with_diagnostics` reaches the UDP decoder as well as the driver, so `bad_line` reports
+    /// under the component id.
     #[test]
     fn with_diagnostics_reaches_the_wrapped_decoder_too() {
         let input = SyslogInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
@@ -1209,17 +1099,13 @@ mod tests {
         }
     }
 
-    /// The same regression on the TCP arm: `Inner::Tcp` has its own `map_decoder` call, and
-    /// nothing about the UDP arm being right would catch this one being dropped.
+    /// The same on the TCP arm, which has its own `map_decoder` call.
     #[test]
     fn with_diagnostics_reaches_the_wrapped_decoder_on_the_tcp_arm_too() {
         let input = SyslogInput::tcp("127.0.0.1:0").with_diagnostics(Diagnostics::new("tcp-id"));
         match &input.inner {
             Inner::Tcp(listener) => {
                 assert_eq!(listener.decoder().diag().component_id(), "tcp-id");
-                // The driver half too: `with_diagnostics` has to reach both, and the decoder
-                // being right says nothing about the listener's own `framing_error`/
-                // `connection_error` handle having been set.
                 assert_eq!(listener.diag().component_id(), "tcp-id");
                 assert!(
                     !listener.decoder().line_splitting,
@@ -1230,11 +1116,8 @@ mod tests {
         }
     }
 
-    /// `decode_into` must stamp every event with the caller's `received_at`, not a fresh
-    /// call-time clock read -- the property `docs/adr/decoupled-listener-io.md` exists for:
-    /// once decode runs on its own loop, "now" at decode time can be arbitrarily later than
-    /// arrival under backlog, and this module's own doc comment promises `timestamp` is receipt
-    /// time, not decode time.
+    /// Events carry the caller's `received_at`, not decode time, which can lag arrival under
+    /// backlog (`docs/adr/decoupled-listener-io.md`).
     #[test]
     fn decode_into_stamps_events_with_the_callers_received_at_not_the_current_time() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
@@ -1251,9 +1134,7 @@ mod tests {
         assert_eq!(out[0].timestamp, deliberately_not_now);
     }
 
-    /// `decode_into` appends to `out` rather than replacing it -- the property that lets a caller
-    /// accumulate several datagrams' events into one reused buffer
-    /// (`logit_pipeline::BatchAccumulator`) instead of allocating fresh per datagram.
+    /// `decode_into` appends to `out`, so `logit_pipeline::BatchAccumulator` can reuse one buffer.
     #[test]
     fn decode_into_appends_to_an_already_populated_out_buffer_rather_than_replacing_it() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
@@ -1314,11 +1195,7 @@ mod tests {
         );
     }
 
-    /// Regression test for a review finding: before `syslog.sd` parsing existed, a whole
-    /// non-UTF-8 line failed whole-line UTF-8 validation and was rejected with its own
-    /// diagnostic; now that only MSG is allowed to carry non-UTF-8 bytes, a non-UTF-8 HOSTNAME
-    /// token is simply skipped -- this pins that the skip is still observable, through a
-    /// throttled `hostname_not_utf8` diagnostic mirrored into
+    /// A skipped non-UTF-8 RFC 3164 HOSTNAME stays observable, as
     /// `logit.component.diagnostics{key="hostname_not_utf8"}`.
     #[test]
     fn a_non_utf8_rfc3164_hostname_is_skipped_with_a_throttled_diagnostic() {
@@ -1353,8 +1230,7 @@ mod tests {
 
     #[test]
     fn rfc3164_json_body_containing_colon_space_is_kept_whole() {
-        // Regression guard for the two-token bound: a tag-less message whose JSON body has a
-        // space after a colon must not have its leading `{"key":` token mistaken for a tag.
+        // A tag-less JSON body's leading `{"key":` token must not be taken for a tag.
         let line = r#"<134>Aug 30 10:00:00 {"status": 200, "path": "/foo: bar"}"#;
         let event = only_event(decode(line));
         assert_eq!(message_str(&event), r#"{"status": 200, "path": "/foo: bar"}"#);
@@ -1372,11 +1248,8 @@ mod tests {
 
     #[test]
     fn rfc3164_tag_with_an_overflowing_numeric_pid_becomes_a_str_pid_not_a_panic() {
-        // Regression test for the original blocker: a PID this long used to reach a bare
-        // `.parse().expect(...)` and panic the listener task on one crafted UDP packet. Now
-        // `syslog.pid` becomes `Value::Str` for PROCID/bracketed-PID content that doesn't fit
-        // `u64` -- see the module doc's `syslog.pid` section -- rather than being dropped and
-        // the whole `tag[pid]:` token absorbed into the message.
+        // A PID that overflows `u64` must not panic; it becomes `Value::Str` (module doc,
+        // `syslog.pid`) and the `tag[pid]:` token stays out of the message.
         let line = "<13>tag[99999999999999999999]: hello";
         let event = only_event(decode(line));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("tag"));
@@ -1397,10 +1270,8 @@ mod tests {
 
     #[test]
     fn rfc3164_tag_with_no_trailing_space_and_empty_message_does_not_panic() {
-        // Regression test for the second blocker: a TAG-shaped token followed by nothing (no
-        // trailing space, so an empty MSG) used to hand `slice_of` the `&'static str` literal
-        // `split_first_token` returned for "no more space in s", rather than a real slice of the
-        // line -- pointer-arithmetic underflow, panicking the listener task on one UDP packet.
+        // A TAG-shaped token with nothing after it: the empty MSG must be a real subslice of the
+        // line, or `slice_of`'s pointer arithmetic underflows and panics.
         let event = only_event(decode("<13>nginx:"));
         assert_eq!(event.attributes.get("syslog.tag").and_then(Value::as_str), Some("nginx"));
         assert_eq!(message_str(&event), "");
@@ -1457,10 +1328,8 @@ mod tests {
             "2024-01-01T00:00:00+99:99", // offset hour/minute both out of range
             "2024-01-01T23:59:60Z",      // RFC 5424 forbids leap seconds
             "2024-01-01t00:00:00z",      // lowercase t/z
-            // 10 fractional digits -- past what an i64 of nanoseconds can hold. RFC 5424 itself
-            // allows at most 6, but the parser is `logit_core::time`'s shared RFC 3339 one now
-            // (it also serves `trace_context`'s `span.*_rfc3339`), which accepts up to 9; a
-            // 7-9 digit fraction from a syslog sender is harmless leniency, not a rejection.
+            // 10 fractional digits, past nanoseconds. RFC 5424 allows 6, but the shared
+            // `logit_core::time` RFC 3339 parser accepts up to 9, a harmless leniency.
             "2024-01-01T00:00:00.1234567890Z",
         ] {
             let line = format!("<134>1 {ts} - - - - - msg");
@@ -1500,9 +1369,8 @@ mod tests {
 
     #[test]
     fn rfc5424_timestamp_outside_the_representable_range_is_kept_without_the_attribute() {
-        // A well-formed RFC 3339 timestamp naming an instant outside the `i64` nanosecond range
-        // (roughly 1677-09-21 to 2262-04-11) used to be indistinguishable from a malformed one,
-        // discarding the whole log record rather than just the unrepresentable attribute.
+        // Well-formed but outside the `i64` nanosecond range (roughly 1677-09-21 to 2262-04-11):
+        // the record is kept without `syslog.timestamp`, not discarded as malformed.
         for ts in ["2400-01-01T00:00:00Z", "1000-01-01T00:00:00Z"] {
             let line = format!("<134>1 {ts} h a 1 - - msg");
             let event = only_event(decode(&line));
@@ -1527,10 +1395,8 @@ mod tests {
 
     #[test]
     fn a_digit_led_rfc3164_message_that_fails_as_rfc5424_falls_back_instead_of_being_dropped() {
-        // "4 requests failed" sniffs as a plausible RFC 5424 VERSION ("4", a digit, then a
-        // space), but has none of RFC 5424's mandatory fields after it, so `parse_5424` fails.
-        // That failure must fall back to RFC 3164 (whose grammar tolerates all of this as an
-        // untagged, hostname-less message) rather than discarding the line.
+        // "4 requests failed" sniffs as RFC 5424 version 4 and fails `parse_5424`, so it must
+        // fall back to RFC 3164 as an untagged, hostname-less message.
         let event = only_event(decode("<13>4 requests failed"));
         assert_eq!(message_str(&event), "4 requests failed");
         assert!(event.attributes.get("syslog.tag").is_none());
@@ -1576,10 +1442,7 @@ mod tests {
 
     #[test]
     fn multi_line_datagram_with_an_invalid_utf8_line_still_emits_the_good_ones() {
-        // Regression test: a whole-datagram `str::from_utf8` used to reject every line in the
-        // packet as soon as any single byte anywhere was invalid UTF-8. There is no whole-line
-        // UTF-8 gate any more, but this line still fails to parse (it has no `<PRI>` at all), so
-        // the assertion -- the good sibling lines still decode -- still exercises the property.
+        // One invalid-UTF-8, PRI-less line must not take its good sibling lines with it.
         let mut datagram = Vec::new();
         datagram.extend_from_slice(b"<13>a\n");
         datagram.extend_from_slice(&[0xff, 0xfe]); // not valid UTF-8, no `<PRI>` either
@@ -1628,8 +1491,7 @@ mod tests {
 
     #[test]
     fn message_whitespace_is_preserved_not_trimmed() {
-        // Regression test: `.trim()` on the whole line used to eat trailing MSG spaces and
-        // collapse an all-whitespace MSG into an (incorrectly) skipped "blank line".
+        // Trailing MSG spaces are payload, and an all-whitespace MSG is not a blank line.
         let event = only_event(decode("<13>tag: value  "));
         assert_eq!(message_str(&event), "value  ");
 
@@ -1690,9 +1552,8 @@ mod tests {
 
     // ---- RFC 5424 section 6.5 examples ---------------------------------------------------------
     //
-    // Transcribed from the author's own knowledge of the RFC 5424 text, not copy-pasted from a
-    // fetched copy -- flagged here explicitly so the docs/test worker verifies these word-for-word
-    // against the actual RFC before relying on them as a fidelity gate.
+    // Transcribed from memory of the RFC 5424 text, not copied from a fetched copy: verify them
+    // word for word against the RFC before relying on them as a fidelity gate.
 
     #[test]
     fn rfc5424_section_6_5_example_1_nil_sd_with_bom_message() {
@@ -1759,11 +1620,9 @@ mod tests {
         assert_eq!(event.attributes.get("syslog.sd"), Some(&Value::Map(Box::new(sd))));
     }
 
-    /// SD-IDs and PARAM-NAMEs go through the decoder's `KeyCache`, and the fixed `syslog.*`
-    /// carrier keys are process constants: a second line with the same structured data (params
-    /// in another order) interns nothing new and the cache holds exactly the id plus the three
-    /// param names. `nextest` runs each test in its own process, so `interner::len()` here
-    /// reflects only this test.
+    /// A repeat line with the same structured data (params reordered) interns nothing new, and
+    /// the `KeyCache` holds exactly the id and three param names. `nextest` runs each test in its
+    /// own process, so `interner::len()` reflects only this test.
     #[test]
     fn repeat_sd_ids_and_param_names_are_cache_hits() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
@@ -1874,20 +1733,14 @@ mod tests {
         assert!(matches!(parse_err(line), CodecError::Malformed(_)));
     }
 
-    /// A line that reaches `parse_structured_data` and is then rejected must intern nothing: the
-    /// SD-ID duplicate check above is a non-interning `AttrMap::get` probe precisely so an SD-ID
-    /// that never validates stays out of the process-wide table. Both ways in matter --
-    /// `parse_line`'s any-digit RFC 5424 sniff hands a plain RFC 3164 line whose MSG contains a
-    /// `[token` to the SD parser before falling back (that token is message text, not an SD-ID),
-    /// and a genuine version-`1` line with a malformed SD-ELEMENT is rejected outright. Either
-    /// one interning its token would retain producer-controlled text for the life of the process,
-    /// outside `docs/design/memory.md` §4's accepted exposure. `nextest` runs each test in its own
-    /// process, so `interner::len()` here reflects only this test.
+    /// A line rejected inside `parse_structured_data` interns nothing, whether it is an RFC 3164
+    /// line routed there by the sniff or a version-`1` line with a malformed SD-ELEMENT
+    /// (`docs/design/memory.md` §4). `nextest` runs each test in its own process, so
+    /// `interner::len()` reflects only this test.
     #[test]
     fn a_line_rejected_inside_structured_data_interns_nothing() {
         let mut decoder = SyslogDecoder::new(Arc::new(Resource::default()));
-        // Warm-up: one well-formed line, so `KEYS`'s `LazyLock` (all eight carrier keys, interned
-        // together on first touch) is initialized before the window below opens.
+        // Warm-up: initializes `KEYS` before the window opens.
         drop(
             decoder
                 .decode(Bytes::from_static(b"<134>1 - - - - - - warm"))
@@ -1936,8 +1789,7 @@ mod tests {
 
     // ---- line splitting off (the TCP framing path) --------------------------------------------
 
-    /// `SyslogInput::tcp`'s whole reason for turning splitting off: the framer has already
-    /// delimited the message, and an octet-counted MSG may contain a `\n` as ordinary content.
+    /// With splitting off, an octet-counted MSG's `\n` stays content.
     #[test]
     fn with_line_splitting_off_treats_the_whole_buffer_as_one_line() {
         let mut decoder =
@@ -1965,9 +1817,7 @@ mod tests {
         out
     }
 
-    /// An octet-counted sender may legally count its own `\r\n` terminator inside MSG-LEN, so
-    /// the frame arrives with it attached -- and must then decode exactly like the same line in a
-    /// UDP datagram, which the splitting arm strips at the line break.
+    /// A `\r\n` counted inside MSG-LEN is stripped, matching the same line over UDP.
     #[test]
     fn with_line_splitting_off_strips_a_counted_crlf_terminator() {
         assert_eq!(
@@ -1981,16 +1831,13 @@ mod tests {
         );
     }
 
-    /// A counted bare `\n` comes off too -- same terminator, one of the two spellings.
+    /// A counted bare `\n` is stripped too.
     #[test]
     fn with_line_splitting_off_strips_a_counted_lf_terminator() {
         assert_eq!(message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\n"))), "hello");
     }
 
-    /// The regression the unconditional `\r` strip caused: an LF-framed frame reaches the decoder
-    /// already terminator-free (`crate::tcp::Framer` consumed the `\n` and one `\r`), so a `\r`
-    /// still at its end is payload -- a message genuinely ending in CR, sent `...hello\r\r\n`.
-    /// It used to lose that byte on TCP while the same bytes kept it over UDP.
+    /// A payload `\r` left after the framer unwrapped `...hello\r\r\n` is kept, as over UDP.
     #[test]
     fn with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped() {
         // What `Framer::next_line` hands the decoder for the wire bytes `...hello\r\r\n`.
@@ -1998,7 +1845,7 @@ mod tests {
             message_str(&only_event(decode_framed(b"<134>1 - - - - - - hello\r"))),
             "hello\r"
         );
-        // And the same wire bytes through the UDP arm, which is what it has to agree with.
+        // The same wire bytes through the UDP arm.
         assert_eq!(message_str(&only_event(decode("<134>1 - - - - - - hello\r\r\n"))), "hello\r");
     }
 
@@ -2013,7 +1860,7 @@ mod tests {
         assert!(out.is_empty(), "an empty frame carries no message");
     }
 
-    /// Splitting stays on by default -- every existing UDP caller depends on it.
+    /// Splitting is on by default, as UDP needs.
     #[test]
     fn line_splitting_is_on_by_default() {
         assert_eq!(decode("<13>a\n<13>b\n").len(), 2);
@@ -2021,9 +1868,8 @@ mod tests {
 
     // ---- TCP end to end (`transport: tcp`) ----------------------------------------------------
 
-    /// Binds an ephemeral TCP port through `Input::bind`, then starts the listener -- the
-    /// `bind()`-then-`local_addr()` readiness shape with no bind-drop race
-    /// (`crates/logit-inputs/src/tcp.rs`'s own driver tests use the same one).
+    /// Binds an ephemeral TCP port through `Input::bind`, then starts the listener, with no
+    /// bind-drop race.
     async fn running_tcp_input(
         tls: Option<&TlsServerSettings>,
     ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>)
@@ -2039,9 +1885,8 @@ mod tests {
     ) -> (String, tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>)
     {
         let mut input = SyslogInput::tcp("127.0.0.1:0").with_tcp_receive(TcpListenerConfig {
-            // One event per frame, no interval timer: every delivery is attributable to exactly
-            // one frame, so a multiline message arriving as two events would fail loudly here
-            // rather than merely arriving in one batch.
+            // One event per batch, no timer: a multiline message split into two events arrives
+            // as two batches, not one.
             batch_max_events: 1,
             batch_flush_interval: Duration::ZERO,
             ..TcpListenerConfig::default()
@@ -2061,9 +1906,8 @@ mod tests {
         let sink = Fanout::new(vec![tx]);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
-            // The sender is moved in and held for the task's life: dropping it would resolve
-            // every `changed()` await inside the driver with an error the moment this helper
-            // returned. The test ends the listener by aborting the handle instead.
+            // Held for the task's life: dropping it would fail every `changed()` await in the
+            // driver. Tests abort the handle instead.
             let _shutdown_tx = shutdown_tx;
             let _ = input.run_until_shutdown(sink, shutdown_rx).await;
         });
@@ -2086,16 +1930,11 @@ mod tests {
         assert_eq!(message_str(event), "hello over tcp");
     }
 
-    /// `bad_line` throttles listener-wide, not per connection: the decoder clone each connection
-    /// gets shares its `Diagnostics`' counts with every other clone of the component's value
-    /// (`logit_core::Diagnostics`' type doc), so two connections rejecting two messages each
-    /// leave the component at 4. Counting per connection would leave this at 0 -- `diag` here is
-    /// the value handed to `with_diagnostics`, and each connection would have counted to 2 in a
-    /// throwaway decoder clone of its own that died with the connection.
+    /// `bad_line` throttles listener-wide: two connections rejecting two messages each leave the
+    /// component's count at 4, where per-connection counting would leave it at 0.
     ///
-    /// The well-formed line written last on each connection is what orders the assertion after
-    /// both connections' rejects: frames arriving on one connection are decoded in order, so
-    /// receiving its event proves the two bad lines ahead of it were already absorbed.
+    /// Each connection's final good line orders the assertion: a connection decodes in order, so
+    /// its event proves the bad lines ahead of it were absorbed.
     #[tokio::test]
     async fn bad_line_throttles_across_connections() {
         let diag = Diagnostics::new("syslog_in");
@@ -2148,8 +1987,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `syslog_out`'s own TCP framing (RFC 6587 section 3.4.1) through the same listener -- the
-    /// framing is detected from the leading digit, with nothing configured.
+    /// `syslog_out`'s TCP framing (RFC 6587 section 3.4.1), detected from the leading digit.
     #[tokio::test]
     async fn tcp_decodes_an_octet_counted_message_end_to_end() {
         let (addr, handle, mut rx) = running_tcp_input(None).await;
@@ -2165,10 +2003,8 @@ mod tests {
         handle.abort();
     }
 
-    /// Finding 1's end-to-end case: a message genuinely ending in CR, LF-framed on the wire as
-    /// `...\r\r\n`, keeps that byte -- the framer takes the `\n` and one `\r`, and the decoder
-    /// leaves what is left alone. The same bytes over UDP decode the same way (the decoder-level
-    /// twin of this is `with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped`).
+    /// A message ending in CR, LF-framed as `...\r\r\n`, keeps that byte, as over UDP. Decoder
+    /// twin: `with_line_splitting_off_keeps_a_payload_cr_the_framer_already_unwrapped`.
     #[tokio::test]
     async fn tcp_keeps_a_payload_cr_on_an_lf_framed_message_end_to_end() {
         let (addr, handle, mut rx) = running_tcp_input(None).await;
@@ -2186,9 +2022,7 @@ mod tests {
         handle.abort();
     }
 
-    /// Finding 1's other end-to-end case: an octet-counted sender whose MSG-LEN covers its own
-    /// `\r\n` terminator gets the terminator stripped, so the message matches what the same line
-    /// would decode to over UDP.
+    /// An octet-counted MSG-LEN covering its own `\r\n` has it stripped, matching UDP.
     #[tokio::test]
     async fn tcp_strips_a_counted_crlf_terminator_end_to_end() {
         let (addr, handle, mut rx) = running_tcp_input(None).await;
@@ -2204,10 +2038,8 @@ mod tests {
         handle.abort();
     }
 
-    /// The regression `SyslogDecoder::with_line_splitting` exists for, end to end: an
-    /// octet-counted MSG containing a newline is **one** event with the newline intact. Before
-    /// the flag, the decoder re-split it into a first half plus a PRI-less remainder that was
-    /// then dropped as `bad_line` -- a silently truncated log line.
+    /// An octet-counted MSG containing a newline is one event with the newline intact, not a
+    /// first half plus a PRI-less remainder dropped as `bad_line`.
     #[tokio::test]
     async fn tcp_keeps_a_multiline_octet_counted_message_as_exactly_one_event() {
         let (addr, handle, mut rx) = running_tcp_input(None).await;
@@ -2221,8 +2053,7 @@ mod tests {
         assert_eq!(events.len(), 1, "a multiline MSG must not be shredded into several events");
         assert_eq!(message_str(&events[0]), "line one\nline two\nline three");
 
-        // With `batch_max_events: 1` a second event would arrive as its own batch -- nothing more
-        // may follow.
+        // A second event would arrive as its own batch.
         assert!(
             tokio::time::timeout(Duration::from_millis(200), rx.recv()).await.is_err(),
             "the multiline message must produce exactly one event"
@@ -2230,12 +2061,8 @@ mod tests {
         handle.abort();
     }
 
-    /// `idle_timeout:` reaching the shared driver through this wrapper. When the clock fires,
-    /// what resets it and why a blocked downstream never counts are all the driver's own tests'
-    /// business (`crates/logit-inputs/src/tcp.rs`, `docs/adr/idle-connection-timeout.md`); what
-    /// is under test here is `SyslogInput::with_idle_timeout` reaching it at all -- a wrapper
-    /// whose method did nothing would leave the second client waiting on a permit forever, since
-    /// `with_max_connections(1)` means the quiet connection's permit is the only one there is.
+    /// `with_idle_timeout` reaches the driver: under `with_max_connections(1)`, a second client
+    /// is served only if the quiet first one is closed. The driver's tests cover the clock.
     #[tokio::test]
     async fn an_idle_tcp_connection_releases_its_permit_after_the_idle_timeout() {
         const LINE: &[u8] = b"<134>Aug 30 10:00:00 myhost nginx: hello over tcp\n";
@@ -2258,8 +2085,7 @@ mod tests {
             let _ = input.run_until_shutdown(sink, shutdown_rx).await;
         });
 
-        // One frame, so the first-byte deadline is behind us and only the idle clock can close
-        // this -- then nothing, with the socket held open.
+        // One frame passes the first-byte deadline, so only the idle clock can close this.
         let mut quiet = tokio::net::TcpStream::connect(&addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut quiet, LINE).await.unwrap();
         assert_nginx_line(&recv_events(&mut rx).await[0]);
@@ -2282,8 +2108,8 @@ mod tests {
         handle.abort();
     }
 
-    /// `crates/logit-inputs` is two levels under the repo root, where the committed TLS fixtures
-    /// live (`testdata/tls/README.md`) -- the same helper shape `crate::tcp`'s own tests use.
+    /// The repo root's `testdata/tls` (`testdata/tls/README.md`), two levels up from
+    /// `CARGO_MANIFEST_DIR`.
     fn testdata_tls_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
@@ -2337,8 +2163,7 @@ mod tests {
         handle.abort();
     }
 
-    /// Graph rule 43 is what an operator actually sees, but the builder refuses the same
-    /// combination rather than silently ignoring a `tls:` block -- DTLS is out of scope.
+    /// The builder refuses `tls:` on UDP rather than ignoring it, backing graph rule 43.
     #[test]
     fn with_tls_on_a_udp_listener_is_a_clear_error() {
         let settings = TlsServerSettings {
@@ -2356,15 +2181,12 @@ mod tests {
 
     // ---- recorded interop fixtures (testdata/interop/syslog/) ---------------------------------
     //
-    // Real captured wire traffic from real senders (util-linux `logger(1)`, Python's
-    // `logging.handlers.SysLogHandler`, and rsyslog itself), recorded by `script/record-fixtures`
-    // -- see testdata/interop/README.md and docs/plans/recorded-interop-fixtures.md for how and
-    // why. These assert on *decoded, identifiable values* (message content, tag, severity), not on
-    // the fixture bytes staying byte-for-byte stable across a re-record -- see
-    // testdata/interop/README.md's "Consuming these fixtures" section for why.
+    // Real captured traffic from util-linux `logger(1)`, Python's
+    // `logging.handlers.SysLogHandler`, and rsyslog, recorded by `script/record-fixtures`
+    // (testdata/interop/README.md, docs/plans/recorded-interop-fixtures.md). Asserted on decoded
+    // values, not bytes, which a re-record changes (that README's "Consuming these fixtures").
 
-    /// `testdata/interop/syslog/<name>` as a `String` -- every fixture here is UTF-8 text, so this
-    /// reuses `decode`'s existing `&str` signature rather than adding a byte-oriented variant.
+    /// `testdata/interop/syslog/<name>` as a `String`; every fixture here is UTF-8 text.
     fn interop_fixture(name: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/interop/syslog")
@@ -2397,9 +2219,8 @@ mod tests {
 
     #[test]
     fn interop_fixture_logger_rfc5424_basic_decodes_message_and_structured_data() {
-        // This capture's STRUCTURED-DATA (`[timeQuality tzKnown="1" ...]`, util-linux logger's own
-        // addition) is real, not hand-typed -- exercising the real `parse_structured_data` path
-        // the module doc describes, with PROCID/MSGID both nil ("-").
+        // Real STRUCTURED-DATA (`[timeQuality tzKnown="1" ...]`, added by util-linux logger), with
+        // PROCID/MSGID both nil ("-").
         let event = only_event(decode(&interop_fixture("logger-rfc5424-basic-000.raw")));
         assert_eq!(
             message_str(&event),
@@ -2423,11 +2244,9 @@ mod tests {
 
     #[test]
     fn interop_fixture_python_syslog_handler_plain_message_has_no_trailing_garbage() {
-        // NoNulSysLogHandler (demo/app/pages/syslog_handler.py) exists because the base
-        // SysLogHandler's trailing NUL byte breaks the json transform -- this fixture is real
-        // captured output from that handler; a trailing byte here would make `decode` see it as
-        // part of the message (syslog_in has no NUL-stripping of its own), so an exact match
-        // doubles as an empirical check that the real handler output stays NUL-free.
+        // Real output of NoNulSysLogHandler (demo/app/pages/syslog_handler.py), which exists
+        // because the base handler's trailing NUL breaks the json transform. syslog_in doesn't
+        // strip NULs, so the exact match also checks the handler's output stays NUL-free.
         let event = only_event(decode(&interop_fixture("python-syslog-handler-000.raw")));
         assert_eq!(
             message_str(&event),
@@ -2437,8 +2256,7 @@ mod tests {
 
     #[test]
     fn interop_fixture_python_syslog_handler_json_body_is_clean_for_the_json_transform() {
-        // The exact shape demo/logit.yaml's app tier logs in production: a JSON MSG body with no
-        // trailing NUL to trip up the downstream `json` transform.
+        // The shape demo/logit.yaml's app tier logs: a JSON MSG with no trailing NUL.
         let event = only_event(decode(&interop_fixture("python-syslog-handler-001.raw")));
         assert_eq!(
             message_str(&event),

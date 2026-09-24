@@ -1,13 +1,12 @@
 # Architecture decision records
 
 Each ADR is a single Markdown file named after the decision (`slug.md`, no number — see
-[`TEMPLATE.md`](TEMPLATE.md)). A slug is permanent once written: don't rename a file to fix a typo
-or reword a title after the fact, since every other doc, source comment, and config in the repo
-cites it by that exact path. `created`/`updated` in each file's frontmatter is what orders this
-index, not the filename.
+[`TEMPLATE.md`](TEMPLATE.md)). A slug is permanent once written. Don't rename a file to fix a typo
+or reword a title, because docs, source comments, and configs across the repo cite it by that exact
+path. The `created`/`updated` dates in each file's frontmatter order this index, not the filename.
 
-New ADR checklist: copy `TEMPLATE.md` to `docs/adr/<slug>.md`, fill in `created` (today) and
-`updated` (same date), write the record, then add a row here.
+To add an ADR, copy `TEMPLATE.md` to `docs/adr/<slug>.md`, set `created` to today and `updated` to
+the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|

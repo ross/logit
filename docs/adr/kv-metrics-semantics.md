@@ -35,7 +35,7 @@ is strictly better than a runtime no-op nobody notices — the same reasoning as
 non-sink component has a consumer" catching a different silent-black-hole shape.
 
 **An empty `name` on any counter, gauge, or distribution entry is also a config error, rejected at
-graph-validation time (rule 12).** `name` becomes the measurement in every metric line the
+graph-validation time (rule 11).** `name` becomes the measurement in every metric line the
 implemented `influxdb_out` sink writes, and Influx line protocol requires a non-empty measurement;
 an empty name reaching runtime would mean the first event to hit that entry produces a malformed
 line and a non-retryable 4xx from the sink instead of a clear error at `logit validate` time.

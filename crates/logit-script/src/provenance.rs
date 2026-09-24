@@ -1,40 +1,30 @@
-//! Exposes a batch's [`logit_core::Provenance`] (which component created it, which component this
-//! one received it from) plus this worker's own component id, to Lua as a global `provenance`
-//! userdata -- **read-only**, unlike `resource`. See `docs/design/lua-api.md`'s "Reading
-//! provenance" section and `docs/adr/batch-provenance-on-delivered.md`.
+//! Exposes a batch's [`logit_core::Provenance`] (the component that created it, and the one this
+//! component received it from) plus this worker's own component id, to Lua as a read-only
+//! `provenance` userdata. See `docs/design/lua-api.md`'s "Reading provenance" section and
+//! `docs/adr/batch-provenance-on-delivered.md`.
 //!
-//! Installed unconditionally in [`crate::ScriptWorker::new`], before the script's own source
-//! runs -- same reasoning as `crate::trace`/`crate::resource`'s module docs: a top-level alias
-//! (`local p = provenance`) captures whatever `provenance` *is* at that instant, once, forever;
-//! installing first means that instant is "the placeholder," not "doesn't exist yet," and later
-//! mutation (`set`/`ScriptWorker::with_component`) is visible through the alias because the
-//! captured value is a reference to the same underlying userdata, not a copy.
+//! Installed in [`crate::ScriptWorker::new`] before the script's source runs, for the reason in
+//! `crate::trace`'s module doc. A top-level alias (`local p = provenance`) holds a reference to
+//! this userdata, so later [`set`]/[`set_component`] calls are visible through it.
 //!
-//! **UserData, not a plain table like `trace`.** `trace`'s own doc comment concedes a script's
-//! write to it is silently accepted and only clobbered on the next batch -- that fails "never
-//! modifiable" outright. This mirrors `crate::resource`'s `__index`/`__newindex` proxy shape
-//! instead, but rejects every write in `__newindex` rather than accepting one: there is no
-//! mutable half to this global the way there is for `resource`.
+//! **UserData, not a plain table like `trace`**, because a plain table accepts a script's write
+//! until the next batch overwrites it. This mirrors `crate::resource`'s `__index`/`__newindex`
+//! shape, but `__newindex` rejects every write.
 
 use mlua::{Lua, MetaMethod, UserData, UserDataMethods, Value as LuaValue};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Shared between [`crate::ScriptWorker`] and the installed [`ProvenanceProxy`] userdata through
-/// one `Rc<RefCell<..>>` -- the same shape `crate::resource`'s `ResourceState` uses, and for the
-/// same reason: `set`/`ScriptWorker::with_component` need to mutate this without a `&Lua` in hand.
+/// State shared by [`crate::ScriptWorker`] and the [`ProvenanceProxy`] userdata, so [`set`] and
+/// [`set_component`] can mutate it without a `&Lua` (as `crate::resource`'s `ResourceState`).
 pub(crate) struct ProvenanceState {
-    /// This worker's own component id -- set once, via [`crate::ScriptWorker::with_component`],
-    /// and never changed again for the worker's whole lifetime. `None` until that builder is
-    /// called (mirrors every other placeholder-before-first-real-value shape in this crate).
+    /// This worker's component id; `None` until [`crate::ScriptWorker::with_component`] sets it.
     component: Option<String>,
     origin: Option<String>,
     previous: Option<String>,
 }
 
-/// Creates the `provenance` global (every field `None`, like `crate::trace::install`'s all-zero
-/// placeholder -- no batch has been seen yet, and no component id set yet either) and returns the
-/// shared state [`set`]/[`crate::ScriptWorker::with_component`] mutate directly.
+/// Creates the `provenance` global, every field `nil` until set, and returns its shared state.
 pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ProvenanceState>>> {
     let state =
         Rc::new(RefCell::new(ProvenanceState { component: None, origin: None, previous: None }));
@@ -43,23 +33,23 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<Rc<RefCell<ProvenanceState>>> {
     Ok(state)
 }
 
-/// Called once per incoming batch, before any of its events reach `process` -- overwrites
-/// `origin`/`previous` in place with the batch's own [`logit_core::Provenance`] -- and once
-/// before every `flush()` call, with the flushing component as both (the root context a flush
-/// runs in, `docs/adr/lua-flush-root-context.md`).
+/// Overwrites `origin`/`previous`.
+///
+/// Called once per incoming batch before its events reach `process`, and before every `flush()`
+/// with the flushing component as both: the root context a flush runs in
+/// (`docs/adr/lua-flush-root-context.md`).
 pub(crate) fn set(state: &Rc<RefCell<ProvenanceState>>, provenance: logit_core::Provenance) {
     let mut state = state.borrow_mut();
     state.origin = provenance.origin_str().map(str::to_string);
     state.previous = provenance.previous_str().map(str::to_string);
 }
 
-/// Called once, from [`crate::ScriptWorker::with_component`] -- sets `provenance.component` for
-/// the rest of this worker's lifetime.
+/// Sets `provenance.component`, from [`crate::ScriptWorker::with_component`].
 pub(crate) fn set_component(state: &Rc<RefCell<ProvenanceState>>, id: &str) {
     state.borrow_mut().component = Some(id.to_string());
 }
 
-/// The `provenance` global's userdata. Shares `ProvenanceState` with [`install`]'s caller.
+/// The `provenance` global's userdata.
 struct ProvenanceProxy(Rc<RefCell<ProvenanceState>>);
 
 impl UserData for ProvenanceProxy {
@@ -78,11 +68,9 @@ impl UserData for ProvenanceProxy {
             })
         });
 
-        // Every field is read-only -- unlike `resource`'s `__newindex`, there is no accepted
-        // write path here at all, matching `crate::proxy::EventProxy`'s "read-only, name it or
-        // say no field" split (`event.has_log` etc): a known field reports itself as read-only,
-        // an unknown one reports it has no field -- never the reverse, so a caller can tell "this
-        // isn't for you to write" from "you mistyped this."
+        // Every write fails. A known field says "read-only" and an unknown one says "no field",
+        // as `crate::proxy::EventProxy` does for `event.has_log`, so a script can tell a
+        // forbidden write from a typo.
         methods.add_meta_method(
             MetaMethod::NewIndex,
             |_, _this, (key, _value): (mlua::String, LuaValue)| -> mlua::Result<()> {
@@ -156,9 +144,7 @@ mod tests {
         assert_eq!(seen, "enrich");
     }
 
-    /// A top-level alias captures the *userdata reference*, not a snapshot -- a later `set`/
-    /// `set_component` must still be visible through it, exactly the property `crate::trace`'s
-    /// own module doc names as the reason installation must happen before `.exec()`.
+    /// A top-level alias holds the userdata, not a snapshot, so later sets are visible through it.
     #[test]
     fn a_top_level_alias_sees_a_later_set() {
         let lua = Lua::new();

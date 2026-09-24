@@ -1,12 +1,16 @@
-//! `internal`: `logit` talking about itself. Drains every component's buffered self-telemetry
-//! points ([`logit_core::telemetry`]) on `interval` and emits them into the graph as ordinary
-//! events, exactly like any other listener -- so every existing downstream tool (`aggregate`,
-//! `keep`, `lua`, any sink) already works on them, with nothing new to build. See
-//! `docs/design/internal-telemetry.md` and `docs/adr/internal-telemetry-as-pipeline-events.md`.
+//! `internal`: `logit` observing itself. On each `interval` it drains every component's
+//! per-component self-telemetry buffer ([`logit_core::telemetry`]) and sends the result as one
+//! ordinary batch, so any downstream component works on it (`docs/design/internal-telemetry.md`,
+//! `docs/adr/internal-telemetry-as-pipeline-events.md`). Graph rule 13 allows at most one
+//! `internal`: a second would split the one process-wide buffer set between them.
 //!
-//! `interval` serves double duty: the drain cadence for every component's buffered points, and
-//! the sampling tick for this component's own process-level gauges (interner size, uptime) --
-//! tied to no occurrence, so nothing else would ever push them.
+//! A drain yields three kinds of event: metric points (timestamped at the drain), spans (at their
+//! own start), and captured logs (at capture). Logs arrive only when `logs:` isn't `off`:
+//! `logit-cli` activates `logit_core::TelemetryLayer` at that threshold (`warn`, the default, or
+//! `error`).
+//!
+//! `interval` is also the sampling tick for this component's own `logit.process.*` gauges, which
+//! no occurrence would ever push.
 
 use crate::Input;
 use logit_core::{
@@ -20,21 +24,13 @@ use tokio::sync::watch;
 pub struct InternalInput {
     interval: Duration,
     registry: Arc<Registry>,
-    /// Built once here and `Arc`-shared by every batch this input ever sends -- the resource is
-    /// batch-level and identical on every tick, so rebuilding it per drain would re-intern
-    /// `service.name` and reallocate an `AttrMap` for a value that cannot change. `internal` is
-    /// the one input allowed to stamp `service.name = logit`: this is `logit`'s own telemetry,
-    /// unlike `syslog_in`/`statsd_in`, whose ingested data belongs to other services and would be
-    /// misidentified by the same stamp. See `docs/design/internal-telemetry.md`.
+    /// `service.name = logit`, built once and `Arc`-shared by every batch. `internal` is the one
+    /// input that stamps it: its data is `logit`'s own, where another listener's belongs to
+    /// other services.
     resource: Arc<Resource>,
-    /// The OTLP instrumentation scope every batch this input sends carries -- `{ name: "logit",
-    /// version: env!("CARGO_PKG_VERSION") }`, built once here and `Arc`-shared across every
-    /// batch the same way `resource` is. `internal` is the one input allowed to stamp this: it's
-    /// the identity an earlier codec revision used to *invent* on decode for any OTLP-sourced
-    /// batch with no wire scope (`crates/logit-proto/src/otlp/common.rs`'s `pb_to_scope`), which
-    /// W4 retired everywhere except here, where it belongs to the one real producer of it --
-    /// `logit`'s own self-telemetry. `docs/design/internal-telemetry.md` relies on this scope
-    /// existing to identify `logit`'s own points/spans/logs downstream.
+    /// `{ name: "logit", version: CARGO_PKG_VERSION }`, built once and `Arc`-shared like
+    /// `resource`. Downstream identifies `logit`'s own points, spans, and logs by it; no other
+    /// input stamps it, and no codec invents it.
     scope: Arc<Scope>,
     telemetry: Telemetry,
     diag: Diagnostics,
@@ -58,14 +54,13 @@ impl InternalInput {
         }
     }
 
-    /// Attaches this component's own telemetry handle -- `internal` is a component like any
-    /// other, registered in the same `Registry` it drains, so its own points (`logit.process.*`,
-    /// `logit.internal.*`) ride along in the very next drain rather than needing a special path.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
         self
     }
 
+    /// This component's own handle, registered in the `Registry` it drains, so its
+    /// `logit.process.*`/`logit.internal.*` points ride along in the next drain.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -75,47 +70,32 @@ impl InternalInput {
 #[async_trait::async_trait]
 impl Input for InternalInput {
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        // Never exercised in production -- `run_input` (`crates/logit-pipeline/src/runtime.rs`)
-        // always calls `run_until_shutdown`. Present because the trait requires it, and shaped
-        // exactly like `crate::udp::UdpListener::run`: a never-firing `watch` channel, so the two
-        // entry points share one loop rather than drifting apart. The `_tx` binding is
-        // load-bearing -- drop the sender and `wait_for` below resolves immediately with
-        // `RecvError`, which would turn every `run` into "drain once, then exit".
+        // The runtime's `run_input` always calls `run_until_shutdown`; this shares its loop
+        // through a never-firing `watch`. Keep `_tx` bound: a dropped sender makes `wait_for`
+        // resolve at once, turning `run` into "drain once, then exit".
         let (_tx, rx) = watch::channel(false);
         self.run_until_shutdown(sink, rx).await
     }
 
-    /// The drain loop, plus **one final drain when `shutdown` fires** -- the whole reason this
-    /// input overrides the trait's default (which just drops `run`'s future, ADR
-    /// `decoupled-listener-io`).
+    /// The drain loop, plus **one final drain when `shutdown` fires**, which is why this input
+    /// overrides the trait's default (cancel-by-drop).
     ///
-    /// **Why.** Points land in `logit_core::telemetry`'s per-component buffers continuously but
-    /// only leave them on a drain tick, so at the instant a SIGTERM arrives there is always up to
-    /// one whole `interval` of buffered self-telemetry sitting there. Cancel-by-drop threw all of
-    /// it away, silently: a process running the default 10s `interval` for 25s reported two
-    /// intervals and lost the third. That's wrong for any operator watching `logit`'s own
-    /// counters across a restart, and it's load-bearing for `logit-perf`'s attribution mode
-    /// (`docs/design/performance.md`), which reads exactly these points back out of a short-lived
-    /// process it SIGTERMs on purpose -- without this drain the last, and for a short run the
-    /// most interesting, slice of every node's `process.duration` never reaches the dump.
+    /// **Why.** Up to one whole `interval` of self-telemetry is always buffered, and
+    /// cancel-by-drop would discard it: a 25s run at the default 10s `interval` would report two
+    /// intervals and lose the third. `logit-perf`'s attribution mode (`docs/design/performance.md`)
+    /// SIGTERMs a short-lived process and reads these points back, so it needs that last slice.
     ///
-    /// **Why the final drain's batch actually gets delivered.** `sink` is a [`Fanout`] owned by
-    /// this future, and every downstream node's inbox stays open for as long as *some* sender
-    /// exists -- so nothing downstream can begin its own close-time flush until this function
-    /// returns and drops it (`run_with_telemetry`'s shutdown cascade,
-    /// `crates/logit-pipeline/src/runtime.rs`). `run_input` bounds that wait by
-    /// `logit_pipeline::InputRuntimeConfig`'s `shutdown_grace`, which for `internal` is
-    /// `ReceiveConfig::default()`'s 5s (`logit_cli::pipeline::input_runtime_config`) -- one
-    /// `Registry::drain` plus one `Fanout::send` fits inside that with room to spare, and
-    /// `Fanout::send`'s only unbounded wait is downstream backpressure, which the grace backstop
-    /// is there to cut short anyway.
+    /// **Why the final batch is delivered.** Downstream inboxes stay open while this future
+    /// holds `sink`, so no downstream close-time flush starts until this returns
+    /// (`run_with_telemetry`'s shutdown cascade). `run_input` bounds the wait by
+    /// `InputRuntimeConfig::shutdown_grace`, which for `internal` is always
+    /// `ReceiveConfig::default()`'s 5s (graph rule 17 rejects a `receive:` block on it). One drain
+    /// and one `Fanout::send` fit well inside that; the grace cuts short a send blocked on
+    /// downstream backpressure, its only unbounded wait.
     ///
-    /// **Residual, by design.** The final drain's own `logit.internal.points.emitted` (and the
-    /// `spans`/`logs` counters, and `logit.internal.drain.duration`) are recorded *after* the
-    /// drain that produced them, so they sit in `internal`'s buffer one tick behind and, with no
-    /// tick left to come, are never emitted. That's the same "a drain can't include a count of
-    /// itself" property every one of these self-counts already has (`InternalInput::tick`'s own
-    /// comment, `docs/design/internal-telemetry.md`) -- not a new gap, just its last instance.
+    /// **Residual.** The final drain's own `logit.internal.{points,spans,logs}.emitted` and
+    /// `logit.internal.drain.duration` are recorded after it, so with no tick left they're never
+    /// emitted: the last instance of "a drain can't count itself" (see `tick`).
     async fn run_until_shutdown(
         &mut self,
         sink: Fanout,
@@ -123,14 +103,11 @@ impl Input for InternalInput {
     ) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut ticker = tokio::time::interval(self.interval);
-        // `tokio::time::interval` fires its first tick immediately -- consumed here and skipped,
-        // so the first real drain happens after one full interval has actually elapsed rather
-        // than at t=0 against buffers nothing has had time to populate.
+        // Skip `interval`'s immediate first tick, so the first drain is one interval in.
         ticker.tick().await;
         loop {
-            // Both arms are cancellation-safe: `Interval::tick` guarantees no tick is consumed
-            // when another branch wins, and `wait_for` re-checks the current value on its next
-            // call, so neither a tick nor the shutdown edge can be lost to the loser of a race.
+            // Both arms are cancel-safe: a losing `Interval::tick` consumes no tick, and
+            // `wait_for` re-checks the current value on its next call.
             tokio::select! {
                 _ = ticker.tick() => self.tick(started, &sink).await,
                 () = shutdown_due(&mut shutdown) => {
@@ -144,10 +121,8 @@ impl Input for InternalInput {
 
 impl InternalInput {
     async fn tick(&self, started: Instant, sink: &Fanout) {
-        // Process-level facts sampled here rather than pushed by anything else, since nothing
-        // else has an occasion to push them -- closes the `interner::len()` observability hook
-        // `docs/known-gaps.md` names as "nearly free... and would make this observable rather
-        // than silent" once something reads it.
+        // Sampled here because nothing else has an occasion to push them. `interner.strings` is
+        // the process-wide interner's size, which never shrinks (`interner::len`).
         self.telemetry.gauge("logit.process.interner.strings", interner::len() as f64, &[]);
         self.telemetry.gauge("logit.process.uptime", started.elapsed().as_secs_f64(), &[]);
 
@@ -157,20 +132,12 @@ impl InternalInput {
         if events.is_empty() {
             return;
         }
-        // Recorded via `self.telemetry` after the drain that produced this count -- like every
-        // other point here, it rides along in the *next* drain, one tick behind. Every mature
-        // statsd client's own self-telemetry (packets sent/dropped) works the same way, for the
-        // same reason: a drain can't include a count of itself.
+        // These counts are recorded after the drain that produced them, so they ride in the next
+        // drain, one tick behind: a drain can't include a count of itself.
         //
-        // Split by shape, not just totalled: `drain` now returns metric-point, span-carrying,
-        // and (workstream D) log-carrying events in one flat list
-        // (`docs/design/internal-telemetry.md`'s "Spans" and "Logs" sections), and
-        // `logit.internal.points.emitted` naming *points* specifically would become wrong the
-        // moment a span or a log rode along inside its count uncounted-for. `event.log` is
-        // checked *before* falling through to "point" -- a log event carries neither `metrics`
-        // nor `span`, so without this check it would be miscounted as a point.
-        // `logit.internal.spans.emitted`/`logs.emitted` are the symmetric counters for the other
-        // two shapes.
+        // Counted per kind, since one drain mixes points, spans, and logs. `event.log` is
+        // checked first: a log event carries neither `metrics` nor `span`, so it would otherwise
+        // fall through as a point.
         let (points_emitted, spans_emitted, logs_emitted) =
             events.iter().fold((0u64, 0u64, 0u64), |(points, spans, logs), event| {
                 if event.log.is_some() {
@@ -191,9 +158,6 @@ impl InternalInput {
             self.telemetry.count("logit.internal.logs.emitted", logs_emitted as f64, &[]);
         }
 
-        // A real Scope, deliberately: this is `logit` observing itself, the one producer
-        // `docs/design/internal-telemetry.md` names as allowed to stamp that identity on purpose
-        // (see `scope`'s own doc comment on this struct).
         sink.send(EventBatch {
             resource: self.resource.clone(),
             scope: Some(self.scope.clone()),
@@ -205,16 +169,12 @@ impl InternalInput {
 
 /// Resolves once `shutdown` holds `true`, yielding nothing.
 ///
-/// The wrapper exists to make the `select!` above `Send`, which `Input`'s `#[async_trait]`
-/// requires: `watch::Receiver::wait_for` resolves to a `watch::Ref` holding an
-/// `RwLockReadGuard`, which isn't `Send`, and `select!` keeps each branch's resolved value alive
-/// across the *other* branch's handler -- which here `.await`s a drain. Returning `()` drops the
-/// guard before the macro ever stores it. (`Input::run_until_shutdown`'s default body can inline
-/// the same call because neither of its handlers awaits anything.)
+/// Exists to keep the `select!` above `Send`, as `#[async_trait]` requires: `wait_for` resolves to
+/// a `watch::Ref` holding a non-`Send` read guard, and `select!` keeps a branch's value alive
+/// across its handler, which here awaits a drain. Returning `()` drops the guard first.
 ///
-/// The `Result` is discarded for the same reason that default body discards it: `Err` means the
-/// sender was dropped, which in this process only happens as part of the same teardown, and
-/// "drain once more, then stop" is the right answer either way.
+/// The `Result` is discarded: `Err` means the sender dropped, which happens only in the same
+/// teardown, and "drain once more, then stop" is right either way.
 async fn shutdown_due(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|&due| due).await;
 }
@@ -277,8 +237,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         let fanout = Fanout::new(vec![tx]);
 
-        // Nothing else buffered, so this drain contains only `internal`'s own process-level
-        // gauges -- sampled just before the drain inside the same `tick` call.
+        // Sampled just before the drain, so they appear in this same tick's batch.
         input.tick(Instant::now(), &fanout).await;
 
         let delivered = rx.try_recv().expect("should have sent a batch");
@@ -296,11 +255,8 @@ mod tests {
         let _ = rx.try_recv(); // drain any second batch, unasserted
     }
 
-    /// Tempo (and every other OTLP backend) reads the *root span's resource* for a trace's
-    /// service name -- an empty `Resource` is why Grafana's Traces Drilldown showed
-    /// `<root span not yet received>` against traces whose root span had plainly been received.
-    /// `internal`'s telemetry is `logit`'s own, so unlike `syslog_in`/`statsd_in` (whose data
-    /// belongs to *other* services) it is the one input that can honestly name itself here.
+    /// OTLP backends read a trace's service name off the root span's resource; with an empty one,
+    /// Grafana's Traces Drilldown shows `<root span not yet received>`.
     #[tokio::test]
     async fn every_batch_carries_service_name_on_its_resource() {
         let registry = Registry::new();
@@ -324,9 +280,6 @@ mod tests {
         );
     }
 
-    /// The scope identity `otlp_out` used to have `otlp_in`'s decoder *invent* for any
-    /// OTLP-sourced batch with no wire scope -- W4 retired that everywhere except here, where it
-    /// belongs to the one real producer of it (`InternalInput::scope`'s own doc comment).
     #[tokio::test]
     async fn every_batch_carries_the_logit_scope() {
         let registry = Registry::new();
@@ -385,9 +338,7 @@ mod tests {
         assert!(found, "the second drain should carry the first drain's emitted-count");
     }
 
-    /// The counting half of `docs/design/internal-telemetry.md`'s "Spans" section: a drain that
-    /// mixes span and metric events reports each kind under its own counter, not one merged
-    /// `points.emitted` that would misdescribe a span as a point.
+    /// A drain mixing spans and points counts each under its own counter.
     #[tokio::test]
     async fn a_drain_carrying_a_span_reports_spans_emitted_separately_from_points_emitted() {
         let registry = logit_core::Registry::with_span_sampling(1.0);
@@ -430,10 +381,7 @@ mod tests {
         assert!(found_spans, "a spans.emitted counter should also be recorded, separately");
     }
 
-    /// The same property as the span/point split above, for workstream D's log events
-    /// (`docs/plans/operator-surface.md`): a log event carries neither `metrics` nor `span`, so
-    /// without the `event.log.is_some()` check landing *before* the "point" fallback, it would be
-    /// miscounted as a point.
+    /// A drained log event is counted as a log, not a point, though it carries no `metrics`.
     #[tokio::test]
     async fn a_drain_carrying_a_log_reports_logs_emitted_separately_from_points_emitted() {
         let registry = logit_core::Registry::new();
@@ -441,8 +389,7 @@ mod tests {
         let component_telemetry = registry.telemetry_for("stat", "statsd_in", "listener");
         component_telemetry.count("logit.input.datagrams", 1.0, &[]);
 
-        // Through the public path -- `TelemetryLayer`, activated, capturing a real `tracing`
-        // event -- rather than reaching into `logit_core::telemetry`'s own private plumbing.
+        // Captured through the public `TelemetryLayer` path, not `logit_core`'s private plumbing.
         use tracing_subscriber::layer::SubscriberExt;
         let layer = logit_core::TelemetryLayer::new();
         layer.activate(registry.clone(), logit_core::Severity::Warn, "self");
@@ -479,9 +426,6 @@ mod tests {
         assert!(found_logs, "a logs.emitted counter should also be recorded, separately");
     }
 
-    /// Pulls the `EventBatch` out of a `Delivered`, the same two-arm match every assertion in
-    /// this module does inline; the shutdown tests below read several batches each, which is
-    /// where repeating it stops being cheaper than naming it.
     fn batch_of(delivered: logit_pipeline::Delivered) -> logit_core::EventBatch {
         match delivered {
             logit_pipeline::Delivered::Owned(batch, _ctx) => batch,
@@ -489,8 +433,6 @@ mod tests {
         }
     }
 
-    /// Every metric name in a batch, resolved -- what the shutdown tests assert the *contents* of
-    /// a drain with, rather than just its arrival.
     fn metric_names(batch: &logit_core::EventBatch) -> Vec<&'static str> {
         batch
             .events
@@ -499,11 +441,7 @@ mod tests {
             .collect()
     }
 
-    /// The point of the `run_until_shutdown` override: a SIGTERM arriving partway through an
-    /// interval used to drop that interval's buffered points on the floor (cancel-by-drop), so
-    /// with a 60s interval and a shutdown one second in, *nothing* was ever emitted. Now the
-    /// buffered point gets exactly one final drain, and the function returns `Ok(())` rather
-    /// than being cancelled.
+    /// A shutdown mid-interval gets one final drain of the buffered point, then `Ok(())`.
     #[tokio::test(start_paused = true)]
     async fn a_shutdown_mid_interval_drains_once_more_before_returning() {
         let registry = Registry::new();
@@ -518,8 +456,7 @@ mod tests {
         let handle =
             tokio::spawn(async move { input.run_until_shutdown(fanout, shutdown_rx).await });
 
-        // One second into a sixty-second interval: the loop is parked on a tick that is 59s away
-        // from firing, which is precisely the window the old cancel-by-drop lost.
+        // One second into a sixty-second interval: the next tick is 59s away.
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(rx.try_recv().is_err(), "no interval tick is due yet");
         shutdown_tx.send(true).expect("the run task holds a receiver");
@@ -535,9 +472,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the final drain should send exactly one batch");
     }
 
-    /// The same property one interval later, which is the case that proves the final drain is a
-    /// drain of the *partial* interval and not just a replay: a full tick emits the first point,
-    /// a second point is then recorded mid-interval, and shutdown emits that one on its own.
+    /// After a full tick, the shutdown drain carries only what was buffered since, not a replay.
     #[tokio::test(start_paused = true)]
     async fn a_shutdown_after_a_tick_still_drains_the_partial_interval() {
         let registry = Registry::new();
@@ -572,9 +507,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly two batches for two drains");
     }
 
-    /// `run` is what the `Input` trait contract requires to work standalone, and it now reaches
-    /// the same loop through a never-firing `watch` channel -- so the thing worth pinning is that
-    /// it still drains on every interval and never returns on its own.
+    /// `run` drains on every interval and never returns on its own.
     #[tokio::test(start_paused = true)]
     async fn run_keeps_draining_on_every_interval() {
         let registry = Registry::new();

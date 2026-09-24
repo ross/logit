@@ -197,8 +197,8 @@ services:
         condition: service_started
       # `service_started`, for the same reason: `postgres_in` (demo/logit.yaml) is a `tail_in` glob
       # over `postgres`'s log directory, and a glob matching nothing yet is a silent, retried no-op
-      # by design (`docs/deploying.md`'s "What to watch"). `logit` doesn't need `postgres` healthy
-      # first.
+      # by design (`docs/deploying.md`'s "What to watch for file tailing"). `logit` doesn't need
+      # `postgres` healthy first.
       postgres:
         condition: service_started
     # Why this service runs as root: `nginx_in` and `redis_in` (demo/logit.yaml) tail those

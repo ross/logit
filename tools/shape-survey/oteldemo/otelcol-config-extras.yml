@@ -1,34 +1,18 @@
-# The `oteldemo` producer's collector extras layer -- mounted over the OpenTelemetry Demo's own
-# `src/otel-collector/otelcol-config-extras.yml` (the path its `.env` calls
-# `OTEL_COLLECTOR_CONFIG_EXTRAS`), which is **the demo's own documented extension point**: the
-# upstream file is an empty stub whose header says "Override this file in your fork to add
-# exporters for your own observability backend", and the core compose file already loads it last
-# (`--config=/etc/otelcol-config.yml --config=/etc/otelcol-config-extras.yml`).
+# The `oteldemo` producer's collector extras layer, selected through the demo's
+# `OTEL_COLLECTOR_CONFIG_EXTRAS`, its documented extension point, which the core compose file
+# loads after `otelcol-config.yml`. It adds one exporter; the only other change is dropping
+# `docker_stats` from the metrics receivers (below).
 #
-# Nothing else about the demo's collector is changed. We do not replace `otelcol-config.yml`, we
-# do not add or remove a processor, and we do not touch a receiver: this file adds **one exporter**
-# and re-declares the three pipelines' `exporters:` lists with the upstream names still in them.
-#
-# That re-declaration is mandatory, and it is upstream's own instruction: "The OTel Collector
-# merges config files but REPLACES arrays, not appends. If you want to keep the default
-# observability stack alongside your own exporters, you must explicitly repeat the upstream
-# exporter names in your pipeline definitions." The upstream exporter list for the **core** layer
-# (compose.yaml alone, no compose.observability.yaml) is `debug` for all three signals plus the
-# `span_metrics` connector on traces -- which is what is repeated below. `receivers:` and
-# `processors:` are deliberately *not* mentioned here, so they merge through from
-# `otelcol-config.yml` untouched.
-#
-# The `profiles` pipeline is left alone: `logit` has no profiles signal.
+# The collector merges config files but replaces arrays, so each pipeline's `exporters:` list
+# repeats the upstream names for the core layer: `debug` on all three, plus the `span_metrics`
+# connector on traces. `processors:`, and the traces and logs `receivers:`, are omitted so they
+# merge through untouched. The `profiles` pipeline is left alone: `logit` has no profiles signal.
 
 exporters:
-  # `logit` is the network alias `start_logit` gives the logit container inside this producer's own
-  # docker network (tools/shape-survey/lib.sh); the demo's collector reaches it because
-  # tools/shape-survey/oteldemo/compose-overlay.yaml attaches that one service to the same network.
-  #
-  # OTLP/HTTP rather than gRPC, so all three signals land on one `otlp_in` component and `shape`'s
-  # `source` tag stays a single value -- see tools/shape-survey/configs/oteldemo.yaml's header.
-  # Everything else is the exporter's default: protobuf encoding, gzip compression (which
-  # `otlp_in` decodes), the default sending queue and retry.
+  # `logit` resolves because compose-overlay.yaml attaches the collector to the survey network.
+  # OTLP/HTTP so all three signals land on one `otlp_in` and `shape`'s `source` tag stays a single
+  # value (configs/oteldemo.yaml's header). Everything else is the exporter's default, including
+  # gzip, which `otlp_in` decodes.
   otlphttp/logit:
     endpoint: http://logit:4318
 
@@ -37,31 +21,12 @@ service:
     traces:
       exporters: [debug, span_metrics, otlphttp/logit]
     metrics:
-      # **The one forced deviation from the demo as shipped, and it is not a choice.** The upstream
-      # metrics receiver list is
-      #
-      #   [docker_stats, http_check/frontend-proxy, host_metrics, nginx, otlp, redis, postgresql,
-      #    prometheus/ad, span_metrics]
-      #
-      # and it is repeated here **minus `docker_stats`**, because on an SELinux-enforcing host the
-      # `docker_stats` receiver cannot start at all:
-      #
-      #   error  graph/graph.go:454  Failed to start component
-      #     {"error": "permission denied while trying to connect to the docker API at
-      #      unix:///var/run/docker.sock", "type": "Receiver", "id": "docker_stats"}
-      #   Error: cannot start pipelines: failed to start "docker_stats" receiver: ...
-      #
-      # A failed receiver start takes the whole collector down, so this is not "one family of
-      # metrics missing" -- it is the difference between a capture and no capture. Getting the
-      # receiver working would mean relabelling the host's own `/var/run/docker.sock` (or running
-      # the collector privileged), which is a system-wide change to a daemon this harness shares
-      # with other sessions, and more than a survey should ask of it -- the same judgement
-      # `producers/exporters.sh` records for cadvisor.
-      #
-      # What it costs the survey is small and worth stating: `container.*` metrics about the demo's
-      # own containers. Those are infrastructure telemetry from a collector receiver, not
-      # application SDK output, which is what this producer exists to measure. Every other receiver
-      # -- including `host_metrics`, which reads the `/hostfs` mount and does start -- is untouched.
+      # The upstream receiver list minus `docker_stats`, the one deviation from the demo as
+      # shipped. On an SELinux-enforcing host it can't reach /var/run/docker.sock ("permission
+      # denied while trying to connect to the docker API"), and a failed receiver start takes the
+      # whole collector down. Fixing it would mean relabeling the shared host's docker.sock or
+      # running the collector privileged. The cost is `container.*` metrics about the demo's own
+      # containers, not SDK output. See README "Caveats each author recorded".
       receivers:
         [
           http_check/frontend-proxy,

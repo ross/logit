@@ -22,14 +22,17 @@ through a bounded `ReceiveQueue`, and `BatchAccumulator` amortizes decoded event
 untouched is the *syscall and bookkeeping* side underneath it, shared by all four UDP inputs
 (`statsd_in`, `syslog_in`, `graphite_in`, `collectd_in`) through that same `udp.rs`:
 
-- **One `recv_from` per datagram** (`docs/known-gaps.md:185-191`) — syscall overhead is now the
-  read half's dominant remaining cost, since a stalled downstream no longer stops it running.
-- **Three mutex-locked gauge updates per push *and* per pop** (`docs/known-gaps.md:200-214`) —
-  `BoundedQueue::push`/`pop` (`crates/logit-pipeline/src/queue.rs:237,330`) call `update_gauges`
-  unconditionally on every accepted item, and `read_loop` (pushing) and `decode_loop` (popping) run
-  concurrently against the identical lock.
-- **No visibility into kernel-side drops** (`docs/known-gaps.md:176-184`) — a datagram the kernel
-  discards before `recv_from` ever returns it is invisible to `logit` entirely.
+- **One `recv_from` per datagram** ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) —
+  syscall overhead is now the read half's dominant remaining cost, since a stalled downstream no
+  longer stops it running.
+- **Three mutex-locked gauge updates per push *and* per pop**
+  ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) — `BoundedQueue::push`/`pop`
+  (`crates/logit-pipeline/src/queue.rs:237,330`) call `update_gauges` unconditionally on every
+  accepted item, and `read_loop` (pushing) and `decode_loop` (popping) run concurrently against the
+  identical lock.
+- **No visibility into kernel-side drops** ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) —
+  a datagram the kernel discards before `recv_from` ever returns it is invisible to `logit`
+  entirely.
 - **No perf scenario touches a real socket** — every scenario under `perf/scenarios/*.yaml`
   ([ADR `load-test-harness`](load-test-harness.md)) drives its listener through `generate_in`
   in-process; nothing exercises a UDP socket, so none of the above can be measured today.
@@ -41,15 +44,15 @@ not the sequencing.
 
 **This revises [ADR `decoupled-listener-io`](decoupled-listener-io.md)'s "Alternatives considered"
 section**, specifically its `recvmmsg`/`SO_REUSEPORT` bullet and its kernel-drop-counter bullet
-(`decoupled-listener-io.md:344-352`), both of which deferred with "recorded as a new
-`docs/known-gaps.md` entry" — this record is that deferred work, now designed.
-`decoupled-listener-io` stays **Accepted**; this repo's existing convention for a revision like this
-one is a forward-pointer left on the older record itself, not a silent one-way reference — the
-`> **Revised by [ADR ...]**` blockquote `buffered-sink-delivery` added to
-`service-lifecycle-and-output-retry.md:72` when it revised that ADR's retry-budget section is the
-precedent — so `decoupled-listener-io.md` gains the equivalent blockquote at those two bullets, and
-its own `updated` frontmatter (and README index row) move to today. Its surrounding Decision text is
-otherwise untouched.
+([`decoupled-listener-io.md`](decoupled-listener-io.md#alternatives-considered)), both of which
+deferred with "recorded as a new `docs/known-gaps.md` entry" — this record is that deferred work,
+now designed. `decoupled-listener-io` stays **Accepted**; this repo's existing convention for a
+revision like this one is a forward-pointer left on the older record itself, not a silent one-way
+reference — the `> **Revised by [ADR ...]**` blockquote `buffered-sink-delivery` added to
+[`service-lifecycle-and-output-retry.md`](service-lifecycle-and-output-retry.md#retry-a-tight-wall-clock-budget-not-an-attempt-count)
+when it revised that ADR's retry-budget section is the precedent — so `decoupled-listener-io.md`
+gains the equivalent blockquote at those two bullets, and its own `updated` frontmatter (and README
+index row) move to today. Its surrounding Decision text is otherwise untouched.
 
 ## Decision
 
@@ -459,12 +462,13 @@ call used keeps the failure behaviour identical rather than subtly narrower.
 
 ### `push_many`/`pop_many` live on `BoundedQueue` itself; `push`/`pop` untouched
 
-`docs/known-gaps.md:200-214`'s entry names the fix explicitly: gauge-update contention belongs in
-`BoundedQueue` itself, "not as a receive-only special case," because `BoundedQueue` is one
-implementation serving both the sink queue and the receive queue by design. `push_many`/`pop_many`
-land as new methods on `BoundedQueue<T: Queued>` (`crates/logit-pipeline/src/queue.rs`) — **not** a
-receive-side wrapper type — and existing `push`/`pop` (and every sink-side call site using them) are
-untouched, so the 18 existing queue tests keep exercising exactly the code path they always have.
+The gauge-update entry in [`docs/known-gaps.md`](../known-gaps.md#udp-intake) names the fix
+explicitly: gauge-update contention belongs in `BoundedQueue` itself, "not as a receive-only special
+case," because `BoundedQueue` is one implementation serving both the sink queue and the receive
+queue by design. `push_many`/`pop_many` land as new methods on `BoundedQueue<T: Queued>`
+(`crates/logit-pipeline/src/queue.rs`) — **not** a receive-side wrapper type — and existing
+`push`/`pop` (and every sink-side call site using them) are untouched, so the 18 existing queue
+tests keep exercising exactly the code path they always have.
 
 `push_many` drains an input `&mut Vec<T>`: per-item weight/overflow/drop counting and per-item
 `Block`-policy waiting are preserved exactly as `push` already does them (an item that would never
@@ -692,9 +696,9 @@ ahead of evidence this same plan is about to produce.
   above and for the same reason: it couples timestamping to the receive path per message rather than
   staying a cheap, batch-level call.
 - **A receive-side wrapper type for `push_many`/`pop_many`, instead of adding them to `BoundedQueue`
-  itself.** Rejected — `docs/known-gaps.md:200-214` is explicit that the fix belongs in `BoundedQueue`
-  itself since it serves both the sink and receive queues by design; a wrapper would re-split
-  behavior the generic type exists to keep unified.
+  itself.** Rejected — the gauge-update entry in `docs/known-gaps.md`'s "UDP intake" section is
+  explicit that the fix belongs in `BoundedQueue` itself since it serves both the sink and receive
+  queues by design; a wrapper would re-split behavior the generic type exists to keep unified.
 - **Counting `push_many`'s cancelled remainder as a drop.** Rejected — would need re-acquiring the
   queue's lock from inside a `Drop` impl to shave an already-bounded, already-accepted,
   shutdown-path-only loss from "uncounted" to "counted"; not worth the poisoning/ordering hazard.
@@ -738,9 +742,9 @@ ahead of evidence this same plan is about to produce.
   alongside today's `Workload::Generated`; new `perf/load/*.yaml` sidecar directory and
   `perf/load/README.md`; a small committed real-client capture and its provenance, partly paying
   down `docs/plans/recorded-interop-fixtures.md`'s owed statsd producer fixtures.
-- `docs/known-gaps.md`: the kernel-drop-visibility entry (`:176-184`) and the one-datagram-per-syscall
-  entry (`:185-191`) close as their respective workstreams land (W1, W4); the gauge-update-contention
-  entry (`:200-214`) closes at W3.
+- [`docs/known-gaps.md`](../known-gaps.md#udp-intake): the kernel-drop-visibility entry and the
+  one-datagram-per-syscall entry close as their respective workstreams land (W1, W4); the
+  gauge-update-contention entry closes at W3.
 - Revises `decoupled-listener-io.md`'s "Alternatives considered" recvmmsg/`SO_REUSEPORT` bullet and
   kernel-drop-counter bullet — both now designed and scheduled rather than merely deferred;
   `decoupled-listener-io.md` gains a `> **Revised by ...**` forward-pointer blockquote at those

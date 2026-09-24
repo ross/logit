@@ -212,15 +212,15 @@ offers none; a cancelled `send` (dropped mid-await) leaves `stream == None`. **D
   #[serde(default = "10s")] request_timeout: Duration }`. Docs on every field.
 - `crates/logit-pipeline/src/graph.rs`: add both to `is_implemented`; retarget
   `unimplemented_kind_is_rejected` (no unimplemented kind remains — delete the test and rule 8's
-  "declared, not runnable" carve-out text, keep rule 8 itself for future kinds); new rule 32:
-  `logit_in`/`logit_out` TLS consistency mirroring rule 22 (`cert_file`/`key_file` paired,
+  "declared, not runnable" carve-out text, keep rule 8 itself for future kinds); new rule 34:
+  `logit_in`/`logit_out` TLS consistency mirroring rule 24 (`cert_file`/`key_file` paired,
   `insecure_skip_verify` + `ca_file` contradictory); `logit_in.max_frame_bytes` ≤ 64 MiB and > 0.
   `docs/design/pipeline-graph.md`'s rule list updated.
 - `crates/logit-cli/src/pipeline.rs`: `LogitIn`/`LogitOut` arms modelled on the `OtlpIn`/`OtlpOut`
   arms; remove `LogitIn`/`LogitOut` from the `unreachable!` fallback's expectations.
 - `script/schema`; `script/validate`.
 
-**Test list:** config round-trips for every new field; graph rule 32 cases; a `build_spec` test
+**Test list:** config round-trips for every new field; graph rule 34 cases; a `build_spec` test
 per kind asserting the constructed spec carries `tls`/`compression`. **Done:** schema diff is
 exactly the new fields; `known-gaps.md`'s "schema advertises kinds the binary can't run" entry
 can be deleted outright.

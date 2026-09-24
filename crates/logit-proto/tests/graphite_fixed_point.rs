@@ -1,46 +1,31 @@
-//! Pure-codec Graphite/Carbon fixed-point tests: `docs/adr/lossless-transit.md`'s "round-trip fixed
-//! point is the test that proves this" requirement, exercised directly against [`GraphiteEncoder`]/
-//! [`GraphiteDecoder`] with no pipeline, listener, sink or socket in between. The mirror of
-//! `tests/collectd_fixed_point.rs`, `tests/otlp_fixed_point.rs` and
-//! `tests/prometheus_fixed_point.rs`.
+//! Pure-codec Graphite/Carbon fixed-point tests, against [`GraphiteEncoder`]/[`GraphiteDecoder`]
+//! with no pipeline or socket: `graphite_in -> graphite_out` is a fixed point modulo the
+//! "Permitted normalizations" list in `logit_proto::graphite`'s module doc.
 //!
 //! Two properties, per fixture and per protocol:
 //!
-//! 1. **`decode(encode(b)) == b`** -- whole-event equality via `PartialEq`
-//!    (`docs/adr/metrics-model-v2.md`'s "`PartialEq` on every record type"). Every fixture is built
-//!    in the shape a *real decode* already produces -- a `Gauge` per record, tags as `Value::Str`
-//!    event attributes, a whole-second timestamp, an already-sanitized path -- so the round trip is
-//!    a real fixed-point check rather than a tautology over whatever the encoder happens to emit.
-//! 2. **`encode(decode(encode(b))) == encode(b)`** on bytes -- the same fixed point restated at the
-//!    wire level, which catches a codec that produces two different byte strings for what it itself
-//!    considers the same batch.
+//! 1. **`decode(encode(b)) == b`**, whole-event `PartialEq`. Every fixture has the shape a real
+//!    decode produces (a `Gauge` per record, `Value::Str` tags, a whole-second timestamp, a
+//!    sanitized path), so the check isn't a tautology.
+//! 2. **`encode(decode(encode(b))) == encode(b)`** on bytes, which catches a codec that writes two
+//!    byte strings for one batch.
 //!
-//! Both are asserted for **each** wire protocol, and a third property on top: the two protocols
-//! decode to the *same* events, which is what makes normalization 2 (an operator-chosen dialect
-//! change, in either direction) a re-spelling rather than a loss.
+//! A third: the two protocols decode to the *same* events, so a dialect change (normalization 2)
+//! is a re-spelling, not a loss.
 //!
-//! One asymmetry the harness has to bridge: [`GraphiteEncoder`] emits a pickle entry that is a
-//! **complete, length-prefixed frame** (so a sink's send path is one `write_all`), while
-//! [`GraphiteDecoder`] is handed an **unframed** payload (so `graphite_in`'s reader owns the
-//! prefix). [`decode_all`] strips the four prefix bytes, which is exactly what that reader does.
+//! The encoder emits a pickle entry as a **length-prefixed frame** and the decoder takes an
+//! **unframed** payload, so [`decode_all`] strips the prefix, as `graphite_in`'s reader does.
 //!
-//! The two `proptest`s at the bottom do the same over a generated batch *grammar*, so the fixtures
-//! above stay readable while the coverage is not limited to what anyone thought to write down.
-//! What they generate, precisely:
+//! The two `proptest`s at the bottom generate:
 //!
-//! - 1-6 events, each one record, paths from `[A-Za-z0-9_.-]{1,20}` -- deliberately **already
-//!   normalized**, i.e. drawn from an alphabet the sanitizer does not touch. A path needing
-//!   substitution is *not* a fixed point (normalization 10) and has its own unit tests in
-//!   `encode.rs` instead;
-//! - 0-4 tags per event with **distinct** names from `[A-Za-z0-9_-]{1,20}` and values from
-//!   `[A-Za-z0-9_.-]{1,20}`, generated in arbitrary order so canonical tag ordering
-//!   (normalization 4) is exercised rather than assumed. Distinct names because a repeated key is
-//!   normalization 5, not a fixed point; an alphabet with no `.` in a name so a generated tag can
-//!   never look like a `statsd.`/`collectd.` carrier, which the encoder skips by design;
-//! - any **finite** `f64` value -- so the whole range, subnormals and `-0.0` included, goes through
-//!   the shortest-round-trip rendering (normalization 8);
-//! - timestamps as whole seconds in `1..=2_000_000_000`, since carbon's wire has no sub-second
-//!   resolution (normalization 6) and a non-positive second is a counted drop, not a fixed point.
+//! - 1-6 events, one record each, paths from `[A-Za-z0-9_.-]{1,20}`, which the sanitizer doesn't
+//!   touch (normalization 10 is tested in `encode.rs`);
+//! - 0-4 tags per event in arbitrary order (normalization 4), with **distinct** names (a repeat is
+//!   normalization 5) from `[A-Za-z0-9_-]{1,20}`, whose lack of `.` keeps a tag from looking like
+//!   a `statsd.`/`collectd.` carrier; values from `[A-Za-z0-9_.-]{1,20}`;
+//! - any **finite** `f64`, subnormals and `-0.0` included (normalization 8);
+//! - whole-second timestamps in `1..=2_000_000_000` (normalization 6; a non-positive second is a
+//!   counted drop).
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -53,8 +38,7 @@ use proptest::prelude::*;
 use std::sync::Arc;
 
 const RECEIVED_AT: i64 = 1_699_000_000_000_000_000;
-/// Both wire protocols, checked for every fixture -- a dialect change is on the
-/// permitted-normalization list and must not change what decodes back out.
+/// Both wire protocols, checked for every fixture.
 const PROTOCOLS: [Protocol; 2] = [Protocol::Plaintext, Protocol::Pickle];
 
 // -- the harness ---------------------------------------------------------------------------------
@@ -66,8 +50,8 @@ fn encode_at(batch: &EventBatch, protocol: Protocol) -> Vec<Vec<u8>> {
     out.iter().map(|message| message.to_vec()).collect()
 }
 
-/// Decodes every message in order through one decoder, exactly as `graphite_in` would -- stripping
-/// the pickle length prefix the way that listener's framing loop does (see this file's module doc).
+/// Decodes every message in order through one decoder, stripping the pickle length prefix as
+/// `graphite_in`'s framing does.
 fn decode_all(messages: &[Vec<u8>], protocol: Protocol, resource: &Arc<Resource>) -> Vec<Event> {
     let mut decoder = GraphiteDecoder::new(resource.clone()).with_protocol(protocol);
     let mut events = Vec::new();
@@ -83,8 +67,7 @@ fn decode_all(messages: &[Vec<u8>], protocol: Protocol, resource: &Arc<Resource>
     events
 }
 
-/// Both properties, for every protocol -- plus the cross-protocol one: the two dialects decode to
-/// the same events, in both directions.
+/// Both properties for every protocol, plus the two dialects decoding to the same events.
 fn assert_fixed_point(batch: EventBatch) {
     let mut decoded_per_protocol = Vec::new();
     for protocol in PROTOCOLS {
@@ -119,7 +102,7 @@ fn batch(events: Vec<Event>) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
 }
 
-/// One event carrying one record, in exactly the shape a real decode produces.
+/// One event carrying one record, in the shape a real decode produces.
 fn datapoint(path: &str, value: f64, seconds: i64, tags: &[(&str, &str)]) -> Event {
     let mut attributes = AttrMap::new();
     for (name, tag_value) in tags {
@@ -157,8 +140,7 @@ fn a_negative_value_is_a_fixed_point() {
     assert_fixed_point(batch(vec![datapoint("queue.lag", -17.25, 1_700_000_000, &[])]));
 }
 
-/// Past 2038, which is where the pickle writer switches from `BININT` to `LONG1` -- the one place
-/// the two dialects' encodings of the same second genuinely differ.
+/// Past 2038, where the pickle writer switches from `BININT` to `LONG1`.
 #[test]
 fn a_large_timestamp_is_a_fixed_point() {
     assert_fixed_point(batch(vec![datapoint("sys.cpu", 1.0, 2_147_483_653, &[])]));
@@ -179,9 +161,8 @@ fn many_datapoints_are_a_fixed_point() {
     assert_fixed_point(batch(events));
 }
 
-/// One event carrying several records is one event with several records on the way back -- carbon
-/// has no multi-value datapoint, so this is the one shape that genuinely *cannot* survive: it comes
-/// back as one event per datapoint. Asserted explicitly rather than left as a surprise.
+/// One event carrying several records comes back as one event per datapoint: carbon has no
+/// multi-record datapoint.
 #[test]
 fn one_event_with_several_records_comes_back_as_several_events() {
     let mut event = datapoint("sys.cpu", 1.0, 1_700_000_000, &[("host", "web-1")]);
@@ -191,14 +172,11 @@ fn one_event_with_several_records_comes_back_as_several_events() {
     let decoded =
         decode_all(&encode_at(&source, Protocol::Plaintext), Protocol::Plaintext, &source.resource);
     assert_eq!(decoded.len(), 2, "one datapoint per record");
-    // And *that* shape is the fixed point, which is what matters for a relay: a second hop changes
-    // nothing.
+    // That shape is the fixed point: a second hop changes nothing.
     assert_fixed_point(batch(decoded));
 }
 
-/// Normalization 12: every `Sum` shape leaves as a bare value and comes back as a `Gauge`. Not a
-/// fixed point on the first hop (the temporality and monotonicity are genuinely gone), but the
-/// decoded shape is -- which is the property a relay actually needs.
+/// Normalization 12: every `Sum` shape comes back as a `Gauge`, which is then a fixed point.
 #[test]
 fn a_sum_becomes_a_gauge_on_the_first_hop_and_is_then_a_fixed_point() {
     for temporality in [Temporality::Delta, Temporality::Cumulative] {
@@ -217,8 +195,7 @@ fn a_sum_becomes_a_gauge_on_the_first_hop_and_is_then_a_fixed_point() {
     }
 }
 
-/// Normalization 4: whatever order the tags arrived in, they leave in ascending rendered-name
-/// order -- and stay there.
+/// Normalization 4: tags leave in ascending rendered-name order, whatever order they arrived in.
 #[test]
 fn tag_order_is_canonical_after_the_first_hop() {
     let event =
@@ -231,8 +208,8 @@ fn tag_order_is_canonical_after_the_first_hop() {
     assert_fixed_point(batch(vec![event]));
 }
 
-/// Normalizations 9 and 5, from the wire side: a `\r\n` line ending, runs of whitespace and a
-/// repeated tag key all decode into a batch that *is* a fixed point from there on.
+/// Normalizations 9 and 5: a `\r\n` ending, whitespace runs, and a repeated tag key decode into a
+/// batch that is a fixed point from there on.
 #[test]
 fn a_wire_shape_the_encoder_never_emits_is_a_fixed_point_once_decoded() {
     for wire in [
@@ -253,8 +230,7 @@ fn a_wire_shape_the_encoder_never_emits_is_a_fixed_point_once_decoded() {
 
 // -- properties ----------------------------------------------------------------------------------
 
-/// A path drawn from the alphabet the sanitizer leaves alone -- see this file's module doc for why
-/// "already normalized" is the right generator here.
+/// A path from the alphabet the sanitizer leaves alone.
 fn path_strategy() -> impl Strategy<Value = String> {
     "[A-Za-z0-9_.-]{1,20}".prop_map(|s| s)
 }
@@ -314,8 +290,7 @@ proptest! {
         prop_assert_eq!(encode_at(&round_tripped, Protocol::Plaintext), encoded);
     }
 
-    /// The same, through the pickle dialect -- and the two dialects must agree on what they
-    /// decoded (normalization 2).
+    /// The same through pickle, and the two dialects decode alike (normalization 2).
     #[test]
     fn pickle_round_trips_every_generated_batch(batch in batch_strategy()) {
         let encoded = encode_at(&batch, Protocol::Pickle);

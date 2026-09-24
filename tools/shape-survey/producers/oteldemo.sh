@@ -1,63 +1,32 @@
-# The `oteldemo` producer: the **OpenTelemetry Demo** ("astronomy shop",
-# github.com/open-telemetry/opentelemetry-demo), run at a pinned release tag under its own Locust
-# load generator, exporting through **its own OpenTelemetry Collector** into a `logit` `otlp_in`.
+# The `oteldemo` producer: the OpenTelemetry Demo (github.com/open-telemetry/opentelemetry-demo)
+# at a pinned release tag, under its own Locust load generator, exporting through its own
+# Collector into `otlp_in`. configs/oteldemo.yaml's header maps `logit.shape.*` onto OTLP's
+# vocabulary; tools/shape-survey/oteldemo/ holds the two override files.
 #
-# Sourced by script/shape-survey, which discovers this file by glob. Everything specific to this
-# producer lives here, in tools/shape-survey/configs/oteldemo.yaml (read that file's header: it is
-# where the mapping from `logit.shape.*` to OTLP's own vocabulary is written down) and in
-# tools/shape-survey/oteldemo/ (two small override files, below).
+# The demo is shallow-cloned into the run directory at run time, never vendored, and the clone is
+# checked against a pinned SHA because a tag can move.
 #
-# **The demo is fetched at run time, never vendored.** `survey_oteldemo_fetch` shallow-clones the
-# pinned tag into the run directory, and the commit it lands on is asserted against the SHA pinned
-# below -- a tag is a movable ref, and a survey that silently measured a different tree than its
-# provenance claims is worse than one that fails. Nothing of the demo's enters this repository;
-# what is committed here is two files totalling a few dozen lines.
+# Representativeness and caveats: README "Producers" and "Caveats each author recorded". Every
+# attribute comes from an OTel SDK, an instrumentation library, or a collector processor, with no
+# operator-added context, so widths are a floor. The appended summary section names every
+# collector processor, so a reader knows whose attributes are in the resource width.
 #
-# ---------------------------------------------------------------------------------------------
-# WHAT THESE NUMBERS ARE WORTH
-#
-# Good evidence, and the best in this harness for OTLP: **what real OpenTelemetry SDK
-# auto-instrumentation emits, across nine languages at once, after a real collector**. Every
-# attribute on every span, metric point and log record below was put there by an OTel SDK, an
-# instrumentation library, or a collector processor -- none of it by this repository. That is the
-# one thing `demo` (whose formats we partly authored) cannot say, and no recorded fixture corpus
-# can say at this breadth.
-#
-# Not evidence: **traffic mix, or what an operator's own pipeline looks like**. This is a demo
-# application. Every instrumentation it ships is enabled at once, on a service graph built to show
-# OpenTelemetry off rather than to serve anybody's customers; the load is one synthetic Locust
-# generator walking a fixed set of user journeys; and there is no operator-added context at all --
-# no team/owner/tier/environment attributes, no per-tenant labels, none of the enrichment a real
-# estate's collector adds before a gateway sees the data. Read the attribute widths as **"what the
-# SDKs and the demo's own collector produce"**, which is a floor an operator adds to, not a
-# typical.
-#
-# The post-collector position is the other half of the caveat, and it is deliberate: a `logit`
-# receiving OTLP is receiving it from something, and in practice that something is a collector. The
-# producer's appended section of summary.md names every processor in the demo's pipelines at this
-# tag, so a reader knows exactly whose attributes are in the resource-width column.
-# ---------------------------------------------------------------------------------------------
+# Environment: SHAPE_SURVEY_DURATION (main window, default 1200s), SHAPE_SURVEY_OTELDEMO_KEEP=1
+# (the `resource: keep` second capture), SHAPE_SURVEY_OTELDEMO_KEEP_DURATION (default 180s).
 
-#: The released tag measured, and the commit that tag pointed at when this producer was written.
-#: Both go in provenance.txt; the clone is asserted against the SHA, so a moved tag fails the run
-#: rather than quietly measuring something else.
+#: The measured tag and its commit. A clone that lands on a different SHA fails the run.
 SHAPE_SURVEY_OTELDEMO_TAG=3.1.0
 SHAPE_SURVEY_OTELDEMO_SHA=dedc0178918e260823323b8d95005a8cb924b007
 
-#: How long the capture runs, in seconds, after the stack reports healthy. 20 minutes by default.
-#: `SHAPE_SURVEY_DURATION=300 script/shape-survey oteldemo` for a verification run -- the load
-#: generator is steady from its first cycle, so a short run is a smaller sample of the same thing.
+#: Capture window in seconds after the stack reports healthy. The load generator is steady from
+#: its first cycle, so a short `SHAPE_SURVEY_DURATION` run is a smaller sample of the same thing.
 SHAPE_SURVEY_OTELDEMO_DURATION_DEFAULT=1200
 
-#: The demo's own `.env` value for `DEMO_VERSION` is `latest`, which is a moving tag. The survey
-#: pins it to the release being measured instead -- the same images, named so they cannot drift
-#: mid-capture or between runs. This and `OTEL_COLLECTOR_CONFIG_EXTRAS` are the **only** two
-#: values of the demo's `.env` this producer overrides.
+#: The demo's `.env` ships `DEMO_VERSION=latest`, which can move mid-capture; this pins it. This
+#: and `OTEL_COLLECTOR_CONFIG_EXTRAS` are the only demo `.env` values this producer overrides.
 SHAPE_SURVEY_OTELDEMO_IMAGE_TAG="${SHAPE_SURVEY_OTELDEMO_TAG}"
 
-# Shallow-clones the pinned tag into the run directory and checks the commit. `--depth 1
-# --branch <tag>` is one tag's tree and nothing else (~40 MB), which is what keeps "fetch it at run
-# time" cheaper than vendoring it would have been.
+# Shallow-clones the pinned tag (~40 MB) into the run directory and checks the commit.
 survey_oteldemo_fetch() {
     local dir="$1" sha
     echo "shape-survey: cloning opentelemetry-demo ${SHAPE_SURVEY_OTELDEMO_TAG} into ${dir}"
@@ -71,12 +40,9 @@ survey_oteldemo_fetch() {
             "SHAPE_SURVEY_OTELDEMO_SHA (and this producer's notes) rather than measuring a tree" \
             "the provenance misdescribes."
 
-    # SELinux: this daemon runs with the `selinux` security option, and the demo's compose files
-    # bind-mount their config with no `:z` (nothing upstream would -- they are not written for a
-    # labelled host). Without a relabel every one of those mounts is `Permission denied` inside the
-    # container and the collector never starts. `chcon` on our own freshly-cloned copy is the
-    # narrowest fix available: it touches nothing outside this run directory, needs no privilege,
-    # and changes no file's content. A host without SELinux no-ops here.
+    # On an SELinux host the demo's bind mounts, which carry no `:z`, are denied inside their
+    # containers and the collector never starts. Relabeling this run's own clone is the narrowest
+    # fix: it touches nothing outside the run directory and needs no privilege.
     if command -v chcon >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null || echo Disabled)" != "Disabled" ]; then
         chcon -R -t container_file_t "${dir}" ||
             echo "shape-survey: WARNING -- chcon failed on ${dir}; expect the demo's bind mounts" \
@@ -84,43 +50,31 @@ survey_oteldemo_fetch() {
     fi
 }
 
-# The demo's `.env`, plus this survey's two overrides, as a second `--env-file`. Compose applies
-# multiple `--env-file`s in order with the later winning -- the same layering the demo's own
-# Makefile uses for `.env.override`. Passing `--env-file` at all disables compose's automatic `.env`
-# pickup, which is why the demo's own file is named explicitly first.
+# This survey's overrides, as a second `--env-file`; the later file wins. Passing `--env-file` at
+# all disables compose's automatic `.env` pickup, so the demo's own file is named explicitly first.
 survey_oteldemo_env() {
     cat <<EOF
 # Generated by tools/shape-survey/producers/oteldemo.sh -- layered over the demo's own .env.
 
-# Pin the image tag: the demo ships DEMO_VERSION=latest, which can move between two runs of this
-# survey (and, for a long capture, underneath one).
+# Pin the image tag: the demo ships DEMO_VERSION=latest, which can move mid-capture.
 DEMO_VERSION=${SHAPE_SURVEY_OTELDEMO_IMAGE_TAG}
 
-# The demo's own documented collector extension point, pointed at this survey's extras layer. The
-# upstream file at this path is an empty stub whose header says to override it; the core compose
-# file already loads it last. See tools/shape-survey/oteldemo/otelcol-config-extras.yml.
+# The demo's documented collector extension point, which the core compose file loads last. See
+# tools/shape-survey/oteldemo/otelcol-config-extras.yml.
 OTEL_COLLECTOR_CONFIG_EXTRAS=${ROOT}/tools/shape-survey/oteldemo/otelcol-config-extras.yml
 
-# Read by tools/shape-survey/oteldemo/compose-overlay.yaml, so the overlay never hard-codes
-# lib.sh's naming scheme.
+# Read by compose-overlay.yaml, so the overlay never hard-codes lib.sh's naming scheme.
 SHAPE_SURVEY_NET=${SURVEY_NET}
 EOF
 }
 
-# The stack, under this run's own compose project. `survey_compose` does the namespacing, the
-# "somebody else's demo stack is already up" guard (the demo gives every service a fixed
-# `container_name` and its network a fixed name, so only one can exist on a host) and the teardown
-# registration -- see lib.sh.
+# The stack, through `survey_compose`, whose already-running guard matters here: the demo fixes
+# every `container_name` and its network name, so only one can exist on a host.
 #
-# **`compose.yaml` alone -- the demo's own "core/minimal" layer**, per its header: "Core/minimal
-# demo services. Run alone for the smallest footprint." It is the right one here on both counts the
-# brief cares about. It has every application service and the load generator, so the polyglot SDK
-# coverage this producer exists for is complete (Java, .NET, Go, C++, Ruby, TypeScript, JavaScript,
-# Python, PHP, Rust, plus Envoy and flagd). What the other layers add is not producers:
-# `compose.full.yaml` adds the Kafka group (accounting, fraud-detection) and
-# `compose.observability.yaml` adds the demo's own *backends* -- Jaeger, Prometheus, Grafana,
-# OpenSearch, OpAMP -- which store the telemetry rather than emit it, and whose OpenSearch alone is
-# a JVM heavyweight. Running them would cost several GB of RAM to measure nothing extra.
+# `compose.yaml` alone, the demo's "core/minimal" layer: it has every application service and the
+# load generator, so the SDK coverage is complete. `compose.full.yaml` adds only the Kafka group,
+# and `compose.observability.yaml` adds backends that store telemetry rather than emit it, at
+# several GB of RAM.
 survey_oteldemo_compose() {
     survey_compose stack \
         -f "${SURVEY_RUN_DIR}/opentelemetry-demo/compose.yaml" \
@@ -129,21 +83,17 @@ survey_oteldemo_compose() {
         --env-file "${SURVEY_RUN_DIR}/survey.env" -- "$@"
 }
 
-# The readiness condition `survey_capture_until` polls, in two parts because one of them is not
-# enough. The load generator healthy means the application chain behind it is up (its own
-# healthcheck waits on `frontend`, which waits on the rest) -- but the load generator does not
-# depend on the collector at all, so it goes healthy just as happily while the collector is
-# crash-looping, and the capture would then run its full window against a dead exporter and only
-# discover it at `stop_logit`'s empty-shape.log check. So the collector's own container state is
-# checked too: `running`, not `restarting`.
+# Readiness, in two parts. A healthy load generator means the application chain is up, but it
+# doesn't depend on the collector, so it goes healthy while the collector crash-loops; the
+# collector's own state is checked too (`running`, not `restarting`).
 survey_oteldemo_ready() {
     survey_oteldemo_service_state load-generator health = healthy &&
         survey_oteldemo_service_state otel-collector state = running
 }
 
-# `<service> health|state = <expected>`: one compose service's container state, or the empty string
-# if compose has not created it yet. A `{{.State.Health.Status}}` on a container with no
-# healthcheck renders empty, which is why the two are separate lookups rather than one.
+# `<service> health|state = <expected>`: compares one compose service's container state. Health
+# and state are separate lookups because `{{.State.Health.Status}}` renders empty on a container
+# with no healthcheck.
 survey_oteldemo_service_state() {
     local service="$1" what="$2" _eq="$3" expected="$4" cid format
     case "${what}" in
@@ -156,18 +106,15 @@ survey_oteldemo_service_state() {
     [ "$(${DOCKER} inspect --format "${format}" "${cid}" 2>/dev/null || true)" = "${expected}" ]
 }
 
-# The producer's own section of summary.md, generated into the run directory and run there rather
-# than committed beside this file -- this producer's reading of its own numbers, computed from
-# `summary.json` alone (never re-parsing shape.log: summarize.py's value->count tables are exact).
+# The producer's own summary.md section, written into the run directory and computed from
+# summary.json alone.
 survey_oteldemo_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
 """Renders the `oteldemo` producer's section of summary.md from /out/summary.json.
 
-Everything here is a statement about **OTLP after a collector**, which is why it is not in
-summarize.py. The per-event series carry `shape`'s `signal` tag, so traces, metrics and logs
-separate inside the one `otlp_in` component; the per-batch series carry no `signal` at all (a
-batch is a (Resource, Scope) group and can hold any mix), so they are reported once.
+Per-event series carry `shape`'s `signal` tag, so the three signals separate inside one `otlp_in`;
+per-batch series carry none (a (Resource, Scope) group can hold any mix), so they're reported once.
 """
 
 import json
@@ -175,10 +122,8 @@ import pathlib
 
 SUMMARY = json.loads(pathlib.Path("/out/summary.json").read_text())
 
-#: Which collector processors ran, per pipeline, at the measured tag -- read off
-#: src/otel-collector/otelcol-config.yml's `service.pipelines`. This is the list that says whose
-#: attributes are in the resource-width row below, and it is written out rather than inferred so a
-#: reader never has to go and look.
+#: Collector processors per pipeline at the measured tag, from the demo's
+#: src/otel-collector/otelcol-config.yml `service.pipelines`. Update it when the tag moves.
 PROCESSORS = {
     "traces": [
         "resource_detection",
@@ -192,8 +137,7 @@ PROCESSORS = {
     "logs": ["resource_detection", "memory_limiter", "transform/sanitize_logs"],
 }
 
-#: Which receivers fed each pipeline. The metrics one matters: only a minority of the metric points
-#: measured here came from an application SDK.
+#: Receivers per pipeline. Most metric points come from collector-side receivers, not an SDK.
 RECEIVERS = {
     "traces": ["otlp"],
     "metrics": [
@@ -532,56 +476,24 @@ PYEOF
 
 # ---- the optional `resource: keep` second run ----------------------------------------------------
 #
-# Off unless `SHAPE_SURVEY_OTELDEMO_KEEP=1`. A short second capture against the *same* demo stack,
-# through configs/oteldemo-keep.yaml, whose tap forwards the observed `Resource` so `aggregate`
-# keys every per-event series per resource and a **per-service** breakdown becomes possible.
+# Off unless `SHAPE_SURVEY_OTELDEMO_KEEP=1`; see README "`resource: keep` captures". Its output is
+# identity-bearing, so it writes only to `resource-keep/` and nothing from it joins the main
+# summary.
 #
-# It answers the one question the main run structurally cannot: does attribute width differ by
-# service -- that is, by SDK and instrumentation stack? Nine languages instrumented nine different
-# ways is exactly the case a single pooled distribution hides.
-#
-# **Its output is identity-bearing and stays in the run directory.** Keeping the resource means
-# `service.name`, `host.name`, `container.id` and everything else `resource_detection` stamped
-# reach the capture, which is precisely the property `resource: drop` exists to deny. It therefore
-# writes to its own `resource-keep/` subdirectory, with its own provenance saying so, and nothing
-# derived from it is folded into the main summary. `perf/results/` is gitignored.
-#
-# Mechanically it retargets `SURVEY_RUN_DIR` for the duration -- lib.sh's `start_logit`/
-# `stop_logit`/`survey_summarize` all read that one variable, so a second capture into a second
-# directory needs no change there and no second copy of any of them.
-#
-# **It holds the whole 20-container stack up for its own window**, on top of whatever else shares
-# the daemon, so it is deliberately short. On one observed run its `survey_capture_for 300` took
-# 54 minutes of wall clock to spend 300 seconds of `sleep` -- three surveys and ~50 containers
-# were live on the workstation at the time, and `logit` itself logged `otlp_in` handshake timeouts
-# ("no first byte received within 5s") through the same stretch, so the host was genuinely starved
-# rather than this loop being wrong; the identical `survey_capture_for` had run 1200s in 20m54s an
-# hour earlier in the same invocation. Nothing here can prevent that, but a short window bounds
-# how long it lasts when it happens.
+# It retargets `SURVEY_RUN_DIR` for its duration: `start_logit`, `stop_logit`, and
+# `survey_summarize` all read that one variable. The window is short because it holds the whole
+# ~20-container stack up, and a starved shared host can stretch wall-clock time well past it.
 SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT=180
 
-# Per-service medians, which `summarize.py` cannot produce: its series key is the metric name plus
-# `shape`'s own `signal`/`source`/`tap` tags, so two services' samples collapse into one series
-# however many resource attributes rode along. This walks `shape.log` itself, reusing
-# summarize.py's own `parse_attrs` (its render parser is the thing under self-test; a second hand-
-# rolled one would be a second thing to get wrong) and grouping on `service.name` instead.
-#
-# `parse_attrs` handles a `resource: keep` line's array values -- `process.command_args`, on the
-# resource of every OTel SDK that detects a process, renders bare with spaces, commas and an `=`
-# inside it. It did not always: that was a real parser bug, and fixing it is what let this run go
-# back through `survey_summarize` at all. summarize.py's own `--self-test` now carries a
-# structurally-verbatim `resource: keep` line (with neutral values) so it cannot regress.
+# Per-service medians, which summarize.py's series key can't separate. It walks shape.log with
+# summarize.py's own `parse_attrs`, which is under `--self-test` for a keep line's bare arrays.
 survey_oteldemo_keep_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
 """Per-service attribute-count medians from a `resource: keep` capture.
 
-Reads /out/shape.log directly, which the main run's section script deliberately does not: with
-`resource: keep`, `service.name` is on each record's `attrs` line but is not one of summarize.py's
-series-key tags, so summary.json has already pooled every service together by the time it is
-written. The parsing itself is summarize.py's (`parse_attrs`), imported rather than re-implemented
--- its render parser is the thing under `--self-test`, including a `resource: keep` line's array
-values; a second hand-rolled one here would be a second thing to get wrong.
+Reads /out/shape.log directly, because summary.json has already pooled every service. It imports
+summarize.py's `parse_attrs` rather than a second parser that could disagree with it.
 
 Its output NAMES SERVICES and stays in this run directory.
 """
@@ -660,8 +572,7 @@ survey_oteldemo_keep_run() {
     keep_dir="${main_dir}/resource-keep"
     duration="${SHAPE_SURVEY_OTELDEMO_KEEP_DURATION:-${SHAPE_SURVEY_OTELDEMO_KEEP_DURATION_DEFAULT}}"
     mkdir -p "${keep_dir}"
-    # The same accommodation `survey_out_dir` makes: the logit container runs as an unprivileged
-    # user whose uid has no relationship to whoever owns this checkout.
+    # As in `survey_out_dir`: the container's `logit` user has an unrelated uid.
     chmod 777 "${keep_dir}"
 
     echo "shape-survey: second capture, resource: keep, into ${keep_dir} (${duration}s)"
@@ -679,10 +590,7 @@ survey_oteldemo_keep_run() {
     survey_capture_for "${duration}"
     stop_logit
 
-    # The ordinary path, like every other capture here: summary.json/summary.md for this run's own
-    # pooled numbers (the series key has no room for a resource, so they are pooled across
-    # services exactly as the main capture's are), and then the per-service table below, which is
-    # the one thing only a `resource: keep` capture can produce.
+    # The ordinary pooled summary, then the per-service table only a keep capture can produce.
     survey_summarize >/dev/null
     survey_oteldemo_keep_section_py >"${keep_dir}/per-service.py"
     survey_python keep-section -- python3 /out/per-service.py
@@ -746,30 +654,26 @@ survey_oteldemo() {
         echo "config: tools/shape-survey/configs/oteldemo.yaml (one otlp_in, one shape tap)"
     } >>"${run_dir}/provenance.txt"
 
-    # logit first, so the collector's very first export has somewhere to land -- an `otlphttp`
-    # exporter whose endpoint refuses connections retries, but the queue is finite and the point of
-    # starting in this order is that nothing is lost while ~20 containers come up.
+    # logit first: the collector's retry queue is finite, so nothing is lost while ~20 containers
+    # come up.
     start_logit "${config}"
 
     echo "shape-survey: bringing up the demo's core stack (this pulls ~20 images on a cold daemon)"
     survey_oteldemo_compose up -d --no-build --pull missing ||
         survey_fail "the opentelemetry-demo core stack did not come up"
 
-    # 15 minutes is generous for a cold start with ~20 image pulls behind it.
+    # Allows for a cold start with ~20 image pulls.
     survey_capture_until survey_oteldemo_ready 900
 
     survey_capture_for "${duration}"
 
-    # The collector's log is worth keeping whatever happens -- an export failure to `logit` shows
-    # up there and nowhere else -- and it is taken *before* the check below, so the check has
-    # something to point the reader at when it fails.
+    # An export failure to `logit` shows up only in the collector's log, so take it before the check
+    # below, which points at it.
     survey_oteldemo_compose logs --no-color --tail 2000 otel-collector \
         >"${run_dir}/service-otel-collector.log" 2>&1 || true
 
-    # The collector is the single point through which every measurement arrives, and it is the one
-    # container in this stack that a bad config or a blocked mount takes down *after* readiness. A
-    # restart mid-window means a gap the summary would not otherwise show, so it is checked rather
-    # than assumed -- loudly, before anything is summarized.
+    # Every measurement arrives through the collector, and a bad config or blocked mount can take
+    # it down after readiness. A mid-window restart is a gap the summary wouldn't otherwise show.
     survey_oteldemo_service_state otel-collector state = running ||
         survey_fail "the demo's otel-collector is not running at the end of the capture --" \
             "see service-otel-collector.log in the run directory; every measurement in this" \
@@ -783,15 +687,10 @@ survey_oteldemo() {
     survey_python section -- python3 /out/section.py
     survey_summarize --append section.md
 
-    # Opt-in, and after the main capture is fully summarized, so nothing here can cost the run its
-    # own result. The stack is still up (`survey_compose`'s teardown runs at cleanup).
-    #
-    # `|| { ...; true; }` rather than a bare call: this is a supplementary capture, the main
-    # summary is already on disk, and the survey's own rule is that a run fails loudly *about the
-    # thing it was measuring*. A failure in the identity-bearing extra should be a loud warning
-    # that leaves `${run_dir}` intact, not a non-zero exit that makes a completed 20-minute
-    # capture look like a failed one. `SURVEY_RUN_DIR` is restored here too, because the keep run
-    # retargets it and an early exit would otherwise leave it pointing at the subdirectory.
+    # After the main capture is summarized, while the stack is still up. A failure here warns
+    # rather than exits, so a completed main capture doesn't read as failed. `SURVEY_RUN_DIR` is
+    # restored because the keep run retargets it and an early exit would leave it pointing at the
+    # subdirectory.
     if [ -n "${SHAPE_SURVEY_OTELDEMO_KEEP:-}" ]; then
         survey_oteldemo_keep_run || {
             SURVEY_RUN_DIR="${run_dir}"

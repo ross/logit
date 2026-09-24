@@ -1,33 +1,29 @@
-//! A deliberately minimal glob subset: a literal path, or one with a `*` in its final path
-//! component (`/var/log/app/*.log`), matching any run of non-`/` characters. No `**`, `?`,
-//! `[...]`, or escaping -- `docs/adr/file-tailing-and-docker-json-logs.md` explains why this is
-//! enough for `tail_in`'s own config-validated `paths` without pulling in a glob crate. Graph
-//! validation (rule 26, `crates/logit-pipeline/src/graph.rs`) already rejects a `tail_in` `*`
-//! outside the final component before this ever runs; [`PathPattern::new`] itself never rejects
-//! anything -- a pattern that can't usefully match just never matches, the same as an empty
-//! directory.
+//! A minimal glob: a literal path, or one `*` in the final path component
+//! (`/var/log/app/*.log`) matching any run of characters, including none. No `**`, `?`, `[...]`,
+//! or escaping (`docs/adr/file-tailing-and-docker-json-logs.md`'s "Alternatives considered"); a
+//! second `*` in the final component is matched literally. Graph rule 26 rejects a `tail_in` `*`
+//! outside the final component. [`PathPattern::new`] itself rejects nothing: a pattern that can't
+//! match never matches, like an empty directory.
 //!
-//! [`PathPattern::docker_containers`] is a second, unrelated way to build one of these: not a
-//! wildcard at all, but `docker_in`'s own two-level discovery under `<root>` (one container-id
-//! subdirectory per container, each holding a log file named after its own directory) -- see that
-//! constructor's doc comment.
+//! [`PathPattern::docker_containers`] isn't a glob: it's `docker_in`'s two-level walk under
+//! `root`.
 
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Matcher {
-    /// No `*` in the final component -- matches exactly one name.
+    /// No `*` in the final component: matches one name.
     Literal(String),
-    /// A `*` in the final component, split at it: `prefix* suffix` (either half may be empty).
+    /// The final component split at its first `*`; either half may be empty.
     Wildcard { prefix: String, suffix: String },
-    /// `docker_in`'s own discovery -- see [`PathPattern::docker_containers`].
+    /// `docker_in`'s discovery; see [`PathPattern::docker_containers`].
     DockerContainers,
 }
 
-/// One `paths:`/discovery entry, split into the directory to scan and how to recognize a match
-/// within it. Scanning one level at a time (never recursive) is deliberate: every caller names a
-/// specific directory, not a subtree -- [`Matcher::DockerContainers`]'s own two-level walk is a
-/// deliberate, narrow exception to that, not a general recursive scan (see its doc comment).
+/// One `paths:`/discovery entry: the directory to scan and how to match a name in it.
+///
+/// Never recursive: every caller names a directory, not a subtree. `docker_in`'s two-level walk
+/// is the one fixed exception.
 #[derive(Debug, Clone)]
 pub struct PathPattern {
     dir: PathBuf,
@@ -35,10 +31,10 @@ pub struct PathPattern {
 }
 
 impl PathPattern {
-    /// `path`'s parent becomes the scanned directory; its final component becomes the matcher.
-    /// A `path` with no parent (bare `"app.log"`) scans `.` -- not a shape either caller
-    /// produces (both always build absolute paths), but not rejected here either, matching this
-    /// module's "never rejects, just may never match" contract.
+    /// `path`'s parent becomes the scanned directory and its final component the matcher.
+    ///
+    /// A bare `"app.log"` gets an empty directory, whose `read_dir` fails, so it never matches.
+    /// Neither caller builds one.
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -52,11 +48,9 @@ impl PathPattern {
         Self { dir, matcher }
     }
 
-    /// `docker_in`'s own discovery under `root`: every `<root>/<id>/<id>-json.log`, where
-    /// `<root>/<id>` is a directory -- Docker's own deterministic naming (the id appears twice,
-    /// once as the directory name and once as the log file's own prefix), not a glob. Rejects
-    /// nothing here either, matching this type's usual contract -- an unreadable or empty `root`
-    /// simply yields no matches, retried on the next scan.
+    /// `docker_in`'s discovery: every `<root>/<id>/<id>-json.log` where `<root>/<id>` is a
+    /// directory, following Docker's naming. An unreadable or empty `root` yields no matches until
+    /// a later scan.
     pub fn docker_containers(root: impl Into<PathBuf>) -> Self {
         Self { dir: root.into(), matcher: Matcher::DockerContainers }
     }
@@ -65,25 +59,19 @@ impl PathPattern {
         &self.dir
     }
 
-    // `watch_dirs()` used to live here, widening to `root` plus every currently-existing
-    // container subdirectory for `Matcher::DockerContainers`. It's gone
-    // (`docs/adr/docker-container-identity-and-minimal-watches.md`): `root` alone already catches
-    // a container directory arriving or leaving (Docker's per-container state directories are
-    // direct children of it), so every matcher now needs exactly `PathPattern::dir` watched --
-    // `Tailer::reconcile_watches` calls that directly rather than through a second method that
-    // would just wrap it in a one-element `Vec`. What the old widening bought beyond `root` --
-    // near-immediate notice of a log file appearing inside an already-existing container
-    // directory, of that file rotating, or of `config.v2.json` changing -- now rides the
-    // `poll_interval` tick instead; a file actually being tailed gets its own watch directly
-    // (`Tailer::open_tracked`, `Watcher::watch_file`).
+    // Every matcher, `DockerContainers` included, needs only `dir` watched
+    // (`Tailer::reconcile_watches`). A container directory arriving or leaving is a direct child
+    // of `root`; a log file appearing inside an existing container directory, its rotation, and a
+    // `config.v2.json` change wait for the `poll_interval` tick
+    // (`docs/adr/docker-container-identity-and-minimal-watches.md`). A tailed file gets its own
+    // watch (`Tailer::open_tracked`, `Watcher::watch_file`).
 
     fn matches_name(&self, name: &str) -> bool {
         match &self.matcher {
             Matcher::Literal(literal) => name == literal,
             Matcher::Wildcard { prefix, suffix } => {
-                // `len() >=` (not `>`) matters when prefix and suffix together exhaust the whole
-                // name and the wildcard itself matches zero characters, e.g. pattern `x*y`
-                // against name `xy`.
+                // The length check stops prefix and suffix overlapping (`x*x` must not match
+                // `x`); `>=`, not `>`, lets `*` match zero characters (`x*y` matches `xy`).
                 name.len() >= prefix.len() + suffix.len()
                     && name.starts_with(prefix.as_str())
                     && name.ends_with(suffix.as_str())
@@ -92,14 +80,12 @@ impl PathPattern {
         }
     }
 
-    /// Every currently-matching file path in this pattern's directory -- a plain, non-recursive
-    /// `read_dir`, except [`Matcher::DockerContainers`]'s own deliberate two-level walk (still
-    /// bounded: exactly one subdirectory level, never deeper). Synchronous: called only from
-    /// [`crate::tail::driver::Tailer::scan`], on the `poll_interval`/wake cadence (seconds, not
-    /// the per-line hot path), so a brief blocking directory listing here costs nothing worth
-    /// threading through `spawn_blocking` for. A directory that doesn't exist (yet, or anymore)
-    /// is silently treated as empty -- discovery is expected to handle "not there yet" by trying
-    /// again next cycle, not by erroring.
+    /// Every currently matching path: one `read_dir`, or for `docker_in` one subdirectory level
+    /// deeper.
+    ///
+    /// Blocking, but only [`crate::tail::driver::Tailer::scan`] calls it, on the rescan cadence,
+    /// never per line. A `read_dir` failure, including a directory that doesn't exist yet, returns
+    /// no matches rather than an error.
     pub fn scan(&self) -> Vec<PathBuf> {
         if self.matcher == Matcher::DockerContainers {
             return self.scan_docker_containers();
@@ -127,7 +113,7 @@ impl PathPattern {
         for entry in entries.flatten() {
             let Ok(is_dir) = entry.file_type().map(|t| t.is_dir()) else { continue };
             if !is_dir {
-                continue; // config.v2.json and friends live in the directory, not beside it
+                continue; // `config.v2.json` and the log live inside the id directory
             }
             let Ok(name) = entry.file_name().into_string() else { continue };
             let log_path = self.dir.join(&name).join(format!("{name}-json.log"));
@@ -163,9 +149,7 @@ mod tests {
 
     #[test]
     fn a_leading_star_matches_any_prefix() {
-        // The mirror-image `prefix=""` case the same matcher must also get right -- not
-        // `docker_in`'s own scenario (see `docker_containers_finds_one_log_per_container_
-        // directory` below for that; its discovery isn't a glob at all).
+        // The empty-prefix case; `docker_in` discovery isn't a glob and is tested below.
         let name_pattern = PathPattern::new("/x/*-json.log");
         assert!(name_pattern.matches_name("abc123-json.log"));
         assert!(!name_pattern.matches_name("abc123-json.log.1"));
@@ -209,7 +193,7 @@ mod tests {
             std::fs::write(dir.join(format!("{id}-json.log")), b"").unwrap();
             std::fs::write(dir.join("config.v2.json"), b"{}").unwrap();
         }
-        // Not a container directory -- must never be treated as one.
+        // Not a container directory.
         std::fs::write(root.join("stray-file.log"), b"").unwrap();
 
         let p = PathPattern::docker_containers(&root);
@@ -241,12 +225,8 @@ mod tests {
 
     #[test]
     fn docker_containers_dir_is_just_root_regardless_of_what_it_currently_holds() {
-        // `docs/adr/docker-container-identity-and-minimal-watches.md`: `docker_in` no longer
-        // widens its watch set to every container subdirectory -- `root` alone is watched,
-        // since Docker's per-container state directories are direct children of it. This
-        // fixture (an existing container, a container with no log file yet, a stray plain file)
-        // is what the old `watch_dirs()` used to have to walk to compute that widened set; now
-        // `dir()` doesn't look at any of it.
+        // Only `root` is watched, whatever it holds
+        // (`docs/adr/docker-container-identity-and-minimal-watches.md`).
         let root = crate::tail::test_support::scratch_dir("pattern-docker-dir");
         let id_a = "aaaa000000000000000000000000000000000000000000000000000000000000";
         let id_b = "bbbb111111111111111111111111111111111111111111111111111111111111";

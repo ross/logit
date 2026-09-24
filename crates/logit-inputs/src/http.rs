@@ -1,22 +1,17 @@
-//! Shared connection-level plumbing for this crate's `hyper`-based listeners -- the idle-timeout
-//! tracker ([`Activity`], [`InFlight`]) and the connection driver that acts on it
-//! ([`drive_with_idle`]).
+//! Connection-level plumbing shared by this crate's `hyper`-based listeners (`otlp_in` and
+//! `prometheus_in`'s remote-write receiver): the idle-timeout tracker ([`Activity`],
+//! [`InFlight`]), the connection driver that acts on it ([`drive_with_idle`]), and the bounded
+//! request-body read.
 //!
-//! Hoisted verbatim out of `crate::otlp` (`docs/plans/prometheus-remote-write.md` W3), where these
-//! three landed with `otlp_in`'s `idle_timeout:` field, once `prometheus_in`'s remote-write
-//! receiver became a second HTTP listener needing exactly the same semantics. Nothing here is
-//! OTLP-specific and nothing here changed in the move; `otlp_in`'s module doc (its "Idle timeout"
-//! section) is still where the *reasoning* lives -- why the clock is tracked at the service rather
-//! than around the socket, why it resets on request completion rather than on bytes, and the
-//! pinned-hyper evidence behind the `graceful_shutdown`-then-bounded-grace-then-drop close
-//! sequence. This module doc deliberately points there rather than duplicating it, so there is one
-//! copy to keep true.
+//! The reasoning lives in `crate::otlp`'s module doc, "Idle timeout" section, and only there: why
+//! the clock is tracked at the service rather than around the socket, why it resets on request
+//! completion rather than on bytes, and the pinned-hyper evidence behind the
+//! `graceful_shutdown`-then-bounded-grace-then-drop close sequence.
 //!
-//! What did *not* hoist is `serve_connection`: it dispatches on `otlp_in`'s own `protocol:`
-//! (HTTP via [`hyper_util::server::conn::auto`], gRPC via `hyper::server::conn::http2`) and wires
-//! in that input's own handlers, so it is a listener's own code rather than shared plumbing. A
-//! second listener builds its own service and its own connection future and hands the result to
-//! [`drive_with_idle`], which is the actual seam.
+//! `serve_connection` is not shared: each listener dispatches on its own protocol (`otlp_in` uses
+//! [`hyper_util::server::conn::auto`] for HTTP and `hyper::server::conn::http2` for gRPC) and wires
+//! in its own handlers. It builds its own service and connection future and hands them to
+//! [`drive_with_idle`], which is the seam.
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Limited};
@@ -27,25 +22,25 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// One connection's idle state, shared between its service and [`drive_with_idle`] -- the
-/// service-level tracker `crate::otlp`'s "Idle timeout" doc section explains, and deliberately not
-/// a timer wrapped around the socket.
+/// One connection's idle state, shared between its service and [`drive_with_idle`].
+///
+/// A service-level tracker, not a timer around the socket (`crate::otlp`'s "Idle timeout" doc
+/// section).
 pub(crate) struct Activity {
     /// Requests hyper has handed this connection's service and not yet had a response from.
-    /// While it is non-zero there is no idle deadline at all: the connection is not quiet, it is
-    /// working (and the work may be a `Fanout::send` parked on a full downstream, which must
-    /// never look like a silent peer -- `docs/adr/idle-connection-timeout.md`'s reset rule).
+    /// While it is non-zero there is no idle deadline: the connection is working, and the work may
+    /// be a `Fanout::send` parked on a full downstream, which must never look like a silent peer
+    /// (`docs/adr/idle-connection-timeout.md`'s reset rule).
     in_flight: AtomicUsize,
-    /// When the last request finished, i.e. when the clock was last re-armed. A plain
-    /// `std::sync::Mutex` and never held across an await: the critical section is one `Instant`
-    /// read or write.
+    /// When the last request finished, which is when the clock was last re-armed. A
+    /// `std::sync::Mutex`, never held across an await: the critical section is one `Instant` read
+    /// or write.
     last_progress: Mutex<tokio::time::Instant>,
     /// Set by a handler whose request body stalled: close this connection as soon as its
     /// response is out, rather than leaving it to the idle deadline.
     close_after: AtomicBool,
-    /// Wakes [`drive_with_idle`] whenever any of the three above changed, so a request
-    /// completing re-arms the deadline and a `close_after` is acted on promptly rather than at
-    /// the next deadline.
+    /// Wakes [`drive_with_idle`] when any of the three above changes, so a finished request
+    /// re-arms the deadline and a `close_after` is acted on now rather than at the next deadline.
     changed: tokio::sync::Notify,
 }
 
@@ -93,12 +88,12 @@ impl Activity {
     }
 }
 
-/// Held for one request's lifetime by the service wrapper a listener builds around its handler
-/// (`crate::otlp`'s `serve_connection`, `crate::prometheus`'s own). A guard rather
-/// than a pair of calls around the handler so that every way out of a handler -- an early
-/// `return` on a 415, a `?`, a panic unwinding through it -- still decrements the count and
-/// re-arms the clock. Stamping progress *here*, when the handler has returned, is what keeps time
-/// spent blocked in `Fanout::send` from ever counting against the peer.
+/// Held for one request's lifetime by the service wrapper a listener builds around its handler.
+///
+/// A guard rather than a pair of calls so that every way out of a handler (an early `return`, a
+/// `?`, a panic unwinding through it) still decrements the count and re-arms the clock. Stamping
+/// progress on drop, after the handler has returned, is what keeps time blocked in
+/// `Fanout::send` from counting against the peer.
 pub(crate) struct InFlight(Arc<Activity>);
 
 impl Drop for InFlight {
@@ -109,19 +104,17 @@ impl Drop for InFlight {
     }
 }
 
-/// Polls one hyper connection future to completion, closing it if [`Activity`] says it has been
-/// idle for `idle` (or if a handler asked for a close after a stalled body). `shutdown` is the
-/// connection's own `graceful_shutdown`, passed in because `auto::Connection` and
-/// `http2::Connection` share the signature (`self: Pin<&mut Self>`) but no trait.
+/// Polls one hyper connection future to completion, closing it once [`Activity`] has been idle
+/// for `idle` or a handler asked for a close after a stalled body.
 ///
-/// With `idle: None` this is `conn.await` and nothing else -- the pre-`idle_timeout` path,
-/// unchanged. Otherwise the connection is raced against its own idle deadline; see `crate::otlp`'s
-/// "Idle timeout" doc section for the semantics and the hyper evidence behind the close sequence.
+/// `shutdown` is the connection's own `graceful_shutdown`, passed in because `auto::Connection`
+/// and `http2::Connection` share the signature (`self: Pin<&mut Self>`) but no trait. With
+/// `idle: None` this is `conn.await`. The close sequence's semantics and hyper evidence are in
+/// `crate::otlp`'s "Idle timeout" doc section.
 ///
 /// **`conn` is polled the whole time, including while waiting for an in-flight request to
-/// finish.** For h1 a handler's future is polled *inside* this connection future, so pausing it
-/// to wait on `changed` alone would stall the very request being waited on -- a deadlock, since
-/// only that request finishing can send the notification.
+/// finish.** For h1 a handler's future is polled *inside* this connection future, so waiting on
+/// `changed` alone would deadlock: only that request finishing can send the notification.
 pub(crate) async fn drive_with_idle<C, E>(
     conn: C,
     shutdown: impl FnOnce(Pin<&mut C>),
@@ -141,8 +134,8 @@ where
 
     loop {
         if activity.in_flight() > 0 {
-            // Working, so no deadline applies -- but keep polling, and wake when the count
-            // changes so the deadline can be re-armed from the instant that request finished.
+            // Working, so no deadline applies. Keep polling, and wake when the count changes so
+            // the deadline re-arms from the instant that request finished.
             tokio::select! {
                 result = conn.as_mut() => return result.map_err(|e| e.to_string()),
                 () = activity.changed.notified() => continue,
@@ -160,19 +153,19 @@ where
         }
         tokio::select! {
             result = conn.as_mut() => return result.map_err(|e| e.to_string()),
-            // Both arms loop back round rather than deciding anything here: the deadline is
-            // recomputed from the *current* `last_progress` at the top, so a request that
-            // finished while this slept simply moves the deadline out instead of closing.
+            // Both arms loop rather than deciding here: the deadline is recomputed from the
+            // current `last_progress` at the top, so a request that finished during the sleep
+            // moves the deadline out instead of closing.
             () = tokio::time::sleep_until(deadline) => continue,
             () = activity.changed.notified() => continue,
         }
     }
 
-    // Idle (or a stalled body asked for this). Ask hyper to close, give it `grace` to do so, and
-    // then drop the connection whatever that returned -- `graceful_shutdown` alone leaves three
-    // real cases parked, and the pre-sniff `ReadVersion` resolves `Err("Cancelled")` rather than
-    // `Ok(())`, which is why the result is deliberately discarded (`crate::otlp`'s "Idle timeout"
-    // doc section). Returning from here is the drop: the socket closes with the pinned future.
+    // Idle, or a stalled body asked for this. Ask hyper to close, give it `grace`, then drop the
+    // connection whatever that returned: `graceful_shutdown` alone leaves three cases parked, and
+    // the pre-sniff `ReadVersion` resolves `Err("Cancelled")` rather than `Ok(())`, so the result
+    // is discarded (`crate::otlp`'s "Idle timeout" doc section). Returning is the drop: the socket
+    // closes with the pinned future.
     shutdown(conn.as_mut());
     loop {
         if tokio::time::timeout(grace, conn.as_mut()).await.is_ok() {
@@ -183,15 +176,13 @@ where
             // for (a `KA::Busy` head, a cancelled pre-sniff, an h2 still handshaking).
             break;
         }
-        // A request *started* inside the grace window and its handler has not returned -- most
+        // A request started inside the grace window and its handler has not returned, most
         // likely parked in `Fanout::send` on a full downstream. Dropping now would discard a
-        // batch that never reached the fanout, which is precisely the backpressure-causes-loss
-        // outcome this whole feature is built to avoid, so the request is waited out instead:
-        // `conn` keeps being polled (on h1 the handler's own future is polled inside it) until
-        // the count falls back to zero, and then the grace runs again so the response reaches
-        // the wire. A stalled body is still bounded by its own per-frame timeout, and a
-        // connection with nothing in flight is closed immediately, so no misbehaving peer can
-        // hold this open by staying silent -- only by continuing to be served.
+        // batch that never reached the fanout (backpressure causing loss), so wait it out: keep
+        // polling `conn` (on h1 the handler's future is polled inside it) until the count is
+        // zero, then run the grace again so the response reaches the wire. A stalled body is
+        // still bounded by its per-frame timeout and an empty connection closes immediately, so
+        // a peer can hold this open only by continuing to be served, never by staying silent.
         let mut connection_finished = false;
         while activity.in_flight() > 0 {
             tokio::select! {
@@ -210,31 +201,31 @@ where
     Ok(())
 }
 
-/// Why reading a request body stopped short, distinguished so the caller can answer `408`/gRPC
-/// `DEADLINE_EXCEEDED` for "this body stopped arriving" rather than reusing the `413` path for
-/// everything, the way a bare `Limited::collect` failure forced.
+/// Why reading a request body stopped short.
+///
+/// Distinguished so the caller answers `408`/gRPC `DEADLINE_EXCEEDED` for a body that stopped
+/// arriving, and `413` only for [`Self::Failed`].
 pub(crate) enum BodyReadError {
     /// No frame of the body arrived within the per-frame bound.
     Stalled(std::time::Duration),
-    /// Anything [`Limited`] itself reports: over `MAX_REQUEST_BYTES`, a client vanishing
-    /// mid-upload, a reset h2 stream. Still goes through [`body_read_error_message`].
+    /// Anything [`Limited`] reports: over the listener's `MAX_REQUEST_BYTES`, a client vanishing
+    /// mid-upload, a reset h2 stream. Render it with [`body_read_error_message`].
     Failed(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// `Limited::collect` with a per-frame stall bound -- the body half of `crate::otlp`'s "Idle
-/// timeout" doc section. The bound is per *frame*, never a total: a large body that keeps
-/// arriving in pieces is making progress and is not stalled, however long it takes in aggregate
-/// (the same distinction `logit_in`'s per-`read` body bound draws).
+/// `Limited::collect` with a per-frame stall bound: the body half of `crate::otlp`'s "Idle
+/// timeout" doc section.
 ///
-/// With `stall: None` this is the old `limited.collect().await` in every observable respect,
-/// including which errors reach [`body_read_error_message`].
+/// The bound is per *frame*, never a total: a large body that keeps arriving in pieces is making
+/// progress, however long it takes in aggregate (the distinction `logit_in`'s per-`read` body
+/// bound also draws). With `stall: None` this behaves as `limited.collect().await`, including
+/// which errors reach [`body_read_error_message`].
 pub(crate) async fn collect_with_stall_bound(
     mut body: Limited<Incoming>,
     stall: Option<std::time::Duration>,
 ) -> Result<Bytes, BodyReadError> {
-    // Frames are accumulated rather than concatenated as they arrive so the overwhelmingly
-    // common single-frame body is handed on without a copy, exactly as `Collected::to_bytes`
-    // would do it.
+    // Frames are accumulated rather than concatenated as they arrive so the common single-frame
+    // body is handed on without a copy, as `Collected::to_bytes` does.
     let mut frames: Vec<Bytes> = Vec::new();
     loop {
         let next = match stall {
@@ -265,15 +256,14 @@ pub(crate) async fn collect_with_stall_bound(
     })
 }
 
-/// Turns a [`Limited`] read failure into a response message that doesn't overclaim. `Limited`'s
-/// `Error` covers *any* failure reading the body, not just exceeding `MAX_REQUEST_BYTES` -- a
-/// client disconnecting mid-upload, malformed chunked encoding, or an HTTP/2 stream reset all
-/// surface the same way. Distinguished via `LengthLimitError`'s presence in the error chain
-/// (`Limited` wraps the real cause when the limit trips, and otherwise forwards the underlying
-/// body's own error untouched) rather than assumed from the mere fact that `collect` failed --
-/// callers still respond `413`/`RESOURCE_EXHAUSTED` either way (there's no better status for "the
-/// request body never finished," and this is not the place to teach every HTTP/gRPC client the
-/// difference), but the message itself says which actually happened.
+/// Turns a [`Limited`] read failure into a response message that doesn't overclaim.
+///
+/// `Limited`'s `Error` covers *any* failure reading the body, not only exceeding the size limit: a
+/// client disconnecting mid-upload, malformed chunked encoding, or an HTTP/2 stream reset surface
+/// the same way. Oversize is recognized by a `LengthLimitError` in the error chain (`Limited`
+/// wraps it when the limit trips and otherwise forwards the body's own error). Callers respond
+/// `413`/`RESOURCE_EXHAUSTED` either way, having no better status for a body that never
+/// finished; only the message distinguishes the two.
 pub(crate) fn body_read_error_message(
     err: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> String {

@@ -1,55 +1,37 @@
-//! `Value` ↔ `AnyValue`, `AttrMap` ↔ `Vec<KeyValue>`, and the `InstrumentationScope` this crate
-//! always stamps -- shared by `logs.rs`/`metrics.rs`/`traces.rs`, since every OTLP signal nests
-//! attributes and scope the same way.
+//! `Value` ↔ `AnyValue`, `AttrMap` ↔ `Vec<KeyValue>`, and resource and scope, shared by every
+//! signal.
 //!
-//! **`Value` ↔ `AnyValue` is total, except three documented, one-directional cases** (see
-//! `docs/known-gaps.md`'s "Cross-protocol semantic gaps" entry) -- all three share one root cause:
-//! OTLP's `AnyValue` has exactly one integer variant (`IntValue`, signed 64-bit), so it cannot
-//! distinguish "this was a `U64`", "this was a `Timestamp`", and "this was actually an `I64`" once
-//! encoded. Nothing short of a `logit`-specific extension field would fix that -- not attempted
-//! here, since it would mean a non-standard OTLP a real collector couldn't read.
-//! - `Value::U64` within `i64::MAX` encodes as `IntValue` (the same representation `Value::I64`
-//!   uses) and decodes back as `Value::I64`, not `Value::U64` -- exact numerically, but the
-//!   "this was unsigned" fact doesn't survive.
-//! - `Value::U64` above `i64::MAX` has no lossless `AnyValue` representation at all -- it encodes
-//!   as `DoubleValue` instead, exact up to `f64`'s 2^53 integer range and lossy above it, and
-//!   decodes back as `Value::F64`.
-//! - `Value::Timestamp` has no OTLP value type of its own -- it encodes as `IntValue` too, so it
-//!   decodes back as `Value::I64`, not `Value::Timestamp`.
+//! **`Value` ↔ `AnyValue` is total except for three one-way cases** (`docs/known-gaps.md`'s
+//! "Cross-protocol semantic gaps"). All three come from `AnyValue` having one integer variant,
+//! signed `IntValue`; fixing them would take a non-standard extension a collector couldn't read.
+//! - `Value::U64` up to `i64::MAX` encodes as `IntValue` and decodes as `Value::I64`: numerically
+//!   exact, but no longer unsigned.
+//! - `Value::U64` above `i64::MAX` encodes as `DoubleValue`, exact up to 2^53 and lossy above, and
+//!   decodes as `Value::F64`.
+//! - `Value::Timestamp` encodes as `IntValue` and decodes as `Value::I64`.
 //!
-//! **Nesting.** A batch's single `Arc<Resource>` becomes one `Resource*` message
-//! ([`resource_to_pb`]/[`pb_to_resource`]), carrying the resource's own `dropped_attributes_count`
-//! and (at the wrapping `Resource*` message's own `schema_url` field, not part of the `Resource`
-//! message itself) its `schema_url`. A batch's single `Option<Arc<Scope>>` becomes one `Scope*`
-//! message the same way ([`scope_to_pb`]/[`pb_to_scope`]): `batch.scope == None` encodes an empty
-//! `InstrumentationScope` (empty name -- never a fabricated `"logit"`/version; see `../mod.rs`'s own
-//! doc for why nothing invents an identity that was never there), never a fixed, hardcoded scope.
-//! Decode groups every `(Resource*, Scope*)` pair in a request into its own `EventBatch` -- see
-//! `../mod.rs`'s own "Nesting" note for the full grouping rule and why a request with several scopes
-//! under one resource decodes to several batches, never flattened into one. Resource attributes are
-//! never copied into `Event::attributes` at all -- they stay on `EventBatch::resource`, `Arc`-shared
-//! across every event exactly the way every other codec in this crate already treats a batch's
-//! resource (see `crates/logit-core/src/event.rs`); the same is true of scope attributes, which now
-//! live on `EventBatch::scope` rather than being copied per event. A downstream consumer that wants
-//! the full resource → scope → data-point precedence merge-joins resource, scope, and event
-//! attributes at the point it renders them, the same way `crates/logit-outputs/src/influxdb.rs`'s
-//! `render_tag_suffix` already does for line-protocol tags.
+//! **Nesting** (grouping rules in `super`'s module doc). A batch's resource becomes one
+//! `Resource*` message ([`resource_to_pb`]/[`pb_to_resource`]); its `schema_url` is the wrapping
+//! `Resource*` message's field, not the inner `Resource`'s. Its scope becomes one `Scope*` message
+//! ([`scope_to_pb`]/[`pb_to_scope`]) the same way. Resource and scope attributes stay on the batch
+//! and are never copied into `Event::attributes`; a sink that wants resource → scope → point
+//! precedence merges them at render time, as `crates/logit-outputs/src/influxdb.rs`'s
+//! `render_tag_suffix` does.
 
 use crate::otlp::generated::opentelemetry::proto::common::v1 as pb;
 use bytes::Bytes;
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Resource, Scope, Value};
 
-/// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the two lossy cases.
+/// Converts one [`Value`] into an [`pb::AnyValue`]. See the module doc for the lossy cases.
 pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {
     use pb::any_value::Value as Any;
     let inner = match value {
         Value::Null => None,
         Value::Bool(b) => Some(Any::BoolValue(*b)),
         Value::I64(i) => Some(Any::IntValue(*i)),
-        // Lossy above i64::MAX (equivalently, above 2^63 - 1): OTLP's IntValue is signed, so a
-        // U64 that doesn't fit becomes a DoubleValue instead of silently wrapping negative.
-        // Exact for any U64 up to f64's 2^53 exact-integer range, approximate beyond it.
+        // IntValue is signed, so a U64 above i64::MAX becomes a DoubleValue rather than wrapping
+        // negative: exact up to 2^53, approximate beyond.
         Value::U64(u) => Some(if *u <= i64::MAX as u64 {
             Any::IntValue(*u as i64)
         } else {
@@ -57,12 +39,11 @@ pub(crate) fn value_to_any_value(value: &Value) -> pb::AnyValue {
         }),
         Value::F64(f) => Some(Any::DoubleValue(*f)),
         Value::Bytes(b) => Some(Any::BytesValue(b.to_vec())),
-        // `Value::Str` is documented to always hold valid UTF-8 (see `crate::value::Value::str`).
+        // `Value::Str` always holds valid UTF-8 (`logit_core::Value::str`).
         Value::Str(b) => Some(Any::StringValue(
             std::str::from_utf8(b).expect("Value::Str is always valid UTF-8").to_string(),
         )),
-        // No distinct OTLP value type -- IntValue is what `Value::I64` also encodes to, so this
-        // is indistinguishable from an I64 once on the wire (see the module doc).
+        // No OTLP timestamp type; decodes as an I64 (see the module doc).
         Value::Timestamp(ts) => Some(Any::IntValue(*ts)),
         Value::Array(items) => Some(Any::ArrayValue(pb::ArrayValue {
             values: items.iter().map(value_to_any_value).collect(),
@@ -93,8 +74,7 @@ pub(crate) fn any_value_to_value(any: pb::AnyValue) -> Value {
             Value::Map(Box::new(attrs))
         }
         Some(Any::BytesValue(b)) => Value::Bytes(Bytes::from(b)),
-        // Profiling-signal-only (see the field's own doc comment in common.proto); logs/metrics/
-        // traces never set it. Treated as absent rather than fabricating a string we don't have.
+        // Profiling-signal-only (common.proto); logs, metrics, and traces never set it.
         Some(Any::StringValueStrindex(_)) => Value::Null,
     }
 }
@@ -106,14 +86,13 @@ pub(crate) fn attrs_to_key_values(attrs: &AttrMap) -> Vec<pb::KeyValue> {
         .map(|(key, value)| pb::KeyValue {
             key: resolve(key).to_string(),
             value: Some(value_to_any_value(value)),
-            // Profiling-signal-only field (see common.proto); logit never sets it.
+            // Profiling-signal-only (common.proto).
             key_strindex: 0,
         })
         .collect()
 }
 
-/// Inserts every `KeyValue` into `attrs`, later entries overwriting an earlier one at the same
-/// key -- `AttrMap::insert`'s own semantics, unchanged here.
+/// Inserts every `KeyValue` into `attrs`; on a duplicate key, the later entry wins.
 pub(crate) fn key_values_into_attrs(kvs: Vec<pb::KeyValue>, attrs: &mut AttrMap) {
     for kv in kvs {
         let value = kv.value.map(any_value_to_value).unwrap_or(Value::Null);
@@ -121,17 +100,14 @@ pub(crate) fn key_values_into_attrs(kvs: Vec<pb::KeyValue>, attrs: &mut AttrMap)
     }
 }
 
-/// A textual OTLP field (`schema_url`, `InstrumentationScope.name`/`.version`) stored as `Bytes`
-/// on `logit`'s own model -- lossy only in the sense any non-UTF-8 byte sequence a well-behaved
-/// producer would never send becomes the Unicode replacement character, the same tradeoff
-/// `Value::Str`'s own "always valid UTF-8" contract already makes throughout this crate.
+/// Renders a model `Bytes` field that OTLP types as a string (`schema_url`, scope `name` and
+/// `version`). Invalid UTF-8, which a conforming producer never sends, becomes U+FFFD.
 pub(crate) fn bytes_to_string(bytes: &Bytes) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// The inverse of [`bytes_to_string`]: an empty string is "unset" (`None`), matching every other
-/// `Option<Bytes>` field in the model (`Resource::schema_url`, `Scope::schema_url`, `SpanExt`'s own
-/// fields) where the wire's empty-string convention and the model's `None` convention agree.
+/// The inverse of [`bytes_to_string`]. An empty string is `None`, the model's "unset" for every
+/// `Option<Bytes>` field (`Resource::schema_url`, `Scope::schema_url`, `SpanExt`'s fields).
 pub(crate) fn string_to_bytes(s: String) -> Option<Bytes> {
     if s.is_empty() {
         None
@@ -150,9 +126,8 @@ pub(crate) fn resource_to_pb(
     }
 }
 
-/// `schema_url` is the wrapping `Resource*` message's own field (`ResourceLogs.schema_url` etc.),
-/// not part of the inner `Resource` message itself -- see the module doc's "Nesting" note -- so it
-/// arrives as a separate parameter rather than living on `resource`.
+/// `schema_url` is the wrapping `Resource*` message's field (`ResourceLogs.schema_url`, ...), so
+/// it arrives separately from `resource`.
 pub(crate) fn pb_to_resource(
     resource: Option<crate::otlp::generated::opentelemetry::proto::resource::v1::Resource>,
     schema_url: &str,
@@ -170,10 +145,8 @@ pub(crate) fn pb_to_resource(
     }
 }
 
-/// One `EventBatch`'s `Option<Arc<Scope>>` -> the one `InstrumentationScope` its request carries.
-/// `None` (no OTLP-sourced scope at all) becomes an empty `InstrumentationScope` -- empty name,
-/// nothing invented -- never a fabricated `"logit"`/version identity (`../mod.rs`'s own doc, and
-/// `docs/adr/lossless-transit.md`'s retirement of that convention).
+/// A batch's scope as the one `InstrumentationScope` its request carries. `None` becomes an empty
+/// `InstrumentationScope`, never a fabricated `logit` identity (ADR `lossless-transit`).
 pub(crate) fn scope_to_pb(scope: Option<&Scope>) -> pb::InstrumentationScope {
     match scope {
         None => pb::InstrumentationScope::default(),
@@ -186,17 +159,13 @@ pub(crate) fn scope_to_pb(scope: Option<&Scope>) -> pb::InstrumentationScope {
     }
 }
 
-/// The mirror of [`scope_to_pb`]. `schema_url` is the wrapping `Scope*` message's own field
-/// (`ScopeLogs.schema_url` etc.), same reasoning as [`pb_to_resource`]'s own `schema_url`
-/// parameter.
-/// `None` when the wire scope is entirely empty -- no `InstrumentationScope` message at all, or
-/// one with an empty name/version, no attributes, and `dropped_attributes_count == 0` -- **and**
-/// the wrapping `Scope*` message's own `schema_url` is also empty. An all-empty scope on the wire
-/// is indistinguishable from "no scope was ever there" (both encode identically via
-/// [`scope_to_pb`]/an empty `schema_url` string), so decode has to collapse them to the same
-/// result: otherwise `EventBatch { scope: None, .. }` -- every statsd/syslog/native-sourced batch,
-/// none of which ever had an OTLP scope to begin with -- would not be a decode/encode fixed point
-/// (`docs/adr/lossless-transit.md`'s round-trip requirement).
+/// The mirror of [`scope_to_pb`]. `schema_url` is the wrapping `Scope*` message's field
+/// (`ScopeLogs.schema_url`, ...).
+///
+/// Returns `None` when the wire scope is all empty (absent, or empty name and version, no
+/// attributes, no dropped count) and `schema_url` is empty too. [`scope_to_pb`] encodes `None`
+/// that way, so without the collapse a batch with no scope (every statsd, syslog, or native one)
+/// wouldn't be an OTLP decode/encode fixed point (ADR `lossless-transit`).
 pub(crate) fn pb_to_scope(
     scope: Option<pb::InstrumentationScope>,
     schema_url: &str,
@@ -245,9 +214,7 @@ mod tests {
             assert_eq!(round_tripped, value, "value {value:?} should round-trip unchanged");
         }
 
-        // U64 and Timestamp are the two variants that do NOT round-trip to themselves -- OTLP's
-        // AnyValue has exactly one integer type (signed IntValue) and no timestamp type at all, so
-        // both decode back as a plain I64 (documented known gap, module doc).
+        // U64 and Timestamp both decode as I64 (the module doc's lossy cases).
         let cases_that_become_i64 = [
             (Value::U64(42), Value::I64(42)),
             (Value::Timestamp(1_700_000_000_000_000_000), Value::I64(1_700_000_000_000_000_000)),
@@ -271,7 +238,7 @@ mod tests {
             }
             other => panic!("expected DoubleValue for a U64 above i64::MAX, got {other:?}"),
         }
-        // Decodes back as F64 -- there is no way to recover it was ever a U64.
+        // Decodes as F64.
         assert_eq!(any_value_to_value(value_to_any_value(&value)), Value::F64(u64::MAX as f64));
     }
 
@@ -328,9 +295,7 @@ mod tests {
 
     #[test]
     fn a_missing_scope_message_decodes_to_a_default_scope_but_keeps_a_present_schema_url() {
-        // The wrapping Scope* message's own schema_url is independent of whether an
-        // InstrumentationScope message itself was present -- see pb_to_scope's own doc comment. A
-        // present schema_url alone is enough to keep this from collapsing to None.
+        // A schema_url alone keeps the scope from collapsing to None.
         let decoded = pb_to_scope(None, "https://example.com/schema")
             .expect("a present schema_url must not collapse to None");
         assert_eq!(decoded.name, Bytes::new());
@@ -339,11 +304,8 @@ mod tests {
         assert_eq!(decoded.schema_url, Some(Bytes::from_static(b"https://example.com/schema")));
     }
 
-    /// The fixed-point half of the same rule: a wire scope that is entirely empty -- no message
-    /// at all, or one whose every field is the zero/empty value -- and an empty wrapping
-    /// `schema_url` must decode to `None`, not `Some(Scope::default())`, or
-    /// `EventBatch { scope: None, .. }` (every statsd/syslog/native-sourced batch) would not
-    /// survive an OTLP decode/encode round trip.
+    /// An all-empty wire scope with an empty `schema_url` decodes to `None`, not
+    /// `Some(Scope::default())`.
     #[test]
     fn a_fully_empty_scope_and_schema_url_decodes_to_none() {
         assert_eq!(pb_to_scope(None, ""), None);

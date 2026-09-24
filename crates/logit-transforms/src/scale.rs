@@ -1,10 +1,6 @@
-//! `scale`: multiplies named numeric attributes by a constant factor, in place -- unit conversion
-//! (nginx's `request_time` in seconds -> milliseconds, say, to share a measurement name with a
-//! source that already reports milliseconds) without a Lua script. See
-//! `docs/adr/scale-transform.md`.
-//!
-//! Stateless -- like `json`/`kv_metrics`, only `process` is overridden; `flush_interval`/`flush`
-//! keep the `Transform` trait's defaults.
+//! `scale`: multiplies named numeric attributes by a constant factor, in place, for unit
+//! conversion without a Lua script (nginx's `request_time` from seconds to milliseconds, say).
+//! Stateless. See `docs/adr/scale-transform.md`.
 
 use crate::numeric;
 use logit_core::interner::intern;
@@ -12,9 +8,8 @@ use logit_core::{Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// One `field -> factor` entry, interned once at construction ([`Scale::new`]) rather than per
-/// event -- `intern`/`resolve` are hash lookups, and this runs on the hot path once per field per
-/// event (mirroring `kv_metrics::CompiledMetric`'s own reasoning).
+/// One `field -> factor` entry, interned once in [`Scale::new`] to keep interner lookups off the
+/// per-event path.
 struct CompiledScale {
     field: Symbol,
     factor: f64,
@@ -36,9 +31,9 @@ impl Scale {
         }
     }
 
-    /// Attaches a telemetry handle -- see [`Set::with_telemetry`](crate::Set::with_telemetry) for
-    /// why there's no `Diagnostics` builder alongside it: a missing or non-numeric field is a
-    /// silent skip, never an error.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: a missing or non-numeric field is a skip, never an error.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -46,18 +41,15 @@ impl Scale {
 }
 
 impl Transform for Scale {
-    /// Multiplies each configured field's current value by its factor and writes the result back
-    /// under the same name, always as `Value::F64` -- even when the product is exact, so a
-    /// field's type never flaps between events depending on whether the multiplication happened
-    /// to stay integral (a real hazard for OTLP/Loki consumers downstream, which see `scale`'s
-    /// output as the type it declares). A missing or non-numeric field, or a non-finite product,
-    /// is a silent skip for that field only, never a dropped event -- the same posture
-    /// `kv_metrics` takes toward its own fields (`docs/adr/kv-metrics-semantics.md`).
-    /// `log`/`span`/other attributes/`timestamp` are untouched, and this always returns `true`.
+    /// Multiplies each configured field by its factor and writes it back under the same name.
     ///
-    /// Records `logit.transform.scaled`/`.scaled.skipped` per configured field, mirroring
-    /// `kv_metrics`'s `logit.transform.derived{,.skipped}` -- the skipped-vs-scaled ratio is the
-    /// visible signal for this transform's documented silent-skip path.
+    /// The result is always `Value::F64`, even when the product is integral, so a field's type
+    /// never flaps between events for OTLP/Loki consumers downstream. A missing or non-numeric
+    /// field, or a non-finite product, skips that field only; the event is never dropped
+    /// (`docs/adr/kv-metrics-semantics.md`'s posture).
+    ///
+    /// Records `logit.transform.scaled`/`.scaled.skipped` per configured field; the ratio is the
+    /// only visible signal for the skip path.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         for f in &self.fields {
             let scaled = event

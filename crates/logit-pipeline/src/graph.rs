@@ -1,367 +1,182 @@
-//! Pure resolution and validation of a [`Config`] into a [`Graph`]. No channels, no threads, no
-//! tokio -- mirrors how `apply_transforms` in the pre-graph `logit-cli::pipeline` was kept pure
-//! specifically for unit-testability. `logit run`, `logit validate`, and `logit graph` are all
-//! just different things layered on top of this one function's output.
+//! Pure resolution and validation of a [`Config`] into a [`Graph`]: no channels, threads, or
+//! tokio, so every rule is unit-testable. `logit run`, `logit validate`, and `logit graph` all
+//! build on [`resolve`]'s output.
 //!
-//! Validation rules, in order (`docs/design/pipeline-graph.md`):
-//! 1. At least one component.
-//! 2. Every `sources` id resolves to a defined component.
-//! 3. No self-reference.
-//! 4. No duplicate source within one component's `sources` list.
-//! 5. No cycles.
-//! 6. Arity per kind (listener: no sources; transform/sink: at least one).
-//! 7. Every non-sink component has at least one consumer.
-//! 8. Kind is implemented.
-//! 9. No zero-length `interval` on a kind that has one.
-//! 10. A `kv_metrics` with counters, gauges, and distributions all empty is rejected -- it can
-//!     only ever be a no-op, the same silent-black-hole failure rule 7 exists to catch.
-//! 11. A `kv_metrics` distribution entry with no `field` is rejected -- a distribution of nothing
-//!     is meaningless (`docs/adr/kv-metrics-semantics.md`).
-//! 12. A `kv_metrics` counter, gauge, or distribution entry with an empty `name` is rejected -- the
-//!     implemented `influxdb_out` sink can't encode a metric with no measurement name (Influx line
-//!     protocol requires one), so this must be caught here rather than surfacing as a runtime sink
-//!     failure the first time such an event arrives.
-//! 13. At most one `internal` component -- two would each drain (and so split) the same
-//!     process-wide telemetry `Registry`, silently halving whichever one a downstream consumer
-//!     happened not to be reading from rather than failing clearly.
-//! 14. A non-default `buffer:` block on a non-sink component is rejected -- `buffer:`
-//!     (`docs/adr/buffered-sink-delivery.md`) configures a sink's delivery queue, which only a
-//!     sink has, so a listener or transform carrying one is almost certainly a misplaced block
-//!     rather than a meaningful setting silently ignored.
-//! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0` is rejected -- an impossible
-//!     bound (no batch could ever be queued) rather than a small one.
-//! 16. `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config error, not
-//!     something to clamp silently.
-//! 17. A non-default `receive:` block is rejected on any kind that is not a datagram listener
-//!     (today `collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in` under `transport: udp`),
-//!     a **stream listener** (`syslog_in`/`graphite_in`/`statsd_in` under `transport: tcp`), or a
-//!     tail listener (`tail_in`/`docker_in`) -- `receive:` (`docs/adr/decoupled-listener-io.md`)
-//!     configures a listener's receive-side batch assembly, and a datagram listener's socket-side
-//!     receive queue on top of that. Neither a tail listener (the tailed file is its own durable
-//!     buffer) nor a stream listener (the connection's own flow control is the backpressure, ADRs
-//!     `syslog-tcp-ingress-and-tls` and `graphite-carbon-relay`) has such a queue, so either may
-//!     only set `receive`'s batch-assembly/shutdown-grace fields -- a queue-bounding field
-//!     (`max_datagrams`, `max_bytes`, `overflow`, `receive_buffer_bytes`), or `read_batch` (which
-//!     sizes one `recvmmsg(2)` read and the matching `pop_many` off that same queue), is rejected
-//!     by name on one. Deliberately **not** `role(&kind) != Role::Listener`: `internal` and `generate_in`
-//!     are listeners by role but have no socket, no queue, and no decoder, so `receive:` on
-//!     either would be a silently-ignored setting -- exactly what this rule exists to catch on
-//!     the sink side (rule 14). A future listener kind rejects `receive:` until it is actually
-//!     wired to one of these three drivers.
-//! 18. A datagram listener's `receive.max_datagrams`, `receive.max_bytes` or `receive.read_batch`
-//!     of `0` is rejected; a datagram, stream or tail listener's `receive.batch_max_events` or
-//!     `receive.batch_max_bytes` of `0` is rejected -- each an impossible bound, the twin of rule
-//!     15. `receive.batch_flush_interval: 0s` is **not** rejected: it means "no flush timer," a
-//!     meaningful setting, unlike the count bounds. Rule 57 owns `read_batch`'s upper end.
-//! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name is rejected
-//!     -- it could never name a real attribute, so that lookup can only ever be a no-op, the same
-//!     reasoning rules 10-12 already apply to `kv_metrics`/`set` (`null`, not `""`, is how an
-//!     optional lookup is disabled).
-//! 20. A `scale` with an empty `fields` map, an empty field name, or a non-finite factor is
-//!     rejected (`docs/adr/scale-transform.md`).
-//! 21. An empty `signals:` list on `has_signal`, `keep_signals`, or `drop_signals` is rejected.
-//!     `keep_signals`/`drop_signals` additionally reject naming all three signals. Which of the
-//!     two shapes is the silent black hole (rule 7's "no consumer" failure, recast here as "no
-//!     event ever gets through") and which is the no-op (every event forwarded untouched) is
-//!     *opposite* between the two kinds -- an allowlist naming nothing keeps nothing (black
-//!     hole), naming everything keeps everything (no-op); a denylist is the mirror. Both shapes
-//!     are rejected either way, but the error message names the right one. `keep`'s empty
-//!     `fields` list stays legal by contrast -- "drop every attribute" is a real operation,
-//!     "drop every event" is not. See `docs/adr/signal-filtering-components.md`.
-//! 22. An `otlp_out` `headers:` entry naming an empty string, an HTTP/2 pseudo-header (starting
-//!     with `:`), any `grpc-*` header, or another header the wire transport itself sets
-//!     (`content-type`, etc. -- see `RESERVED_OTLP_HEADERS`) is rejected, case-insensitively --
-//!     almost certainly a config mistake, not a meaningful override. Two entries naming the same
-//!     header once case is ignored (HTTP header names are case-insensitive) are also rejected --
-//!     which value would actually be sent is otherwise undefined.
-//! 23. A non-empty `otlp_out` `paths:` under `protocol: grpc` is rejected -- gRPC method names
-//!     are fixed by the OTLP service definitions, not a mount point `paths` can move, so silently
-//!     ignoring it would be a worse failure mode than a clear error.
-//! 24. An `otlp_out` `tls:` block must be internally consistent (`cert_file`/`key_file`
-//!     together, no `insecure_skip_verify` alongside `ca_file`) and is rejected under a
-//!     non-`https://` endpoint, where it would have no effect
-//!     (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
-//! 25. A `trace_context` `span:` block with an empty `name` (OTLP requires a span name) or a
-//!     `max_skew` of `0s` (an impossible window -- every span would be rejected as skewed) is
-//!     rejected (`docs/adr/trace-context-span-lifting.md`).
-//! 26. A `tail_in` with an empty `paths`, an empty `paths` entry, or a `*` outside the final
-//!     path component is rejected (`docs/adr/file-tailing-and-docker-json-logs.md`).
-//! 27. A `docker_in` with an empty `containers` and no `discover: true`, an empty `containers`/
-//!     `labels` entry, a duplicate `containers` entry, or an empty `root` is rejected
-//!     (`docs/adr/file-tailing-and-docker-json-logs.md`).
-//! 28. A `tail_in`/`docker_in` with a `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
-//!     of `0` is rejected -- each would busy-loop, thrash the checkpoint file, or drop every
-//!     line, the same "0 is impossible" reasoning as rule 9.
-//! 29. A `kv` with an empty `pair_sep` or `kv_sep`, with `pair_sep == kv_sep`, or with a `kv_sep`
-//!     that *contains* `pair_sep`, is rejected. An empty separator makes splitting yield a
-//!     boundary between every character; identical separators mean every segment is split away
-//!     from its own separator, so no line could ever produce a pair; and a `kv_sep` containing
-//!     `pair_sep` can never appear intact inside a segment, since the `pair_sep` split runs
-//!     first -- each is a certain no-op or a certain garbage result, catchable at `logit
-//!     validate` time.
-//! 30. A `regex` `pattern` that doesn't compile, or that declares no named capture group, is
-//!     rejected -- and so is an empty `field` name. The pattern is compiled here, not deferred
-//!     to `build_spec`, so an invalid one is a `logit validate` error rather than a run-time
-//!     surprise. The compiled `Regex` is then dropped and rebuilt in `build_spec`, matching how
-//!     every other kind re-derives from its raw `ComponentKind` -- one `Regex::new` at process
-//!     start is not worth inventing a mechanism for. A pattern with no named group could only
-//!     ever be a no-op; an empty `field` name could never match a real attribute. A duplicate
-//!     capture-group name needs no separate check -- the `regex` crate rejects it at compile
-//!     time already.
-//! 31. A `csv` with an empty `columns` list, an empty column name, or a duplicate column name is
-//!     rejected, as is a `delimiter` that is `"` (RFC 4180's quote character), `\n`/`\r`
-//!     (already consumed as line framing by every input), or non-ASCII. The empty-list and
-//!     empty-name clauses are the "can only ever be a no-op" rule again; the duplicate clause is
-//!     the "a repeated entry silently doubles rather than erroring" rule applied to columns
-//!     instead of sources.
+//! # Validation rules
 //!
-//! (Numbers 32-38 belong to other components' rules that landed after this list's numbering
-//! already drifted from the code, per the note on rule 12 above -- left unnumbered here rather
-//! than renumbered, so a rule referenced elsewhere by its own PR keeps the number it was given
-//! there.)
+//! This list is canonical; `docs/design/pipeline-graph.md`'s "Validation" section mirrors it. Each
+//! rule is enforced at its `// Rule N` label in [`resolve`], or in the helper its entry names. The
+//! numbers are identifiers, not execution order: [`resolve`] runs its checks in source order, which
+//! interleaves them (49's first clause runs inside 6 and 50 inside 7; 47, 51, 48, and 49's last
+//! clause right after 7; 26-28 before 19; 52 after 44; 53 between 45 and 46). A new rule takes the
+//! next number.
 //!
-//! 39. An `aggregate` with `temporality: cumulative` requires `series_retention >= 1` (a count of
-//!     windows) and `max_retained_series >= 1` -- either at `0` means no accumulator survives a
-//!     flush, so every window would emit its own increment labelled a cumulative total, silently
-//!     wrong for the consumer that mode exists for. `series_retention: 0` stays legal under the
-//!     default `temporality: delta` (`docs/adr/aggregation-window-semantics.md`'s cumulative
-//!     amendment).
-//! 40. A **scrape-mode** `prometheus_in`'s scrape settings. Every check here is a statement about
-//!     an outbound scrape, so the whole rule is gated on a non-empty `scrape_targets` and says
-//!     nothing at all about a `bind:` receiver; rule 55 owns the mode itself, including the case
-//!     where neither mode is configured. Each `scrape_targets` entry must parse as an absolute
-//!     `http://`/`https://` URL with a non-empty authority -- `logit-pipeline` doesn't
-//!     depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s crate layout), so this is a
-//!     small hand-rolled scheme/authority check, not a real URL parse. A `scrape_tls:` block must
-//!     be internally consistent -- `cert_file`/`key_file` set together, no `insecure_skip_verify`
-//!     alongside `ca_file` -- the same two checks rule 24 makes for `otlp_out`'s own `tls:` block
-//!     (and rule 34 for `logit_out`'s) -- and is rejected outright unless at least one target is
-//!     `https://` (the same "would have no effect" reasoning as rule 24's third check).
-//!     `timeout: 0s` is rejected (the same "0 is impossible" reasoning as rule 9's `interval`).
-//!     `headers` may not name a header this input sets itself (`accept`, `user-agent`, `host`,
-//!     `content-length`, `te`, `transfer-encoding`, `connection`, an empty name, or an HTTP/2
-//!     pseudo-header starting with `:`), checked case-insensitively, and no two entries may
-//!     collide once case is ignored -- the same shape rule 22 already checks for `otlp_out`.
-//! 41. A `prometheus_out` `path:` must start with `/` (a request URI's path is always absolute,
-//!     so anything else could never be scraped), and `max_series` must be >= 1 -- rule 38's
-//!     impossible-bound shape again: `0` would evict every series the instant it arrived
+//! One principle recurs, cited by number: a config that can only be a no-op, a black hole, or an
+//! impossible bound (`0` for a count or duration) is an error, and so is a setting that would be
+//! silently ignored.
+//!
+//! 1. A config with no components.
+//! 2. A `sources` id that names no defined component.
+//! 3. A component listing itself as a source: a special case of 5, with its own message.
+//! 4. A repeated id in one `sources` list: that source's `Fanout` would hold two senders into one
+//!    inbox and deliver every batch twice.
+//! 5. A cycle, through `sources` or router -> target edges: with bounded channels it deadlocks.
+//!    The error names one concrete cycle, never a component merely downstream of it.
+//! 6. Wrong arity for the kind's [`Role`]: a listener or `target` with `sources`, a transform or
+//!    sink without, or a sink named as another component's source.
+//! 7. A non-sink component with no consumer: it would run for nothing (50 exempts routers).
+//! 8. A kind `is_implemented` doesn't list.
+//! 9. A zero `interval` on a kind that has one (the `interval` fn's table): it would flush
+//!    continuously.
+//! 10. A `kv_metrics` with `counters`, `gauges`, and `distributions` all empty: a no-op.
+//! 11. A `kv_metrics` distribution with no `field`, or any entry with an empty `name`: a
+//!     distribution of nothing is meaningless, and `influxdb_out` can't encode a nameless metric
+//!     (`docs/adr/kv-metrics-semantics.md`).
+//! 12. A `set` with neither `resource` nor `attributes`, or an empty key in either: a no-op, or a
+//!     key that could never name a real attribute, so `has_attributes` (36), which shares `set`'s
+//!     config shape, never meets a key `set` stamped that its own rule rejects
+//!     (`docs/adr/operator-declared-resource-attributes.md`).
+//! 13. More than one `internal`: each would drain, and so split, the one process-wide telemetry
+//!     registry.
+//! 14. A non-default `buffer:` on a non-sink: only a sink has a delivery queue
+//!     (`docs/adr/buffered-sink-delivery.md`).
+//! 15. A sink's `buffer.max_batches` or `buffer.max_bytes` of `0`: no batch could ever be queued.
+//! 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`: a typo, not a value
+//!     to clamp (NaN would keep every span).
+//! 17. A non-default `receive:` outside a datagram, stream, or tail listener (explicit predicates,
+//!     not [`Role`], so `internal`/`generate_in` are rejected too); on a stream or tail listener,
+//!     which has no receive queue, a queue field or `read_batch`, by name.
+//! 18. A `receive.max_datagrams`/`max_bytes`/`read_batch` (datagram listeners) or
+//!     `batch_max_events`/`batch_max_bytes` (all three drivers) of `0`. `batch_flush_interval: 0s`
+//!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end.
+//! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name: it could never
+//!     match an attribute (`null`, not `""`, disables an optional lookup)
+//!     (`docs/adr/log-record-trace-context.md`).
+//! 20. A `scale` with no `fields`, an empty field name, or a non-finite factor
+//!     (`docs/adr/scale-transform.md`).
+//! 21. An empty `signals:` on `has_signal`/`keep_signals`/`drop_signals`, or all three signals on
+//!     `keep_signals`/`drop_signals`. Which shape is the black hole and which the no-op is
+//!     opposite between those two, so each message names the right one
+//!     (`docs/adr/signal-filtering-components.md`).
+//! 22. An `otlp_out` `headers:` name that is empty, `:`-prefixed, `grpc-*`, in
+//!     `RESERVED_OTLP_HEADERS`, or a case-insensitive duplicate: the transport sets those itself,
+//!     and which duplicate is sent is undefined.
+//! 23. A non-empty `otlp_out` `paths:` under `protocol: grpc`: gRPC method names are fixed by the
+//!     OTLP service definitions.
+//! 24. An `otlp_out` `tls:` with one of `cert_file`/`key_file` alone, with `insecure_skip_verify`
+//!     and `ca_file` together, or under a non-`https://` endpoint, where the scheme selects TLS and
+//!     the block would do nothing (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
+//! 25. A `trace_context` `span:` with an empty `name` (OTLP requires one) or a `max_skew` of `0s`
+//!     (every span would be skewed) (`docs/adr/trace-context-span-lifting.md`).
+//! 26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component,
+//!     which the tail matcher never expands (`check_tail_glob`).
+//! 27. A `docker_in` with no `containers` and no `discover: true` (it would tail nothing), an empty
+//!     `containers`/`labels` entry, a duplicate `containers` entry, or an empty `root`.
+//! 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`:
+//!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
+//!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
+//! 29. A `file_out` whose `rotate:` sets neither `max_bytes` nor `interval` (use `stdio_out` for an
+//!     unrotated file), or a `rotate.max_bytes`/`max_files` of `0`
+//!     (`docs/adr/rotating-file-output.md`).
+//! 30. A `kv` with an empty `pair_sep`/`kv_sep`, `pair_sep == kv_sep`, or a `kv_sep` containing
+//!     `pair_sep`: since `pair_sep` splits first, each is a certain no-op or garbage
+//!     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule: its one field is a `bool`.
+//! 31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named
+//!     capture group. Compiling here makes a bad pattern a `logit validate` error
+//!     (`docs/adr/regex-transform.md`).
+//! 32. A `csv` with no `columns`, an empty column name, a duplicate one (the later would overwrite
+//!     the earlier), or a `delimiter` that is `"`, `\n`, `\r`, or non-ASCII
+//!     (`docs/adr/csv-positional-columns.md`).
+//! 33. A `stdio_out`/`file_out` `compression:` other than `none` outside `format: native`, where it
+//!     would do nothing (`docs/adr/file-output-native-format.md`).
+//! 34. A `logit_out` `tls:` failing 24's two consistency checks (no scheme check: the endpoint is a
+//!     bare `host:port`); a `logit_in` `max_frame_bytes` of `0` or above
+//!     `MAX_SANE_UNCOMPRESSED_LEN`, which the frame reader enforces regardless.
+//! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`/`max_bytes` (disk replaces
+//!     them), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
+//!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md`).
+//! 36. A `has_attributes`/`drop_attributes` with nothing configured, an empty key, or a non-finite
+//!     value. Zero pairs match vacuously, so `has_*` is the no-op and `drop_*` the black hole, the
+//!     inverse of 21 (`docs/adr/attribute-filtering-components.md`).
+//! 37. A `has_provenance`/`drop_provenance` with neither `origin` nor `previous`, or an empty or
+//!     repeated entry. Oriented like 36, not 21: an empty field is left out of the match
+//!     (`docs/adr/provenance-filtering-components.md`).
+//! 38. A `statsd_out`/`collectd_out`/`graphite_out` `max_packet_bytes` of `0`, and a `collectd_out`
+//!     value outside `1024..=65535`: above it every send fails `EMSGSIZE` while reporting success
+//!     (`docs/adr/collectd-binary-relay.md`).
+//! 39. A `temporality: cumulative` `aggregate` with `series_retention` or `max_retained_series` of
+//!     `0`: nothing survives a flush, so each window's increment would be labeled a running total
+//!     (`docs/adr/aggregation-window-semantics.md`).
+//! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
+//!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
+//!     `https://` target, or 22's header faults against `RESERVED_PROMETHEUS_HEADERS`.
+//! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
+//!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
-//! 42. A `generate_in`'s bounds and templates. `count`, `batch`, and `rate` must each be at
-//!     least 1 where set -- `0` generates nothing at all, the impossible bound of rules
-//!     9/15/18/38 rather than a small one, and omitting `count`/`rate` is already how
-//!     "unbounded"/"unthrottled" is spelled. A `metric` must carry a non-empty `name` and a
-//!     finite `value`. No `event.attributes` or `resource` key may be empty. And every template
-//!     string -- `event.log`, every `event.attributes` value, every `resource` value, and
-//!     `event.metric.name` -- must parse as a `logit_core::template` and may name only the
-//!     placeholders `generate_in` actually substitutes: `seq`, or `seq%N` with `N >= 1`. An
-//!     unknown placeholder is rejected here rather than rendered literally or as nothing: a
-//!     mistyped `{seg}` would otherwise silently collapse a scenario's intended cardinality to a
-//!     single series, which is the difference between measuring an aggregation window and
-//!     measuring nothing. `event.metric.name` is narrower still -- only `{seq%N}`, never a bare
-//!     `{seq}`: a metric name is *interned*, and `logit_core::interner` never removes a `Symbol`,
-//!     so an unbounded name would intern a fresh one per generated event (a process-lifetime
-//!     leak, not a cardinality knob). The var-name check lives in `generate_var_is_valid` so that
-//!     `logit-inputs`' own `compile` resolver can mirror it exactly without depending on
-//!     `logit-config` (`docs/design/pipeline-graph.md`'s crate layout). `receive:` on a
-//!     `generate_in` is rejected by rule 17's own allowlist -- it is a listener by role, with no
-//!     socket, queue, or decoder for `receive:` to configure (`docs/plans/load-test-harness.md`).
-//! 43. A listener with a `tls:` block must be on a stream transport -- `transport: tcp` on a
-//!     `syslog_in`, a `graphite_in` or a `statsd_in`. TLS is defined over a reliable ordered byte
-//!     stream, and DTLS, its datagram sibling, is out of scope throughout this project (RFC 6012
-//!     for syslog, `docs/adr/syslog-tcp-ingress-and-tls.md`; neither carbon nor statsd has a DTLS
-//!     receiver at all) -- so a
-//!     `tls:` block under `transport: udp` could never take effect. Rejected rather than ignored,
-//!     the same call rule 22 makes for a `tls:` block under a plaintext `otlp_out` endpoint: an
-//!     operator who wrote one meant the connection encrypted, and running it in the clear anyway
-//!     is the worst of the available outcomes.
-//! 44. A `syslog_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
-//!     together, no `insecure_skip_verify` alongside `ca_file` -- the same two checks rule 34
-//!     makes for `logit_out`'s own `tls:`, and for the same reason: both sinks dial a bare
-//!     `host:port` where `tls:`'s mere presence is the only "TLS is wanted" signal there is.
-//!     Plus one check of its own: `tls:` together with `transport: udp` is rejected. Syslog over
-//!     TLS is RFC 5425, which is TLS over TCP; DTLS is out of scope
-//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`), so silently ignoring the block would leave an
-//!     operator who asked for encryption on a plaintext datagram socket.
-//! 45. Every TCP listener's `handshake_timeout` must be greater than `0s`, and a *non-default*
-//!     value is rejected where nothing could consult it -- on a UDP `syslog_in`, `graphite_in` or
-//!     `statsd_in`, none of which has a connection to hand shake. `0s` is an impossible budget, not a tight
-//!     one -- rules 9/15/18/28's call again -- and set-but-ignored is rule 33's shape for an "only
-//!     means anything under X" field (`docs/adr/syslog-tcp-ingress-and-tls.md`).
-//! 46. A `graphite_in`'s and a `graphite_out`'s protocol/transport combination and size bounds
-//!     (`docs/adr/graphite-carbon-relay.md`). `protocol: pickle` requires `transport: tcp` on
-//!     both kinds: carbon's pickle wire is a 4-byte big-endian length prefix around each batch
-//!     (Twisted's `Int32StringReceiver`), which has no meaning in a datagram that already
-//!     delimits itself, so the combination could only ever mis-frame rather than work slightly
-//!     worse. A zero `max_line_bytes` (`graphite_in`, plaintext+tcp), `max_frame_bytes` (either
-//!     kind, pickle), or `connect_timeout` (`graphite_out`, tcp) is rejected -- the impossible
-//!     bound of rules 9/15/18/38 again: `max_line_bytes: 0` would drain every byte as one endless
-//!     oversize line; `max_frame_bytes: 0` could never fit even carbon's own two-opcode empty-list
-//!     pickle frame; `connect_timeout: 0s` could never establish a TCP connection at all.
-//!     `max_frame_bytes` is additionally bounded to `1024..=16 MiB` on both kinds: below 1024 no
-//!     real carbon batch fits, and above 16 MiB one frame's declared length is a bigger
-//!     allocation than any sender has a reason to ask for -- the same "a bound above what the
-//!     transport can honestly carry is a silent failure, not a generous setting" reasoning rule
-//!     38 applies to `collectd_out`'s `MaxPacketSize` range.
-//! 47. A non-empty `targets:` is legal only on a `lua`/`lua_file` component
-//!     (`docs/adr/target-components.md`). On any other kind it is rejected by name -- rule 14's
-//!     shape: a `route` declares its targets through `routes:`' values, and no other kind has any
-//!     way to direct an event anywhere, so a set-but-ignored list is a config error rather than a
-//!     setting silently doing nothing.
-//! 48. Every id in [`targets_of`] -- a `lua`/`lua_file`'s `targets:` entries, a `route`'s
-//!     `routes:` values -- must resolve to a defined component, must not be the router itself, and
-//!     must name a `target` kind: a router may never direct at an ordinary component, which would
-//!     be a `sources:` entry written on the wrong side of the edge (the inversion
-//!     `docs/adr/component-graph-configuration.md`'s "named outlets" rejection was about), so the
-//!     message says so. A `lua`/`lua_file` `targets:` list may not repeat an id -- rule 4's
-//!     reasoning, one hop over: two `Fanout`s into the same target would deliver every routed
-//!     batch to it twice. A `route` mapping several `routes:` values onto one target is legal by
-//!     contrast and collapses to one slot -- that is the many-to-one the kind exists for. Rule
-//!     51's `routes:` shape checks deliberately run *before* this rule, so an empty `routes:`
-//!     value is reported as the empty value it is rather than as an unresolved target id.
-//! 49. A `target` declares no `sources` -- it is fed by direction, from a router that names it,
-//!     never by naming anything itself (checked in rule 6's own arity match, where the rest of
-//!     the table lives). Rule 7 still requires it to have at least one consumer, and it must also
-//!     be directed to by at least one router: rule 7's mirror, since a target nothing routes to
-//!     is the same black hole seen from the other end -- its consumers would wait on it forever.
-//! 50. Rule 7 is relaxed for routers only: a component with a non-empty [`targets_of`] is exempt
-//!     from the "no consumers" rejection. A router's ordinary consumers are where its *unrouted*
-//!     events go, so a router without any is a legal config -- those events are dropped and
-//!     counted (`logit.component.events.dropped{reason="unrouted"}`), never silently
-//!     (`docs/adr/target-components.md`).
-//! 51. A `route` needs a non-empty `routes:` map -- an empty one can only ever be a no-op, rules
-//!     10/20's reasoning -- with no empty key (it could never match a real value) and no empty
-//!     value (it could never name a real target), and, under `by: {attribute: k}`/
-//!     `{resource: k}`, a non-empty `k`: rule 19/20's empty-field-name rejection, applied to the
-//!     one key a `route` reads per event.
-//! 52. A `statsd_out` `tls:` block must be internally consistent -- `cert_file`/`key_file` set
-//!     together, no `insecure_skip_verify` alongside `ca_file` -- rule 44's three checks with its
-//!     messages verbatim, since this sink dials the same bare `host:port` where `tls:`'s mere
-//!     presence is the only "TLS is wanted" signal there is. Plus that rule's own third check:
-//!     `tls:` together with `transport: udp` is rejected, since DTLS is out of scope here too
-//!     (`docs/adr/statsd-output.md`'s TLS amendment). One rule per *sink* (24/34/44/52), unlike
-//!     rule 43's one-rule-for-every-listener, because each sink also checks its own `tls:`
-//!     internals.
-//! 53. A TCP listener's `idle_timeout`, where set, must be greater than `0s`, and must not be set
-//!     at all on a UDP `syslog_in`, `graphite_in` or `statsd_in`, which have no connection to time
-//!     out (`docs/adr/idle-connection-timeout.md`). One rule over all six kinds that carry the
-//!     field -- `syslog_in`, `graphite_in`, `statsd_in`, `logit_in`, `otlp_in` and
-//!     `prometheus_in` (whose `bind:` receiver is the field's sixth listener; a *scrape*-mode
-//!     `prometheus_in` has no connection either, but that is rule 55's wrong-mode check rather
-//!     than this rule's wrong-transport one) -- rule 43's
-//!     one-rule-for-every-listener shape rather than one number per kind; every kind's arm landed
-//!     in the same PR that made that listener honour the field, so no landed state ever accepted a
-//!     set-but-ignored `idle_timeout`. `0s` is rules 9/15/18/28/45's
-//!     impossible bound again: it would close every connection the instant the listener stopped
-//!     reading from it. Unlike rule 45's field this one is an `Option` with no default to tell
-//!     apart from a set value, so there is nothing to compare against and the message says what to
-//!     do instead -- omit the field to disable the idle timeout.
-//! 54. `keep_values`-specific validation (`docs/adr/value-allowlist-cardinality-clamp.md`): both
-//!     `resource`/`attributes` maps empty is rejected, the same "can only ever be a no-op"
-//!     instinct as rule 12; an empty field name in either map is rejected, rule 19/20's reasoning;
-//!     an empty `allow` list on a field is rejected, naming `set`/`remove` as what "clamp
-//!     everything on this field" already means; a non-finite `F64` in `allow`/`other` is rejected,
-//!     rule 36's finiteness reasoning; a `Str` literal in `allow`/`other` that isn't already
-//!     ASCII-lowercase under that field's `normalize: [lower]` is rejected, naming the field and
-//!     the literal, since it could never match anything that step could produce; and a duplicate
-//!     step within one field's `normalize:` list is rejected, the same no-op reasoning again. An
-//!     empty `normalize:` list is not rejected -- it's the default, meaning no normalization.
-//! 55. A `prometheus_in` is in exactly one mode, and every field belongs to the mode it is written
-//!     under ([ADR `prometheus-remote-write`](../../../docs/adr/prometheus-remote-write.md)).
-//!     `scrape_targets:` (non-empty) is a scrape client; `bind:` is a remote-write receiver.
-//!     Both together is two components' worth of config in one, and neither is a listener that
-//!     could never produce an event -- rules 7/12's "can only ever be a no-op" instinct, answered
-//!     with a message instead of a process that starts up listening on nothing. Then: a
-//!     non-default `interval`, `timeout`, `headers` or `scrape_tls` alongside `bind:` is rejected
-//!     (a receiver performs no scrape), and a non-default `path`, `bind_tls` or `idle_timeout`
-//!     alongside `scrape_targets:` is rejected (a scrape client binds nothing) -- rule 45's and
-//!     rule 53's shape one kind over, for their reason: a setting silently doing nothing is worse
-//!     than a startup failure naming it. A non-default `metadata_cache` alongside
-//!     `scrape_targets:` joins that second list: it configures what the *receiver* remembers about
-//!     metric types between requests, and a scrape client reads a `# TYPE` line in every response.
-//!     Only *non-default* values are rejected, which is also what lets `interval` keep its default
-//!     in bind mode and so keeps rule 9's `interval: 0s` rejection satisfied there with no
-//!     mode-specific carve-out. In bind mode the `path` itself must also start with `/` -- rule
-//!     41's check for `prometheus_out`, for its reason: a request URI's path is always absolute, so
-//!     a relative or empty one could never match and every write would `404` against a listener
-//!     that looks configured -- and `metadata_cache.ttl` must be greater than `0s`, rule 9's
-//!     zero-interval reasoning: an entry that expires the instant it is written is a cache that
-//!     does nothing while still sweeping on every request, and `max_families: 0` is the spelling
-//!     for turning it off -- which is why that pairing, where the `ttl` governs nothing at all, is
-//!     the one case the zero check lets through.
-//! 56. `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`): exactly one of
-//!     `bind:` (serve an exposition) and `endpoint:` (write to a remote-write receiver), never
-//!     both and never neither. A **non-default** field belonging to the mode that isn't set is an
-//!     error rather than a silent no-op -- `path`/`expire_after`/`max_series` under `endpoint:`,
-//!     `version`/`timeout`/`headers`/`endpoint_tls` under `bind:` -- rules 45/53's shape, for
-//!     their reason: a setting that quietly does nothing is worse than a startup failure naming
-//!     it. Compared against `logit_config`'s own `default_prometheus_*` functions, imported the
-//!     way rule 45 imports `default_handshake_timeout`, so a default that moves can't leave this
-//!     rule disagreeing with it. Rule 41's `path`/`max_series` checks become registry-mode-only
-//!     for the same reason -- two rules, one gate each. In sender mode the rest is rule 40's own
-//!     shape restated against this kind's fields: `endpoint` must be an absolute `http://`/
-//!     `https://` URL (path included -- the receiver's write path lives there, not in `path:`),
-//!     `timeout: 0s` is rejected, `headers` may not be empty-named, `:`-prefixed, case-colliding,
-//!     or name one of [`RESERVED_REMOTE_WRITE_HEADERS`], the `endpoint_tls:` block must be
-//!     internally consistent (rules 24/34/44/52's two checks, since this is a *sink*'s own TLS
-//!     block), and a non-default `endpoint_tls:` under a plain `http://` endpoint is rejected --
-//!     a *scheme* check, exactly rule 40's third TLS check, since TLS is selected by the
-//!     endpoint's own scheme and a block under `http://` could only ever be ignored.
-//! 57. A datagram listener's `receive.read_batch` above `1024` is rejected
-//!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
-//!     `vlen`, and `1024` is `UIO_MAXIOV`'s number -- but the ceiling is `logit`'s, not the
-//!     kernel's: `do_recvmmsg` clamps no `vlen` at all (`UIO_MAXIOV` bounds `msg_iovlen` within
-//!     one `msghdr`, which the read path sets to 1). What it bounds is the per-listener receive
-//!     slab and the shutdown-path loss, both of which grow linearly with it. Rule 18 owns
-//!     the `0` end. A `read_batch` *larger than* `max_datagrams` is deliberately legal: `push_many`
-//!     has a defined answer for a batch bigger than the whole queue, so a rule against it would
-//!     only refuse a configuration that works.
-//! 58. A `shape`'s `max_tracked_keys` or `max_tracked_keysets` of `0` is rejected
-//!     (`docs/adr/shape-observer-component.md`) -- rules 9/15/18/28/45's impossible-bound shape
-//!     again. A cap of `0` tracks nothing at all, so `logit.shape.distinct_keys`/
-//!     `.distinct_keysets` would read `0` and `logit.shape.tracking_overflow` `1` forever, from a
-//!     component that looks configured. There is no "turn the table off" spelling because the
-//!     cumulative gauges *are* half of what this component is for; remove the `shape` instead.
-//! 59. `flatten`-specific validation (`docs/adr/flatten-transform.md`): `attributes: none`
-//!     together with `resource: none` is rejected, rules 7/12/54's "can only ever be a no-op"
-//!     instinct again; an empty named list on either field is rejected, naming `all`/`none` as
-//!     what an operator meant instead; an empty field name within a named list is rejected, rule
-//!     19/20/54's reasoning; and a field name repeated within one named list is rejected, the same
-//!     no-op reasoning once more. `attributes: all` (the default) and a field name containing `.`
-//!     are both deliberately legal -- the former is the useful default, the latter names a literal
-//!     attribute exactly as rule 54's `keep_values` fields already may.
-//! 60. `http_access`-specific validation (`docs/adr/http-access-normalization.md`): every
-//!     `routes[].match` and `user_agent_rules[].match` must compile as a regex, rule 31's
-//!     reasoning -- a pattern `build_spec` would only discover at startup is a run-time surprise
-//!     validation exists to prevent; an empty `match`, `route`, `class`, `route_other`, or
-//!     `redact_query` entry is rejected, rules 19/20/54's reasoning (an empty `route`/`class`/
-//!     `route_other` would write an empty, meaningless label; an empty `match` matches every path
-//!     and hides every rule after it); each `routes` entry must be exactly `builtin` or
-//!     `match` + `route`, the error naming which half is missing or which extra key is present --
-//!     the reason that entry is one flat struct rather than an untagged enum; a repeated
-//!     `builtin:` set is rejected, since the second can never match anything the first didn't;
-//!     a `max_length` key must name a field in `logit_config::CAPPED_FIELDS` (the error lists
-//!     them), since a cap on a field this component never caps can only ever be a no-op, and a
-//!     limit of `0` is rejected, rules 9/15/18/58's impossible-bound shape; and `forwarded:
-//!     {trust: false}` is rejected in favour of omitting the block, so "don't trust XFF" has one
-//!     spelling. There is deliberately **no** "nothing configured" clause: a bare
-//!     `type: http_access` still coerces, caps, derives, and classifies with the built-in tables.
-//! 61. `sample`-specific validation (`docs/adr/consistent-sampling-component.md`): `rate` must be
-//!     finite and within `[0, 1]`, rule 16's reasoning; `rate: 1` is rejected (it keeps every
-//!     event, a no-op) and so is `rate: 0` without `always_keep` (it keeps nothing -- that's
-//!     `null_out`), rules 7/12/54/59's "a config that can only be a no-op is an error" -- `rate: 0`
-//!     *with* `always_keep` is the "only flagged events" mode, and allowed; an empty `key:` or
-//!     `always_keep:` field name is rejected, rules 19/20's reasoning; `always_keep` must name
-//!     exactly one of `attribute`/`resource`; a non-finite `always_keep.value` is rejected, since
-//!     it can never match anything (rules 36/54); and `missing:` without `key:` is rejected as
-//!     meaningless -- there is no key to be missing.
+//! 42. A `generate_in` `count`/`batch`/`rate` of `0`, an empty metric name or attribute/resource
+//!     key, a non-finite metric value, or a placeholder other than `{seq}`/`{seq%N}`, with only
+//!     `{seq%N}` in the interned metric name (`check_generate_template`).
+//! 43. A `tls:` on a UDP `syslog_in`/`graphite_in`/`statsd_in`: DTLS is out of scope, so it could
+//!     never take effect. One rule for every listener: a new one adds a match arm
+//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//! 44. A `syslog_out` `tls:` failing 24's two consistency checks, or under `transport: udp`, since
+//!     RFC 5425 is TLS over TCP (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//! 45. A `handshake_timeout` of `0s` on any kind that has one (either transport), or a non-default
+//!     one on a UDP `syslog_in`/`graphite_in`/`statsd_in`, which has no handshake. Compared against
+//!     `default_handshake_timeout`, so the default stays legal everywhere
+//!     (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+//! 46. A `graphite_in`/`graphite_out` `protocol: pickle` off TCP (its length prefix means nothing
+//!     in a datagram), a `max_line_bytes`/`max_frame_bytes`/`connect_timeout` of `0`, or a
+//!     `max_frame_bytes` outside `GRAPHITE_FRAME_BYTES_RANGE`
+//!     (`docs/adr/graphite-carbon-relay.md`).
+//! 47. A non-empty `targets:` on anything but `lua`/`lua_file`: a `route`'s targets are its
+//!     `routes:` values, and no other kind can direct an event (`docs/adr/target-components.md`).
+//! 48. A router target id that is unresolved, the router itself, or not a `target` (the message
+//!     names the `sources:` fix), or a repeated `lua` `targets:` id. A `route` may map many values
+//!     onto one target.
+//! 49. A `target` with `sources` (checked in 6), or one no router directs to: its consumers would
+//!     wait forever.
+//! 50. Not a rejection: 7 exempts a router, whose unrouted events are dropped and counted
+//!     (`logit.component.events.dropped{reason="unrouted"}`).
+//! 51. A `route` with no `routes:`, an empty key or value, or an empty `by:` attribute/resource
+//!     key. Runs before 48, so an empty value isn't reported as an unknown target.
+//! 52. A `statsd_out` `tls:` failing 44's three checks, messages verbatim
+//!     (`docs/adr/statsd-output.md`). Sink TLS rules are one per sink (24/34/44/52), since each
+//!     also checks its own block.
+//! 53. An `idle_timeout` of `0s` (omit it to disable), or any `idle_timeout` on a UDP
+//!     `syslog_in`/`graphite_in`/`statsd_in`. It's an `Option`, so there is no default to exempt
+//!     (`docs/adr/idle-connection-timeout.md`).
+//! 54. A `keep_values` with nothing configured, an empty field name, an empty `allow` (that's
+//!     `set`/`remove`), a non-finite literal, a non-lowercase `Str` under `normalize: [lower]`, or
+//!     a repeated `normalize` step (`docs/adr/value-allowlist-cardinality-clamp.md`).
+//! 55. A `prometheus_in` with both or neither of `scrape_targets`/`bind`, a non-default field of
+//!     the other mode, a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
+//!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`).
+//! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
+//!     other mode, or a sender fault in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a
+//!     reserved or colliding header, or a bad `endpoint_tls`
+//!     (`docs/adr/prometheus-remote-write.md`).
+//! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
+//!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
+//!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
+//! 58. A `shape` `max_tracked_keys`/`max_tracked_keysets` of `0`: nothing would be tracked, and
+//!     there is no "table off" spelling; remove the component instead
+//!     (`docs/adr/shape-observer-component.md`).
+//! 59. A `flatten` with `attributes: none` and `resource: none`, an empty named list (write
+//!     `none` or `all`), or an empty or repeated field name (`docs/adr/flatten-transform.md`).
+//! 60. An `http_access` `match` that is empty or invalid, an empty `route`/`class`/`route_other`/
+//!     `redact_query`, a `routes` entry not `builtin` xor `match` + `route`, a repeated `builtin`,
+//!     a bad `max_length`, or `forwarded: {trust: false}`
+//!     (`docs/adr/http-access-normalization.md`).
+//! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
+//!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
+//!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
 //!
-//! Deliberately not validated: that a `by: {provenance: ..}` route key names a component in
-//! *this* graph -- rule 37's reasoning; the key is as likely to name a component relayed from
-//! another process.
+//! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
+//! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
+//! "drop every attribute" is a real operation, unlike 21's "drop every event".
 //!
-//! Sink reachability from a listener needs no separate rule -- it's implied by 2 + 5 + 7: every
-//! acyclic chain of sourced components terminates somewhere, and every non-terminal component in
-//! it is required (by 7) to have a consumer, so the chain can only terminate at a sink.
+//! Sink reachability needs no rule: by 2 + 5 + 7, every acyclic chain ends, and only at a sink.
 
 use logit_config::{
     default_handshake_timeout, default_prometheus_scrape_interval,
@@ -373,13 +188,10 @@ use logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
-/// Rule 46's bound on a `graphite_in`/`graphite_out` `max_frame_bytes`. The lower end is the
-/// smallest frame a real carbon pickle batch fits in; the upper is 16 MiB, past which a frame's
-/// *declared* length is a larger allocation than any sender has a reason to ask for -- the same
-/// shape rule 38 gives `collectd_out`'s `MaxPacketSize` range. The default
-/// (`logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES`, Twisted's own `MAX_LENGTH`) sits at 1 MiB,
-/// comfortably inside it. A module-level const (rather than a literal at each of the two call
-/// sites) so both kinds' checks are provably the same range.
+/// Rule 46's bound on a `graphite_in`/`graphite_out` `max_frame_bytes`. Below 1024 no real carbon
+/// pickle batch fits; above 16 MiB a frame's *declared* length is a larger allocation than any
+/// sender has reason to ask for. The default (`logit_proto::graphite::DEFAULT_MAX_FRAME_BYTES`,
+/// Twisted's `MAX_LENGTH`, 1 MiB) sits inside. One const, so both kinds check the same range.
 const GRAPHITE_FRAME_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1024..=16 * 1024 * 1024;
 
 /// A component's arity class, fixed by its `kind` (`docs/design/pipeline-graph.md`'s arity
@@ -395,8 +207,8 @@ pub enum Role {
 }
 
 impl Role {
-    /// A stable, lowercase name for this role -- used to stamp `logit.component.*` telemetry
-    /// points with which arity class produced them (`docs/design/internal-telemetry.md`).
+    /// A stable, lowercase name for this role, stamped on `logit.component.*` telemetry points
+    /// (`docs/design/internal-telemetry.md`).
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Listener => "listener",
@@ -407,9 +219,8 @@ impl Role {
     }
 }
 
-/// The arity class a kind belongs to. Public so `logit graph` (`logit-cli`) can style nodes by
-/// role directly off a `Config`, without needing a fully-resolved `Graph` -- useful precisely
-/// because it lets `logit graph` render *something* even for a config that fails validation
+/// The arity class a kind belongs to. Public so `logit graph` (`logit-cli`) can style nodes
+/// straight off a `Config`, and so render even a config that fails validation
 /// (`docs/design/pipeline-graph.md`'s "`logit graph`" section).
 pub fn role(kind: &ComponentKind) -> Role {
     use ComponentKind::*;
@@ -467,13 +278,10 @@ pub fn role(kind: &ComponentKind) -> Role {
     }
 }
 
-/// A stable, human-readable name for this kind -- exactly the config `type` tag it deserializes
-/// from. Not derived from `Serialize` (that would round-trip a whole `Component`, not just name a
-/// variant) -- alongside [`role`], this is the one other place that must be kept in sync with a
-/// new `ComponentKind` variant landing ("the kind already knows its own arity",
-/// `docs/design/pipeline-graph.md`, extended here to naming). Used to stamp `logit.component.*`
-/// telemetry points with which kind produced them (`docs/design/internal-telemetry.md`) --
-/// `logit-cli::pipeline::build_spec` is the one caller.
+/// The config `type` tag this kind deserializes from, stamped on `logit.component.*` telemetry
+/// points (`docs/design/internal-telemetry.md`). Hand-written rather than derived from `Serialize`,
+/// which would round-trip a whole `Component`; like [`role`] and `is_implemented`, it needs an arm
+/// for every new `ComponentKind` variant.
 pub fn kind_name(kind: &ComponentKind) -> &'static str {
     use ComponentKind::*;
     match kind {
@@ -530,16 +338,14 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
     }
 }
 
-/// Every router -> target edge one component declares, paired with the route key that produced it
-/// (`None` for a `lua`/`lua_file` `targets:` entry, which has no key -- the key lives in the
-/// script, on `event:to("..")`). Duplicates are preserved: this is the *edge* list, where
-/// [`targets_of`] is the slot list, so a `route` mapping two values onto one target appears here
-/// twice and there once. Every other kind declares no target edges at all -- a non-empty
-/// `targets:` on one is rejected by rule 47 rather than silently honored here.
+/// Every router -> target edge one component declares, with the route key that produced it (`None`
+/// for a `lua`/`lua_file` `targets:` entry, whose key is the script's `event:to("..")`). Keeps
+/// duplicates: this is the *edge* list, where [`targets_of`] is the slot list, so a `route` mapping
+/// two values onto one target appears here twice and there once. Any other kind has no edges; rule
+/// 47 rejects `targets:` on one.
 ///
-/// Public for the same reason [`role`] is: `logit graph` (`logit-cli`'s `dot.rs`) renders these
-/// edges straight off a raw `Config`, without a resolved [`Graph`]
-/// (`docs/design/pipeline-graph.md`'s "`logit graph`" section).
+/// Public for the same reason as [`role`]: `logit graph` (`logit-cli`'s `dot.rs`) renders these
+/// edges off a raw `Config`.
 pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
     match &component.kind {
         ComponentKind::Route { routes, .. } => {
@@ -552,18 +358,15 @@ pub fn target_edges(component: &Component) -> Vec<(Option<&str>, &str)> {
     }
 }
 
-/// The slot-ordered, de-duplicated list of `target` ids one component directs events into: a
-/// `route`'s `routes:` values in map (key) order with the first occurrence of each winning, a
-/// `lua`/`lua_file`'s `targets:` as written, and nothing at all for every other kind. This order
-/// is what a router's slot index *means* everywhere downstream -- the `Vec<Fanout>` the node
-/// runtime hands a router, and the name -> slot table a Lua worker resolves `event:to("..")`
-/// against (`docs/adr/target-components.md`) -- so it is derived here, once, rather than
-/// re-derived per caller.
+/// The slot-ordered, de-duplicated `target` ids one component directs events into: a `route`'s
+/// `routes:` values in key order (first occurrence wins), a `lua`/`lua_file`'s `targets:` as
+/// written, nothing for any other kind. This order is what a router's slot index means downstream
+/// (the node runtime's `Vec<Fanout>`, a Lua worker's `event:to("..")` table), so it is derived here
+/// once (`docs/adr/target-components.md`).
 ///
-/// A `route` ignores `Component.targets` entirely: its edges *are* its `routes:` values, and rule
-/// 47 rejects a `targets:` written on one anyway.
+/// A `route` ignores `Component.targets`; rule 47 rejects one written on it.
 ///
-/// Public for the same reason [`target_edges`] and [`role`] are.
+/// Public for the same reason as [`target_edges`].
 pub fn targets_of(component: &Component) -> Vec<&str> {
     let mut slots: Vec<&str> = Vec::new();
     for (_, target) in target_edges(component) {
@@ -574,9 +377,7 @@ pub fn targets_of(component: &Component) -> Vec<&str> {
     slots
 }
 
-/// The single source of truth for which `ComponentKind`s the runtime can actually build --
-/// mirrors the pre-graph `require_implemented_input`/`require_implemented_output`/
-/// `require_implemented_transform` trio, now unified over one enum.
+/// Rule 8's list: the `ComponentKind`s the runtime can build.
 fn is_implemented(kind: &ComponentKind) -> bool {
     matches!(
         kind,
@@ -633,10 +434,9 @@ fn is_implemented(kind: &ComponentKind) -> bool {
     )
 }
 
-/// `Some(interval)` for a kind with an `interval` field, `Aggregate`'s always populated,
-/// `Lua`/`LuaFile`'s only when set. `None` either means no `interval` field on this kind, or a
-/// `Lua`/`LuaFile` component that left it unset -- both are "never flushes", so rule 9 treats
-/// them the same: nothing to reject.
+/// Rule 9's table: `Some` for a kind with an `interval` field, set or defaulted; `None` for a kind
+/// without one, or a `lua`/`lua_file` that left it unset. Neither `None` case ever flushes, so rule
+/// 9 has nothing to reject.
 fn interval(kind: &ComponentKind) -> Option<Duration> {
     match kind {
         ComponentKind::Lua { interval, .. } | ComponentKind::LuaFile { interval, .. } => *interval,
@@ -648,8 +448,8 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
     }
 }
 
-/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces` -- rule 19's shared test for
-/// `keep_signals`/`drop_signals`'s two opposite black-hole shapes.
+/// `true` if `signals` names all three of `Logs`/`Metrics`/`Traces`: rule 21's test for
+/// `keep_signals`/`drop_signals`.
 fn names_all_three(signals: &[logit_config::Signal]) -> bool {
     signals.contains(&logit_config::Signal::Logs)
         && signals.contains(&logit_config::Signal::Metrics)
@@ -659,19 +459,15 @@ fn names_all_three(signals: &[logit_config::Signal]) -> bool {
 pub struct ResolvedComponent {
     pub sources: Vec<String>,
     pub consumers: Vec<String>,
-    /// The `target` components this one directs events into, in slot order -- [`targets_of`]'s
-    /// output, owned (`docs/adr/target-components.md`). Empty for everything that isn't a router;
-    /// validated by rules 47-49, so once resolution has succeeded every id here names a defined
-    /// `target` component and appears exactly once.
+    /// The `target` components this one directs events into, in slot order ([`targets_of`], owned).
+    /// Empty for a non-router; once rules 47-49 pass, every id names a defined `target`, once.
     pub targets: Vec<String>,
     pub kind: ComponentKind,
-    /// Per-sink delivery buffer config (`docs/adr/buffered-sink-delivery.md`). Validated as
-    /// sink-only by [`resolve`] (rule 14); meaningless on any other role, so a non-sink component's
-    /// value here is always [`BufferConfig::default`] once resolution has succeeded.
+    /// Per-sink delivery buffer config (`docs/adr/buffered-sink-delivery.md`). Rule 14 guarantees
+    /// it is [`BufferConfig::default`] on any non-sink.
     pub buffer: BufferConfig,
-    /// Per-listener receive queue/batching config (`docs/adr/decoupled-listener-io.md`).
-    /// Validated as datagram-listener-only by [`resolve`] (rule 17); meaningless on any other
-    /// kind, so its value here is always [`ReceiveConfig::default`] once resolution has succeeded.
+    /// Per-listener receive config (`docs/adr/decoupled-listener-io.md`). Rule 17 guarantees it is
+    /// [`ReceiveConfig::default`] on anything but a datagram, stream, or tail listener.
     pub receive: ReceiveConfig,
 }
 
@@ -687,20 +483,16 @@ impl ResolvedComponent {
 
 pub struct Graph {
     pub components: HashMap<String, ResolvedComponent>,
-    /// Listener-first, sink-last ("produce before consume") order, a byproduct of rule 5's cycle
-    /// check. Nothing outside tests reads it: the node runtime creates every inbox up front, so
-    /// spawn order doesn't matter, and `logit graph` renders from the raw `Config`.
+    /// Listener-first order, a byproduct of rule 5's cycle check. Only tests read it: the node
+    /// runtime creates every inbox up front, and `logit graph` renders from the raw `Config`.
     pub topological_order: Vec<String>,
 }
 
-/// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1's own
-/// connection-management semantics reserve regardless of transport
-/// (`crates/logit-outputs/src/otlp.rs`'s `send_http`). Checked case-insensitively, matching
-/// HTTP's own header-name semantics. Every `grpc-*` name is reserved too -- checked separately,
-/// by prefix, in `resolve` -- since the gRPC wire protocol defines a whole namespace of them
-/// (`grpc-encoding`, `grpc-status`, `grpc-trace-bin`, ...), not just the handful
-/// `crates/logit-outputs/src/otlp.rs`'s `grpc_roundtrip` happens to set today; a fixed list here
-/// would silently stop covering a `grpc-*` header this project starts setting later.
+/// Non-gRPC header names `otlp_out`'s HTTP transport sets itself, or that HTTP/1.1 connection
+/// management reserves (`crates/logit-outputs/src/otlp.rs`'s `send_http`); rule 22 compares them
+/// case-insensitively. Every `grpc-*` name is reserved by prefix in `resolve` instead: gRPC defines
+/// a whole namespace (`grpc-encoding`, `grpc-trace-bin`, ...), and a fixed list would miss one the
+/// transport starts setting later.
 const RESERVED_OTLP_HEADERS: &[&str] = &[
     "content-type",
     "content-length",
@@ -711,12 +503,10 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "connection",
 ];
 
-/// Header names `prometheus_in`'s scrape client sets itself (rule 40) --
-/// `crates/logit-inputs/src/prometheus.rs`'s `scrape_target` unconditionally sends `Accept` (the
-/// dialect-negotiation header) and `User-Agent`, in addition to the same connection-management
-/// names `RESERVED_OTLP_HEADERS` already reserves for `otlp_out` (this listener never sends a
-/// body, so `content-type`/`content-encoding` aren't actually load-bearing here, but naming them
-/// too costs nothing and keeps this list's shape recognizable next to that one).
+/// Header names `prometheus_in`'s scrape client sets itself (rule 40): `Accept` (dialect
+/// negotiation) and `User-Agent` (`crates/logit-inputs/src/prometheus.rs`'s `scrape_target`), plus
+/// [`RESERVED_OTLP_HEADERS`]'s connection-management names. A scrape sends no body, so
+/// `content-type`/`content-encoding` are listed only to keep the two lists parallel.
 const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "accept",
     "user-agent",
@@ -729,16 +519,12 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "connection",
 ];
 
-/// Header names `prometheus_out`'s remote-write sender sets itself (rule 56) --
-/// `crates/logit-outputs/src/prometheus.rs`'s `RemoteWriteOutput::send` inserts all four protocol
-/// headers over the operator's own map, plus `content-length`, which `reqwest` sets from the body.
-/// Five names -- exactly what the sink writes, and nothing else
-/// (`docs/adr/prometheus-remote-write.md`'s "Sender behaviour"). Narrower than
-/// [`RESERVED_PROMETHEUS_HEADERS`] and [`RESERVED_OTLP_HEADERS`], which additionally carry HTTP's
-/// connection-management names: those two lists are shared with components that hand-frame a
-/// request (`otlp_out`'s gRPC transport) or negotiate a dialect through one (`prometheus_in`'s
-/// `accept`), and this sender does neither. Checked case-insensitively, matching HTTP's own
-/// header-name semantics.
+/// Header names `prometheus_out`'s remote-write sender sets itself (rule 56): the four protocol
+/// headers `RemoteWriteOutput::send` inserts over the operator's map
+/// (`crates/logit-outputs/src/prometheus.rs`), plus `content-length`, which `reqwest` sets
+/// (`docs/adr/prometheus-remote-write.md`'s "Sender behaviour"). No connection-management names:
+/// unlike the other two lists' users, this sender neither hand-frames a request nor negotiates a
+/// dialect. Compared case-insensitively.
 const RESERVED_REMOTE_WRITE_HEADERS: &[&str] = &[
     "content-type",
     "content-encoding",
@@ -747,18 +533,13 @@ const RESERVED_REMOTE_WRITE_HEADERS: &[&str] = &[
     "user-agent",
 ];
 
-/// Rule 40's URL check: `scrape_targets` must be absolute `http://`/`https://` URLs with a non-empty
-/// authority. `logit-pipeline` doesn't depend on `reqwest`/`url` (`docs/design/pipeline-graph.md`'s
-/// crate layout keeps this crate free of any concrete protocol's dependencies), so this is a small
-/// hand-rolled scheme/authority check rather than a real URL parse -- good enough to catch a typo'd
-/// scheme or a bare `host:port` with none at all, which is what this rule exists for, but **not**
-/// good enough to catch every string `reqwest::Url::parse` itself would reject (an out-of-range
-/// octet like `999.999.999.999`, an unbalanced `[`/`]` in an IPv6 literal, a port past `u16::MAX`,
-/// a bare space or invalid percent-escape in the host). Such a target still reaches
-/// `crates/logit-inputs/src/prometheus.rs`, which does the real parse when building its
-/// `Resource` and falls back to a placeholder keyed by the target's own configured index (so two
-/// such targets never collide onto the same `instance`/`prometheus.target`) rather than silently
-/// treating it as scrapeable.
+/// Rules 40 and 56's URL check: an absolute `http://`/`https://` URL with a non-empty authority.
+/// Hand-rolled because this crate doesn't depend on `reqwest`/`url`
+/// (`docs/design/pipeline-graph.md`'s "Crate layout"), so it catches a typo'd scheme or a bare
+/// `host:port` but not everything `reqwest::Url::parse` rejects (a `999.999.999.999` host, an
+/// unbalanced IPv6 `[`, a port past `u16::MAX`). `crates/logit-inputs/src/prometheus.rs` does the
+/// real parse, and keys an unparseable target's placeholder `Resource` by its configured index so
+/// two never collide.
 fn is_absolute_http_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
@@ -771,17 +552,14 @@ fn is_absolute_http_url(url: &str) -> bool {
 pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let Config { components, .. } = config;
 
+    // Rule 1: at least one component.
     if components.is_empty() {
         anyhow::bail!("config defines no components");
     }
 
-    // Rules 2 + 3 + 4: every source resolves, no self-reference, no duplicate source within one
-    // component's `sources` list. The last of these matters beyond tidiness: a duplicate would
-    // otherwise push the same consumer id into `consumers` twice below, so that source's `Fanout`
-    // would hold two live `Sender` clones pointing at the same inbox and deliver every batch to
-    // it twice -- a repeated source id would silently double telemetry (and, through an
-    // `aggregate` component, double every aggregated count) rather than being rejected as the
-    // config typo it almost certainly is.
+    // Rules 2 + 3 + 4: every source resolves, no self-reference, no repeated source. A repeated
+    // source would push the same consumer into `consumers` twice below, so its `Fanout` would
+    // deliver every batch twice.
     for (id, component) in &components {
         let mut seen = std::collections::HashSet::with_capacity(component.sources.len());
         for source in &component.sources {
@@ -806,8 +584,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 5: cycle detection, via Kahn's algorithm -- its natural byproduct is also the
-    // listener-first topological order `Graph::topological_order` publishes.
+    // Rule 5: no cycles. The Kahn pass also yields the order `Graph::topological_order` publishes.
     let topological_order = topological_order(&components)?;
 
     // Rule 6: arity per kind.
@@ -819,10 +596,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             Role::Transform if component.sources.is_empty() => {
                 anyhow::bail!("component '{id}' is a transform and requires at least one source");
             }
-            // Rule 49's first clause lives here, with the rest of the arity table: a `target` is
-            // fed by *direction* (`docs/adr/target-components.md`), from a router that names it,
-            // so it never names anything itself -- the one role whose inbound edges aren't in its
-            // own config.
+            // Rule 49's first clause: a `target` is fed by a router that names it, so it names
+            // nothing itself.
             Role::Target if !component.sources.is_empty() => {
                 anyhow::bail!(
                     "component '{id}' is a target and cannot declare sources -- a target is fed \
@@ -844,15 +619,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 7: every non-sink component needs at least one consumer -- including a `target`, whose
-    // consumers are the ordinary `sources:` entries naming it, so the message reads the same way
-    // for one.
+    // Rule 7: every non-sink component, `target`s included, needs at least one consumer.
     //
-    // Rule 50 is the one exemption: a router (anything with a non-empty `targets_of`) may have no
-    // ordinary consumers at all. Its consumers are where its *unrouted* events go, and a config
-    // that routes everything it produces is a real shape, not a black hole -- an event no route
-    // claimed is dropped and counted, `logit.component.events.dropped{reason="unrouted"}`
-    // (`docs/adr/target-components.md`), never silently discarded the way rule 7 exists to catch.
+    // Rule 50: a router (non-empty `targets_of`) is exempt. Its consumers get only its unrouted
+    // events, and a router with none drops and counts those
+    // (`logit.component.events.dropped{reason="unrouted"}`), so it isn't a silent black hole.
     for (id, component) in &components {
         if role(&component.kind) != Role::Sink
             && consumers.get(id).is_none_or(Vec::is_empty)
@@ -862,11 +633,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 47: `targets:` is a `lua`/`lua_file`-only concept -- rule 14's shape, for rule 14's
-    // reason. A `route` declares its targets through `routes:`' values (so repeating them here
-    // would be a second place to keep in sync), and no other kind has any way to direct an event
-    // anywhere at all, so a `targets:` on one is a misplaced block silently doing nothing rather
-    // than a setting that would be honored.
+    // Rule 47: `targets:` is `lua`/`lua_file`-only, rule 14's shape. A `route`'s targets are its
+    // `routes:` values, and no other kind can direct an event at all.
     for (id, component) in &components {
         if !component.targets.is_empty()
             && !matches!(component.kind, ComponentKind::Lua { .. } | ComponentKind::LuaFile { .. })
@@ -878,12 +646,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 51: `route`-specific validation. Deliberately *before* rule 48, which reads the same
-    // `routes:` values as target ids: an empty value is reported as the empty value it is, rather
-    // than as an unresolved target named `''`. An empty `routes:` map can only ever be a no-op
-    // (rules 10/20's reasoning); an empty key could never match a real value, and an empty
-    // `by:` key name could never name a real attribute or resource key (rule 19/20's reasoning,
-    // applied to the one key a `route` reads per event).
+    // Rule 51: `route`'s own shape. Runs before rule 48, which reads the same `routes:` values as
+    // target ids, so an empty value is reported as empty rather than as an unknown target `''`.
     for (id, component) in &components {
         if let ComponentKind::Route { by, routes } = &component.kind {
             if routes.is_empty() {
@@ -921,15 +685,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 48: every router -> target reference resolves, isn't the router itself, and names a
-    // `target` kind; a `lua`/`lua_file` may not repeat one. The unresolved case is checked first
-    // so a typo'd id is reported as a typo rather than as whatever kind it happened to collide
-    // with. Directing at an ordinary component is the inversion
-    // `docs/adr/component-graph-configuration.md`'s "named outlets" rejection was about -- a
-    // `sources:` entry written on the wrong side of the edge -- so the message names that fix.
-    // The duplicate clause is rule 4's, one hop over: two `Fanout`s into the same target would
-    // deliver every routed batch to it twice. A `route` naming one target from several `routes:`
-    // values is *not* a duplicate -- many-to-one is what the kind is for, and `targets_of`
-    // collapses it to a single slot -- so only the keyless (`lua`/`lua_file`) edges are checked.
+    // `target`; a `lua`/`lua_file` may not repeat one. Unresolved is checked first, so a typo is
+    // reported as a typo. Directing at an ordinary component is a `sources:` entry on the wrong
+    // side of the edge (`docs/adr/component-graph-configuration.md`'s "named outlets"), so the
+    // message names that fix. Only keyless edges are checked for repeats: a `route` mapping several
+    // values onto one target is the many-to-one the kind exists for, and `targets_of` collapses it
+    // to one slot.
     for (id, component) in &components {
         let mut seen = std::collections::HashSet::new();
         for (key, target) in target_edges(component) {
@@ -956,9 +717,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 49's last clause: a `target` no router directs to is rule 7's black hole seen from the
-    // other end. The directed-to set is computed once over every component's `targets_of` rather
-    // than per target.
+    // Rule 49's last clause: a `target` no router directs to would leave its consumers waiting
+    // forever.
     let directed_to: BTreeSet<&str> = components.values().flat_map(targets_of).collect();
     for (id, component) in &components {
         if role(&component.kind) == Role::Target && !directed_to.contains(id.as_str()) {
@@ -986,8 +746,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rules 10 + 11: `kv_metrics`-specific validation. Neither is a generic arity/interval check,
-    // so each gets its own loop rather than folding into rules 6/9 above.
+    // Rule 10: a `kv_metrics` with nothing configured is a no-op.
     for (id, component) in &components {
         if let ComponentKind::KvMetrics { counters, gauges, distributions } = &component.kind {
             if counters.is_empty() && gauges.is_empty() && distributions.is_empty() {
@@ -996,6 +755,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      configured can only ever be a no-op"
                 );
             }
+            // Rule 11: a distribution needs a `field`, and every entry a `name` (`influxdb_out`
+            // can't encode a metric with no measurement name).
             if distributions.iter().any(|m| m.field.is_none()) {
                 anyhow::bail!(
                     "component '{id}': a kv_metrics distribution entry requires a 'field' -- a \
@@ -1012,11 +773,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 12: `set`-specific validation -- neither map configured can only ever be a no-op,
-    // exactly the `kv_metrics` rule above, for the same reason. An empty key in either map could
-    // never name a real attribute -- rule 19/20's reasoning, applied here too so `has_attributes`/
-    // `drop_attributes` (rule 36) can claim their own empty-key rejection actually bounds what
-    // `set` can stamp: `has_attributes`' config is `set`'s config, and this keeps that true.
+    // Rule 12: a `set` with nothing configured is a no-op, and an empty key could never name a real
+    // attribute. Rejecting it here means `has_attributes` (rule 36), which shares `set`'s config
+    // shape and rejects an empty key itself, never meets one `set` stamped.
     for (id, component) in &components {
         if let ComponentKind::Set { resource, attributes } = &component.kind {
             if resource.is_empty() && attributes.is_empty() {
@@ -1050,8 +809,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
-    // Rule 14: `buffer:` is a sink-only concept -- a non-default value on any other role is
-    // almost certainly a misplaced block, not a setting that would be silently honored.
+    // Rule 14: `buffer:` is sink-only; a non-default value elsewhere is a misplaced block.
     for (id, component) in &components {
         if component.buffer != BufferConfig::default() && role(&component.kind) != Role::Sink {
             anyhow::bail!(
@@ -1061,11 +819,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 15: `max_batches: 0` or `max_bytes: 0` is an impossible bound, not a small one -- it
-    // makes every push overflow unconditionally, even against an empty queue, with nothing a
-    // concurrent commit could ever do to free room (`SinkQueue::push`'s "impossible to ever fit"
-    // check tolerates this at runtime rather than hanging, but a config that can never accept a
-    // single batch is a mistake worth catching here, not something to silently degrade around).
+    // Rule 15: `max_batches: 0` or `max_bytes: 0` makes every push overflow, even into an empty
+    // queue. `SinkQueue::push` tolerates that at runtime rather than hanging, but a sink that can
+    // never queue a batch is a config mistake.
     for (id, component) in &components {
         if role(&component.kind) == Role::Sink {
             if component.buffer.max_batches == 0 {
@@ -1083,12 +839,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 16: `internal`'s `span_sample_rate` must be finite and within `[0, 1]` -- a config
-    // error, not something to clamp silently. `trace_is_sampled` (`crates/logit-core/src/
-    // telemetry.rs`) treats NaN as "keep everything," which would be a surprising thing to get
-    // from a typo (`span_sample_rate: tru` parsing as a string coerced to NaN, say) rather than a
-    // deliberate "sample everything" choice; a value above 1 or below 0 is unambiguously a
-    // mistake, since neither has a sensible "keep more/less than everything" reading.
+    // Rule 16: `internal`'s `span_sample_rate` must be finite and within `[0, 1]`.
+    // `trace_is_sampled` (`crates/logit-core/src/telemetry.rs`) treats NaN as "keep everything",
+    // which a typo shouldn't get, and no value outside `[0, 1]` has a sensible reading.
     for (id, component) in &components {
         if let ComponentKind::Internal { span_sample_rate, .. } = &component.kind {
             if !span_sample_rate.is_finite() {
@@ -1104,17 +857,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: `receive:` is a datagram-, stream- or tail-listener-only concept -- see this
-    // module's own doc comment on why this checks dedicated predicates rather than
-    // `role() == Role::Listener` (which would wrongly also permit `internal`). Neither a tail
-    // listener (the tailed file is its own durable buffer) nor a stream listener (the TCP
-    // connection's own flow control is the backpressure) has a receive *queue*, so either may
-    // only set the batch-assembly/shutdown-grace fields `receive:` also carries -- the
-    // queue-bounding fields (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) and
-    // `read_batch` (which sizes one `recvmmsg` read and the matching `pop_many` off that same
-    // queue) stay datagram-only and are named individually here, not just rejected as "any
-    // non-default field", so the error points at exactly what doesn't apply rather than making an
-    // operator guess.
+    // Rule 17: `receive:` belongs to a datagram, stream, or tail listener only, tested by those
+    // predicates rather than `Role::Listener` so `internal`/`generate_in` are rejected. A stream or
+    // tail listener has no receive queue, so the queue fields and `read_batch` are rejected there
+    // by name, and the error says which field doesn't apply.
     for (id, component) in &components {
         if component.receive == ReceiveConfig::default() {
             continue;
@@ -1138,9 +884,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 None
             };
             if let Some(field) = queue_only_field {
-                // Two messages rather than one, because the *reason* differs and that reason is
-                // the actionable half: a tail listener's buffer is the file, a stream listener's
-                // is the peer's own send window.
+                // The reason is the actionable half, and it differs: a tail listener's buffer is
+                // the file, a stream listener's is the peer's send window.
                 if is_stream_listener(&component.kind) {
                     anyhow::bail!(
                         "component '{id}': 'receive.{field}' is only meaningful on a datagram \
@@ -1169,12 +914,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         );
     }
 
-    // Rule 18: the twin of rule 15, for a listener's receive-side batch assembly -- `0` on any
-    // of the four count/byte bounds is an impossible bound, never a small one.
-    // `batch_flush_interval: 0s` is deliberately not checked here: zero there means "no timer,"
-    // a meaningful setting. `max_datagrams`/`max_bytes` (the receive *queue*'s own bounds) are
-    // datagram-listener-only, since neither a tail nor a stream listener has such a queue
-    // (rule 17).
+    // Rule 18: rule 15's twin for receive-side batch assembly. `batch_flush_interval: 0s` isn't
+    // checked: it means "no timer". The queue bounds are datagram-only (rule 17).
     for (id, component) in &components {
         if is_datagram_listener(&component.kind) {
             if component.receive.max_datagrams == 0 {
@@ -1215,10 +956,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 26: `tail_in`'s `paths` -- at least one, none empty, and a `*` (this driver's only
-    // wildcard) permitted only in the final path component. An unrestricted `*` (e.g.
-    // `/var/*/app.log`) would make the same glob match a moving set of *directories*, not just
-    // files, which this driver's minimal matcher doesn't attempt to reason about.
+    // Rule 26: `tail_in`'s `paths`: at least one, none empty, and `*` only in the final path
+    // component (`check_tail_glob`).
     for (id, component) in &components {
         if let ComponentKind::TailIn { paths, .. } = &component.kind {
             if paths.is_empty() {
@@ -1233,13 +972,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 27: `docker_in`'s `containers`/`discover`/`root`/`labels` shape. `containers` empty
-    // and `discover` unset would silently tail nothing -- the same black-hole reasoning rule 7
-    // exists to catch, just not derivable from arity alone here. No empty entry in `containers`/
-    // `labels` (an empty string can never match a real container or a real label key), no
-    // duplicate `containers` entry (a repeated selector is always a config mistake, never
-    // meaningful), and `root` must be non-empty (an empty path would resolve to the process's own
-    // working directory, almost certainly not intended).
+    // Rule 27: `docker_in`'s shape. No `containers` and no `discover` would tail nothing (rule 7's
+    // black hole, invisible to arity). An empty `containers`/`labels` entry can never match, a
+    // repeated `containers` entry is a mistake, and an empty `root` would resolve to the working
+    // directory.
     for (id, component) in &components {
         if let ComponentKind::DockerIn { root, containers, discover, labels, .. } = &component.kind
         {
@@ -1269,9 +1005,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 28: a tail listener's timing knobs must be positive -- `0s` on either would busy-loop
-    // (`poll_interval`) or write the checkpoint on every single tick (`checkpoint_interval`), the
-    // same "0 is impossible, not just small" reasoning as rule 9's flush interval.
+    // Rule 28: a tail listener's knobs must be positive: `0` would busy-loop (`poll_interval`),
+    // checkpoint every tick (`checkpoint_interval`), or drop every line (`max_line_bytes`).
     for (id, component) in &components {
         let tail_options = match &component.kind {
             ComponentKind::TailIn { tail, .. } => Some(tail),
@@ -1300,10 +1035,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 19: `trace_context`-specific validation -- an empty field name could never name a
-    // real attribute, so that lookup can only ever be a no-op, the same reasoning rules 10-12
-    // already apply to `kv_metrics`/`set`. `span_id`/`flags` are disabled with `null`, never
-    // `""` -- an empty string there is a typo, not an opt-out.
+    // Rule 19: an empty `trace_context` field name could never name an attribute. `span_id`/`flags`
+    // are disabled with `null`; `""` there is a typo, not an opt-out.
     for (id, component) in &components {
         if let ComponentKind::TraceContext { trace_id, span_id, flags, .. } = &component.kind {
             if trace_id.is_empty() {
@@ -1323,12 +1056,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 20: `scale`-specific validation -- an empty `fields` map can only ever be a no-op, the
-    // same reasoning rules 10-12/19 already apply to `kv_metrics`/`set`/`trace_context`; an empty
-    // field name could never match a real attribute for the same reason rule 19 rejects one on
-    // `trace_context`; a non-finite factor would only ever produce values `numeric` then rejects
-    // downstream (`crates/logit-transforms/src/lib.rs::numeric`), which is a confusing way to
-    // learn about what's almost certainly a config typo.
+    // Rule 20: `scale`. No `fields` is a no-op, an empty field name can't match (rule 19's
+    // reasoning), and a non-finite factor only produces values `numeric`
+    // (`crates/logit-transforms/src/lib.rs`) rejects downstream.
     for (id, component) in &components {
         if let ComponentKind::Scale { fields } = &component.kind {
             if fields.is_empty() {
@@ -1349,17 +1079,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`. For
-    // `keep_signals`/`drop_signals`, an empty or all-three list is *always* rejected, but which
-    // of the two is the silent-black-hole shape (rule 7's "no consumer" failure, here recast as
-    // "no event ever gets through") and which is the no-op (every event forwarded completely
-    // untouched, so the component is pointless) is *opposite* between the two kinds -- an
-    // allowlist that names nothing keeps nothing (black hole), one that names everything keeps
-    // everything (no-op); a denylist is the mirror. Both shapes are rejected either way (a no-op
-    // component is exactly as much a config mistake as a black hole one), but the message must
-    // say which is which, or it tells the operator the wrong thing happened.
-    // `has_signal` naming all three signals is left alone: under `mode: only` that's a real,
-    // if permissive, "forward anything with a payload" filter, not a no-op.
+    // Rule 21: `has_signal`/`keep_signals`/`drop_signals` need a non-empty `signals:`, and
+    // `keep_signals`/`drop_signals` may not name all three. For an allowlist, empty keeps nothing
+    // (black hole) and all three keeps everything (no-op); a denylist is the mirror. Both are
+    // rejected, but each message must name the right failure. `has_signal` naming all three stays
+    // legal: under `mode: only` it forwards anything with a payload.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::HasSignal { signals, .. } => {
@@ -1402,12 +1126,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 22: an `otlp_out` `headers:` entry may not name a header the protocol itself sets
-    // (see `RESERVED_OTLP_HEADERS`'s own doc comment for why `grpc-*` is a prefix check here,
-    // not a fixed list), and no two entries may name the same header once case is ignored --
-    // HTTP header names are case-insensitive, so e.g. `X-Scope-OrgID` and `x-scope-orgid` in the
-    // same `headers:` block would silently collide into one `HeaderMap` entry
-    // (`OtlpOutput::with_headers`) with no way to predict which value wins.
+    // Rule 22: an `otlp_out` header the transport sets itself (`grpc-*` by prefix; see
+    // `RESERVED_OTLP_HEADERS`), or two names equal ignoring case, which would collide into one
+    // `HeaderMap` entry (`OtlpOutput::with_headers`) with an unpredictable winner.
     for (id, component) in &components {
         if let ComponentKind::OtlpOut { headers, .. } = &component.kind {
             let mut seen_lowercase = BTreeSet::new();
@@ -1441,10 +1162,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 23: `otlp_out`'s `paths:` is HTTP-only -- gRPC method names are fixed by the `.proto`
-    // service definitions, not a mount point an operator can move, so a non-empty `paths:` under
-    // `protocol: grpc` is rejected rather than silently ignored (the same instinct as rule 14's
-    // `buffer:` on a non-sink, and rule 17's `receive:` on a non-datagram listener).
+    // Rule 23: `otlp_out`'s `paths:` is HTTP-only: gRPC method names are fixed by the `.proto`
+    // service definitions, so `paths:` under `protocol: grpc` is rejected, not ignored.
     for (id, component) in &components {
         if let ComponentKind::OtlpOut { protocol, paths, .. } = &component.kind {
             if *protocol == logit_config::OtlpProtocol::Grpc && !paths.is_empty() {
@@ -1457,14 +1176,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 24: `otlp_out`'s `tls:` block. `cert_file`/`key_file` must be set together -- a lone
-    // one is almost certainly a typo, not a deliberate half-configured mTLS. `insecure_skip_verify`
-    // together with `ca_file` is contradictory -- "trust this CA" and "trust nothing, verify
-    // nothing" can't both be meant. And a non-empty `tls:` under a plain `http://`/`grpc://`
-    // endpoint is rejected outright, the same instinct as rule 14's `buffer:` on a non-sink and
-    // rule 23's `paths:` under `protocol: grpc` -- TLS is selected by the endpoint's scheme
-    // (`docs/adr/otlp-tls-and-pooled-grpc-client.md`), so a `tls:` block with nothing to tune
-    // would otherwise be silently ignored rather than caught as a likely mistake.
+    // Rule 24: `otlp_out`'s `tls:`. `cert_file` or `key_file` alone is a typo, not half an mTLS
+    // config; `insecure_skip_verify` with `ca_file` is contradictory; and under a non-`https://`
+    // endpoint the block does nothing, since the scheme selects TLS
+    // (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
     for (id, component) in &components {
         if let ComponentKind::OtlpOut { endpoint, tls, .. } = &component.kind {
             if tls.cert_file.is_some() != tls.key_file.is_some() {
@@ -1490,10 +1205,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 25: `trace_context`'s `span:` block (`docs/adr/trace-context-span-lifting.md`). An
-    // empty default `name` would mint spans OTLP requires a name for, and a `max_skew` of zero
-    // rejects every span as skewed -- an impossible window, the same instinct as rule 9's
-    // zero-length `interval` and rule 15's zero-sized buffer.
+    // Rule 25: `trace_context`'s `span:` (`docs/adr/trace-context-span-lifting.md`). OTLP requires
+    // a span name, and a zero `max_skew` rejects every span as skewed.
     for (id, component) in &components {
         if let ComponentKind::TraceContext { span: Some(span), .. } = &component.kind {
             if span.name.is_empty() {
@@ -1511,12 +1224,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 29: `file_out`'s `rotate:` block. Neither trigger set would silently never rotate at
-    // all -- the same "would silently do nothing" reasoning rule 7/27 already apply, just not
-    // derivable from arity alone here; `stdio_out` already covers the never-rotate case on
-    // purpose, so this rejects rather than treats it as a quiet no-op. `max_bytes: 0`/
-    // `max_files: 0` are each an impossible bound, the same "0 is impossible, not just small"
-    // instinct as rule 9/15/18/28.
+    // Rule 29: `file_out`'s `rotate:`. With neither trigger it never rotates, which is what
+    // `stdio_out` is for, so the message points there. `max_bytes: 0`/`max_files: 0` are impossible
+    // bounds.
     for (id, component) in &components {
         if let ComponentKind::FileOut { path, rotate, .. } = &component.kind {
             if rotate.max_bytes.is_none() && rotate.interval.is_none() {
@@ -1541,12 +1251,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 30: `kv`'s separators. An empty `pair_sep` or `kv_sep` makes splitting yield a
-    // boundary between every character; `pair_sep == kv_sep` means every segment is split away
-    // from its own separator, so no line could ever produce a pair; and a `kv_sep` that
-    // *contains* `pair_sep` can never appear intact inside a segment, since the `pair_sep` split
-    // always runs first -- each shape is a certain no-op or a certain garbage result, catchable
-    // here rather than surfacing as silently-wrong output at runtime.
+    // Rule 30: `kv`'s separators. An empty one splits between every character, identical ones split
+    // every segment away from its own separator, and a `kv_sep` containing `pair_sep` never
+    // survives the `pair_sep` split, which runs first.
     for (id, component) in &components {
         if let ComponentKind::Kv { pair_sep, kv_sep, .. } = &component.kind {
             if pair_sep.is_empty() {
@@ -1571,10 +1278,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 31: `regex`-specific validation -- an empty `field` name could never match a real
-    // attribute for the same reason rule 19 rejects one on `trace_context`; a pattern that
-    // doesn't compile, or declares no named capture group, can only ever be a no-op (or worse, a
-    // run-time surprise) if left for `build_spec` to discover.
+    // Rule 31: `regex`. An empty `field` can't match (rule 19's reasoning); a pattern that fails to
+    // compile or has no named group is caught here rather than by `build_spec` at startup. The
+    // compiled `Regex` is dropped: `build_spec` rebuilds from the raw `ComponentKind`, like every
+    // kind. A duplicate group name needs no check; the `regex` crate rejects it.
     for (id, component) in &components {
         if let ComponentKind::Regex { pattern, field } = &component.kind {
             if field.as_deref() == Some("") {
@@ -1596,15 +1303,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 32: a `csv`'s `columns`/`delimiter` shape (`docs/adr/csv-positional-columns.md`). An
-    // empty `columns` list can only ever be a no-op, the same reasoning rules 10-12/19/20 already
-    // apply elsewhere; an empty column name could never be a useful attribute name, the same
-    // reasoning as rule 20's empty scale field name; a duplicate column name would let the later
-    // field silently overwrite the earlier one on every event, leaving one configured column
-    // permanently unreachable -- the "a repeated entry silently doubles rather than erroring" rule
-    // applied to columns instead of sources (rule 4). `delimiter` must be a single ASCII
-    // character, and not `"` (RFC 4180's quote character, which this parser reads as field
-    // framing, not data) or `\n`/`\r` (already consumed as line framing by every input).
+    // Rule 32: `csv` (`docs/adr/csv-positional-columns.md`). No `columns` is a no-op, an empty name
+    // is no usable attribute, and a duplicate name would let the later field overwrite the earlier
+    // on every event (rule 4's reasoning, applied to columns). `"` is the quote character this
+    // parser frames fields with, and `\n`/`\r` are line framing every input already consumes.
     for (id, component) in &components {
         if let ComponentKind::Csv { columns, delimiter } = &component.kind {
             if columns.is_empty() {
@@ -1640,9 +1342,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 33: `stdio_out`/`file_out`'s `compression:` only means anything under `format:
-    // native` -- under the default `format: human`, a non-`none` value would silently do
-    // nothing, the same reasoning rule 29 already applies to `rotate:`'s own triggers
+    // Rule 33: `compression:` does nothing outside `format: native`
     // (`docs/adr/file-output-native-format.md`).
     for (id, component) in &components {
         let stream_format = match &component.kind {
@@ -1659,16 +1359,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 34: `logit_out`'s `tls:` block must be internally consistent -- `cert_file`/`key_file`
-    // together, `insecure_skip_verify` and `ca_file` contradictory -- mirroring rule 24's first
-    // two checks. No scheme-based check the way rule 24's third one has: `logit_out`'s `endpoint`
-    // is a bare `host:port` (the `syslog_out` shape), so `tls:`'s mere presence is the only signal
-    // available, and it always turns TLS on -- there's no "wrong scheme" case to catch. And
-    // `logit_in`'s `max_frame_bytes`, when set, must be a real, sane bound: `0` could never accept
-    // a single frame (the same "0 is impossible, not just small" instinct as rules 9/15/18/28),
-    // and anything over `logit_proto::frame::MAX_SANE_UNCOMPRESSED_LEN` (64 MiB) exceeds what
-    // `read_frame`/`read_frame_with_header` themselves ever accept regardless of what a listener
-    // configures.
+    // Rule 34: `logit_out`'s `tls:` gets rule 24's two consistency checks but no scheme check: its
+    // `endpoint` is a bare `host:port`, so `tls:`'s presence alone turns TLS on. `logit_in`'s
+    // `max_frame_bytes` may be neither `0` nor above `MAX_SANE_UNCOMPRESSED_LEN` (64 MiB), which
+    // `read_frame`/`read_frame_with_header` enforce whatever a listener configures.
     for (id, component) in &components {
         if let ComponentKind::LogitOut { tls: Some(tls), .. } = &component.kind {
             if tls.cert_file.is_some() != tls.key_file.is_some() {
@@ -1703,17 +1397,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 35: `buffer.disk:`'s shape (`docs/adr/disk-backed-sink-buffer.md`). Disk *replaces*
-    // memory for that sink, not a tier sized alongside it, so `max_batches`/`max_bytes` staying
-    // at their defaults while `disk:` is set would silently ignore whichever one an operator
-    // actually meant to tune -- the same "a knob that would silently do nothing is a config
-    // error" reasoning as rule 33. `segment_bytes`/`max_bytes` of `0` are impossible bounds, the
-    // same instinct as rule 15's `buffer.max_batches: 0`. Two sinks sharing a literal `disk.path`
-    // would corrupt each other's spool; `DiskQueue::open`'s own exclusive lock also catches an
-    // *aliased* path (`./spool` vs `spool`) this literal-string check can't see, since this
-    // function never resolves a path against the config's base directory.
-    // `(path, id)`, not `(id, path)` -- sorted so two entries sharing a path become adjacent
-    // regardless of which component id happens to sort first.
+    // Rule 35: `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`). Disk replaces the in-memory
+    // bound rather than sizing alongside it, so a non-default `max_batches`/`max_bytes` beside it
+    // would be ignored. Zero disk bounds are impossible. Two sinks sharing a literal `disk.path`
+    // would corrupt each other's spool; `DiskQueue::open`'s exclusive lock catches an aliased path
+    // (`./spool` vs `spool`), since this function never resolves paths. Sorted as `(path, id)` so
+    // entries sharing a path are adjacent.
     let mut disk_paths: Vec<(&str, &str)> = Vec::new();
     for (id, component) in &components {
         let Some(disk) = &component.buffer.disk else { continue };
@@ -1762,22 +1451,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 36: `has_attributes`/`drop_attributes`-specific validation
-    // (`docs/adr/attribute-filtering-components.md`). Neither map configured is rejected on both
-    // kinds, the same "can only ever be a no-op" instinct as rule 12 -- but note the black-hole/
-    // no-op assignment is *inverted* from rule 21: there the allowlist (`keep_signals`) is the
-    // black hole and the denylist the no-op, because `signals:` is a list of alternatives.
-    // `resource:`/`attributes:` is a map of conjunctions instead, so a conjunction over zero pairs
-    // is vacuously true -- `has_attributes` with nothing configured matches *every* event (a
-    // no-op, forwarding everything untouched) and `drop_attributes` with nothing configured is
-    // therefore its exact complement, matching every event too, but that means dropping every one
-    // of them (a black hole). An empty key could never name a real attribute (rule 12/19/20's
-    // reasoning). A non-finite value can never compare equal to anything under
-    // `crate::attributes`' coercing matcher, so an entry holding one could never match -- the same
-    // "would only ever produce a value `numeric` then rejects" reasoning rule 20 applies to
-    // `scale`'s factors. The same key appearing in both `resource:` and `attributes:` is
-    // deliberately *not* rejected -- they address different objects (the batch vs. the event), so
-    // that config is meaningful, not a mistake.
+    // Rule 36: `has_attributes`/`drop_attributes` (`docs/adr/attribute-filtering-components.md`).
+    // The maps are conjunctions, so zero pairs match every event: `has_attributes` forwards all
+    // (no-op) and `drop_attributes` drops all (black hole), the inverse of rule 21's list of
+    // alternatives. An empty key can't name an attribute; a non-finite value never compares equal
+    // under `crate::attributes`' coercing matcher. The same key in `resource:` and `attributes:` is
+    // legal: one addresses the batch, the other the event.
     for (id, component) in &components {
         let (kind_name, resource, attributes) = match &component.kind {
             ComponentKind::HasAttributes { resource, attributes } => {
@@ -1825,22 +1504,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 37: `has_provenance`/`drop_provenance`-specific validation
-    // (`docs/adr/provenance-filtering-components.md`). Same "can only ever be a no-op" instinct
-    // as rule 36, and the empty-config black-hole/no-op assignment lines up with rule 36's, not
-    // rule 21's -- despite each field's *contents* being a list of alternatives, the same shape
-    // `signals:` has. The difference is what "empty" means at the *field*, not the list: an empty
-    // `origin:`/`previous:` means "this field isn't part of the match" (vacuously true, so it
-    // never narrows what matches), exactly like `has_attributes`' empty `resource:`/`attributes:`
-    // map -- not "match against zero alternatives" (vacuously false), which is what makes
-    // `has_signal`'s family the inverted case. Two independently-omittable AND'd fields, each an
-    // OR internally, is `has_attributes`' top-level shape with `has_signal`'s per-field shape
-    // nested inside it -- and it's the *top* level that decides this assignment. So: both fields
-    // empty means `has_provenance` matches every batch (a no-op, forwarding everything untouched)
-    // and `drop_provenance`, its exact complement, therefore drops every one of them (a black
-    // hole). An empty string entry could never name a real component id (rule 12/19/20/36's
-    // reasoning); a duplicate entry within one list is almost certainly a copy-paste typo, the
-    // same instinct rule 4 already applies to a repeated `sources` entry.
+    // Rule 37: `has_provenance`/`drop_provenance` (`docs/adr/provenance-filtering-components.md`).
+    // Oriented like rule 36, not rule 21, although each field is a list of alternatives: an empty
+    // `origin:`/`previous:` leaves that field out of the match (vacuously true) rather than
+    // matching zero alternatives, and the two AND'd fields decide. So with both empty
+    // `has_provenance` is the no-op and `drop_provenance` the black hole. An empty entry can't name
+    // a component id; a repeated one is a copy-paste mistake (rule 4's reasoning).
     for (id, component) in &components {
         let (kind_name, origin, previous) = match &component.kind {
             ComponentKind::HasProvenance { origin, previous } => {
@@ -1885,20 +1554,12 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 38: `statsd_out`'s/`collectd_out`'s/`graphite_out`'s `max_packet_bytes: 0` is rejected
-    // the same way rule 15's `max_batches`/`max_bytes: 0` is -- an impossible bound (every
-    // line/value list would overflow it and be dropped whole), not a small one. `collectd_out`
-    // additionally rejects anything outside `1024..=65535` -- collectd's own `MaxPacketSize` range
-    // (`docs/adr/collectd-binary-relay.md`) -- because unlike `statsd_out` (which just starts a
-    // new datagram at the cap) a `collectd_out` value above the real UDP payload ceiling (65507)
-    // packs datagrams the socket can never actually send: every one fails `EMSGSIZE` at `send_to`,
-    // which `collectd_out` counts as a per-datagram drop rather than a `Fault` -- so the component
-    // would silently report `requests{class="ok"}` while delivering nothing at all. `statsd_out`
-    // makes no such range claim in its own ADR, so it keeps only the zero check above.
-    // `graphite_out` makes no such claim either (`docs/adr/graphite-carbon-relay.md`) -- an
-    // oversize packed datagram is already counted `oversize_datagram` and skipped rather than
-    // sunk, the same as `statsd_out`'s own `EMSGSIZE` handling -- so it too keeps only the zero
-    // check here.
+    // Rule 38: `max_packet_bytes: 0` is an impossible bound on all three sinks. `collectd_out` also
+    // requires collectd's own `MaxPacketSize` range (`docs/adr/collectd-binary-relay.md`): above
+    // the UDP payload ceiling every datagram fails `EMSGSIZE`, which `collectd_out` counts as a
+    // per-datagram drop, not a `Fault`, so it would report `requests{class="ok"}` while delivering
+    // nothing. `statsd_out` starts a new datagram at the cap and `graphite_out` counts an oversize
+    // one `oversize_datagram`; neither ADR claims a range, so both keep only the zero check.
     for (id, component) in &components {
         if matches!(
             &component.kind,
@@ -1924,12 +1585,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 39: an `aggregate` in `temporality: cumulative` needs both retention bounds non-zero.
-    // Either one at `0` means no series can survive a flush, so every window's emitted `Sum`/
-    // `Histogram` would be that window's own increment wearing a `Cumulative` label -- a silently
-    // wrong number for the consumer that mode exists for (`prometheus_out`, which reads a
-    // cumulative record as a running total). The same "an impossible bound is a config error, not a
-    // small one" shape rules 15/18/38 use.
+    // Rule 39: a cumulative `aggregate` needs both retention bounds non-zero, or every window's
+    // `Sum`/`Histogram` is its own increment labeled `Cumulative`: a wrong number for
+    // `prometheus_out`, which reads it as a running total.
     for (id, component) in &components {
         if let ComponentKind::Aggregate {
             temporality, series_retention, max_retained_series, ..
@@ -1948,12 +1606,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: a *scrape-mode* `prometheus_in`'s `scrape_targets`/`timeout`/`scrape_tls`/`headers`
-    // -- see this module's own doc comment for the full rule text. Every check below is a
-    // statement about a scrape, so the whole body is gated on this component actually being in
-    // scrape mode; rule 55 owns the mode itself (exactly-one-of, and the wrong-mode fields in both
-    // directions), including the "neither mode is set" case this rule's empty-list bail used to
-    // catch by accident.
+    // Rule 40: a scrape-mode `prometheus_in`'s scrape settings. Gated on scrape mode; rule 55 owns
+    // the mode itself, including neither mode set.
     for (id, component) in &components {
         if let ComponentKind::PrometheusIn {
             scrape_targets,
@@ -2031,16 +1685,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 41: a `prometheus_out` `path:` must be a non-empty absolute path, and `max_series` must
-    // admit at least one series. A relative or empty `path` could never match a request URI's own
-    // path (always absolute), so every scrape would 404 against an endpoint that looks configured;
-    // `max_series: 0` is rule 38's impossible bound in another shape -- every series would be
-    // evicted the instant it arrived, exposing nothing.
-    //
-    // **Registry mode only.** Both fields are statements about an exposition this sink serves, and
-    // a `prometheus_out` in sender mode serves none; rule 56 is what rejects a non-default value
-    // of either one there, with a message that says so. Without this gate the two rules would
-    // race for the same config and an operator would get whichever fired first.
+    // Rule 41: a registry-mode `prometheus_out` `path:` must be absolute, since a request URI's
+    // path always is (a relative one would 404 every scrape), and `max_series: 0` would evict every
+    // series on arrival. Registry mode only: rule 56 rejects a non-default value of either in
+    // sender mode, and one gate per rule keeps the two from racing for the same config.
     for (id, component) in &components {
         let ComponentKind::PrometheusOut { bind: Some(_), path, max_series, .. } = &component.kind
         else {
@@ -2060,13 +1708,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 42: a `generate_in`'s own bounds and templates. The three counts are the
-    // impossible-bound shape rules 9/15/18/38 already apply elsewhere -- `0` here means "generate
-    // nothing", never "as little/slow as possible", and `None` is how unbounded/unthrottled is
-    // actually spelled. The template checks are what keep a mistyped placeholder from silently
-    // collapsing a scenario's cardinality instead of failing `logit validate`; the parse happens
-    // here and the result is dropped, matching how rule 30 compiles a `regex` `pattern` it also
-    // throws away (`build_spec` re-derives from the raw `ComponentKind` like every other kind).
+    // Rule 42: a `generate_in`'s bounds and templates. `0` for a count means "generate nothing"
+    // (`None` spells unbounded/unthrottled). The template checks keep a mistyped placeholder from
+    // silently collapsing a scenario's cardinality. As with rule 31's `regex`, the parse result is
+    // dropped; `build_spec` re-derives from the raw `ComponentKind`.
     for (id, component) in &components {
         let ComponentKind::GenerateIn { count, batch, rate, event, resource } = &component.kind
         else {
@@ -2119,7 +1764,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             if metric.name.is_empty() {
                 anyhow::bail!(
                     "component '{id}': 'event.metric.name' is empty -- a generated metric needs a \
-                     name, the same reason rule 12 requires one of every kv_metrics entry"
+                     name, the same reason rule 11 requires one of every kv_metrics entry"
                 );
             }
             if !metric.value.is_finite() {
@@ -2132,19 +1777,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 43: a listener's `tls:` block needs a stream transport. TLS is defined over a reliable
-    // ordered byte stream; its datagram sibling, DTLS, is deliberately out of scope everywhere in
-    // this project (`docs/adr/syslog-tcp-ingress-and-tls.md`'s Alternatives -- RFC 6012 for
-    // syslog, and carbon has no DTLS receiver at all), so a `tls:` block on a datagram listener
-    // could never take effect. Rejected rather than ignored, for the same reason rule 22 rejects a
-    // `tls:` block under a plaintext `otlp_out` endpoint: an operator who wrote one meant the
-    // connection to be encrypted, and silently running it in the clear is the worst of the three
-    // possible outcomes.
-    //
-    // One rule over every such listener rather than one rule each: the check, the message and the
-    // reasoning are identical, and only the kind's own `transport` spelling differs -- so a new
-    // stream-capable listener joins by adding one arm to the match below, not by claiming another
-    // rule number. Three today: `syslog_in`, `graphite_in`, `statsd_in`.
+    // Rule 43: a listener's `tls:` needs a stream transport. DTLS is out of scope
+    // (`docs/adr/syslog-tcp-ingress-and-tls.md`'s "Alternatives considered"), so `tls:` under UDP
+    // could never take effect, and running a connection the operator meant encrypted in the clear
+    // is the worst outcome (rule 24's reasoning). One rule for every such listener: a new
+    // stream-capable listener adds a match arm, not a rule number.
     for (id, component) in &components {
         let tls_on_a_datagram_transport = match &component.kind {
             ComponentKind::SyslogIn { transport, tls: Some(_), .. } => {
@@ -2166,15 +1803,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 44: `syslog_out`'s `tls:` block -- the twin of rule 34's for `logit_out`, since both
-    // sinks dial the same bare `host:port` shape where `tls:`'s mere presence is the only signal
-    // that TLS is wanted. `cert_file`/`key_file` must be set together, and `insecure_skip_verify`
-    // together with `ca_file` is contradictory; the messages are rule 34's verbatim, so one grep
-    // finds every sink that makes the same two checks. The third check is this rule's own:
-    // `tls:` under `transport: udp` is rejected rather than silently ignored -- syslog over TLS
-    // is RFC 5425, which is TLS over *TCP*, and DTLS is out of scope
-    // (`docs/adr/syslog-tcp-ingress-and-tls.md`). `SyslogOutput::with_tls` re-checks that last
-    // one itself, since `graph::resolve` isn't the only possible caller.
+    // Rule 44: `syslog_out`'s `tls:`. Rule 34's two checks, messages verbatim so one grep finds
+    // every sink making them: like `logit_out`, it dials a bare `host:port`. Its own third check:
+    // syslog over TLS is RFC 5425, TLS over TCP, so `tls:` under `transport: udp` is rejected.
+    // `SyslogOutput::with_tls` re-checks that one, since `resolve` isn't its only possible caller.
     for (id, component) in &components {
         let ComponentKind::SyslogOut { tls: Some(tls), transport, .. } = &component.kind else {
             continue;
@@ -2197,14 +1829,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 52: `statsd_out`'s `tls:` block -- rule 44's three checks, with its messages verbatim,
-    // for the same reason it shares them with rule 34: this sink dials the same bare `host:port`
-    // shape where `tls:`'s mere presence is the only signal TLS is wanted, so one grep still
-    // finds every sink making these checks. Kept a rule of its own rather than folded into rule
-    // 44's loop -- the sink rules stay one per sink (24/34/44/52), the opposite convention from
-    // rule 43's one-rule-for-every-listener, because each sink also validates its own `tls:`
-    // internals. `StatsdOutput::with_tls` re-checks the `transport: udp` one itself, since
-    // `graph::resolve` isn't the only possible caller.
+    // Rule 52: `statsd_out`'s `tls:`: rule 44's three checks, messages verbatim. Its own rule
+    // rather than an arm of 44's loop, since sink TLS rules are one per sink (24/34/44/52).
+    // `StatsdOutput::with_tls` re-checks the UDP case, since `resolve` isn't its only possible
+    // caller.
     for (id, component) in &components {
         let ComponentKind::StatsdOut { tls: Some(tls), transport, .. } = &component.kind else {
             continue;
@@ -2227,25 +1855,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 45: every TCP listener's `handshake_timeout` must be non-zero, and on a UDP
-    // `syslog_in` it must be left at its default. `0s` is an impossible budget, not a tight one --
-    // the phase it bounds (a TLS accept, a first-byte read, a `Hello` read) cannot complete in
-    // zero time, so every connection would be closed the instant it was accepted and the listener
-    // would accept nothing at all: the same "0 is impossible, not just small" call rules 9/15/18/28
-    // already make for a flush interval, a queue bound, and a poll interval.
-    //
-    // The context check is rule 43's spirit applied to this field instead of `tls:`, and rule 33's
-    // shape for an "only means anything under X" field: where nothing could ever consult the
-    // value, an operator who set one meant it to take effect, so set-but-ignored is an error
-    // rather than a silent no-op. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection at
-    // all to hand shake. Only a *non-default* value is rejected, so the field can carry its
-    // default on every one of them without making `transport: udp` a config error.
-    //
-    // A *plaintext* `otlp_in` used to be the second such case -- that listener's budget once
-    // bounded its TLS accept and nothing else. It now bounds the wait for a plaintext
-    // connection's first byte too (`crates/logit-inputs/src/otlp.rs`'s "Handshake timeout" and
-    // "peek, not a read" sections), so the value is live with or without a `tls:` block and there
-    // is nothing left to reject.
+    // Rule 45: `handshake_timeout` must be non-zero on every kind that has one: no TLS accept,
+    // first-byte read, or `Hello` read completes in zero time, so every connection would close on
+    // accept. A UDP `syslog_in`/`graphite_in`/`statsd_in` has no connection to hand shake, so a set
+    // value there is rejected (rule 33's shape). Only a non-default value counts as set, so the
+    // default stays legal under UDP. `otlp_in` gets only the zero check: its budget also bounds a
+    // plaintext connection's first-byte wait (`crates/logit-inputs/src/otlp.rs`'s "Handshake
+    // timeout"), so it is live with or without `tls:`.
     for (id, component) in &components {
         let handshake_timeout = match &component.kind {
             ComponentKind::SyslogIn { handshake_timeout, .. }
@@ -2284,32 +1900,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 53: a TCP listener's `idle_timeout`, where set, must be non-zero and must be on a kind
-    // and transport that has a connection to time out (`docs/adr/idle-connection-timeout.md`).
-    // Rule 45's two checks one field over, with two differences worth naming.
-    //
-    // First, the field is an `Option`, not a defaulted `Duration`: absent *is* "no idle timeout",
-    // so there is no `default_*` value to tell apart from a set one and no
-    // `handshake_timeout`-shaped "a defaulted value is not a set one" escape hatch. Every `Some`
-    // is a set value, which is why the UDP check below rejects any value rather than only a
-    // non-default one -- and why the zero message names the fix (`omit the field`) rather than a
-    // legal value to use instead.
-    //
-    // Second, `0s` is impossible for a different reason than rule 45's: not "no handshake
-    // completes in zero time" but "a connection is momentarily idle every time this listener is
-    // waiting on its next byte", so a zero budget would close every connection the instant it
-    // stopped sending -- rules 9/15/18/28/45's impossible-bound call either way.
-    //
-    // One loop over every kind that carries the field, rule 43's one-rule-for-every-listener
-    // shape: the check, the message and the reasoning are identical on all of them and only the
-    // `transport` spelling differs -- and on a kind with no datagram transport at all there is
-    // nothing to spell, which is why `logit_in`'s, `otlp_in`'s and `prometheus_in`'s arms report
-    // `false` rather than reading a field: `logit_in` has no `transport:` at all (it is TCP by
-    // construction), `otlp_in`'s `protocol` picks HTTP or gRPC over TCP, not a datagram
-    // alternative, and `prometheus_in`'s receiver is HTTP over TCP with no datagram spelling
-    // either. Only the zero check can ever fire on any of the three. A `prometheus_in` in *scrape*
-    // mode has no connection of its own to time out -- but that is a wrong-mode field rather than
-    // a wrong-transport one, so rule 55 rejects it rather than this rule growing a second axis.
+    // Rule 53: `idle_timeout`, rule 45's checks one field over
+    // (`docs/adr/idle-connection-timeout.md`), with two differences. The field is an `Option` whose
+    // absence means "no idle timeout", so every `Some` is set: the UDP check rejects any value, and
+    // the zero message says to omit the field. And `0s` is impossible because a connection is idle
+    // whenever the listener awaits its next byte. `logit_in`, `otlp_in`, and `prometheus_in` have
+    // no datagram transport, so their arms pass `false`; a scrape-mode `prometheus_in`'s value is
+    // rule 55's wrong-mode check.
     for (id, component) in &components {
         let (kind_name, idle_timeout, datagram) = match &component.kind {
             ComponentKind::SyslogIn { idle_timeout, transport, .. } => {
@@ -2343,17 +1940,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 46: `graphite_in`'s and `graphite_out`'s protocol/transport pair and size bounds
-    // (`docs/adr/graphite-carbon-relay.md`). Carbon's pickle wire is a 4-byte big-endian length
-    // prefix around each batch (Twisted's `Int32StringReceiver`), which has no meaning in a
-    // datagram that already delimits itself -- so `protocol: pickle` over UDP could only ever
-    // mis-frame, and is a config error rather than a degraded mode, on either kind. The zero
-    // checks are rules 9/15/18/38's impossible-bound shape; the `max_frame_bytes` range is rule
-    // 38's "a bound the transport cannot honestly carry is a silent failure, not a generous
-    // setting" applied to a length-prefixed frame: below 1024 no real carbon batch fits, and
-    // above 16 MiB one declared length is a larger allocation than any sender has a reason to
-    // ask for. One loop covers both kinds so the shared constant and error wording are reused
-    // rather than duplicated.
+    // Rule 46: `graphite_in`/`graphite_out` (`docs/adr/graphite-carbon-relay.md`). Carbon's pickle
+    // wire is a 4-byte big-endian length prefix per batch (Twisted's `Int32StringReceiver`), which
+    // means nothing in a self-delimiting datagram, so pickle over UDP could only mis-frame. The
+    // zero checks are impossible bounds; `GRAPHITE_FRAME_BYTES_RANGE` holds the range's reasoning.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::GraphiteIn {
@@ -2430,23 +2020,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 54: `keep_values`-specific validation
-    // (`docs/adr/value-allowlist-cardinality-clamp.md`). Neither map configured can only ever be
-    // a no-op, exactly rule 12's `set` reasoning -- `keep_values`'s config is shaped like `set`'s
-    // on purpose. An empty key in either map could never name a real attribute, rule 12/19/20's
-    // reasoning again. A field's own `allow` list being empty is a stronger no-op than rule 12's:
-    // there is no value that field could ever keep, so the whole field clamps to `other` (or
-    // removal) unconditionally -- which is exactly what `set`/`remove` already express, so the
-    // message names them rather than leaving an operator to guess. A non-finite `F64` in `allow`
-    // or `other` can never compare equal to anything under `value_matches`'s coercion, the same
-    // "would only ever produce a value the matcher then rejects" reasoning rule 36 applies to
-    // `has_attributes`. A `normalize: [lower]` field additionally constrains what a `Str` literal
-    // in `allow`/`other` may spell: anything but already-lowercase ASCII could never be produced
-    // by that step, so `allow` could never match it and `other` would violate the field's own
-    // declared invariant the moment it's substituted in -- rejected by name rather than silently
-    // lowercased, so what validates is what the operator actually wrote. A duplicate step within
-    // one field's `normalize:` list is the same no-op instinct once more; an *empty* list is not
-    // rejected -- it is the default, meaning no normalization at all.
+    // Rule 54: `keep_values` (`docs/adr/value-allowlist-cardinality-clamp.md`), shaped like `set`
+    // and checked like rule 12, plus: an empty `allow` clamps every value, which `set`/`remove`
+    // already express, so the message names them; a non-finite `F64` never compares equal under
+    // `value_matches` (rule 36's reasoning); and under `normalize: [lower]` a `Str` literal that
+    // isn't ASCII-lowercase could never be produced, and is rejected rather than lowercased so what
+    // validates is what the operator wrote. A repeated step is a no-op; an empty `normalize:` is
+    // the default.
     for (id, component) in &components {
         if let ComponentKind::KeepValues { resource, attributes } = &component.kind {
             if resource.is_empty() && attributes.is_empty() {
@@ -2506,19 +2086,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 55: a `prometheus_in` is in exactly one mode, and every field belongs to the mode it
-    // is written under (`docs/adr/prometheus-remote-write.md`). `scrape_targets:` is a scrape
-    // client, `bind:` is a remote-write receiver; both together is two components' worth of config
-    // in one, and neither is a component that does nothing at all -- rules 7/12's "can only ever
-    // be a no-op" instinct, with an explicit message instead of a silent start-up that listens on
-    // nothing.
-    //
-    // The wrong-mode checks are rule 45's and rule 53's shape (`handshake_timeout`/`idle_timeout`
-    // on a UDP listener), and they exist for the same reason: a setting that silently does nothing
-    // is worse than a startup failure naming it. Only a *non-default* value is rejected, so a
-    // config that never mentions the other mode's fields is fine in either mode -- which is also
-    // what keeps `interval:` at its default in bind mode, so rule 9's `interval: 0s` rejection
-    // stays satisfied without a mode-specific carve-out there.
+    // Rule 55: a `prometheus_in` is a scrape client (`scrape_targets:`) or a remote-write receiver
+    // (`bind:`), exactly one (`docs/adr/prometheus-remote-write.md`). A non-default field of the
+    // other mode is rejected (rules 45/53's shape). Comparing against defaults is what keeps
+    // `interval` defaulted in bind mode, so rule 9 needs no bind-mode carve-out.
     for (id, component) in &components {
         let ComponentKind::PrometheusIn {
             scrape_targets,
@@ -2549,10 +2120,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             _ => {}
         }
         if bind.is_some() {
-            // Rule 41's check for `prometheus_out`, verbatim in reasoning and nearly so in wording
-            // -- a receiver's `path` is compared against a request URI's own path, which is always
-            // absolute, so a relative or empty one could never match and every write would `404`
-            // against a listener that looks configured.
+            // Rule 41's check, for its reason: a request URI's path is always absolute.
             if !path.starts_with('/') {
                 anyhow::bail!(
                     "component '{id}': prometheus_in path '{path}' must start with '/' -- a \
@@ -2577,11 +2145,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      could never take effect"
                 );
             }
-            // Rule 9's `interval: 0s` reasoning, one field over: a time bound whose zero value
-            // would make the thing it bounds do nothing is a typo, not a setting. An entry that
-            // expires the instant it is written would have the receiver sweep and lock on every
-            // request to keep a table that can never answer -- and `max_families: 0`, which is
-            // *not* rejected, is the spelling that turns the cache off for real.
+            // Rule 9's reasoning: a zero `ttl` expires every entry as it is written, yet the
+            // receiver would still sweep and lock per request. `max_families: 0` turns the cache
+            // off, so `ttl` is unchecked there.
             if metadata_cache.max_families > 0 && metadata_cache.ttl.is_zero() {
                 anyhow::bail!(
                     "component '{id}': 'metadata_cache.ttl' is 0s, so every remembered metric \
@@ -2612,12 +2178,10 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 56: `prometheus_out`'s two modes (`docs/adr/prometheus-remote-write.md`). Exactly one
-    // of `bind:`/`endpoint:`, and a non-default field belonging to the other mode is an error
-    // rather than a setting that silently does nothing -- rules 45/53's shape, for their reason.
-    // Everything else here is the sender's own shape: rule 40's URL, timeout, header and TLS
-    // *scheme* checks, restated against this kind's fields. Rule 41 owns the registry mode's
-    // `path`/`max_series` and runs only when `bind:` is set.
+    // Rule 56: `prometheus_out` is a registry (`bind:`) or a remote-write sender (`endpoint:`),
+    // exactly one (`docs/adr/prometheus-remote-write.md`). A non-default field of the other mode is
+    // rejected (rules 45/53's shape); the sender's own fields get rule 40's checks. Rule 41 owns
+    // the registry's `path`/`max_series`.
     for (id, component) in &components {
         let ComponentKind::PrometheusOut {
             bind,
@@ -2645,10 +2209,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  has nowhere to put anything it's sent"
             ),
             (Some(_), None) => {
-                // Registry mode: every sender-only field must still be at its default. Compared
-                // against the config crate's own defaults rather than literals here, so the
-                // field's default stays legal in both modes and can move without this rule
-                // silently disagreeing with it.
+                // Registry mode: sender-only fields must be at their defaults, compared against
+                // `logit_config`'s default fns so a moved default can't disagree with this rule.
                 if *version != logit_config::RemoteWriteVersion::default() {
                     anyhow::bail!(
                         "component '{id}': 'version' selects the remote-write protocol version \
@@ -2680,8 +2242,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 }
             }
             (None, Some(endpoint)) => {
-                // Sender mode: the registry-only fields must be at their defaults, then the
-                // sender's own fields are checked.
+                // Sender mode: registry-only fields at their defaults, then the sender's own
+                // checks.
                 if path != &logit_config::default_prometheus_path() {
                     anyhow::bail!(
                         "component '{id}': 'path' is the path this sink *serves* an exposition on \
@@ -2716,9 +2278,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          immediately -- use a positive duration"
                     );
                 }
-                // Rule 40's header block, verbatim except for the list and the word "output" --
-                // an operator who wrote one of these meant it to be sent, and a name the sink
-                // sets itself can't be.
+                // Rule 40's header checks, against this sink's own reserved list.
                 let mut seen_lowercase = BTreeSet::new();
                 for name in headers.keys() {
                     if name.is_empty() {
@@ -2745,7 +2305,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         );
                     }
                 }
-                // Rule 24/34/44/52's per-sink `tls:` internals, on this sink's own block.
+                // Rules 24/34/44/52's two consistency checks, on this sink's block.
                 if endpoint_tls.cert_file.is_some() != endpoint_tls.key_file.is_some() {
                     anyhow::bail!(
                         "component '{id}': 'endpoint_tls.cert_file' and 'endpoint_tls.key_file' \
@@ -2760,8 +2320,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          trusts any certificate, which makes a specific trusted CA meaningless"
                     );
                 }
-                // A *scheme* check, exactly rule 40's third TLS check: TLS is selected by the
-                // endpoint's own scheme, so a block under `http://` could only ever be ignored.
+                // Rule 40's scheme check: the endpoint's scheme selects TLS, so a block under
+                // `http://` would be ignored.
                 if !endpoint_tls.is_empty()
                     && !endpoint.to_ascii_lowercase().starts_with("https://")
                 {
@@ -2775,25 +2335,17 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 57: a datagram listener's `receive.read_batch` may not exceed `MAX_READ_BATCH`
+    // Rule 57: a datagram listener's `read_batch` may not exceed `MAX_READ_BATCH`
     // (`docs/adr/udp-intake-batching-and-socket-visibility.md`). `read_batch` is `recvmmsg(2)`'s
-    // `vlen`, and `1024` is `UIO_MAXIOV`'s number -- but `logit` chose it, the kernel did not
-    // impose it. `UIO_MAXIOV` bounds `msg_iovlen` *within one* `msghdr` (`__copy_msghdr`,
-    // `net/socket.c`), which the UDP read path sets to 1; `do_recvmmsg`'s own loop is a plain
-    // `while (datagrams < vlen)` with no clamp, and the only `UIO_MAXIOV` clamp on a `vlen`
-    // anywhere is `__sys_sendmmsg`'s, on the send side. So a larger value would be honoured, not
-    // refused -- what it would cost is a bigger per-listener slab (`read_batch x 65,507` bytes of
-    // address space) and a wider shutdown-path loss. Rejected here so those two costs have a
-    // named ceiling rather than an unbounded one.
+    // `vlen`, and 1024 is `UIO_MAXIOV`'s value, but the ceiling is `logit`'s: `UIO_MAXIOV` bounds
+    // `msg_iovlen` within one `msghdr` (`__copy_msghdr`, `net/socket.c`), which this path sets to
+    // 1, and `do_recvmmsg` loops `while (datagrams < vlen)` with no clamp (only `__sys_sendmmsg`
+    // clamps a `vlen`). A larger value would be honored; the ceiling bounds the per-listener slab
+    // (`read_batch x 65,507` bytes) and the shutdown-path loss.
     //
-    // Rule 18 owns the other end (`read_batch: 0`), the same split the two rules already have for
-    // `max_datagrams`/`max_bytes`. A `read_batch` *larger than* `max_datagrams` is deliberately
-    // **not** an error: `push_many` has a defined answer for a batch bigger than the whole queue
-    // (evict or block per policy, per item, exactly as `push` would), so a rule against it would
-    // only refuse a configuration that works.
-    //
-    // Datagram listeners only -- rule 17 has already rejected a non-default `read_batch` on every
-    // other kind, so a stream or tail listener reaching here carries the default and can't fail.
+    // Rule 18 owns `read_batch: 0`. A `read_batch` above `max_datagrams` is legal: `push_many`
+    // evicts or blocks per item, as `push` would. Only datagram listeners are checked, since rule
+    // 17 has rejected a non-default `read_batch` everywhere else.
     for (id, component) in &components {
         if is_datagram_listener(&component.kind) && component.receive.read_batch > MAX_READ_BATCH {
             anyhow::bail!(
@@ -2805,12 +2357,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 58: a `shape`'s two cumulative-table caps may not be `0`
-    // (`docs/adr/shape-observer-component.md`). Rules 9/15/18/28/45's impossible-bound shape: a cap
-    // of `0` tracks nothing at all, so the gauges the table exists to produce read `0` (and
-    // `tracking_overflow` reads `1`) forever from a component that looks configured. There is no
-    // "turn the table off" spelling on purpose -- the cumulative measurements are half of what
-    // `shape` is for; an operator who doesn't want them removes the component.
+    // Rule 58: a `shape` cap of `0` tracks nothing, so its cumulative gauges would read `0` (and
+    // `tracking_overflow` `1`) forever (`docs/adr/shape-observer-component.md`). There is no "table
+    // off" spelling: those gauges are half of what `shape` is for.
     for (id, component) in &components {
         if let ComponentKind::Shape { max_tracked_keys, max_tracked_keysets, .. } = &component.kind
         {
@@ -2829,14 +2378,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 59: `flatten`-specific validation (`docs/adr/flatten-transform.md`). Neither
-    // `attributes` nor `resource` selecting anything can only ever be a no-op, rules 7/12/54's
-    // "can only ever be a no-op" instinct again. An empty named list could only mean the operator
-    // meant `none` (nothing) or `all` (everything) and wrote a list by mistake instead, so it's
-    // rejected naming both keywords. An empty field name within a named list could never name a
-    // real attribute, rule 19/20/54's reasoning; a field name repeated within one named list is
-    // the same no-op instinct once more. `attributes: all` (the default) is deliberately not
-    // rejected here -- it's the useful default, not a mistake.
+    // Rule 59: `flatten` (`docs/adr/flatten-transform.md`). Both fields `none` is a no-op; an empty
+    // named list meant `none` or `all`, so the message names both; an empty name can't match (rule
+    // 19's reasoning) and a repeated one is a no-op. `attributes: all`, the default, is legal.
     for (id, component) in &components {
         if let ComponentKind::Flatten { attributes, resource, .. } = &component.kind {
             let selects_nothing = |fields: &logit_config::FlattenFields| {
@@ -2879,11 +2423,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 60: `http_access`-specific validation (`docs/adr/http-access-normalization.md`). Every
-    // pattern is compiled here, rule 31's reasoning; the empties are rules 19/20/54's; a route
-    // rule's shape is checked here rather than by serde because an untagged enum's failure names
-    // no key, which is the whole reason `HttpRouteRule` is one flat struct. No "nothing
-    // configured" clause: a bare `http_access` is meaningful.
+    // Rule 60: `http_access` (`docs/adr/http-access-normalization.md`). Every pattern is compiled
+    // here (rule 31's reasoning), and the empties are rules 19/20/54's. A route rule's shape is
+    // checked here rather than by serde because an untagged enum's error names no key, which is why
+    // `HttpRouteRule` is one flat struct. No "nothing configured" check: a bare `http_access` still
+    // normalizes with the built-in tables.
     for (id, component) in &components {
         if let ComponentKind::HttpAccess {
             routes,
@@ -3004,14 +2548,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 61: `sample`-specific validation (`docs/adr/consistent-sampling-component.md`). The
-    // rate's range is rule 16's, word for word -- `sampling::keep` shares `trace_is_sampled`'s
-    // "NaN keeps everything" fallback, which is no more what a typo should get here than there.
-    // Its two no-op edges are rules 7/12/54/59's: `rate: 1` keeps everything and `rate: 0` alone
-    // keeps nothing, but `rate: 0` with `always_keep` is the "only flagged events" mode and
-    // stays. The empties are rules 19/20's; a non-finite override value is rules 36/54's (it can
-    // never compare equal under `value_matches`); `missing:` has nothing to apply to without
-    // `key:`.
+    // Rule 61: `sample` (`docs/adr/consistent-sampling-component.md`). The rate range is rule 16's,
+    // since `sampling::keep` shares `trace_is_sampled`'s NaN-keeps-everything fallback. `rate: 1`
+    // keeps everything and `rate: 0` alone keeps nothing; `rate: 0` with `always_keep` is the "only
+    // flagged events" mode. A non-finite override value never compares equal under `value_matches`
+    // (rules 36/54); `missing:` means nothing without `key:`.
     for (id, component) in &components {
         if let ComponentKind::Sample { rate, key, missing, always_keep } = &component.kind {
             if !rate.is_finite() {
@@ -3087,9 +2628,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     let mut resolved = HashMap::with_capacity(components.len());
     for (id, component) in components {
-        // Slot order is decided here, once, from the raw `Component` -- a `route`'s `routes:`
-        // values collapse to one slot per distinct target, a `lua`/`lua_file`'s `targets:` are
-        // its slots as written (`docs/adr/target-components.md`).
+        // Slot order is fixed here, once (see [`targets_of`]).
         let node_targets: Vec<String> =
             targets_of(&component).into_iter().map(String::from).collect();
         let Component { sources, buffer, receive, kind, targets: _ } = component;
@@ -3110,46 +2649,28 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     Ok(Graph { components: resolved, topological_order })
 }
 
-/// The predicate rule 17 needs: which `ComponentKind`s the UDP listener driver
-/// (`docs/adr/decoupled-listener-io.md`, `logit-inputs::udp::UdpListener`) actually backs.
-/// Kept explicit rather than derived from [`Role`] -- see rule 17's own doc comment -- so a new
-/// listener kind rejects `receive:` until it is actually wired to that driver.
+/// Rules 17/18/57's datagram predicate: the kinds the UDP listener driver backs
+/// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`). An explicit list, not
+/// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,
         ComponentKind::CollectdIn { .. }
-            // Narrowed by `docs/adr/syslog-tcp-ingress-and-tls.md`: a TCP `syslog_in` runs on
-            // the stream driver, which has no `ReceiveQueue` at all -- see
-            // [`is_stream_listener`]. A TCP `graphite_in` is narrowed out for the same reason
-            // (`docs/adr/graphite-carbon-relay.md`), and a TCP `statsd_in` because that same ADR
-            // named it as the driver's third caller.
+            // UDP only: under TCP these run on the stream driver, which has no `ReceiveQueue` (see
+            // [`is_stream_listener`]).
             | ComponentKind::SyslogIn { transport: SyslogTransport::Udp, .. }
             | ComponentKind::GraphiteIn { transport: GraphiteTransport::Udp, .. }
             | ComponentKind::StatsdIn { transport: StatsdTransport::Udp, .. }
     )
 }
 
-/// [`is_datagram_listener`]'s stream-transport counterpart, and the predicate rules 17/18 need
-/// for a **stream** listener: one that assembles batches on the receive side but has no receive
-/// *queue*, because its transport cannot drop silently. Three kinds today, all on the one shared
-/// stream driver (`logit_inputs::tcp::TcpListener`): a TCP `syslog_in`
-/// (`docs/adr/syslog-tcp-ingress-and-tls.md`), a TCP `graphite_in`
-/// (`docs/adr/graphite-carbon-relay.md`'s 2026-09-14 amendment, which moved it off its own accept
-/// loop and onto that driver) and a TCP `statsd_in` (the third adoption that same syslog ADR
-/// named). Still an explicit list rather than "anything with a `transport` field": the next
-/// listener kind to gain one rejects `receive:` until it is genuinely wired to a driver.
-///
-/// Like a tail listener, a stream listener has no receive *queue* -- ADR `decoupled-listener-io`'s
-/// queue exists for a UDP socket's invisible drops, and the connection's own TCP flow control is
-/// the backpressure instead, so a blocked `Fanout::send` simply stops the socket being read and
-/// the peer's window closes. The queue-bounding fields (`max_datagrams`, `max_bytes`, `overflow`,
-/// `receive_buffer_bytes`) are as meaningless on one as they are on a tail listener, and are
-/// rejected by name for the same reason rather than silently ignored; only `receive`'s
-/// batch-assembly and shutdown-grace fields apply, scoped per connection.
-///
-/// Kept explicit alongside [`is_datagram_listener`] and [`is_tail_listener`], never derived from
-/// [`Role`]: a future listener kind rejects `receive:` until it is actually wired to one of the
-/// three drivers.
+/// Rules 17/18's stream predicate: the kinds on the shared stream driver
+/// (`logit_inputs::tcp::TcpListener`), which are `syslog_in`/`graphite_in`/`statsd_in` under TCP.
+/// Such a listener assembles batches per connection but has no receive queue: TCP flow control is
+/// the backpressure, so a blocked `Fanout::send` stops the socket being read and the peer's window
+/// closes. Batch bounds are per connection, so N connections can hold N × `batch_max_events` in
+/// flight (`docs/adr/syslog-tcp-ingress-and-tls.md`). An explicit list, like
+/// [`is_datagram_listener`].
 fn is_stream_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,
@@ -3159,33 +2680,21 @@ fn is_stream_listener(kind: &ComponentKind) -> bool {
     )
 }
 
-/// The predicate rules 17/18/28 need: which `ComponentKind`s the file-tailing driver
-/// (`docs/adr/file-tailing-and-docker-json-logs.md`, `logit_inputs::tail::Tailer`) backs. A tail
-/// listener has no receive *queue* at all -- the tailed file is its own durable buffer, so only
-/// `receive`'s batch-assembly and shutdown-grace fields apply to it, never the queue-bounding
-/// ones a datagram listener's socket needs (`max_datagrams`, `max_bytes`, `overflow`,
-/// `receive_buffer_bytes`). Kept explicit, alongside [`is_datagram_listener`], rather than
-/// derived from [`Role`] -- the same reasoning: a future listener kind rejects `receive:` until
-/// it is actually wired to one of these two drivers.
-///
+/// Rules 17/18/28's tail predicate: the kinds the file-tailing driver backs
+/// (`logit_inputs::tail::Tailer`, `docs/adr/file-tailing-and-docker-json-logs.md`). The tailed file
+/// is its own durable buffer, so there is no receive queue. An explicit list, like
+/// [`is_datagram_listener`].
 fn is_tail_listener(kind: &ComponentKind) -> bool {
     matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
 }
 
-/// Whether `name` is a placeholder `generate_in` substitutes: `seq` (the 0-based event counter)
-/// or `seq%N` with `N >= 1` (that counter modulo `N`, a scenario's cardinality knob).
+/// Whether `name` is a placeholder `generate_in` substitutes: `seq` (the 0-based event counter) or
+/// `seq%N` with `N >= 1` (that counter modulo `N`).
 ///
-/// Pure, and public within this crate's rule 42 only in the sense that it takes a bare `&str`:
-/// `logit-inputs`' own `Template::compile` resolver needs the *same* verdict on the *same*
-/// spelling, and it cannot reach `logit-config` (`docs/design/pipeline-graph.md`'s crate layout),
-/// so keeping the rule a one-argument string predicate is what lets the two stay in step by
-/// inspection rather than by a shared type. `N == 0` is rejected here rather than left to panic
-/// on a modulo by zero at render time.
-///
-/// `N` must be ASCII digits and nothing else -- deliberately narrower than `u64::from_str`, which
-/// also accepts a leading `+`, so `{seq%+5}` is a config error rather than a second spelling of
-/// `{seq%5}`. One spelling per meaning is what keeps this predicate mirrorable by eye in
-/// `logit-inputs`.
+/// A bare-`&str` predicate so `logit-inputs`' `Template::compile` resolver, which can't depend on
+/// `logit-config` (`docs/design/pipeline-graph.md`'s "Crate layout"), can mirror it by eye. `N`
+/// must be ASCII digits only: `u64::from_str` would also accept `+5`, a second spelling of `5`. `N
+/// == 0` is rejected here rather than dividing by zero at render time.
 fn generate_var_is_valid(name: &str) -> bool {
     if name == "seq" {
         return true;
@@ -3243,15 +2752,13 @@ fn check_generate_template(
     Ok(())
 }
 
-/// Rule 26: rejects a `*` anywhere in `path` except its final `/`-separated component --
-/// `logit_inputs::tail::pattern::PathPattern`'s matcher only ever treats the last component as a
-/// pattern, so a wildcard earlier (`/var/*/app.log`) would silently never match anything rather
-/// than doing what its author probably meant.
+/// Rule 26's glob check: `*` is allowed only in `path`'s final `/`-separated component, the only
+/// one `logit_inputs::tail::pattern::PathPattern` treats as a pattern; an earlier one would never
+/// match.
 fn check_tail_glob(id: &str, path: &str) -> anyhow::Result<()> {
     let Some((parent, _last)) = path.rsplit_once('/') else {
-        // No `/` at all isn't a path this driver can use either way, but that's not this rule's
-        // job to say -- an absolute-path requirement is a deployment convention this driver
-        // trusts the operator on, not something graph validation enforces.
+        // No `/` at all isn't this rule's concern: an absolute path is a deployment convention, not
+        // a validation rule.
         return Ok(());
     };
     if parent.contains('*') {
@@ -3263,27 +2770,18 @@ fn check_tail_glob(id: &str, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Kahn's algorithm over the `sources` edges (a source's data flows *into* the component that
-/// names it, so indegree is `sources.len()`). Returns a listener-first order, or a cycle error
-/// naming one concrete cycle recovered from the components still unresolved once no more
-/// zero-indegree nodes remain -- that residual set is the cycle *and* everything downstream of
-/// it (a node fed by a cycle never reaches indegree 0 either), so it is walked back down to a
-/// single cycle rather than reported as-is.
+/// Rule 5: Kahn's algorithm over the component graph. Returns a listener-first order, or an error
+/// naming one concrete cycle.
 fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<Vec<String>> {
-    // Two kinds of edge feed this: a `sources` entry (consumer -> source, walked here as source
-    // -> consumer) and a router -> target direction (`docs/adr/target-components.md`). Both are
-    // real data flow, so both count: a target's indegree counts the routers that direct at it,
-    // which is what makes `router -> target -> .. -> router` the deadlock it would be at runtime
-    // rather than a graph this function silently accepts. `incoming` is built alongside
-    // `outgoing` (rather than indegree being read off `sources.len()`) because the cycle-recovery
-    // walk below has to traverse *both* edge kinds backwards -- `sources` alone dead-ends at a
-    // target, which has none.
+    // Two edge kinds: a `sources` entry and a router -> target direction
+    // (`docs/adr/target-components.md`). Both carry data, so both count toward indegree, which is
+    // what catches `router -> target -> .. -> router`. `incoming` is kept alongside indegree
+    // because the cycle-recovery walk traverses both kinds backwards, and a target has no
+    // `sources`.
     //
-    // An id that names no defined component is skipped on both sides: rule 2 has already
-    // rejected an unresolved `sources` entry by the time this runs, but an unresolved *target*
-    // id is rule 48's, which runs later -- as is a router naming itself, skipped here for the
-    // same reason (rule 48's message says what is wrong; a self-loop reported as a cycle would
-    // not).
+    // An id naming no component is skipped: rule 2 has rejected an unresolved `sources` entry, and
+    // an unresolved or self-directed target is rule 48's, which runs after this, and whose message
+    // is clearer than a cycle report.
     let mut incoming: HashMap<&str, Vec<&str>> =
         components.keys().map(|id| (id.as_str(), Vec::new())).collect();
     let mut outgoing: HashMap<&str, Vec<&str>> =
@@ -3326,12 +2824,10 @@ fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<
     }
 
     if order.len() != components.len() {
-        // Residual indegree marks the cycle *and* everything downstream of it -- a node fed by a
-        // cycle never reaches indegree 0 either. Naming that whole set would blame components
-        // that are merely downstream victims, so walk `incoming` backwards inside it to recover
-        // one real cycle instead. Every stuck node has a stuck source (that's what non-zero
-        // residual indegree means), so the walk can't dead-end, and it must revisit a node within
-        // `stuck.len()` steps.
+        // Residual indegree marks the cycle *and* everything downstream of it. Naming that set
+        // would blame downstream victims, so walk `incoming` backwards within it to one real cycle.
+        // Every stuck node has a stuck source, so the walk can't dead-end and must revisit a node
+        // within `stuck.len()` steps.
         let stuck: BTreeSet<&str> =
             indegree.iter().filter(|(_, &deg)| deg > 0).map(|(&id, _)| id).collect();
         let mut path: Vec<&str> = Vec::new();
@@ -3355,9 +2851,8 @@ fn topological_order(components: &HashMap<String, Component>) -> anyhow::Result<
         // tail that led into the cycle, not part of it.
         let mut cycle: Vec<&str> = path[start..].to_vec();
         cycle.reverse();
-        // Rotate so the lexicographically smallest id leads -- a cosmetic step only (any
-        // rotation names the same cycle), but it keeps the message independent of which stuck
-        // node the backward walk happened to start from.
+        // Rotate so the smallest id leads, making the message independent of where the walk
+        // started.
         let min_idx = cycle.iter().enumerate().min_by_key(|(_, id)| *id).map(|(i, _)| i).expect(
             "cycle is non-empty: the loop above always pushes at least one node before repeating",
         );
@@ -3407,8 +2902,7 @@ mod tests {
         Config { components: map, ..Default::default() }
     }
 
-    /// Same as [`cfg`], but with an explicit `receive` on one component -- for rules 16/17's
-    /// tests.
+    /// Same as [`cfg`], but with an explicit `receive` on one component, for rules 17/18's tests.
     fn cfg_with_receive(
         components: Vec<(&str, Vec<&str>, ComponentKind, ReceiveConfig)>,
     ) -> Config {
@@ -3428,11 +2922,9 @@ mod tests {
         Config { components: map, ..Default::default() }
     }
 
-    /// One raw `Component`, for the tests that call a pure function
-    /// ([`targets_of`]/[`target_edges`]/[`topological_order`]) directly instead of going through
-    /// [`resolve`] -- which is how a *success* path involving a `target`/`route` is asserted at
-    /// all while rule 8 still rejects both kinds as unimplemented (W4,
-    /// `docs/plans/target-components.md`).
+    /// One raw `Component`, for tests that call
+    /// [`targets_of`]/[`target_edges`]/[`topological_order`] directly rather than through
+    /// [`resolve`].
     fn component(sources: Vec<&str>, targets: Vec<&str>, kind: ComponentKind) -> Component {
         Component {
             sources: sources.into_iter().map(String::from).collect(),
@@ -3735,9 +3227,9 @@ mod tests {
         ComponentKind::NullOut {}
     }
 
-    /// `Graph` isn't `Debug` (it embeds `ComponentKind`, which isn't either), so
-    /// `Result::expect_err` -- which needs `Debug` on the `Ok` side to format its panic message --
-    /// doesn't work here. Same reason `logit-cli::pipeline` has its own `expect_err` helper.
+    /// `Result::expect_err` needs `Debug` on the `Ok` side, and `Graph` isn't `Debug` (it embeds
+    /// `ComponentKind`, which isn't either). `logit-cli::pipeline` has its own helper for the same
+    /// reason.
     fn expect_err(config: Config) -> String {
         match resolve(config) {
             Ok(_) => panic!("expected resolution to fail"),
@@ -3763,9 +3255,8 @@ mod tests {
         assert!(err.contains("lists itself as a source"), "got: {err}");
     }
 
-    /// A repeated source id would otherwise push the same consumer into `consumers` twice, giving
-    /// that source's `Fanout` two live `Sender` clones pointing at the same inbox -- silently
-    /// doubling every batch delivered, not a cosmetic issue.
+    /// Rule 4: a repeated source would give that source's `Fanout` two senders into one inbox,
+    /// doubling every batch.
     #[test]
     fn duplicate_source_within_one_component_is_rejected() {
         let err =
@@ -3799,9 +3290,8 @@ mod tests {
         assert!(err.contains("cycle: a -> b -> c -> a"), "got: {err}");
     }
 
-    /// The regression this exists for: residual indegree marks the cycle *and* everything
-    /// downstream of it, since a node fed by a cycle never reaches indegree 0 either. The message
-    /// must name only the cycle, not `out`, which is merely a downstream victim.
+    /// Rule 5's error names only the cycle, not `out`, which is merely downstream of it (residual
+    /// indegree marks both).
     #[test]
     fn a_cycle_error_does_not_name_components_downstream_of_it() {
         let err = expect_err(cfg(vec![
@@ -3955,9 +3445,7 @@ mod tests {
         assert_eq!(graph.components["in"].consumers, vec!["enrich"]);
     }
 
-    /// The headline regression test: today's `validate_semantics` rejects an input/output
-    /// referenced by more than one pipeline outright. A sink with two independent upstream
-    /// branches must now be *accepted*.
+    /// A sink fed by two independent branches resolves: sharing needs no rule.
     #[test]
     fn a_sink_shared_by_two_branches_is_accepted() {
         let graph = resolve(cfg(vec![
@@ -4414,8 +3902,7 @@ mod tests {
 
     #[test]
     fn the_same_key_in_both_maps_resolves_fine() {
-        // resource: and attributes: address different objects, so a shared key name is
-        // meaningful configuration, not a mistake -- deliberately not rejected.
+        // resource: and attributes: address different objects, so a shared key name is legal.
         resolve(cfg(vec![
             ("in", vec![], listener()),
             (
@@ -4493,10 +3980,8 @@ mod tests {
 
     #[test]
     fn an_otlp_out_with_a_grpc_header_not_on_the_fixed_reserved_list_is_still_rejected() {
-        // Regression guard: RESERVED_OTLP_HEADERS deliberately no longer lists every gRPC header
-        // name individually -- any `grpc-*` header is reserved by prefix, not by exact match, so
-        // a header this project doesn't itself set (e.g. `grpc-trace-bin`, part of the gRPC wire
-        // protocol but never used by `crates/logit-outputs/src/otlp.rs`) is still rejected.
+        // `grpc-*` is reserved by prefix, so a gRPC header the transport never sets
+        // (`grpc-trace-bin`) is still rejected.
         let err = expect_err(cfg(vec![
             ("in", vec![], listener()),
             ("out", vec!["in"], otlp_out_with_headers(vec![("grpc-trace-bin", "x")])),
@@ -5549,14 +5034,14 @@ mod tests {
         .expect("should resolve");
     }
 
-    /// Rule 60 (a), route half.
+    /// Rule 60: an uncompilable `routes` match.
     #[test]
     fn an_http_access_route_with_an_uncompilable_match_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, Some("(unclosed"), Some("/"))]));
         assert!(err.contains("routes[0]") && err.contains("not a valid regex"), "{err}");
     }
 
-    /// Rule 60 (a), user-agent half.
+    /// Rule 60: an uncompilable `user_agent_rules` match.
     #[test]
     fn an_http_access_user_agent_rule_with_an_uncompilable_match_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5570,21 +5055,21 @@ mod tests {
         assert!(err.contains("user_agent_rules[0]") && err.contains("not a valid regex"), "{err}");
     }
 
-    /// Rule 60 (b): an empty `match`.
+    /// Rule 60: an empty `match`.
     #[test]
     fn an_http_access_empty_match_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, Some(""), Some("/"))]));
         assert!(err.contains("'match' must not be empty"), "{err}");
     }
 
-    /// Rule 60 (b): an empty `route`.
+    /// Rule 60: an empty `route`.
     #[test]
     fn an_http_access_empty_route_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, Some("^/$"), Some(""))]));
         assert!(err.contains("'route' must not be empty"), "{err}");
     }
 
-    /// Rule 60 (b): an empty `class`.
+    /// Rule 60: an empty `class`.
     #[test]
     fn an_http_access_empty_class_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5598,7 +5083,7 @@ mod tests {
         assert!(err.contains("'class' must not be empty"), "{err}");
     }
 
-    /// Rule 60 (b): an empty `route_other`.
+    /// Rule 60: an empty `route_other`.
     #[test]
     fn an_http_access_empty_route_other_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5609,7 +5094,7 @@ mod tests {
         assert!(err.contains("'route_other' must not be empty"), "{err}");
     }
 
-    /// Rule 60 (b): an empty `redact_query` entry.
+    /// Rule 60: an empty `redact_query` entry.
     #[test]
     fn an_http_access_empty_redact_query_entry_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5620,7 +5105,7 @@ mod tests {
         assert!(err.contains("'redact_query' entry must not be empty"), "{err}");
     }
 
-    /// Rule 60 (c): `builtin` and `match` together.
+    /// Rule 60: `builtin` and `match` together.
     #[test]
     fn an_http_access_route_with_builtin_and_match_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(
@@ -5631,7 +5116,7 @@ mod tests {
         assert!(err.contains("both 'builtin' and 'match'"), "{err}");
     }
 
-    /// Rule 60 (c): `builtin` and `route` together.
+    /// Rule 60: `builtin` and `route` together.
     #[test]
     fn an_http_access_route_with_builtin_and_route_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(
@@ -5642,28 +5127,28 @@ mod tests {
         assert!(err.contains("both 'builtin' and 'route'"), "{err}");
     }
 
-    /// Rule 60 (c): `match` without `route`.
+    /// Rule 60: `match` without `route`.
     #[test]
     fn an_http_access_route_with_match_but_no_route_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, Some("^/$"), None)]));
         assert!(err.contains("has 'match' but no 'route'"), "{err}");
     }
 
-    /// Rule 60 (c): `route` without `match`.
+    /// Rule 60: `route` without `match`.
     #[test]
     fn an_http_access_route_with_route_but_no_match_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, None, Some("/"))]));
         assert!(err.contains("has 'route' but no 'match'"), "{err}");
     }
 
-    /// Rule 60 (c): an entry with nothing in it.
+    /// Rule 60: an entry with nothing in it.
     #[test]
     fn an_http_access_empty_route_rule_is_rejected() {
         let err = http_access_err(set_routes(vec![route_rule(None, None, None)]));
         assert!(err.contains("routes[0] is empty"), "{err}");
     }
 
-    /// Rule 60 (d).
+    /// Rule 60: a repeated `builtin` set.
     #[test]
     fn an_http_access_repeated_builtin_is_rejected() {
         let err = http_access_err(set_routes(vec![
@@ -5674,7 +5159,7 @@ mod tests {
         assert!(err.contains("routes[2] repeats 'builtin: assets'"), "{err}");
     }
 
-    /// Rule 60 (e): the error lists the valid keys.
+    /// Rule 60: a `max_length` key `http_access` never caps; the error lists the valid keys.
     #[test]
     fn an_http_access_max_length_for_an_uncapped_field_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5685,7 +5170,7 @@ mod tests {
         assert!(err.contains("'url.paths'") && err.contains("valid keys: url.path,"), "{err}");
     }
 
-    /// Rule 60 (f).
+    /// Rule 60: a `max_length` of `0`.
     #[test]
     fn an_http_access_zero_max_length_is_rejected() {
         let err = http_access_err(|kind| {
@@ -5696,7 +5181,7 @@ mod tests {
         assert!(err.contains("'url.path' is 0"), "{err}");
     }
 
-    /// Rule 60 (g).
+    /// Rule 60: `forwarded: {trust: false}`, the default spelled out.
     #[test]
     fn an_http_access_forwarded_trust_false_is_rejected() {
         let err = http_access_err(|kind| {
@@ -6025,9 +5510,7 @@ mod tests {
         assert_eq!(kind_name(&sink()), "influxdb_out");
     }
 
-    /// `target`/`route` are real, *implemented* `ComponentKind` variants as of W4
-    /// (`docs/plans/target-components.md`) -- `is_implemented` now recognizes both, so an
-    /// otherwise-valid config (rules 47-51) resolves instead of being rejected by rule 8.
+    /// A valid router -> target config resolves (rules 47-51).
     #[test]
     fn a_target_and_its_router_resolve() {
         let graph = resolve(cfg_with_targets(vec![
@@ -6071,10 +5554,7 @@ mod tests {
         );
     }
 
-    // Rules 43-47 (`docs/adr/target-components.md`). Every *success* path below is asserted by
-    // calling the pure function directly rather than through `resolve`: rule 8 still rejects
-    // `target`/`route` as unimplemented until W4, so a config that reaches the end of validation
-    // is not something `resolve` can return `Ok` for yet.
+    // Rules 47-51 (`docs/adr/target-components.md`).
 
     #[test]
     fn targets_on_a_non_router_kind_is_rejected() {
@@ -6147,8 +5627,7 @@ mod tests {
         assert!(err.contains("lists target 't' more than once"), "got: {err}");
     }
 
-    /// Many-to-one is what `routes:` is for, so it is legal and collapses to a single slot --
-    /// asserted on `targets_of` directly, since rule 8 would reject the config as unimplemented.
+    /// Many-to-one is what `routes:` is for, so it is legal and collapses to one slot.
     #[test]
     fn a_many_to_one_route_map_is_legal_and_collapses_to_one_slot() {
         let router = component(
@@ -6193,9 +5672,8 @@ mod tests {
         assert!(err.contains("'t': is a target that no router directs to"), "got: {err}");
     }
 
-    /// Rule 50: a router whose every event is routed has no ordinary consumers, and that is a
-    /// real config -- its unrouted events are dropped and counted at runtime, not silently lost.
-    /// It must therefore resolve rather than being rejected by rule 7.
+    /// Rule 50: a router whose every event is routed needs no ordinary consumer, so rule 7 doesn't
+    /// reject it.
     #[test]
     fn a_router_with_targets_but_no_consumers_resolves() {
         let graph = resolve(cfg_with_targets(vec![
@@ -6230,8 +5708,8 @@ mod tests {
         assert!(err.contains("a route 'routes' key must not be empty"), "got: {err}");
     }
 
-    /// Rule 51 runs before rule 48 precisely so this reads as an empty value rather than as an
-    /// unresolved target id named `''`.
+    /// Rule 51 runs before rule 48, so this reads as an empty value rather than an unknown target
+    /// `''`.
     #[test]
     fn a_route_with_an_empty_routes_value_is_rejected() {
         let err = expect_err(cfg_with_targets(vec![
@@ -6253,9 +5731,7 @@ mod tests {
         assert!(err.contains("'by: {attribute: ..}' key name must not be empty"), "got: {err}");
     }
 
-    /// Router -> target edges are real edges, so a loop closed through a target is the deadlock
-    /// rule 5 exists to catch. Rule 5 runs well before rule 8, so `resolve` reports it even
-    /// though both kinds are still unimplemented.
+    /// Rule 5: router -> target edges count, so a loop closed through a target is a cycle.
     #[test]
     fn a_cycle_through_a_target_is_detected() {
         let err = expect_err(cfg_with_targets(vec![
@@ -6279,9 +5755,7 @@ mod tests {
         assert_eq!(order, vec!["in", "r", "t", "out"]);
     }
 
-    /// Fan-in at a target: two routers directing at one target is two inbound edges, so the
-    /// target sorts after *both* -- an indegree of 1 would emit it as soon as the first router
-    /// was visited (and underflow on the second).
+    /// Fan-in at a target counts both inbound edges, so the target sorts after both routers.
     #[test]
     fn a_target_fed_by_two_routers_has_indegree_two() {
         let components = components_map(vec![
@@ -6460,8 +5934,8 @@ mod tests {
 
     #[test]
     fn a_default_buffer_on_a_non_sink_validates_fine() {
-        // An explicitly-written but all-default `buffer: {}` on a non-sink is indistinguishable
-        // from an omitted block -- rule 14 only rejects a genuinely *non-default* value.
+        // An explicit but all-default `buffer: {}` is indistinguishable from an omitted block; rule
+        // 14 rejects only a non-default value.
         let graph = resolve(cfg_with_buffer(vec![
             ("in", vec![], listener(), BufferConfig::default()),
             ("enrich", vec!["in"], lua(), BufferConfig::default()),
@@ -6516,9 +5990,8 @@ mod tests {
         );
     }
 
-    /// The reason rule 17 checks a dedicated predicate rather than `role() == Role::Listener`:
-    /// `internal` is a listener by role but has no socket, no queue, and no decoder, so a
-    /// `receive:` block on it must be rejected just as clearly as on a sink or a transform.
+    /// Rule 17: `internal` is a listener by role but has no socket, queue, or decoder, so
+    /// `receive:` on it is rejected like on a sink or transform.
     #[test]
     fn a_non_default_receive_on_internal_is_rejected() {
         let err = expect_err(cfg_with_receive(vec![
@@ -6545,8 +6018,8 @@ mod tests {
 
     #[test]
     fn a_default_receive_on_a_non_listener_validates_fine() {
-        // An explicitly-written but all-default `receive: {}` is indistinguishable from an
-        // omitted block -- rule 17 only rejects a genuinely *non-default* value.
+        // An explicit but all-default `receive: {}` is indistinguishable from an omitted block;
+        // rule 17 rejects only a non-default value.
         let graph = resolve(cfg_with_receive(vec![
             ("in", vec![], listener(), ReceiveConfig::default()),
             ("enrich", vec!["in"], lua(), ReceiveConfig::default()),
@@ -6623,10 +6096,8 @@ mod tests {
         assert!(err.contains("read_batch"), "got: {err}");
     }
 
-    /// Rule 57: above `MAX_READ_BATCH` the per-listener slab and the shutdown-path loss both grow
-    /// without a named bound, so the config is rejected -- with `UIO_MAXIOV` in the message,
-    /// because that is where the number comes from even though the kernel imposes no such limit
-    /// on `recvmmsg`'s `vlen` (see the rule's own comment).
+    /// Rule 57: a `read_batch` above `MAX_READ_BATCH` is rejected, with `UIO_MAXIOV` named in the
+    /// message as the number's source.
     #[test]
     fn a_listeners_read_batch_above_uio_maxiov_is_rejected() {
         let err = expect_err(cfg_with_receive(vec![
@@ -6660,9 +6131,8 @@ mod tests {
         assert_eq!(graph.components["in"].receive.read_batch, MAX_READ_BATCH);
     }
 
-    /// Deliberately legal, and pinned so it stays that way: `push_many` has a defined answer for a
-    /// batch larger than the whole queue (evict or block per policy, per item), so a rule against
-    /// this combination would only refuse a configuration that works -- see rule 57's own comment.
+    /// A `read_batch` above `max_datagrams` is legal: `push_many` handles a batch larger than the
+    /// whole queue (rule 57).
     #[test]
     fn a_read_batch_larger_than_max_datagrams_validates_fine() {
         let graph = resolve(cfg_with_receive(vec![
@@ -6697,9 +6167,9 @@ mod tests {
         assert!(err.contains("a stream listener has no receive queue"), "got: {err}");
     }
 
-    /// The default is 64, and it is the same 64 `UdpListenerConfig::default` carries -- the two
-    /// live in different crates (`logit-inputs` deliberately does not depend on `logit-config`),
-    /// so nothing but a test can hold them together.
+    /// The default is the same 64 `UdpListenerConfig::default` carries. They live in different
+    /// crates (`logit-inputs` doesn't depend on `logit-config`), so only a test holds them
+    /// together.
     #[test]
     fn the_default_read_batch_is_sixty_four() {
         assert_eq!(ReceiveConfig::default().read_batch, 64);
@@ -6779,7 +6249,7 @@ mod tests {
         assert!(err.contains("DTLS"), "got: {err}");
     }
 
-    /// Rule 43's other side: TLS over TCP is exactly what RFC 5425 is.
+    /// Rule 43's other side: TLS over TCP is RFC 5425.
     #[test]
     fn tls_on_a_tcp_syslog_in_validates_fine() {
         resolve(cfg(vec![
@@ -6789,7 +6259,7 @@ mod tests {
         .expect("a TLS-terminating TCP syslog_in is the RFC 5425 shape");
     }
 
-    /// And rule 43 says nothing about a plaintext TCP listener, which stays perfectly legal.
+    /// Rule 43 doesn't touch a plaintext TCP listener.
     #[test]
     fn a_plaintext_tcp_syslog_in_validates_fine() {
         resolve(cfg(vec![
@@ -6799,9 +6269,8 @@ mod tests {
         .expect("TCP without TLS is a perfectly ordinary syslog listener");
     }
 
-    /// Rule 17: a TCP `syslog_in` has no receive queue at all -- the connection's own flow
-    /// control is the backpressure -- so a queue-only field is rejected by name, with the reason
-    /// spelled out rather than left as "not a datagram listener".
+    /// Rule 17: a TCP `syslog_in` has no receive queue, so a queue field is rejected by name, with
+    /// the reason in the message.
     #[test]
     fn a_receive_queue_field_on_a_tcp_syslog_in_is_rejected_naming_the_field() {
         let err = expect_err(cfg_with_receive(vec![
@@ -6831,7 +6300,7 @@ mod tests {
         assert_eq!(graph.components["in"].receive.batch_max_events, 1);
     }
 
-    /// Narrowing `is_datagram_listener` must not have cost the UDP arm its queue fields.
+    /// A UDP `syslog_in` keeps its queue fields.
     #[test]
     fn a_receive_queue_field_on_a_udp_syslog_in_still_validates_fine() {
         let graph = resolve(cfg_with_receive(vec![
@@ -6842,9 +6311,8 @@ mod tests {
         assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
     }
 
-    /// Rule 18: an impossible batch bound stays impossible on the stream path too -- without
-    /// `is_stream_listener` in rule 18's second loop, a TCP `syslog_in` would have slipped
-    /// through with `batch_max_events: 0` and accumulated forever.
+    /// Rule 18 reaches a TCP `syslog_in` through `is_stream_listener`: with `batch_max_events: 0`
+    /// it would accumulate forever.
     #[test]
     fn a_zero_batch_max_events_on_a_tcp_syslog_in_is_rejected() {
         let err = expect_err(cfg_with_receive(vec![
@@ -7214,9 +6682,8 @@ mod tests {
         }
     }
 
-    /// Rule 53's `logit_in` shape -- the `Option` that rule reads. No `transport:` to vary,
-    /// unlike its three siblings: a `logit_in` is TCP by construction, so the rule's context
-    /// check can never fire here and only the zero one can.
+    /// Rule 53's `logit_in` shape. `logit_in` is TCP by construction, so only the zero check can
+    /// fire.
     fn logit_in_with_idle_timeout(idle_timeout: Option<Duration>) -> ComponentKind {
         ComponentKind::LogitIn {
             bind: "0.0.0.0:5140".to_string(),
@@ -7238,9 +6705,8 @@ mod tests {
         }
     }
 
-    /// [`otlp_in_with_handshake_timeout`] with rule 53's knob exposed instead -- and no
-    /// `transport` parameter, since `otlp_in` has no datagram transport for that half of the rule
-    /// to reject.
+    /// [`otlp_in_with_handshake_timeout`] with rule 53's knob exposed instead. `otlp_in` has no
+    /// datagram transport, so there is no `transport` parameter.
     fn otlp_in_with_idle_timeout(idle_timeout: Option<Duration>) -> ComponentKind {
         ComponentKind::OtlpIn {
             bind: "0.0.0.0:4317".to_string(),
@@ -7298,9 +6764,8 @@ mod tests {
         assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
     }
 
-    /// Rule 44's own third check, which rule 34 has no counterpart for: syslog over TLS is RFC
-    /// 5425, TLS over *TCP*. A `tls:` block under `transport: udp` would otherwise be silently
-    /// ignored, leaving an operator who asked for encryption with a plaintext datagram socket.
+    /// Rule 44's third check, which rule 34 lacks: syslog over TLS is RFC 5425, TLS over TCP, so
+    /// `tls:` under `transport: udp` is rejected.
     #[test]
     fn a_syslog_out_with_tls_under_transport_udp_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -7361,9 +6826,7 @@ mod tests {
         assert!(err.contains("insecure_skip_verify") && err.contains("ca_file"), "got: {err}");
     }
 
-    /// Rule 52's own third check, rule 44's verbatim: DTLS is out of scope here too, so a `tls:`
-    /// block under `transport: udp` is rejected rather than silently ignored -- which would leave
-    /// an operator who asked for encryption with a plaintext datagram socket.
+    /// Rule 52's third check, rule 44's verbatim: `tls:` under `transport: udp` is rejected.
     #[test]
     fn a_statsd_out_with_tls_under_transport_udp_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -7380,9 +6843,7 @@ mod tests {
         assert!(err.contains("DTLS") && err.contains("transport: tcp"), "got: {err}");
     }
 
-    /// The positive case: a consistent `tls:` block on the TCP transport resolves, so the three
-    /// rejections above are pinning a real distinction rather than rejecting every `tls:` block
-    /// that reaches this sink.
+    /// A consistent `tls:` block on TCP resolves, so the rejections above are specific.
     #[test]
     fn a_statsd_out_with_a_consistent_tls_block_over_tcp_resolves() {
         let tls = logit_config::TlsClientConfig {
@@ -7400,10 +6861,8 @@ mod tests {
 
     // ---- Rule 45: `handshake_timeout` on the five TCP listeners ---------------------------------
 
-    /// `0s` cannot be met by any handshake, so a listener configured with it would accept
-    /// connections only to close each one immediately -- an impossible bound, rejected the way
-    /// rules 9/15/18/28 reject theirs. One test per kind, because the rule reads the field off
-    /// three separate variants.
+    /// Rule 45: `0s` would close every connection on accept. One test per kind, since each variant
+    /// carries its own field.
     #[test]
     fn a_zero_handshake_timeout_is_rejected_on_a_tcp_syslog_in() {
         let err = expect_err(cfg(vec![
@@ -7435,8 +6894,7 @@ mod tests {
         assert!(err.contains("handshake_timeout") && err.contains("0s"), "got: {err}");
     }
 
-    /// Rule 43's spirit on this field: a UDP `syslog_in` has no connection, so a
-    /// `handshake_timeout` there could never take effect. Set-but-ignored is an error.
+    /// Rule 45: a non-default `handshake_timeout` on a UDP `syslog_in` could never take effect.
     #[test]
     fn a_non_default_handshake_timeout_under_transport_udp_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -7454,11 +6912,9 @@ mod tests {
         assert!(err.contains("handshake_timeout") && err.contains("transport: tcp"), "got: {err}");
     }
 
-    /// A plaintext `otlp_in` used to be the second context check here -- rejected, because that
-    /// listener's budget once bounded its TLS accept alone. It now also bounds the wait for a
-    /// plaintext connection's first byte (`crates/logit-inputs/src/otlp.rs`'s "peek, not a read"
-    /// section), so a real value there is live rather than a no-op and the rule no longer names
-    /// `otlp_in` at all. The twin of the removed rejection test.
+    /// Rule 45 has no context check for `otlp_in`: its budget also bounds a plaintext connection's
+    /// first-byte wait (`crates/logit-inputs/src/otlp.rs`'s "peek, not a read"), so a value is live
+    /// without `tls:`.
     #[test]
     fn a_non_default_handshake_timeout_on_a_plaintext_otlp_in_resolves_fine() {
         resolve(cfg(vec![
@@ -7468,8 +6924,7 @@ mod tests {
         .expect("a plaintext otlp_in with a real handshake_timeout should resolve");
     }
 
-    /// And the same value on an `otlp_in` that really terminates TLS is ordinary -- the check is
-    /// about the missing `tls:` block, not about `otlp_in`.
+    /// The same value on a TLS-terminating `otlp_in` resolves too.
     #[test]
     fn a_non_default_handshake_timeout_on_a_tls_otlp_in_resolves_fine() {
         let kind = ComponentKind::OtlpIn {
@@ -7487,11 +6942,9 @@ mod tests {
             .expect("a TLS otlp_in with a real handshake_timeout should resolve");
     }
 
-    /// The other side of that check, and what keeps every existing UDP `syslog_in:` config in the
-    /// wild valid: the field's own default is not a set value, so it resolves fine under UDP.
-    /// Deliberately deserializes a real config rather than constructing the variant by hand, so
-    /// it exercises `serde`'s defaulting path -- the thing rule 45's comparison against
-    /// [`default_handshake_timeout`] actually has to agree with.
+    /// A UDP `syslog_in` at the default `handshake_timeout` resolves. Deserializes a real config,
+    /// so it exercises the `serde` defaulting path rule 45's comparison against
+    /// [`default_handshake_timeout`] must agree with.
     #[test]
     fn a_udp_syslog_in_at_the_default_handshake_timeout_resolves_fine() {
         let component: logit_config::Component =
@@ -7501,7 +6954,7 @@ mod tests {
             .expect("a defaulted handshake_timeout under UDP should resolve");
     }
 
-    /// And a non-default value on the transport that actually has a handshake is ordinary.
+    /// A non-default value under `transport: tcp` resolves.
     #[test]
     fn a_non_default_handshake_timeout_on_a_tcp_syslog_in_resolves_fine() {
         resolve(cfg(vec![
@@ -7521,15 +6974,11 @@ mod tests {
 
     // ---- Rule 53: `idle_timeout` on a TCP listener ----------------------------------------------
     //
-    // Rule 45's tests one field over. The shapes differ in one way worth seeing in the test
-    // names: because `idle_timeout` is an `Option`, *any* value under `transport: udp` is
-    // rejected, not just a non-default one -- there is no default to exempt.
+    // Rule 45's tests one field over, except that `idle_timeout` is an `Option`, so *any* value
+    // under `transport: udp` is rejected, not only a non-default one.
 
-    /// `0s` would close a connection the instant this listener stopped reading from it -- every
-    /// connection is momentarily idle between frames. An impossible bound, rejected the way rules
-    /// 9/15/18/28/45 reject theirs, with a message naming the fix, since the way to turn the
-    /// feature off is to omit the field rather than to set a sentinel value. One test per kind,
-    /// because the rule reads the field off three separate variants.
+    /// Rule 53: `0s` would close every connection the moment it paused, so it is rejected with a
+    /// message saying to omit the field instead. One test per kind with a `transport`.
     #[test]
     fn a_zero_idle_timeout_is_rejected_on_a_syslog_in() {
         let err = expect_err(cfg(vec![
@@ -7561,8 +7010,7 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
-    /// The same check on the one kind with no `transport:` to pair it with -- a `logit_in` is TCP
-    /// by construction, so `0s` is the only way rule 53 can reject one of these.
+    /// The zero check on `logit_in`, TCP by construction.
     #[test]
     fn a_zero_idle_timeout_is_rejected_on_a_logit_in() {
         let err = expect_err(cfg(vec![
@@ -7572,9 +7020,8 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
-    /// `otlp_in` has no datagram transport to reject a value under either, so the zero check is
-    /// the only half of this rule that can fire on it -- and it fires with the identical message,
-    /// off the same loop body.
+    /// The zero check on `otlp_in`, with the identical message: it has no datagram transport
+    /// either.
     #[test]
     fn a_zero_idle_timeout_is_rejected_on_an_otlp_in() {
         let err = expect_err(cfg(vec![
@@ -7584,9 +7031,8 @@ mod tests {
         assert!(err.contains("idle_timeout") && err.contains("omit the field"), "got: {err}");
     }
 
-    /// Rule 43's spirit on this field, rule 45's context check one field over: a UDP listener has
-    /// no connection to time out, so an `idle_timeout` there could never take effect and
-    /// set-but-ignored is an error. One test per kind, since each reads its own `transport`.
+    /// Rule 53: any `idle_timeout` on a UDP listener is rejected, since it has no connection to
+    /// time out. One test per kind, since each reads its own `transport`.
     #[test]
     fn a_set_idle_timeout_under_transport_udp_is_rejected_on_a_syslog_in() {
         let err = expect_err(cfg(vec![
@@ -7644,8 +7090,7 @@ mod tests {
         );
     }
 
-    /// And the ordinary case on every kind: a real value on the transport that actually has a
-    /// connection to time out.
+    /// A real value on a connection-oriented transport resolves, on every kind.
     #[test]
     fn a_set_idle_timeout_on_a_tcp_listener_resolves_fine() {
         for kind in [
@@ -7660,11 +7105,8 @@ mod tests {
         }
     }
 
-    /// The other side of the context check, and what keeps every existing UDP config in the wild
-    /// valid: the field is absent by default, and absent is not a set value. Deliberately
-    /// deserializes a real config rather than constructing the variant by hand, so it exercises
-    /// `serde`'s `#[serde(default)]` path -- the thing rule 53's `Option` match actually has to
-    /// agree with.
+    /// A UDP config that omits `idle_timeout` resolves. Deserializes a real config, so it exercises
+    /// the `#[serde(default)]` path rule 53's `Option` match must agree with.
     #[test]
     fn a_udp_syslog_in_with_no_idle_timeout_resolves_fine() {
         let component: logit_config::Component =
@@ -7915,8 +7357,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
     }
 
-    /// Rule 38: `max_packet_bytes: 0` would drop every metric line -- an impossible bound, not a
-    /// small one, the same shape as rule 15's `buffer.max_batches`/`max_bytes: 0`.
+    /// Rule 38: `max_packet_bytes: 0` would drop every metric line.
     #[test]
     fn a_zero_max_packet_bytes_is_rejected() {
         let err =
@@ -7939,8 +7380,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("sink"), "got: {err}");
     }
 
-    /// Rule 38 (extended): `collectd_out`'s `max_packet_bytes: 0` is the same impossible bound as
-    /// `statsd_out`'s own.
+    /// Rule 38: `collectd_out`'s `max_packet_bytes: 0`.
     #[test]
     fn a_zero_max_packet_bytes_is_rejected_for_collectd_out_too() {
         let err =
@@ -7948,7 +7388,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("max_packet_bytes: 0"), "got: {err}");
     }
 
-    /// Rule 38's `collectd_out`-only range check: below collectd's own `MaxPacketSize` minimum.
+    /// Rule 38's `collectd_out` range check, below collectd's own `MaxPacketSize` minimum.
     #[test]
     fn a_max_packet_bytes_below_1024_is_rejected_for_collectd_out() {
         let err = expect_err(cfg(vec![
@@ -7958,9 +7398,8 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
     }
 
-    /// Rule 38's `collectd_out`-only range check: above `u16::MAX`, which no UDP datagram can
-    /// ever actually carry (every send would fail `EMSGSIZE`, silently reported as a successful
-    /// request -- the finding this range check exists to close).
+    /// Rule 38's `collectd_out` range check, above `u16::MAX`: every send would fail `EMSGSIZE`
+    /// while reporting success.
     #[test]
     fn a_max_packet_bytes_above_65535_is_rejected_for_collectd_out() {
         let err = expect_err(cfg(vec![
@@ -7970,8 +7409,7 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("1024..=65535"), "got: {err}");
     }
 
-    /// Both ends of `1024..=65535` are legal -- an off-by-one in the range check would reject one
-    /// of these.
+    /// Both ends of `1024..=65535` are legal.
     #[test]
     fn max_packet_bytes_at_either_bound_is_accepted_for_collectd_out() {
         for bound in [1024u64, 65535] {
@@ -8058,8 +7496,7 @@ mod tests {
         .expect("pickle over tcp should resolve fine");
     }
 
-    /// Rule 38 (`graphite_out`'s zero check): `max_packet_bytes: 0` would drop every plaintext
-    /// line -- the same impossible bound as `statsd_out`'s/`collectd_out`'s own.
+    /// Rule 38: `graphite_out`'s `max_packet_bytes: 0`.
     #[test]
     fn a_zero_max_packet_bytes_graphite_out_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -8161,9 +7598,8 @@ mod tests {
         }
     }
 
-    /// Rule 39: `temporality: cumulative` with no retention can only ever emit each window's own
-    /// increment labelled as a running total -- an impossible combination, not a tuning choice
-    /// (`docs/adr/aggregation-window-semantics.md`'s cumulative amendment).
+    /// Rule 39: cumulative with no retention would label each window's own increment a running
+    /// total.
     #[test]
     fn a_cumulative_aggregate_with_zero_series_retention_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -8190,9 +7626,8 @@ mod tests {
         assert!(err.contains("max_retained_series"), "got: {err}");
     }
 
-    /// Rule 39 is scoped to `cumulative`: `series_retention: 0` stays legal in `delta` mode, where
-    /// it is the documented opt-out reproducing the strictly-tumbling behavior every config had
-    /// before retention existed.
+    /// Rule 39 is scoped to `cumulative`: in `delta` mode `series_retention: 0` is the documented
+    /// opt-out to strictly tumbling windows.
     #[test]
     fn a_delta_aggregate_with_zero_series_retention_is_accepted() {
         resolve(cfg(vec![
@@ -8203,8 +7638,7 @@ mod tests {
         .expect("delta mode without retention is the pre-existing default behavior");
     }
 
-    /// A well-formed cumulative `aggregate` resolves fine -- the positive case rule 39's two
-    /// rejection tests are the complement of.
+    /// A well-formed cumulative `aggregate` resolves.
     #[test]
     fn a_cumulative_aggregate_with_both_bounds_set_resolves() {
         resolve(cfg(vec![
@@ -8230,9 +7664,8 @@ mod tests {
             .expect("a well-formed prometheus_in should resolve fine");
     }
 
-    /// Rule 40's body is gated on scrape mode now, so "no targets at all" is rule 55's
-    /// neither-mode case rather than rule 40's empty-list bail -- the config is still rejected,
-    /// and the message still names the field an operator forgot.
+    /// With no targets and no `bind:`, rule 55's neither-mode check rejects the config, naming the
+    /// missing field.
     #[test]
     fn a_prometheus_in_with_neither_scrape_targets_nor_bind_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -8421,11 +7854,8 @@ mod tests {
         .expect("should resolve");
     }
 
-    /// `receive:` stays rejected on `prometheus_in` via rule 17's explicit allowlist -- it's a
-    /// listener by role, but not one of the three drivers (`is_datagram_listener`/
-    /// `is_stream_listener`/`is_tail_listener`) rule 17 actually wires `receive:` to, so a
-    /// non-default block on it is
-    /// caught the same way `internal`'s own is.
+    /// Rule 17 rejects `receive:` on `prometheus_in`: a listener by role, but on none of the three
+    /// drivers.
     #[test]
     fn a_non_default_receive_on_prometheus_in_is_rejected() {
         let err = expect_err(cfg_with_receive(vec![
@@ -8455,9 +7885,7 @@ mod tests {
             .expect("a bind-mode prometheus_in should resolve fine");
     }
 
-    /// The regression test for rule 40's gating: before it, rule 40's empty-`scrape_targets` bail
-    /// ran over *every* `prometheus_in` and failed a bind-mode config before rule 55 was ever
-    /// consulted -- which is what made bind mode unreachable rather than merely unvalidated.
+    /// A bind-mode `prometheus_in` resolves: rule 40's scrape checks are gated on scrape mode.
     #[test]
     fn rule_40_does_not_fire_on_a_bind_mode_prometheus_in() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
@@ -8482,9 +7910,7 @@ mod tests {
         assert!(err.contains("exactly one of them"), "got: {err}");
     }
 
-    /// Rule 41's `prometheus_out` check, one kind over: a `path` that a request URI's own path
-    /// could never equal would `404` every write forever, against a listener that looks perfectly
-    /// configured and reports no error at all.
+    /// Rule 55: a bind-mode `path` must start with `/` (rule 41's check), or every write would 404.
     #[test]
     fn a_bind_mode_prometheus_in_with_a_relative_path_is_rejected() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
@@ -8529,9 +7955,8 @@ mod tests {
         }
     }
 
-    /// `interval` keeps its default in bind mode rather than being carved out of rule 9 -- so
-    /// rule 9's `interval: 0s` rejection stays satisfied there with nothing mode-specific about
-    /// it, and rule 55 sees a defaulted value rather than a set one.
+    /// `interval` keeps its default in bind mode, so rule 9 needs no carve-out and rule 55 sees a
+    /// defaulted value.
     #[test]
     fn bind_mode_leaves_interval_at_its_default_and_rule_9_stays_satisfied() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
@@ -8544,9 +7969,8 @@ mod tests {
         assert!(err.contains("a flush interval of 0s"), "got: {err}");
     }
 
-    /// Rule 53's sixth arm. A bind-mode `prometheus_in` is the field's newest listener, so its
-    /// zero check has to reach it -- and rule 55, not rule 53, is what rejects the field in
-    /// scrape mode (covered by `a_bind_only_field_alongside_scrape_targets_is_rejected`).
+    /// Rule 53 reaches a bind-mode `prometheus_in`. In scrape mode rule 55 rejects the field
+    /// instead (`a_bind_only_field_alongside_scrape_targets_is_rejected`).
     #[test]
     fn a_zero_idle_timeout_on_a_bind_mode_prometheus_in_is_rejected() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
@@ -8649,12 +8073,8 @@ mod tests {
         ]
     }
 
-    /// The cache is what the *receiver* remembers about metric types between requests. A scrape
-    /// client reads a `# TYPE` line in every response it gets, so there is nothing for it to
-    /// remember and the setting could never take effect -- rule 55's wrong-mode shape, and the
-    /// reason `metadata_cache` is in `bind_only_mutations` above rather than a rule of its own.
-    /// (Its default, on the other hand, is invisible: a scrape config that never mentions the key
-    /// resolves.)
+    /// Rule 55: a non-default `metadata_cache` in scrape mode is rejected (a scrape client reads `#
+    /// TYPE` in every response); the default resolves.
     #[test]
     fn a_default_metadata_cache_alongside_scrape_targets_resolves() {
         resolve(cfg(vec![
@@ -8664,9 +8084,8 @@ mod tests {
         .expect("an untouched metadata_cache is not a wrong-mode value");
     }
 
-    /// Rule 9's `interval: 0s` reasoning, one field over: a bound whose zero value makes the thing
-    /// it bounds do nothing is a typo. `max_families: 0`, which *is* how the cache is turned off,
-    /// stays legal -- the asymmetry is the point, so the message names it.
+    /// Rule 55: `metadata_cache.ttl: 0s` is rejected, except with `max_families: 0`, which turns
+    /// the cache off; the message names that spelling.
     #[test]
     fn a_zero_metadata_cache_ttl_on_a_bind_mode_prometheus_in_is_rejected() {
         let mut kind = prometheus_in_bind("0.0.0.0:9090");
@@ -8771,8 +8190,7 @@ mod tests {
         )
     }
 
-    /// [`graphite_in`] with rules 43's and 45's knobs exposed too -- `tls:` and
-    /// `handshake_timeout`, both TCP-only, since `graphite_in` joined the shared stream driver.
+    /// [`graphite_in`] with rules 43's and 45's knobs, `tls:` and `handshake_timeout`, exposed.
     fn graphite_in_full(
         transport: GraphiteTransport,
         protocol: GraphiteProtocol,
@@ -8814,9 +8232,7 @@ mod tests {
         }
     }
 
-    /// Rule 43 over `graphite_in`, the second listener it covers: a `tls:` block on the datagram
-    /// transport is rejected with the identical message a `syslog_in` gets, since the check and
-    /// the reasoning are the same one.
+    /// Rule 43 over `graphite_in`: the same message a `syslog_in` gets.
     #[test]
     fn tls_on_a_udp_graphite_in_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -8839,8 +8255,7 @@ mod tests {
         assert!(err.contains("DTLS"), "got: {err}");
     }
 
-    /// Rule 43's other side for carbon: TLS over a TCP `graphite_in` is exactly the relay hop the
-    /// listener now supports.
+    /// Rule 43's other side for carbon: a TLS-terminating TCP `graphite_in` resolves.
     #[test]
     fn tls_on_a_tcp_graphite_in_validates_fine() {
         resolve(cfg(vec![
@@ -8918,9 +8333,8 @@ mod tests {
         .expect("a non-default handshake_timeout on a TCP graphite_in is what the field is for");
     }
 
-    /// And the default value is not a *set* one: a UDP `graphite_in` that never mentions
-    /// `handshake_timeout` must keep validating, which is what the defaulted-value early return in
-    /// rule 45 is there for.
+    /// A UDP `graphite_in` at the default `handshake_timeout` resolves (rule 45's defaulted-value
+    /// early return).
     #[test]
     fn a_defaulted_handshake_timeout_on_a_udp_graphite_in_is_fine() {
         resolve(cfg(vec![
@@ -8994,9 +8408,7 @@ mod tests {
         }
     }
 
-    /// Rule 46's range: below 1024 no real carbon batch fits; above 16 MiB a frame's *declared*
-    /// length is a bigger allocation than any sender has a reason to ask for. The default sits
-    /// comfortably inside, which the resolving half of this test pins.
+    /// Rule 46's range: both out-of-range sides are rejected, and the default resolves.
     #[test]
     fn a_graphite_in_max_frame_bytes_is_bounded() {
         for out_of_range in [1023u64, 16 * 1024 * 1024 + 1] {
@@ -9033,8 +8445,7 @@ mod tests {
         }
     }
 
-    /// A UDP `graphite_in` is a datagram listener, so the *whole* `receive:` block applies to it
-    /// -- the property `is_datagram_listener`'s new arm exists to carry.
+    /// A UDP `graphite_in` is a datagram listener, so the whole `receive:` block applies to it.
     #[test]
     fn a_non_default_receive_on_a_udp_graphite_in_is_allowed() {
         let graph = resolve(cfg_with_receive(vec![
@@ -9050,9 +8461,7 @@ mod tests {
         assert_eq!(graph.components["in"].receive.max_datagrams, 4096);
     }
 
-    /// A TCP `graphite_in` has no receive queue at all (TCP's own flow control is the
-    /// backpressure), so a queue-bounding field is rejected **by name** rather than silently
-    /// ignored -- the treatment rule 17 already gives a tail listener.
+    /// Rule 17: a TCP `graphite_in` has no receive queue, so a queue field is rejected by name.
     #[test]
     fn a_queue_bounding_receive_field_on_a_tcp_graphite_in_is_rejected_by_name() {
         for (field, receive) in [
@@ -9084,9 +8493,7 @@ mod tests {
         }
     }
 
-    /// The other half of rule 17's split: batch assembly and `shutdown_grace` *are* meaningful on
-    /// a TCP listener -- it runs its own `BatchAccumulator` per connection -- so those fields must
-    /// pass.
+    /// Rule 17: batch assembly and `shutdown_grace` apply on a TCP listener, per connection.
     #[test]
     fn a_batch_assembly_receive_field_on_a_tcp_graphite_in_is_allowed() {
         let graph = resolve(cfg_with_receive(vec![
@@ -9308,8 +8715,8 @@ mod tests {
         .expect("defaults are legal in either mode");
     }
 
-    /// Rule 41's checks are registry-mode-only now: a sender-mode component never reaches them,
-    /// and rule 56 is what rejects a non-default `max_series` there.
+    /// Rule 41's checks are registry-mode only: a sender-mode component never reaches them, and
+    /// rule 56 rejects a non-default `max_series` there.
     #[test]
     fn rule_41_does_not_fire_on_a_sender_mode_prometheus_out() {
         let err = expect_err(remote_write_cfg(|kind| {
@@ -9454,8 +8861,7 @@ mod tests {
         assert_eq!(graph.components["sink"].kind_name(), "null_out");
     }
 
-    /// Rule 6, reached through the new listener: `generate_in` produces events, it never reads
-    /// any.
+    /// Rule 6: `generate_in` is a listener, so it may not declare sources.
     #[test]
     fn a_generate_in_with_sources_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -9605,9 +9011,8 @@ mod tests {
         }
     }
 
-    /// Rule 42's var-name check: a placeholder `generate_in` can't substitute is a config error,
-    /// not something rendered literally or as nothing -- a mistyped `{seg}` would otherwise
-    /// silently collapse a scenario's cardinality to one series.
+    /// Rule 42: a placeholder `generate_in` can't substitute is rejected, not rendered literally or
+    /// as nothing.
     #[test]
     fn an_unknown_generate_in_placeholder_is_rejected() {
         for name in ["seg", "SEQ", "seq%", "seq%0", "seq%x", "seq%-1", "seq-1", "hostname", "seq "]
@@ -9631,10 +9036,8 @@ mod tests {
         }
     }
 
-    /// A metric name is *interned*, and `logit_core::interner` never removes a `Symbol`, so a
-    /// bare `{seq}` there would intern a fresh, never-reclaimed name for every event a run
-    /// generates -- a process-lifetime leak rather than the cardinality knob it reads as. Only
-    /// the bounded `{seq%N}` form is accepted in that one position.
+    /// Rule 42: a bare `{seq}` in the interned metric name is rejected; it would leak one interned
+    /// name per generated event.
     #[test]
     fn a_bare_seq_in_a_generate_in_metric_name_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -9657,8 +9060,7 @@ mod tests {
         );
     }
 
-    /// The bounded form stays legal in that same position -- it is what metric-name cardinality
-    /// actually means, and `N` bounds the interner growth.
+    /// The bounded form stays legal there: `N` bounds the interner's growth.
     #[test]
     fn a_bounded_seq_modulus_in_a_generate_in_metric_name_resolves() {
         resolve(cfg(vec![
@@ -9697,9 +9099,7 @@ mod tests {
         .expect("a copied rendering is freed with its event, so an unbounded seq is fine");
     }
 
-    /// `u64::from_str` would accept `+5`, which would make `{seq%+5}` a silent second spelling of
-    /// `{seq%5}`; rule 42 takes ASCII digits and nothing else, so there is one spelling per
-    /// meaning for `logit-inputs`' own resolver to mirror.
+    /// Rule 42: `{seq%+5}` is rejected; `N` is ASCII digits only, so `{seq%5}` has one spelling.
     #[test]
     fn a_seq_modulus_with_a_leading_plus_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -9753,10 +9153,8 @@ mod tests {
         );
     }
 
-    /// Nothing in `resolve` requires the graph to be connected, and nothing objects to one
-    /// component dialling an address another binds -- which is what lets the harness's
-    /// `native-relay` scenario put both ends of a `logit_out`/`logit_in` hop in a single config,
-    /// as two disconnected chains. Rules 2/5/7 are satisfied per chain, not graph-wide.
+    /// A graph may be disconnected: the harness's `native-relay` scenario puts both ends of a
+    /// `logit_out`/`logit_in` hop in one config as two chains. Rules 2/5/7 hold per chain.
     #[test]
     fn a_logit_out_and_logit_in_in_one_graph_resolve() {
         let relay_out = ComponentKind::LogitOut {
@@ -9784,7 +9182,7 @@ mod tests {
         assert_eq!(graph.components["sink"].sources, vec!["relay_in".to_string()]);
     }
 
-    // ---- `statsd_in`'s stream transport: rules 43/45/17 ------------------------------------------
+    // ---- `statsd_in`'s stream transport: rules 43/45/17 -----------------------------------------
 
     /// A `statsd_in` with `transport`/`tls:`/`handshake_timeout` spelled out -- an enum variant
     /// has no functional-record-update syntax, so every case below goes through this.
@@ -9820,9 +9218,7 @@ mod tests {
         }
     }
 
-    /// Rule 43 over `statsd_in`, the third listener it covers: DTLS is out of scope and no statsd
-    /// client speaks it anyway, so a `tls:` block on the datagram transport could never take
-    /// effect and is rejected rather than silently ignored.
+    /// Rule 43 over `statsd_in`: a `tls:` block under UDP is rejected.
     #[test]
     fn a_udp_statsd_in_with_tls_is_rejected() {
         let err = expect_err(cfg(vec![
@@ -9834,8 +9230,7 @@ mod tests {
         assert!(err.contains("DTLS"), "got: {err}");
     }
 
-    /// Rule 43's other side for statsd: a TLS-terminating TCP `statsd_in` is exactly the relay hop
-    /// the listener gained a stream transport for.
+    /// Rule 43's other side for statsd: a TLS-terminating TCP `statsd_in` resolves.
     #[test]
     fn a_tcp_statsd_in_with_tls_resolves_fine() {
         resolve(cfg(vec![
@@ -9845,9 +9240,8 @@ mod tests {
         .expect("a TLS-terminating TCP statsd_in is legal");
     }
 
-    /// Rule 45 over `statsd_in`: `0s` is impossible on either transport, and a non-default value
-    /// is set-but-ignored under `transport: udp`, where there is no connection to hand shake. The
-    /// TCP case with a real value resolves, which is what the field is for.
+    /// Rule 45 over `statsd_in`: `0s` is rejected on either transport, a non-default value under
+    /// UDP is rejected, and a real value under TCP resolves.
     #[test]
     fn a_non_default_handshake_timeout_on_a_udp_statsd_in_is_rejected() {
         let zero = expect_err(cfg(vec![
@@ -9883,9 +9277,8 @@ mod tests {
         .expect("a UDP statsd_in that never mentions handshake_timeout must keep resolving");
     }
 
-    /// Rule 17 through the narrowed `is_datagram_listener`: a TCP `statsd_in` runs on the stream
-    /// driver, which has no receive queue at all, so a queue-only field is rejected by name --
-    /// and the UDP arm must not have lost its own queue fields in the narrowing.
+    /// Rule 17: a TCP `statsd_in` has no receive queue, so a queue field is rejected by name, while
+    /// the UDP arm keeps its own.
     #[test]
     fn a_tcp_statsd_in_rejects_receive_max_datagrams() {
         let err = expect_err(cfg_with_receive(vec![

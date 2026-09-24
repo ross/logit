@@ -1,43 +1,36 @@
 #!/usr/bin/env python3
-"""Emits an app-like statsd/DogStatsD workload from a *real* third-party client, for
+"""Emits an app-like statsd/DogStatsD workload from a real third-party client, for
 `script/record-fixtures statsd` to capture through `raw_capture.py --proto udp`.
 
-Two clients, four modes, because the thing worth capturing is not "a statsd line" -- this repo
-already has 40 hand-written ones under `crates/logit-cli/tests/fixtures/statsd/` -- but **how a
-real client packs an application's metrics into datagrams**:
+The capture records how a real client packs an application's metrics into datagrams; hand-written
+pairs under `crates/logit-cli/tests/fixtures/statsd/` cover the line grammar:
 
     --client dogstatsd --mode unbuffered   `datadog`'s DogStatsd, one datagram per call
     --client dogstatsd --mode buffered     the same client with its own send buffer on
     --client statsd    --mode plain        `statsd`'s StatsClient, one datagram per call
     --client statsd    --mode pipeline     the same client through `client.pipeline()`
 
-The two buffered modes are the interesting ones: each client decides for itself how many lines fit
-in a datagram and where to cut, which is exactly the distribution `perf/load/README.md` measures
-the load model's `datagram_mix:` weights out of. The two unbuffered modes are the other end of that
-same distribution -- one metric per datagram, the syscall-bound shape
-[ADR `udp-intake-batching-and-socket-visibility`](../../docs/adr/udp-intake-batching-and-socket-visibility.md)
-calls the worst case.
+In the buffered modes each client decides where to cut a datagram, which is the distribution
+`perf/load/README.md` measures the load model's `datagram_mix:` weights from. The unbuffered modes
+are its other end: one metric per datagram, the syscall-bound worst case (ADR
+`udp-intake-batching-and-socket-visibility`).
 
-The workload itself is a small, plausible web service: request counters and latency timings per
-endpoint and status, a response-size distribution, worker-queue gauges, an active-user set, and a
-sampled cache counter. Deliberately not a loop over one metric -- name length, tag count and value
-width are what a decoder actually pays for, and a single repeated line would misreport all three.
-Values come from a seeded `random.Random`, so a re-record produces the same *shape* (it cannot
-produce the same bytes: see `testdata/interop/README.md` on why this corpus is real captures rather
-than golden files).
+The workload is a small web service: request counters and latency timings per endpoint and status,
+a response-size distribution, worker-queue gauges, an active-user set, and sampled counters. It
+isn't one repeated metric, because name length, tag count, and value width are what a decoder pays
+for. Values come from a seeded `random.Random`, so a re-record has the same shape but not the same
+bytes.
 
-Stdlib plus the client under test only. `script/record-fixtures` `pip install`s the client into a
-stock `python:3.12-slim` at record time, the same "install the real third-party software fresh"
-shape `rsyslog`/`collectd` already use with `apt-get`; the resolved version is printed here so
-`testdata/interop/statsd/README.md`'s provenance table records what actually ran.
+Needs only the stdlib and the client under test, which `script/record-fixtures` `pip install`s at
+record time. The resolved version prints first, for `testdata/interop/statsd/README.md`'s
+provenance table.
 """
 
 import argparse
 import random
 import sys
 
-# A small, fixed service topology. Sizes chosen to look like a real app's naming rather than to hit
-# a byte target: hierarchical dotted names, a handful of endpoints, a few status codes, one host.
+# A small, fixed service topology, sized like a real app's naming rather than to hit a byte target.
 ENDPOINTS = [
     "/api/v1/users",
     "/api/v1/users/:id",
@@ -54,15 +47,14 @@ BASE_TAGS = ["env:prod", "service:checkout-api", "region:us-east-1", "host:web-0
 def latency_ms(rng, mean, stddev):
     """A plausible latency: a normal draw floored just above zero.
 
-    The floor is not cosmetic. An unclamped `gauss(42, 18)` emits negative timings a few percent of
-    the time, and a capture full of negative durations would be a fixture of a bug rather than of a
-    real application's traffic -- worth getting right in a corpus whose whole point is being real.
+    An unclamped `gauss(42, 18)` goes negative a few percent of the time, and a fixture of negative
+    durations would record a bug rather than an application's traffic.
     """
     return max(0.05, rng.gauss(mean, stddev))
 
 
 def version_of(package):
-    """The installed distribution version, for the provenance table -- printed, never asserted on."""
+    """The installed distribution version, printed for the provenance table."""
     try:
         from importlib.metadata import version
 
@@ -74,9 +66,8 @@ def version_of(package):
 def dogstatsd_client(host, port, buffered):
     """A real `datadog.DogStatsd`, with buffering explicitly on or off.
 
-    The buffering knob has been spelled two ways across the package's life (`disable_buffering=`
-    in 0.44+, `max_buffer_size=` before it), so this tries the current one and falls back rather
-    than pinning a version this repo has no other reason to pin.
+    The argument is `disable_buffering=` in 0.44+ and `max_buffer_size=` before it, so this tries
+    the current one and falls back rather than pinning a version.
     """
     from datadog import DogStatsd
 
@@ -97,10 +88,9 @@ def dogstatsd_workload(client, rng, rounds):
         client.increment("app.http.requests.count", tags=tags)
         client.histogram("app.http.request.duration_ms", latency_ms(rng, 42.0, 18.0), tags=tags)
         client.distribution("app.http.response.size_bytes", rng.randint(180, 64000), tags=tags)
-        # Two sampled counters, at the two rates a hot path typically picks. Both clients sample
-        # *client-side* -- the call returns without sending at `1 - sample_rate` -- so these
-        # deliberately appear on the wire far less often than the unsampled lines above, which is
-        # itself part of what the capture measures.
+        # Two sampled counters at typical hot-path rates. Both clients sample client-side, skipping
+        # the send at `1 - sample_rate`, so these reach the wire far less often than the lines
+        # above; the capture measures that too.
         client.increment("app.cache.lookups.count", sample_rate=0.1, tags=BASE_TAGS)
         client.increment("app.render.calls.count", sample_rate=0.5, tags=tags)
         if i % 3 == 0:
@@ -174,15 +164,13 @@ def main():
         print("datadog=={}".format(version_of("datadog")))
         client = dogstatsd_client(args.host, args.port, buffered=args.mode == "buffered")
         if args.mode == "buffered":
-            # The context manager is the documented way to batch: it opens a buffer on entry and
-            # flushes whatever is left on exit, so nothing is lost when the workload ends
-            # mid-datagram.
+            # The context manager is the documented way to batch: it flushes what's left on exit,
+            # so nothing is lost when the workload ends mid-datagram.
             with client:
                 dogstatsd_workload(client, rng, args.rounds)
         else:
             dogstatsd_workload(client, rng, args.rounds)
-        # Belt and braces across versions: `flush` exists on the buffered paths, and calling it on
-        # an unbuffered client is a no-op.
+        # `flush` exists on the buffered paths across versions and is a no-op when unbuffered.
         getattr(client, "flush", lambda: None)()
     else:
         if args.mode not in ("plain", "pipeline"):

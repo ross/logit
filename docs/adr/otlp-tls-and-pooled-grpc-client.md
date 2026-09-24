@@ -85,7 +85,7 @@ endpoint means TLS on either `otlp_out` transport, matching every OTel SDK's
 bare `host:port` both still mean plaintext gRPC. `otlp_out`'s new `tls:` block
 (`TlsClientConfig`: `ca_file`, `cert_file`+`key_file` for mutual TLS, `insecure_skip_verify`)
 *tunes* an already-TLS connection -- it never turns TLS on by itself, and `graph::resolve`'s rule
-22 rejects a non-empty `tls:` under a plain `http://`/`grpc://` endpoint rather than silently
+24 rejects a non-empty `tls:` under a plain `http://`/`grpc://` endpoint rather than silently
 ignoring it. `otlp_in` has no endpoint to read a scheme from, so its mere presence of a `tls:`
 block (`TlsServerConfig`: `cert_file`+`key_file` required, `client_ca_file` optional) is what turns
 TLS on for that listener, on both transports.
@@ -129,7 +129,7 @@ An operator reaching a privately-CA'd endpoint sets `tls.ca_file` explicitly.
   `tokio_rustls::TlsAcceptor` before dispatching to the (unchanged) HTTP/gRPC serving code, via a
   new `serve_connection<IO>` helper generic over the plaintext vs. TLS stream type.
 - `logit_config::ComponentKind::OtlpOut`/`OtlpIn` gain `tls` fields (`TlsClientConfig`,
-  `Option<TlsServerConfig>`); `graph::resolve` gains rule 22. Both new types belong in
+  `Option<TlsServerConfig>`); `graph::resolve` gains rule 24. Both new types belong in
   `logit-config` rather than being sink/listener-specific, so `influxdb_out`/`syslog_out`/a future
   native `logit_in`/`logit_out` can reuse them without re-deciding this shape.
 - Test fixtures: `testdata/tls/` (repo root) holds a committed self-signed test CA plus server,
