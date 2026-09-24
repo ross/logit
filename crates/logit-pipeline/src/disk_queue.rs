@@ -1501,7 +1501,6 @@ mod tests {
     use super::*;
     use crate::fault::{self, errno};
     use logit_core::{AttrMap, Event, Registry, Resource, Value};
-    use std::future::Future;
 
     fn open(dir: PathBuf) -> DiskQueue {
         DiskQueue::open(config(dir), Telemetry::default(), Diagnostics::new("test")).unwrap()
