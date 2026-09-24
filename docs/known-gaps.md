@@ -1252,6 +1252,13 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     by a kill between that rename and its promotion is promoted to `.1` on the next rotation, never
     silently lost.
 
+- **`file_out` never fsyncs, by design.** Nothing in `crates/logit-outputs/src/file.rs` fsyncs
+  the active file, the `.rotating` staging file, or the directory after a rename, so a power loss
+  (not a process crash) can lose the most recent writes or leave a rotation half-applied. A
+  log-file sink doesn't pay per-batch fsyncs for a guarantee few deployments need; see the
+  "`file_out` makes no durability promise" amendment to
+  [ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24).
+  No revisit trigger short of a deployment that needs a power-loss-safe log file.
 - **`stdio_out` has no reopen** — a file target is opened once, in append mode, and held for the
   process's lifetime, so an external log rotator that moves the file leaves `logit` writing to the
   unlinked inode until restart (there is no SIGHUP-reopen). Acceptable for a debugging/dev-loop
