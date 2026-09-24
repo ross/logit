@@ -1,24 +1,19 @@
-//! `Event`/`SpanRecord` ↔ OTLP `Span` -- total.
+//! `Event`/`SpanRecord` ↔ OTLP `Span`: total.
 //!
-//! `start_time_unix_nano`/`end_time_unix_nano` map directly to `Event::timestamp`/
-//! `SpanRecord::end_timestamp`. `SpanKind`/`SpanStatus` map directly (OTLP's
-//! `SPAN_KIND_UNSPECIFIED` decodes to `Internal`, matching the OTLP spec's own recommendation).
-//! `parent_span_id: Option<[u8; 8]>` ⇔ OTLP's empty-bytes-means-none convention. `Span.flags` ↔
-//! `SpanRecord::flags` directly, both plain `u32`s.
+//! `start_time_unix_nano`/`end_time_unix_nano` map to `Event::timestamp`/
+//! `SpanRecord::end_timestamp`. `SpanKind`/`SpanStatus` map directly; `SPAN_KIND_UNSPECIFIED`
+//! decodes to `Internal`, as OTLP recommends. `parent_span_id: None` ↔ empty bytes. `Span.flags` ↔
+//! `SpanRecord::flags`, both plain `u32`s. A `trace_id` or `span_id` of the wrong length fails the
+//! request (`mod ids`), unlike a log's lenient trace context.
 //!
 //! **`Status.message`, `trace_state`, and the three `dropped_*_count` fields map onto
-//! `SpanRecord::ext: Option<Box<SpanExt>>`,** not attributes -- these are real typed fields now
-//! (`docs/adr/metrics-model-v2.md`), so the well-known status-message attribute convention this
-//! module used before these typed fields existed is retired: encode no longer reads it, decode no
-//! longer stamps it. Encode builds `Some(Box<SpanExt>)` only
-//! when at least one of its five fields is non-default (an all-default `SpanExt` and `None` encode
-//! identically -- empty `trace_state`, empty `Status.message`, `0` dropped counts -- so there is no
-//! reason to allocate the box for the overwhelmingly common span that carries none of these).
+//! `SpanRecord::ext: Option<Box<SpanExt>>`,** typed fields rather than attributes (ADR
+//! `metrics-model-v2`). Decode builds `Some(Box<SpanExt>)` only when one of the five is
+//! non-default: an all-default `SpanExt` and `None` encode identically, and most spans carry none.
 //!
-//! **`SpanLink` gains real `flags`/`trace_state`/`dropped_attributes_count`,** mapped directly
-//! (not boxed -- a link is already a `Vec` element, see `docs/adr/metrics-model-v2.md`'s reasoning
-//! for why only `SpanRecord` itself needed the box). **`SpanEvent.dropped_attributes_count`** maps
-//! directly too.
+//! **`SpanLink`'s `flags`, `trace_state`, and `dropped_attributes_count`** map directly, unboxed:
+//! a link is already a `Vec` element (ADR `metrics-model-v2`). So does
+//! **`SpanEvent.dropped_attributes_count`**.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::trace::v1 as pb;
@@ -37,8 +32,8 @@ fn encode_span_kind(kind: SpanKind) -> pb::span::SpanKind {
     }
 }
 
-/// OTLP's `SPAN_KIND_UNSPECIFIED` (and any value this build of the enum doesn't recognize) decodes
-/// to `Internal`, per the OTLP spec's own recommendation for readers.
+/// `SPAN_KIND_UNSPECIFIED`, or any value this enum doesn't know, decodes to `Internal`, as OTLP
+/// recommends for readers.
 fn decode_span_kind(raw: i32) -> SpanKind {
     match pb::span::SpanKind::try_from(raw).unwrap_or(pb::span::SpanKind::Unspecified) {
         pb::span::SpanKind::Unspecified | pb::span::SpanKind::Internal => SpanKind::Internal,
@@ -111,8 +106,8 @@ fn decode_span_link(link: pb::span::Link) -> Result<SpanLink, CodecError> {
     })
 }
 
-/// `trace_id`/`span_id` length validation, shared by a `Span` and its `Link`s -- OTLP requires
-/// exactly 16 and 8 bytes respectively; anything else is malformed input, not a value to coerce.
+/// `trace_id`/`span_id` length validation for a `Span` and its `Link`s: OTLP requires 16 and 8
+/// bytes, and anything else is `Malformed`, never coerced.
 mod ids {
     use crate::CodecError;
 
@@ -129,10 +124,7 @@ mod ids {
     }
 }
 
-/// Builds `Some(Box<SpanExt>)` only when at least one of its five fields is non-default -- see
-/// the module doc. `None` and an all-default `SpanExt` are indistinguishable on the wire, so there
-/// is no reason to allocate the box for the overwhelmingly common span that carries neither a
-/// status message, a `tracestate`, nor any dropped counts.
+/// `Some(Box<SpanExt>)` only when one of its five fields is non-default (see the module doc).
 fn ext_from_wire(
     status_message: &str,
     trace_state: &str,
@@ -174,7 +166,7 @@ pub(crate) fn encode_span(event: &Event, span: &SpanRecord) -> pb::Span {
         trace_id: span.trace_id.to_vec(),
         span_id: span.span_id.to_vec(),
         trace_state,
-        // OTLP's own convention: empty bytes, not a distinguished "no parent" sentinel.
+        // OTLP's "no parent" is empty bytes.
         parent_span_id: span.parent_span_id.map(|id| id.to_vec()).unwrap_or_default(),
         flags: span.flags,
         name: span.name.as_str().unwrap_or_default().to_string(),
@@ -194,8 +186,7 @@ pub(crate) fn encode_span(event: &Event, span: &SpanRecord) -> pb::Span {
     }
 }
 
-/// `base_attrs` is the resource-level base (`common`'s own doc), cloned once per span by the
-/// caller.
+/// Decodes one span, layering its attributes onto `attrs`; every caller passes an empty map.
 pub(crate) fn decode_span(span: pb::Span, mut attrs: AttrMap) -> Result<Event, CodecError> {
     let trace_id = ids::trace_id(&span.trace_id)?;
     let span_id = ids::span_id(&span.span_id)?;
@@ -344,8 +335,7 @@ mod tests {
         }
     }
 
-    /// `Status.message` maps onto `SpanExt::status_message`, a real field -- not the retired
-    /// attribute convention this module used before it existed.
+    /// `Status.message` maps onto `SpanExt::status_message`.
     #[test]
     fn a_status_message_maps_onto_span_ext_not_an_attribute() {
         let span = bare_span();
@@ -365,14 +355,11 @@ mod tests {
             Some(b"boom".as_slice())
         );
 
-        // Encode: the field comes back out as Status.message.
         let re_encoded = encode_span(&decoded, &decoded_span);
         assert_eq!(re_encoded.status.unwrap().message, "boom");
     }
 
-    /// The overwhelmingly common span (no status message, no `tracestate`, nothing dropped) must
-    /// decode to `ext: None`, not `Some(Box<SpanExt>)` full of defaults -- the two are
-    /// indistinguishable on the wire, so allocating the box would be pure waste.
+    /// A span with no status message, `tracestate`, or dropped counts decodes to `ext: None`.
     #[test]
     fn a_span_with_nothing_extra_decodes_with_ext_none() {
         let span = bare_span();
@@ -381,8 +368,8 @@ mod tests {
         assert_eq!(decoded.span.unwrap().ext, None);
     }
 
-    /// Each of `SpanExt`'s five fields independently earns the box on decode -- exercised one at a
-    /// time so a future field that forgets to join the "any non-default" check is caught.
+    /// Each of `SpanExt`'s five fields alone earns the box, so a field missing from the
+    /// "any non-default" check fails here.
     #[test]
     fn any_single_non_default_ext_field_earns_the_box_on_decode() {
         let span = bare_span();

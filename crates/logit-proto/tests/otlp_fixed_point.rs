@@ -1,25 +1,16 @@
-//! Pure-codec OTLP fixed-point tests: `docs/adr/lossless-transit.md`'s "round-trip fixed point is
-//! the test that proves this" requirement, exercised directly against [`OtlpEncoder`]/
-//! [`OtlpDecoder`] with no pipeline, transform, or transport in between.
+//! OTLP codec fixed-point tests (ADR `lossless-transit`), run against [`OtlpEncoder`]/
+//! [`OtlpDecoder`] directly.
 //!
-//! Two properties, per fixture, both over a fully-populated *single-signal* [`EventBatch`] (a
-//! batch carrying only logs, only metrics, or only spans -- `encode_signals` returns one payload
-//! per non-empty signal, and mixing signals would just mean picking one out of several payloads
-//! below, adding nothing):
+//! Each fixture is a fully populated single-signal [`EventBatch`] (`encode_signals` returns one
+//! payload per signal, so mixing signals adds nothing), checked for two properties:
 //!
-//! 1. **`decode_signal(encode_signals(b)) == vec![b]`** -- whole-`EventBatch` equality via
-//!    `PartialEq` (`docs/adr/metrics-model-v2.md`'s "`PartialEq` on every record type"). Each
-//!    fixture is built in the shape a *real decode* would already produce (e.g. a log's
-//!    `otel.severity_number`/`otel.severity_text` attributes already match its `Severity`) --
-//!    otherwise decode's own enrichment (stamping those two attributes fresh from the wire values
-//!    it just wrote) would make the round trip a no-op tautology instead of a real fixed-point
-//!    check. Logs set `observed_timestamp` non-zero so `encode_log_record`'s only
-//!    non-deterministic path (falling back to the wall clock) never fires -- see `otlp/logs.rs`'s
-//!    own module doc.
-//! 2. **`encode_signals(decode_signal(encode_signals(b))[0]) == encode_signals(b)` on bytes** --
-//!    the same fixed point restated at the wire level, catching a codec that produces two
-//!    different byte strings for what it itself considers the same batch (a non-deterministic
-//!    field ordering, a stray default it sometimes omits and sometimes doesn't).
+//! 1. **`decode_signal(encode_signals(b)) == vec![b]`**, whole-batch `PartialEq`. A fixture is
+//!    built in the shape a real decode produces (a log's `otel.severity_*` attributes already
+//!    match its `Severity`), since decode stamps those attributes. Logs set `observed_timestamp`
+//!    so encode never falls back to the wall clock (`otlp/logs.rs`'s module doc).
+//! 2. **`encode_signals(decode_signal(encode_signals(b))[0]) == encode_signals(b)` on bytes**,
+//!    catching an encoder that writes two byte strings for one batch (unstable field order, a
+//!    default it sometimes omits).
 
 use bytes::Bytes;
 use logit_core::interner::intern;
@@ -55,14 +46,11 @@ fn fully_populated_scope() -> Arc<Scope> {
     })
 }
 
-/// A fixed point on both sides, not a lossless-transit "does the round trip pin this" tautology:
-/// the round-trip test in this file needs `decode(encode(b)) == b`, which only holds if `b`'s own
-/// attributes are already the ones a real decode would produce -- see this file's own module doc.
+/// A log whose attributes are already what a real decode would stamp (see the module doc).
 fn log_batch() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("custom.attr", "value");
-    // The raw severity, already matching Severity::Info's INFO2 (10) band member -- what a real
-    // decode of a SeverityNumber=10/"INFO2" wire record would itself stamp (otlp/logs.rs).
+    // What decoding SeverityNumber=10/"INFO2" stamps, matching Severity::Info.
     attrs.insert("otel.severity_number", Value::I64(10));
     attrs.insert("otel.severity_text", "INFO2");
 
@@ -105,9 +93,8 @@ fn metric_record(name: &str, kind: MetricKind, exemplars: Vec<Exemplar>) -> Metr
 }
 
 /// One metric event per kind (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`/`Summary`), each
-/// with `description`/`start_timestamp`/`flags` set -- `Summary` alone carries no exemplars, since
-/// `SummaryDataPoint` has no wire field for them (`otlp/metrics.rs`'s own module doc): including
-/// one there would make this fixture *not* a fixed point, by construction, not by a codec bug.
+/// with `description`/`start_timestamp`/`flags` set. `Summary` carries no exemplars:
+/// `SummaryDataPoint` has no field for them (`otlp/metrics.rs`'s module doc).
 fn metric_batch() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("host", "web-1");
@@ -170,11 +157,9 @@ fn metric_batch() -> EventBatch {
     }
 }
 
-/// A bare `MetricRecord::new(..)` metric -- `start_timestamp: 0`, `flags: 0`, no description, no
-/// exemplars -- the shape every non-OTLP-sourced producer (statsd, `kv_metrics`, `internal`,
-/// `aggregate` output) actually builds. Fix 5 (`docs/adr/lossless-transit.md`) makes this a fixed
-/// point: `start_timestamp` writes through verbatim with no fallback to `Event::timestamp`, so a
-/// `0` start stays `0` on the wire instead of coming back equal to the event's own timestamp.
+/// A bare `MetricRecord::new(..)` (`start_timestamp: 0`, `flags: 0`, no description or
+/// exemplars), as every non-OTLP producer builds it. A `0` start stays `0` on the wire rather
+/// than becoming the event's timestamp.
 fn metric_batch_with_new_defaults() -> EventBatch {
     let mut attrs = AttrMap::new();
     attrs.insert("host", "web-1");
@@ -239,7 +224,7 @@ fn span_batch() -> EventBatch {
     }
 }
 
-/// Runs both fixed-point properties (see this file's own module doc) for `batch`, over `signal`.
+/// Checks both fixed-point properties (see the module doc) for `batch` over `signal`.
 fn assert_fixed_point(signal: Signal, batch: EventBatch) {
     let mut encoder = OtlpEncoder::new();
     let payloads = encoder.encode_signals(&batch).expect("encode must succeed");
@@ -277,29 +262,22 @@ fn a_fully_populated_span_batch_is_a_fixed_point() {
     assert_fixed_point(Signal::Traces, span_batch());
 }
 
-/// `scope: None` -- every statsd/syslog/native-sourced batch -- has to be a fixed point too: it
-/// must decode back to `None`, not `Some(Scope::default())`, or a relay through `otlp_out ->
-/// otlp_in` would silently invent scope identity nothing upstream ever had
-/// (`common::pb_to_scope`'s own doc comment). Reuses each signal's fully-populated fixture with
-/// only `scope` overridden, so a fixture and its no-scope sibling stay identical apart from that
-/// one field.
+/// `batch` with `scope: None`, as every statsd, syslog, or native batch has. It must decode back
+/// to `None`, not `Some(Scope::default())` (`common::pb_to_scope`).
 fn without_scope(mut batch: EventBatch) -> EventBatch {
     batch.scope = None;
     batch
 }
 
-/// One-sided severity fixtures: only `otel.severity_number` present -- the missing
-/// `otel.severity_text` must round-trip as OTLP's own unset sentinel (empty string), not the
-/// band-derived variant name (`docs/adr/lossless-transit.md`'s pair-as-a-unit rule).
+/// Only `otel.severity_number`: the missing text must round-trip as `""`, not the variant name
+/// (`otlp/logs.rs`'s pair-as-a-unit rule).
 fn log_batch_with_severity_number_only() -> EventBatch {
     let mut batch = log_batch();
     batch.events[0].attributes.remove("otel.severity_text");
     batch
 }
 
-/// The mirror one-sided fixture: only `otel.severity_text` present -- the missing
-/// `otel.severity_number` must round-trip as `0` (`SEVERITY_NUMBER_UNSPECIFIED`), not the
-/// band-derived number.
+/// Only `otel.severity_text`: the missing number must round-trip as `0`, not the band's base.
 fn log_batch_with_severity_text_only() -> EventBatch {
     let mut batch = log_batch();
     let event = &mut batch.events[0];

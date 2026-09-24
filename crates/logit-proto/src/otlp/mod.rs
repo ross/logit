@@ -1,48 +1,28 @@
-//! The OTLP codec: `OtlpEncoder`/`OtlpDecoder`, implementing [`crate::SignalEncoder`]/
-//! [`crate::SignalDecoder`] against the vendored, committed protobuf types in `generated/` (see
-//! `crates/logit-proto/proto/README.md` for provenance and
-//! [ADR `committed-pregenerated-otlp-protobuf`](../../../../docs/adr/committed-pregenerated-otlp-protobuf.md) for why they're
-//! committed rather than generated at build time).
+//! The OTLP codec: `OtlpEncoder`/`OtlpDecoder` over the committed protobuf types in `generated/`
+//! (`crates/logit-proto/proto/README.md` has their provenance; ADR
+//! `committed-pregenerated-otlp-protobuf` says why they're committed).
 //!
-//! **This module doc is the mapping table.** The four sibling modules hold one direction/signal
-//! each: [`common`] (`Value` ↔ `AnyValue`, attributes, resource/scope nesting -- shared by all
-//! three signals), [`logs`] (`Severity`, `BodyFormat`), [`traces`] (near-total), [`metrics`] (the
-//! hard part: temporality, histogram/summary/distribution/set). Read each module's own doc for its
-//! detail; this one covers only what's common to all of them.
+//! **This module doc is the mapping table** for what all three signals share. Each sibling module
+//! doc has its own: [`common`] (`Value` ↔ `AnyValue`, attributes, resource and scope), [`logs`]
+//! (`Severity`, `BodyFormat`, trace context), [`traces`], and [`metrics`] (temporality and the
+//! kinds OTLP can't carry natively). [`json`] is the OTLP/JSON dialect layer.
 //!
-//! **Wire types.** `logit` encodes/decodes `TracesData`/`LogsData`/`MetricsData` (the plain,
-//! non-collector top-level messages -- `{ repeated Resource*Signal* = 1; }`), not
-//! `Export*ServiceRequest`. The two are wire-identical: an `ExportTraceServiceRequest` has exactly
-//! the same single `repeated ResourceSpans resource_spans = 1` field `TracesData` does, so the
-//! bytes this crate produces are valid `Export*ServiceRequest` bodies without this crate ever
-//! generating or depending on the collector service messages (see `proto/README.md`). PR3's
-//! `otlp_in`/`otlp_out` parse `partial_success` themselves from the same bytes, on the response
-//! side, without needing generated types for it either -- that shape is small enough to build by
-//! hand there. The same equivalence holds for OTLP/JSON, and for a cleaner reason: since
-//! [`json`]'s dialect layer keys off field *names* rather than protobuf tag numbers, and both
-//! message shapes present the identical top-level key (`resourceSpans`/`resourceLogs`/
-//! `resourceMetrics`), one parser reads either without needing to know which it received.
+//! **Wire types.** This codec encodes and decodes `TracesData`/`LogsData`/`MetricsData`, not
+//! `Export*ServiceRequest`. The two are wire-identical (one `repeated Resource* = 1` field), so
+//! these bytes are valid request bodies with no collector service types generated. OTLP/JSON
+//! matches too: both shapes share the top-level key (`resourceSpans`, ...), and [`json`] keys off
+//! field names.
 //!
-//! **Nesting**, shared by every signal (detail in [`common`]): one `EventBatch` encodes as one
-//! `Resource*` entry (the batch's single `Arc<Resource>`, with its own `dropped_attributes_count`
-//! and `schema_url`) holding exactly one `Scope*` entry built from the batch's single
-//! `Option<Arc<Scope>>` (`common::scope_to_pb`) -- `None` encodes an empty `InstrumentationScope`
-//! (empty name), never a fabricated `{name: "logit", version: ...}` identity the way an earlier
-//! revision of this codec did. Decoding is the mirror at finer grain: every `(Resource*, Scope*)`
-//! pair in a request becomes its own `EventBatch` -- **never collapsed**, whether that's two
-//! `Resource*` entries in one request, or two `Scope*` groups nested under the *same* `Resource*`
-//! entry (a real OTLP shape: one resource, several instrumentation scopes). A batch always holds
-//! exactly one resource and at most one scope, and a request can legitimately carry several of
-//! either. A scope group that decodes to zero events (an empty ScopeLogs/ScopeSpans/ScopeMetrics,
-//! or -- for metrics -- one whose every point is otherwise unrepresentable) produces no batch at
-//! all, rather than an empty one nothing downstream asked for. A wire scope that is entirely
-//! empty decodes to `scope: None`, not `Some(Scope::default())` -- see [`common::pb_to_scope`]'s
-//! own doc comment for why that collapse is required for `otlp_in -> otlp_out` to be a fixed
-//! point on every non-OTLP-sourced batch.
+//! **Nesting.** One `EventBatch` encodes as one `Resource*` entry (with the resource's
+//! `dropped_attributes_count` and `schema_url`) holding one `Scope*` entry. A `None` scope encodes
+//! an empty `InstrumentationScope`, never a fabricated `logit` identity. Decoding is finer: every
+//! `(Resource*, Scope*)` pair becomes its own `EventBatch`, **never collapsed**, including several
+//! scopes under one resource. A scope group that decodes to no events produces no batch. An
+//! all-empty wire scope decodes to `scope: None` (see [`common::pb_to_scope`] for why the fixed
+//! point needs that).
 //!
-//! **An empty batch encodes to no payloads at all** -- an OTLP request with zero `Resource*`
-//! entries is a valid but pointless wire message, so [`SignalEncoder::encode_signals`] simply
-//! returns nothing for a signal with no events to carry, rather than sending an empty request.
+//! **An empty batch encodes to no payloads**, never an empty request
+//! ([`SignalEncoder::encode_signals`]).
 
 pub mod common;
 pub mod json;
@@ -50,7 +30,7 @@ pub mod logs;
 pub mod metrics;
 pub mod traces;
 
-#[allow(dead_code)] // PR3 (otlp_in/otlp_out) is the first real caller of most of this tree's API.
+#[allow(dead_code)] // prost emits types the codec never names (the `*Flags` enums, for one).
 pub(crate) mod generated;
 
 use crate::{CodecError, Signal, SignalDecoder, SignalEncoder};
@@ -62,11 +42,10 @@ use logit_core::{AttrMap, Diagnostics, Event, EventBatch, Telemetry};
 use prost::Message;
 use std::sync::Arc;
 
-/// Encodes an [`EventBatch`] into OTLP, one payload per non-empty [`Signal`] it carries. Carries
-/// its own [`Telemetry`]/[`Diagnostics`] handle so the lossy metric paths ([`metrics`]'s module
-/// doc) can count themselves -- disabled (default-constructed) handles make every one of those
-/// calls a no-op, so an `OtlpEncoder` used purely as a codec (no component attached) costs nothing
-/// extra to carry.
+/// Encodes an [`EventBatch`] into OTLP, one payload per non-empty [`Signal`].
+///
+/// Holds [`Telemetry`]/[`Diagnostics`] handles so the lossy metric paths ([`metrics`]'s module
+/// doc) can count themselves; the default handles are no-ops.
 #[derive(Default)]
 pub struct OtlpEncoder {
     telemetry: Telemetry,
@@ -192,10 +171,9 @@ impl OtlpDecoder {
     }
 }
 
-/// One `EventBatch` per `(ResourceX, ScopeX)` pair -- see the module doc's "Nesting" note. A
-/// record's own decoder gets an empty base `AttrMap`: resource attributes never rode as event
-/// attributes even before scope grouping existed, and scope attributes now live on
-/// `EventBatch::scope` rather than being copied onto every event under it.
+/// One `EventBatch` per `(ResourceX, ScopeX)` pair (the module doc's "Nesting"). A record's
+/// decoder gets an empty base `AttrMap`: resource and scope attributes live on the batch, never
+/// copied onto its events.
 fn decode_resource_logs(rl: logs_pb::ResourceLogs) -> Vec<EventBatch> {
     let resource = Arc::new(common::pb_to_resource(rl.resource, &rl.schema_url));
     rl.scope_logs
@@ -206,7 +184,7 @@ fn decode_resource_logs(rl: logs_pb::ResourceLogs) -> Vec<EventBatch> {
                 .into_iter()
                 .map(|record| logs::decode_log_record(record, AttrMap::new()))
                 .collect();
-            // A scope group with no records is not a batch -- see this module's own doc.
+            // A scope group with no records is not a batch.
             if events.is_empty() {
                 return None;
             }
@@ -225,7 +203,7 @@ fn decode_resource_spans(rs: trace_pb::ResourceSpans) -> Result<Vec<EventBatch>,
             .into_iter()
             .map(|span| traces::decode_span(span, AttrMap::new()))
             .collect::<Result<_, _>>()?;
-        // A scope group with no records is not a batch -- see this module's own doc.
+        // A scope group with no records is not a batch.
         if events.is_empty() {
             continue;
         }
@@ -248,8 +226,7 @@ impl OtlpDecoder {
                         metrics::decode_metric(metric, &AttrMap::new(), &self.telemetry)
                     })
                     .collect();
-                // A scope group that expands to no events (an empty metrics list, or every
-                // metric's data variant unset) is not a batch -- see this module's own doc.
+                // No events (no metrics, or every data variant unset) is not a batch.
                 if events.is_empty() {
                     return None;
                 }
@@ -296,12 +273,10 @@ impl SignalDecoder for OtlpDecoder {
 }
 
 impl OtlpDecoder {
-    /// The OTLP/JSON mirror of [`SignalDecoder::decode_signal`] -- not a trait method (see
-    /// [`crate::SignalDecoder`]'s doc comment for why), but otherwise identical in shape: parse
-    /// `bytes` into the same generated `prost` structs the protobuf path decodes into (via
-    /// [`json`]'s hand-written dialect layer, [ADR `otlp-json-decoding`](../../../../docs/adr/otlp-json-decoding.md)),
-    /// then feed them through the exact same `decode_resource_*` functions above, so every
-    /// semantic rule and every test that covers them applies regardless of wire encoding.
+    /// [`SignalDecoder::decode_signal`] for OTLP/JSON (an inherent method; see
+    /// [`crate::SignalDecoder`]). [`json`] parses `bytes` into the same `prost` structs the
+    /// protobuf path uses (ADR `otlp-json-decoding`), and the same `decode_resource_*` functions
+    /// take it from there, so every mapping rule holds for both encodings.
     pub fn decode_signal_json(
         &mut self,
         signal: Signal,
@@ -453,8 +428,7 @@ mod tests {
             })
             .unwrap();
 
-        // Hand-assemble one TracesData carrying both ResourceSpans, the shape a batching
-        // intermediary (or a test standing in for one) produces.
+        // One TracesData carrying both ResourceSpans, as a batching intermediary sends.
         let data_a = trace_pb::TracesData::decode(bytes_a[0].1.clone()).unwrap();
         let data_b = trace_pb::TracesData::decode(bytes_b[0].1.clone()).unwrap();
         let mut combined = data_a;
@@ -468,15 +442,11 @@ mod tests {
         assert_eq!(batches[1].resource.attributes.get("host").and_then(|v| v.as_str()), Some("b"));
     }
 
-    /// Captured provenance: NOT from a live collector (none is reachable from this crate's test
-    /// suite -- `docs/design/memory.md`'s "Fixtures" section requires exactly that). Self-
-    /// constructed instead, by encoding a `TracesData` message with this crate's own generated
-    /// `prost` types (one `ResourceSpans` / one `ScopeSpans` / one `Span` with a name, kind,
-    /// times, one attribute, one event, one link, and an OK status) and capturing
-    /// `prost::Message::encode_to_vec()`'s output, run once and pasted here as a literal --
-    /// see `tools/protogen` for the types used. Proves this crate's vendored `.proto`s produce
-    /// the field layout OTLP expects (tag numbers, wire types) by decoding it back below and
-    /// checking known field values, even without a real collector to compare against.
+    /// Provenance: not from a live collector (`docs/design/memory.md`'s "Fixtures" section).
+    /// `prost::Message::encode_to_vec()`'s output for a `TracesData` built with this crate's
+    /// generated types (`tools/protogen`): one `ResourceSpans`/`ScopeSpans`/`Span` with a name,
+    /// kind, times, one attribute, one event, one link, and an OK status, pasted once as a
+    /// literal. Decoding it back checks the vendored `.proto`s' tag numbers and wire types.
     #[rustfmt::skip]
     const OTLP_TRACE_REQUEST: &[u8] = &[
         0x0a, 0xb2, 0x01, 0x12, 0xaf, 0x01, 0x0a, 0x0e, 0x0a, 0x05, 0x6c, 0x6f, 0x67, 0x69, 0x74,
@@ -531,14 +501,9 @@ mod tests {
         assert_eq!(scope.version, bytes::Bytes::from_static(b"0.1.0"));
     }
 
-    /// The strongest claim this codec can make about its two wire encodings, and OTLP/JSON's own
-    /// claim about itself: a hand-written OTLP/JSON literal describing the exact same span as
-    /// [`OTLP_TRACE_REQUEST`] above must decode to the identical [`EventBatch`], through the
-    /// completely separate [`json`] parsing path -- not merely "produces similar-looking output",
-    /// full structural equality. `parentSpanId` is deliberately written as `null` here rather than
-    /// omitted: [`OTLP_TRACE_REQUEST`] encodes no `parent_span_id` field at all, so this proves a
-    /// producer that serializes "unset" as an explicit `null` decodes identically to one that omits
-    /// the key entirely, and to the protobuf encoding of the same span.
+    /// The span in [`OTLP_TRACE_REQUEST`], hand-written as OTLP/JSON; it must decode to an equal
+    /// [`EventBatch`]. `parentSpanId` is an explicit `null` where the protobuf omits the field, so
+    /// `null` must decode like an absent key.
     const OTLP_TRACE_REQUEST_JSON: &[u8] = br#"{
         "resourceSpans": [{
             "scopeSpans": [{
@@ -576,9 +541,6 @@ mod tests {
 
         assert_eq!(proto_batches.len(), 1);
         assert_eq!(json_batches.len(), 1);
-        // Full structural equality, now that EventBatch derives PartialEq -- not merely
-        // "produces similar-looking output" (this fn's own doc comment), the whole batch two
-        // completely separate parsing paths produced for the same logical span must be identical.
         assert_eq!(
             proto_batches[0], json_batches[0],
             "protobuf and JSON encodings of the same span must decode to the identical EventBatch"

@@ -1,11 +1,11 @@
-//! The wire dictionary: every interned `Symbol` a batch uses, written once, referenced everywhere
-//! else by `u32` index. See `docs/design/wire-protocol.md`'s "dictionary-first batches".
+//! The wire dictionary: every interned `Symbol` a batch uses, written once as a string and
+//! referenced by `u32` index. See `docs/design/wire-protocol.md`'s "Payload: dictionary-first
+//! batches".
 //!
-//! **A `Symbol` (`lasso::Spur`) is never written raw.** It's a process-local index into a
-//! never-evicting global interner (`docs/design/data-model.md`) -- the same key string gets a
-//! different `Spur` in two processes, or in the same process on a later run reading an old file.
-//! [`DictBuilder`] resolves every `Symbol` to its string at encode time; [`Dict`] re-interns every
-//! string at decode time. This is the one correctness rule the whole codec exists to uphold.
+//! **A `Symbol` (`lasso::Spur`) is never written raw.** It's a process-local index into the global
+//! interner (`docs/design/data-model.md`): the same string gets a different `Spur` in another
+//! process, or in a later run reading an old file. [`DictBuilder`] resolves every `Symbol` to its
+//! string at encode time; [`Dict`] re-interns every string at decode time.
 
 use std::collections::HashMap;
 
@@ -15,9 +15,8 @@ use logit_core::{interner, Symbol};
 use crate::native::varint::{read_uvarint, write_uvarint};
 use crate::CodecError;
 
-/// Collects the distinct `Symbol`s a batch actually uses, in first-use order, and assigns each a
-/// stable index -- the same batch encoded twice produces the same dictionary, which matters for
-/// tests and for two batches sharing an otherwise-identical shape compressing similarly.
+/// Collects the distinct `Symbol`s a batch uses, indexed in first-use order, so the same batch
+/// always encodes to the same dictionary.
 #[derive(Default)]
 pub struct DictBuilder {
     symbols: Vec<Symbol>,
@@ -25,10 +24,7 @@ pub struct DictBuilder {
 }
 
 impl DictBuilder {
-    /// Interns `sym` into this batch's dictionary, returning its index. Idempotent: interning the
-    /// same `Symbol` twice returns the same index without growing the dictionary again -- the
-    /// same repetition this whole mechanism exists to avoid paying for twice, once in the
-    /// process-wide interner and again here.
+    /// Returns `sym`'s index, adding it on first use.
     pub fn intern(&mut self, sym: Symbol) -> u32 {
         if let Some(&i) = self.index.get(&sym) {
             return i;
@@ -39,8 +35,7 @@ impl DictBuilder {
         i
     }
 
-    /// Writes the dictionary section: a count, then each string in index order (so the decoder's
-    /// `Vec` position matches the index this builder handed out).
+    /// Writes a count, then each string in index order, so a decoded `Vec` position is its index.
     pub fn write(&self, out: &mut BytesMut) {
         write_uvarint(out, self.symbols.len() as u64);
         for &sym in &self.symbols {
@@ -51,17 +46,13 @@ impl DictBuilder {
     }
 }
 
-/// The decode-side dictionary: every string read back and re-interned once, up front, so every
-/// later `Dict::get` is a plain index into an already-resolved `Vec` rather than a repeated
-/// interner round trip.
+/// The decode-side dictionary. Every string is re-interned once, up front, so `Dict::get` is a
+/// plain index.
 pub struct Dict(Vec<Symbol>);
 
-/// A dictionary this large -- ~64 MiB of index storage alone, since a `Symbol` is 4 bytes
-/// (`crates/logit-core/tests/type_sizes.rs`) -- is almost certainly a corrupt or hostile length
-/// field, not a real batch. This is the outer bound; the `Vec::with_capacity` below is separately
-/// clamped to a 4096-entry starting hint, so even a count well under this cap can't be used to
-/// force a large eager allocation before a single byte of the dictionary's actual content has been
-/// validated.
+/// Rejects a declared entry count this large (~64 MiB of 4-byte `Symbol`s) as corrupt or hostile.
+/// The initial `Vec::with_capacity` is separately clamped to 4096, so a count under the cap
+/// still can't force a large allocation before any content is validated.
 const MAX_SANE_DICT_ENTRIES: usize = 16 * 1024 * 1024;
 
 impl Dict {

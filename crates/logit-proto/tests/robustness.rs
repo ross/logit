@@ -1,33 +1,19 @@
-//! Robustness/mutation testing over every decoder that will read untrusted bytes off a socket:
-//! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`, and
-//! `collectd::CollectdDecoder` (a UDP listener's datagrams are as untrusted as a `logit_in`
-//! connection's frames, and rather easier to spoof), and `graphite::GraphiteDecoder` in **both**
-//! its wire protocols -- the pickle half of which is the highest-risk parser in the repo, a format
-//! whose stated purpose is arbitrary object construction, fed from a socket
-//! (`docs/plans/graphite-carbon-relay.md`'s open risks). Workstream A of
-//! `docs/plans/native-transport.md`: this gate must exist and pass *before* `logit_in` listens on a
-//! real network -- and `docs/plans/collectd-binary-relay.md`/`docs/plans/graphite-carbon-relay.md`
-//! hold `collectd_in`/`graphite_in` to the same bar.
+//! Mutation testing over every decoder that reads untrusted bytes off a socket:
+//! [`frame::read_frame`], [`native::decode_batch`], each `native::control::*::decode`,
+//! `collectd::CollectdDecoder` (UDP datagrams are easy to spoof), and `graphite::GraphiteDecoder`
+//! in both protocols. Pickle is the highest-risk parser in the repo: a format built for arbitrary
+//! object construction, read from a socket. A network-facing decoder must pass this suite
+//! (`docs/plans/native-transport.md`).
 //!
-//! What's checked, for each decoder: every single-byte truncation of a valid input; several
-//! thousand seeded bit flips; a length-bearing field inflated to a value far past what the input
-//! actually holds; and (for `decode_batch`, the one decoder whose payload is recursive)
-//! `Value::Array`/`Value::Map` nested past the decode-side depth cap. In every case: the decoder
-//! must never panic, and never allocate as if it trusted an attacker-declared length before
-//! bounding it (checked directly via a peak-allocation counter on the crafted-huge-count cases,
-//! where the property actually bites). **Not every decoder here holds the same truncation
-//! contract, though** -- see [`assert_every_truncation_never_panics`] vs.
-//! [`assert_every_truncation_fails_cleanly`]'s own doc comments for which decoders hold which,
-//! and why.
+//! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
+//! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
+//! cap. The decoder must never panic, and never size an allocation from an attacker-declared
+//! length before bounding it (a peak-allocation counter checks the huge-count cases). Truncation
+//! contracts differ by decoder: see [`assert_every_truncation_never_panics`] and
+//! [`assert_every_truncation_fails_cleanly`].
 //!
-//! No RNG crate exists anywhere in this workspace (`docs/plans/native-transport.md`'s own
-//! research confirmed it) and none is added here -- [`Lcg`] below is a hand-rolled, seeded,
-//! reproducible PRNG, good enough for "flip a pseudo-random bit," not for anything
-//! cryptographic.
-//!
-//! Keep this suite fast (`script/test` runs it on every `cargo nextest run`) -- iteration counts
-//! are tuned to stay well under a second per decoder, not the full 10s budget
-//! `docs/plans/native-transport.md` allows.
+//! The workspace has no RNG crate; [`Lcg`] is a seeded, reproducible PRNG, fine for picking a bit
+//! to flip. Iteration counts keep each decoder well under a second, since `script/test` runs this.
 
 use bytes::{Bytes, BytesMut};
 use logit_core::{AttrMap, Event, EventBatch, LogRecord, Provenance, Resource, Severity, Value};
@@ -44,10 +30,8 @@ use std::sync::Arc;
 
 // -- a tiny, self-contained peak-allocation counter -----------------------------------------
 //
-// Not a reuse of `crates/logit-bench`'s `CountingAlloc` -- `logit-bench` depends on
-// `logit-proto`, not the other way around, so this crate can't borrow it. Same idea, scoped down
-// to just what this suite needs: how many bytes were live at the high-water mark during one
-// measured call.
+// Not `logit-bench`'s `CountingAlloc`: `logit-bench` depends on `logit-proto`, not the reverse.
+// Measures only the live-byte high-water mark during one call.
 
 struct CountingAlloc;
 
@@ -93,10 +77,8 @@ fn record(delta: i64) {
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
-/// Runs `f`, returning the peak live-byte high-water mark reached while it ran. Not
-/// warmed/isolated the way `logit-bench`'s allocation tests are (this only needs an order-of-
-/// magnitude bound, not an exact count), but each call zeroes the counters first so one crafted
-/// call's peak isn't inflated by whatever ran before it.
+/// Runs `f`, returning its peak live bytes: an order-of-magnitude bound, not an exact count.
+/// Zeroes the counters first so an earlier call can't inflate the peak.
 fn peak_live_bytes(f: impl FnOnce()) -> i64 {
     LIVE.with(|live| live.set(0));
     PEAK.with(|peak| peak.set(0));
@@ -106,8 +88,7 @@ fn peak_live_bytes(f: impl FnOnce()) -> i64 {
 
 // -- seeded LCG -------------------------------------------------------------------------------
 
-/// A minimal linear congruential generator -- reproducible across runs (fixed seed), good enough
-/// to pick "which byte, which bit" for a mutation sweep. Constants are Numerical Recipes' LCG.
+/// A linear congruential generator with Numerical Recipes' constants, reproducible from its seed.
 struct Lcg(u64);
 
 impl Lcg {
@@ -131,19 +112,13 @@ impl Lcg {
 
 // -- generic mutation sweeps, parameterized over one decoder at a time ------------------------
 
-/// Truncates `valid` to every length from 0 to `valid.len() - 1` and asserts the decoder never
-/// panics -- the weaker of the two truncation contracts in this file, for decoders that genuinely
-/// don't guarantee more. `decode` returns whether the decode *failed* (every call site passes
-/// `.is_err()`), but that return value is deliberately not asserted on here.
+/// Truncates `valid` to every shorter length and asserts only that the decoder never panics. The
+/// weaker truncation contract: `decode`'s "failed" result isn't asserted.
 ///
-/// The control messages (`Hello`/`HelloAck`/`Ack`/`Reject`/`ControlMessage`) use this weaker
-/// helper on purpose, not by oversight: their TLV fields are all-optional with silent
-/// zero/empty defaults by design (this module's own doc comment on
-/// `logit_proto::native::control`, `read_field`'s `Ok(None)` on an exhausted body, and the
-/// `hello_with_empty_lists_round_trips` unit test all pin this down), so a short truncation of a
-/// valid message routinely decodes `Ok` with some fields defaulted -- that is the protocol
-/// working as designed, not a bug this suite should flag. It also isn't a production hole:
-/// `logit_in::handshake` version-checks a zeroed `Hello` and rejects it explicitly.
+/// The control messages use it because their TLV fields are all optional with zero or empty
+/// defaults (`control::read_field` returns `Ok(None)` on an exhausted body), so a truncated
+/// message can decode `Ok` with fields defaulted. `logit_in`'s handshake rejects a zeroed `Hello`
+/// on its version.
 fn assert_every_truncation_never_panics(valid: &[u8], decode: impl Fn(&mut Bytes) -> bool) {
     for len in 0..valid.len() {
         let mut truncated = Bytes::copy_from_slice(&valid[..len]);
@@ -153,13 +128,9 @@ fn assert_every_truncation_never_panics(valid: &[u8], decode: impl Fn(&mut Bytes
     }
 }
 
-/// [`assert_every_truncation_never_panics`], plus the stronger property [`frame::read_frame`] and
-/// [`native::decode_batch`] actually hold: no proper prefix of a valid encoding is itself a valid
-/// encoding, because every one of them ends in length-checked content rather than optional
-/// trailing fields the way the control messages do (see
-/// [`assert_every_truncation_never_panics`]'s own doc comment for that contrast). `decode` returns
-/// whether the decode *failed* (every call site passes `.is_err()`) -- call sites here assert on
-/// that, not just on panic-freedom.
+/// [`assert_every_truncation_never_panics`] plus the stronger contract: **no proper prefix of a
+/// valid encoding decodes**. [`frame::read_frame`] and [`native::decode_batch`] hold it because
+/// every encoding ends in length-checked content, never an optional trailing field.
 fn assert_every_truncation_fails_cleanly(valid: &[u8], decode: impl Fn(&mut Bytes) -> bool) {
     for len in 0..valid.len() {
         let mut truncated = Bytes::copy_from_slice(&valid[..len]);
@@ -172,8 +143,7 @@ fn assert_every_truncation_fails_cleanly(valid: &[u8], decode: impl Fn(&mut Byte
 }
 
 /// Flips one pseudo-random bit in a fresh copy of `valid`, `iterations` times, asserting only
-/// that the decoder never panics -- a single bit flip can still land on a valid-looking encoding
-/// (e.g. inside a string's content), so `Err` is not asserted, only "did not panic."
+/// that the decoder never panics: a flip inside a string's content can still decode.
 fn assert_bit_flips_never_panic(
     valid: &[u8],
     iterations: usize,
@@ -182,8 +152,7 @@ fn assert_bit_flips_never_panic(
     if valid.is_empty() {
         return;
     }
-    // Fixed, reproducible seed -- a failure here should reproduce on the next run, not require
-    // capturing which random bytes it happened to pick.
+    // A fixed seed, so a failure reproduces.
     let mut rng = Lcg::new(0x5EED_5EED_5EED_5EEDu64);
     for _ in 0..iterations {
         let mut mutated = valid.to_vec();
@@ -244,14 +213,12 @@ fn deeply_nested_batch(depth: usize) -> EventBatch {
     EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![event] }
 }
 
-/// A complete, realistic collectd datagram: two value lists sharing one host/plugin/type, the
-/// second eliding everything but its own TypeInstance, plus a trailing notification -- so a
-/// truncation or a bit flip can land in a part header, an identity string, a sticky-state
-/// boundary, a value vector, or the Message/Severity parts a notification adds.
+/// A realistic collectd datagram: two value lists sharing one host/plugin/type (the second sets
+/// only its TypeInstance) and a trailing notification, so a mutation can land in a part header,
+/// an identity string, a sticky-state boundary, a value vector, or a notification part.
 fn sample_collectd_packet() -> Vec<u8> {
-    /// Appends one part: `type u16 BE, len u16 BE` (the length *includes* the header), payload.
-    /// Hand-written rather than reusing `logit_proto::collectd::part`'s writers, so a bug in those
-    /// writers cannot quietly produce a fixture this suite then declares safe.
+    /// Appends one part: `type u16 BE, len u16 BE` (the length includes the header), payload.
+    /// Hand-written, not `collectd::part`'s writers, so a bug there can't shape the fixture.
     fn part(out: &mut Vec<u8>, part_type: u16, payload: &[u8]) {
         out.extend_from_slice(&part_type.to_be_bytes());
         out.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
@@ -293,9 +260,8 @@ fn sample_collectd_packet() -> Vec<u8> {
     out
 }
 
-/// Runs `CollectdDecoder::decode_into` over `bytes` with a fresh decoder, returning whether it
-/// failed. A fresh decoder per call because the sweeps below run one mutation at a time and must not
-/// let an earlier one's state colour a later one.
+/// Runs `CollectdDecoder::decode_into` over `bytes`, returning whether it failed. A fresh decoder
+/// per call keeps one mutation's sticky state out of the next.
 fn decode_collectd(bytes: &Bytes) -> bool {
     let mut decoder = logit_proto::collectd::CollectdDecoder::new(Arc::new(Resource::default()));
     let mut events = Vec::new();
@@ -371,8 +337,7 @@ fn read_frame_never_allocates_proportionally_to_a_hostile_uncompressed_len() {
     let peak = peak_live_bytes(|| {
         let _ = frame::read_frame(&mut bad);
     });
-    // u32::MAX bytes would be ~4 GiB -- anything under 1 MiB proves the header's declared length
-    // was checked against the sanity cap before it was ever used to size an allocation.
+    // u32::MAX bytes is ~4 GiB; under 1 MiB means the cap was checked before any allocation.
     assert!(peak < 1024 * 1024, "peak live bytes {peak} suggests the length field was trusted");
 }
 
@@ -392,9 +357,7 @@ fn decode_batch_survives_seeded_bit_flips() {
 
 #[test]
 fn decode_batch_rejects_a_dictionary_count_inflated_far_past_the_sanity_cap() {
-    // The dictionary entry count is the very first varint in the payload (`native::mod`'s
-    // `encode_batch`/`Dict::read`) -- overwrite it with a huge count and nothing else, no dict
-    // content behind it.
+    // The dictionary entry count is the payload's first varint; a huge one with nothing behind it.
     let mut out = BytesMut::new();
     write_uvarint(&mut out, u32::MAX as u64);
     let mut bytes = out.freeze();
@@ -414,8 +377,7 @@ fn decode_batch_never_allocates_proportionally_to_a_hostile_dictionary_count() {
 
 #[test]
 fn decode_batch_rejects_value_nesting_past_the_depth_cap() {
-    // 128 is `native::value`'s own `MAX_VALUE_DEPTH` -- go one past it, through the real encoder,
-    // exercising the cap at the full-batch level rather than `value`'s own inline unit test.
+    // One past `native::value`'s `MAX_VALUE_DEPTH` (128), through the real encoder.
     let batch = deeply_nested_batch(129);
     let mut payload = native::encode_batch(&batch);
     assert!(native::decode_batch(&mut payload).is_err());
@@ -451,10 +413,7 @@ fn decode_batch_v2_survives_seeded_bit_flips() {
     assert_bit_flips_never_panic(&payload, 5000, |bytes| native::decode_batch_v2(bytes).is_ok());
 }
 
-/// A plain v1 payload is a distinct codec, not a subset of v2's -- `decode_batch_v2` must reject
-/// it rather than silently decode it as "no provenance" (`native::mod`'s own inline test covers
-/// the same property; this is the adversarial-suite copy for consistency with every other decoder
-/// here).
+/// `decode_batch_v2` rejects a plain v1 payload rather than decoding it as "no provenance".
 #[test]
 fn decode_batch_v2_rejects_a_plain_v1_payload() {
     let mut payload = native::encode_batch(&sample_batch());
@@ -463,8 +422,7 @@ fn decode_batch_v2_rejects_a_plain_v1_payload() {
 
 #[test]
 fn native_decoder_decode_into_never_panics_on_a_truncated_framed_batch() {
-    // The full `Decoder` entry point `logit_in` actually calls -- `read_frame` + `decode_batch`
-    // composed, rather than either alone.
+    // The whole `Decoder` entry point: `read_frame` and `decode_batch` composed.
     let mut encoder = native::NativeEncoder::default();
     let framed = encoder.encode(&sample_batch()).unwrap();
     for len in 0..framed.len() {
@@ -481,14 +439,10 @@ fn native_decoder_decode_into_never_panics_on_a_truncated_framed_batch() {
 
 // -- collectd ---------------------------------------------------------------------------------
 
-/// The **weaker** truncation helper, deliberately: a collectd datagram is a flat sequence of
-/// self-delimiting parts with no trailing checksum or total length, so a prefix that happens to end
-/// exactly on a part boundary is not a truncation at all -- it is a shorter, perfectly valid
-/// datagram, and `decode_into` correctly returns `Ok` with the lists it did read. (The same is true
-/// one level down: a prefix ending mid-list still yields `Ok`, because every list the truncation
-/// left intact is kept and only the rest of the datagram is abandoned -- `collectd/decode.rs`'s
-/// per-datagram isolation rule.) `assert_every_truncation_fails_cleanly`'s stronger property
-/// genuinely does not hold here, and asserting it would be asserting a bug.
+/// The **weaker** truncation helper: a collectd datagram is self-delimiting parts with no
+/// checksum or total length, so a prefix ending on a part boundary is a shorter valid datagram.
+/// A prefix ending mid-list is `Ok` too: the intact lists are kept and the rest abandoned
+/// (`collectd/decode.rs`'s per-datagram isolation rule).
 #[test]
 fn collectd_decode_survives_every_single_byte_truncation() {
     let packet = sample_collectd_packet();
@@ -501,9 +455,8 @@ fn collectd_decode_survives_seeded_bit_flips() {
     assert_bit_flips_never_panic(&packet, 4000, |bytes| decode_collectd(bytes));
 }
 
-/// A Values part declaring 65535 data sources over a 20-byte buffer: the count is attacker-chosen
-/// (`u16`) and must be checked against the part's own declared length *before* anything is sized
-/// from it. 65535 data sources would be ~590 KB of type bytes and values.
+/// A Values part declaring 65535 data sources in 20 bytes: the attacker-chosen count must be
+/// checked against the part's length before anything is sized from it.
 #[test]
 fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds() {
     let mut hostile = Vec::new();
@@ -517,23 +470,20 @@ fn collectd_decode_rejects_a_values_count_inflated_far_past_what_the_input_holds
     let peak = peak_live_bytes(|| {
         let _ = decode_collectd(&bytes);
     });
-    // 65535 data sources would be ~590 KB before a single byte of it was read; anything under a few
-    // KB proves the declared count was checked against the part's own length first.
+    // 65535 data sources is ~590 KB; a few KB means the count was checked first.
     assert!(peak < 4096, "peak live bytes {peak} suggests the values count was trusted");
 }
 
 // -- graphite -----------------------------------------------------------------------------------
 
-/// A realistic carbon plaintext datagram: several `\n`-separated lines, tagged and untagged, with
-/// a `\r\n` ending and a trailing blank line -- so a truncation or a bit flip can land in a path,
-/// a tag segment, a value, a timestamp or a line boundary.
+/// A realistic carbon plaintext datagram: tagged and untagged lines, a `\r\n` ending, and a
+/// trailing blank line, so a mutation can land in a path, tag, value, timestamp, or line boundary.
 const GRAPHITE_PLAINTEXT: &[u8] = b"robustness.host.cpu;env=prod;dc=iad 0.5 1700000000\nrobustness.host.mem 2 1700000001\r\nrobustness.host.disk;mount=_root -1.25 1700000002\n\n";
 
 /// `p = 'robustness.host.cpu;env=prod'; pickle.dumps([(p, (1700000000, 0.5)),
 /// ('robustness.host.mem', (1700000001, 2**31 + 5)), (p, (1700000002, -1.25))], protocol=2)`,
-/// produced by CPython on the host and hexdumped -- so the mutation sweep runs over bytes a real
-/// sender actually emits: `BINUNICODE`, `BINPUT`, `BINGET`, `BININT`, `LONG1`, `BINFLOAT`,
-/// `TUPLE2`, `MARK`/`APPENDS`.
+/// produced by CPython and hexdumped, so the sweep runs over bytes a real sender emits:
+/// `BINUNICODE`, `BINPUT`, `BINGET`, `BININT`, `LONG1`, `BINFLOAT`, `TUPLE2`, `MARK`/`APPENDS`.
 const GRAPHITE_PICKLE: &[u8] = &[
     0x80, 0x02, 0x5d, 0x71, 0x00, 0x28, 0x58, 0x1c, 0x00, 0x00, 0x00, 0x72, 0x6f, 0x62, 0x75, 0x73,
     0x74, 0x6e, 0x65, 0x73, 0x73, 0x2e, 0x68, 0x6f, 0x73, 0x74, 0x2e, 0x63, 0x70, 0x75, 0x3b, 0x65,
@@ -547,17 +497,15 @@ const GRAPHITE_PICKLE: &[u8] = &[
 ];
 
 /// Runs `GraphiteDecoder::decode_into` over `bytes` with a fresh decoder, returning whether it
-/// failed. Fresh per call for [`decode_collectd`]'s reason: one mutation must not colour the next.
+/// failed.
 fn decode_graphite(bytes: &Bytes, protocol: Protocol) -> bool {
     let mut decoder = GraphiteDecoder::new(Arc::new(Resource::default())).with_protocol(protocol);
     let mut events = Vec::new();
     decoder.decode_into(bytes.clone(), 0, &mut events).is_err()
 }
 
-/// The **weaker** helper, for [`collectd_decode_survives_every_single_byte_truncation`]'s reason
-/// one level simpler: a carbon plaintext datagram is a sequence of self-delimiting lines, so a
-/// prefix ending on a line boundary is a shorter, perfectly valid datagram, and a prefix ending
-/// mid-line costs that line alone. `decode_into` correctly returns `Ok` in both cases.
+/// The **weaker** helper: plaintext lines are self-delimiting, so a prefix ending on a line
+/// boundary is a shorter valid datagram, and one ending mid-line costs that line alone.
 #[test]
 fn graphite_plaintext_survives_every_single_byte_truncation() {
     assert_every_truncation_never_panics(GRAPHITE_PLAINTEXT, |bytes| {
@@ -572,8 +520,7 @@ fn graphite_plaintext_survives_seeded_bit_flips() {
     });
 }
 
-/// The **stronger** helper genuinely holds for pickle: a payload is only complete at its `STOP`
-/// opcode, which is its last byte, so no proper prefix of a valid payload can itself be valid.
+/// The **stronger** helper: a pickle is complete only at its final `STOP` opcode.
 #[test]
 fn graphite_pickle_fails_cleanly_on_every_single_byte_truncation() {
     assert_every_truncation_fails_cleanly(GRAPHITE_PICKLE, |bytes| {
@@ -588,10 +535,9 @@ fn graphite_pickle_survives_seeded_bit_flips() {
     });
 }
 
-/// A `BINUNICODE` declaring `u32::MAX` bytes over a 5-byte payload: the length is attacker-chosen
-/// and must be checked against the remaining input *before* anything is sized from it. Four GiB
-/// would be a fatal allocation; the reader stores string values as ranges and never copies at all,
-/// so the peak here is bounded by the reader's own small `Vec`s.
+/// A `BINUNICODE` declaring `u32::MAX` bytes over a 5-byte payload must be checked against the
+/// remaining input before anything is sized from it. The reader stores strings as ranges, so the
+/// peak is only its own small `Vec`s.
 #[test]
 fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_holds() {
     let mut hostile = vec![0x80, 0x02, 0x58];
@@ -607,8 +553,7 @@ fn graphite_pickle_rejects_a_string_length_inflated_far_past_what_the_input_hold
     assert!(peak < 4096, "peak live bytes {peak} suggests the declared length was trusted");
 }
 
-/// The same property for the two eight-byte length opcodes protocol 4/5 adds (`BINUNICODE8`,
-/// `BINBYTES8`), whose declared length does not even fit a `u32`.
+/// The same for protocol 4's eight-byte length opcodes (`BINUNICODE8`, `BINBYTES8`).
 #[test]
 fn graphite_pickle_rejects_a_64_bit_string_length() {
     for opcode in [0x8du8, 0x8e] {
@@ -626,10 +571,9 @@ fn graphite_pickle_rejects_a_64_bit_string_length() {
     }
 }
 
-/// The depth cap's edge, from both sides: `MAX_PICKLE_DEPTH` open marks is refused only for leaving
-/// values on the stack, while one more is refused *as* a depth violation -- so the cap fires where
-/// it is documented to, not one level early or late. And a crafted 100k-deep payload must not
-/// recurse: the reader is a flat loop over a `Vec` stack, so depth bounds work, never call frames.
+/// The depth cap fires at its documented edge: `MAX_PICKLE_DEPTH` open marks fail only for
+/// leaving values on the stack, one more fails as a depth violation. A 100k-deep payload must not
+/// recurse; the reader loops over a `Vec` stack.
 #[test]
 fn graphite_pickle_rejects_nesting_past_the_depth_cap() {
     let depth = logit_proto::graphite::MAX_PICKLE_DEPTH;
@@ -642,8 +586,7 @@ fn graphite_pickle_rejects_nesting_past_the_depth_cap() {
     }
 }
 
-/// A `LONG4` declaring a 2 GB magnitude, and an inflated `FRAME` length: two more attacker-chosen
-/// lengths that must be compared, never trusted.
+/// A `LONG4` declaring a 2 GB magnitude, and an inflated `FRAME` length, must not be trusted.
 #[test]
 fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
     let mut long4 = vec![0x80u8, 0x02, 0x8b];
@@ -657,11 +600,8 @@ fn graphite_pickle_rejects_inflated_long_and_frame_lengths() {
     assert!(decode_graphite(&Bytes::from(frame), Protocol::Pickle));
 }
 
-/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` -- 9 bytes. Before the memo-key ordinal check,
-/// this `resize`d the reader's memo to 500,000 `Option<PValue>` slots (~8 MB) from a key with
-/// nothing behind it, the one `Vec` in the reader sized from a declared index rather than input
-/// actually consumed. It must now be rejected, and cost no more peak memory than the sibling
-/// pickle cases above.
+/// `PROTO 2, EMPTY_LIST, LONG_BINPUT 499999, STOP` (9 bytes): a memo key with nothing behind it
+/// must be rejected, not grow the memo to 500,000 slots (~8 MB).
 #[test]
 fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
     let hostile = vec![0x80, 0x02, 0x5d, 0x72, 0x1f, 0xa1, 0x07, 0x00, 0x2e];
@@ -677,8 +617,7 @@ fn graphite_pickle_never_allocates_from_a_hostile_memo_key() {
     assert!(peak < 4096, "peak live bytes {peak} suggests the memo key sized the memo");
 }
 
-/// Every opcode byte that is not on the allowlist must be refused, one at a time -- the property
-/// the allowlist exists for, asserted exhaustively rather than on a handful of samples.
+/// Every opcode byte off the allowlist is refused, checked exhaustively.
 #[test]
 fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
     const PERMITTED: &[u8] = &[
@@ -690,8 +629,7 @@ fn graphite_pickle_rejects_every_opcode_outside_the_allowlist() {
         if PERMITTED.contains(&opcode) {
             continue;
         }
-        // `PROTO 2`, the opcode under test, then enough trailing bytes that a permitted opcode
-        // would have had operands to read -- so a failure here is the allowlist, not a short read.
+        // Trailing operand bytes, so a refusal is the allowlist, not a short read.
         let mut hostile = vec![0x80u8, 0x02, opcode];
         hostile.extend_from_slice(&[0u8; 16]);
         hostile.push(0x2e);
@@ -754,9 +692,8 @@ fn reject_survives_seeded_bit_flips() {
 
 #[test]
 fn reject_rejects_a_message_length_inflated_far_past_what_the_input_holds() {
-    // Hand-build a Reject payload whose message field declares far more bytes than actually
-    // follow -- the field-length check (`control::read_field`), not the 1 KiB message-size cap,
-    // is what this exercises.
+    // A Reject whose message field overstates its length: `control::read_field`'s check, not
+    // the 1 KiB message cap.
     let mut out = BytesMut::new();
     out.extend_from_slice(&[4]); // MSG_REJECT
     out.extend_from_slice(&[2]); // REJECT_FIELD_MESSAGE tag
