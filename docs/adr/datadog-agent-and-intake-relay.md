@@ -117,8 +117,9 @@ Three facts from the survey drive the shape of the decision:
 10. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
     never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
     than Datadog's documented windows (1 h for metrics, 18 h for logs, 10 min for checks) before
-    sending. The metrics window is stricter than the intake, which stored series points 3 h old;
-    the documented window stays, because no longer one is documented.
+    sending. The metrics window is the documented one and stricter than the intake
+    ([the plan's §11](../plans/datadog-relay.md#11-timestamp-windows-w5) has what the intake
+    stored).
 
 11. **`datadog_trace_in` shares decision 5's bounded-wait-then-`503` mechanism, but a `503` there
     is loss, not deferral, and the bound is shorter.** Delivery is the same

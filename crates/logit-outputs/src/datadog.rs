@@ -74,10 +74,9 @@
 //! A `buffer.disk:` replaying after a long outage therefore sends only what is still inside these
 //! windows. Anything older is counted `stale` and dropped at replay time, not delivered late.
 //!
-//! The series window is the documented one, and stricter than the intake: against a trial org
-//! (`docs/plans/datadog-relay.md`'s W7b) the intake stored gauge points 2 h and 3 h old, not 6 h
-//! or older, and a point more than 10 min ahead was dropped alone, with `202` and an `errors`
-//! entry naming it, while the rest of its request was stored.
+//! The series window is the documented one, and stricter than the intake, which stored older
+//! points in a trial-org run (`docs/plans/datadog-relay.md`, "Verification"). That plan's
+//! "Timestamp windows" section has what the intake stored and how it treats a point too far ahead.
 //!
 //! **Traces an Agent hasn't processed** (ADR decision 2). The intake's trace route expects what an
 //! Agent sends: normalized, obfuscated, `_top_level`-marked spans, with the Agent's stats beside
@@ -149,10 +148,12 @@
 //! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
 //! [`DatadogOutput::duplicate_safe`] is **`false`**: a batch spans several requests, so a retry
-//! re-sends the ones that succeeded, and only some of those the intake dedupes. A resent series
-//! point is stored once, the last write winning at its `(series, timestamp)`; a resent log is
-//! stored twice (both checked against a trial org). So the default posture is at-most-once, and a
-//! 5xx drops the batch; `buffer: { delivery: at_least_once }` accepts duplicate logs instead.
+//! re-sends the ones that succeeded. A trial org was sent two resends: a resent series point was
+//! stored once, the last write winning at its `(series, timestamp)`, and an identical log was
+//! stored twice. Every other route (distribution points, sketches, events, checks, traces, stats)
+//! is assumed to store a resend again until measured. So the default posture is at-most-once, and
+//! a 5xx drops the batch; `buffer: { delivery: at_least_once }` retries and accepts those
+//! duplicates instead.
 //!
 //! ## Telemetry
 //!
@@ -852,10 +853,7 @@ impl Output for DatadogOutput {
         self.send_at(batch, now_nanos()).await
     }
 
-    /// `false`, for two reasons, either sufficient: a batch is several requests, so a retry
-    /// after a mid-batch failure re-sends the ones that succeeded; and whether the intake dedupes
-    /// a resent point, log, or span is unverified. So the default is at-most-once;
-    /// `buffer: { delivery: at_least_once }` overrides it.
+    /// `false`: the module doc's "Faults, retries, and duplicate safety" says why.
     fn duplicate_safe(&self) -> bool {
         false
     }

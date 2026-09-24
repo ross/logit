@@ -922,25 +922,30 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     byte-level comparison against a real client's output could differ.
   - **Revisit trigger:** W7 records a client (datadog-go v5.6+ or a current dd-trace library) that
     sends the two fields.
-- **`datadog_out`'s size limits for distribution points, sketches, and logs are tighter than the
+- **`datadog_out`'s size limits for distribution points and logs are tighter than the
   intake's.** Only the series limit is the intake's own: a 512,180 B gzip series body drew `413`
-  ("limit=512 kB"). Distribution points and sketches reuse the series limits, and logs keep the
-  documented 5,000,000 B, but a trial org accepted a 1,052,533 B gzip distribution-points body
-  (150,000 values, all counted) and a 5,252,247 B logs body (all 21 logs stored). Service checks
-  and stats are sent uncapped.
+  ("limit=512 kB"). Distribution points reuse the series limits, and logs keep the documented
+  5,000,000 B, but a trial org accepted a 1,052,533 B gzip distribution-points body (150,000
+  values, all counted) and a 5,252,247 B logs body (all 21 logs stored). Sketches also reuse the
+  series limits, unmeasured: no oversized sketch body was sent. Service checks and stats are sent
+  uncapped.
   - **Consequence:** extra requests, never a `413`, on these routes.
-- **`datadog_out` isn't duplicate-safe, because Datadog stores a resent log twice.** A trial org
-  stored a series point resent at the same `(series, timestamp)` once, the last write winning (a
-  count sent twice read 5, not 10; a gauge sent as 7 then 9 read 9), and an identical log posted
-  twice as two logs. A batch is several requests, and a retry re-sends the ones that succeeded.
+- **`datadog_out` isn't duplicate-safe, because Datadog stores a resent log twice.** A batch is
+  several requests, and a retry re-sends the ones that succeeded. A trial org was sent two
+  resends: a series point resent at the same `(series, timestamp)` was stored once, the last write
+  winning (a count sent twice read 5, not 10; a gauge sent as 7 then 9 read 9), and an identical
+  log posted twice was stored as two logs. Every other route (distribution points, sketches,
+  events, checks, traces, stats) is assumed to store a resend again until measured.
   - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
-    `buffer: {delivery: at_least_once}` retries it and accepts duplicate logs; its metrics are
-    unaffected.
+    `buffer: {delivery: at_least_once}` retries it and accepts duplicates on every route but
+    series: duplicate logs, and assumed inflated distribution, sketch, event, check, trace, and
+    stats counts.
 - **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The series
-  window is the documented one. A trial org stored gauge points 2 and 3 hours old (not 6 hours or
-  older) through `/api/v2/series`, so the filter is stricter than the intake.
-  - **Consequence:** a `buffer.disk:` replay after an outage of 1 to about 3 hours drops metrics
-    the intake would still have stored, counted `records.dropped{reason="stale"}`.
+  window is the documented one, and stricter than the intake:
+  [the plan's "Timestamp windows" section](plans/datadog-relay.md#11-timestamp-windows-w5) has
+  what a trial org stored.
+  - **Consequence:** a `buffer.disk:` replay after an outage longer than 1 hour drops metrics
+    the intake may still have stored, counted `records.dropped{reason="stale"}`.
   - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
 - **`datadog_out` treats a `202` as full success, and the intake drops parts of a `202`ed
   request.** The series route answers `202` with an `errors` array naming what it dropped: a point

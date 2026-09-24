@@ -1549,8 +1549,9 @@ discards data outside it, so `datadog_out` drops it and counts
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
 batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
 past 18 hours are dropped as stale, not sent. The metrics window is Datadog's documented one, and
-stricter than the intake: a trial org stored gauge points 2 and 3 hours old, though not 6 hours
-old. Watch `records.dropped{reason="stale"}` after a replay to see how much.
+stricter than the intake; the
+[Datadog plan's "Timestamp windows" section](plans/datadog-relay.md#11-timestamp-windows-w5) has
+what a trial org stored. Watch `records.dropped{reason="stale"}` after a replay to see how much.
 
 **Traces must have been through an Agent.** Datadog's trace intake expects spans an Agent has
 normalized, obfuscated, and marked, with the Agent's APM stats sent beside them. `datadog_out`
@@ -1578,10 +1579,12 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 **Delivery.** One batch is up to eight requests, sent one after another. The first that fails
 stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
 and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
-retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded: Datadog
-stores a resent series point once, the last write winning, but a resent log twice. So the default
-is at-most-once and a `5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to retry
-instead and accept duplicate logs.
+retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded. A trial
+org stored a resent series point once, the last write winning at its `(series, timestamp)`, and an
+identical log twice. Assume every other route (distribution points, sketches, events, checks,
+traces, stats) stores a resend again: none was measured. So the default is at-most-once and a
+`5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to retry instead and accept those
+duplicates.
 
 **Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
 is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:

@@ -47,8 +47,8 @@ Datadog ingests five kinds of data. Each cell reads today → after this stack.
 | Signal | Direct API, no Agent | Through a local Agent | Agent stand-in (receive from apps) | Intake stand-in (receive from Agents) |
 |---|---|---|---|---|
 | Logs | `otlp_out` agentless (verified in W7b) → `datadog_out` `/api/v2/logs` (W5) | `otlp_out` to the Agent's OTLP receiver (its `logs.enabled` defaults to false), or `syslog_out` over TCP to the Agent's `logs` TCP listener, which accepts syslog-formatted lines; `syslog_out` writes a `Str` body verbatim, but whether the Agent then parses a JSON body into attributes is UNVERIFIED | `syslog_in`; apps that write JSON lines to an Agent TCP port have no plain-lines listener (documented gap, §7) | none → `datadog_in` `/api/v2/logs` and legacy `/v1/input` (W3) |
-| Metrics | `otlp_out` agentless, delta only → `datadog_out` `/api/v2/series` + `/api/v1/distribution_points` + sketches (W5, §4) | `statsd_out format: dogstatsd`, over UDP or either Agent Unix socket (W4b); `otlp_out` | `statsd_in` over UDP or either Agent Unix socket, `\|e:`/`\|card:` carried (W4b); `otlp_in` | none → `datadog_in` series v1/v2 + sketches (W3) |
-| Traces | `otlp_out` agentless, lossy for Datadog-origin spans → `datadog_out` `/api/v0.2/traces` + `/api/v0.2/stats`, the Agent's own protocol (W5, §12); `otlp_out` stays the path for OTel-origin spans | `otlp_out` → also `datadog_trace_out` msgpack `/v0.4/traces` + `/v0.6/stats` (W6) | `otlp_in` (dd-trace OTLP export is Preview) → `datadog_trace_in` on `:8126`, traces and client stats (W4a) | none → `datadog_in` `AgentPayload` + `StatsPayload` (W3) |
+| Metrics | `otlp_out` agentless, delta only (verified in W7b) → `datadog_out` `/api/v2/series` + `/api/v1/distribution_points` + sketches (W5, §4) | `statsd_out format: dogstatsd`, over UDP or either Agent Unix socket (W4b); `otlp_out` | `statsd_in` over UDP or either Agent Unix socket, `\|e:`/`\|card:` carried (W4b); `otlp_in` | none → `datadog_in` series v1/v2 + sketches (W3) |
+| Traces | `otlp_out` agentless, lossy for Datadog-origin spans (verified in W7b) → `datadog_out` `/api/v0.2/traces` + `/api/v0.2/stats`, the Agent's own protocol (W5, §12); `otlp_out` stays the path for OTel-origin spans | `otlp_out` → also `datadog_trace_out` msgpack `/v0.4/traces` + `/v0.6/stats` (W6) | `otlp_in` (dd-trace OTLP export is Preview) → `datadog_trace_in` on `:8126`, traces and client stats (W4a) | none → `datadog_in` `AgentPayload` + `StatsPayload` (W3) |
 | Events | none → `datadog_out` `/api/v1/events` (W5) | `statsd_out` `_e{}` | `statsd_in` `_e{}` | none → `datadog_in` `/intake/` (W3) |
 | Service checks | none → `datadog_out` `/api/v1/check_run` (W5) | `statsd_out` `_sc` | `statsd_in` `_sc` | none → `datadog_in` `/api/v1/check_run` (W3) |
 
@@ -64,7 +64,7 @@ or a real Agent and this section is updated then.
 
 | Endpoint | Body and limits | Notes |
 |---|---|---|
-| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future (W7b: the intake stored points 2 h and 3 h old, not 6 h; a point over 10 min ahead is dropped alone, with `202` and an `errors` entry). A series with more than 100 tags is dropped the same way. A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning |
+| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future (what the intake does outside that window: §11). A series with more than 100 tags is dropped the same way. A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning |
 | `POST /api/v1/distribution_points` | JSON `{series:[{metric, host, tags, type:"distribution", points:[[ts,[v…]]]}]}`; `deflate` only | Raw values; Datadog sketches them server side. Limits undocumented; W7b sent 1,052,533 B gzip (150,000 values) and got `202` with every value counted. gzip and zlib deflate are both accepted, raw deflate is `400` |
 | `POST /api/beta/sketches` | protobuf `SketchPayload` | What Agents send. Not in the public spec; Vector's `datadog_metrics` sink sends it with an API key, and W7b's `datadog_out` did too: `aggregate`'s locally built sketches are queryable (`avg`, `count`, `max`) |
 | `POST http-intake.logs.<site>/api/v2/logs` | JSON array of `{message, ddsource, ddtags, hostname, service, status, …}`; 1,000 entries, 5 MB decompressed, 1 MB per log (cut, still 2xx); up to 18 h in the past; `gzip`/`deflate`/`identity`; 202 accepted, retry 408/429/500/503 | Other keys are attributes, nested maps included. Trace correlation auto-detects OTel `trace_id`/`span_id` (32-/16-char lowercase hex) and Datadog `dd.trace_id`/`dd.span_id` (decimal) |
@@ -385,6 +385,11 @@ added since it was written.
 `datadog_out` drops and counts `dropped{reason="stale"}` any point older than 1 h, log older
 than 18 h, or check older than 10 min, instead of letting one stale point fail a payload. The
 consequence for `buffer.disk:` replay after a long outage is documented with the component.
+
+The series window is the documented one, and stricter than the intake: a trial-org run stored
+gauge points 2 h and 3 h old, and none 6 h or older. The 1 h window stays because it's the one
+Datadog documents. A point more than 10 min ahead was dropped alone, with `202` and an `errors`
+entry naming it, while the rest of its request was stored.
 
 ### 12. Traces to Datadog: the Agent's protocol, not OTLP, for Datadog-origin spans (W5, W7)
 
