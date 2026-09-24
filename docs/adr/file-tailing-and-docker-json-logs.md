@@ -443,6 +443,9 @@ decisions 1 to 4.
 **The tmp file appends `.tmp` to the full file name.** It used to replace the extension, so
 `state.json` and `state.yaml` shared `state.tmp`. Graph rule 62 now also rejects two `tail_in`/
 `docker_in` components that set the same literal `checkpoint_path`: each would overwrite the
-other's offsets on every write, and each would resume from whichever wrote last. Like rule 35's
+other's offsets on every write, and each would resume from whichever wrote last. It also rejects a
+`checkpoint_path` equal to another component's `<checkpoint_path>.tmp`: every write of the other
+would truncate that checkpoint and rename it away, and at restart it would load as missing and
+fall back to `read_from`, the loss this amendment closes. Like rule 35's
 `disk.path` check, the rule compares literal strings, so two spellings of one path (`./a.json` and
 `a.json`) still pass.

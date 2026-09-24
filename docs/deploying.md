@@ -1006,7 +1006,7 @@ Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoi
 directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
 one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
 tick. Give each `tail_in`/`docker_in` its own `checkpoint_path`: validation rejects two components
-that name the same one.
+that name the same one, or one that names another's `<checkpoint_path>.tmp`.
 
 ### `watch: auto | inotify | poll`
 

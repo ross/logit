@@ -294,8 +294,10 @@ script is needed. This list is filled in as each workstream lands.
     - `a_crash_between_checkpoint_write_and_rename_resumes_from_the_previous_checkpoint_with_duplicates_only`:
       a freeze at the rename, then a restart under `read_from: end`, redelivers the line read
       since the last checkpoint and skips nothing.
-  - `crates/logit-pipeline/src/graph.rs`: `two_tailing_listeners_sharing_a_checkpoint_path_are_rejected`
-    (rule 62) and `tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine`.
+  - `crates/logit-pipeline/src/graph.rs` (rule 62):
+    `two_tailing_listeners_sharing_a_checkpoint_path_are_rejected`,
+    `a_checkpoint_path_equal_to_another_components_tmp_path_is_rejected`, and
+    `tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine`.
 - **`dur/w7`, `file_out` rotation (DISK-10):** to be listed when `dur/w7` lands.
 
 ## Consequences
