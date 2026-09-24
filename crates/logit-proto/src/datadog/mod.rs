@@ -51,7 +51,7 @@
 //! | `unit` | `MetricRecord::unit` when non-empty | -- |
 //! | `tags` | attributes by [`tags`]'s rule | -- |
 //! | the first named `host` resource; v1 and distribution `host` | [`ATTR_HOST_NAME`] | -- |
-//! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED) | -- |
+//! | the first named `device` resource; v1 `device` | [`ATTR_DEVICE`] (the Agent's v2 serializer sends a v1 `device` as that resource, UNVERIFIED: the recorded Agent ran no check that sets one) | -- |
 //! | every other resource, including an empty-named or second `host` | [`ATTR_RESOURCES`]: `Array` of `Map{type, name}`, in wire order | -- |
 //! | `source_type_name` | [`ATTR_SOURCE_TYPE_NAME`] when non-empty | -- |
 //! | `interval` | [`ATTR_INTERVAL`] (`I64`) when nonzero | -- |
@@ -155,6 +155,7 @@
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
 //! | body: a JSON array of objects, or one bare object | one [`logit_core::Event::log`] per object | anything else (or not JSON): `CodecError::Malformed` |
+//! | body: a bare empty object `{}`, the connectivity check an Agent's logs sender posts before its first batch (`testdata/interop/datadog/agent-api-v2-logs-000.bin`) | no events | -- |
 //! | an array element that isn't an object | skipped | `logit.input.logs.skipped{reason="not_an_object"}` + diag `malformed_log` |
 //! | `message` string | `LogRecord::message` = `Str`, `body_format: Raw` | -- |
 //! | `message` of another JSON type | `Str` of its JSON text | -- |
@@ -297,7 +298,7 @@
 //! | chunk `origin`, `dropped_trace`, `tags` | [`traces::ATTR_CHUNK_ORIGIN`] (non-empty), [`traces::ATTR_CHUNK_DROPPED_TRACE`] (`true`), [`traces::ATTR_CHUNK_TAGS`] (`Map` of `Str`, non-empty), on every span | -- |
 //! | `TracerPayload` fields | batch resource `datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
 //! | tracer API request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Lang-Version`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `datadog.tracer.language_name`, `.language_version`, `.tracer_version`, `.container_id` (`Str`), each when non-empty; on v0.7 only where the `TracerPayload` left the field empty | -- |
-//! | `Datadog-Meta-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `Datadog-Entity-ID` | [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER`], [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR`], [`RESOURCE_ATTR_TRACER_ENTITY_ID`] (`Str`), each when non-empty | -- |
+//! | `Datadog-Meta-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, `Datadog-External-Env` | [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER`], [`RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR`], [`RESOURCE_ATTR_TRACER_ENTITY_ID`], [`RESOURCE_ATTR_TRACER_EXTERNAL_ENV`] (`Str`), each when non-empty | -- |
 //! | `Datadog-Client-Computed-Top-Level` (any non-empty value); `Datadog-Client-Computed-Stats` (any non-empty value but a Go `false` spelling) | [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_TOP_LEVEL`], [`RESOURCE_ATTR_TRACER_CLIENT_COMPUTED_STATS`] = `Bool(true)`; absent otherwise | -- |
 //! | `Datadog-Client-Dropped-P0-Traces`, `-Spans` | [`RESOURCE_ATTR_TRACER_DROPPED_P0_TRACES`], [`RESOURCE_ATTR_TRACER_DROPPED_P0_SPANS`] (`U64`); a value that isn't an unsigned integer is left out | diag `bad_header` |
 //! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
@@ -403,6 +404,7 @@
 //! | `PeerTags`, `AdditionalMetricTags`, `SpanDerivedPrimaryTags` | `datadog.stats.peer_tags`, `.additional_metric_tags`, `.span_derived_primary_tags`: `Array` of `Str`, when non-empty | -- |
 //! | bucket `Duration`, `AgentTimeShift` | each of its groups' `datadog.stats.bucket.duration` (`U64`, always) and `.bucket.agent_time_shift` (`I64`, when nonzero) | -- |
 //! | `ClientStatsPayload` `Hostname`, `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `datadog.tracer.hostname`, `.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
+//! | `/v0.6/stats` request headers (read by `datadog_trace_in`, not by these decoders): `Datadog-Meta-Lang`, `-Tracer-Version`, `Datadog-Container-ID` | batch resource `datadog.tracer.language_name`, `.tracer_version`, `.container_id` (`Str`), each when non-empty and only where the payload's `Lang`, `TracerVersion`, or `ContainerID` left it unset, as the Agent's stats receiver fills them | -- |
 //! | `AgentAggregation`, `Service`, `GitCommitSha`, `ImageTag`, `ProcessTags` | resource `datadog.stats.agent_aggregation`, `.service`, `.git_commit_sha`, `.image_tag`, `.process_tags`, when non-empty | -- |
 //! | `Sequence`, `ProcessTagsHash`; `Tags` | resource `datadog.stats.sequence`, `.process_tags_hash` (`U64`), when nonzero; `datadog.stats.tags` (`Array` of `Str`), when non-empty | -- |
 //! | `StatsPayload` `AgentHostname`, `AgentEnv`, `AgentVersion` | every batch's resource [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`], when non-empty | -- |
@@ -429,8 +431,9 @@
 //!
 //! ## Permitted normalizations (APM stats)
 //!
-//! `datadog_in -> datadog_out` on one stats route is a fixed point modulo this list
-//! (`tests/datadog_stats_fixed_point.rs` pins it):
+//! `datadog_in -> datadog_out` on one stats route, and `datadog_trace_in -> datadog_trace_out` on
+//! `/v0.6/stats`, is a fixed point modulo this list (`tests/datadog_stats_fixed_point.rs` pins
+//! items 1-5):
 //!
 //! 1. every map key is written, in Go field order, zero values included: a tracer's omitted key or
 //!    `nil` leaves as the explicit zero value, and an unknown key is dropped;
@@ -440,7 +443,9 @@
 //!    merge, their groups in first-seen order;
 //! 4. an intake `StatsPayload` leaves as one `StatsPayload` per `ClientStatsPayload` (batching),
 //!    its envelope restated on each;
-//! 5. a count above 2^53 that `f64` can't hold exactly is rounded, and counted.
+//! 5. a count above 2^53 that `f64` can't hold exactly is rounded, and counted;
+//! 6. on `/v0.6/stats`, a `Lang`, `TracerVersion`, or `ContainerID` the payload left empty leaves
+//!    in the payload when the request's matching header carried it, as it does behind an Agent.
 
 pub mod generated;
 pub mod tags;
@@ -513,13 +518,16 @@ pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "datadog.tracer.runtime_id";
 pub const RESOURCE_ATTR_TRACER_ENV: &str = "datadog.tracer.env";
 pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
 pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
-/// `datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id`: a
-/// tracer's `Datadog-Meta-Lang-Interpreter`, `Datadog-Meta-Lang-Interpreter-Vendor`, and
-/// `Datadog-Entity-ID` request headers (`Str`), which no payload carries.
+/// `datadog.tracer.language_interpreter` / `.language_interpreter_vendor` / `.entity_id` /
+/// `.external_env`: a tracer's `Datadog-Meta-Lang-Interpreter`,
+/// `Datadog-Meta-Lang-Interpreter-Vendor`, `Datadog-Entity-ID`, and `Datadog-External-Env` request
+/// headers (`Str`), which no payload carries. `Datadog-External-Env` is the tracer's copy of the
+/// `DD_EXTERNAL_ENV` a DogStatsD client sends as `|e:`, which the Agent's origin detection reads.
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER: &str = "datadog.tracer.language_interpreter";
 pub const RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER_VENDOR: &str =
     "datadog.tracer.language_interpreter_vendor";
 pub const RESOURCE_ATTR_TRACER_ENTITY_ID: &str = "datadog.tracer.entity_id";
+pub const RESOURCE_ATTR_TRACER_EXTERNAL_ENV: &str = "datadog.tracer.external_env";
 /// `datadog.tracer.client_computed_top_level` / `.client_computed_stats`: a tracer's
 /// `Datadog-Client-Computed-Top-Level` and `Datadog-Client-Computed-Stats` request headers, as
 /// `Bool(true)` when set and absent otherwise.
@@ -542,6 +550,7 @@ pub const HEADER_META_LANG_INTERPRETER_VENDOR: &str = "datadog-meta-lang-interpr
 pub const HEADER_META_TRACER_VERSION: &str = "datadog-meta-tracer-version";
 pub const HEADER_CONTAINER_ID: &str = "datadog-container-id";
 pub const HEADER_ENTITY_ID: &str = "datadog-entity-id";
+pub const HEADER_EXTERNAL_ENV: &str = "datadog-external-env";
 pub const HEADER_CLIENT_COMPUTED_TOP_LEVEL: &str = "datadog-client-computed-top-level";
 pub const HEADER_CLIENT_COMPUTED_STATS: &str = "datadog-client-computed-stats";
 pub const HEADER_CLIENT_DROPPED_P0_TRACES: &str = "datadog-client-dropped-p0-traces";
@@ -551,7 +560,7 @@ pub const HEADER_TRACE_COUNT: &str = "x-datadog-trace-count";
 
 /// The tracer headers whose value is a `Str` resource attribute: header, then attribute.
 /// `datadog_trace_in` reads them and `datadog_trace_out` writes them back.
-pub const TRACER_STR_HEADERS: [(&str, &str); 7] = [
+pub const TRACER_STR_HEADERS: [(&str, &str); 8] = [
     (HEADER_META_LANG, RESOURCE_ATTR_TRACER_LANGUAGE_NAME),
     (HEADER_META_LANG_VERSION, traces::RESOURCE_ATTR_TRACER_LANGUAGE_VERSION),
     (HEADER_META_LANG_INTERPRETER, RESOURCE_ATTR_TRACER_LANGUAGE_INTERPRETER),
@@ -559,6 +568,7 @@ pub const TRACER_STR_HEADERS: [(&str, &str); 7] = [
     (HEADER_META_TRACER_VERSION, RESOURCE_ATTR_TRACER_VERSION),
     (HEADER_CONTAINER_ID, RESOURCE_ATTR_TRACER_CONTAINER_ID),
     (HEADER_ENTITY_ID, RESOURCE_ATTR_TRACER_ENTITY_ID),
+    (HEADER_EXTERNAL_ENV, RESOURCE_ATTR_TRACER_EXTERNAL_ENV),
 ];
 
 /// The tracer headers whose resource attribute is `Bool(true)` when set and absent otherwise.

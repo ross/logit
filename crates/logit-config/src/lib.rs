@@ -909,8 +909,8 @@ pub enum ComponentKind {
     /// or both at once; at least one is required. Every span is kept: the reply sets every
     /// service's sampling rate to 1.0. Profiling, debugger, and `evp_proxy` uploads are answered
     /// `200` and discarded; telemetry, Remote Configuration, and the other trace forms get `404`.
-    /// A request the pipeline can't take within 2s gets `503`, which a tracer drops rather than
-    /// retries. Spans pass through unprocessed (no obfuscation, normalization, or stats), so
+    /// A request the pipeline can't take within 2s gets `503`, which a tracer retries a few times
+    /// and then drops. Spans pass through unprocessed (no obfuscation, normalization, or stats), so
     /// send them to a real Agent (`datadog_trace_out`) or `otlp_out`, never straight to
     /// `datadog_out`.
     DatadogTraceIn {
@@ -923,7 +923,7 @@ pub enum ComponentKind {
         /// (`/var/run/datadog/apm.socket` by default). A tracer finds it through
         /// `DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket`. The directory must exist; a
         /// stale socket file at the path is replaced, and the new one is made writable by every
-        /// user (mode `0666`) so unprivileged tracers can connect.
+        /// user (mode `0722`, the Agent's own) so unprivileged tracers can connect.
         #[serde(default)]
         socket: Option<String>,
         /// Terminates TLS on the `bind` listener when present; plaintext when omitted. Requires

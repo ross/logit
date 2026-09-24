@@ -122,13 +122,15 @@ Three facts from the survey drive the shape of the decision:
     stored).
 
 11. **`datadog_trace_in` shares decision 5's bounded-wait-then-`503` mechanism, but a `503` there
-    is loss, not deferral, and the bound is shorter.** Delivery is the same
+    is deferral for about 15 s, not minutes, and the bound is shorter.** Delivery is the same
     `Fanout::send_with_deadline` all-edges-or-nothing wait, under `BUSY_AFTER` at 2 s rather than
-    5 s: a dd-trace tracer writes with a short timeout, commonly 2 s, and drops the payload on any
-    non-`2xx` answer or its own timeout, with no retry (UNVERIFIED against a real tracer until
-    W7). So a `503` here doesn't defer delivery to a retry, the way it does on `datadog_in` — it
-    is the loss, counted `logit.input.batches.dropped{reason="busy"}` rather than assumed
-    recovered. The 2 s bound is sized to answer before the tracer gives up on its own, which would
+    5 s: a dd-trace tracer writes with a short timeout and gives up on a payload quickly.
+    dd-trace-py 4.15.2, observed once (amendment below), retries a `503` five times, waiting 100,
+    200, 400, 800, and 1,600 ms between attempts (3.1 s), then drops the payload. Each of its six
+    attempts waits up to `BUSY_AFTER` for its `503`, so against this listener the window is
+    6 × 2 s + 3.1 s, about 15 s. A stall shorter than that defers delivery; a longer one loses the
+    payload, counted `logit.input.batches.dropped{reason="busy"}` rather than assumed recovered.
+    The 2 s bound is sized to answer before the tracer gives up on its own, which would
     lose the payload the same way with nothing counted. The operator's lever against the loss is
     downstream capacity, not a retry: a `buffer:` (memory or disk) on the sinks behind this
     listener, sized to absorb a stall so the channel keeps draining. The
@@ -145,14 +147,12 @@ Three facts from the survey drive the shape of the decision:
     - **`unix_stream` frames each packet as a 4-byte little-endian length, then one datagram's
       worth of newline-separated lines**: what the Agent's `pkg/dogstatsd/listeners/uds_stream.go`
       reads and `datadog-go`'s stream writer sends. It's a separate framing mode from carbon's
-      big-endian `LengthPrefixed`, not a flag on it. UNVERIFIED against a real Agent or client
-      until W7.
-    - **`statsd_in` makes its socket mode `0722`; `datadog_trace_in` makes its `0666`.** `0722` is
-      the Agent's own mode for the DogStatsD socket, and it's enough because a datagram sender or a
-      stream client needs only write permission on the socket file; the directory's permissions
-      are the access control. The Agent's mode for its APM `receiver_socket` wasn't found in the
-      source surveyed (UNVERIFIED), so `datadog_trace_in` uses `0666`, which lets a tracer running
-      as any user connect whatever the Agent's mode turns out to be.
+      big-endian `LengthPrefixed`, not a flag on it. Recorded from the `datadog` Python client, and
+      accepted by a real Agent 7.83 from `statsd_out` (amendment below).
+    - **`statsd_in` and `datadog_trace_in` make their sockets mode `0722`**, the Agent's own mode
+      for its DogStatsD and APM sockets (both recorded, amendment below). It's enough because a
+      datagram sender or a stream client needs only write permission on the socket file; the
+      directory's permissions are the access control.
     - **`statsd_out`'s `unix` sender connects its datagram socket to the path**, as `datadog-go`
       does with `net.Dial("unixgram", path)`, rather than calling `send_to(path)` on an unbound
       socket. Linux parks a sender on a full receiver queue, and wakes it when the receiver
@@ -179,8 +179,9 @@ Three facts from the survey drive the shape of the decision:
     - **`socket:` is an HTTP/1.1 client over the Unix socket**, a pooled `hyper_util` client whose
       connector dials the path for each new connection, beside `reqwest` for `endpoint:`; the two
       share request building and fault classification. A missing socket file or a refused connect
-      is `Fault::Clean`, as a refused TCP connect is. Agent 7.83.3's `receiver_socket` accepts
-      it, traces and `/v0.6/stats` alike.
+      is `Fault::Clean`, as a refused TCP connect is. A real Agent 7.83's socket accepted it
+      (amendment below), and the trial-org run's Agent 7.83.3 took traces and `/v0.6/stats` alike
+      through it.
     - **Requests are cut by trace**, at most 1,000 traces and 25 MiB (the Agent's
       `max_request_bytes`) on the wire, through `datadog_out`'s splitter. The Agent has no count
       limit; the 1,000 bounds one request's encode and send.
@@ -249,18 +250,47 @@ Three facts from the survey drive the shape of the decision:
 - The Agent-equivalent trace processor (normalization, `_top_level`, sampler tags, a stats
   concentrator) for the no-Agent topology is a follow-up plan, not this one; until it exists the
   tracer-direct topology runs through `datadog_trace_out` and a real Agent.
-- The plan's W7b settled the survey facts that needed a trial org: sketches, distribution points
-  (gzip or zlib, not raw deflate), `/api/v0.2/traces` and `/api/v0.2/stats` from a sender that
-  isn't an Agent, the series size cap, deduplication, and the stale windows. One changed a
-  decision (decision 14). Whether the intake accepts a stats sketch whose gamma isn't 1.0202 stays
-  open, because nothing in `logit` sends one yet.
+- The plan's W7a settled the survey facts a real Agent and tracer could (amendment below), and
+  W7b the ones that needed a trial org: sketches, distribution points (gzip or zlib, not raw
+  deflate), `/api/v0.2/traces` and `/api/v0.2/stats` from a sender that isn't an Agent, the
+  series size cap, deduplication, and the stale windows. One changed a decision (decision 14).
+  Whether the intake accepts a stats sketch whose gamma isn't 1.0202 stays open, because nothing
+  in `logit` sends one yet.
 - The hand-rolled `DdSketch` store measures +4.2% CPU on `aggregate` and +4.4% on `json-parse` on
   the perf VM, both sketch-heavy paths, and no measurable cost anywhere else
   ([`docs/design/performance.md`](../design/performance.md) §9). Accepted: bin-for-bin Datadog
   parity needs the Agent's own bin mapping, not a cheaper store that doesn't match it.
-- `datadog_trace_in`'s `503` counts as loss (`logit.input.batches.dropped{reason="busy"}`), not
-  the deferral `datadog_in`'s is (decision 11); the tracer short-timeout, no-retry behavior behind
-  that is UNVERIFIED until W7.
-- `statsd_in`/`statsd_out`'s `unix_stream` framing and `datadog_trace_in`'s `0666` socket mode
-  are UNVERIFIED until W7 (decision 12). A `unix` `statsd_out` whose receiver restarts mid-batch
-  fails that batch under the sink's usual rules; only a restart between batches is absorbed.
+- `datadog_trace_in`'s `503` is deferral only across a tracer's retries, and loss after them
+  (`logit.input.batches.dropped{reason="busy"}`), not the minutes-long deferral `datadog_in`'s is.
+  Decision 11 gives the window.
+- A `unix` `statsd_out` whose receiver restarts mid-batch fails that batch under the sink's usual
+  rules; only a restart between batches is absorbed.
+
+## Amendment: what W7a's recorded traffic settled
+
+`testdata/interop/datadog/` holds traffic from a real Agent 7.83, dd-trace-py 4.15, and the
+`datadog` DogStatsD client 0.54; its README lists each finding with the file that proves it. The
+ones that bear on these decisions:
+
+- **Decision 11:** the tracer retries a `503` five times, then drops the payload. This was one
+  observation, not a recorded fixture (the corpus README's "What this settled" has the command).
+  The mechanism stands; decision 11 changed from "no retry" to the retry window it now states.
+- **Decision 12:** the stream socket is 4-byte little-endian length-prefixed, as decided. Both of
+  the Agent's sockets are `0722`, so `datadog_trace_in` changed from `0666` to `0722`. And the
+  Python client writes a service check's `c:` and `card:` after `m:`, which the Agent reads by
+  ending `m:` at the next `|`; `statsd_in` changed to read it the same way, so a service-check
+  message can no longer carry `|`, and `statsd_out` substitutes `_` for one.
+- **Decision 13:** a real Agent's `receiver_socket` took `datadog_trace_out`'s requests.
+- **`datadog_trace_in`'s `/info`:** libdatadog, under current tracers, rejects the whole document
+  over one field of the wrong JSON type, and did over `"redis": false`. The document now has the
+  recorded Agent's field types, held by a test. With `client_drop_p0s: false`, such a tracer
+  computes no client stats, so the downstream Agent computes them. `/v0.6/stats` now takes a
+  tracer's language, version, and container id from headers where the payload leaves them empty,
+  as the Agent does, and `Datadog-External-Env` is a tracer header carrier.
+- **`datadog_in`:** the Agent's key check sends its key only as `?api_key=`, and it probes
+  `/api/v2/validate` and `/_health` too; all three are served, and a probe reads the query key.
+  The logs sender's `{}` connectivity check is no log rather than a skipped one.
+
+The survey facts about Datadog's backend (sketches and traces from a sender that isn't an Agent,
+zlib on distribution points, size limits, dedupe, URL classification for v3 series) are the
+trial-org run's; Consequences and decision 14 have what it settled.

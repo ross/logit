@@ -63,7 +63,7 @@
 //! | `Content-Type` | `application/msgpack` |
 //! | `Content-Encoding` | `gzip` under `compression: gzip`; absent under `none` |
 //! | `User-Agent` | `logit/<version>` |
-//! | [`TRACER_STR_HEADERS`] (`Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`) | trace requests: the batch resource's `Str` attribute, when present |
+//! | [`TRACER_STR_HEADERS`] (`Datadog-Meta-Lang`, `-Lang-Version`, `-Lang-Interpreter`, `-Lang-Interpreter-Vendor`, `-Tracer-Version`, `Datadog-Container-ID`, `Datadog-Entity-ID`, `Datadog-External-Env`) | trace requests: the batch resource's `Str` attribute, when present |
 //! | [`TRACER_FLAG_HEADERS`] (`Datadog-Client-Computed-Top-Level`, `-Stats`) | trace requests: `true` when the attribute is `Bool(true)`; absent otherwise |
 //! | [`TRACER_U64_HEADERS`] (`Datadog-Client-Dropped-P0-Traces`, `-Spans`) | trace requests: the `U64` attribute in decimal, when present |
 //! | `X-Datadog-Trace-Count` | trace requests: the number of traces the encoder wrote |

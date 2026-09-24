@@ -1369,7 +1369,8 @@ components:
 | `/api/v0.2/traces` | APM traces (`AgentPayload`) |
 | `/api/v0.2/stats` | APM stats, relayed rather than recomputed |
 
-`/api/v1/validate` answers `200` for a valid key. Host and inventory metadata
+The Agent's probes, `/api/v1/validate`, `/api/v2/validate`, and `GET /_health`, answer `200` for a
+valid key. Host and inventory metadata
 (`/api/v2/host_metadata`, `/api/v1/metadata`, host metadata on `/intake/`) and the process and
 orchestrator collectors (`/api/v1/collector`, `/api/v1/container`, `/api/v2/orch`) are answered
 `202` and discarded, counted `logit.input.requests.acknowledged{route}`. **Any other path gets
@@ -1378,7 +1379,9 @@ Agent's own status and logs, instead of as data acknowledged and silently lost. 
 the wrong method gets `405`.
 
 **Authentication.** With `api_keys` set, a request whose `DD-API-KEY` header matches none of them
-gets `403`, counted `logit.input.requests.rejected{reason="auth"}`. A key is never logged. Take the
+gets `403`, counted `logit.input.requests.rejected{reason="auth"}`. The probes also accept the key
+as an `api_key` query parameter, because that's the only place the Agent's own key check sends it.
+A key is never logged. Take the
 keys from the environment with `!env`, as the example does. `api_keys` is a shared secret, not
 transport security: add `tls:` before binding beyond loopback, since otherwise the key crosses the
 network in the clear. With `api_keys` empty, every request is accepted and `/api/v1/validate`
@@ -1481,13 +1484,16 @@ headers. For `/v0.7/traces`, the payload's own fields win over a header.
 **The Unix socket.** `socket:` binds a Unix stream socket, as the Agent's `receiver_socket` does.
 The directory must already exist. A stale socket file from an earlier run is replaced, but a path
 that exists and isn't a socket is refused, so a typo can't delete a file. The new socket is mode
-`0666`, so a tracer running as any user can connect. Restrict access with the directory's
-permissions if that's too open. `tls:` applies to `bind` only.
+`0722`, the mode the Agent gives its own `apm.socket`: connecting needs only write permission, so
+a tracer running as any user can connect. Restrict access with the directory's permissions if
+that's too open. `tls:` applies to `bind` only.
 
 **A full pipeline loses spans.** When the pipeline doesn't accept a request's batch within 2
-seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, and — unlike `datadog_in`, whose
-own Agent retries — that `503` is loss, counted `logit.input.batches.dropped{reason="busy"}`
-([ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md), decision 11).
+seconds, `datadog_trace_in` answers `503` with `Retry-After: 1`, counted
+`logit.input.batches.dropped{reason="busy"}`. Unlike `datadog_in`'s Agent, which retries for
+minutes, a tracer retries a few times and then drops the payload. So a stall longer than the
+window in [ADR `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)'s
+decision 11 is loss.
 Prevent it downstream: give the sinks this listener feeds a `buffer:` (memory, or `disk:` for a
 long outage) large enough to absorb a stall, so the channel `datadog_trace_in` sends into keeps
 draining.

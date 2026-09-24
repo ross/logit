@@ -463,3 +463,66 @@ async fn a_stalled_downstream_is_answered_503_and_the_retry_succeeds() {
     assert_eq!(status, reqwest::StatusCode::ACCEPTED, "the Agent's retry succeeds");
     assert_eq!(recv(&mut rx).await, case.expected);
 }
+
+// -------------------------------------------------------------------------------------------------
+// Recorded Agent traffic (testdata/interop/datadog/, `script/record-fixtures datadog-agent`)
+// -------------------------------------------------------------------------------------------------
+
+/// Every request a real Agent 7.83 sent its intake, replayed with its recorded method, path,
+/// headers, and body: zstd and gzip as the Agent compressed them, the key in `DD-API-KEY` or, on
+/// the validate probe, in the query string. Each is answered its route's `2xx`, and the data
+/// routes deliver what the Agent sent.
+#[tokio::test]
+async fn every_recorded_agent_request_is_answered_2xx() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/interop/datadog");
+    let mut input = DatadogInput::new("127.0.0.1:0").with_api_keys(vec!["logit-record".into()]);
+    input.bind().await.expect("binding datadog_in");
+    let addr = input.local_addr().expect("bind() leaves an address");
+    let (tx, mut rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let _ = input.run(Fanout::new(vec![tx])).await;
+    });
+
+    let mut stems: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the recorded corpus")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("agent-") && n.ends_with(".headers"))
+        .map(|n| n.trim_end_matches(".headers").to_string())
+        .collect();
+    stems.sort();
+    assert!(stems.len() >= 15, "the whole Agent capture: {stems:?}");
+    for stem in &stems {
+        let sidecar = std::fs::read_to_string(dir.join(format!("{stem}.headers"))).unwrap();
+        let body = std::fs::read(dir.join(format!("{stem}.bin"))).unwrap();
+        let mut fields = sidecar.lines().filter_map(|l| l.split_once(": "));
+        let (_, method) = fields.next().expect("method first");
+        let (_, path) = fields.next().expect("path second");
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = client().request(method, format!("http://{addr}{path}"));
+        for (name, value) in fields {
+            // reqwest writes its own framing and host.
+            if !matches!(name, "host" | "content-length") {
+                request = request.header(name, value);
+            }
+        }
+        let response = request.body(body).send().await.expect("the request reaches datadog_in");
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        assert!(status.is_success(), "{stem} ({path}): {status} {text}");
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    while let Ok(Some(delivered)) =
+        tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+    {
+        for event in logit_pipeline::unwrap_batch(delivered).events {
+            if let Some(metric) = event.metrics.first() {
+                names.insert(logit_core::interner::resolve(metric.name).to_string());
+            }
+        }
+    }
+    for name in ["record.requests.count", "record.response.size", "record.can_connect"] {
+        assert!(names.contains(name), "{name} was delivered: {names:?}");
+    }
+}

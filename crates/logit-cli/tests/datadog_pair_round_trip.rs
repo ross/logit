@@ -368,3 +368,32 @@ async fn a_stale_point_is_counted_and_not_delivered() {
     assert_nothing_delivered(&mut rx).await;
     assert_eq!(dropped(&registry.drain(0), "stale"), 1.0);
 }
+
+/// A real Agent 7.83's series request (`testdata/interop/datadog/agent-api-v2-series-004.bin`),
+/// decoded, relays unchanged. Its points are restamped to now first, since `datadog_out` drops a
+/// point older than an hour; nothing else is touched.
+#[tokio::test]
+async fn a_recorded_agent_series_request_relays_unchanged() {
+    use std::io::Read;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/interop/datadog/agent-api-v2-series-004.bin");
+    let compressed = std::fs::read(&path).expect("the recorded series request");
+    let mut body = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(&compressed[..])
+        .expect("a zstd frame")
+        .read_to_end(&mut body)
+        .expect("the Agent compressed it with zstd");
+    let mut batch = decoder().decode_series_v2_protobuf(&body, 0).expect("the Agent's series");
+    assert!(batch.events.len() > 10, "a whole flush: {} points", batch.events.len());
+    let now = now_s() * 1_000_000_000;
+    for event in &mut batch.events {
+        event.timestamp = now;
+    }
+
+    let (addr, mut rx) = listener().await;
+    let registry = Registry::new();
+    let mut out = sink(addr, &registry);
+    out.send(&batch).await.expect("datadog_in accepts");
+    assert_eq!(recv(&mut rx).await, batch);
+    assert_nothing_delivered(&mut rx).await;
+}

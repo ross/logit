@@ -1,7 +1,8 @@
 #!/bin/bash
 # Usage: script/record-fixtures [producer ...]
 #   Producers: logger, python-syslog-handler, rsyslog, rsyslog-tcp, collectd, otlp, graphite,
-#              prometheus, statsd
+#              prometheus, statsd, datadog (= datadog-agent, datadog-tracer,
+#              datadog-dogstatsd-unix)
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -22,21 +23,29 @@ TOOLS_DIR="${ROOT}/tools/record-fixtures"
 OUT_ROOT="${ROOT}/testdata/interop"
 NET="logit-record-fixtures"
 PROM_CFG_DIR="" # set by record_prometheus, removed by cleanup()
+DD_CONF_DIR=""  # set by record_datadog_agent, removed by cleanup()
+# The Datadog producers' shared `/var/run/datadog`: the Agent's sockets, or the capture's.
+DD_VOLUME="logit-record-fixtures-dd-run"
 
 # ---- shared plumbing ---------------------------------------------------------------------------
 
-# start_capture <proto> <port> <out_dir> <prefix> <count> [timeout]: launches
-# tools/record-fixtures/raw_capture.py in a throwaway container named "capture" on $NET, writing
-# straight into the bind-mounted $out_dir. Call finish_capture once the producer has started.
+# start_capture <proto> <port> <out_dir> <prefix> <count> [timeout [raw_capture.py args...]]:
+# launches tools/record-fixtures/raw_capture.py in a throwaway container named "capture" on $NET,
+# writing straight into the bind-mounted $out_dir. Arguments past the timeout go to raw_capture.py
+# unchanged, and `CAPTURE_DOCKER_ARGS` (empty unless a producer sets it) to `docker run`, for a Unix
+# socket's shared volume or a reply file. Call finish_capture once the producer has started.
+CAPTURE_DOCKER_ARGS=()
 start_capture() {
     local proto="$1" port="$2" out_dir="$3" prefix="$4" count="$5" timeout="${6:-15}"
+    shift "$(($# < 6 ? $# : 6))"
     mkdir -p "${out_dir}"
     ${DOCKER} run -d --name capture --network "${NET}" \
         -v "${TOOLS_DIR}/raw_capture.py:/raw_capture.py:ro,z" \
         -v "${out_dir}:/out:z" \
+        "${CAPTURE_DOCKER_ARGS[@]}" \
         python:3.12-slim \
         python3 /raw_capture.py --proto "${proto}" --port "${port}" --out-dir /out \
-            --prefix "${prefix}" --count "${count}" --timeout "${timeout}" \
+            --prefix "${prefix}" --count "${count}" --timeout "${timeout}" "$@" \
         >/dev/null
     # Give the listener time to bind before anything sends to it.
     sleep 1
@@ -56,11 +65,13 @@ finish_capture() {
 }
 
 cleanup() {
-    ${DOCKER} rm -f capture otelcol prometheus metatarget >/dev/null 2>&1 || true
+    ${DOCKER} rm -f capture otelcol prometheus metatarget dd-agent dd-clients >/dev/null 2>&1 || true
+    ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" >/dev/null 2>&1 || true
-    # record_prometheus renders its config into a temp dir; remove it here too so a run that dies
-    # mid-capture doesn't leave one behind.
+    # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
+    # so a run that dies mid-capture doesn't leave one behind.
     [ -n "${PROM_CFG_DIR}" ] && rm -rf "${PROM_CFG_DIR}"
+    [ -n "${DD_CONF_DIR}" ] && rm -rf "${DD_CONF_DIR}"
     return 0
 }
 
@@ -383,9 +394,228 @@ record_statsd() {
     done
 }
 
+# ---- Datadog ----------------------------------------------------------------------------------------
+#
+# Three producers, all writing testdata/interop/datadog/ (its README has the provenance table):
+#   datadog-agent           a real Agent with every intake URL pointed at the capture sink, fed by
+#                           DogStatsD over UDP and both Unix sockets, a dd-trace app over the APM
+#                           socket, and a tailed log file
+#   datadog-tracer          the same dd-trace app sending straight to the capture sink, which
+#                           answers `/info` as `datadog_trace_in` does
+#   datadog-dogstatsd-unix  the `datadog` DogStatsD client to the capture sink over a Unix datagram
+#                           socket and a Unix stream socket
+# `datadog` runs all three.
+#
+# Nothing here reaches Datadog. Every Agent runs with a fake API key and every intake URL it has is
+# the capture sink's; `--dns 192.0.2.1` (TEST-NET-1, unrouted) leaves Docker's embedded resolver
+# answering container names and fails every other lookup, so whatever the Agent tries on its own
+# (remote config, its own telemetry, cloud metadata) can't resolve a Datadog host.
+#
+# `pip install` takes the current `datadog`, `ddtrace`, and `flask`; each producer prints what it
+# resolved, as does the Agent image, for the README's table.
+
+DD_AGENT_IMAGE="docker.io/datadog/agent:7"
+DD_CLIENT_PACKAGES="datadog ddtrace flask"
+# Set on every DogStatsD client, so each line carries `|e:` (the client reads it at startup).
+DD_EXTERNAL_ENV="it-false,cn-record-fixtures,pu-00000000-0000-4000-8000-000000000001"
+
+# dd_clients_run <name> <cmd>: a python:3.12-slim container on $NET with the shared socket volume
+# and the two Python producers mounted, running `cmd` after installing $DD_CLIENT_PACKAGES.
+dd_clients_run() {
+    local name="$1" cmd="$2"
+    shift 2
+    ${DOCKER} run --name "${name}" --network "${NET}" \
+        -v "${DD_VOLUME}:/var/run/datadog" \
+        -v "${TOOLS_DIR}/python_dogstatsd_producer.py:/producer/dogstatsd.py:ro,z" \
+        -v "${TOOLS_DIR}/python_ddtrace_app.py:/producer/app.py:ro,z" \
+        -e DD_EXTERNAL_ENV="${DD_EXTERNAL_ENV}" \
+        -e DD_SERVICE=record-fixtures -e DD_ENV=record -e DD_VERSION=1.2.3 \
+        -e DD_INSTRUMENTATION_TELEMETRY_ENABLED=false -e DD_REMOTE_CONFIGURATION_ENABLED=false \
+        "$@" -w /producer python:3.12-slim \
+        bash -c "python3 --version && pip install --quiet --disable-pip-version-check \
+            --root-user-action=ignore ${DD_CLIENT_PACKAGES} && ${cmd}"
+}
+
+# A real Agent, redirected. The capture runs by path (raw_capture.py's `--name-by-path`), keeping
+# one request per route except where a `--require` asks for more, and completes once every
+# `--require` is met. Series, `/intake/`, and service checks keep several because the Agent flushes
+# on its own 15 s clock: its own metrics, host metadata, and startup event arrive first, and the
+# DogStatsD clients' data lands in whichever flush follows their send. check_datadog_agent_capture.py
+# then deletes host metadata (testdata/interop/datadog/README.md's "Privacy") and fails the run
+# unless every construct the tests read made it in.
+record_datadog_agent() {
+    echo "== recording: Datadog Agent (${DD_AGENT_IMAGE}) =="
+    local out="${OUT_ROOT}/datadog"
+    ${DOCKER} run --rm --entrypoint agent "${DD_AGENT_IMAGE}" version 2>&1 | sed 's/^/  [agent] /'
+    ${DOCKER} volume create "${DD_VOLUME}" >/dev/null
+
+    # The Agent's whole conf.d: only the log tail, so none of the image's default checks run.
+    DD_CONF_DIR="$(mktemp -d)"
+    mkdir -p "${DD_CONF_DIR}/record.d"
+    cp "${TOOLS_DIR}/datadog-agent-logs.yaml" "${DD_CONF_DIR}/record.d/conf.yaml"
+    chmod -R a+rX "${DD_CONF_DIR}"
+
+    start_capture http 8080 "${out}" agent 0 240 \
+        --name-by-path --max-per-path 1 \
+        --require /api/v2/series=5 --require /api/beta/sketches --require /api/v1/check_run=3 \
+        --require /api/v2/logs=2 --require /api/v0.2/traces --require /api/v0.2/stats \
+        --require /intake/=4 --require /api/v1/validate --require /api/v2/validate \
+        --discard /api/v2/host_metadata
+
+    # `datadog-agent-app.txt`, not `.log`: `.gitignore`'s `*.log` would leave a `.log` untracked.
+    ${DOCKER} run -d --name dd-agent --network "${NET}" --dns 192.0.2.1 \
+        -v "${DD_VOLUME}:/var/run/datadog" \
+        -v "${DD_CONF_DIR}:/etc/datadog-agent/conf.d:z" \
+        -v "${TOOLS_DIR}/datadog-agent-app.txt:/var/log/record/app.log:ro,z" \
+        -e DD_API_KEY=logit-record -e DD_HOSTNAME=record-fixtures \
+        -e DD_DD_URL=http://capture:8080 \
+        -e DD_LOGS_ENABLED=true -e DD_LOGS_CONFIG_LOGS_DD_URL=capture:8080 \
+        -e DD_LOGS_CONFIG_LOGS_NO_SSL=true -e DD_LOGS_CONFIG_FORCE_USE_HTTP=true \
+        -e DD_APM_ENABLED=true -e DD_APM_DD_URL=http://capture:8080 \
+        -e DD_APM_RECEIVER_SOCKET=/var/run/datadog/apm.socket \
+        -e DD_DOGSTATSD_SOCKET=/var/run/datadog/dsd.socket \
+        -e DD_DOGSTATSD_STREAM_SOCKET=/var/run/datadog/dsd-stream.socket \
+        -e DD_DOGSTATSD_NON_LOCAL_TRAFFIC=true \
+        -e DD_PROCESS_AGENT_ENABLED=false -e DD_REMOTE_CONFIGURATION_ENABLED=false \
+        -e DD_ORCHESTRATOR_EXPLORER_ENABLED=false -e DD_AGENT_TELEMETRY_ENABLED=false \
+        -e DD_INVENTORIES_ENABLED=false \
+        "${DD_AGENT_IMAGE}" >/dev/null
+
+    # The socket files are the Agent's own; their modes are what decision 12 of ADR
+    # `datadog-agent-and-intake-relay` needed to know.
+    local tries=0
+    until ${DOCKER} exec dd-agent bash -c 'for s in apm dsd dsd-stream; do test -S /var/run/datadog/${s}.socket || exit 1; done' 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "${tries}" -gt 90 ]; then
+            echo "record-fixtures: the Agent never created all three of its sockets" >&2
+            ${DOCKER} logs dd-agent 2>&1 | tail -40 | sed 's/^/  [agent] /'
+            return 1
+        fi
+        sleep 1
+    done
+    sleep 2
+    ${DOCKER} exec dd-agent bash -c 'ls -ln /var/run/datadog/; stat -c "%A %a %U:%G %n" /var/run/datadog/*' \
+        2>&1 | sed 's/^/  [agent sockets] /'
+    # The Agent's own `/info`, asked over its APM socket the way a tracer asks: the document
+    # `datadog_trace_in`'s is checked against, field by field (crates/logit-inputs/src/datadog_trace.rs).
+    ${DOCKER} exec dd-agent curl -sS --unix-socket /var/run/datadog/apm.socket http://localhost/info \
+        >"${out}/agent-info.json"
+    echo "  [agent] GET /info over apm.socket: $(wc -c <"${out}/agent-info.json") bytes -> agent-info.json"
+
+    # One client container: DogStatsD over UDP, the datagram socket, and the stream socket, then
+    # the dd-trace app over the APM socket.
+    dd_clients_run dd-clients "\
+        python3 dogstatsd.py --url udp://dd-agent:8125 \
+        && python3 dogstatsd.py --url unix:///var/run/datadog/dsd.socket \
+        && python3 dogstatsd.py --url unixstream:///var/run/datadog/dsd-stream.socket \
+        && ddtrace-run python3 app.py" \
+        -e DD_TRACE_AGENT_URL=unix:///var/run/datadog/apm.socket \
+        2>&1 | sed 's/^/  [clients] /'
+    ${DOCKER} rm -f dd-clients >/dev/null 2>&1 || true
+
+    local status=0
+    finish_capture || status=$?
+    ${DOCKER} logs dd-agent 2>&1 | grep -E '\| ERROR \||dogstatsd|uds_stream|receiver' | tail -20 | sed 's/^/  [agent] /' || true
+    ${DOCKER} rm -f dd-agent >/dev/null 2>&1 || true
+    # Run whatever the capture's outcome: it also deletes the host metadata a partial capture wrote.
+    ${DOCKER} run --rm -v "${out}:/data:z" \
+        -v "${TOOLS_DIR}/check_datadog_agent_capture.py:/check.py:ro,z" python:3.12-slim \
+        bash -c "pip install --quiet --disable-pip-version-check --root-user-action=ignore \
+            zstandard && python3 /check.py /data" 2>&1 | sed 's/^/  [check] /' || status=1
+    ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
+    rm -rf "${DD_CONF_DIR}"
+    DD_CONF_DIR=""
+    return "${status}"
+}
+
+# A dd-trace tracer with no Agent: the capture sink answers `GET /info` with
+# datadog-trace-info.json (the document `datadog_trace_in` serves, which a test in
+# crates/logit-inputs/src/datadog_trace.rs keeps in step) and every trace request with
+# datadog-trace-rates.json, so the tracer picks its forms as it would against `datadog_trace_in`.
+#
+# Two runs:
+#   tracer      the tracer's defaults against that document: its default trace form, and no
+#               client stats
+#   tracer-v04  `DD_TRACE_API_VERSION=v0.4` and `DD_TRACE_STATS_COMPUTATION_ENABLED=true`, against
+#               the same document with `client_drop_p0s: true`, as a real Agent answers. The tracer
+#               computes client stats only when the Agent lets it drop priority-0 traces, so this is
+#               the run that puts `/v0.6/stats` on the wire (testdata/interop/datadog/README.md).
+#               One request (`RECORD_PATHS`), which keeps the v0.4 body inside the size budget.
+record_datadog_tracer() {
+    local out="${OUT_ROOT}/datadog"
+    DD_CONF_DIR="$(mktemp -d)"
+    cp "${TOOLS_DIR}/datadog-trace-info.json" "${DD_CONF_DIR}/info.json"
+    sed 's/"client_drop_p0s":false/"client_drop_p0s":true/' "${TOOLS_DIR}/datadog-trace-info.json" \
+        >"${DD_CONF_DIR}/info-drop-p0s.json"
+    chmod -R a+rX "${DD_CONF_DIR}"
+    # prefix:info document:trace form:required paths (comma-separated)
+    for spec in \
+        "tracer:info.json:default:/info,/v0.5/traces" \
+        "tracer-v04:info-drop-p0s.json:v0.4:/info,/v0.4/traces,/v0.6/stats"; do
+        local prefix info api required
+        IFS=: read -r prefix info api required <<<"${spec}"
+        echo "== recording: ddtrace straight to the capture sink (${prefix}: ${api} trace form, ${info}) =="
+        local require_args=()
+        local path
+        for path in ${required//,/ }; do require_args+=(--require "${path}"); done
+        CAPTURE_DOCKER_ARGS=(
+            -v "${DD_CONF_DIR}/${info}:/replies/info.json:ro,z"
+            -v "${TOOLS_DIR}/datadog-trace-rates.json:/replies/rates.json:ro,z"
+        )
+        start_capture http 8126 "${out}" "${prefix}" 0 120 \
+            --name-by-path --max-per-path 1 \
+            --reply /info=/replies/info.json \
+            --reply /v0.4/traces=/replies/rates.json --reply /v0.5/traces=/replies/rates.json \
+            --reply /v0.7/traces=/replies/rates.json \
+            "${require_args[@]}"
+        CAPTURE_DOCKER_ARGS=()
+        local tracer_env=()
+        if [ "${api}" != "default" ]; then
+            tracer_env=(-e "DD_TRACE_API_VERSION=${api}" -e DD_TRACE_STATS_COMPUTATION_ENABLED=true
+                -e RECORD_PATHS=/orders/42)
+        fi
+        dd_clients_run dd-clients "ddtrace-run python3 app.py" \
+            -e DD_TRACE_AGENT_URL=http://capture:8126 \
+            "${tracer_env[@]}" \
+            2>&1 | grep -v -E '^  File |^    |^Traceback' | sed 's/^/  [tracer] /'
+        ${DOCKER} rm -f dd-clients >/dev/null 2>&1 || true
+        finish_capture
+    done
+    rm -rf "${DD_CONF_DIR}"
+    DD_CONF_DIR=""
+}
+
+# The `datadog` DogStatsD client over both Unix sockets, straight to the capture sink: what settles
+# the stream framing and the `|c:`/`|e:`/`|card:`/`|T` order. Nine datagrams (one per call,
+# unbuffered), then two stream connections (unbuffered, then buffered).
+record_datadog_dogstatsd_unix() {
+    local out="${OUT_ROOT}/datadog"
+    ${DOCKER} volume create "${DD_VOLUME}" >/dev/null
+    CAPTURE_DOCKER_ARGS=(-v "${DD_VOLUME}:/var/run/datadog")
+
+    echo "== recording: datadog DogStatsD client over a Unix datagram socket =="
+    start_capture unix 0 "${out}" dogstatsd-unix 9 90 --path /var/run/datadog/dsd.socket
+    dd_clients_run dd-clients "python3 dogstatsd.py --url unix:///var/run/datadog/dsd.socket" \
+        2>&1 | sed 's/^/  [client] /'
+    ${DOCKER} rm -f dd-clients >/dev/null 2>&1 || true
+    finish_capture
+
+    echo "== recording: datadog DogStatsD client over a Unix stream socket =="
+    start_capture unix-stream 0 "${out}" dogstatsd-unix-stream 2 90 \
+        --path /var/run/datadog/dsd-stream.socket
+    dd_clients_run dd-clients \
+        "python3 dogstatsd.py --url unixstream:///var/run/datadog/dsd-stream.socket --modes unbuffered,buffered" \
+        2>&1 | sed 's/^/  [client] /'
+    ${DOCKER} rm -f dd-clients >/dev/null 2>&1 || true
+    finish_capture
+
+    CAPTURE_DOCKER_ARGS=()
+    ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
-all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus statsd)
+all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus statsd datadog)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -406,6 +636,14 @@ for p in "${producers[@]}"; do
     graphite) record_graphite ;;
     prometheus) record_prometheus ;;
     statsd) record_statsd ;;
+    datadog-agent) record_datadog_agent ;;
+    datadog-tracer) record_datadog_tracer ;;
+    datadog-dogstatsd-unix) record_datadog_dogstatsd_unix ;;
+    datadog)
+        record_datadog_dogstatsd_unix
+        record_datadog_tracer
+        record_datadog_agent
+        ;;
     *)
         echo "record-fixtures: unknown producer '${p}'" >&2
         exit 1

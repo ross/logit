@@ -67,12 +67,15 @@ static KEYS: LazyLock<LogKeys> = LazyLock::new(|| LogKeys {
 
 impl DatadogDecoder {
     /// Decodes a `/api/v2/logs` body: a JSON array of log objects, or one bare object. One
-    /// [`Event::log`] per item; an item with no `message` is skipped and counted. The batch
-    /// `Resource` is empty: a log payload carries no request-level identity.
+    /// [`Event::log`] per item; an item with no `message` is skipped and counted. A bare empty
+    /// object is no log and isn't counted: it's the connectivity check an Agent's logs sender
+    /// posts before its first batch. The batch `Resource` is empty: a log payload carries no
+    /// request-level identity.
     pub fn decode_logs(&mut self, body: &[u8], received_at: i64) -> Result<EventBatch, CodecError> {
         let json = parse_json(body, "logs")?;
         let items = match &json {
             Json::Array(items) => items.as_slice(),
+            Json::Object(obj) if obj.is_empty() => &[],
             Json::Object(_) => std::slice::from_ref(&json),
             _ => {
                 return Err(CodecError::Malformed(
@@ -527,6 +530,22 @@ pub(super) mod tests {
         assert_eq!(batch.events[0].timestamp, 1_700_000_000_500_000_000);
         assert_eq!(batch.events[1].timestamp, RECEIVED_AT);
         assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 2.0);
+    }
+
+    /// An Agent's connectivity check: no log, and nothing counted as skipped. An empty object
+    /// inside an array is still a log item with no message.
+    #[test]
+    fn a_bare_empty_object_is_no_log_and_not_a_skip() {
+        let registry = Registry::new();
+        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
+            "datadog_in",
+            "datadog_in",
+            "listener",
+        ));
+        assert!(decoder.decode_logs(b"{}", RECEIVED_AT).unwrap().events.is_empty());
+        assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 0.0);
+        assert!(decoder.decode_logs(b"[{}]", RECEIVED_AT).unwrap().events.is_empty());
+        assert_eq!(counted(&registry, "logit.input.logs.skipped", ("reason", "no_message")), 1.0);
     }
 
     #[test]

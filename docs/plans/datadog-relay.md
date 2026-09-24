@@ -38,7 +38,7 @@ Settled with Ross (2026-09-23): both stand-in directions are in scope; receive s
 the decoders fix the attribute vocabulary the encoders mirror; the Agent-API pair is
 `datadog_trace_in`/`datadog_trace_out`; Datadog events and service checks reuse the
 `statsd.event.*`/`statsd.service_check.*` attribute names; `datadog_in` decodes zstd with a
-pure-Rust decoder; a Datadog trial org is assumed available for W7's end-to-end verification.
+pure-Rust decoder; a Datadog trial org is assumed available for W7b's end-to-end verification.
 
 ## Coverage by signal
 
@@ -57,7 +57,7 @@ Datadog ingests five kinds of data. Each cell reads today → after this stack.
 Surveyed 2026-09-23 from Datadog's OpenAPI specs
 (`github.com/DataDog/datadog-api-client-go/.generator/schemas/{v1,v2}/openapi.yaml`), the
 `datadog-agent` and `agent-payload` sources on `main`, and `docs.datadoghq.com`. Items marked
-UNVERIFIED were not confirmed by a current official page; W7 verifies each against the trial org
+UNVERIFIED were not confirmed by a current official page; W7b verifies each against the trial org
 or a real Agent and this section is updated then.
 
 ### Public intake API (no Agent)
@@ -81,7 +81,8 @@ Sites: `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`
 
 - **DogStatsD**: UDP `:8125`, a datagram Unix socket at `dogstatsd_socket`
   (default `/var/run/datadog/dsd.socket`; what Kubernetes clients use), and an optional stream
-  Unix socket (`dogstatsd_stream_socket`; a 4-byte little-endian length per packet, UNVERIFIED).
+  Unix socket (`dogstatsd_stream_socket`; a 4-byte little-endian length per packet, recorded in
+  `testdata/interop/datadog/README.md`).
   Buffer 8,192 B. Grammar as
   [`telemetry-landscape.md`](../design/telemetry-landscape.md)'s DogStatsD section, plus two
   suffixes `statsd_in` carries since W4b: `|e:<external data>` (v1.5, Agent 7.57+) and
@@ -97,7 +98,7 @@ Sites: `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`, `us5.datadoghq.com`
   `/profiling/v1/input`, `/debugger/*`, `/tracer_flare/v1`, and an optional
   `receiver_socket` (`/var/run/datadog/apm.socket`). Response `{"rate_by_service": {...}}`.
   Request headers: `X-Datadog-Trace-Count`, `Datadog-Meta-Lang`, `Datadog-Meta-Tracer-Version`,
-  `Datadog-Container-ID`, `Datadog-Entity-ID`, `Datadog-Client-Computed-Stats`,
+  `Datadog-Container-ID`, `Datadog-Entity-ID`, `Datadog-External-Env`, `Datadog-Client-Computed-Stats`,
   `Datadog-Client-Computed-Top-Level`, `Datadog-Client-Dropped-P0-{Traces,Spans}`. Span schema
   (`span.proto`): `service`, `name`, `resource`, `type` strings; `trace_id`, `span_id`,
   `parent_id` uint64; `start`, `duration` int64 ns; `error` int32; `meta` string→string;
@@ -125,7 +126,7 @@ Redirected by `dd_url` (metrics, events, checks, metadata only), `logs_config.lo
 
 | Route | Body | Notes |
 |---|---|---|
-| `/api/v2/series` | protobuf `MetricPayload` (`agent-payload` `metrics/agent_payload.proto`); `Content-Type: application/x-protobuf` | **zstd level 1 by default** (`serializer_compressor_kind`), one setting for every endpoint. 512,000 B compressed, 5 MiB decompressed, 10,000 points. v1 JSON only if `use_v2_api.series: false`. v3 columnar (`/api/intake/metrics/v3/series`) only to Datadog URLs (`use_v3_api.series.enabled: datadog_only`); W7b's Agent 7.83.3, with `dd_url` at a `datadog_in`, sent v2 protobuf only |
+| `/api/v2/series` | protobuf `MetricPayload` (`agent-payload` `metrics/agent_payload.proto`); `Content-Type: application/x-protobuf` | **zstd level 1 by default** (`serializer_compressor_kind`), one setting for every endpoint. 512,000 B compressed, 5 MiB decompressed, 10,000 points. v1 JSON only if `use_v2_api.series: false`. v3 columnar (`/api/intake/metrics/v3/series`) only to Datadog URLs (`use_v3_api.series.enabled: datadog_only`); a recorded 7.83 Agent redirected elsewhere sent v2 (`testdata/interop/datadog/README.md`), and W7b's Agent 7.83.3, with `dd_url` at a `datadog_in`, sent v2 protobuf only |
 | `/api/beta/sketches` | protobuf `SketchPayload`: `{metric, host, tags, dogsketches:[{ts, cnt, min, max, avg, sum, k: sint32[], n: uint32[]}]}` | DDSketch with `eps = 1/128` (gamma 1.015625), `min = 1e-9`, bias, 4,096-bin collapsing, int16 keys (`pkg/util/quantile`). No mapping parameters on the wire: the receiver assumes them |
 | `/api/v1/check_run` | JSON | |
 | `/intake/` | JSON: events and host metadata in one route | |
@@ -242,7 +243,8 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
   `compression: gzip`, `timeout`, `tls`. One request per endpoint per batch, outside the three
   encoder shapes for the same reason `prometheus` is: several endpoints per signal.
   `duplicate_safe()` is false: W7b showed the intake dedupes a resent `(series, timestamp)`, last
-  write winning, but stores a resent log twice.
+  write winning, but stores a resent log twice, and every other route is assumed to store a
+  resend again until measured.
   Host, service, source, and tags come from attributes and the resource (an upstream `set`), not
   from per-sink fields. Metric kinds: delta monotonic `Sum` → `count` with `interval` from
   `datadog.interval` or the batch's `aggregate` window; `Gauge` → `gauge` (or `rate` when
@@ -304,8 +306,9 @@ offset, it exposes no bins, and its `to_java_bytes` is a third format, neither t
   above. Every allocation tripwire held unchanged (the first bin `Vec` reserves the same 1 KiB
   the old crate's chunk did).
 
-Still UNVERIFIED for W7: whether the intake accepts a stats sketch whose gamma isn't 1.0202 (a
-relayed stats sketch keeps its own, so only a locally aggregated one would send another).
+Still UNVERIFIED for W7b: whether the intake accepts a stats sketch whose gamma isn't 1.0202. A
+relayed stats sketch keeps its own, and that needn't be 1.0202: a recorded dd-trace-py 4.15
+computes its client stats on gamma 1.015625 with an index offset (`testdata/interop/datadog/README.md`).
 
 ### 5. Compression (W3, W5)
 
@@ -327,10 +330,10 @@ the protobuf vendoring landed in W2a; msgpack is W2b's, since only traces and st
 ### 7. Documented recipes, not code (W8)
 
 - Agent-equivalent `h`/`ms` output: `aggregate` then a sink that renders quantiles; whether an
-  `aggregate` option should emit the Agent's five-metric set is a follow-up decided by W7's
+  `aggregate` option should emit the Agent's five-metric set is a follow-up decided by W7b's
   measurements.
 - Logs to an Agent: `otlp_out` with the Agent's `logs.enabled: true`, or `syslog_out` over TCP
-  to a `logs` TCP listener (W7 checks whether a JSON body inside the syslog line reaches Datadog
+  to a `logs` TCP listener (W7b checks whether a JSON body inside the syslog line reaches Datadog
   as attributes; if not, the recipe is OTLP only).
 - Apps writing JSON lines to an Agent TCP port: no plain-lines listener today. Recorded as a gap
   with a sketch of a `lines_in` on the `TcpListener` driver; not built in this stack.
@@ -369,14 +372,14 @@ rule 64 requires an absolute path and rejects `tls:` under either. The listener'
 mode `0722`, the Agent's own, through path handling shared with `datadog_trace_in`
 (`crates/logit-inputs/src/unix.rs`). `unix` runs on the UDP driver (receive queue, `recvmmsg`,
 `SO_MEMINFO` sampler); `unix_stream` runs on the TCP driver with each packet (one datagram's worth
-of lines) after a 4-byte little-endian length, the framing `uds_stream.go` reads and `datadog-go`
-writes, UNVERIFIED until W7. `statsd_out` packs packets as for UDP under both, sends a Unix datagram
+of lines) after a 4-byte little-endian length, the framing `uds_stream.go` reads and the `datadog`
+Python client writes (`testdata/interop/datadog/README.md`). `statsd_out` packs packets as for UDP under both, sends a Unix datagram
 with its wait on a full receiver bounded by `connect_timeout`, and connects a stream lazily as for
 TCP.
 
 `|e:` → `statsd.external_data` and `|card:` → `statsd.cardinality` (the raw token; the Agent's
 four values aren't enforced) on metric, event, and service-check lines, round-tripped. `statsd_out`
-writes them after `|c:` and before `|T` (segment order UNVERIFIED until W7) and counts each as a
+writes them after `|c:` and before `|T`, the `datadog` Python client's order (`testdata/interop/datadog/README.md`), and counts each as a
 dropped dialect field under `format: statsd`, so superset requirement 14 holds for the two suffixes
 added since it was written.
 
@@ -439,7 +442,7 @@ Agent in the path has to do what the Agent does between tracer and intake: norma
 by service/name/resource/type/kind/status, DDSketch durations, `1/_sample_rate` weights), with
 obfuscation as an operator choice. That is a transform of its own (`datadog_apm`, say), placed
 between `datadog_trace_in` and `datadog_out`, and its output is ready to send because it writes
-the same `_top_level` mark §12 keys on. It is a follow-up plan once W7 shows what the intake
+the same `_top_level` mark §12 keys on. It is a follow-up plan once W7b shows what the intake
 needs. Until then
 the tracer-direct topology is "`datadog_trace_in` → `datadog_trace_out` → a real Agent", and
 the OTel-direct topology is `otlp_out`.
@@ -457,10 +460,10 @@ the OTel-direct topology is `otlp_out`.
 | W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
 | W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
 | W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 66; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
-| W7a | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); pair fixed-point tests over the corpus; the UNVERIFIED items a recording settles | M | W5, W6 |
-| W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W5, W6, W8a |
+| W7a | **Landed** (`dd/w7a`). Recorded fixtures from a real Agent 7.83, dd-trace-py 4.15, and the `datadog` DogStatsD client over both Unix sockets (`script/record-fixtures datadog`, `testdata/interop/datadog/`), replayed through every decoder and both pairs; fixed what the captures contradicted: `/info`'s field types, `statsd_in`'s service-check `m:`, `datadog_trace_in`'s socket mode and stats headers, `datadog_in`'s probe routes and the logs `{}` check. | M | W5, W6 |
+| W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W7a, W8a |
 | W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 67; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
-| W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
+| W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7b |
 
 Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7a → W7b → W8b, linear; W4b
 stacks after W4a to keep the stack linear even though it depends only on W0, and W8a after W6
@@ -468,12 +471,13 @@ because it needs nothing from W7. Each PR is based on and
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, W8a, and
-W7b complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets
-to `main` once it merges. W7b pointed a real Agent at `datadog_in`, `datadog_out` at a trial org,
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, W8a,
+W7a, and W7b complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and
+retargets to `main` once it merges. W7a pointed a real Agent, tracer, and DogStatsD client at W3's
+and W4's listeners, and relayed a real tracer and client through W6's and W4b's sinks to a real
+Agent's sockets. W7b pointed a real Agent at `datadog_in`, `datadog_out` at a trial org,
 `datadog_trace_out` at a real Agent's TCP port and `receiver_socket`, and W8a's `format: datadog`
-at a real `ddtrace` 4.15.2 log line. W7a's recordings, which settle the DogStatsD stream framing,
-the `|e:`/`|card:` segment order, and the tracer's own forms, are in progress.
+at a real `ddtrace` 4.15.2 log line.
 
 ## Verification
 
@@ -494,7 +498,9 @@ the `|e:`/`|card:` segment order, and the tracer's own forms, are in progress.
   relayed stats and a stats sketch re-encoded by `DdSketch` accepted; a real Agent accepts
   `datadog_trace_out`'s traces and client stats and the trial org shows the spans. Done in W7b,
   except the service checks, which have no query API (`202` recorded only).
-- W7: both pair tests hold over the recorded corpus (W7a); every UNVERIFIED item in this plan is
-  resolved and the text updated (W7a and W7b; the PRs list what stays open and why).
+- W7a: both pair tests hold over the recorded corpus, and every UNVERIFIED item a real Agent or
+  tracer could settle is settled in this text, citing `testdata/interop/datadog/README.md`.
+- W7b: every UNVERIFIED item left in this plan (Datadog's backend) is resolved and the text
+  updated; the PR lists what stays open and why.
 - W0 (this PR) is documentation only: every relative link resolves and `docs/plans/README.md`
   gained a row.

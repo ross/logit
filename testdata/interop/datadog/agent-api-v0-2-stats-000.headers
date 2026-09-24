@@ -1,0 +1,10 @@
+method: POST
+path: /api/v0.2/stats
+host: capture:8080
+user-agent: Datadog Trace Agent/7.83.3/8c639c92581
+content-length: 717
+content-encoding: gzip
+content-type: application/msgpack
+dd-api-key: logit-record
+x-datadog-reported-languages: 
+accept-encoding: gzip
