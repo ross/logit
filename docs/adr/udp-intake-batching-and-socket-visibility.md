@@ -27,7 +27,7 @@ untouched is the *syscall and bookkeeping* side underneath it, shared by all fou
   longer stops it running.
 - **Three mutex-locked gauge updates per push *and* per pop**
   ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) — `BoundedQueue::push`/`pop`
-  (`crates/logit-pipeline/src/queue.rs:237,330`) call `update_gauges` unconditionally on every
+  (`crates/logit-pipeline/src/queue.rs`) call `update_gauges` unconditionally on every
   accepted item, and `read_loop` (pushing) and `decode_loop` (popping) run concurrently against the
   identical lock.
 - **No visibility into kernel-side drops** ([`docs/known-gaps.md`](../known-gaps.md#udp-intake)) —
@@ -187,16 +187,18 @@ Socket stats are sampled on a fixed 1 s interval by a new `read_loop_sampled` wr
 `tokio::time::interval` in one new `select!`, looped so a tick never resolves the wrapper itself:
 each tick samples and the loop goes back around to `select!` again, while `read_loop`'s own future —
 polled by reference every iteration — keeps running underneath it, untouched. `read_loop_sampled`
-then takes `read_loop`'s place as the future `run_until_shutdown` races against `decode`
-(`udp.rs:269-270,296-298`), so sampling continues while `read_loop` is parked inside a blocked `push`
-(`overflow: block`) — exactly the moment drops are most likely to be happening.
+then takes `read_loop`'s place as the future `UdpListener::run_until_shutdown` races against
+`decode` (`crates/logit-inputs/src/udp.rs`), so sampling continues while `read_loop` is parked
+inside a blocked `push` (`overflow: block`) — exactly the moment drops are most likely to be
+happening.
 
 This has to be a wrapping loop, not a third arm of either existing `select!`, for two different
 reasons:
 
-- **`run_until_shutdown`'s own `select!` (`udp.rs:296-298`) is a one-shot race**, not a loop: it
-  decides once which of the whole `read`/`decode` futures finishes first, guarded by the `Option`
-  indirection the code comment there explains is specifically there to avoid double-polling
+- **`UdpListener::run_until_shutdown`'s own `select!` (`crates/logit-inputs/src/udp.rs`) is a
+  one-shot race**, not a loop: it decides once which of the whole `read`/`decode` futures finishes
+  first, guarded by the `Option` indirection the code comment there explains is specifically there
+  to avoid double-polling
   whichever one didn't win. A periodically-firing arm there would resolve that same race on every
   tick instead of only when `read`/`decode` actually finish — it would need its own wrapping loop
   regardless, which is exactly what `read_loop_sampled` provides, one layer down, next to the socket
@@ -534,14 +536,16 @@ flight per turn of the loop. Worth recording, not worth acting on: the receive q
 
 `push_many` holds a `Peekable<std::vec::Drain<'_, T>>` across its internal `.await` points
 specifically so a cancellation (the caller's future dropped mid-call — `read_loop`'s own shutdown
-race, the same shape `udp.rs:474-477`'s existing single-item cancellation already documents) leaves
-the caller's `Vec` **empty**, not partially drained: whatever was already accepted into the queue
-stays accepted, and whatever hadn't yet been reached is dropped along with the `Drain` iterator,
-uncounted. This is a direct widening of the loss `decoupled-listener-io` already accepted for a
-single in-flight datagram at shutdown (`udp.rs:474-477`, "drops the one datagram it was holding,
-uncounted") from exactly one datagram to at most `read_batch` datagrams — still bounded, still
-shutdown-path-only (ordinary operation never cancels a `push_many` call mid-flight), and named here
-explicitly rather than left implicit in the widened bound.
+race in `crates/logit-inputs/src/udp.rs`, the same shape
+[`docs/plans/decoupled-listener-io.md`](../plans/decoupled-listener-io.md)'s single-item
+cancellation correction already described) leaves the caller's `Vec` **empty**, not partially
+drained: whatever was already accepted into the queue stays accepted, and whatever hadn't yet been
+reached is dropped along with the `Drain` iterator, uncounted. This is a direct widening of the
+loss `decoupled-listener-io` already accepted for a single in-flight datagram at shutdown
+(`docs/plans/decoupled-listener-io.md`'s "drops the one datagram it was holding, uncounted") from
+exactly one datagram to at most `read_batch` datagrams — still bounded, still shutdown-path-only
+(ordinary operation never cancels a `push_many` call mid-flight), and named here explicitly rather
+than left implicit in the widened bound.
 
 **The decode side has the same shape, for the same reason.** `decode_loop` popping a batch means a
 cancelled decode loop (the shutdown-grace backstop dropping that future) discards whatever it had

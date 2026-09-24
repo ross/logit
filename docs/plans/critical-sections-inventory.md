@@ -488,7 +488,7 @@ All line numbers verified against the worktree at
     `*shutdown.borrow()` check. The two drivers reach the same behavior by different means; worth
     confirming the UDP side really is immune (it compiles, so it is — but the asymmetry suggests one
     of the two comments is imprecise).
-- **Existing coverage:** `udp.rs` tests `shutdown_drains_the_queue_and_delivers_every_already_queued_datagram`
+- **Existing coverage:** `udp.rs` tests `shutdown_with_an_empty_queue_finishes_within_grace_and_delivers_nothing`
   (1400), `a_backlog_queued_before_shutdown_is_still_decoded_and_delivered` (1514),
   `shutdown_while_a_batch_is_mid_push_exits_promptly_and_closes_the_queue` (2488),
   `a_block_queue_smaller_than_the_read_batch_still_delivers_every_datagram` (2557),
