@@ -17,7 +17,7 @@
 //!    with no metadata at all, the 2.0 symbol-table errors, the label-validation skips, the label
 //!    sort order, and the stale NaN.
 //!
-//! **What the generators deliberately leave out**, for the reasons `prometheus_fixed_point.rs`'s
+//! **What the generators leave out**, for the reasons `prometheus_fixed_point.rs`'s
 //! own module doc gives, plus two this transport adds:
 //!
 //! - `NaN` as an ordinary sample value (`f64::NAN != f64::NAN`, so `PartialEq` cannot express the
@@ -195,10 +195,9 @@ fn rendered(families: &[MetricFamily], dialect: Dialect) -> String {
 }
 
 /// Parse a fixture, take it through remote-write, and write it back out: the bytes must equal what
-/// writing the parsed families directly produces. Stated on the rendered exposition rather than on
-/// the family list because one normalization is invisible there and load-bearing here -- neither
-/// version has a spelling for text 0.0.4's `untyped`, so an `untyped` family comes back `unknown`,
-/// and both write as `# TYPE x untyped` in text 0.0.4.
+/// writing the parsed families directly produces. Compared on the rendered exposition rather than
+/// on the family list because an `untyped` family comes back `unknown` (neither version can spell
+/// `untyped`), and both write as `# TYPE x untyped` in text 0.0.4.
 fn assert_corpus_survives(body: &str, dialect: Dialect, version: Version) {
     let families = stamped(parse(body.as_bytes(), dialect).expect("fixture must parse"), version);
     let direct = rendered(&families, dialect);
@@ -224,8 +223,7 @@ fn the_openmetrics_corpus_survives_a_remote_write_detour() {
     assert_corpus_survives(OPENMETRICS_FIXTURE, Dialect::OpenMetrics1_0, Version::V2);
 }
 
-/// 2.0 carries a created timestamp and 1.0 does not, so the OpenMetrics corpus' `_created` lines
-/// survive the 2.0 detour and are the one thing 1.0 drops.
+/// The OpenMetrics corpus' `_created` lines survive 2.0 and are the one thing 1.0 drops.
 #[test]
 fn version_2_keeps_created_timestamps_and_version_1_drops_them() {
     let families =
@@ -273,10 +271,7 @@ fn decode_v1(request: pb1::WriteRequest) -> Decoded {
         .expect("must decode")
 }
 
-/// A 1.0 sender that ships metadata in separate requests -- Prometheus' own default -- leaves the
-/// receiver with flat, untyped series. Nothing is lost, but a histogram is three families rather
-/// than one: the stateless-receiver limitation the ADR names, pinned so it is a decision rather
-/// than a surprise.
+/// A 1.0 request with no metadata decodes a histogram as three flat, untyped families, losing none.
 #[test]
 fn version_1_without_metadata_decodes_flat_untyped_families() {
     let decoded = decode_v1(pb1::WriteRequest {
@@ -302,18 +297,8 @@ fn version_1_without_metadata_decodes_flat_untyped_families() {
     assert_eq!(decoded.samples, 3);
 }
 
-/// The summary-shaped sibling of the test above, and the case it could not reach: a summary is the
-/// one classic kind whose *bare* name is a sample, so its flat series are `foo{quantile=…}`,
-/// `foo_sum` and `foo_count` -- and remote-write sorts a request's series by name, so the bare one
-/// always arrives first and opens the implicit family `foo` before its two suffixed siblings show
-/// up.
-///
-/// That ordering is what made this the shape a real Prometheus lost samples on (`testdata/interop/
-/// prometheus/README.md`, and `prometheus_remote_write_interop.rs`'s own doc): the suffix scan
-/// matched `foo_sum`'s base against that implicit `foo`, found no role for `_sum` under an untyped
-/// family, and skipped the sample. `foo_bucket`/`foo_count`/`foo_sum` above never armed it, having
-/// no bare-named sample between them. **Only a declared base claims a suffix**, so all three are
-/// families of their own here and every sample survives.
+/// An unseeded summary keeps `foo_sum`/`foo_count` though the bare `foo` opened an implicit family
+/// first (`assemble.rs`'s "Only a declared base claims a suffix").
 #[test]
 fn version_1_without_metadata_keeps_a_summarys_suffixed_series() {
     let decoded = decode_v1(pb1::WriteRequest {
@@ -341,9 +326,7 @@ fn version_1_without_metadata_keeps_a_summarys_suffixed_series() {
     assert_eq!(decoded.samples, 4, "every sample the request carried is accounted for");
 }
 
-/// The same four series seeded with `# TYPE foo summary`: one summary, assembled, its quantiles in
-/// the point rather than on the label set. The seed buys *typing*, which is all it ever buys --
-/// the stateless decode above already kept every sample.
+/// The same four series seeded with `# TYPE foo summary` assemble into one summary.
 #[test]
 fn a_seed_types_a_metadata_less_summary() {
     let mut seed = Declarations::default();
@@ -404,10 +387,7 @@ fn version_1_with_metadata_assembles_one_histogram() {
     );
 }
 
-/// A bad label set is one skipped series, not a `400`: a real sender's other series are worth
-/// keeping. Each case is counted `logit.input.metrics.skipped{reason="invalid_labels"}`, which the
-/// codec's own unit tests assert on the counter; here the question is that the request still
-/// decodes and the good series survives.
+/// A bad label set skips one series, not the request: the good series still decodes.
 #[test]
 fn an_invalid_label_set_skips_one_series_rather_than_the_request() {
     let bad: [&[(&str, &str)]; 5] = [
@@ -435,8 +415,7 @@ fn an_invalid_label_set_skips_one_series_rather_than_the_request() {
     }
 }
 
-/// `__name__` last, not first: `_` is `0x5f`, so an uppercase-initial label name precedes it, and a
-/// sender that sorted `__name__` first would be writing an unsorted label set.
+/// Labels sort by byte order, so an uppercase-initial label name precedes `__name__` (`_` is 0x5f).
 #[test]
 fn encoded_label_names_are_strictly_ascending_by_byte_order() {
     let families = vec![vec![MetricFamily {
@@ -468,9 +447,7 @@ fn decode_v2_err(request: pb2::Request) -> String {
         .to_string()
 }
 
-/// 2.0's symbol table is the whole request's string storage: a bad index doesn't mean one bad
-/// series, it means the table is being read wrongly, so it fails the request (the receiver's
-/// `400`).
+/// A bad 2.0 symbol reference fails the whole request (the receiver's `400`).
 #[test]
 fn version_2_symbol_table_errors_fail_the_whole_request() {
     let series = |refs: Vec<u32>| pb2::TimeSeries {
@@ -511,8 +488,7 @@ fn version_2_symbol_table_errors_fail_the_whole_request() {
     assert!(decode_v2_err(bad_help).contains("out of range"));
 }
 
-/// The `help_ref`/`unit_ref` convention: `0` points at the mandatory empty symbol and means the
-/// field is absent, not `Some("")`.
+/// A `0` `help_ref`/`unit_ref` (the mandatory empty symbol) decodes as absent, not `Some("")`.
 #[test]
 fn version_2_help_and_unit_refs_resolve_through_the_symbol_table() {
     let request = pb2::Request {
@@ -555,8 +531,7 @@ fn version_2_help_and_unit_refs_resolve_through_the_symbol_table() {
     }
 }
 
-/// 2.0 requires per-series metadata, and the upstream Go type is by-value (`nullable = false`), so
-/// Prometheus always writes field 5. This encoder does too, whatever the family has to say.
+/// The 2.0 encoder always writes per-series metadata (field 5), as Prometheus does.
 #[test]
 fn every_encoded_version_2_series_carries_a_metadata_message() {
     let families = stamped(
@@ -573,8 +548,7 @@ fn every_encoded_version_2_series_carries_a_metadata_message() {
     assert_eq!(request.symbols.first().map(String::as_str), Some(""));
 }
 
-/// The stale marker is a bit pattern, not a value: it must survive a protobuf double round trip
-/// bit for bit, and must not be confused with an ordinary `NaN` reading.
+/// The stale NaN survives a protobuf double bit for bit and stays distinct from an ordinary `NaN`.
 #[test]
 fn a_stale_marker_round_trips_as_its_exact_bit_pattern() {
     for version in [Version::V1, Version::V2] {
@@ -603,8 +577,7 @@ fn a_stale_marker_round_trips_as_its_exact_bit_pattern() {
     }
 }
 
-/// A histogram's exemplars land on the bucket their own value falls in, all of them -- unlike an
-/// OpenMetrics `_bucket` line, remote-write's `exemplars` is a repeated field with no cap.
+/// Every histogram exemplar lands on the bucket its value falls in, with no one-per-bucket cap.
 #[test]
 fn histogram_exemplars_are_placed_on_the_bucket_their_value_falls_in() {
     let exemplar = |value: f64| Exemplar {
@@ -665,12 +638,8 @@ fn encode_reasons(groups: &[Vec<MetricFamily>], version: Version) -> (Vec<u8>, V
     (body, reasons)
 }
 
-/// The wire has millisecond resolution and the model has nanosecond, so two readings of one series
-/// a nanosecond apart truncate onto one timestamp. A `TimeSeries` may not carry two samples at one
-/// timestamp -- Prometheus and Mimir answer `400 duplicate sample for timestamp`, which a sender
-/// classifies as permanent and drops the *whole batch* over -- so the later reading wins and the
-/// earlier is dropped and counted. Any sub-millisecond source (`statsd_in` gauges, `internal`)
-/// reaches this through `prometheus_out endpoint:`.
+/// Two readings truncating onto one millisecond: the later wins, the earlier is counted
+/// `sub_ms_collapsed` (see `remote_write.rs`'s drop table).
 #[test]
 fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
     let reading = |timestamp: i64, value: f64| {
@@ -683,7 +652,7 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
         }]
     };
     // Two `Event::timestamp`s one nanosecond apart, so two groups that truncate onto one
-    // millisecond -- exactly what a batch of statsd gauges looks like.
+    // millisecond, as a batch of statsd gauges does.
     let groups = vec![reading(TIMESTAMP, 1.0), reading(TIMESTAMP + 1, 2.0)];
 
     for version in [Version::V1, Version::V2] {
@@ -730,11 +699,7 @@ fn two_readings_on_one_millisecond_collapse_to_the_later_one() {
     }
 }
 
-/// Protobuf skips fields it does not recognise, and the two versions' field numbers are disjoint
-/// (2.0 reserves 1-3, which is where 1.0 keeps its `timeseries` and `metadata`), so each version's
-/// body decodes as an *empty* request of the other rather than as an error. Left alone, a sender
-/// that posts 1.0 bytes under the 2.0 `Content-Type` gets a `204` reporting nothing written, which
-/// reads as "accepted"; a receiver has to answer `400`.
+/// A body sent under the other version's `Content-Type` is `Malformed`, not an empty request.
 #[test]
 fn a_body_of_the_other_version_is_malformed_rather_than_an_empty_request() {
     let families = vec![vec![MetricFamily {
@@ -748,7 +713,7 @@ fn a_body_of_the_other_version_is_malformed_rather_than_an_empty_request() {
     for (sent, claimed) in [(Version::V1, Version::V2), (Version::V2, Version::V1)] {
         let body = encode(&families, sent, &mut PrometheusEncoder::new());
         assert!(!body.is_empty());
-        // It really does decode "successfully" as the wrong version -- that is the trap.
+        // It decodes "successfully" as the wrong version -- that is the trap.
         match claimed {
             Version::V1 => {
                 let wrong = pb1::WriteRequest::decode(body.as_slice()).expect("prost accepts it");
@@ -770,8 +735,7 @@ fn a_body_of_the_other_version_is_malformed_rather_than_an_empty_request() {
     }
 }
 
-/// A zero-byte body is a genuinely empty request, not a wrong-version one -- an empty 1.0
-/// `WriteRequest` encodes to exactly that.
+/// A zero-byte body (an empty 1.0 `WriteRequest`) is an empty request, not a wrong-version one.
 #[test]
 fn an_empty_body_is_an_empty_request_in_both_versions() {
     for version in [Version::V1, Version::V2] {
@@ -826,8 +790,7 @@ fn from_content_type_recognizes_both_versions_and_rejects_the_rest() {
     assert_eq!(Version::from_content_type(Version::V2.content_type()), v2);
 }
 
-/// Native histograms are counted, not decoded, and the count is what a 2.0 receiver reports in
-/// `X-Prometheus-Remote-Write-Histograms-Written` (as zero written, this many seen).
+/// Native histograms are counted in `histograms_skipped`, not decoded.
 #[test]
 fn native_histograms_are_counted_and_skipped() {
     let decoded = decode_v1(pb1::WriteRequest {
@@ -843,10 +806,7 @@ fn native_histograms_are_counted_and_skipped() {
     assert!(decoded.groups.is_empty(), "nothing to put in a group");
 }
 
-/// A stale marker has to survive on *every* family type, not only the ones `events_to_families`
-/// can build one for: a stale NaN on `foo_bucket{le=…}` flags the whole series stale, so a relay
-/// hands this encoder stale histograms and summaries too. The bare family name is not a sample name
-/// for those types, so the marker rides `_count`/`_sum` (`_gcount`/`_gsum`) instead.
+/// A stale marker round-trips on every family type; it rides `_count`/`_sum` for multi-series ones.
 #[test]
 fn a_stale_marker_survives_on_every_family_type() {
     for kind in [
@@ -883,11 +843,8 @@ fn a_stale_marker_survives_on_every_family_type() {
 // Declarations are materialized on demand, and only what a sample asks for
 // -------------------------------------------------------------------------------------------------
 
-/// A request's declaration count and its distinct-timestamp count are both attacker-controlled, so
-/// a decoder that replayed every declaration into every timestamp group would let a small body ask
-/// for `declarations x groups` accumulators. Declaring on demand makes the cost proportional to the
-/// samples the request actually carries: 200 declarations and 50 timestamps over one series is 50
-/// groups of **one** family, not 50 of 201.
+/// 200 declarations over 50 timestamps of one series decode to 50 groups of **one** family: both
+/// counts come off the wire (`assemble.rs`'s "Declaring lazily" bound).
 #[test]
 fn declarations_materialize_only_where_a_sample_routes_to_them() {
     const DECLARATIONS: usize = 200;
@@ -949,10 +906,7 @@ fn a_declared_but_unsampled_family_never_appears_in_any_group() {
     assert_eq!(decoded.groups[0][0].help.as_deref(), Some("Sampled."));
 }
 
-/// 2.0 repeats a family's `Metadata` on every one of its wire series, so a decoder that treated
-/// each repeat as a second declaration would count `duplicate_metadata` once per series -- a
-/// counter operators read as "input was dropped" firing on a request nothing was dropped from.
-/// Asserted over both fixture corpora and the 100-series bench shape, in both versions.
+/// Repeated identical metadata (2.0 repeats it per series) never counts `duplicate_metadata`.
 #[test]
 fn a_faithful_round_trip_counts_nothing_as_skipped_or_degraded() {
     for (label, body) in
@@ -992,8 +946,7 @@ fn a_faithful_round_trip_counts_nothing_as_skipped_or_degraded() {
     }
 }
 
-/// A metadata entry that *disagrees* with an earlier one for the same family is the real duplicate:
-/// first wins, and it is counted.
+/// Metadata that *disagrees* with an earlier entry for one family: first wins, counted.
 #[test]
 fn a_conflicting_metadata_entry_is_counted_and_loses() {
     let request = pb1::WriteRequest {
@@ -1027,11 +980,8 @@ fn a_conflicting_metadata_entry_is_counted_and_loses() {
 // Exemplars are placed against their own series' samples, not against whatever group exists
 // -------------------------------------------------------------------------------------------------
 
-/// An exemplar goes to a group where *its own* series has a sample. The failure this pins is
-/// order-dependence: with one series sampled at 2000 and another at 1000 carrying an exemplar
-/// timestamped 2000, a decoder that matched the exemplar against groups-so-far would put it in the
-/// 2000 group (inventing a reading-less series there) or not, depending purely on `TimeSeries`
-/// order, which neither spec constrains.
+/// An exemplar goes to a group where *its own* series has a sample, whatever the series order:
+/// matching against the groups built so far would hinge on `TimeSeries` order, which no spec fixes.
 #[test]
 fn an_exemplar_lands_on_its_own_series_whichever_order_the_series_arrive_in() {
     let at = |name: &str, ms: i64| pb1::TimeSeries {
@@ -1070,9 +1020,7 @@ fn an_exemplar_lands_on_its_own_series_whichever_order_the_series_arrive_in() {
     assert!(forwards.groups[1][0].series[0].exemplars.is_empty());
 }
 
-/// An exemplar whose series carried no sample at all has no reading to be an example of. It is
-/// dropped and counted, never stored, and `Decoded::exemplars` -- which becomes
-/// `X-Prometheus-Remote-Write-Exemplars-Written` -- does not claim it.
+/// An exemplar on a sample-less series is dropped, counted, and absent from `Decoded::exemplars`.
 #[test]
 fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
     let request = pb1::WriteRequest {
@@ -1093,11 +1041,7 @@ fn an_exemplar_with_no_sample_to_sit_on_is_dropped_and_counted() {
     assert_eq!(reasons, [("exemplar_dropped".to_string(), 1)]);
 }
 
-/// An exemplar on a series whose labels were rejected is unwritable too, and is counted as such.
-/// The two counters answer different questions -- how many series went, and how much of what the
-/// sender sent was not stored -- so they are deliberately not additive, and a sender reconciling
-/// its own exemplar count against `X-Prometheus-Remote-Write-Exemplars-Written` can always find the
-/// difference in `exemplar_dropped` alone.
+/// An exemplar on an `invalid_labels` series counts `exemplar_dropped` as well.
 #[test]
 fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
     let exemplar = |value: f64| pb1::Exemplar {
@@ -1137,11 +1081,7 @@ fn exemplars_on_a_series_with_invalid_labels_are_counted_as_dropped() {
 // 2.0's per-series metadata names no family, so an unspecified type must not invent one
 // -------------------------------------------------------------------------------------------------
 
-/// A 2.0 series with help but no *type* says nothing about which family it belongs to: `foo_bucket`
-/// might be a histogram's bucket line or a gauge that happens to be called that. Declaring a family
-/// from it would create a `foo_bucket` family that beats the sibling's `HISTOGRAM` declaration of
-/// `foo` -- `route` prefers an exact name over the suffix scan -- and leave the histogram
-/// bucket-less. The help still lands, on the family the sample actually routed to.
+/// A typeless 2.0 `foo_bucket` with help doesn't beat a sibling's `HISTOGRAM` `foo`; help lands.
 #[test]
 fn an_unspecified_type_describes_the_family_its_samples_land_in_rather_than_declaring_one() {
     let request = pb2::Request {
@@ -1159,7 +1099,7 @@ fn an_unspecified_type_describes_the_family_its_samples_land_in_rather_than_decl
             pb2::TimeSeries {
                 labels_refs: vec![1, 2, 3, 4],
                 samples: vec![pb2::Sample { value: 3.0, timestamp: 1, start_timestamp: 0 }],
-                // Help, no type -- the case the guard used not to cover.
+                // Help, no type.
                 metadata: Some(pb2::Metadata {
                     r#type: pb2::metadata::MetricType::Unspecified as i32,
                     help_ref: 6,
@@ -1297,8 +1237,8 @@ fn point_for(kind: FamilyType) -> BoxedStrategy<Point> {
     };
     // Every family type, `Stale` included. `events_to_families` only ever builds a `Stale` for the
     // single-series kinds, but *this decoder* builds one for any of them -- a stale NaN on
-    // `foo_bucket{le=…}` flags the whole series stale -- so a relay (1.0 to 2.0, or W3 to W4) can
-    // and does hand the encoder a stale histogram.
+    // `foo_bucket{le=…}` flags the whole series stale -- so a relay (1.0 to 2.0, or receiver to
+    // sender) hands the encoder a stale histogram.
     prop_oneof![9 => valued, 1 => Just(Point::Stale)].boxed()
 }
 
@@ -1495,12 +1435,7 @@ proptest! {
         prop_assert_eq!(round_trip(&groups, Version::V2).groups, groups);
     }
 
-    /// `wire_samples` is the exactness proof behind a receiver's
-    /// `X-Prometheus-Remote-Write-Samples-Written`: whatever it says a series is spelled as, the
-    /// encoder writes exactly that many `Sample`s for it. Asserted over the same generated group
-    /// sets the identity properties above use, so every `Point` variant, both `_sum`/`_count`
-    /// spellings, a gaugehistogram's `_gcount` rule and a stale marker on every family type are all
-    /// covered by construction rather than by a list of hand-written cases.
+    /// `wire_samples` equals the number of `Sample`s the encoder writes, over generated groups.
     #[test]
     fn wire_samples_counts_exactly_what_version_1_encodes(groups in groups(Version::V1)) {
         prop_assert_eq!(
@@ -1518,11 +1453,7 @@ proptest! {
     }
 }
 
-/// The one place `wire_samples` and `encode` deliberately disagree, and the reason it takes a
-/// `Version` at all. 1.0 spells a created timestamp as a `_created` sample of its own, which
-/// `decode` reads and counts -- so a receiver kept it and must report it -- while `encode` drops it,
-/// 1.0 having no field to put it in (this module's permitted-normalization list). 2.0 carries it as
-/// `Sample.start_timestamp`, a field *on* a sample rather than a sample, so it adds nothing there.
+/// On 1.0, `wire_samples` counts a `_created` sample that `encode` drops (see `wire_samples`).
 #[test]
 fn a_created_timestamp_is_a_wire_sample_in_version_1_and_a_field_in_version_2() {
     let mut family = MetricFamily::new("requests", FamilyType::Counter);
@@ -1545,7 +1476,7 @@ fn a_created_timestamp_is_a_wire_sample_in_version_1_and_a_field_in_version_2() 
     // And `encode` writes only the value sample on 1.0, which is the disagreement being pinned.
     assert_eq!(encoded_sample_count(&groups, Version::V1), 1);
 
-    // A 1.0 request that really does carry a `_created` sample: `decode` counts two, so a receiver
+    // A 1.0 request that does carry a `_created` sample: `decode` counts two, so a receiver
     // reporting `wire_samples` reports two.
     let decoded = decode_v1(pb1::WriteRequest {
         timeseries: vec![
@@ -1587,9 +1518,7 @@ fn decode_v1_with(request: pb1::WriteRequest, seed: &Declarations) -> Decoded {
         .expect("must decode")
 }
 
-/// The whole point of the seed: the request carrying the samples carries no metadata at all, and a
-/// caller that remembers an earlier request's histogram declaration gets one assembled `Histogram`
-/// instead of four unrelated untyped series.
+/// A seeded histogram declaration assembles a metadata-less request into one `Histogram`.
 #[test]
 fn a_seed_types_a_metadata_less_version_1_request() {
     let mut seed = Declarations::default();
@@ -1615,8 +1544,7 @@ fn a_seed_types_a_metadata_less_version_1_request() {
     assert_eq!(decode_v1(untyped_histogram_request()).groups[0].len(), 3);
 }
 
-/// A remembered declaration never outranks the request in hand: a sender that says `foo` is a gauge
-/// today is describing today's series.
+/// The request's own declaration outranks the seed, per family name.
 #[test]
 fn a_request_declaration_beats_the_seed() {
     let mut seed = Declarations::default();
@@ -1656,8 +1584,7 @@ fn a_request_declaration_beats_the_seed() {
     assert_eq!(families[0].kind, FamilyType::Counter);
 }
 
-/// What a caller learns from a 1.0 request: one entry per `metadata[]` family, deduped, with an
-/// empty `help`/`unit` absent rather than `Some("")`.
+/// A 1.0 request reports one declaration per `metadata[]` family, deduped, empty strings absent.
 #[test]
 fn decoded_declarations_report_version_1_metadata() {
     let decoded = decode_v1(pb1::WriteRequest {
@@ -1677,7 +1604,7 @@ fn decoded_declarations_report_version_1_metadata() {
                 unit: "seconds".to_string(),
             },
             // Declared but never sampled -- still learnable: the request that carries its samples
-            // is a later one, which is the entire reason a cache exists.
+            // is a later one, which is why a cache exists.
             pb1::MetricMetadata {
                 r#type: pb1::metric_metadata::MetricType::Counter as i32,
                 metric_family_name: "never_sampled".to_string(),
@@ -1705,10 +1632,7 @@ fn decoded_declarations_report_version_1_metadata() {
     assert_eq!(decoded.declarations.len(), 2);
 }
 
-/// 2.0 declares per series and names no family, so what a caller learns is the *family base* the
-/// type implies -- and an `UNSPECIFIED` series declares nothing at all, however much help text it
-/// carries, for `decode_v2`'s own reason: with no type there is no suffix to strip and no family to
-/// name. So a mixed 2.0/1.0 fleet fills one cache.
+/// A 2.0 request reports the *family base* each typed series implies; `UNSPECIFIED` reports none.
 #[test]
 fn decoded_declarations_report_version_2_metadata_but_not_unspecified() {
     let request = pb2::Request {
@@ -1787,12 +1711,7 @@ fn seed_of(entries: &[(&str, FamilyType)]) -> Declarations {
     seed
 }
 
-/// The seed is a memory of what some *other* message said; the sample is the message in hand. So a
-/// remembered `histogram` that would make a bare `foo` gauge sample disappear gives way instead --
-/// the sample is kept, exactly as a decode with no seed at all would keep it, and the mismatch is
-/// a degradation rather than a skip. Without this a single sender declaring a common name a
-/// histogram would silently delete every other sender's series of that name for as long as the
-/// caller remembers it.
+/// A seeded `histogram` gives way to a bare `foo` sample: kept, counted `seed_mismatch`.
 #[test]
 fn a_seeded_type_gives_way_to_a_sample_it_would_reject() {
     let (decoded, reasons) = decode_v1_with_reasons(
@@ -1812,10 +1731,7 @@ fn a_seeded_type_gives_way_to_a_sample_it_would_reject() {
     assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
 }
 
-/// The same rule on the suffix arm: a remembered `counter foo` would claim `foo_sum` and then
-/// refuse it (`_sum` means nothing to a counter). The raw name gets a family of its own instead,
-/// and the seeded `foo` -- which nothing was stored in -- disappears at `finish` rather than
-/// surfacing as an empty family.
+/// A seeded `counter foo` gives way to `foo_sum`, and the empty seeded `foo` disappears.
 #[test]
 fn a_seeded_base_gives_way_for_a_suffix_it_would_reject() {
     let (decoded, reasons) = decode_v1_with_reasons(
@@ -1833,9 +1749,7 @@ fn a_seeded_base_gives_way_for_a_suffix_it_would_reject() {
     assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
 }
 
-/// And on the label the role's value lives in: a `foo_bucket` with no `le` would route into a
-/// remembered histogram and then be thrown away as a malformed line. With no seed it is an ordinary
-/// series called `foo_bucket`, so that is what it stays.
+/// A `foo_bucket` with no `le` under a seeded histogram stays an ordinary `foo_bucket` series.
 #[test]
 fn a_seeded_histogram_gives_way_to_a_bucket_with_no_le() {
     let (decoded, reasons) = decode_v1_with_reasons(
@@ -1853,10 +1767,7 @@ fn a_seeded_histogram_gives_way_to_a_bucket_with_no_le() {
     assert_eq!(reasons, [("seed_mismatch".to_string(), 1)]);
 }
 
-/// The give-way stops the moment the request itself corroborates the seed. Once `foo_bucket` has
-/// landed in the remembered histogram, a bare `foo` in the same request contradicts the producer's
-/// own message rather than a stale memory -- and is counted as the skip it always was, with the
-/// histogram left intact.
+/// Once the request corroborates the seed, a contradicting sample is skipped as usual.
 #[test]
 fn a_seeded_type_still_applies_once_the_request_corroborates_it() {
     let (decoded, reasons) = decode_v1_with_reasons(
@@ -1886,10 +1797,7 @@ fn v1_unknown_metadata(family: &str) -> pb1::MetricMetadata {
     }
 }
 
-/// 1.0's `UNKNOWN` declares nothing -- the enum's zero value means "no type given", which is what
-/// an undeclared family already gets -- so `Decoded::declarations` has nothing for a caller to
-/// learn and later impose on a sender that *does* declare a type. Its `help`/`unit` still land, on
-/// the family a sample of that exact name opened, which is all such an entry can be describing.
+/// A 1.0 `UNKNOWN` entry declares nothing learnable; its `help`/`unit` still land.
 #[test]
 fn version_1_unknown_metadata_is_not_learnable_but_still_describes() {
     let decoded = decode_v1(pb1::WriteRequest {
@@ -1905,10 +1813,7 @@ fn version_1_unknown_metadata_is_not_learnable_but_still_describes() {
     assert_eq!(families[0].unit.as_deref(), Some("seconds"));
 }
 
-/// And the other half of declaring nothing: an `UNKNOWN` entry naming `foo` no longer *claims*
-/// `foo_bucket` by the suffix scan only to refuse it (`_bucket` means nothing to an untyped
-/// family). The sample opens a family of its own, which is what a request carrying no metadata at
-/// all has always done with it.
+/// An `UNKNOWN` `foo` doesn't claim `foo_bucket`; the sample opens a family of its own.
 #[test]
 fn version_1_unknown_metadata_does_not_claim_a_suffixed_sample() {
     let (decoded, reasons) = decode_reasons(
@@ -1926,7 +1831,6 @@ fn version_1_unknown_metadata_does_not_claim_a_suffixed_sample() {
     // The `le` was not stripped: nothing declared `foo` a histogram, so it is an ordinary label.
     assert_eq!(families[0].series[0].labels, [("le".to_string(), "1".to_string())]);
     assert!(reasons.is_empty(), "nothing was dropped: {reasons:?}");
-    // The description named `foo`, and this request has no `foo`, so it described nothing -- the
-    // right answer rather than a lost one.
+    // The description named `foo`, and this request has no `foo`, so it described nothing.
     assert_eq!(families[0].help, None);
 }

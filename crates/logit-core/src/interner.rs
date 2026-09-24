@@ -26,63 +26,51 @@ pub fn intern(s: &str) -> Symbol {
     interner().get_or_intern(s)
 }
 
-/// Resolve a `Symbol` back to its string. Panics if the symbol was not produced by [`intern`] --
-/// symbols are only ever created by this module, so this indicates a bug, not bad input.
+/// Resolve a `Symbol` back to its string. Panics if the symbol didn't come from [`intern`], which
+/// is a bug, not bad input: only this module creates symbols.
 pub fn resolve(sym: Symbol) -> &'static str {
     interner().resolve(&sym)
 }
 
-/// Look up a string's `Symbol` *without* interning it. Returns `None` if the string was never
-/// interned, and -- unlike [`intern`] -- a miss never adds it to the table. Since interning is
-/// monotonic and process-global, `None` here means the string cannot possibly be the key of
-/// anything already built from a `Symbol` (an `AttrMap` entry, a `SeriesKey`, ...), so a caller
-/// that only wants to test membership can skip `intern` entirely. Use this instead of `intern`
-/// whenever the string might not exist and creating it on a miss would be wasted work -- e.g.
-/// `AttrMap::get`/`remove` on a key the map turns out not to have.
+/// Look up a string's `Symbol` without interning it; a miss adds nothing to the table.
+///
+/// Interning is monotonic and process-global, so `None` means the string can't be a key of
+/// anything already built (an `AttrMap` entry, a `SeriesKey`). Use it where a miss is likely and
+/// interning would be wasted, e.g. `AttrMap::get`/`remove`.
 pub fn lookup(s: &str) -> Option<Symbol> {
     interner().get(s)
 }
 
-/// Count of distinct strings interned so far, process-wide. Never decreases -- `ThreadedRodeo`
-/// never evicts (see `docs/design/memory.md` §4) -- so this is an observability hook for that
-/// growth, not a live size. Cheap enough to expose now even with nothing wired up to read it yet.
+/// Count of distinct strings interned so far, process-wide. Never decreases (`ThreadedRodeo`
+/// never evicts, `docs/design/memory.md` §4); `internal` reports it as
+/// `logit.process.interner.strings`.
 pub fn len() -> usize {
     interner().len()
 }
 
-/// A per-component memo of `&str -> Symbol` for keys a parser sees again and again -- a pure
-/// fast path in front of [`intern`], never a substitute for it.
+/// A per-component `&str -> Symbol` memo in front of [`intern`], for keys a parser takes from its
+/// input rather than its config.
 ///
-/// **Why it exists.** `intern` on a string the table already holds allocates nothing, but it is
-/// still a hash of the bytes plus a `DashMap` shard lock (an atomic on a cache line every task
-/// in the process shares) plus a table probe. A parser that produces keys from its *input* --
-/// `json`'s object keys, unlike the config-time keys `set`/`csv`/`kv_metrics` intern once at
-/// construction -- pays that once per key per event, and on the `json-parse` load-test
-/// scenario that was the single largest cost left in the parse (`docs/design/performance.md`).
-/// The key set of a real log stream is small and repeats in the same order on every line, so a
-/// cache owned by the one task that runs the parser turns each of those into one `memcmp`.
+/// **Why.** A hit on [`intern`] allocates nothing but still costs a hash, a `DashMap` shard lock
+/// (an atomic on a cache line every task shares), and a probe. A parser like `json` pays that per
+/// key per event; it was the largest remaining parse cost in the `json-parse` load test
+/// (`docs/design/performance.md`). A real log stream's keys are few and repeat in the same order
+/// every line, so a cache owned by the parser's task makes each one a `memcmp`.
 ///
-/// **Shape.** Not a hash map: entries are kept in first-seen (document) order with a cursor,
-/// so on the steady path the next key is the entry at the cursor -- a length compare and a
-/// `memcmp`, no hashing at all. A key that isn't there (an optional field absent this event, a
-/// producer that reorders) is found by scanning forward from the cursor and wrapping, which
-/// resynchronises within a few compares; a name repeated at two nesting depths (`id` and
-/// `user.id`) is one entry either way. Only a key seen for the first time reaches `intern`.
+/// **Shape.** Entries are in first-seen order with a cursor, not a hash map: on the steady path
+/// the next key is the entry at the cursor, a length compare and a `memcmp`. An absent optional
+/// field or a reordering producer is found by scanning forward from the cursor with wrap-around.
+/// A name at two nesting depths (`id`, `user.id`) is one entry. Only a first sighting reaches
+/// [`intern`].
 ///
-/// **Bounds.** Capped at [`KeyCache::MAX_ENTRIES`] distinct keys, and keys longer than
-/// [`KeyCache::MAX_KEY_LEN`] are never cached: the process-wide interner already retains every
-/// distinct key forever (`docs/design/memory.md` §4 accepts that on the "keys are schema-shaped"
-/// premise), and this is a *second* copy per node, so it must not also grow without bound when
-/// a producer puts data in key position. Past the cap a miss still returns the right `Symbol`
-/// -- it just pays today's `intern` after a bounded scan of mostly single-instruction length
-/// rejections. Never evicts: an entry, once cached, is as eternal as its `Symbol`.
+/// **Bounds.** At most [`KeyCache::MAX_ENTRIES`] keys, none longer than
+/// [`KeyCache::MAX_KEY_LEN`]: this is a second copy per node of keys the interner already keeps
+/// forever, so data in key position mustn't grow it without bound. Past the cap a miss still
+/// returns the right `Symbol`, via [`intern`] after a bounded scan. Never evicts.
 ///
-/// **Contract.** `cache.get_or_intern(s) == intern(s)` for every `s`, always; the cache holds no
-/// `Symbol` the global table doesn't. Single-owner by design (`&mut self`): a `Transform` is
-/// owned by exactly one task, so there is nothing to synchronise. `Clone` because the decoders
-/// that own one are cloned per accepted connection (`crates/logit-inputs/src/tcp.rs`); a clone
-/// carries the warm entries with it, which is harmless (every entry is a valid `Symbol` for the
-/// life of the process) and lets a new connection start warm on a listener-wide schema.
+/// **Contract.** `cache.get_or_intern(s) == intern(s)` for every `s`; the cache holds no `Symbol`
+/// the global table doesn't. Single-owner (`&mut self`), so nothing to synchronize. `Clone`
+/// because decoders are cloned per accepted connection; a clone starts warm, which is harmless.
 #[derive(Debug, Default, Clone)]
 pub struct KeyCache {
     entries: Vec<(Box<str>, Symbol)>,
@@ -90,35 +78,30 @@ pub struct KeyCache {
 }
 
 impl KeyCache {
-    /// Most distinct keys one cache will hold. 64 covers a wide flat log object (pino's default
-    /// shape is 28 keys) plus the keys of any nested objects with room to spare; see the type
-    /// docs for why it is capped at all.
+    /// Most distinct keys one cache holds: a wide flat log object (pino's default is 28 keys)
+    /// plus nested objects' keys, with room to spare.
     pub const MAX_ENTRIES: usize = 64;
-    /// Longest key worth caching. A key past this is data in key position, not schema, and
-    /// caching it would only spend the cap on something that won't repeat.
+    /// Longest key worth caching; a longer one is data in key position and won't repeat.
     pub const MAX_KEY_LEN: usize = 128;
 
     pub fn new() -> Self {
         Self { entries: Vec::with_capacity(Self::MAX_ENTRIES), cursor: 0 }
     }
 
-    /// The `Symbol` for `s`, exactly as [`intern`] would return it -- from the cache when `s` has
-    /// been seen by this cache before, from the interner (and then cached, if there is room)
-    /// otherwise.
+    /// The `Symbol` [`intern`] would return for `s`, from the cache when seen before, otherwise
+    /// interned and cached if there's room.
     #[inline]
     pub fn get_or_intern(&mut self, s: &str) -> Symbol {
         let len = self.entries.len();
         if len > 0 {
-            // Steady state: the same keys in the same order as last time, so the one we want is
-            // at the cursor. Wrap so the first key of the next event follows the last key of
-            // this one without a scan.
+            // Steady state: the key is at the cursor. Wrapping lets the next event's first key
+            // follow this event's last without a scan.
             let start = if self.cursor < len { self.cursor } else { 0 };
             if self.entries[start].0.as_ref() == s {
                 self.cursor = start + 1;
                 return self.entries[start].1;
             }
-            // Resync: scan forward from the cursor, wrapping, so an absent optional key or a
-            // reordered one is found in a few compares rather than a full pass.
+            // Resync: scan forward from the cursor, wrapping.
             for offset in 1..len {
                 let i = (start + offset) % len;
                 if self.entries[i].0.as_ref() == s {
@@ -135,7 +118,7 @@ impl KeyCache {
         sym
     }
 
-    /// Distinct keys cached so far -- never more than [`KeyCache::MAX_ENTRIES`].
+    /// Distinct keys cached, at most [`KeyCache::MAX_ENTRIES`].
     pub fn len(&self) -> usize {
         self.entries.len()
     }

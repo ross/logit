@@ -1,7 +1,7 @@
 # Consistent, keyed sampling (docs/adr/consistent-sampling-component.md): `sample` keeps a
-# fraction of *traces*, not of events -- every event of a kept trace survives, none of a dropped
-# one does -- and it reaches the same verdict on every run, in every `logit` process, with nothing
-# propagated between them. Self-contained: no socket, no service, it runs and exits.
+# fraction of traces, not of events. Every event of a kept trace survives, none of a dropped one
+# does, and every `logit` process reaches the same verdict with nothing propagated between them.
+# Self-contained: no socket, no service; it runs and exits.
 #
 #   gen ──────────┐
 #                 ├─> traced (trace_context) ─> sampled (sample) ─> out (stdio_out)
@@ -9,13 +9,13 @@
 #
 #   logit run examples/sample-traces.yaml | grep -o 'trace_id=[0-9a-f]*' | sort | uniq -c
 #
-# ...prints the trace ids that survived and how many events each kept: roughly half of the ten,
-# each with all 100 of its events (plus the flagged ones below), and the *same* half every time you
-# run it -- the verdict is a hash of the trace id, not a draw. Change `rate` and the kept set grows
-# or shrinks, but a trace kept at 0.3 is always also kept at 0.5: the threshold only moves.
+# prints the trace ids that survived and how many events each kept: about half of the ten, each
+# with all 100 of its events plus the flagged ones, and the same half every run, because the
+# verdict is a hash of the trace id, not a draw. A trace kept at `rate: 0.3` is also kept at 0.5;
+# changing the rate only moves the threshold.
 #
-# The split-collection shape this exists for (docs/OVERVIEW.md) is the same component on every
-# collector a trace's spans pass through -- each one keeps the same traces independently:
+# In the split-collection topology (docs/OVERVIEW.md) the same component sits on every collector a
+# trace's spans pass through, and each keeps the same traces independently:
 #
 #   spans_in:
 #     type: otlp_in
@@ -45,10 +45,9 @@ components:
         trace.id: "4bf92f3577b34da6a3ce929d0e0e473{seq%10}"
         request_id: "{seq}"
 
-  # Ten more lines from the same ten traces, each carrying `sampling.keep` -- the "keep *this*
-  # request whatever the rate" flag an operator sets while debugging. These survive even in a
-  # trace `sample` drops; the rest of that trace's events still don't (the override is per event,
-  # and per leg -- nothing is propagated to other samplers).
+  # Ten more lines from the same ten traces, each carrying `sampling.keep`, the "keep this request
+  # whatever the rate" flag. These survive even in a trace `sample` drops; the rest of that trace's
+  # events still don't, because the override is per event and per leg.
   gen_flagged:
     type: generate_in
     count: 10
@@ -61,10 +60,9 @@ components:
         trace.id: "4bf92f3577b34da6a3ce929d0e0e473{seq%10}"
         sampling.keep: "true"
 
-  # Lifts `trace.id` onto each line's `LogRecord.trace` -- what `key: trace_id` reads on an event
-  # with no span (and what `otlp_in` already sets on a real OTLP log). `key: {attribute: trace.id}`
-  # on the unlifted hex string would reach exactly the same verdicts: a trace id is hashed as its
-  # 32 lowercase hex characters either way.
+  # Lifts `trace.id` onto each line's `LogRecord.trace`, which `key: trace_id` reads on an event
+  # with no span (and which `otlp_in` sets on a real OTLP log). `key: {attribute: trace.id}` on the
+  # unlifted hex string reaches the same verdicts.
   traced:
     type: trace_context
     sources: [gen, gen_flagged]
@@ -72,19 +70,16 @@ components:
   sampled:
     type: sample
     sources: [traced]
-    # Fraction of traces kept, in [0, 1]. `1` is rejected (a no-op); `0` is rejected unless
-    # `always_keep` is set, when it means "only the flagged events".
+    # In [0, 1]. `1` is rejected as a no-op; `0` is rejected unless `always_keep` is set.
     rate: 0.5
-    # What is hashed: `trace_id` (a span's, else a log's trace reference), `{attribute: <name>}`,
-    # or `{resource: <name>}` (every event of a resource together). Omit for a plain per-event
-    # draw that keeps nothing together.
+    # `trace_id`, `{attribute: <name>}`, or `{resource: <name>}`; omit for a per-event draw.
     key: trace_id
-    # An event with no trace id at all: `random` (the default) draws for it, `keep` forwards it,
-    # `drop` drops it. None arrive here -- every line above carries one.
+    # An event with no key: `random` (the default) draws for it, `keep` forwards it, `drop` drops
+    # it. None arrive here.
     missing: drop
-    # Kept unconditionally when the event carries this attribute. Add `value:` to require a
-    # specific value (compared the way `has_attributes` compares -- a `value: true` boolean does
-    # not match the string "true" these lines carry, so it's omitted here: any value counts).
+    # Kept unconditionally when the event carries this attribute, any value. A `value:` compares
+    # as `has_attributes` does, so `value: true` would not match the string "true" these lines
+    # carry.
     always_keep:
       attribute: sampling.keep
 

@@ -1,25 +1,22 @@
 //! The collectd binary protocol ("`network` plugin") codec, both directions: [`CollectdDecoder`]
 //! turns one UDP datagram into events, [`CollectdEncoder`] packs a batch of events back into
-//! datagrams. The part framing itself lives next door in [`part`]; nothing in [`decode`] or
-//! [`encode`] knows a byte offset or a byte order.
+//! datagrams. The part framing lives in [`part`]; nothing in [`decode`] or [`encode`] knows a byte
+//! offset or a byte order.
 //!
-//! **This module doc is the mapping table** (house convention, see [`crate::prometheus`]'s and
-//! [`crate::otlp`]'s module docs). [ADR `collectd-binary-relay`](../../../../docs/adr/collectd-binary-relay.md)
-//! is the decision record; [`docs/plans/collectd-binary-relay.md`](../../../../docs/plans/collectd-binary-relay.md)
-//! is the workstream plan.
+//! **This module doc is the codec's canonical mapping table and normalization list**, which docs,
+//! tests, and examples point at.
+//! [ADR `collectd-binary-relay`](../../../../docs/adr/collectd-binary-relay.md) is the decision
+//! record.
 //!
 //! [`CollectdEncoder`] **implements [`crate::FramedEncoder`], not [`crate::Encoder`]** (ADR
-//! `framed-encoder`), for the reason `statsd_out`/`syslog_out`/`prometheus_out`'s encoders do too
-//! (`crates/logit-outputs/src/statsd.rs`'s module doc): `Encoder` is `fn encode(&mut self,
-//! &EventBatch) -> Result<Bytes, _>` -- one opaque buffer per batch, with no framing metadata --
-//! and collectd egress genuinely needs per-*datagram* boundaries, since the receiver resets its
-//! sticky identity state at every datagram edge and a `max_packet_bytes` cap decides where those
-//! edges fall. [`CollectdEncoder::encode_into`] fills a [`crate::MessageBuf`]`<usize>` instead: one
-//! entry per datagram, whose `usize` meta is the number of *messages* (value lists or
-//! notifications -- a notification is always alone, meta `1`) that datagram carries (what
-//! `collectd_out` needs to attribute an `EMSGSIZE` drop to the right number of metrics). The
-//! decode direction has no such problem -- one datagram in, N events out -- so [`CollectdDecoder`]
-//! is an ordinary [`crate::Decoder`].
+//! `framed-encoder`): `Encoder` returns one opaque buffer per batch, and collectd egress needs
+//! per-*datagram* boundaries, because the receiver resets its sticky identity state at every
+//! datagram edge and `max_packet_bytes` decides where those edges fall.
+//! [`CollectdEncoder::encode_into`] fills a [`crate::MessageBuf`]`<usize>`: one entry per datagram,
+//! whose meta is the number of *messages* (value lists or notifications; a notification is always
+//! alone, meta `1`) it carries, so `collectd_out` can attribute an `EMSGSIZE` drop to the right
+//! number of metrics. Decode is one datagram in, N events out, so [`CollectdDecoder`] is an
+//! ordinary [`crate::Decoder`].
 //!
 //! ## Wire shape, in one paragraph
 //!
@@ -29,16 +26,15 @@
 //! part dispatches one *value list* against whatever identity is currently in force. That is the
 //! protocol's compression scheme: a sender writes an identity part only when it differs from the
 //! last one it wrote *in that datagram*, so 25 lists from one host share a single Host part. The
-//! sticky state resets at every datagram boundary, which is why the encoder's packing loop has to
-//! re-encode a list that lands at the start of a fresh packet (see [`encode`]).
+//! sticky state resets at every datagram boundary, so the encoder re-encodes a list that lands at
+//! the start of a fresh packet (see [`encode`]).
 //!
 //! ## Decode: bytes → events
 //!
 //! One [`logit_core::Event`] per Values part, its `metrics` carrying one
-//! [`logit_core::MetricRecord`] per data source **in wire order** -- a 3-data-source `load` list is
-//! one event with three records, not three events, which is what makes it re-encodable as the same
-//! single list (`logit_core::MetricList` is a `SmallVec` inlined at 1, so the common
-//! single-data-source list costs no allocation).
+//! [`logit_core::MetricRecord`] per data source **in wire order**: a 3-data-source `load` list is
+//! one event with three records, which is what lets it re-encode as the same single list
+//! (`logit_core::MetricList` inlines one record, so a single-data-source list costs no allocation).
 //!
 //! | Wire | Model | Counter / diag |
 //! |---|---|---|
@@ -65,10 +61,9 @@
 //! ## Notifications: `0x0100`/`0x0101`
 //!
 //! A notification is dispatched **at the Message part**, against whatever sticky state the
-//! datagram currently holds -- the same compression scheme a value list uses, and why a
-//! `0x0101` Severity part sets sticky state rather than being read directly. Unlike a value
-//! list, collectd's own `notification_t` has no interval field at all, so a notification never
-//! carries [`ATTR_INTERVAL`] even when an earlier value list in the same datagram set one.
+//! datagram holds, which is why a `0x0101` Severity part sets sticky state rather than being read
+//! directly. collectd's `notification_t` has no interval field, so a notification never carries
+//! [`ATTR_INTERVAL`], even when an earlier value list in the same datagram set one.
 //!
 //! | Condition | Outcome |
 //! |---|---|
@@ -79,21 +74,21 @@
 //! | a message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` bytes | accepted as-is -- collectd's own `NOTIF_MAX_MSG_LEN` bounds what its *sender* writes, not what a length-prefixed part can carry, so there is nothing here for this decoder to cap |
 //!
 //! `collectd_out` re-encodes the inverse: a `log`-only event (no metrics) carrying a
-//! [`ATTR_SEVERITY`] attribute is a notification, and the raw attribute -- not the normalized
-//! [`logit_core::LogRecord::severity`] -- is what reaches the wire, rule (b) of
-//! [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)'s raw-outranks-normalized
-//! precedent. See [`encode`]'s own module doc for the wire order and drop table.
+//! [`ATTR_SEVERITY`] attribute is a notification, and the raw attribute, not the normalized
+//! [`logit_core::LogRecord::severity`], is what reaches the wire (rule (b) of
+//! [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md)). The "Encode" table below
+//! has the wire order and drops.
 //!
-//! The decoded [`logit_core::Resource`] is always the decoder's own, shared, usually-default one and
-//! the [`logit_core::Scope`] is always `None`: a per-host resource would look tidier but
-//! `logit_pipeline::BatchAccumulator::absorb` keys accumulation on `Arc::ptr_eq`, so minting one per
-//! datagram would split every batch by sender. The host rides on `collectd.host` instead.
+//! The decoded [`logit_core::Resource`] is always the decoder's own shared one and the
+//! [`logit_core::Scope`] is always `None`: `logit_pipeline::BatchAccumulator::absorb` keys
+//! accumulation on `Arc::ptr_eq`, so a per-host resource would split every batch by sender. The
+//! host rides on `collectd.host` instead.
 //!
 //! **Record names are display/cross-protocol only.** `collectd_out` re-encodes a list from the
-//! `collectd.*` attributes, the `MetricList`'s order and each record's kind, and never reads the
-//! name -- so a pipeline with no `types_db:`, one with a stale file, and one with the sender's own
-//! file all relay the same bytes. What the names change is what an InfluxDB/Prometheus/statsd sink
-//! calls the series, which is the whole reason to configure [`types_db`] at all.
+//! `collectd.*` attributes, the `MetricList`'s order, and each record's kind, and never reads the
+//! name, so a pipeline with no `types_db:`, a stale one, or the sender's own relays the same bytes.
+//! The names change only what an InfluxDB/Prometheus/statsd sink calls the series, which is the
+//! reason to configure [`types_db`].
 //!
 //! ## Encode: events → datagrams
 //!
@@ -135,28 +130,25 @@
 //! | that notification's message longer than [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes | truncated on a character (`Str`) or byte (`Bytes`) boundary | `logit.output.messages.truncated` + diag `message_truncated` ([`EncodeStats::notification_messages_truncated`]) |
 //! | a notification alone exceeding `max_packet_bytes` | dropped whole, never split | `logit.output.metrics.skipped{reason="oversize_notification"}` + diag `oversize_notification` ([`EncodeStats::dropped_oversize_notification`]) |
 //!
-//! A notification is **always its own datagram**, carrying its identity in full -- confirmed by
-//! the recorded capture this workstream added (`testdata/interop/collectd/
-//! collectd-notification-000.raw`), not merely assumed: collectd's own sender flushes whatever
-//! value-list packet is in progress, writes the notification alone (TimeHR, Severity, Host,
-//! Plugin, Type, Message -- no PluginInstance/TypeInstance in that capture, since `load` has
-//! neither), and the *next* value list restates its identity in full too. [`encode::CollectdEncoder`]
-//! does exactly the same: [`encode::pack_notification`] flushes any in-progress packet first (if one
-//! is open), pushes the notification as a one-message datagram of its own, and clears the elision
-//! state (`last`) both before and after -- a notification never elides against a preceding list's
-//! identity, and never leaves state behind for a following one to elide against either. Every
-//! Plugin/PluginInstance/Type/TypeInstance part is still written only when non-empty, exactly like
-//! an absent instance on a value list -- "in full" means "not elided", not "every field always
-//! present".
+//! A notification is **always its own datagram**, carrying its identity in full. That mirrors
+//! collectd's own sender, per the recorded capture
+//! `testdata/interop/collectd/collectd-notification-000.raw`: it flushes the value-list packet in
+//! progress, writes the notification alone (TimeHR, Severity, Host, Plugin, Type, Message; `load`
+//! has no instances), and the *next* value list restates its identity in full too.
+//! [`encode::pack_notification`] does the same: it flushes any open packet, pushes the
+//! notification as a one-message datagram, and clears the elision state (`last`) before and after,
+//! so a notification neither elides against a preceding list nor leaves state for a following
+//! one. Plugin/PluginInstance/Type/TypeInstance parts are still written only when non-empty: "in
+//! full" means "not elided", not "every field present".
 //!
 //! ## Well-known attributes (`collectd.*`)
 //!
 //! Rule (b) of [ADR `lossless-transit`](../../../../docs/adr/lossless-transit.md): the raw,
 //! protocol-native fact rides alongside the normalized model field and wins on the way back out.
-//! These are **event** attributes, never resource ones (the `Arc::ptr_eq` accumulator keying above,
-//! and `syslog.hostname`'s precedent). Every one of them is *consumed* by `collectd_out` -- read for
-//! its own purpose, never re-emitted as something else -- and appears as an ordinary tag at every
-//! other sink. `docs/design/data-model.md`'s well-known-attribute table is the canonical list.
+//! These are **event** attributes, never resource ones (the `Arc::ptr_eq` accumulator keying
+//! above). `collectd_out` *consumes* each one (reads it for its own purpose, never re-emits it as
+//! something else); every other sink shows it as an ordinary tag. `docs/design/data-model.md`'s
+//! well-known-attribute table is the canonical list.
 //!
 //! | Attribute | Value | Meaning |
 //! |---|---|---|
@@ -179,12 +171,10 @@
 //! fixed point for no wire-level reason.
 //!
 //! A notification's **message** is not an identity field and gets a narrower rule: NUL becomes
-//! `_` (uncounted -- unlike an identity field, a `_` in a log message changes nothing a receiver
-//! keys a series on), `/` rides through untouched (a message is free text, not a path-like name),
-//! and it is truncated to [`NOTIF_MAX_MSG_LEN`] `- 1` (255) bytes on a character or byte boundary,
-//! counted `logit.output.messages.truncated` -- collectd's own sender-side bound
-//! (`NOTIF_MAX_MSG_LEN`), applied here on egress since this codec's decoder has no reason to
-//! enforce a sender's own limit on what it receives.
+//! `_`, uncounted (a message is not something a receiver keys a series on); `/` rides through (a
+//! message is free text, not a path-like name); and it is truncated to [`NOTIF_MAX_MSG_LEN`] `- 1`
+//! (255) bytes on a character or byte boundary, counted `logit.output.messages.truncated`. That is
+//! collectd's sender-side bound, so it applies on egress only; the decoder doesn't enforce it.
 //!
 //! ## Permitted normalizations
 //!
@@ -210,8 +200,7 @@
 //!     sender's elided (unchanged) time or interval part is restored -- information-preserving (the
 //!     restored part carries what the receiver's sticky state already held) but not free: a packed
 //!     datagram grows and may split across `max_packet_bytes`. Only (3)'s *string* parts are
-//!     elided on egress. Added by the ADR's "an eleventh normalization" amendment, where the same
-//!     entry is numbered 11 because that list splits (3) in two;
+//!     elided on egress. The ADR numbers this entry 11, because its list splits (3) in two;
 //! 11. a notification always leaves as its own datagram, carrying its identity in full and
 //!     sharing no elision state with any value list -- a notification dispatched from elided
 //!     sticky state on the way in leaves with its own full identity, and neither reads nor leaves
@@ -233,40 +222,33 @@ pub use types_db::{DataSource, DsKind, TypesDb, TypesDbError};
 /// collectd's own default `network` plugin port, for both the listener and the sink.
 pub const DEFAULT_PORT: u16 = 25826;
 
-/// collectd's own `MaxPacketSize` default: 1452 bytes, i.e. a 1500-byte Ethernet MTU minus the
-/// IPv4 and UDP headers minus a little headroom. Bounds one **datagram** (several packed value
-/// lists), not one list. collectd itself accepts `1024..=65535` for this setting.
+/// collectd's own `MaxPacketSize` default: a 1500-byte Ethernet MTU minus the IPv4 and UDP
+/// headers and some headroom. Bounds one **datagram** (several packed value lists), not one list.
+/// collectd accepts `1024..=65535` for this setting.
 pub const DEFAULT_MAX_PACKET_BYTES: usize = 1452;
 
-/// collectd's `DATA_MAX_NAME_LEN` (`plugin.h`): the buffer an identity string is parsed into,
-/// including its NUL terminator -- so 127 usable bytes. `parse_part_string` rejects the entire
-/// packet when a string does not fit, which is why the encoder truncates rather than trusting a
-/// peer to cope.
+/// collectd's `DATA_MAX_NAME_LEN` (`plugin.h`), including the NUL, so 127 usable bytes.
+///
+/// `parse_part_string` rejects the entire packet when a string does not fit, which is why the
+/// encoder truncates rather than trusting a peer to cope.
 pub const DATA_MAX_NAME_LEN: usize = 128;
 
-/// collectd's `NOTIF_MAX_MSG_LEN` (`plugin.h`), including the NUL -- so 255 usable bytes. Unused
-/// until notifications land in W5; defined here so both halves of that workstream share one
-/// constant.
+/// collectd's `NOTIF_MAX_MSG_LEN` (`plugin.h`), including the NUL, so 255 usable bytes.
 pub const NOTIF_MAX_MSG_LEN: usize = 256;
 
-/// The most data sources this codec will read or write in one Values part. collectd's own wire
-/// format allows up to `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3,
-/// `if_octets` 2, `disk_io_time` 2).
+/// The most data sources this codec reads or writes in one Values part.
 ///
-/// A **pair-wide** cap, not a decode-side one. Over it, a Values part is malformed on decode (the
-/// rest of the datagram is abandoned, not truncated -- see this module's decode table), and on
-/// encode the list is dropped whole and counted
-/// `logit.output.metrics.skipped{reason="too_many_values"}`: a longer list would sail under the
-/// byte cap only for a receiver running this same codec to reject it, taking every unrelated list
-/// packed behind it in that datagram with it.
+/// The wire allows `(65535 - 6) / 9 = 7281`, but nothing real comes close (`load` has 3,
+/// `if_octets` 2). The cap is **pair-wide**: over it, a Values part is malformed on decode (the
+/// rest of the datagram is abandoned), so the encoder drops such a list whole, counted
+/// `logit.output.metrics.skipped{reason="too_many_values"}`, rather than send one that a receiver
+/// running this codec would reject along with every list packed behind it.
 ///
-/// What it bounds is the decoder's per-part work and the per-list record-name suffix fan-out
-/// (`<plugin>.<type>.<i>`). It is deliberately **not** a bound on interner growth: the unbounded
-/// axis there is distinct `<plugin>`/`<type>` strings, which the decoder caps in neither count nor
-/// length, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
-/// bytes whatever this constant is. That exposure is exactly the one `statsd_in` already has --
-/// wire-chosen metric names, accepted on `docs/design/memory.md` §4's "listeners are private"
-/// premise.
+/// It bounds the decoder's per-part work and the record-name suffix fan-out
+/// (`<plugin>.<type>.<i>`), **not** interner growth: distinct `<plugin>`/`<type>` strings are
+/// uncapped, and a fresh Plugin part plus a one-value list mints a new interned name for ~21 wire
+/// bytes. That is the same wire-chosen-name exposure `statsd_in` has, accepted on
+/// `docs/design/memory.md` §4's "listeners are private" premise.
 pub const MAX_VALUES_PER_LIST: usize = 64;
 
 /// The wire Host. See this module doc's well-known-attribute table.
@@ -283,43 +265,41 @@ pub const ATTR_TYPE_INSTANCE: &str = "collectd.type_instance";
 /// The wire Interval, as `Value::F64` seconds (`cdtime / 2³⁰`, exact).
 pub const ATTR_INTERVAL: &str = "collectd.interval";
 /// The raw wire severity of a *notification* (`1` FAILURE, `2` WARNING, `4` OKAY), as
-/// `Value::U64`. Its presence on a `log`-only event (no metrics) is what [`encode::CollectdEncoder`]
-/// reads to decide the event is a notification rather than an ordinary skipped log; its value, not
-/// the normalized [`logit_core::LogRecord::severity`], is what reaches the wire.
+/// `Value::U64`.
+///
+/// Its presence on a `log`-only event (no metrics) makes [`encode::CollectdEncoder`] encode the
+/// event as a notification rather than skip it; its value, not the normalized
+/// [`logit_core::LogRecord::severity`], is what reaches the wire.
 pub const ATTR_SEVERITY: &str = "collectd.severity";
 
-/// The prefix every attribute above shares. The encoder skips the whole namespace when it decides
-/// what has no wire form, rather than matching the seven names individually, so a later addition is
-/// automatically not leaked onto the wire as something it isn't.
+/// The prefix every attribute above shares. The encoder excludes the whole namespace when it
+/// decides what has no wire form, so a later addition can't leak onto the wire as something else.
 pub const ATTR_PREFIX: &str = "collectd.";
 
-/// One second in collectd's `cdtime_t` units: 2⁻³⁰ s ticks, i.e. `1 << 30` ticks per second.
+/// One second in collectd's `cdtime_t` units (2⁻³⁰ s ticks).
 pub(crate) const CDTIME_ONE_SECOND: u64 = 1 << 30;
 
 /// A `cdtime_t` (2⁻³⁰-second ticks since the epoch, collectd's `utils_time.h`) as Unix nanoseconds.
 ///
-/// Deliberately collectd's **own split arithmetic** -- whole seconds and sub-second ticks converted
-/// separately, the sub-second half rounded half-up -- rather than the obvious
-/// `t * 1e9 / 2^30`: the latter overflows `u64` above ~18 seconds since the epoch, and doing it in
-/// `u128` instead would give a *different* answer at the rounding boundary than collectd itself
-/// produces, which is exactly the kind of one-tick disagreement that turns a fixed-point test
-/// flaky. Saturating at [`i64::MAX`] rather than wrapping: a `cdtime` past year 2554 is nonsense,
-/// and a nonsense timestamp must not become a negative one.
+/// Uses collectd's **own split arithmetic** (whole seconds and sub-second ticks converted
+/// separately, the sub-second half rounded half-up) rather than `t * 1e9 / 2^30`: that overflows
+/// `u64` above ~18 seconds since the epoch, and a `u128` version disagrees with collectd by a tick
+/// at the rounding boundary, which makes a fixed-point test flaky. Saturates at [`i64::MAX`]: a
+/// `cdtime` past year 2554 is nonsense, and must not become a negative timestamp.
 pub fn cdtime_to_nanos(cdtime: u64) -> i64 {
     let seconds = cdtime >> 30;
     let ticks = cdtime & (CDTIME_ONE_SECOND - 1);
-    // `ticks < 2^30`, so `ticks * 1e9 < 1.08e18` -- comfortably inside `u64`, no saturation needed
-    // on this half.
+    // `ticks < 2^30`, so `ticks * 1e9 < 1.08e18`: no saturation needed on this half.
     let sub_nanos = (ticks * 1_000_000_000 + (CDTIME_ONE_SECOND / 2)) >> 30;
     let nanos = seconds.saturating_mul(1_000_000_000).saturating_add(sub_nanos);
     i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
-/// Unix nanoseconds as a `cdtime_t` -- the inverse of [`cdtime_to_nanos`], and exact in this
-/// direction (`ns → cdtime → ns` round-trips; the other way may move one tick once).
+/// Unix nanoseconds as a `cdtime_t`: the inverse of [`cdtime_to_nanos`], exact in this direction
+/// (`ns → cdtime → ns` round-trips; the other way may move one tick once).
 ///
-/// A non-positive `ns` yields `0`, collectd's own "no time given": there is no cdtime before the
-/// epoch, and `0` is precisely what its receiver reads as unset.
+/// A non-positive `ns` yields `0`, which collectd's receiver reads as "no time given": there is no
+/// cdtime before the epoch.
 pub fn nanos_to_cdtime(ns: i64) -> u64 {
     if ns <= 0 {
         return 0;
@@ -337,9 +317,8 @@ pub fn nanos_to_cdtime(ns: i64) -> u64 {
 mod tests {
     use super::*;
 
-    /// The table from `docs/plans/collectd-binary-relay.md`'s wire-facts section, plus the two
-    /// saturation edges. `2^30 - 1` ticks is 999_999_999 ns (not 1e9) and `1` tick is 1 ns after
-    /// rounding -- the two values a naive `t * 1e9 >> 30` gets subtly wrong.
+    /// `2^30 - 1` ticks is 999_999_999 ns (not 1e9) and `1` tick is 1 ns: the values a naive
+    /// `t * 1e9 >> 30` gets wrong.
     #[test]
     fn cdtime_to_nanos_matches_collectds_own_split_arithmetic() {
         let cases: &[(u64, i64)] = &[
@@ -355,8 +334,7 @@ mod tests {
         }
     }
 
-    /// `u64::MAX` cdtime is year ~2554 in seconds; `seconds * 1e9` overflows `i64`, so it must
-    /// saturate rather than wrap into a negative timestamp.
+    /// `u64::MAX` cdtime (year ~2554) overflows `i64` nanoseconds and must not wrap negative.
     #[test]
     fn cdtime_to_nanos_saturates_instead_of_wrapping_negative() {
         assert_eq!(cdtime_to_nanos(u64::MAX), i64::MAX);
@@ -383,8 +361,7 @@ mod tests {
         assert_eq!(nanos_to_cdtime(1_700_000_000_000_000_000), 1_700_000_000 << 30);
     }
 
-    /// Zero and every negative instant collapse to collectd's own "unset" -- there is no cdtime
-    /// before the epoch to be faithful to.
+    /// Zero and every negative instant collapse to collectd's "unset".
     #[test]
     fn nanos_to_cdtime_clamps_non_positive_instants_to_zero() {
         assert_eq!(nanos_to_cdtime(0), 0);
@@ -392,8 +369,7 @@ mod tests {
         assert_eq!(nanos_to_cdtime(i64::MIN), 0);
     }
 
-    /// The one-hop tolerance the ADR's normalization list names: `cdtime → ns → cdtime` may move by
-    /// a single tick, and must then be stable.
+    /// Normalization (2): `cdtime → ns → cdtime` may move one tick, then is stable.
     #[test]
     fn cdtime_round_trips_within_one_tick_and_is_then_stable() {
         for cdtime in [1u64, 12345, CDTIME_ONE_SECOND - 1, (1_700_000_000 << 30) | 0x1234_5678] {

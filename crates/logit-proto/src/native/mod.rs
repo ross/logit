@@ -1,30 +1,23 @@
-//! The native `logit`-to-`logit` codec: dictionary-first, hand-rolled binary encoding of an
-//! [`EventBatch`], framed by [`crate::frame`]. See `docs/design/wire-protocol.md` for the design,
-//! and `docs/adr/native-wire-format-encoding.md` for why this beat `rkyv` and a serde/`postcard`
-//! encoding in the bake-off that decided it.
+//! The native `logit`-to-`logit` codec: a dictionary-first, hand-rolled binary encoding of an
+//! [`EventBatch`], framed by [`crate::frame`]. `docs/design/wire-protocol.md` has the layout;
+//! ADR `native-wire-format-encoding` says why it's hand-rolled rather than `rkyv` or `postcard`.
 //!
-//! **This is the same format for a socket and a file.** [`NativeEncoder`]/[`NativeDecoder`]
-//! implement the ordinary [`crate::Encoder`]/[`crate::Decoder`] traits every other codec in this
-//! crate does -- nothing here assumes a connection; [`crate::frame::write_frame`]/`read_frame`
-//! work identically appending to a file. The `buffer.disk:` spool and the `logit_in`/`logit_out`
-//! transport (`docs/design/wire-protocol.md`'s "Buffering" and "Connection protocol") both build
-//! on exactly this module, unmodified.
+//! **This is the same format for a socket and a file.** Nothing here assumes a connection: the
+//! `buffer.disk:` spool, `file_out`'s native format, and the `logit_in`/`logit_out` transport all
+//! use this module unmodified.
 //!
-//! **Correctness rules this module exists to uphold** (`docs/design/wire-protocol.md`,
-//! `docs/design/data-model.md`):
-//! - A `Symbol` (`lasso::Spur`) is never written raw -- see [`dict`]'s own doc comment. Every key,
-//!   metric name, and unit crosses the wire as a string in the dictionary, referenced by index.
-//! - Every frame is independently decodable: its own dictionary, its own resource, its own scope,
-//!   its own events. A file is a plain concatenation of frames -- append, sequential read,
-//!   `frame::resync` past a torn write.
-//! - Every record type (`Event`, `MetricRecord`, `LogRecord`, `SpanRecord`, `SpanLink`,
-//!   `SpanEvent`, `Exemplar`, `Resource`, `Scope`) is TLV-framed: `record::write_field`/
-//!   `for_each_field`'s per-field framing lets a reader skip a field it doesn't recognize.
-//!   `logit` is pre-release (`docs/adr/lossless-transit.md`), so this is hygiene against a torn
-//!   write, not a version-negotiation mechanism -- growing a fixed enum (`Value`, `MetricKind`) is
-//!   a straight reshape of this module, not something an old reader is expected to tolerate; see
-//!   [`value`]'s and [`record`]'s own doc comments for exactly what an unrecognized tag degrades
-//!   to in each case.
+//! Rules this module upholds:
+//! - A `Symbol` (`lasso::Spur`) is never written raw (see [`dict`]). Every key, metric name, and
+//!   unit crosses the wire as a dictionary string referenced by index.
+//! - Every frame is independently decodable: its own dictionary, resource, scope, and events. A
+//!   file is a plain concatenation of frames: append, read sequentially, `frame::resync` past a
+//!   torn write.
+//! - No proper prefix of a valid encoding decodes (`tests/robustness.rs`'s
+//!   `assert_every_truncation_fails_cleanly`), so no section is an optional trailer.
+//! - Every record type is TLV-framed (`record::write_field`/`for_each_field`), so a reader skips
+//!   a field tag it doesn't know. `logit` is pre-release, so that's hygiene against a torn write,
+//!   not version negotiation: growing a fixed enum (`Value`, `MetricKind`) is a straight reshape
+//!   of this module. [`value`] and [`record`] say what an unknown tag degrades to.
 
 pub mod control;
 pub mod dict;
@@ -43,42 +36,33 @@ use crate::native::dict::{Dict, DictBuilder};
 use crate::native::varint::{read_u8, read_uvarint, write_uvarint};
 use crate::{CodecError, Decoder, Encoder};
 
-/// The `codec` byte [`crate::frame::FrameHeader`] carries for this payload format -- what lets a
-/// reader reject a frame that says "native" but whose codec byte says otherwise, or (eventually)
-/// dispatch among several codecs sharing the same frame header.
+/// The frame header's `codec` byte for this payload format, without provenance.
 pub const CODEC_NATIVE_V1: u8 = 1;
 
-/// [`encode_batch`]'s payload, plus a mandatory length-prefixed [`Provenance`] trailer -- see
-/// [`encode_batch_v2`]/[`decode_batch_v2`] and `docs/adr/batch-provenance-on-delivered.md`. Not an
-/// in-place change to v1: `crates/logit-proto/tests/robustness.rs`'s
-/// `assert_every_truncation_fails_cleanly` pins the invariant that no proper prefix of a valid
-/// encoding is itself valid, which an *optional* trailer on the existing format would silently
-/// break (a payload truncated exactly at the trailer boundary would decode as "no provenance,"
-/// a valid-looking result, not an error). `Hello.codecs`/`HelloAck.codec`
-/// (`crate::native::control`) negotiate which of the two a `logit_out`/`logit_in` pair actually
-/// uses; either side offering only v1 still talks, with provenance simply absent.
+/// [`encode_batch`]'s payload plus a mandatory length-prefixed [`Provenance`] trailer (ADR
+/// `batch-provenance-on-delivered`).
+///
+/// A separate codec rather than an optional trailer on v1, which would let a payload truncated at
+/// the trailer boundary decode as "no provenance". `Hello.codecs`/`HelloAck.codec`
+/// ([`control`]) negotiate v1 or v2; a peer offering only v1 still talks, without provenance.
 pub const CODEC_NATIVE_V2: u8 = 2;
 
 const TRAILER_TAG_ORIGIN: u8 = 1;
 const TRAILER_TAG_PREVIOUS: u8 = 2;
 
-/// A trailer field's value is bounded to catch a corrupt/hostile length before it's used to slice
-/// `bytes` -- a component id is config-sized text, never remotely close to this.
+/// Bounds a trailer field's declared length before it slices `bytes`; a component id is far
+/// shorter.
 const MAX_SANE_TRAILER_FIELD_BYTES: usize = 4096;
 
-/// Encodes one [`EventBatch`] into the dictionary-first payload `docs/design/wire-protocol.md`
-/// describes: the dictionary section, then a len-prefixed [`Resource`] TLV section, then a
-/// mandatory [`logit_core::Scope`] section (a presence byte, and if present a len-prefixed TLV
-/// body), then a length-prefixed list of events (each itself [`record::write_event`]'s TLV field
-/// stream). The scope section is placed right after the resource, never as an optional *trailing*
-/// section -- an optional trailing section would let a truncated payload decode successfully with
-/// "no scope" instead of failing, breaking `crates/logit-proto/tests/robustness.rs`'s "no proper
-/// prefix of a valid encoding is itself valid" invariant the same way an optional provenance
-/// trailer would have (see [`encode_batch_v2`]'s own doc comment for that same reasoning).
+/// Encodes one [`EventBatch`] into the v1 payload: dictionary, len-prefixed [`Resource`] TLV,
+/// mandatory [`logit_core::Scope`] section (presence byte, then a len-prefixed TLV if present),
+/// then a counted list of len-prefixed events (`docs/design/wire-protocol.md`'s "Batch grammar").
 ///
-/// The dictionary is written *first* on the wire but built *last*, in the sense that
-/// [`DictBuilder`] accumulates symbols as encoding proceeds and its own bytes aren't emitted until
-/// every symbol that will ever be interned already has been -- one pass over the batch, not two.
+/// The scope section sits right after the resource, never as an optional trailing section,
+/// which would let a truncated payload decode as "no scope".
+///
+/// The dictionary is written first but built last: [`DictBuilder`] collects symbols while the
+/// other sections encode into their own buffers, so the batch is walked once.
 pub fn encode_batch(batch: &EventBatch) -> Bytes {
     let mut dict = DictBuilder::default();
 
@@ -114,9 +98,7 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
     out.freeze()
 }
 
-/// A batch with more events than this could plausibly be a well-formed single batch -- guards
-/// `Vec::with_capacity` below against a corrupt or hostile length field, the same reasoning as
-/// [`dict::Dict::read`]'s own cap.
+/// Bounds a declared event count before it sizes an allocation, like [`dict::Dict::read`]'s cap.
 const MAX_SANE_EVENT_COUNT: usize = 16 * 1024 * 1024;
 
 /// The inverse of [`encode_batch`].
@@ -172,18 +154,11 @@ pub fn decode_batch(bytes: &mut Bytes) -> Result<EventBatch, CodecError> {
     Ok(EventBatch { resource, scope, events })
 }
 
-/// [`encode_batch`], plus a mandatory length-prefixed [`Provenance`] trailer -- see
-/// [`CODEC_NATIVE_V2`]'s own doc comment for why this is a separate codec rather than a change to
-/// v1. Calls [`encode_batch`] as a subroutine and appends to its output; v1's own encoding is
-/// untouched by this addition.
+/// [`encode_batch`] followed by the [`CODEC_NATIVE_V2`] provenance trailer.
 ///
-/// The trailer is its own small TLV section (same `tag(u8) + len(uvarint) + payload` shape as
-/// `crate::native::control`), holding each present field's string *inline*, not dictionary-
-/// indexed: `origin`/`previous` are at most two scalar strings written once per batch, so there's
-/// no repetition within one payload for a dictionary to pay off on -- unlike attribute/metric
-/// keys, which repeat once per event (`docs/design/wire-protocol.md`'s "dictionary-first
-/// batches"). A `None` field costs nothing (no tag entry at all); the trailer's own length prefix
-/// is what stays mandatory, always at least one byte, even when both fields are absent.
+/// The trailer is `tag(u8) + len(uvarint) + payload` entries with strings inline, not
+/// dictionary-indexed: two strings per batch give a dictionary nothing to amortize. An absent
+/// field writes no entry, but the trailer's length prefix is always written, `0x00` when empty.
 pub fn encode_batch_v2(batch: &EventBatch, provenance: Provenance) -> Bytes {
     let v1 = encode_batch(batch);
 
@@ -208,13 +183,8 @@ fn write_trailer_field(out: &mut BytesMut, tag: u8, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// The inverse of [`encode_batch_v2`]. Decodes the v1-shaped prefix via [`decode_batch`] itself
-/// (inheriting its truncation/bit-flip robustness unchanged, `crates/logit-proto/tests/
-/// robustness.rs`), then reads the mandatory trailer -- so a plain v1 payload (no trailer at all)
-/// fails here rather than silently decoding as "no provenance": once [`decode_batch`] consumes
-/// every byte a v1 encoding has, the trailer-length `read_uvarint` below finds nothing left and
-/// errors, exactly the "no proper prefix of a valid encoding is itself valid" property this
-/// module holds for v1.
+/// The inverse of [`encode_batch_v2`]. A plain v1 payload fails here rather than decoding as
+/// "no provenance": [`decode_batch`] consumes all of it and the trailer-length read finds nothing.
 pub fn decode_batch_v2(bytes: &mut Bytes) -> Result<(EventBatch, Provenance), CodecError> {
     let batch = decode_batch(bytes)?;
 
@@ -247,7 +217,7 @@ pub fn decode_batch_v2(bytes: &mut Bytes) -> Result<(EventBatch, Provenance), Co
         match tag {
             TRAILER_TAG_ORIGIN => provenance.origin = Some(intern(trailer_str(&field)?)),
             TRAILER_TAG_PREVIOUS => provenance.previous = Some(intern(trailer_str(&field)?)),
-            _unknown => { /* forward compatibility -- a future field is skipped, not rejected */ }
+            _unknown => { /* skipped, not rejected: torn-write hygiene (module doc) */ }
         }
     }
     Ok((batch, provenance))
@@ -258,9 +228,7 @@ fn trailer_str(bytes: &[u8]) -> Result<&str, CodecError> {
         .map_err(|e| CodecError::Malformed(format!("provenance trailer field not utf-8: {e}")))
 }
 
-/// Encodes an [`EventBatch`] to a complete, framed byte string -- [`encode_batch`]'s payload
-/// wrapped by [`crate::frame::write_frame`] under [`CODEC_NATIVE_V1`]. The `logit_proto::Encoder`
-/// implementor.
+/// The [`Encoder`]: [`encode_batch`]'s payload framed under [`CODEC_NATIVE_V1`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeEncoder {
     pub compression: Compression,
@@ -279,11 +247,8 @@ impl Encoder for NativeEncoder {
     }
 }
 
-/// The `logit_proto::Decoder` implementor. Unlike every other decoder in this crate,
-/// [`NativeDecoder::decode_into`] ignores `received_at`: a native frame's events already carry
-/// their own original timestamps end to end (that fidelity is the entire point of this format
-/// existing), so there is no "receipt time" to stamp over them the way `statsd_in`/`syslog_in`
-/// do for protocols that don't reliably carry one.
+/// The [`Decoder`] for [`CODEC_NATIVE_V1`] frames. Ignores `received_at`: a native event keeps
+/// its original timestamp end to end.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeDecoder;
 
@@ -397,8 +362,7 @@ mod tests {
         assert_eq!(resource.attributes, batch.resource.attributes);
         assert!(scope.is_none());
         assert_eq!(events.len(), 3);
-        // The whole point of this decoder: original timestamps survive, `received_at` (999) never
-        // overwrites them.
+        // Original timestamps survive; `received_at` (999) never overwrites them.
         assert_eq!(events[0].timestamp, 1);
         assert_eq!(events[1].timestamp, 2);
         assert_eq!(events[2].timestamp, 3);
@@ -453,12 +417,7 @@ mod tests {
         assert_eq!(decoded.scope.as_deref(), Some(&*scope));
     }
 
-    /// The `Decoder`/`Encoder` trait seam, not the free `encode_batch`/`decode_batch` functions
-    /// directly: `NativeDecoder::decode_into` returns `(Arc<Resource>, Option<Arc<Scope>>)`
-    /// specifically so `Decoder::decode`'s default body can carry the scope through into the
-    /// `EventBatch` it builds, rather than hardcoding `scope: None` the way it did before this
-    /// field existed on the trait. `assert_eq!` on the whole batch (not just its scope) is the
-    /// point -- proves nothing else about the round trip regressed either.
+    /// The scope survives the `Encoder`/`Decoder` trait seam, not just the free functions.
     #[test]
     fn a_batch_with_a_scope_round_trips_through_the_decoder_trait() {
         let scope = std::sync::Arc::new(logit_core::Scope {
@@ -492,8 +451,7 @@ mod tests {
 
     #[test]
     fn concatenated_frames_written_to_a_buffer_are_each_independently_decodable() {
-        // The on-disk half of the requirement: a "file" here is just two encoded batches back to
-        // back, with no shared dictionary or index between them.
+        // A "file": two encoded batches back to back, sharing no dictionary.
         let mut encoder = NativeEncoder::default();
         let batch_a = sample_batch();
         let mut batch_b = sample_batch();
@@ -504,10 +462,7 @@ mod tests {
         file.extend_from_slice(&encoder.encode(&batch_b).unwrap());
         let mut cursor = file.freeze();
 
-        // `decode_into` (the `Decoder` trait method) takes one already-framed buffer at a time --
-        // finding successive frame boundaries in a longer buffer (a file, a stream) is
-        // `read_frame`'s job, driven in a loop by the caller. Exercise that loop directly, the
-        // shape a file reader would actually use.
+        // A file reader loops `read_frame` to find each frame boundary.
         let (codec_a, mut payload_a) = read_frame(&mut cursor).unwrap();
         assert_eq!(codec_a, CODEC_NATIVE_V1);
         let decoded_a = decode_batch(&mut payload_a).unwrap();
@@ -547,8 +502,7 @@ mod tests {
         assert_eq!(provenance, Provenance::default());
     }
 
-    /// An absent field costs no dictionary entry and no tag byte at all -- the trailer for two
-    /// absent fields is exactly the one-byte `trailer_len = 0` varint.
+    /// Two absent fields encode as the one-byte `trailer_len = 0`.
     #[test]
     fn an_absent_provenance_field_costs_one_byte_total() {
         let batch = sample_batch();
@@ -557,10 +511,7 @@ mod tests {
         assert_eq!(with_empty_provenance.len(), without.len() + 1);
     }
 
-    /// The core invariant this module holds for v1 (`crates/logit-proto/tests/robustness.rs`'s
-    /// `assert_every_truncation_fails_cleanly`) must also hold for v2's trailer: no proper prefix
-    /// of a valid v2 encoding decodes successfully. This is what the mandatory length-prefixed
-    /// trailer buys over an optional one.
+    /// No proper prefix of a valid v2 encoding decodes, trailer included.
     #[test]
     fn decode_batch_v2_rejects_every_proper_prefix_of_a_valid_encoding() {
         let valid = encode_batch_v2(&sample_batch(), sample_provenance());
@@ -573,19 +524,14 @@ mod tests {
         }
     }
 
-    /// A plain v1 payload has no trailer at all -- fed to `decode_batch_v2`, `decode_batch` inside
-    /// it consumes every byte, and the trailer-length read then finds nothing left. This must fail
-    /// rather than silently decode as "no provenance": v1 and v2 are distinct codecs, not one a
-    /// superset of the other, and `logit_in`'s codec dispatch (not this function) is what decides
-    /// which to call.
+    /// A v1 payload fed to `decode_batch_v2` fails rather than decoding as "no provenance".
     #[test]
     fn decode_batch_v2_rejects_a_plain_v1_payload() {
         let mut v1_payload = encode_batch(&sample_batch());
         assert!(decode_batch_v2(&mut v1_payload).is_err());
     }
 
-    /// An unrecognized trailer tag is skipped, not rejected -- the same forward-compatibility
-    /// contract `record::read_event`'s field loop holds for a future `Event` field.
+    /// An unrecognized trailer tag is skipped, not rejected.
     #[test]
     fn decode_batch_v2_skips_an_unrecognized_trailer_tag() {
         let batch = sample_batch();

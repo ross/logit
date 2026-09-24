@@ -1,27 +1,20 @@
-//! A reusable buffer of encoded messages: one contiguous byte buffer plus a range per message
-//! (and one `M` per message), so encoding a batch allocates once (the backing `Vec`s grow as
-//! needed and are never freed between calls) rather than once per message. The output half of
-//! [`crate::FramedEncoder`] -- see ADR `framed-encoder`.
+//! A reusable buffer of encoded messages, the output half of [`crate::FramedEncoder`] (ADR
+//! `framed-encoder`). One contiguous byte buffer plus a range and an `M` per message, so a batch
+//! allocates only while the backing `Vec`s grow, never once per message.
 //!
-//! Originally `syslog_out`'s own private type, lifted into `logit-outputs`'s `msgbuf` once
-//! `statsd_out` needed the identical shape, and moved here once a codec living in *this* crate
-//! needed it too: `logit-proto` can't depend on `logit-outputs`, so a buffer both a codec and a
-//! sink name has to live at the codec layer.
+//! It lives in `logit-proto`, not `logit-outputs`, because codecs in this crate (collectd,
+//! graphite) fill it too, and `logit-proto` can't depend on `logit-outputs`.
 
 use std::fmt;
 use std::ops::Range;
 
 /// One contiguous byte buffer, one range per message, one `M` per message.
 ///
-/// `M` is whatever an encoder needs to say about a message beyond its bytes -- `()` for a sink
-/// whose messages are self-describing (syslog's one datagram or frame per message, statsd's
-/// lines packed by the transport), or, say, a per-datagram value count for a packer that has to
-/// report how many records each message carries. `M = ()` costs nothing: a `Vec<()>` never
-/// allocates, so the default instantiation is exactly the two-`Vec` buffer it always was.
+/// `M` is [`crate::FramedEncoder::Meta`]: `()` for self-describing messages, or a per-packet
+/// record count. `M = ()` costs nothing, since a `Vec<()>` never allocates.
 ///
-/// The "allocate once per batch, never free between calls" contract is load-bearing: the exact
-/// allocation counts `crates/logit-bench/tests/allocations.rs` pins for every framed encoder
-/// (`docs/design/memory.md` §2) rely on `clear` keeping capacity.
+/// `clear` keeps capacity. The exact allocation counts `crates/logit-bench/tests/allocations.rs`
+/// pins for every framed encoder (`docs/design/memory.md` §2) depend on it.
 pub struct MessageBuf<M = ()> {
     bytes: Vec<u8>,
     ranges: Vec<Range<usize>>,
@@ -48,8 +41,7 @@ impl<M: fmt::Debug> fmt::Debug for MessageBuf<M> {
 }
 
 impl<M> MessageBuf<M> {
-    /// Forgets every message but keeps every backing allocation -- the next batch of the same
-    /// size fills the buffer without touching the allocator.
+    /// Forgets every message but keeps every backing allocation.
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.ranges.clear();
@@ -95,9 +87,8 @@ impl MessageBuf<()> {
         self.push_with(msg.as_bytes(), ());
     }
 
-    /// Same as [`MessageBuf::push`], for a message that is already raw bytes (arbitrary, not
-    /// assumed to be valid UTF-8) -- `syslog_out`'s `Value::Bytes` message path
-    /// (`crates/logit-outputs/src/syslog.rs`'s module doc, "Message body" section).
+    /// [`MessageBuf::push`] for bytes that needn't be UTF-8, such as `syslog_out`'s
+    /// `Value::Bytes` message body.
     pub fn push_bytes(&mut self, msg: &[u8]) {
         self.push_with(msg, ());
     }
@@ -171,9 +162,7 @@ mod tests {
         for _ in 0..1000 {
             buf.push("m");
         }
-        // `Vec<()>` is a zero-sized-element vector: its "capacity" is `usize::MAX` and it never
-        // touches the allocator, which is what makes `MessageBuf<()>` cost exactly what the
-        // pre-generic two-`Vec` buffer did.
+        // A `Vec<()>` reports `usize::MAX` capacity and never touches the allocator.
         assert_eq!(buf.meta.capacity(), usize::MAX);
         assert_eq!(buf.meta.len(), 1000);
     }
