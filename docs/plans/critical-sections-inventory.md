@@ -179,7 +179,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs:141-154` | unreviewed |
 | [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | findings → #328 |
 | [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | findings → #328 |
-| [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | findings → dur/w4 |
+| [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | findings → #331 |
 | [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | in-progress (dur/w5) |
 | [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | in-progress (dur/w5) |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs:174-536` | unreviewed |
@@ -218,7 +218,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs:229-321` | unreviewed |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs:325-346` | unreviewed |
 | [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | findings → #324 |
-| [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | findings → dur/w4 |
+| [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | findings → #331 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
 | [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | in-progress (dur/w7) |
@@ -2134,7 +2134,7 @@ surveyor's.
   `tokio::time::timeout` around `push` with a paused clock, or a `poll_fn` driving one poll) and then asserts the
   next push repairs; strace to confirm the `set_len`/`write`/`fsync` ordering.
 - **Priority:** P0 — the write path for every batch on a disk-backed sink, with hand-rolled cancellation recovery.
-- **Verified 2026-09-24 (dur/w4):** the cancellation hole is worse than the unchecked `set_len`.
+- **Verified 2026-09-24 (#331):** the cancellation hole is worse than the unchecked `set_len`.
   `tokio::fs::File::poll_write` hands the write to a blocking thread and returns `Ready`
   (tokio 1.53.1 `src/fs/file.rs:755-770`); only an operation on the same `File` waits for it
   (`complete_inflight`, `:354`, `:392`), so the fresh-descriptor truncate could run first and the
@@ -2248,7 +2248,7 @@ surveyor's.
   a stress test with `max_bytes` just above one segment under `DropOldest` measuring worst-case work per push.
 - **Priority:** P1 — deliberate data destruction whose accounting is the only audit trail; the unbounded
   evict-loop is the concrete thing to size.
-- **Verified 2026-09-24 (dur/w4):** the evict loop is confirmed and inherent to reclaiming by
+- **Verified 2026-09-24 (#331):** the evict loop is confirmed and inherent to reclaiming by
   whole segment: one push evicts every record in the head segment, each counted
   `overflow_oldest`, and with the head segment active it evicts every queued record and then
   writes past `max_bytes`. Pinned by
@@ -2260,7 +2260,7 @@ surveyor's.
   refuted: when the reader has consumed the active segment and that segment's length plus the next
   record exceeds `max_bytes` (reachable with `segment_bytes` equal to `max_bytes`), the push parks
   on `not_full` and the reader on `not_empty`, and nothing wakes either, because the full check
-  runs before the push would rotate and the active segment is never deleted. Not fixed here.
+  runs before the push would rotate and the active segment is never deleted. Fixed in `dur/w5`.
 
 ---
 
