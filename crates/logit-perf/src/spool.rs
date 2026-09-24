@@ -1,46 +1,38 @@
 //! Clears a disk-backed scenario's spool directory before it's spawned.
 //!
-//! `buffered.yaml`'s spool is a real crash-recoverable disk queue
-//! (`docs/adr/disk-backed-sink-buffer.md`), and `DiskQueue::open` unconditionally reads and
-//! CRC-walks the *entire* active segment file on every startup, whether or not there's anything
-//! left to replay (`crates/logit-pipeline/src/disk_queue.rs`, `docs/known-gaps.md`'s `buffered`
-//! entry). Left alone across repeats -- or across separate `script/perf` invocations -- that spool
-//! only grows, so each later run re-validates a larger file than the one before it: exactly the
-//! monotonic throughput collapse `docs/design/performance.md`'s `buffered` investigation found.
-//! Clearing the spool before every spawn removes the accumulation, not the per-startup scan cost
-//! itself -- that's still `DiskQueue::open`'s, and stays open work
-//! (`docs/known-gaps.md`).
+//! `buffered.yaml`'s spool is a crash-recoverable disk queue
+//! (`docs/adr/disk-backed-sink-buffer.md`), and `DiskQueue::open` reads and CRC-walks the whole
+//! active segment on every startup, whether or not anything is left to replay. Left alone across
+//! repeats or `script/perf` invocations, the spool only grows, and each run re-validates a larger
+//! file than the last: a monotonic throughput collapse (`docs/known-gaps.md`'s `buffered` entry,
+//! `docs/design/performance.md`). Clearing it before every spawn removes the accumulation; the
+//! per-startup scan itself is still `DiskQueue::open`'s cost and open work.
 //!
 //! **Never removes anything outside `<repo root>/perf/results/`.** A scenario's `buffer.disk.path`
-//! is an ordinary relative path resolved against that scenario's own file
-//! (`crates/logit-cli/src/pipeline.rs`'s `queue_config`: `base_dir.join(&disk.path)`, `base_dir`
-//! being `path.parent()`) -- this harness resolves it exactly the same way, then refuses to touch
-//! the result unless it lands inside `perf/results/`, the one directory every shipped scenario's
-//! spool convention keeps it under (`perf/scenarios/buffered.yaml`'s own comment). A scenario
-//! declaring a spool path that resolves somewhere else is a scenario bug worth surfacing loudly,
-//! not a directory this tool should ever `rm -rf`.
+//! resolves against the scenario file's directory, as `logit` resolves it
+//! (`crates/logit-cli/src/pipeline.rs`'s `queue_config`). This harness resolves it the same way
+//! and refuses the result unless it lands inside `perf/results/`, where every shipped scenario
+//! keeps its spool. A spool path resolving anywhere else is a scenario bug to surface, not a
+//! directory to `rm -rf`.
 
 use crate::scenario::Scenario;
 use anyhow::{bail, Context};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// Resolves every `buffer.disk.path` `scenario` declares against its own file's directory --
-/// exactly what `logit` itself does at startup (`crates/logit-cli/src/pipeline.rs`'s
-/// `queue_config`) -- then normalizes the result lexically. Normalizing (rather than
-/// [`std::fs::canonicalize`]) is deliberate: the spool directory may not exist yet (the very first
-/// repeat, or a scenario nobody has run before), and [`clear`]'s containment check has to work
-/// before anything on disk does.
+/// Resolves every `buffer.disk.path` `scenario` declares against its own file's directory.
+///
+/// Resolution matches `logit`'s own (`crates/logit-cli/src/pipeline.rs`'s `queue_config`), then
+/// normalizes lexically rather than with [`std::fs::canonicalize`]: the spool may not exist yet,
+/// and [`clear`]'s containment check has to work before it does.
 pub fn resolve_spool_dirs(scenario: &Scenario) -> Vec<PathBuf> {
     let base_dir = scenario.path.parent().unwrap_or_else(|| Path::new(""));
     scenario.disk_spool_paths.iter().map(|raw| normalize(&base_dir.join(raw))).collect()
 }
 
-/// Resolves `.`/`..` components the way a filesystem would, but purely as text -- no
-/// [`std::fs::canonicalize`], no symlink resolution, nothing that requires the path to exist. A
-/// leading `..` past the root simply has nowhere to go and is dropped, the same behavior
-/// `PathBuf::pop` already gives an absolute path (this harness only ever resolves scenario paths,
-/// which are always absolute -- `scenario::discover`'s `entry.path()` off an absolute `dir`).
+/// Resolves `.`/`..` components as text, with no symlink resolution and no need for the path to
+/// exist. A `..` past the root is dropped, as `PathBuf::pop` does; scenario paths are always
+/// absolute (`scenario::discover` lists an absolute `dir`).
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -55,11 +47,9 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Refuses `resolved` unless it lands strictly inside `<root>/perf/results/` -- see the module doc
-/// for why. `perf/results/` itself is refused too, not just accepted as trivially "inside itself"
-/// (`Path::starts_with`'s own definition): it's the harness's shared results directory, holding
-/// every scenario's JSON output and every other scenario's spool, not one scenario's own spool to
-/// remove.
+/// Refuses `resolved` unless it lands strictly inside `<root>/perf/results/` (see the module doc).
+/// `perf/results/` itself is refused, although `Path::starts_with` accepts it: it holds every
+/// scenario's JSON output and every other scenario's spool.
 fn require_within_results_dir(root: &Path, resolved: &Path) -> anyhow::Result<()> {
     let results_dir = normalize(&root.join("perf/results"));
     if resolved == results_dir || !resolved.starts_with(&results_dir) {
@@ -74,11 +64,11 @@ fn require_within_results_dir(root: &Path, resolved: &Path) -> anyhow::Result<()
     Ok(())
 }
 
-/// Clears every disk-backed spool `scenario` declares. Called once before every spawn -- each
-/// repeat in `run`, and once each in `attribute`/`flamegraph` -- so `DiskQueue::open`'s startup
-/// scan never sees a spool left over from an earlier repeat or invocation. Prints one line per
-/// directory actually removed; a scenario with no `buffer.disk:` at all, or whose spool doesn't
-/// exist yet, is silent.
+/// Clears every disk-backed spool `scenario` declares.
+///
+/// Call it before every spawn (each repeat in `run`, and once each in `attribute`/`flamegraph`),
+/// so `DiskQueue::open`'s startup scan never sees a spool from an earlier repeat or invocation.
+/// Prints one line per directory removed; silent when there is none.
 pub fn clear(root: &Path, scenario: &Scenario) -> anyhow::Result<()> {
     for resolved in resolve_spool_dirs(scenario) {
         require_within_results_dir(root, &resolved)?;

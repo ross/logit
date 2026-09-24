@@ -1,11 +1,10 @@
-//! `logit-perf compare a.json b.json`: per-scenario percent deltas on medians between two results
-//! files, gated on a regression threshold (docs/plans/load-test-harness.md's "Harness" section).
+//! `logit-perf compare a.json b.json`: per-scenario percent deltas between two results files'
+//! medians, gated on a regression threshold (docs/adr/load-test-harness.md's "Results as local,
+//! gitignored JSON, `compare` as the tool, docs tables as the record").
 //!
-//! `b` is read as "after" and `a` as "before" -- a positive `events_per_s` delta or a negative
-//! `cpu_us_per_event`/`max_rss_bytes` delta is an improvement; the opposite direction on
-//! `events_per_s` or `cpu_us_per_event` past `--threshold` percent is a regression. `max_rss_bytes`
-//! is reported unconditionally but only gates the exit code when `--rss-threshold` is given
-//! (docs/plans/load-test-harness.md: "RSS reported, gated only with `--rss-threshold`").
+//! `a` is "before", `b` is "after". An `events_per_s` drop or a `cpu_us_per_event` rise past
+//! `--threshold` percent is a regression. `max_rss_bytes` is always reported but gates the exit
+//! code only when `--rss-threshold` is given.
 
 use crate::result::{RunReport, Sample};
 use std::collections::BTreeSet;
@@ -14,15 +13,15 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScenarioComparison {
     pub name: String,
-    /// `None` when the scenario is present in only one of the two files -- listed, not compared
-    /// (docs/plans/load-test-harness.md's W5 row); see [`Presence`] for which file it's in then.
+    /// `None` when the scenario is in only one file: listed, not compared. [`Presence`] says which.
     pub deltas: Option<Deltas>,
     pub presence: Presence,
 }
 
-/// Which of the two compared files a scenario appears in. `Both` is the only case `deltas` is
-/// ever `Some` for; the other two exist so the caller can name the actual file the lone entry
-/// came from, rather than a bare "only in one file".
+/// Which of the two compared files a scenario appears in.
+///
+/// `deltas` is `Some` only for `Both`; the other two let the caller name the file a lone entry
+/// came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     Both,
@@ -36,19 +35,16 @@ pub struct Deltas {
     pub events_per_s_pct: f64,
     pub cpu_us_per_event_pct: f64,
     pub max_rss_bytes_pct: f64,
-    /// `None` when either side's median `startup_s` is itself `None` (no repeat on that side ever
-    /// observed a `ready` line) -- a delta needs both ends, and there is nothing to warn about
-    /// when one is missing.
+    /// `None` when either side's median `startup_s` is `None` (no repeat saw a `ready` line).
     pub startup_s_pct: Option<f64>,
     /// The change in datagram drop rate, in **percentage points** (not a percent change): a
     /// baseline that dropped 3.0% of datagrams against an "after" that drops 1.2% gives `-1.8`.
     ///
-    /// Percentage points rather than a relative percentage because the quantity is already a rate,
-    /// and a relative delta on a small rate is nearly all noise -- 0.1% to 0.2% reads as "+100%"
-    /// and means almost nothing, while "+0.1 points" is exactly as much as it is.
+    /// Points because the quantity is already a rate: 0.1% to 0.2% reads as "+100%" as a relative
+    /// change, but is only "+0.1 points".
     ///
-    /// `None` unless both sides are real-socket scenarios carrying a `UdpSample`. **Reported,
-    /// never gated**: see [`Deltas::is_regression`].
+    /// `None` unless both sides are real-socket scenarios carrying a `UdpSample`. Reported, never
+    /// gated: see [`Deltas::is_regression`].
     pub drop_rate_points: Option<f64>,
 }
 
@@ -69,18 +65,17 @@ impl Deltas {
         }
     }
 
-    /// A throughput drop or a CPU-per-event rise past `threshold_pct` (of `a`'s value) is a
-    /// regression on its own. `rss_threshold_pct`, when given, adds RSS growth past it as a third
-    /// gating reason. `pub`: `main.rs`'s table printer calls this directly to mark which rows
-    /// tripped the threshold, the same verdict [`CompareReport::has_regression`] gates the exit
-    /// code on.
+    /// Whether this scenario regressed: a throughput drop or CPU-per-event rise past
+    /// `threshold_pct`, or, when `rss_threshold_pct` is given, RSS growth past it.
     ///
-    /// `startup_s_pct` and `drop_rate_points` deliberately never participate here -- see
-    /// [`Deltas::startup_regressed`] and [`Deltas::drop_rate_points`]. A UDP scenario's drop rate
-    /// is a property of how hard the harness chose to push it, tuned on purpose into a lossy
-    /// regime (ADR `udp-intake-batching-and-socket-visibility`); gating on it would fail a run for
-    /// being configured the way it was meant to be. It is printed because a *change* in it between
-    /// two runs of the same spec is exactly what `push_many`/`recvmmsg` are supposed to move.
+    /// `main.rs` marks table rows with this; [`CompareReport::has_regression`] gates the exit code
+    /// on the same verdict.
+    ///
+    /// `startup_s_pct` and `drop_rate_points` never gate (see [`Deltas::startup_regressed`]). A
+    /// UDP scenario is tuned into a lossy regime
+    /// (docs/adr/udp-intake-batching-and-socket-visibility.md), so gating on its drop rate would
+    /// fail a run for being configured as intended. The rate is printed because a change in it
+    /// between two runs of one spec is what `push_many`/`recvmmsg` are meant to move.
     pub fn is_regression(&self, threshold_pct: f64, rss_threshold_pct: Option<f64>) -> bool {
         let events_regressed = self.events_per_s_pct < -threshold_pct;
         let cpu_regressed = self.cpu_us_per_event_pct > threshold_pct;
@@ -89,18 +84,16 @@ impl Deltas {
         events_regressed || cpu_regressed || rss_regressed
     }
 
-    /// Whether startup time rose by more than `threshold_pct` -- `main.rs` prints a warning for
-    /// this, but it is never folded into [`Deltas::is_regression`] or
-    /// [`CompareReport::has_regression`]: startup is spawn -> ready, process bring-up rather than
-    /// the graph's own per-event cost, so a regression here is worth a human's attention without
-    /// failing a `compare --threshold` gate meant for throughput/CPU/RSS.
+    /// Whether startup time rose by more than `threshold_pct`.
+    ///
+    /// `main.rs` warns on it, but it never gates: startup is spawn to `ready`, process bring-up
+    /// rather than per-event cost.
     pub fn startup_regressed(&self, threshold_pct: f64) -> bool {
         self.startup_s_pct.is_some_and(|pct| pct > threshold_pct)
     }
 }
 
-/// An effective pacing rate for the warning above -- "unpaced" reads better than a bare `None`,
-/// and distinguishes a spec with no `rate:` from one whose results predate the field.
+/// Renders an effective pacing rate for the pacing warning in [`compare`].
 fn render_rate(rate: Option<u64>) -> String {
     rate.map(|rate| rate.to_string()).unwrap_or_else(|| "unpaced/unrecorded".to_string())
 }
@@ -121,18 +114,15 @@ fn pct_change(a: f64, b: f64) -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompareReport {
     pub scenarios: Vec<ScenarioComparison>,
-    /// Every reason this comparison might be apples-to-oranges: a `hostname`/`cpu_model`
-    /// mismatch (docs/plans/load-test-harness.md: cross-machine wall noise is why CPU/event is
-    /// the actual gate, not a reason to refuse the comparison outright), a `profile`/`rustc`
-    /// mismatch, or a per-scenario `count` mismatch (its events/s and CPU us/event denominators
-    /// differ, so a delta between them conflates a real change with a different workload size).
-    /// Warnings, never failures -- `main.rs` prints each one but still runs the comparison.
+    /// Every reason the two sides might not be comparable: a `hostname`/`cpu_model`, `profile`, or
+    /// `rustc` mismatch; an identical binary sha256 on both sides; or, per scenario, a `count`
+    /// mismatch (different denominators) or a different pacing rate (different operating points).
+    /// Warnings, never failures: `main.rs` prints each and still compares.
     pub warnings: Vec<String>,
 }
 
 impl CompareReport {
-    /// Whether any compared scenario regressed past the given thresholds -- what `main.rs` maps
-    /// to the process exit code.
+    /// Whether any compared scenario regressed past the given thresholds; `main.rs`'s exit code.
     pub fn has_regression(&self, threshold_pct: f64, rss_threshold_pct: Option<f64>) -> bool {
         self.scenarios.iter().any(|scenario| {
             scenario
@@ -142,9 +132,9 @@ impl CompareReport {
     }
 }
 
-/// Builds the comparison between two [`RunReport`]s. Never fails: a scenario present in only one
-/// file is reported as such rather than treated as an error, and every mismatch that makes the
-/// comparison less trustworthy is collected into `warnings` rather than a `Result::Err`.
+/// Builds the comparison between two [`RunReport`]s.
+///
+/// Never fails: a scenario in only one file is listed, and every mismatch becomes a warning.
 pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
     let mut warnings = Vec::new();
 
@@ -165,11 +155,10 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
         warnings
             .push(format!("comparing different rustc versions: `{}` vs `{}`", a.rustc, b.rustc));
     }
-    // Caught the exact hazard a multi-source VM session ran into by hand (`docs/adr/disposable-
-    // azure-perf-vm.md`): two source trees extracted around the same time against one shared
-    // `CARGO_TARGET_DIR` let cargo's mtime fingerprinting treat the second as unchanged, so a
-    // "delta" would have been measured against a byte-identical binary under a different label. A
-    // warning, not a refusal -- a docs-only diff between two refs legitimately produces this too.
+    // Two source trees built against one shared `CARGO_TARGET_DIR` can let cargo's mtime
+    // fingerprinting skip the second build, so both labels measure one binary
+    // (docs/adr/disposable-azure-perf-vm.md's "Multiple sources, one VM"). A warning, not a
+    // refusal: a docs-only diff between two refs produces this too.
     if let (Some(a_bin), Some(b_bin)) = (&a.binary, &b.binary) {
         if a_bin.sha256 == b_bin.sha256 {
             let short: String = a_bin.sha256.chars().take(12).collect();
@@ -192,10 +181,8 @@ pub fn compare(a: &RunReport, b: &RunReport) -> CompareReport {
                         a_scenario.count, b_scenario.count
                     ));
                 }
-                // A driven scenario read at two different `--rate-scale`s is two different
-                // operating points, and a real-socket pipeline's CPU/event moves with where on the
-                // load curve it sat. Nothing else in a results file would say so, so this is the
-                // one place it can be caught.
+                // Two `--rate-scale`s are two operating points, and a real-socket pipeline's
+                // CPU/event moves along the load curve. Nothing else in a results file says so.
                 let (a_rate, b_rate) = (
                     a_scenario.median.udp.and_then(|udp| udp.effective_rate),
                     b_scenario.median.udp.and_then(|udp| udp.effective_rate),

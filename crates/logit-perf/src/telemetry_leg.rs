@@ -1,13 +1,10 @@
-//! Reading a running scenario's own self-telemetry, by appending a temporary `internal → file_out
+//! Reads a running scenario's self-telemetry by appending a temporary `internal → file_out
 //! format: native` leg to a copy of it and decoding the dump afterwards.
 //!
-//! Built for `crate::attribute` ([ADR `load-test-harness`](../../../docs/adr/load-test-harness.md)'s
-//! "Per-node attribution" section) and hoisted here unchanged when `crate::run` needed the same
-//! machinery for a different question: a `Driven` scenario's denominator is events *delivered to
-//! `null_out`*, and the only place that count exists is the child's own
-//! `logit.component.events.received`, which is exactly what this leg carries out
-//! ([ADR `udp-intake-batching-and-socket-visibility`](../../../docs/adr/udp-intake-batching-and-socket-visibility.md)'s
-//! harness decisions). Two callers, one mechanism, no second implementation of it.
+//! Two callers: `crate::attribute` for its per-node breakdown (docs/adr/load-test-harness.md's
+//! "Per-node attribution"), and `crate::run` for a `Driven` scenario's denominator, events
+//! delivered to the sink, which exists only as the child's own `logit.component.events.received`
+//! (docs/adr/udp-intake-batching-and-socket-visibility.md).
 //!
 //! The leg appended to a **copy** of the scenario (the shipped file is never touched):
 //!
@@ -17,35 +14,26 @@
 //!                  format: native, rotate: { max_bytes: "1024GiB" } }
 //! ```
 //!
-//! Then the dump is decoded with the very codec that wrote it --
-//! [`logit_proto::frame::read_frame`] in a loop over the file, each frame's payload through
-//! [`logit_proto::native::decode_batch`], which is exactly what `format: native` writes per batch
-//! (`logit_outputs::stdio::StreamEncoder::Native` -> `NativeEncoder::encode` ->
-//! `write_frame(CODEC_NATIVE_V1, .., encode_batch(batch))`). `native` is the only format that can
-//! be read back byte-exactly: `human` is a render meant for a person, and there is no `json`
-//! stream format at all (`StreamFormat` is `Human | Native`).
+//! The dump is decoded with the codec that wrote it: [`logit_proto::frame::read_frame`] in a loop,
+//! each payload through [`logit_proto::native::decode_batch`], the inverse of what `format:
+//! native` writes per batch (`NativeEncoder::encode`). `native` is the only stream format that
+//! reads back exactly; `human` is a render for people.
 //!
-//! **The append is textual, never a parse-and-reserialize.** A scenario is round-tripped through
-//! [`logit_config::Config`] nowhere in this crate: that would resolve `!env` (which a scenario
-//! never uses, but which would then have to *exist* to run the harness), normalize every default
-//! into the file, and couple this tool to the config crate for no gain. The YAML is parsed as a
-//! bare [`serde_norway::Value`] only to *check* it -- rule 13 allows at most one `internal` per
-//! config, so a scenario that already has one is refused rather than rewritten into a config the
-//! binary would reject.
+//! **The append is textual, never a parse-and-reserialize.** Round-tripping through
+//! `logit_config::Config` would resolve `!env`, write every default into the file, and couple
+//! this crate to `logit-config`. The YAML is parsed as a bare [`serde_norway::Value`] only to
+//! check it: graph rule 13 allows one `internal` per config, so a scenario that has one is
+//! refused rather than rewritten into a config the binary would reject.
 //!
 //! **The rewritten scenario is written next to the original**, as
-//! `perf/scenarios/.<name>.<purpose>.<pid>.yaml`, and removed on every exit path -- not into the
-//! temp directory the dump goes to. Relative paths in a config resolve against that config file's
-//! own directory, so moving it would silently repoint `lua`'s `script_file`, a sink's
-//! `buffer.disk.path` (`perf/scenarios/buffered.yaml` has one), and any relative file target. See
+//! `perf/scenarios/.<name>.<purpose>.<pid>.yaml`, and removed on every exit path; see
 //! [`rewritten_config_path`].
 //!
-//! **A graph with an `internal` in it never self-exits** -- the drain ticker runs until shutdown
-//! -- so a scenario carrying this leg always takes `run`'s settle-then-SIGTERM path, never the
-//! wait-for-exit one. That SIGTERM is also what makes the numbers whole:
-//! `InternalInput::run_until_shutdown` drains once more on the way out
-//! (`docs/design/internal-telemetry.md`, "Shutdown drains once more"), so the last partial interval
-//! lands in the dump instead of being thrown away.
+//! **A graph with an `internal` never self-exits** (the drain ticker runs until shutdown), so a
+//! scenario carrying this leg always takes the settle-then-SIGTERM path. That SIGTERM also makes
+//! the numbers whole: `InternalInput::run_until_shutdown` drains once more on the way out
+//! (`docs/design/internal-telemetry.md`, "Shutdown drains once more"), so the last partial
+//! interval reaches the dump.
 
 use crate::scenario::Scenario;
 use anyhow::{bail, Context};
@@ -59,23 +47,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// The appended components' ids. Prefixed so they can't collide with a scenario's own ids and are
-/// recognizable in the output as the harness's own machinery rather than part of the graph under
-/// test -- [`HARNESS_PREFIX`] is what `attribute`'s verdict and count check filter on.
+/// The appended components' ids, prefixed so they can't collide with a scenario's ids;
+/// `attribute`'s verdict and count check filter on [`HARNESS_PREFIX`].
 pub const INTERNAL_ID: &str = "__perf_internal";
 pub const DUMP_ID: &str = "__perf_dump";
 pub const HARNESS_PREFIX: &str = "__perf_";
 
-/// `file_out` must have at least one rotation trigger (graph rule 29 -- neither set would
-/// silently never rotate). One is required here, but rotating *at all* mid-dump would split the
-/// data across `<purpose>.native` and `<purpose>.native.1`, so this is set far above any plausible
-/// dump: a scenario's whole self-telemetry stream is kilobytes per drain.
+/// `file_out` needs a rotation trigger (graph rule 29), but rotating mid-dump would split the
+/// data across two files, so this sits far above any dump (kilobytes per drain).
 const ROTATE_MAX_BYTES: &str = "1024GiB";
 
-/// A path removed when this guard drops -- so every early return (a failed `validate`, a failed
-/// run, an undecodable dump, a panic) takes the rewritten scenario with it. That file sits in
-/// `perf/scenarios/` alongside the real ones (see [`rewritten_config_path`]), which is exactly
-/// where a leftover would do the most harm.
+/// A path removed when this guard drops, so every early return or panic removes the rewritten
+/// scenario from `perf/scenarios/`, where a leftover would do the most harm.
 pub struct RemoveOnDrop(pub PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -87,19 +70,14 @@ impl Drop for RemoveOnDrop {
 /// Where the rewritten scenario is written: **next to the original**, not in the temp directory
 /// with the dump.
 ///
-/// Every relative path in a config resolves against that config file's own directory
-/// (`logit_cli::pipeline`'s `base_dir`) -- `lua`'s `script_file`, a sink's `buffer.disk.path`, a
-/// `file_out`/`stdio_out` file target. `perf/scenarios/buffered.yaml`'s
-/// `buffer.disk.path: ../results/spool` is the live example: run from `/tmp`, that config spools
-/// to `/results/spool` instead of `perf/results/spool`, so the scenario under attribution is not
-/// the scenario that ships. Keeping the rewrite in the same directory keeps `base_dir` identical
-/// and every relative path pointing where the author meant.
+/// Every relative path in a config resolves against the config file's directory
+/// (`logit_cli::pipeline`'s `base_dir`): `lua`'s `script_file`, a sink's `buffer.disk.path`, a
+/// file target. Moved to `/tmp`, `perf/scenarios/buffered.yaml`'s `../results/spool` would spool
+/// to `/results/spool`, and the scenario measured wouldn't be the one that ships.
 ///
-/// Dot-prefixed and pid-suffixed: `script/validate`'s `perf/scenarios/*.yaml` glob doesn't match
-/// a leading dot, `scenario::discover` skips dotfiles for the same reason, and two concurrent
-/// runs can't collide. `purpose` (`attribute`, `run`) keeps two subcommands running at once from
-/// sharing a name even at the same pid, which they can't be -- but it also makes a leftover file
-/// say which command left it.
+/// Dot-prefixed so `script/validate`'s glob and `scenario::discover` skip it, pid-suffixed so
+/// concurrent runs can't collide. `purpose` (`attribute`, `run`) says which command left a
+/// leftover.
 pub fn rewritten_config_path(scenario: &Scenario, purpose: &str) -> anyhow::Result<PathBuf> {
     let dir = scenario
         .path
@@ -108,15 +86,13 @@ pub fn rewritten_config_path(scenario: &Scenario, purpose: &str) -> anyhow::Resu
     Ok(dir.join(format!(".{}.{purpose}.{}.yaml", scenario.name, std::process::id())))
 }
 
-/// Where [`make_workdir`] puts a given purpose's scratch directory. Pure, so a caller that only
-/// wants to *clean up* afterwards doesn't have to create the directory to learn its name.
+/// Where [`make_workdir`] puts a purpose's scratch directory, without creating it.
 pub fn workdir_path(purpose: &str) -> PathBuf {
     std::env::temp_dir().join(format!("logit-perf-{purpose}-{}", std::process::id()))
 }
 
-/// A private scratch directory for one run's native dump -- and nothing else; the rewritten
-/// scenario deliberately stays next to the original (see [`rewritten_config_path`]). Named by
-/// purpose and pid so two concurrent runs can't share one.
+/// Creates a scratch directory for native dumps, named by purpose and pid so concurrent runs
+/// can't share one. The rewritten scenario stays beside the original ([`rewritten_config_path`]).
 pub fn make_workdir(purpose: &str) -> anyhow::Result<PathBuf> {
     let dir = workdir_path(purpose);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -125,19 +101,16 @@ pub fn make_workdir(purpose: &str) -> anyhow::Result<PathBuf> {
 
 /// Removes a workdir left by [`make_workdir`] **only if it is empty**.
 ///
-/// Non-recursive on purpose: every dump inside it was either removed by the repeat that wrote it
-/// (because that repeat succeeded) or deliberately kept (because it didn't). An empty directory is
-/// therefore exactly "nothing failed", and a `remove_dir_all` here would throw away the evidence
-/// the failure path just went out of its way to preserve. Silent either way -- a leftover scratch
-/// directory is not worth a message.
+/// Non-recursive: a successful repeat removes its dump and a failed one keeps it, so only an
+/// empty directory means nothing failed. `remove_dir_all` would destroy that evidence. Silent
+/// either way.
 pub fn remove_workdir_if_empty(purpose: &str) {
     let _ = fs::remove_dir(workdir_path(purpose));
 }
 
-/// Runs the built binary's own `logit validate` over the rewritten file before spawning it. The
-/// rewrite is textual, so the first thing that would notice a malformed append is `logit run`
-/// itself, ~10 seconds into a scenario, as a generic startup failure -- this turns that into an
-/// immediate error carrying `validate`'s own message about which component and which rule.
+/// Runs the binary's own `logit validate` over the rewritten file before spawning it, so a
+/// malformed append fails at once with `validate`'s component-and-rule message rather than as a
+/// generic startup failure.
 pub fn validate(logit_bin: &Path, config: &Path) -> anyhow::Result<()> {
     let output = Command::new(logit_bin)
         .arg("validate")
@@ -158,12 +131,10 @@ pub fn validate(logit_bin: &Path, config: &Path) -> anyhow::Result<()> {
 
 /// Appends the `internal` + `file_out` dump leg to `yaml`, textually.
 ///
-/// Refuses rather than rewrites when the append couldn't produce a valid config: a scenario that
-/// already has an `internal` component (graph rule 13 allows at most one per config -- two would
-/// each drain, and so split, the same process-wide `Registry`), one that already uses either of
-/// the reserved ids, or one with a top-level key other than `components:`. That last check is
-/// what makes appending at the end of the file sound: the two new entries are indented as
-/// `components:` members, which is only where they land if nothing else follows it.
+/// Refuses a scenario the append can't make valid: one that already has an `internal` (graph
+/// rule 13; two would split one process-wide registry's drains), uses a reserved id, or has a
+/// top-level key besides `components:`. That last check makes appending at end of file sound:
+/// the new entries are indented as `components:` members.
 pub fn rewrite_scenario(
     yaml: &str,
     interval: Duration,
@@ -218,13 +189,9 @@ pub fn rewrite_scenario(
         yaml_double_quoted(&dump_path.to_string_lossy())
     ));
 
-    // The append is two-space-indented text, which is right for every scenario in this repo and
-    // wrong for any other layout: a four-space-indented scenario makes the result a YAML syntax
-    // error (the new keys are less indented than their siblings), and other layouts could nest
-    // them somewhere unintended instead. Re-reading the result and checking both components
-    // actually landed turns either outcome into a harness-worded error naming the harness as the
-    // thing at fault, rather than a `serde_norway` position report or a puzzling `logit validate`
-    // complaint about somebody else's component.
+    // The append is two-space-indented, which fits every shipped scenario. Another layout either
+    // fails to parse or nests the new keys elsewhere; re-checking turns both into an error that
+    // names the harness, not a parser position or a `logit validate` complaint.
     check_append_landed(&out).context(
         "this rewrite indents its two appended components by two spaces, so a scenario laid out \
          differently needs the harness taught about it \
@@ -233,9 +200,8 @@ pub fn rewrite_scenario(
     Ok(out)
 }
 
-/// Re-parses a rewritten scenario and confirms both appended components are where they were meant
-/// to go. Split out from [`rewrite_scenario`] so the one `context` above covers every way this
-/// can fail -- a parse error and a mis-nested key are the same problem wearing two hats.
+/// Re-parses a rewritten scenario and confirms both appended components landed under
+/// `components:`; a parse error and a mis-nested key are the same failure.
 fn check_append_landed(rewritten: &str) -> anyhow::Result<()> {
     let value: serde_norway::Value = serde_norway::from_str(rewritten)
         .context("the rewritten scenario is not valid YAML any more")?;
@@ -251,11 +217,10 @@ fn check_append_landed(rewritten: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `humantime` duration literal for the appended `internal`'s `interval:` --
-/// `logit_config`'s own `humantime_serde_duration` is what parses it back. Whole seconds render
-/// as seconds, everything else as whole milliseconds; sub-millisecond intervals are rejected by
-/// the caller, since there is no finer unit this needs and a rounded-to-zero interval would be a
-/// config error rather than a fast one.
+/// A duration literal for the appended `internal`'s `interval:`.
+///
+/// Whole seconds render as seconds, anything else as whole milliseconds, so a sub-millisecond
+/// interval rounds down (`attribute` rejects one up front).
 pub fn format_interval(interval: Duration) -> String {
     if interval.subsec_nanos() == 0 {
         format!("{}s", interval.as_secs())
@@ -264,10 +229,8 @@ pub fn format_interval(interval: Duration) -> String {
     }
 }
 
-/// A YAML double-quoted scalar, so a temp-directory path containing a `:` or a leading `#`
-/// can't be misread as structure. Only `"` and `\` need escaping in a path -- a path holding a
-/// raw control character is rejected outright rather than escaped, since it is far more likely to
-/// be a bug in whatever produced it than a path anyone meant.
+/// A YAML double-quoted scalar, so a temp path containing `:` or a leading `#` can't be misread
+/// as structure. Escapes only `"` and `\`; a control character passes through unescaped.
 fn yaml_double_quoted(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 2);
     out.push('"');
@@ -282,15 +245,12 @@ fn yaml_double_quoted(raw: &str) -> String {
     out
 }
 
-/// Reads the whole dump and decodes every frame in it. A file written by `format: native` is a
-/// plain concatenation of independently-decodable frames (`logit_proto::native`'s module doc), so
-/// this is `read_frame` in a loop over one `Bytes` cursor, each frame's payload handed to
-/// `decode_batch` -- the exact inverse of `NativeEncoder::encode`, and the same two calls
-/// `NativeDecoder::decode_into` makes.
+/// Reads the whole dump and decodes every frame in it.
 ///
-/// A torn *final* frame is a warning, not a failure: the process is SIGTERMed on purpose, and a
-/// write interrupted mid-frame leaves a valid prefix followed by a partial one. Every earlier
-/// frame decoding cleanly is what matters; a corrupt frame anywhere else fails loudly.
+/// A `format: native` file is a concatenation of independently decodable frames
+/// (`logit_proto::native`'s module doc), decoded as `NativeDecoder::decode_into` does. A torn
+/// final frame only warns, since SIGTERM can interrupt a write mid-frame; a bad frame anywhere
+/// else fails.
 pub fn decode_dump(path: &Path, quiet: bool) -> anyhow::Result<Vec<Event>> {
     let raw =
         fs::read(path).with_context(|| format!("reading the telemetry dump {}", path.display()))?;
