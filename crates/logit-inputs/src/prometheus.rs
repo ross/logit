@@ -2601,8 +2601,9 @@ mod tests {
     /// A body that decompresses but is not protobuf (a truncated varint) is a `400`. Sent as 2.0,
     /// so this also pins the zero `-Written` report 2.0 requires on a `4xx`.
     ///
-    /// A *valid 1.0* body under a 2.0 `Content-Type` is also a `CodecError` now
-    /// (`logit_proto::prometheus::remote_write`'s module doc), but no test here posts one.
+    /// A *valid 1.0* body under a 2.0 `Content-Type` is also a `CodecError`
+    /// (`logit_proto::prometheus::remote_write`'s module doc) -- see
+    /// `a_valid_body_of_the_other_version_is_400_and_counted_bad_request`.
     #[tokio::test]
     async fn a_body_that_is_not_the_promised_message_is_400() {
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
@@ -2621,6 +2622,57 @@ mod tests {
                 .contains(&format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN)),
             "got: {response}"
         );
+    }
+
+    /// A *valid* body of one version, posted under the other version's `Content-Type`, is also a
+    /// `400`: `logit_proto::prometheus::remote_write::decode_v1`/`decode_v2` refuse a non-empty
+    /// body that decodes to an empty message, since 1.0 and 2.0 field numbers don't overlap.
+    #[tokio::test]
+    async fn a_valid_body_of_the_other_version_is_400_and_counted_bad_request() {
+        for (sent, claimed) in [
+            (remote_write::Version::V1, remote_write::Version::V2),
+            (remote_write::Version::V2, remote_write::Version::V1),
+        ] {
+            let (receiver, addr) = bound_receiver("/api/v1/write").await;
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("receive", "prometheus_in", "listener");
+            let receiver = receiver.with_telemetry(telemetry);
+            let mut rx = spawn_receiver(receiver, 4);
+            let groups = vec![vec![gauge_family(
+                "queue_depth",
+                ("job", "api"),
+                7.0,
+                millis(1_700_000_000_000),
+            )]];
+            let body = request_body(&groups, sent);
+
+            let response = post_write(&addr, "/api/v1/write", claimed, &body).await;
+
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "{sent:?} as {claimed:?} got: {response}"
+            );
+            if claimed == remote_write::Version::V2 {
+                // 2.0 wants the `-Written` report on a 4xx too: zeros, since nothing was stored.
+                assert!(
+                    response
+                        .to_ascii_lowercase()
+                        .contains(&format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN)),
+                    "got: {response}"
+                );
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "{sent:?} as {claimed:?}: nothing should reach the fanout"
+            );
+
+            let events = registry.drain(0);
+            assert_eq!(
+                counter_in(&events, "logit.input.writes", ("class", "bad_request")),
+                Some(1.0),
+                "{sent:?} as {claimed:?}"
+            );
+        }
     }
 
     /// Three samples of one series become **one** batch of three events in ascending timestamp
