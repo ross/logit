@@ -480,8 +480,18 @@ generator's time blocked on a full sink. At `buffered`'s 64 MiB default the delt
   paused clock doesn't advance time while it waits. Then it drops the channel, and the worker exits
   once the job has run. A persist after `finish` runs inline.
 
-**Crash semantics.** `DiskQueue` still has no `Drop` impl, and a process death stops the worker
-wherever it is:
+**`Drop` joins the worker, and that's all it does.** Dropping a `DiskQueue` without `finish` drops
+the worker's sender and joins the thread, which exits once it has run the jobs already queued, each
+a few milliseconds of small-file I/O. `Drop` starts no new I/O: no final cursor persist and no
+`fsync`, which stay `finish`'s. It runs before the spool's lock file is released, so the worker
+never writes `cursor.json` or unlinks a segment under a queue reopened on the same directory in the
+same process (only tests do that today). A dropped queue leaves the disk at least as durable as a
+crash at the same point would. Having the worker hold the lock file instead was rejected: a reopen
+right after the drop would fail spuriously, as if another process held the spool, while the thread
+wound down. Tests keep a `kill -9` analogue, `DiskQueue::abandon_queued_persists`, which discards
+the queued jobs and then joins, so the spool model's reopen is deterministic.
+
+**Crash semantics.** A process death stops the worker wherever it is:
 
 - A job not yet persisted leaves an older cursor on disk, and every segment it would have unlinked
   still exists. The next `open` replays from the older cursor: duplicates, never loss, by the same
@@ -508,11 +518,14 @@ unchanged.
 - `a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open`: the F4 path.
 - `finish_waits_for_every_queued_persist`: `finish` doesn't complete while a roll's job is held.
 - `persist_jobs_never_move_the_cursor_backwards`: two queued rolls land in order, the later
-  cursor last.
+  cursor last. The enqueue half of the ordering is structural: the one enqueue function,
+  `DiskQueue::queue_persist`, takes the state guard by value and sends before releasing it.
+- `dropping_a_queue_runs_its_queued_persists_before_releasing_the_lock`: a roll's job held by a
+  paused worker has run, persist and unlink, by the time `drop` returns.
 
 Existing tests that assert on disk after a `commit` wait for the worker first
 (`DiskQueue::wait_for_persists`). The spool model proptests in `disk_queue_verification.rs` do too,
-and their reopen without `finish` discards every job the worker hadn't started
+and their reopen without `finish` discards every job the worker hadn't started and joins it
 (`DiskQueue::abandon_queued_persists`), as a `kill -9` would. Without that, the old worker could
 unlink a segment under the reopened queue. Before the helper existed, one generated case failed
 with a peek that stopped responding while draining, which is consistent with that race.

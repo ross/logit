@@ -415,27 +415,28 @@ impl PersistGate {
 /// Starts the spool's persist worker: one `std::thread` that runs each [`PersistJob`] in the order
 /// it was queued, and exits once its sender is gone and the queue is drained. A dedicated thread
 /// rather than `spawn_blocking`, so a job never waits for a blocking-pool slot and the channel
-/// alone decides the order.
+/// alone decides the order. [`DiskQueue`]'s `Drop` joins it through the returned handle.
 fn spawn_persist_worker(
     dir: PathBuf,
     telemetry: Telemetry,
     mut diag: Diagnostics,
     #[cfg(test)] gate: Arc<PersistGate>,
-) -> io::Result<mpsc::Sender<PersistJob>> {
+) -> io::Result<(mpsc::Sender<PersistJob>, std::thread::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<PersistJob>();
-    std::thread::Builder::new().name("logit-spool-persist".into()).spawn(move || {
-        for job in rx {
-            #[cfg(test)]
-            if !gate.admit() {
-                if let Some(done) = job.done {
-                    done.send(()).ok();
+    let worker =
+        std::thread::Builder::new().name("logit-spool-persist".into()).spawn(move || {
+            for job in rx {
+                #[cfg(test)]
+                if !gate.admit() {
+                    if let Some(done) = job.done {
+                        done.send(()).ok();
+                    }
+                    continue;
                 }
-                continue;
+                run_persist_job(&dir, job, &telemetry, &mut diag);
             }
-            run_persist_job(&dir, job, &telemetry, &mut diag);
-        }
-    })?;
-    Ok(tx)
+        })?;
+    Ok((tx, worker))
 }
 
 /// Whether `path` names an existing file. Only on a failure path: a blocking `stat`.
@@ -555,6 +556,9 @@ pub struct DiskQueue {
     compression: Compression,
     checkpoint_interval: Duration,
     inner: Mutex<State>,
+    /// The persist worker, joined by `Drop` (see [`DiskQueue::stop_persist_worker`]). A `Mutex`
+    /// only so a test can stop it early through `&self`.
+    persist_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     #[cfg(test)]
     persist_gate: Arc<PersistGate>,
     not_empty: tokio::sync::Notify,
@@ -746,7 +750,7 @@ impl DiskQueue {
         // is the only writer of `cursor.json`.
         #[cfg(test)]
         let persist_gate = Arc::new(PersistGate::default());
-        let persist_tx = spawn_persist_worker(
+        let (persist_tx, persist_worker) = spawn_persist_worker(
             config.dir.clone(),
             telemetry.clone(),
             diag.clone(),
@@ -782,6 +786,7 @@ impl DiskQueue {
             compression: config.compression,
             checkpoint_interval: config.checkpoint_interval,
             inner: Mutex::new(state),
+            persist_worker: Mutex::new(Some(persist_worker)),
             #[cfg(test)]
             persist_gate,
             not_empty: tokio::sync::Notify::new(),
@@ -1460,9 +1465,14 @@ impl DiskQueue {
         }
     }
 
-    /// Hands `job` to the persist worker, sending while `state` is still held so jobs queue in
-    /// the order the cursor moved (see [`PersistJob`]). With no worker (after
-    /// [`DiskQueue::finish`]), runs it inline once the lock is released.
+    /// Hands `job` to the persist worker, the one way any job is queued. It consumes the state
+    /// guard and sends before releasing it, because the lock is what orders jobs: the consumer
+    /// isn't the only task that moves the cursor (a producer's `drop_oldest` eviction and its
+    /// make-room rotation roll it too), so a job sent after the unlock could land behind a later
+    /// cursor's job and move the cursor on disk backward. This signature pins the
+    /// enqueue-under-lock half of that; `persist_jobs_never_move_the_cursor_backwards` pins the
+    /// worker running jobs in queue order. With no worker (after [`DiskQueue::finish`]), runs the
+    /// job inline once the lock is released.
     fn queue_persist(&self, mut state: MutexGuard<'_, State>, job: PersistJob) {
         let job = match &state.persist_tx {
             Some(tx) => match tx.send(job) {
@@ -1562,7 +1572,7 @@ impl DiskQueue {
 
     /// Persists the cursor durably regardless of `checkpoint_interval`, after every persist and
     /// unlink already queued, then flushes and `fsync`s the active segment, `fsync`s the
-    /// directory, and closes files. Stops the persist worker, so a later persist runs inline.
+    /// directory, and closes files. Releases the persist worker, so a later persist runs inline.
     /// Each failure is counted and diagnosed. Drops nothing: what is queued delivers after the
     /// next open.
     ///
@@ -1577,15 +1587,11 @@ impl DiskQueue {
             let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             state.last_checkpoint = Instant::now();
             let cursor = Some((state.read_seq, state.read_offset));
-            let job = PersistJob { cursor, unlink: Vec::new(), done: Some(done) };
-            // Taking the sender lets the worker exit once it has run this last job.
-            let tx = state.persist_tx.take();
-            if let Some(tx) = tx {
-                self.queue_persist_to(state, &tx, job);
-            } else {
-                self.queue_persist(state, job);
-            }
+            self.queue_persist(state, PersistJob { cursor, unlink: Vec::new(), done: Some(done) });
         }
+        // Dropping the sender lets the worker exit once it has run every job queued so far.
+        let tx = self.inner.lock().unwrap_or_else(|p| p.into_inner()).persist_tx.take();
+        drop(tx);
         wait_for_worker(persisted).await;
         let mut held = self.hold_write_file();
         let active_seq = {
@@ -1621,17 +1627,16 @@ impl DiskQueue {
         drop(held.file.take());
     }
 
-    /// [`DiskQueue::queue_persist`] through a sender already taken out of the state.
-    fn queue_persist_to(
-        &self,
-        state: MutexGuard<'_, State>,
-        tx: &mpsc::Sender<PersistJob>,
-        job: PersistJob,
-    ) {
-        if let Err(mpsc::SendError(job)) = tx.send(job) {
-            let mut diag = state.diag.clone();
-            drop(state);
-            run_persist_job(&self.dir, job, &self.telemetry, &mut diag);
+    /// Drops the persist worker's sender and joins it. The worker exits once it has run every job
+    /// already queued (each a few milliseconds of small-file I/O), so this starts no new I/O and
+    /// waits only for I/O already committed to. Idempotent.
+    fn stop_persist_worker(&self) {
+        let tx = self.inner.lock().unwrap_or_else(|p| p.into_inner()).persist_tx.take();
+        drop(tx);
+        let worker = self.persist_worker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(worker) = worker {
+            // `Err` only if the worker panicked; there is nothing left to stop.
+            worker.join().ok();
         }
     }
 
@@ -1672,14 +1677,26 @@ impl DiskQueue {
         self.persist_gate.update(|g| g.paused = false);
     }
 
-    /// Discards every job still queued for the persist worker, and every later one, then returns
-    /// once the worker is idle, as a `kill -9` leaves the spool: a job already running finishes,
-    /// and nothing after it runs. Call it before dropping a queue that a test then reopens, so
-    /// the old worker can't touch the directory under the new queue.
+    /// The test-only `kill -9` analogue: discards every job still queued for the persist worker,
+    /// then joins it, so a job already running finishes and nothing after it runs. `Drop` alone
+    /// would run the queued jobs first, which leaves the disk more durable than a crash does.
     #[cfg(test)]
     pub(crate) fn abandon_queued_persists(&self) {
         self.persist_gate.update(|g| g.abandoned = true);
-        self.wait_for_persists_blocking();
+        self.stop_persist_worker();
+    }
+}
+
+/// The one thing dropping a `DiskQueue` does: stop and join the persist worker before the spool's
+/// lock file is released (fields drop after this runs), so the worker never writes `cursor.json`
+/// or unlinks a segment under a queue reopened on the same directory. It runs only jobs already
+/// queued and starts no new I/O: no final cursor persist and no `fsync`, which stay `finish`'s.
+impl Drop for DiskQueue {
+    fn drop(&mut self) {
+        // A test that panicked with the worker paused must not turn into a join that never ends.
+        #[cfg(test)]
+        self.persist_gate.update(|g| g.paused = false);
+        self.stop_persist_worker();
     }
 }
 
@@ -3782,6 +3799,27 @@ mod tests {
         drop(scope);
         drop(q);
 
+        let reopened = open(dir.clone());
+        assert_eq!(drain_all(&reopened).await, vec!["c"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queue_runs_its_queued_persists_before_releasing_the_lock() {
+        let dir = scratch_dir("drop-joins-worker");
+        let q = roll_setup(&dir).await;
+        q.pause_persists();
+        q.commit().unwrap(); // queues the roll out of segment 1, held by the paused worker
+        assert!(segment_path(&dir, 1).exists());
+
+        // `Drop` releases a paused worker (a test-only safeguard), then joins it.
+        drop(q);
+        assert_eq!(
+            on_disk_cursor(&dir),
+            Some((2, 0)),
+            "the queued persist ran before drop returned"
+        );
+        assert!(!segment_path(&dir, 1).exists(), "and so did its unlink");
         let reopened = open(dir.clone());
         assert_eq!(drain_all(&reopened).await, vec!["c"]);
         std::fs::remove_dir_all(&dir).ok();

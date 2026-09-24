@@ -457,7 +457,8 @@ synchronously inside `commit`". It no longer does. Each spool starts one persist
 cursor to persist durably and, for a roll, the segments the cursor left, unlinked after the
 persist. `commit` stays synchronous and now does no disk I/O at all. Jobs are queued under the
 state lock, so the cursor on disk never moves backward. `finish` waits for every queued job before
-its own flush and `fsync`s.
+its own flush and `fsync`s. Dropping the queue without `finish` joins the worker once it has run
+what's already queued, before the lock file is released, and starts no new I/O.
 
 The in-memory side of a roll is unchanged: the segments leave `total_bytes` and the segment count
 at once, whether or not their unlink has run yet. A crash before a job's persist leaves an older
