@@ -153,9 +153,10 @@
 //!     the other mode, a bind-mode `path` not starting with `/`, or `metadata_cache.ttl: 0s` with
 //!     `max_families > 0` (`docs/adr/prometheus-remote-write.md`).
 //! 56. A `prometheus_out` with both or neither of `bind`/`endpoint`, a non-default field of the
-//!     other mode, or a sender fault in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a
-//!     reserved or colliding header, or a bad `endpoint_tls`
-//!     (`docs/adr/prometheus-remote-write.md`).
+//!     other mode, `version: 2` with `compression: zstd` (2.0 mandates Snappy), or a sender fault
+//!     in 40's shape: a non-absolute `endpoint`, `timeout: 0s`, a reserved or colliding header, or
+//!     a bad `endpoint_tls` (`docs/adr/prometheus-remote-write.md`,
+//!     `docs/adr/victoriametrics-interop.md`).
 //! 57. A datagram listener's `receive.read_batch` above `MAX_READ_BATCH`: the kernel doesn't clamp
 //!     `recvmmsg`'s `vlen`, so this bounds the receive slab and the shutdown-path loss
 //!     (`docs/adr/udp-intake-batching-and-socket-visibility.md`).
@@ -2200,6 +2201,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             max_series,
             endpoint,
             version,
+            compression,
             timeout,
             headers,
             endpoint_tls,
@@ -2226,6 +2228,14 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                         "component '{id}': 'version' selects the remote-write protocol version \
                          and only means anything with 'endpoint' -- a prometheus_out with 'bind' \
                          serves an exposition, which has no wire version to pick"
+                    );
+                }
+                if *compression != logit_config::RemoteWriteCompression::default() {
+                    anyhow::bail!(
+                        "component '{id}': 'compression' selects how a remote-write request body \
+                         is compressed and only means anything with 'endpoint' -- a \
+                         prometheus_out with 'bind' serves an exposition, which sends no request \
+                         bodies"
                     );
                 }
                 if *timeout != logit_config::default_prometheus_endpoint_timeout() {
@@ -2286,6 +2296,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     anyhow::bail!(
                         "component '{id}': 'timeout: 0s' would fail every remote-write request \
                          immediately -- use a positive duration"
+                    );
+                }
+                if *version == logit_config::RemoteWriteVersion::V2
+                    && *compression == logit_config::RemoteWriteCompression::Zstd
+                {
+                    anyhow::bail!(
+                        "component '{id}': 'compression: zstd' needs 'version: 1' -- remote-write \
+                         2.0 mandates Snappy, and zstd is the VictoriaMetrics variant of 1.0; use \
+                         'compression: snappy' with 'version: 2'"
                     );
                 }
                 // Rule 40's header checks, against this sink's own reserved list.
@@ -8717,6 +8736,7 @@ mod tests {
             max_series,
             endpoint: None,
             version: logit_config::RemoteWriteVersion::default(),
+            compression: logit_config::RemoteWriteCompression::default(),
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -8732,6 +8752,7 @@ mod tests {
             max_series: logit_config::default_prometheus_max_series(),
             endpoint: Some(endpoint.to_string()),
             version: logit_config::RemoteWriteVersion::default(),
+            compression: logit_config::RemoteWriteCompression::default(),
             timeout: logit_config::default_prometheus_endpoint_timeout(),
             headers: HashMap::new(),
             endpoint_tls: logit_config::TlsClientConfig::default(),
@@ -8853,6 +8874,12 @@ mod tests {
         assert!(err.contains("'out'") && err.contains("'version'"), "got: {err}");
 
         let err = expect_err(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }));
+        assert!(err.contains("'out'") && err.contains("'compression'"), "got: {err}");
+
+        let err = expect_err(expose_cfg(|kind| {
             let ComponentKind::PrometheusOut { timeout, .. } = kind else { unreachable!() };
             *timeout = Duration::from_secs(30);
         }));
@@ -8883,6 +8910,45 @@ mod tests {
             *version = logit_config::RemoteWriteVersion::default();
         }))
         .expect("defaults are legal in either mode");
+        resolve(expose_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Snappy;
+        }))
+        .expect("an explicit default compression is legal under bind");
+    }
+
+    /// Remote-write 2.0 mandates Snappy, so `zstd` pairs only with `version: 1`.
+    #[test]
+    fn zstd_compression_with_version_2_is_rejected() {
+        let err = expect_err(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { version, compression, .. } = kind else {
+                unreachable!()
+            };
+            *version = logit_config::RemoteWriteVersion::V2;
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }));
+        assert!(
+            err.contains("'out'") && err.contains("'compression: zstd' needs 'version: 1'"),
+            "got: {err}"
+        );
+    }
+
+    /// `zstd` with `version: 1` and `snappy` with `version: 2` are both legal senders.
+    #[test]
+    fn zstd_with_version_1_and_snappy_with_version_2_both_resolve() {
+        resolve(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { compression, .. } = kind else { unreachable!() };
+            *compression = logit_config::RemoteWriteCompression::Zstd;
+        }))
+        .expect("zstd with version: 1 is the VictoriaMetrics wire");
+        resolve(remote_write_cfg(|kind| {
+            let ComponentKind::PrometheusOut { version, compression, .. } = kind else {
+                unreachable!()
+            };
+            *version = logit_config::RemoteWriteVersion::V2;
+            *compression = logit_config::RemoteWriteCompression::Snappy;
+        }))
+        .expect("snappy with version: 2 is the 2.0 wire");
     }
 
     /// Rule 41's checks are registry-mode only: a sender-mode component never reaches them, and
