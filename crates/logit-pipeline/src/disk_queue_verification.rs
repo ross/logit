@@ -6,6 +6,10 @@
 //! The generated records never embed a whole frame in a payload, so a record can only parse at
 //! an offset where the model placed one. A payload that did embed one could still be read as a
 //! phantom record after corruption; that's an accepted limit of a MAGIC-scan resync.
+//!
+//! `spool_model_every_push_is_delivered_dropped_or_queued` covers the write path (DISK-03,
+//! DISK-05): random pushes, cancelled pushes, peeks, commits, injected failures, and
+//! crash-reopens, checked against a model of what the spool counted queued or dropped.
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -19,6 +23,7 @@ use crate::disk_queue::{
     list_segments, segment_path, walk_segment, DiskQueue, WalkOutcome, CONTEXT_LEN,
 };
 use crate::fanout::{BatchContext, TraceContext};
+use crate::fault::{self, errno, sites, Op, Point};
 use crate::queue::SINK_QUEUE_METRICS;
 use logit_core::{Diagnostics, Provenance, Registry};
 use logit_proto::frame;
@@ -405,4 +410,378 @@ fn open_and_drain(dir: &Path) -> (Vec<String>, f64, f64) {
         }
         (delivered, truncated, corrupt)
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// A model of the spool's delivery contract under pushes, cancelled pushes, injected failures, and
+// crash-reopens (DISK-03, DISK-05).
+// ---------------------------------------------------------------------------------------------
+
+const MODEL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a peek waits when the model has nothing that must be queued: long enough for a
+/// replayed record to be read, short enough that an empty spool costs little.
+const EMPTY_PEEK_WAIT: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy)]
+enum Fault {
+    FlushEnospc,
+    SetLenEio,
+    FsyncEio,
+    UnlinkEio,
+}
+
+#[derive(Debug, Clone)]
+enum SpoolOp {
+    /// Pushes a batch whose marker is padded by this many bytes.
+    Push(usize),
+    Peek,
+    Commit,
+    /// Polls a push this many times, then drops it. The push runs on a second runtime whose one
+    /// blocking thread first sleeps this many microseconds, so what the push handed off lands
+    /// before, during, or after the next operation's own work.
+    CancelPush(usize, u32, u64),
+    /// Fails the next occurrence of one operation.
+    Inject(Fault),
+    /// Freezes the spool directory at the next occurrence of one of [`CRASH_POINTS`], until the
+    /// next `Reopen`.
+    Crash(Index),
+    /// Drops the spool (after `finish` if `true`) and its runtime, as a process exit would, then
+    /// reopens it.
+    Reopen(bool),
+}
+
+const CRASH_POINTS: [Point; 9] = [
+    Point::new(sites::SPOOL_SEGMENT, Op::Write),
+    Point::new(sites::SPOOL_SEGMENT, Op::Flush),
+    Point::new(sites::SPOOL_SEGMENT, Op::SetLen),
+    Point::new(sites::SPOOL_SEGMENT, Op::SyncFile),
+    Point::new(sites::SPOOL_SEGMENT, Op::Create),
+    Point::new(sites::SPOOL_SEGMENT, Op::Unlink),
+    Point::new(sites::SPOOL_CURSOR, Op::Write),
+    Point::new(sites::SPOOL_CURSOR, Op::Rename),
+    Point::new(sites::SPOOL_DIR, Op::SyncDir),
+];
+
+fn spool_op() -> impl Strategy<Value = SpoolOp> {
+    let fault = prop_oneof![
+        Just(Fault::FlushEnospc),
+        Just(Fault::SetLenEio),
+        Just(Fault::FsyncEio),
+        Just(Fault::UnlinkEio),
+    ];
+    prop_oneof![
+        6 => (0usize..300).prop_map(SpoolOp::Push),
+        3 => Just(SpoolOp::Peek),
+        4 => Just(SpoolOp::Commit),
+        2 => (0usize..300, 1u32..=6, 0u64..2000)
+            .prop_map(|(size, polls, delay)| SpoolOp::CancelPush(size, polls, delay)),
+        1 => fault.prop_map(SpoolOp::Inject),
+        1 => any::<Index>().prop_map(SpoolOp::Crash),
+        1 => any::<bool>().prop_map(SpoolOp::Reopen),
+    ]
+}
+
+/// What the model knows about one push, by id (the push's position in the sequence).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pushed {
+    /// Counted queued: it must be delivered.
+    Queued,
+    /// Counted dropped, or cancelled before it completed. Its bytes may have reached the disk
+    /// whole, so it may be delivered, but only after a reopen.
+    Unconfirmed,
+}
+
+struct Model {
+    pushes: Vec<Pushed>,
+    /// For each id, the reopen epoch it was first committed in.
+    committed_in: Vec<Option<u32>>,
+    /// The reopen epoch each id was pushed in.
+    pushed_in: Vec<u32>,
+    epoch: u32,
+    /// The highest id committed for the first time so far: first deliveries are FIFO.
+    last_first_commit: Option<usize>,
+    /// The depth the queue must report, once a reopen has set a baseline.
+    depth: f64,
+}
+
+impl Model {
+    fn must_deliver(&self) -> bool {
+        self.pushes.iter().zip(&self.committed_in).any(|(p, c)| *p == Pushed::Queued && c.is_none())
+    }
+}
+
+fn marker(id: usize, pad: usize) -> String {
+    format!("{id:05}-{}", "p".repeat(pad))
+}
+
+fn id_of(marker: &str) -> usize {
+    marker[..5].parse().expect("a model marker")
+}
+
+fn drops(events: &[logit_core::Event]) -> f64 {
+    ["disk_full", "disk_io_error", "frame_too_large"]
+        .iter()
+        .map(|r| metric_sum(events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", r))))
+        .sum()
+}
+
+/// The last `buffer.batches` gauge value in `events`, if the queue reported one.
+fn depth_gauge(events: &[logit_core::Event]) -> Option<f64> {
+    let name = logit_core::interner::intern(SINK_QUEUE_METRICS.depth);
+    events.iter().flat_map(|e| e.metrics.iter()).filter(|m| m.name == name).last().and_then(|m| {
+        match m.kind {
+            logit_core::MetricKind::Gauge(v) => Some(v),
+            _ => None,
+        }
+    })
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+/// A runtime with one blocking thread, which [`poll_then_cancel`] stalls.
+fn side_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+/// Stalls `side`'s blocking thread for `delay`, then polls `push` on `side` at most `polls`
+/// times and drops it. Returns whether it completed.
+fn poll_then_cancel(
+    side: &tokio::runtime::Runtime,
+    push: impl std::future::Future<Output = ()>,
+    polls: u32,
+    delay: Duration,
+) -> bool {
+    side.spawn_blocking(move || std::thread::sleep(delay));
+    let mut push = std::pin::pin!(push);
+    for _ in 0..polls {
+        let ready = side.block_on(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(push.as_mut().poll(cx).is_ready())
+        }));
+        if ready {
+            return true;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    false
+}
+
+/// Records a commit of `id`, checking that first deliveries are FIFO and that a repeat, or a
+/// push that was never counted queued, comes only after a reopen.
+fn on_commit(m: &mut Model, id: usize) -> Result<(), TestCaseError> {
+    prop_assert!(id < m.pushes.len(), "delivered an id never pushed: {id}");
+    match m.committed_in[id] {
+        Some(first) => {
+            prop_assert!(m.epoch > first, "id {id} delivered twice with no reopen in between")
+        }
+        None => {
+            if m.pushes[id] == Pushed::Unconfirmed {
+                prop_assert!(
+                    m.epoch > m.pushed_in[id],
+                    "unconfirmed id {id} delivered without a reopen"
+                );
+            }
+            if let Some(last) = m.last_first_commit {
+                prop_assert!(id > last, "first delivery of {id} after {last}: not FIFO");
+            }
+            m.last_first_commit = Some(id);
+            m.committed_in[id] = Some(m.epoch);
+        }
+    }
+    m.depth -= 1.0;
+    Ok(())
+}
+
+fn run_spool_model(segment_bytes: u64, ops: &[SpoolOp]) -> Result<(), TestCaseError> {
+    let dir = crate::disk_queue::test_support::scratch_dir("spool-model");
+    let mut cfg = config(dir.clone());
+    cfg.segment_bytes = segment_bytes;
+    // Never full: `Block` never parks a push, so every op runs to completion or times out.
+    cfg.max_bytes = 1 << 30;
+    cfg.checkpoint_interval = Duration::ZERO;
+    let result = drive_spool_model(&dir, cfg, ops);
+    std::fs::remove_dir_all(&dir).ok();
+    result
+}
+
+fn drive_spool_model(
+    dir: &Path,
+    cfg: crate::disk_queue::DiskQueueConfig,
+    ops: &[SpoolOp],
+) -> Result<(), TestCaseError> {
+    let registry = Registry::new();
+    let open = |registry: &Registry| {
+        DiskQueue::open(
+            cfg.clone(),
+            registry.telemetry_for("test", "output", "sink"),
+            Diagnostics::new("test"),
+        )
+        .unwrap()
+    };
+    let mut scope = fault::scope(dir);
+    let mut rt = runtime();
+    let mut side = side_runtime();
+    let mut q = open(&registry);
+    registry.drain(0);
+    let mut m = Model {
+        pushes: Vec::new(),
+        committed_in: Vec::new(),
+        pushed_in: Vec::new(),
+        epoch: 0,
+        last_first_commit: None,
+        depth: 0.0,
+    };
+    let mut corrupt = 0.0;
+
+    for op in ops {
+        match op {
+            SpoolOp::Push(pad) | SpoolOp::CancelPush(pad, _, _) => {
+                let id = m.pushes.len();
+                let item = (batch(&marker(id, *pad)), ctx_for_model());
+                let completed = match op {
+                    SpoolOp::Push(_) => {
+                        rt.block_on(async {
+                            tokio::time::timeout(MODEL_TIMEOUT, q.push(item)).await
+                        })
+                        .map_err(|_| TestCaseError::fail("push stopped responding"))?;
+                        true
+                    }
+                    SpoolOp::CancelPush(_, polls, delay) => {
+                        poll_then_cancel(&side, q.push(item), *polls, Duration::from_micros(*delay))
+                    }
+                    _ => unreachable!(),
+                };
+                let events = registry.drain(0);
+                corrupt += corrupt_count(&events);
+                let dropped = drops(&events);
+                prop_assert!(dropped <= 1.0, "one push counted {dropped} drops");
+                let queued = completed && dropped == 0.0;
+                // Exactly one of: counted queued (the depth gauge moves), or counted dropped.
+                match depth_gauge(&events) {
+                    Some(depth) if queued => prop_assert_eq!(depth, m.depth + 1.0),
+                    Some(depth) => {
+                        prop_assert_eq!(depth, m.depth, "a dropped push moved the depth")
+                    }
+                    None => prop_assert!(!queued, "a queued push didn't report its depth"),
+                }
+                if queued {
+                    m.depth += 1.0;
+                }
+                m.pushes.push(if queued { Pushed::Queued } else { Pushed::Unconfirmed });
+                m.committed_in.push(None);
+                m.pushed_in.push(m.epoch);
+            }
+            SpoolOp::Peek => {
+                let wait = if m.must_deliver() { MODEL_TIMEOUT } else { EMPTY_PEEK_WAIT };
+                let peeked = rt.block_on(async { tokio::time::timeout(wait, q.peek()).await });
+                prop_assert!(
+                    peeked.is_ok() || !m.must_deliver(),
+                    "peek stopped responding with a queued record undelivered"
+                );
+                corrupt += corrupt_count(&registry.drain(0));
+            }
+            SpoolOp::Commit => {
+                if let Some((batch, _)) = q.commit() {
+                    on_commit(&mut m, id_of(&marker_of(&batch)))?;
+                }
+                let events = registry.drain(0);
+                corrupt += corrupt_count(&events);
+                if let Some(depth) = depth_gauge(&events) {
+                    prop_assert_eq!(depth, m.depth);
+                }
+            }
+            SpoolOp::Inject(fault) => {
+                let (op, errno) = match fault {
+                    Fault::FlushEnospc => (Op::Flush, errno::ENOSPC),
+                    Fault::SetLenEio => (Op::SetLen, errno::EIO),
+                    Fault::FsyncEio => (Op::SyncFile, errno::EIO),
+                    Fault::UnlinkEio => (Op::Unlink, errno::EIO),
+                };
+                scope.fail_nth(Point::new(sites::SPOOL_SEGMENT, op), 1, errno);
+            }
+            SpoolOp::Crash(at) => {
+                scope.crash_at(CRASH_POINTS[at.index(CRASH_POINTS.len())], 1);
+            }
+            SpoolOp::Reopen(finish) => {
+                if *finish {
+                    rt.block_on(q.finish());
+                }
+                drop(q);
+                // Dropping the runtime waits for every blocking write already handed off, as
+                // those land before a process's exit completes.
+                drop(rt);
+                drop(side);
+                // A fresh scope: a reopen starts with no rule left armed and nothing frozen.
+                drop(scope);
+                scope = fault::scope(dir);
+                rt = runtime();
+                side = side_runtime();
+                q = open(&registry);
+                m.epoch += 1;
+                let events = registry.drain(0);
+                corrupt += corrupt_count(&events);
+                let depth = depth_gauge(&events).expect("open reports the depth");
+                let live = m
+                    .pushes
+                    .iter()
+                    .zip(&m.committed_in)
+                    .filter(|(p, c)| **p == Pushed::Queued && c.is_none())
+                    .count() as f64;
+                prop_assert!(depth >= live, "reopened with {depth} queued, {live} undelivered");
+                m.depth = depth;
+            }
+        }
+    }
+
+    // Drain: every queued push must come out, and nothing may stall.
+    scope.revive();
+    q.close();
+    loop {
+        let peeked = rt
+            .block_on(async { tokio::time::timeout(MODEL_TIMEOUT, q.peek()).await })
+            .map_err(|_| TestCaseError::fail("peek stopped responding while draining"))?;
+        if peeked.is_none() {
+            break;
+        }
+        let (batch, _) = q.commit().expect("commit what was just peeked");
+        on_commit(&mut m, id_of(&marker_of(&batch)))?;
+    }
+    corrupt += corrupt_count(&registry.drain(0));
+    for (id, pushed) in m.pushes.iter().enumerate() {
+        if *pushed == Pushed::Queued {
+            prop_assert!(m.committed_in[id].is_some(), "queued id {id} was never delivered");
+        }
+    }
+    prop_assert_eq!(m.depth, 0.0, "the drained queue's depth");
+    prop_assert_eq!(corrupt, 0.0, "no corruption was injected, so none may be found");
+    drop(scope);
+    Ok(())
+}
+
+fn ctx_for_model() -> BatchContext {
+    BatchContext { trace: TraceContext::new_root(), provenance: Provenance::default() }
+}
+
+fn corrupt_count(events: &[logit_core::Event]) -> f64 {
+    metric_sum(events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_corrupt")))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Every push is delivered, counted dropped, or still queued; duplicates, and a push that
+    /// wasn't counted queued, appear only after a reopen; first deliveries are FIFO; no peek
+    /// stalls; and the depth gauge matches the model.
+    #[test]
+    fn spool_model_every_push_is_delivered_dropped_or_queued(
+        segment_bytes in prop_oneof![Just(1u64), Just(400), Just(1 << 20)],
+        ops in prop::collection::vec(spool_op(), 1..=40),
+    ) {
+        run_spool_model(segment_bytes, &ops)?;
+    }
 }
