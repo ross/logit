@@ -1,15 +1,16 @@
 # Prometheus remote-write interop fixtures
 
-Real HTTP request bodies that a real Prometheus `POST`ed, captured verbatim by
+Real HTTP request bodies that a real Prometheus and a real vmagent `POST`ed, captured verbatim by
 `tools/record-fixtures/raw_capture.py --proto http`, with **no parsing, no decompression, and no
-re-encoding.** Each `.bin` is exactly the Snappy-compressed protobuf Prometheus put on the wire.
+re-encoding.** Each `.bin` is exactly the compressed protobuf the sender put on the wire: Snappy,
+or zstd for vmagent's default wire.
 `logit`'s own encoder never touches these, which is the point:
 `crates/logit-proto/src/prometheus/remote_write.rs` was written from the two remote-write specs and
 the vendored `prompb`, and these fixtures check that reading against the sender every deployment
 runs.
 
-To regenerate, run `script/record-fixtures prometheus`. See `../README.md` and the header comment
-in `script/record-fixtures`.
+To regenerate, run `script/record-fixtures prometheus vmagent`. See `../README.md` and the header
+comment in `script/record-fixtures`.
 
 ## Fixtures
 
@@ -22,7 +23,8 @@ captured through an HTTP sink that **answers** `204`, not through the read-only 
 the `*.raw` corpora use: a real client won't send a second request to a listener that never replied
 to the first.
 
-All seven requests came from one `script/record-fixtures prometheus` run, in three captures.
+The seven `prometheus-*` requests came from one `script/record-fixtures prometheus` run, in three
+captures.
 Each capture renders `tools/record-fixtures/prometheus.yml` differently. The renderings differ only
 in:
 
@@ -41,19 +43,34 @@ in:
 | `prometheus-v2-000.bin` (771 bytes) | Same | Same config rendered with `protobuf_message: io.prometheus.write.v2.Request` | 2026-09-18 | The same 26 series as remote-write **2.0**: an interned `symbols` table with every label name and value referenced by index, one `Metadata` per series, and `Sample.start_timestamp` present on the wire. For what 3.14.0 actually puts in that `Metadata`, see "What isn't covered here (yet)" |
 | `prometheus-v2-001.bin` (786 bytes) | Same | Same | 2026-09-18 | The next scrape, as above |
 
+The four `vmagent-*` requests came from one `script/record-fixtures vmagent` run, in two captures
+of two requests each. vmagent scrapes `tools/record-fixtures/prometheus-metadata-target.prom`
+(the metadata target above, so the same four families) through `tools/record-fixtures/vmagent.yml`.
+The two captures differ only in `-remoteWrite.forcePromProto`. vmagent sends a scrape's samples and
+its `MetricMetadata` as **separate requests in no fixed order**, so each capture holds one of each,
+and a consuming test tells them apart by content, never by file name.
+
+| File | Producer | Invocation | Captured | Construct exercised |
+|---|---|---|---|---|
+| `vmagent-zstd-000.bin` (663 bytes) | vmagent v1.152.0 (`victoriametrics/vmagent:v1.152.0`, `vmagent-20260911-130401-tags-v1.152.0-0-g540b91da03`) | `-promscrape.config=vmagent.yml -remoteWrite.url=http://capture:9091/api/v1/write`, nothing else: vmagent's default wire | 2026-09-24 | The **VictoriaMetrics remote write protocol**: a 1.0 `WriteRequest` with `Content-Encoding: zstd`, `X-VictoriaMetrics-Remote-Write-Version: 1`, and no `X-Prometheus-Remote-Write-Version`. `raw_capture.py` answers `204`, so vmagent never sees the `415` or `400` that would downgrade it to Snappy. One scrape's 17 series: the target's four families plus vmagent's own `up` and six `scrape_*` series. The zstd frame header sets `Single_Segment_Flag` and declares its content size (2489 bytes). Labels are **not sorted**: vmagent appends `instance`, `job`, and `monitor` after the exposition's own labels |
+| `vmagent-zstd-001.bin` (312 bytes) | Same | Same | 2026-09-24 | A metadata-only 1.0 request on the zstd wire: four `MetricMetadata` entries, one per target family, and no series |
+| `vmagent-snappy-000.bin` (379 bytes) | Same | The same, plus `-remoteWrite.forcePromProto` | 2026-09-24 | The metadata-only request on plain remote-write 1.0: `Content-Encoding: snappy`, `X-Prometheus-Remote-Write-Version: 0.1.0`. The same four entries as `vmagent-zstd-001` |
+| `vmagent-snappy-001.bin` (843 bytes) | Same | Same | 2026-09-24 | The same 17-series scrape as `vmagent-zstd-000`, Snappy-compressed. Decompressed, the two sample bodies are the same length |
+
 The Prometheus version is what `prom/prometheus:v3.14.0 --version` reported inside the recording
-container. `record_prometheus` prints it on every run, so a re-record's drift from this table shows
+container, and the vmagent version what `victoriametrics/vmagent:v1.152.0 --version` reported. `record_prometheus` prints it on every run, so a re-record's drift from this table shows
 in the script's own output.
 
-The seven bodies total ~4.4 KB (the sidecars add ~1.5 KB), inside `../README.md`'s size
-discipline: low single-digit KB per fixture and well under 100 KB for the whole directory. Two
+The seven Prometheus bodies total ~4.4 KB (the sidecars add ~1.5 KB), and the four vmagent bodies
+~2.2 KB (the sidecars ~0.9 KB), inside `../README.md`'s size discipline: low single-digit KB per fixture and well under 100 KB for the whole directory. Two
 choices keep it there:
 
 - **The four families `write_relabel_configs` keeps on the sample side.** Between them they cover
   all four classic metric types in 26 series. That's one `max_samples_per_send` request's worth, so
   a capture is one whole scrape rather than a fragment.
 - **The small static target the metadata side scrapes.** It keeps a *complete* metadata request
-  under 400 bytes, where a self-scrape's would be ~16 KB.
+  under 400 bytes, where a self-scrape's would be ~16 KB. vmagent scrapes the same target, so its
+  sample request is one scrape of four families.
 
 ## Tests that consume these fixtures
 
@@ -70,6 +87,12 @@ that:
 - Seeding a sample request with the declarations the *metadata* captures reported folds those
   eight families back into the four Prometheus meant, each with its own type and with
   `quantile`/`le` moved into the point. This assertion puts both halves together.
+- vmagent's Snappy sample request decodes every one of its 17 series, with its unsorted labels
+  sorted, and its own metadata request types the target's four families while `up` and the
+  `scrape_*` series stay untyped.
+- The zstd captures carry `content-encoding: zstd`, vmagent's version header and no Prometheus
+  one, and a zstd frame. The test has no zstd decoder, so it stops there;
+  `docs/plans/victoriametrics-interop.md`'s W2 adds one and makes both decode.
 
 **This corpus found a codec bug, which is what it was for.** Recorded against the assembler as it
 stood, the first of those assertions read `["unknown_suffix"]` for every sample capture.
@@ -86,6 +109,13 @@ why the round-trip and fixed-point suites looked sound.
 The fix is in the assembler ("only a declared base claims a suffix"). What the cache buys is now
 what it always should have been: **typing, never samples**. A metadata-less request is flatter than
 the producer's shape, not lossier.
+
+**The vmagent corpus found a second one.** vmagent doesn't sort a series' labels, which both
+remote-write specs require of a sender, and the decoder skipped any series whose set wasn't
+strictly ascending as `invalid_labels`. Against vmagent that is every series with a label of its
+own: `script/victoria-interop`'s vmagent leg received vmagent's `up` and `scrape_*` series and
+none of the target's. Prometheus's and VictoriaMetrics's receivers both sort on arrival, and the
+decoder now does too, rejecting only a repeated name.
 
 ## What isn't covered here (yet)
 
