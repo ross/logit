@@ -24,11 +24,11 @@
 //! and repeated keys, every type, resources) and assert both properties on every route.
 
 use bytes::Bytes;
-use logit_core::{Event, EventBatch, MetricKind};
+use logit_core::{Event, EventBatch, MetricKind, Value};
 use logit_proto::datadog::generated::agentpayload::{
     metric_payload::{MetricPoint, MetricSeries, Resource as PbResource},
     sketch_payload::{sketch::Dogsketch, Sketch},
-    Metadata, MetricPayload, Origin, SketchPayload,
+    CommonMetadata, Metadata, MetricPayload, Origin, SketchPayload,
 };
 use logit_proto::datadog::{DatadogDecoder, DatadogEncoder};
 use proptest::prelude::*;
@@ -275,6 +275,152 @@ fn dogsketch_with_negative_zero_positive_and_large_counts() {
     let dog = &relayed.sketches[0].dogsketches[0];
     assert_eq!(dog.k, payload.sketches[0].dogsketches[0].k);
     assert_eq!(dog.n, payload.sketches[0].dogsketches[0].n);
+}
+
+#[test]
+fn a_datadog_type_tag_never_rewrites_a_gauge_or_count() {
+    // The wire type always wins over a tag spelled like its carrier: a GAUGE or COUNT tagged
+    // `datadog.type:rate` (or `:unspecified`) relays as itself, and the tag is gone.
+    for tag in ["datadog.type:rate", "datadog.type:unspecified"] {
+        for (proto_type, v1_type) in [(3, "gauge"), (1, "count")] {
+            let tags = vec![tag.to_string(), "env:prod".to_string()];
+            let protobuf = MetricPayload {
+                series: vec![MetricSeries {
+                    metric: "m".into(),
+                    tags: tags.clone(),
+                    points: vec![MetricPoint { value: 2.0, timestamp: 1_700_000_000 }],
+                    r#type: proto_type,
+                    ..Default::default()
+                }],
+            }
+            .encode_to_vec();
+            let v1 = json_bytes(json!({"series":[
+                {"metric":"m","points":[[1700000000,2.0]],"tags":tags,"type":v1_type}
+            ]}));
+            for (route, body) in [(Route::V2Protobuf, protobuf), (Route::V1, v1)] {
+                let events = assert_fixed_point(route, &body);
+                assert_eq!(events[0].attributes.get("datadog.type"), None, "{route:?} {tag}");
+                let out = encode(route, &decode(route, &body)).unwrap();
+                let (wire_type, wire_tags) = match route {
+                    Route::V2Protobuf => {
+                        let s = MetricPayload::decode(out).unwrap().series.remove(0);
+                        (s.r#type.to_string(), s.tags)
+                    }
+                    _ => {
+                        let v: JsonValue = serde_json::from_slice(&out).unwrap();
+                        let s = &v["series"][0];
+                        let tags = serde_json::from_value(s["tags"].clone()).unwrap();
+                        (s["type"].as_str().unwrap().to_string(), tags)
+                    }
+                };
+                let expected = match route {
+                    Route::V2Protobuf => proto_type.to_string(),
+                    _ => v1_type.to_string(),
+                };
+                assert_eq!(wire_type, expected, "{route:?} {tag}");
+                assert_eq!(wire_tags, vec!["env:prod".to_string()], "{route:?} {tag}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sketch_count_at_i64_max_relays_unchanged() {
+    // `DdSketch::count()` of a decoded `cnt = i64::MAX` is 2^63, one past `i64::MAX`; the encoder
+    // saturates it instead of wrapping to a negative `cnt` the next hop would reject.
+    let body = SketchPayload {
+        sketches: vec![Sketch {
+            metric: "huge".into(),
+            dogsketches: vec![Dogsketch {
+                ts: 1_700_000_000,
+                cnt: i64::MAX,
+                min: 1.0,
+                max: 1.0,
+                avg: 0.0,
+                sum: 1.0,
+                k: vec![1],
+                n: vec![1],
+            }],
+            ..Default::default()
+        }],
+        metadata: None,
+    }
+    .encode_to_vec();
+    assert_eq!(assert_fixed_point(Route::Sketches, &body).len(), 1);
+    let relayed =
+        SketchPayload::decode(encode(Route::Sketches, &decode(Route::Sketches, &body)).unwrap())
+            .unwrap();
+    assert_eq!(relayed.sketches[0].dogsketches[0].cnt, i64::MAX);
+}
+
+#[test]
+fn sketch_payload_common_metadata_relays_on_the_resource() {
+    let sketch = Sketch {
+        metric: "lat".into(),
+        host: "h".into(),
+        tags: vec!["env:prod".into()],
+        dogsketches: vec![Dogsketch {
+            ts: 1_700_000_000,
+            cnt: 2,
+            min: 1.0,
+            max: 2.0,
+            avg: 0.0,
+            sum: 3.0,
+            k: vec![1, 2],
+            n: vec![1, 1],
+        }],
+        ..Default::default()
+    };
+    let body = SketchPayload {
+        sketches: vec![sketch.clone()],
+        metadata: Some(CommonMetadata {
+            agent_version: "7.50.3".into(),
+            timezone: "UTC".into(),
+            current_epoch: 1_700_000_000.25,
+            internal_ip: "10.0.0.7".into(),
+            public_ip: "203.0.113.9".into(),
+            api_key: "secret".into(),
+        }),
+    }
+    .encode_to_vec();
+
+    let d1 = decode(Route::Sketches, &body);
+    let resource = &d1.resource.attributes;
+    assert_eq!(resource.get("datadog.agent.version"), Some(&Value::str("7.50.3")));
+    assert_eq!(resource.get("datadog.agent.timezone"), Some(&Value::str("UTC")));
+    assert_eq!(resource.get("datadog.agent.epoch"), Some(&Value::F64(1_700_000_000.25)));
+    assert_eq!(resource.get("datadog.agent.internal_ip"), Some(&Value::str("10.0.0.7")));
+    assert_eq!(resource.get("datadog.agent.public_ip"), Some(&Value::str("203.0.113.9")));
+    // The API key is a credential: never stored.
+    assert_eq!(resource.len(), 5);
+
+    // Whole-batch fixed point, resource included, and on bytes.
+    let b1 = encode(Route::Sketches, &d1).unwrap();
+    let d2 = decode(Route::Sketches, &b1);
+    assert_eq!(d1, d2);
+    assert_eq!(encode(Route::Sketches, &d2).unwrap(), b1);
+
+    let relayed = SketchPayload::decode(b1).unwrap();
+    assert_eq!(
+        relayed.metadata,
+        Some(CommonMetadata {
+            agent_version: "7.50.3".into(),
+            timezone: "UTC".into(),
+            current_epoch: 1_700_000_000.25,
+            internal_ip: "10.0.0.7".into(),
+            public_ip: "203.0.113.9".into(),
+            api_key: String::new(),
+        })
+    );
+    // The resource carriers are consumed, never rendered as tags.
+    assert_eq!(relayed.sketches[0].tags, sketch.tags);
+
+    // A payload without `CommonMetadata` still relays without one.
+    let bare = SketchPayload { sketches: vec![sketch], metadata: None }.encode_to_vec();
+    let d = decode(Route::Sketches, &bare);
+    assert!(d.resource.attributes.is_empty());
+    let out = SketchPayload::decode(encode(Route::Sketches, &d).unwrap()).unwrap();
+    assert_eq!(out.metadata, None);
 }
 
 // -- generated payloads --------------------------------------------------------------------------

@@ -8,16 +8,19 @@
 //! so every decoded sketch is [`Mapping::agent`], and every encoded one has to be.
 
 use super::generated::agentpayload::sketch_payload::{sketch::Dogsketch, Sketch};
-use super::generated::agentpayload::SketchPayload;
-use super::series::{OriginCodes, Route, WireSeries};
+use super::generated::agentpayload::{CommonMetadata, SketchPayload};
+use super::series::{first_metric, OriginCodes, Route, WireSeries};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
-use super::{DatadogDecoder, DatadogEncoder};
+use super::{
+    DatadogDecoder, DatadogEncoder, RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP,
+    RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
+};
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
 use logit_core::{
     Bin, DdSketch, Event, EventBatch, Mapping, MappingKind, MetricKind, MetricRecord, Resource,
-    SketchStats,
+    SketchStats, Value,
 };
 use prost::Message;
 use std::sync::Arc;
@@ -77,8 +80,65 @@ impl DatadogDecoder {
                 out.push(Event::metric(timestamp, attrs.clone(), record));
             }
         }
-        Ok(EventBatch { resource: Arc::new(Resource::default()), scope: None, events: out })
+        let resource = common_metadata_resource(payload.metadata.as_ref());
+        Ok(EventBatch { resource: Arc::new(resource), scope: None, events: out })
     }
+}
+
+/// A payload's `CommonMetadata` as `datadog.agent.*` resource attributes, each only when
+/// non-empty (or, for the epoch, nonzero). `api_key` is a credential: dropped, never stored.
+fn common_metadata_resource(metadata: Option<&CommonMetadata>) -> Resource {
+    let mut resource = Resource::default();
+    let Some(m) = metadata else { return resource };
+    for (key, value) in [
+        (RESOURCE_ATTR_AGENT_VERSION, &m.agent_version),
+        (RESOURCE_ATTR_AGENT_TIMEZONE, &m.timezone),
+        (RESOURCE_ATTR_AGENT_INTERNAL_IP, &m.internal_ip),
+        (RESOURCE_ATTR_AGENT_PUBLIC_IP, &m.public_ip),
+    ] {
+        if !value.is_empty() {
+            resource.attributes.insert(key, Value::str(value));
+        }
+    }
+    if m.current_epoch != 0.0 {
+        resource.attributes.insert(RESOURCE_ATTR_AGENT_EPOCH, Value::F64(m.current_epoch));
+    }
+    resource
+}
+
+/// The batch resource's `datadog.agent.*` attributes back as a `CommonMetadata`, `api_key` empty;
+/// `None` when the resource carries none of them. A carrier of the wrong `Value` type is
+/// dropped and counted `unrepresentable` by the per-event carrier walk.
+fn common_metadata(resource: &Resource) -> Option<CommonMetadata> {
+    let attrs = &resource.attributes;
+    let text = |key: &str| match attrs.get(key) {
+        Some(v @ Value::Str(_)) => v.as_str().map(str::to_string),
+        _ => None,
+    };
+    let epoch = match attrs.get(RESOURCE_ATTR_AGENT_EPOCH) {
+        Some(Value::F64(f)) => Some(*f),
+        _ => None,
+    };
+    let version = text(RESOURCE_ATTR_AGENT_VERSION);
+    let timezone = text(RESOURCE_ATTR_AGENT_TIMEZONE);
+    let internal_ip = text(RESOURCE_ATTR_AGENT_INTERNAL_IP);
+    let public_ip = text(RESOURCE_ATTR_AGENT_PUBLIC_IP);
+    if version.is_none()
+        && timezone.is_none()
+        && internal_ip.is_none()
+        && public_ip.is_none()
+        && epoch.is_none()
+    {
+        return None;
+    }
+    Some(CommonMetadata {
+        agent_version: version.unwrap_or_default(),
+        timezone: timezone.unwrap_or_default(),
+        current_epoch: epoch.unwrap_or_default(),
+        internal_ip: internal_ip.unwrap_or_default(),
+        public_ip: public_ip.unwrap_or_default(),
+        api_key: String::new(),
+    })
 }
 
 /// `Ok(None)` for an empty sketch (no bins, zero count), which the encoder never sends either.
@@ -121,7 +181,7 @@ impl DatadogEncoder {
         let mut sketches = Vec::new();
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics {
+            for record in &event.metrics[first_metric(&batch.resource, event)..] {
                 let MetricKind::Distribution(sketch) = &record.kind else { continue };
                 if record.is_no_recorded_value() {
                     self.out_skipped(("reason", "no_recorded_value"));
@@ -143,8 +203,10 @@ impl DatadogEncoder {
                 });
             }
         }
-        (!sketches.is_empty())
-            .then(|| Bytes::from(SketchPayload { sketches, metadata: None }.encode_to_vec()))
+        (!sketches.is_empty()).then(|| {
+            let metadata = common_metadata(&batch.resource);
+            Bytes::from(SketchPayload { sketches, metadata }.encode_to_vec())
+        })
     }
 
     /// One sketch as a `Dogsketch`, re-binned first when it isn't under the Agent mapping; `None`
@@ -184,7 +246,9 @@ impl DatadogEncoder {
         if fractional {
             self.out_degraded("fractional_count");
         }
-        let cnt = sketch.count() as i64;
+        // `count()` is a `usize` that can reach 2^63 and beyond from a decoded `cnt` near
+        // `i64::MAX`; saturate rather than wrap to a negative `cnt` the next hop rejects.
+        let cnt = i64::try_from(sketch.count()).unwrap_or(i64::MAX);
         if k.is_empty() && cnt == 0 {
             return None;
         }

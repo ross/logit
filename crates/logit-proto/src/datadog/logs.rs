@@ -6,7 +6,7 @@
 //! Agent's key order.
 
 use super::time::{millis_to_nanos, nanos_to_millis, or_received};
-use super::{DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE};
+use super::{is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_HOST_NAME, ATTR_SOURCE};
 use crate::CodecError;
 use base64::Engine;
 use bytes::Bytes;
@@ -181,14 +181,18 @@ fn status_severity(status: &str) -> Option<Severity> {
 
 impl DatadogEncoder {
     /// Encodes every event carrying a `log` as one `/api/v2/logs` JSON array; `None` when none
-    /// does. An event without a `log` is skipped silently: a metrics-only batch reaching the logs
-    /// route is ordinary fan-out, not a loss.
+    /// does. An event without a `log`, or a Datadog event (a `log` carrying `statsd.event.title`,
+    /// which [`DatadogEncoder::encode_events`] sends), is skipped silently: that is ordinary
+    /// fan-out, not a loss.
     pub fn encode_logs(&self, batch: &EventBatch) -> Option<Bytes> {
         let mut out = Vec::new();
         out.push(b'[');
         let mut any = false;
         for event in &batch.events {
             let Some(log) = &event.log else { continue };
+            if is_datadog_event(&batch.resource, event) {
+                continue;
+            }
             if any {
                 out.push(b',');
             }

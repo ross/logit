@@ -7,12 +7,18 @@
 //! decoded `Event::timestamp` is always a whole second too, including a `received_at` stand-in.
 
 use super::generated::agentpayload::{metric_payload, Metadata, MetricPayload, Origin};
+use super::service_checks::{
+    ATTR_SERVICE_CHECK_HOST, ATTR_SERVICE_CHECK_MESSAGE, ATTR_SERVICE_CHECK_NAME,
+    ATTR_SERVICE_CHECK_STATUS,
+};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
-    DatadogDecoder, DatadogEncoder, ATTR_DEVICE, ATTR_HOST_NAME, ATTR_INTERVAL,
+    is_service_check, DatadogDecoder, DatadogEncoder, ATTR_DEVICE, ATTR_HOST_NAME, ATTR_INTERVAL,
     ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE,
-    ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
+    ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, RESOURCE_ATTR_AGENT_EPOCH,
+    RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE,
+    RESOURCE_ATTR_AGENT_VERSION,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -184,8 +190,15 @@ impl<'a> WireSeries<'a> {
         if self.interval != 0 {
             attrs.insert(ATTR_INTERVAL, Value::I64(self.interval));
         }
-        if let Some(t) = self.wire_type.and_then(WireType::type_attr) {
-            attrs.insert(ATTR_TYPE, Value::str(t));
+        // A route that carries a type always decides `datadog.type`, so a tag spelled
+        // `datadog.type:rate` can't turn a GAUGE or COUNT into a RATE on re-encode.
+        if let Some(wire_type) = self.wire_type {
+            match wire_type.type_attr() {
+                Some(t) => attrs.insert(ATTR_TYPE, Value::str(t)),
+                None => {
+                    attrs.remove(ATTR_TYPE);
+                }
+            }
         }
         for (key, code) in [
             (ATTR_ORIGIN_PRODUCT, self.origin.product),
@@ -605,7 +618,7 @@ fn distribution_point(point: &JsonValue) -> Option<(Option<i64>, Vec<f64>)> {
 // -- encode ---------------------------------------------------------------------------------------
 
 /// Every attribute a metrics route reads into a wire field of its own; never rendered as a tag.
-static CONSUMED: LazyLock<[Symbol; 10]> = LazyLock::new(|| {
+static CONSUMED: LazyLock<[Symbol; 15]> = LazyLock::new(|| {
     [
         intern(ATTR_HOST_NAME),
         intern(ATTR_TYPE),
@@ -617,7 +630,30 @@ static CONSUMED: LazyLock<[Symbol; 10]> = LazyLock::new(|| {
         intern(ATTR_ORIGIN_CATEGORY),
         intern(ATTR_ORIGIN_SERVICE),
         intern(ATTR_ORIGIN_METRIC_TYPE),
+        intern(RESOURCE_ATTR_AGENT_VERSION),
+        intern(RESOURCE_ATTR_AGENT_TIMEZONE),
+        intern(RESOURCE_ATTR_AGENT_EPOCH),
+        intern(RESOURCE_ATTR_AGENT_INTERNAL_IP),
+        intern(RESOURCE_ATTR_AGENT_PUBLIC_IP),
     ]
+});
+
+/// [`CONSUMED`] plus a service check's own carriers: on a check's later records (its first is
+/// the service-checks route's), those belong to the check and are never rendered as tags, as
+/// `statsd_out` never renders a `statsd.*` carrier. Rendered, they'd make the relayed series
+/// decode as a service check itself.
+static CONSUMED_WITH_CHECK: LazyLock<Vec<Symbol>> = LazyLock::new(|| {
+    let mut keys = CONSUMED.to_vec();
+    keys.extend(
+        [
+            ATTR_SERVICE_CHECK_NAME,
+            ATTR_SERVICE_CHECK_STATUS,
+            ATTR_SERVICE_CHECK_MESSAGE,
+            ATTR_SERVICE_CHECK_HOST,
+        ]
+        .map(intern),
+    );
+    keys
 });
 
 /// The carriers of one event (resource merged with event attributes), read back into wire fields,
@@ -633,6 +669,9 @@ pub(super) struct Carriers {
     /// `datadog.type`'s value, when it is one this codec knows.
     pub wire_type: Option<WireType>,
     pub origin: OriginCodes,
+    /// How many `datadog.agent.*` carriers (a sketch payload's `CommonMetadata`) are present;
+    /// only the sketches route writes them, from the batch resource.
+    pub agent_metadata: usize,
 }
 
 impl Carriers {
@@ -641,17 +680,19 @@ impl Carriers {
         let origin = |set: bool| usize::from(set);
         match route {
             Route::V1 => {
-                usize::from(!self.resources.is_empty())
+                self.agent_metadata
+                    + usize::from(!self.resources.is_empty())
                     + origin(self.origin.product != 0)
                     + origin(self.origin.category != 0)
                     + origin(self.origin.service != 0)
                     + origin(self.origin.metric_type != 0)
             }
             // v2 carries `device` as a resource; the JSON origin has no `category`.
-            Route::V2Json => origin(self.origin.category != 0),
-            Route::V2Protobuf => origin(self.origin.metric_type != 0),
+            Route::V2Json => self.agent_metadata + origin(self.origin.category != 0),
+            Route::V2Protobuf => self.agent_metadata + origin(self.origin.metric_type != 0),
             Route::Distribution => {
-                usize::from(self.device.is_some())
+                self.agent_metadata
+                    + usize::from(self.device.is_some())
                     + usize::from(!self.resources.is_empty())
                     + usize::from(self.source_type_name.is_some())
                     + usize::from(self.interval != 0)
@@ -754,8 +795,10 @@ impl DatadogEncoder {
     /// whatever `route` can't write.
     pub(super) fn carriers(&self, resource: &Resource, event: &Event, route: Route) -> Carriers {
         let consumed = &*CONSUMED;
+        let skip: &[Symbol] =
+            if is_service_check(resource, event) { &CONSUMED_WITH_CHECK } else { consumed };
         let mut c = Carriers::default();
-        let dropped = render_tags(merged(resource, event), consumed, &mut c.tags);
+        let dropped = render_tags(merged(resource, event), skip, &mut c.tags);
         let mut unrepresentable = dropped.unrepresentable;
         for (key, value) in merged(resource, event) {
             if !consumed.contains(&key) {
@@ -798,6 +841,19 @@ impl DatadogEncoder {
                 ATTR_ORIGIN_SERVICE => unsigned(value).map(|n| c.origin.service = n).is_some(),
                 ATTR_ORIGIN_METRIC_TYPE => {
                     unsigned(value).map(|n| c.origin.metric_type = n).is_some()
+                }
+                RESOURCE_ATTR_AGENT_EPOCH => {
+                    let ok = matches!(value, Value::F64(_));
+                    c.agent_metadata += usize::from(ok);
+                    ok
+                }
+                RESOURCE_ATTR_AGENT_VERSION
+                | RESOURCE_ATTR_AGENT_TIMEZONE
+                | RESOURCE_ATTR_AGENT_INTERNAL_IP
+                | RESOURCE_ATTR_AGENT_PUBLIC_IP => {
+                    let ok = matches!(value, Value::Str(_));
+                    c.agent_metadata += usize::from(ok);
+                    ok
                 }
                 _ => true,
             };
@@ -861,7 +917,7 @@ impl DatadogEncoder {
     ) {
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics {
+            for record in &event.metrics[first_metric(&batch.resource, event)..] {
                 let c = match &carriers {
                     Some(c) => c,
                     None => {
@@ -988,7 +1044,7 @@ impl DatadogEncoder {
         let mut series = Vec::new();
         for event in &batch.events {
             let mut carriers = None;
-            for record in &event.metrics {
+            for record in &event.metrics[first_metric(&batch.resource, event)..] {
                 let MetricKind::Samples(samples) = &record.kind else { continue };
                 if record.is_no_recorded_value() {
                     self.out_skipped(("reason", "no_recorded_value"));
@@ -1025,6 +1081,13 @@ impl DatadogEncoder {
         }
         json_body(series)
     }
+}
+
+/// The index of an event's first record a metrics route may send: `1` for a service check, whose
+/// record 0 is [`DatadogEncoder::encode_service_checks`]'s alone (skipped silently, as fan-out),
+/// else `0`.
+pub(super) fn first_metric(resource: &Resource, event: &Event) -> usize {
+    usize::from(is_service_check(resource, event))
 }
 
 fn json_body(series: Vec<JsonValue>) -> Option<Bytes> {

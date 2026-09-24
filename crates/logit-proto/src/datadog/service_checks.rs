@@ -10,7 +10,7 @@ use super::events::{non_empty_str, seconds, ATTR_STATSD_TIMESTAMP};
 use super::logs::{new_batch, parse_json, value_text, write_i64, write_str, JsonObject};
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received};
-use super::{DatadogDecoder, DatadogEncoder};
+use super::{is_service_check, DatadogDecoder, DatadogEncoder};
 use crate::CodecError;
 use bytes::Bytes;
 use logit_core::attrs::merged;
@@ -130,6 +130,9 @@ impl DatadogEncoder {
         out.push(b'[');
         let mut any = false;
         for event in &batch.events {
+            if !is_service_check(&batch.resource, event) {
+                continue;
+            }
             let Some(MetricKind::Gauge(gauge)) = event.metrics.first().map(|m| &m.kind) else {
                 continue;
             };

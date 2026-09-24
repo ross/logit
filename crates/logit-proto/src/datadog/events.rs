@@ -15,8 +15,8 @@ use super::logs::{
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, or_received, seconds_f64_to_nanos, seconds_to_nanos};
 use super::{
-    DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME, ATTR_EVENT_RELATED_EVENT_ID,
-    ATTR_EVENT_TYPE, RESOURCE_ATTR_AGENT_HOSTNAME,
+    is_datadog_event, DatadogDecoder, DatadogEncoder, ATTR_EVENT_DEVICE_NAME,
+    ATTR_EVENT_RELATED_EVENT_ID, ATTR_EVENT_TYPE, RESOURCE_ATTR_AGENT_HOSTNAME,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -249,13 +249,11 @@ pub(super) fn seconds(value: &Json) -> Option<i64> {
 impl DatadogEncoder {
     /// Encodes every event carrying `statsd.event.title` in `format`: [`EventFormat::AgentEnvelope`]
     /// gives at most one body for the whole batch, [`EventFormat::PublicV1`] one body per event.
-    /// An event without a title (a plain log) is skipped silently: it belongs to the logs route.
+    /// An event without a title (a plain log) or without a `log` is skipped silently: it belongs
+    /// to another route.
     pub fn encode_events(&self, batch: &EventBatch, format: EventFormat) -> Vec<Bytes> {
         let keys = &*KEYS;
-        let titled = batch.events.iter().filter(|e| {
-            e.attributes.get_sym(keys.title).is_some()
-                || batch.resource.attributes.get_sym(keys.title).is_some()
-        });
+        let titled = batch.events.iter().filter(|e| is_datadog_event(&batch.resource, e));
         match format {
             EventFormat::PublicV1 => titled
                 .map(|event| {

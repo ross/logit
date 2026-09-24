@@ -27,8 +27,9 @@
 //! Five routes, each a [`DatadogDecoder`] method taking one decompressed body and `received_at`
 //! (`decode_series_v2_protobuf`, `decode_series_v2_json`, `decode_series_v1`,
 //! `decode_distribution_points`, `decode_sketches`) and a matching `DatadogEncoder::encode_*`
-//! returning `None` when nothing in the batch belongs on that route. The decoded batch `Resource`
-//! is empty and its scope `None`: every Datadog field is an event attribute.
+//! returning `None` when nothing in the batch belongs on that route. The decoded batch scope is
+//! `None`, and its `Resource` is empty except a sketch payload's `CommonMetadata`: every other
+//! Datadog field is an event attribute.
 //!
 //! ## Decode: series and distribution points → events
 //!
@@ -60,7 +61,9 @@
 //! | a distribution point with no values | skipped | `skipped{reason="empty_distribution"}` |
 //! | a body that isn't JSON (or protobuf), or has no top-level `series` array | `CodecError::Malformed` | -- |
 //!
-//! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names.
+//! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. On a route with
+//! a `type` (every series route, not distribution points), that includes `datadog.type`: a GAUGE
+//! or COUNT series drops a `datadog.type:rate` tag rather than turning into a RATE on re-encode.
 //!
 //! ## Decode: sketches → events
 //!
@@ -73,6 +76,9 @@
 //! | no bins and `cnt == 0` | skipped | `skipped{reason="empty_sketch"}` |
 //! | `k`/`n` lengths differ, a key outside ±32767, `cnt <= 0` with populated bins, a non-finite `min`/`max`/`sum`, or no `metric` | skipped | `skipped{reason="bad_sketch"}` + diag `bad_sketch` |
 //! | legacy `distributions` entries | ignored | `skipped{reason="legacy_distribution"}`, one per entry |
+//! | payload `metadata` (`CommonMetadata`) `agent_version`, `timezone`, `internal_ip`, `public_ip` | batch resource [`RESOURCE_ATTR_AGENT_VERSION`], [`RESOURCE_ATTR_AGENT_TIMEZONE`], [`RESOURCE_ATTR_AGENT_INTERNAL_IP`], [`RESOURCE_ATTR_AGENT_PUBLIC_IP`] (`Str`), each when non-empty | -- |
+//! | payload `metadata.current_epoch` | batch resource [`RESOURCE_ATTR_AGENT_EPOCH`] (`F64`) when nonzero | -- |
+//! | payload `metadata.api_key` | dropped; a credential, never stored | -- |
 //!
 //! ## Encode: events → series, distribution points, sketches
 //!
@@ -94,6 +100,7 @@
 //! | `Sum{Cumulative}` / `Sum{Delta, !monotonic}` | skipped by the series encoders | `skipped{metric_kind="cumulative_sum"\|"non_monotonic_delta_sum"}` |
 //! | `GaugeDelta`, `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `skipped{metric_kind="gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
+//! | record 0 of a service check (`statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `statsd.service_check.*` carriers as tags | -- |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `skipped{reason="no_recorded_value"}` |
 //! | a non-finite value or sample | skipped (JSON has no `NaN`) | `skipped{reason="non_finite_value"}` |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
@@ -101,7 +108,8 @@
 //! | [`ATTR_DEVICE`] | v1: `device`; v2: a `{type: "device"}` resource after the host | -- |
 //! | [`ATTR_RESOURCES`] | v2 resources after host and device, in order | -- |
 //! | the `datadog.origin.*` codes | protobuf and sketch `metadata.origin` (no `metric_type`); JSON v2 `metadata.origin` (no `category`) | -- |
-//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`) | dropped | `logit.output.tags.dropped{reason="no_wire_form"}`, one per carrier |
+//! | a carrier the route has no field for (v1: resources and origin; distribution points: all but the host; sketches: device, resources, source type, interval, type, `metric_type`; every route but sketches: the `datadog.agent.*` payload metadata) | dropped | `logit.output.tags.dropped{reason="no_wire_form"}`, one per carrier |
+//! | batch resource `datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip` | sketches: payload `metadata` (`CommonMetadata`, `api_key` `""`); omitted when the resource carries none | -- |
 //! | `MetricRecord::unit` | v1 and v2 `unit` when `Some` | -- |
 //!
 //! v1 JSON emits the Agent's field set: `metric`, `points`, `tags`, `host`, `type`, and `interval`
@@ -199,10 +207,15 @@
 //!
 //! Each encoder reads the merged resource and event attributes (the event's value winning), and
 //! skips an event that belongs to another route without counting it: that is ordinary fan-out.
+//! The carriers decide which route owns an event, through one shared predicate per route, so the
+//! routes never disagree: a `log` carrying `statsd.event.title` is a Datadog event, sent only by
+//! `encode_events`; `statsd.service_check.name` with a `Gauge` first metric is a service check,
+//! whose record 0 is sent only by `encode_service_checks` (the metrics routes send its later
+//! records, as `statsd_out` does).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
-//! | **logs** ([`DatadogEncoder::encode_logs`]): an event with a `log` | one object in a JSON array; `None` when no event has a `log` | -- |
+//! | **logs** ([`DatadogEncoder::encode_logs`]): an event with a `log` and no `statsd.event.title` | one object in a JSON array; `None` when no event qualifies | -- |
 //! | `LogRecord::message` | `message`: a `Str` as-is, `Bytes` as lossy UTF-8, anything else as its JSON text | -- |
 //! | attribute `status`, else `severity` | `status` (`severity.as_str()`), omitted when neither | -- |
 //! | `Event::timestamp` | `timestamp`, integer milliseconds | -- |
@@ -212,7 +225,7 @@
 //! | `ddtags` | `ddtags`, verbatim | -- |
 //! | every other attribute | a top-level key: `Map`/`Array` nested, `Bytes` → base64, `Timestamp` → RFC 3339, non-finite `F64` → `null` | -- |
 //! | an attribute named `message` or `timestamp` | dropped: it would collide with the wire's own | `logit.output.tags.dropped{reason="reserved_key"}` |
-//! | **events** ([`DatadogEncoder::encode_events`]): an event carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
+//! | **events** ([`DatadogEncoder::encode_events`]): an event with a `log` carrying `statsd.event.title` | [`events::EventFormat::AgentEnvelope`] (the default): one envelope for the batch, `apiKey` `""`, groups keyed by `statsd.event.source_type` (else `api`) in sorted order; [`events::EventFormat::PublicV1`]: one object per event | -- |
 //! | resource [`RESOURCE_ATTR_AGENT_HOSTNAME`] | envelope `internalHostname`, `""` when absent | -- |
 //! | the event fields | Agent item keys in the Agent's order: `msg_title`, `msg_text`, `timestamp` (seconds), `priority`, `host` (always, `""` when absent), `tags`, `alert_type`, `aggregation_key`, `source_type_name`, `event_type`, then `device_name`, `related_event_id`; the public form uses `title`, `text`, `date_happened` and omits an absent `host`. Empty optional fields are omitted | -- |
 //! | no `statsd.event.alert_type` | `alert_type` from `severity`: `Error`/`Fatal` → `error`, `Warn` → `warning`, `Info` → `info`, else omitted | -- |
@@ -247,7 +260,7 @@ pub mod events;
 pub mod logs;
 pub mod service_checks;
 
-use logit_core::{Diagnostics, Telemetry};
+use logit_core::{Diagnostics, Event, MetricKind, Resource, Telemetry, Value};
 
 /// `host.name`: the Datadog host of a series/sketch/log, as an event attribute.
 pub const ATTR_HOST_NAME: &str = "host.name";
@@ -279,6 +292,33 @@ pub const ATTR_EVENT_RELATED_EVENT_ID: &str = "datadog.event.related_event_id";
 pub const ATTR_SOURCE: &str = "datadog.source";
 /// `datadog.agent.hostname`: an events envelope's `internalHostname`, as a resource attribute.
 pub const RESOURCE_ATTR_AGENT_HOSTNAME: &str = "datadog.agent.hostname";
+/// `datadog.agent.version` / `.timezone` / `.epoch` / `.internal_ip` / `.public_ip`: a sketch
+/// payload's `CommonMetadata`, as resource attributes (`epoch` an `F64`, the rest `Str`).
+pub const RESOURCE_ATTR_AGENT_VERSION: &str = "datadog.agent.version";
+pub const RESOURCE_ATTR_AGENT_TIMEZONE: &str = "datadog.agent.timezone";
+pub const RESOURCE_ATTR_AGENT_EPOCH: &str = "datadog.agent.epoch";
+pub const RESOURCE_ATTR_AGENT_INTERNAL_IP: &str = "datadog.agent.internal_ip";
+pub const RESOURCE_ATTR_AGENT_PUBLIC_IP: &str = "datadog.agent.public_ip";
+
+/// The attribute `key` with the event's value winning over the resource's, as
+/// [`logit_core::attrs::merged`] resolves it, without the full merged walk.
+fn merged_get<'a>(resource: &'a Resource, event: &'a Event, key: &str) -> Option<&'a Value> {
+    event.attributes.get(key).or_else(|| resource.attributes.get(key))
+}
+
+/// A service check: `statsd.service_check.name` present and a `Gauge` first metric, exactly what
+/// [`DatadogEncoder::encode_service_checks`] sends. Its record 0 belongs to that route alone; the
+/// metrics routes skip it and send any later records as ordinary metrics, as `statsd_out` does.
+pub(super) fn is_service_check(resource: &Resource, event: &Event) -> bool {
+    matches!(event.metrics.first().map(|m| &m.kind), Some(MetricKind::Gauge(_)))
+        && merged_get(resource, event, service_checks::ATTR_SERVICE_CHECK_NAME).is_some()
+}
+
+/// A Datadog (or DogStatsD) event: a `log` carrying `statsd.event.title`, exactly what
+/// [`DatadogEncoder::encode_events`] sends. The logs route skips it.
+pub(super) fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
+    event.log.is_some() && merged_get(resource, event, events::ATTR_EVENT_TITLE).is_some()
+}
 
 /// Decodes Datadog intake bodies, one per route. Carries its [`Diagnostics`] and [`Telemetry`]
 /// so a malformed item can be dropped and counted while the rest of a request decodes;
