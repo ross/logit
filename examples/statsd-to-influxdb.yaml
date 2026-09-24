@@ -1,59 +1,35 @@
-# A minimal example matching the v0.1 vertical slice target (docs/OVERVIEW.md): statsd/DogStatsD
-# in, a 10s aggregation window, one enrichment script, InfluxDB 2.x out. Matches the `influxdb`
-# service seeded by compose.yaml for local testing.
-#
-# Config is a flat graph of components (docs/design/pipeline-graph.md,
-# docs/adr/component-graph-configuration.md): each names its own `sources`, rather than
-# sitting in a fixed inputs/transforms/outputs pipeline. `aggregate` (docs/adr/
-# aggregation-window-semantics.md) is one of several implemented built-in transforms today --
-# `logit run` rejects a config referencing a still-unimplemented kind (docs/known-gaps.md) with a
-# clear error. `token: !env INFLUXDB_TOKEN` below pulls the token from the environment rather than
-# inlining a secret in the file (docs/adr/env-yaml-tag.md) -- any field on any component can use
-# `!env` the same way.
+# The v0.1 vertical slice (docs/OVERVIEW.md): statsd/DogStatsD in, a 10s aggregation window, one
+# Lua enrichment script, InfluxDB 2.x out. Matches the `influxdb` service compose.yaml seeds, and
+# is what `script/server` runs. `token: !env INFLUXDB_TOKEN` pulls the token from the environment
+# (docs/adr/env-yaml-tag.md); any field on any component can use `!env` the same way.
 components:
   statsd_in:
     type: statsd_in
     bind: 0.0.0.0:8125
-    # transport: udp              # udp (the default, classic statsd) | tcp -- tls: below needs tcp.
-    #                             # A tcp listener frames one LF-delimited line per message (there is
-    #                             # no octet-counted alternative: a statsd name may start with a digit)
-    #                             # and has no receive *queue* at all -- only the four batch/shutdown
-    #                             # fields below apply to one, per connection.
-    # tls:                        # tcp only; presence turns TLS on and makes it *required* -- there is
-    #                             # no plaintext fallback once a tls: block is configured. DTLS is out
-    #                             # of scope, so tls: under transport: udp is a config error.
+    # transport: udp              # udp (the default) | tcp -- tls: below needs tcp. A tcp listener
+    #                             # frames LF-delimited lines and has no receive queue: only the
+    #                             # four batch/shutdown fields below apply, per connection
+    # tls:                        # tcp only; presence turns TLS on and makes it required
     #   cert_file: server.pem     # resolved against this config file's directory
     #   key_file: server.key
     #   client_ca_file: ca.pem    # omit for server-auth-only TLS; set it to require a client cert
-    # handshake_timeout: 5s       # tcp only; bounds each pre-message phase *separately* -- the TLS
-    #                             # accept, then the wait for the connection's first byte. NOT an idle
-    #                             # timeout: see idle_timeout below.
-    # idle_timeout: 5m            # tcp only, off by default. Bounds the gap before a *later* line --
-    #                             # closes a connection quiet for longer than this and releases its
-    #                             # permit. Recommended wherever consistent traffic is expected, sized
-    #                             # above the sender's longest normal gap; think twice here since a
-    #                             # plaintext statsd client cannot detect the close
-    #                             # (docs/adr/idle-connection-timeout.md).
-    # Every field below defaults (docs/adr/decoupled-listener-io.md) -- an omitted `receive:`
-    # block is exactly the values shown here, commented out purely as a reference for tuning a
-    # real deployment. `receive:` is meaningful only on a datagram, stream or tail listener;
-    # `logit-pipeline`'s graph validation rejects it on any other component kind, and rejects the
-    # four queue-bounding fields below on a stream listener (a TCP statsd_in included) by name.
+    # handshake_timeout: 5s       # tcp only; bounds the TLS accept and the wait for the first byte
+    #                             # separately. Not an idle timeout
+    # idle_timeout: 5m            # tcp only, off by default; closes a connection quiet for longer
+    #                             # than this. A plaintext statsd client can't detect the close
+    #                             # (docs/adr/idle-connection-timeout.md)
+    # Every field below is its default; omit the block for the same effect
+    # (docs/adr/decoupled-listener-io.md).
     # receive:
     #   max_datagrams: 10000        # receive-queue depth, in datagrams -- whichever of this or max_bytes trips first
     #   max_bytes: "32MiB"          # bound on undecoded datagram bytes held in the queue
-    #   overflow: drop_oldest       # block | drop_oldest | drop_newest -- what happens once both bounds are full;
-    #                               # drop_oldest (not buffer:'s block) is the default here on purpose -- blocking a
-    #                               # UDP reader relocates loss into the kernel where nothing counts it
-    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream; 1 means
-    #                               # one send per datagram, today's pre-ADR `decoupled-listener-io` behavior
+    #   overflow: drop_oldest       # block | drop_oldest | drop_newest; blocking a UDP reader moves
+    #                               # loss into the kernel, where nothing counts it
+    #   batch_max_events: 1000      # events accumulated across datagrams before one send downstream
     #   batch_max_bytes: "1MiB"     # the other accumulation bound -- whichever trips first
-    #   batch_flush_interval: 100ms # longest an accumulated batch waits before being sent regardless of size;
-    #                               # 0s disables the timer, leaving the two bounds above as the only trigger
+    #   batch_flush_interval: 100ms # longest an accumulated batch waits regardless of size; 0s disables the timer
     #   # receive_buffer_bytes: 8MiB  # SO_RCVBUF, requested at bind -- omitted leaves the kernel default alone
-    #   read_batch: 64              # datagrams one recvmmsg(2) read may return, and how many the decode
-    #                               # half pops at a time. Linux-only effect; parsed and ignored elsewhere.
-    #                               # Watch logit.input.datagrams / logit.input.reads to see if it matters
+    #   read_batch: 64              # datagrams one recvmmsg(2) read may return; Linux-only effect
     #   shutdown_grace: 5s          # how long SIGTERM waits for the receive queue to drain before dropping the rest
 
   windowed:
@@ -77,22 +53,19 @@ components:
     org: logit
     bucket: metrics
     token: !env INFLUXDB_TOKEN
-    # Every field below defaults (docs/adr/buffered-sink-delivery.md) -- an omitted `buffer:`
-    # block is exactly the values shown here, commented out purely as a reference for tuning a
-    # real deployment. `buffer:` is meaningful only on a sink; `logit-pipeline`'s graph validation
-    # rejects it on any other component kind.
+    # Every field below is its default; omit the block for the same effect
+    # (docs/adr/buffered-sink-delivery.md).
     # buffer:
     #   max_batches: 1024      # queue depth, in batches -- whichever of this or max_bytes trips first
     #   max_bytes: "64MiB"     # estimated heap footprint bound -- a quoted string, always (KiB/MiB/GiB or a bare number)
     #   overflow: block        # block | drop_oldest | drop_newest -- what happens once both bounds are full
     #   # delivery: at_least_once  # at_least_once | at_most_once -- omitted derives from the sink's own
-    #                              # duplicate_safe() fact (true for influxdb_out's idempotent overwrite)
+    #                              # duplicate_safe() (true for influxdb_out's idempotent overwrite)
     #   retry_budget: 60s      # wall-clock ceiling on retrying one batch before it's dropped
     #   retry_max_delay: 10s   # backoff cap between retry attempts
     #   shutdown_grace: 5s     # how long SIGTERM waits for the queue to drain before dropping the rest
-    #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md) --
-    #   #                              # replaces the in-memory queue above, not sized alongside it;
-    #   #                              # max_batches/max_bytes above must stay at their defaults if set
+    #   # disk:                        # opt-in durable buffering (docs/adr/disk-backed-sink-buffer.md);
+    #   #                              # replaces the in-memory queue, so max_batches/max_bytes stay at their defaults
     #   #   path: spool/influxdb_out   # required, resolved relative to this config file's own directory
     #   #   max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes
     #   #   segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap

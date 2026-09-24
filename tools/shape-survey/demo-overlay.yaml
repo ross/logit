@@ -1,30 +1,17 @@
-# Compose overlay for the `demo` shape-survey producer (tools/shape-survey/producers/demo.sh).
+# Compose overlay for the `demo` shape-survey producer (tools/shape-survey/producers/demo.sh),
+# layered over demo/compose.yaml so `demo/` itself is never modified. It changes two things about
+# the `logit` service:
 #
-# Layered over demo/compose.yaml with a second `-f`, so `demo/` itself is never modified: the
-# survey is a thing done *to* the demo stack, not a variant of it, and a tap left behind in
-# demo/logit.yaml would change what every future `script/demo` runs.
+#   * `/config.yaml` comes from ${SHAPE_SURVEY_CONFIG}, the tapped config the producer generates.
+#   * ${SHAPE_SURVEY_RUN_DIR} is mounted at /shape-survey, where that config writes the capture.
 #
-# It changes exactly two things about the `logit` service:
-#
-#   * `/config.yaml` comes from ${SHAPE_SURVEY_CONFIG} -- the tapped config the producer generates
-#     from demo/logit.yaml at run time, written into the run directory as an artifact. There is no
-#     committed copy of it: a second config that has to be kept in step with demo/logit.yaml by
-#     hand would be wrong the first time either changed.
-#   * ${SHAPE_SURVEY_RUN_DIR} is mounted at /shape-survey, where that config's `file_out` writes
-#     the capture.
-#
-# Both are absolute paths supplied through `--env-file <run dir>/compose.env` rather than the
-# environment, because `${DOCKER}` is `sudo docker` by default and sudo does not forward
-# variables. A relative path would be wrong here anyway: with `-f demo/compose.yaml` first, the
-# project directory is `demo/`, and this file is not in it.
-#
-# Everything else -- the other services, the `user: "0:0"`, the Docker-state and postgres-log
-# mounts `docker_in`/`tail_in` need, the healthcheck -- is inherited untouched.
+# Both are absolute paths from `--env-file <run dir>/compose.env`, not the environment, because
+# `${DOCKER}` is `sudo docker` by default and sudo doesn't forward variables. They must be
+# absolute: with `-f demo/compose.yaml` first, the project directory is `demo/`.
 services:
   logit:
     volumes:
-      # Same target as demo/compose.yaml's own `./logit.yaml:/config.yaml:ro`, which is what makes
-      # this replace it rather than collide with it: Compose merges a service's volumes by mount
-      # target, not by appending.
+      # Same target as demo/compose.yaml's own config mount, so this replaces it: Compose merges a
+      # service's volumes by mount target.
       - ${SHAPE_SURVEY_CONFIG}:/config.yaml:ro
       - ${SHAPE_SURVEY_RUN_DIR}:/shape-survey
