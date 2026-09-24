@@ -59,7 +59,8 @@
 //! | JSON `metadata.origin` `product` / `service` / `metric_type` | [`ATTR_ORIGIN_PRODUCT`] / [`ATTR_ORIGIN_SERVICE`] / [`ATTR_ORIGIN_METRIC_TYPE`], each when nonzero | -- |
 //! | distribution point `[ts, [v, ...]]` | `MetricKind::Samples(Samples::new(values))`, rate 1.0; the series' `type` is ignored | -- |
 //! | a distribution point with no values | skipped | `skipped{reason="empty_distribution"}` |
-//! | a body that isn't JSON (or protobuf), or has no top-level `series` array | `CodecError::Malformed` | -- |
+//! | a body that isn't JSON (or protobuf), isn't a JSON object, or has a `series` that isn't an array | `CodecError::Malformed` | -- |
+//! | an object with no `series` member (the Agent's `{}` connectivity probe, which the intake answers `202`) | an empty batch | -- |
 //!
 //! A tag spelled like a carrier (`host.name:x`) loses to the wire field it names. On a route with
 //! a `type` (every series route, not distribution points), that includes `datadog.type`: a GAUGE

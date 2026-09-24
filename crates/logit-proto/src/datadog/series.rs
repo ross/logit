@@ -302,14 +302,16 @@ fn parse_json(body: &[u8]) -> Result<JsonValue, CodecError> {
         .map_err(|e| CodecError::Malformed(format!("datadog metrics body is not JSON: {e}")))
 }
 
+/// The body's `series` array. An object with no `series` member is an empty request: the Agent
+/// probes each route with `{}` when it starts, and Datadog's intake answers that `202`.
 fn series_array(root: &JsonValue) -> Result<&[JsonValue], CodecError> {
-    root.as_object()
-        .and_then(|o| o.get("series"))
-        .and_then(JsonValue::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| {
-            CodecError::Malformed("datadog metrics body has no `series` array".to_string())
-        })
+    let malformed =
+        || CodecError::Malformed("datadog metrics body has no `series` array".to_string());
+    let object = root.as_object().ok_or_else(malformed)?;
+    match object.get("series") {
+        None => Ok(&[]),
+        Some(series) => series.as_array().map(Vec::as_slice).ok_or_else(malformed),
+    }
 }
 
 fn batch(events: Vec<Event>) -> EventBatch {
@@ -1226,12 +1228,24 @@ mod tests {
     fn unparseable_bodies_are_malformed() {
         let (mut d, _) = decoder();
         assert!(matches!(d.decode_series_v1(b"nope", 0), Err(CodecError::Malformed(_))));
-        assert!(matches!(d.decode_series_v2_json(b"{}", 0), Err(CodecError::Malformed(_))));
+        assert!(matches!(
+            d.decode_series_v2_json(br#"{"series":{}}"#, 0),
+            Err(CodecError::Malformed(_))
+        ));
         assert!(matches!(
             d.decode_series_v2_protobuf(b"\xff\xff\xff", 0),
             Err(CodecError::Malformed(_))
         ));
         assert!(matches!(d.decode_distribution_points(b"[]", 0), Err(CodecError::Malformed(_))));
+    }
+
+    /// The Agent's startup connectivity probe: `{}` on every JSON metrics route.
+    #[test]
+    fn an_object_without_series_is_an_empty_request() {
+        let (mut d, _) = decoder();
+        assert!(d.decode_series_v1(b"{}", 0).unwrap().events.is_empty());
+        assert!(d.decode_series_v2_json(b"{}", 0).unwrap().events.is_empty());
+        assert!(d.decode_distribution_points(b"{}", 0).unwrap().events.is_empty());
     }
 
     #[test]

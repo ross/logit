@@ -1530,13 +1530,14 @@ response text quoted in a log line or error has the key replaced with `<redacted
 Each route's encoder reads `host.name`, `service`, `ddsource`, and the rest from event attributes
 and the batch resource, so stamp them upstream with `set`, as the example does for `host.name`.
 
-**Compression.** `compression: gzip`, the default, gzips every body except distribution points,
-which Datadog documents as accepting deflate only, so those go zlib-deflated. `compression: none`
-sends every body uncompressed.
+**Compression.** `compression: gzip`, the default, gzips every body except two. Distribution
+points go zlib-deflated, which is what Datadog documents for that route. Events go uncompressed,
+because Datadog's events route answers any compressed body `400 Invalid JSON structure`.
+`compression: none` sends every body uncompressed.
 
-**Stale data is dropped before sending.** Datadog rejects or discards data outside its windows, so
-`datadog_out` drops it and counts `logit.output.records.dropped{reason="stale"}`, measured from the
-moment of sending:
+**Stale data is dropped before sending.** Datadog documents a window for each kind of data and
+discards data outside it, so `datadog_out` drops it and counts
+`logit.output.records.dropped{reason="stale"}`, measured from the moment of sending:
 
 | Data | Dropped when |
 |---|---|
@@ -1547,9 +1548,9 @@ moment of sending:
 
 **A disk buffer can't deliver an outage's metrics late.** A `buffer.disk:` on this sink holds
 batches through a Datadog outage, but on replay, the metrics that aged past 1 hour and the logs
-past 18 hours are dropped as stale, not sent. For an outage longer than those windows, the data is
-lost at Datadog's end either way; the buffer delivers only what Datadog would still accept. Watch
-`records.dropped{reason="stale"}` after a replay to see how much.
+past 18 hours are dropped as stale, not sent. The metrics window is Datadog's documented one, and
+stricter than the intake: a trial org stored gauge points 2 and 3 hours old, though not 6 hours
+old. Watch `records.dropped{reason="stale"}` after a replay to see how much.
 
 **Traces must have been through an Agent.** Datadog's trace intake expects spans an Agent has
 normalized, obfuscated, and marked, with the Agent's APM stats sent beside them. `datadog_out`
@@ -1577,9 +1578,10 @@ event too large to send alone is dropped and counted `records.dropped{reason="ov
 **Delivery.** One batch is up to eight requests, sent one after another. The first that fails
 stops the rest, and the whole batch is retried or dropped as one. `408`, `429`, and `5xx` answers
 and timeouts are retryable; `413` counts the request's entries `oversize`; any other `4xx` isn't
-retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded, so the
-default is at-most-once and a `5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to
-retry instead and accept the duplicates.
+retried. The sink isn't duplicate-safe, since a retry re-sends the requests that succeeded: Datadog
+stores a resent series point once, the last write winning, but a resent log twice. So the default
+is at-most-once and a `5xx` drops the batch. Set `buffer: {delivery: at_least_once}` to retry
+instead and accept duplicate logs.
 
 **Pointing it at another `logit`.** `endpoints:` replaces each derived host with a base URL, which
 is how to send through a proxy, or to relay into another `logit`'s `datadog_in`:

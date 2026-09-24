@@ -60,9 +60,9 @@
 //!
 //! ## What is never sent
 //!
-//! **Stale points.** Datadog rejects or silently discards data outside its windows, and one stale
-//! point can fail a whole payload, so before encoding, relative to the send time, this sink drops
-//! and counts `logit.output.records.dropped{reason="stale"}`, per record:
+//! **Stale points.** Datadog documents a window per route and discards data outside it, so before
+//! encoding, relative to the send time, this sink drops and counts
+//! `logit.output.records.dropped{reason="stale"}`, per record:
 //!
 //! | Route | Dropped when |
 //! |---|---|
@@ -73,6 +73,11 @@
 //!
 //! A `buffer.disk:` replaying after a long outage therefore sends only what is still inside these
 //! windows. Anything older is counted `stale` and dropped at replay time, not delivered late.
+//!
+//! The series window is the documented one, and stricter than the intake: against a trial org
+//! (`docs/plans/datadog-relay.md`'s W7b) the intake stored gauge points 2 h and 3 h old, not 6 h
+//! or older, and a point more than 10 min ahead was dropped alone, with `202` and an `errors`
+//! entry naming it, while the rest of its request was stored.
 //!
 //! **Traces an Agent hasn't processed** (ADR decision 2). The intake's trace route expects what an
 //! Agent sends: normalized, obfuscated, `_top_level`-marked spans, with the Agent's stats beside
@@ -87,7 +92,7 @@
 //!
 //! | Route | Entries per request | Uncompressed body | Body on the wire |
 //! |---|---|---|---|
-//! | series (points), distribution points and sketches (records; UNVERIFIED, the series limits) | 10,000 | 5,242,880 B | 512,000 B |
+//! | series (points), distribution points and sketches (records; the series limits) | 10,000 | 5,242,880 B | 512,000 B |
 //! | logs | 1,000 | 5,000,000 B | -- |
 //! | events | 1 | -- | -- |
 //! | traces | -- | 3,200,000 B | -- |
@@ -101,6 +106,12 @@
 //! per encode attempt. Datadog's 1 MB per-log limit isn't enforced here: the intake truncates such
 //! a log and still accepts it.
 //!
+//! The series wire limit is the intake's: a 512,180 B gzip body drew `413` ("limit=512 kB"). The
+//! intake enforced none of the others at the sizes tried (distribution points: 1,052,533 B gzip
+//! holding 150,000 values; logs: 5,252,247 B uncompressed), so distribution points and sketches
+//! keep the series limits and logs the documented 5,000,000 B, which cost extra requests rather
+//! than a `413`.
+//!
 //! ## The wire
 //!
 //! Headers are the operator's `headers:` with these `insert`ed over them, so a protocol-owned name
@@ -110,7 +121,7 @@
 //! |---|---|
 //! | `DD-API-KEY` | `api_key`, marked sensitive |
 //! | `Content-Type` | per route, above |
-//! | `Content-Encoding` | `gzip` under `compression: gzip`, except `deflate` (zlib-wrapped) on distribution points, which Datadog documents as deflate-only (UNVERIFIED); absent under `compression: none` |
+//! | `Content-Encoding` | `gzip` under `compression: gzip`, except `deflate` (zlib-wrapped) on distribution points, which Datadog documents as deflate-only (the intake takes gzip and zlib there, and rejects raw deflate), and none on events, whose route answers any compressed body `400 Invalid JSON structure`; absent under `compression: none` |
 //! | `User-Agent` | `logit/<version>` |
 //!
 //! The key never appears in a diagnostic or an error: a rejection body is read past the quoted
@@ -138,10 +149,10 @@
 //! Redirects aren't followed ([`crate::http::build_client`] says why).
 //!
 //! [`DatadogOutput::duplicate_safe`] is **`false`**: a batch spans several requests, so a retry
-//! re-sends the ones that succeeded, and nobody has yet shown the intake dedupes a resent series
-//! point, log, or span (UNVERIFIED; `docs/plans/datadog-relay.md`'s W7 settles it). So the default
-//! posture is at-most-once, and a 5xx drops the batch; `buffer: { delivery: at_least_once }`
-//! accepts the duplicates instead.
+//! re-sends the ones that succeeded, and only some of those the intake dedupes. A resent series
+//! point is stored once, the last write winning at its `(series, timestamp)`; a resent log is
+//! stored twice (both checked against a trial org). So the default posture is at-most-once, and a
+//! 5xx drops the batch; `buffer: { delivery: at_least_once }` accepts duplicate logs instead.
 //!
 //! ## Telemetry
 //!
@@ -208,7 +219,7 @@ const CHECK_MAX_AGE: i64 = 10 * MINUTE;
 /// `logit-config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DatadogCompression {
-    /// gzip, except zlib-wrapped deflate on distribution points.
+    /// gzip, except zlib-wrapped deflate on distribution points and no compression on events.
     #[default]
     Gzip,
     None,
@@ -325,7 +336,8 @@ impl Route {
 
     fn body_encoding(self, compression: DatadogCompression) -> BodyEncoding {
         match (compression, self) {
-            (DatadogCompression::None, _) => BodyEncoding::Identity,
+            // The events route answers any compressed body `400 Invalid JSON structure`.
+            (DatadogCompression::None, _) | (_, Self::Events) => BodyEncoding::Identity,
             (DatadogCompression::Gzip, Self::DistributionPoints) => BodyEncoding::Deflate,
             (DatadogCompression::Gzip, _) => BodyEncoding::Gzip,
         }
@@ -1449,11 +1461,15 @@ mod tests {
 
     // ---- compression and headers -------------------------------------------------------------
 
-    /// gzip on every route but distribution points, which get zlib deflate; `none` sends every
-    /// body as-is, with no `Content-Encoding`.
+    /// gzip on every route but distribution points, which get zlib deflate, and events, which go
+    /// uncompressed; `none` sends every body as-is, with no `Content-Encoding`.
     #[tokio::test]
     async fn gzip_by_default_deflate_for_distribution_points_and_none_when_asked() {
-        let b = batch(vec![gauge(NOW), metric(NOW, MetricKind::Samples(Samples::new([1.0])))]);
+        let b = batch(vec![
+            gauge(NOW),
+            metric(NOW, MetricKind::Samples(Samples::new([1.0]))),
+            datadog_event(NOW),
+        ]);
 
         let (addr, log) = accepting().await;
         sink(addr).send_at(&b, NOW).await.unwrap();
@@ -1465,6 +1481,9 @@ mod tests {
             .decode_distribution_points(&captured[1].decoded(), NOW)
             .expect("a zlib stream, not raw deflate");
         assert_eq!(points.events.len(), 1);
+        assert_eq!(captured[2].path, "/api/v1/events");
+        assert_eq!(captured[2].header("content-encoding"), None);
+        DatadogDecoder::new().decode_events(&captured[2].body, NOW).expect("plain JSON");
 
         let (addr, log) = accepting().await;
         sink(addr).with_compression(DatadogCompression::None).send_at(&b, NOW).await.unwrap();

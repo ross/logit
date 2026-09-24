@@ -871,7 +871,8 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   than losing data silently:
   - The v3 columnar series routes (`/api/intake/metrics/v3/series` and its siblings). An Agent sends
     v3 only to Datadog's own URLs (`use_v3_api.series.enabled: datadog_only`), so a redirected Agent
-    sends v2, which is served. How the Agent classifies a URL as Datadog's is UNVERIFIED until W7.
+    sends v2, which is served. Agent 7.83.3 with `dd_url` at a `datadog_in` sent only v2 protobuf
+    series.
   - The legacy TCP logs intake (port 10516, `<api-key> <json>\n` or length-prefixed protobuf). That
     isn't HTTP, so it can't share this listener. Set `logs_config.force_use_http: true` on the Agent.
   - An API key in the query string (`?api_key=`) or the path (`/v1/input/<key>`). Only the
@@ -921,47 +922,41 @@ search for an old symptom still finds what fixed it and what, if anything, is st
     byte-level comparison against a real client's output could differ.
   - **Revisit trigger:** W7 records a client (datadog-go v5.6+ or a current dd-trace library) that
     sends the two fields.
-- **`datadog_out`'s sketches route is UNVERIFIED for a sender that isn't an Agent.** It posts
-  `Distribution` records to `/api/beta/sketches` with an API key, as Vector's `datadog_metrics`
-  sink does, but the route isn't in Datadog's public API spec.
-  - **Consequence:** if the intake refuses it, every sketch is a failed request, and
-    `aggregate`'s `distributions: sketch` output never reaches Datadog.
-  - **Workaround:** `distributions: samples` on `aggregate`, which sends raw values to the
-    documented `/api/v1/distribution_points`.
-  - **Revisit trigger:** W7's trial-org run.
-- **`datadog_out`'s trace route is UNVERIFIED for a sender that isn't an Agent.**
-  `/api/v0.2/traces` and `/api/v0.2/stats` are the Agent's own outbound protocol, which Datadog
-  doesn't document for third parties
-  ([plan §12](plans/datadog-relay.md#12-traces-to-datadog-the-agents-protocol-not-otlp-for-datadog-origin-spans-w5-w7)).
-  - **Consequence:** if the intake refuses a third-party `AgentPayload`, relayed traces don't reach
-    Datadog; the pair test against `datadog_in` still holds.
-  - **Revisit trigger:** W7 sends traces and stats to the trial org and checks the service pages.
-- **`datadog_out` sends distribution points zlib-deflated, UNVERIFIED.** The public API survey
-  records `/api/v1/distribution_points` as accepting `deflate` only, so that route alone isn't
-  gzipped.
-  - **Consequence:** if the intake also accepts gzip, nothing is lost; if it wants raw deflate
-    rather than zlib-wrapped, every distribution-points request fails.
-  - **Revisit trigger:** W7's trial-org run.
-- **`datadog_out`'s per-request size limits are partly UNVERIFIED.** The series (10,000 points,
-  512,000 B compressed, 5,242,880 B uncompressed), logs (1,000 entries, 5,000,000 B), and traces
-  (3,200,000 B) limits come from Datadog's docs or the Agent's source; distribution points and
-  sketches reuse the series limits because none are documented, and service checks and stats are
-  sent uncapped.
-  - **Consequence:** a limit set too high draws a `413`, which drops the request's entries as
-    `oversize`; one set too low only costs extra requests.
-  - **Revisit trigger:** W7, or a `413` from a real intake.
-- **`datadog_out` isn't duplicate-safe until the intake is shown to dedupe.** A batch is several
-  requests, and whether Datadog overwrites a resent series point (it's documented for series, not
-  for logs, events, or spans) is UNVERIFIED.
+- **`datadog_out`'s size limits for distribution points, sketches, and logs are tighter than the
+  intake's.** Only the series limit is the intake's own: a 512,180 B gzip series body drew `413`
+  ("limit=512 kB"). Distribution points and sketches reuse the series limits, and logs keep the
+  documented 5,000,000 B, but a trial org accepted a 1,052,533 B gzip distribution-points body
+  (150,000 values, all counted) and a 5,252,247 B logs body (all 21 logs stored). Service checks
+  and stats are sent uncapped.
+  - **Consequence:** extra requests, never a `413`, on these routes.
+- **`datadog_out` isn't duplicate-safe, because Datadog stores a resent log twice.** A trial org
+  stored a series point resent at the same `(series, timestamp)` once, the last write winning (a
+  count sent twice read 5, not 10; a gauge sent as 7 then 9 read 9), and an identical log posted
+  twice as two logs. A batch is several requests, and a retry re-sends the ones that succeeded.
   - **Consequence:** the default posture is at-most-once, so a `5xx` or timeout drops the batch.
-    `buffer: {delivery: at_least_once}` retries it and accepts duplicates.
-  - **Revisit trigger:** W7 resends a request to the trial org and checks what Datadog shows.
-- **`datadog_trace_out`'s Unix-socket client is UNVERIFIED against a real Agent.** It sends
-  HTTP/1.1 with `Host: localhost` over the socket, which `datadog_trace_in` and the tests' local
-  server accept; no real Agent's `receiver_socket` has received it.
-  - **Consequence:** if the Agent's socket listener wants something else, every request over
-    `socket:` fails; `endpoint:` is unaffected.
-  - **Revisit trigger:** W7 points it at a real Agent's socket.
+    `buffer: {delivery: at_least_once}` retries it and accepts duplicate logs; its metrics are
+    unaffected.
+- **`datadog_out` drops metric points older than 1 hour, which Datadog would store.** The series
+  window is the documented one. A trial org stored gauge points 2 and 3 hours old (not 6 hours or
+  older) through `/api/v2/series`, so the filter is stricter than the intake.
+  - **Consequence:** a `buffer.disk:` replay after an outage of 1 to about 3 hours drops metrics
+    the intake would still have stored, counted `records.dropped{reason="stale"}`.
+  - **Revisit trigger:** Datadog documents a longer window, or an operator needs the replay.
+- **`datadog_out` treats a `202` as full success, and the intake drops parts of a `202`ed
+  request.** The series route answers `202` with an `errors` array naming what it dropped: a point
+  more than 10 minutes ahead ("contains 1 data points too far in the future"), or a whole series
+  carrying more than 100 tags ("too many tags in series ...: limit=100"). The sink doesn't read
+  the body of a `2xx`, so neither is counted.
+  - **Consequence:** a series over 100 tags reaches no dashboard, and nothing in `logit`'s
+    telemetry says so.
+  - **Workaround:** keep series under 100 tags with `keep` upstream.
+- **`datadog_out` sends a Datadog event's and a service check's host as a tag.** Their encoders
+  read the host from `statsd.event.host` and `statsd.service_check.host` only, so a `host.name`
+  that `set` stamps on the resource renders as a `host.name:<value>` tag, and Datadog shows the
+  event or check with no host.
+  - **Consequence:** events and checks sent directly, not through an Agent, have no host in
+    Datadog unless the DogStatsD client set `h:`.
+  - **Workaround:** `set` `statsd.event.host` and `statsd.service_check.host` as attributes.
 - **`datadog_trace_out` under `version: v0.4` drops the trace chunk and tracer payload fields.**
   A chunk's `datadog.chunk.*` fields (sampling priority, origin, dropped flag, tags) and the
   tracer payload fields no request header carries (`datadog.tracer.runtime_id`, `.env`,

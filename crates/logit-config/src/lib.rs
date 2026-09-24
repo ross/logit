@@ -518,7 +518,8 @@ pub struct DatadogEndpoints {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DatadogCompression {
-    /// gzip on every route but distribution points, which get zlib-wrapped deflate.
+    /// gzip on every route but distribution points, which get zlib-wrapped deflate, and events,
+    /// which go uncompressed.
     #[default]
     Gzip,
     /// Every body uncompressed.
@@ -1613,8 +1614,8 @@ pub enum ComponentKind {
         #[serde(default)]
         endpoints: DatadogEndpoints,
         /// How request bodies are compressed. `gzip`, the default, gzips every route except
-        /// distribution points, which Datadog accepts only zlib-deflated; `none` sends every body
-        /// uncompressed.
+        /// distribution points, which are zlib-deflated, and events, which Datadog accepts only
+        /// uncompressed; `none` sends every body uncompressed.
         #[serde(default)]
         compression: DatadogCompression,
         /// Timeout for one request. Defaults to `10s`; `0s` is rejected.

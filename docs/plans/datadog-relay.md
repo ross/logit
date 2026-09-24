@@ -46,7 +46,7 @@ Datadog ingests five kinds of data. Each cell reads today → after this stack.
 
 | Signal | Direct API, no Agent | Through a local Agent | Agent stand-in (receive from apps) | Intake stand-in (receive from Agents) |
 |---|---|---|---|---|
-| Logs | `otlp_out` agentless (unverified) → `datadog_out` `/api/v2/logs` (W5) | `otlp_out` to the Agent's OTLP receiver (its `logs.enabled` defaults to false), or `syslog_out` over TCP to the Agent's `logs` TCP listener, which accepts syslog-formatted lines; `syslog_out` writes a `Str` body verbatim, but whether the Agent then parses a JSON body into attributes is UNVERIFIED | `syslog_in`; apps that write JSON lines to an Agent TCP port have no plain-lines listener (documented gap, §7) | none → `datadog_in` `/api/v2/logs` and legacy `/v1/input` (W3) |
+| Logs | `otlp_out` agentless (verified in W7b) → `datadog_out` `/api/v2/logs` (W5) | `otlp_out` to the Agent's OTLP receiver (its `logs.enabled` defaults to false), or `syslog_out` over TCP to the Agent's `logs` TCP listener, which accepts syslog-formatted lines; `syslog_out` writes a `Str` body verbatim, but whether the Agent then parses a JSON body into attributes is UNVERIFIED | `syslog_in`; apps that write JSON lines to an Agent TCP port have no plain-lines listener (documented gap, §7) | none → `datadog_in` `/api/v2/logs` and legacy `/v1/input` (W3) |
 | Metrics | `otlp_out` agentless, delta only → `datadog_out` `/api/v2/series` + `/api/v1/distribution_points` + sketches (W5, §4) | `statsd_out format: dogstatsd`, over UDP or either Agent Unix socket (W4b); `otlp_out` | `statsd_in` over UDP or either Agent Unix socket, `\|e:`/`\|card:` carried (W4b); `otlp_in` | none → `datadog_in` series v1/v2 + sketches (W3) |
 | Traces | `otlp_out` agentless, lossy for Datadog-origin spans → `datadog_out` `/api/v0.2/traces` + `/api/v0.2/stats`, the Agent's own protocol (W5, §12); `otlp_out` stays the path for OTel-origin spans | `otlp_out` → also `datadog_trace_out` msgpack `/v0.4/traces` + `/v0.6/stats` (W6) | `otlp_in` (dd-trace OTLP export is Preview) → `datadog_trace_in` on `:8126`, traces and client stats (W4a) | none → `datadog_in` `AgentPayload` + `StatsPayload` (W3) |
 | Events | none → `datadog_out` `/api/v1/events` (W5) | `statsd_out` `_e{}` | `statsd_in` `_e{}` | none → `datadog_in` `/intake/` (W3) |
@@ -64,11 +64,11 @@ or a real Agent and this section is updated then.
 
 | Endpoint | Body and limits | Notes |
 |---|---|---|
-| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future |
-| `POST /api/v1/distribution_points` | JSON `{series:[{metric, host, tags, type:"distribution", points:[[ts,[v…]]]}]}`; `deflate` only | Raw values; Datadog sketches them server side. Limits undocumented (UNVERIFIED) |
-| `POST /api/beta/sketches` | protobuf `SketchPayload` | What Agents send. Not in the public spec; Vector's `datadog_metrics` sink sends it with an API key (UNVERIFIED as supported for third parties) |
+| `POST api.<site>/api/v2/series` | JSON `{series:[{metric, type, points:[{timestamp s, value}], interval, unit, tags[], resources:[{name,type}], source_type_name, metadata.origin}]}`; 512,000 B compressed, 5,242,880 B decompressed; `Content-Encoding: deflate \| zstd1 \| gzip`; header `DD-API-KEY` | `type`: 0 unspecified, 1 count, 2 rate, 3 gauge. No histogram, set, or distribution type. Points must be no more than 1 h in the past or 10 min in the future (W7b: the intake stored points 2 h and 3 h old, not 6 h; a point over 10 min ahead is dropped alone, with `202` and an `errors` entry). A series with more than 100 tags is dropped the same way. A body over 512 kB compressed gets `413`. A resent point overwrites: one value per `(series, timestamp)`, the last write winning |
+| `POST /api/v1/distribution_points` | JSON `{series:[{metric, host, tags, type:"distribution", points:[[ts,[v…]]]}]}`; `deflate` only | Raw values; Datadog sketches them server side. Limits undocumented; W7b sent 1,052,533 B gzip (150,000 values) and got `202` with every value counted. gzip and zlib deflate are both accepted, raw deflate is `400` |
+| `POST /api/beta/sketches` | protobuf `SketchPayload` | What Agents send. Not in the public spec; Vector's `datadog_metrics` sink sends it with an API key, and W7b's `datadog_out` did too: `aggregate`'s locally built sketches are queryable (`avg`, `count`, `max`) |
 | `POST http-intake.logs.<site>/api/v2/logs` | JSON array of `{message, ddsource, ddtags, hostname, service, status, …}`; 1,000 entries, 5 MB decompressed, 1 MB per log (cut, still 2xx); up to 18 h in the past; `gzip`/`deflate`/`identity`; 202 accepted, retry 408/429/500/503 | Other keys are attributes, nested maps included. Trace correlation auto-detects OTel `trace_id`/`span_id` (32-/16-char lowercase hex) and Datadog `dd.trace_id`/`dd.span_id` (decimal) |
-| `POST /api/v1/events` | `title`, `text` (≤4,000 chars), `date_happened` (≤18 h old), `priority: normal \| low`, `alert_type`, `aggregation_key` (≤100), `host`, `tags`, `source_type_name` | v2 events (`event-management-intake.<site>`) are a different product surface; v1 is what DogStatsD events map to |
+| `POST /api/v1/events` | `title`, `text` (≤4,000 chars), `date_happened` (≤18 h old), `priority: normal \| low`, `alert_type`, `aggregation_key` (≤100), `host`, `tags`, `source_type_name`; uncompressed only (W7b: gzip and deflate get `400 Invalid JSON structure`) | v2 events (`event-management-intake.<site>`) are a different product surface; v1 is what DogStatsD events map to |
 | `POST /api/v1/check_run` | array of `{check, host_name, status 0–3, tags, message?, timestamp?}`; ≤10 min old; message cut at 500 chars, discarded on OK | |
 | Traces | **No documented native-span API**, but the Agent's own outbound protocol is open source (`pkg/trace/writer`) and Vector's `datadog_traces` sink is a working third-party sender of it: see the Agent outbound table below | Trace metrics (`trace.*`, service pages) are not derived from `/api/v0.2/traces`; the sender must also send `/api/v0.2/stats` (inferred from `metrics_namespace` docs and the Agent's concentrator; the backend is closed source) |
 | `POST otlp.<site>/v1/{traces,metrics,logs}` | OTLP/HTTP protobuf (traces and metrics also JSON); header `dd-api-key`; 512 KiB compressed metrics, 5.1 MiB logs, 15 MiB traces; 413 when over | HTTP only, no gRPC. Metrics must be delta temporality; cumulative is an error. Optional `dd-otel-metric-config` (`histograms.mode`, `summaries.mode`, `resource_attributes_as_tags`) and `dd-otel-span-mapping` headers; `compute_stats=true` to get trace metrics. No Preview banner on any of the three pages, no explicit GA statement either |
@@ -125,7 +125,7 @@ Redirected by `dd_url` (metrics, events, checks, metadata only), `logs_config.lo
 
 | Route | Body | Notes |
 |---|---|---|
-| `/api/v2/series` | protobuf `MetricPayload` (`agent-payload` `metrics/agent_payload.proto`); `Content-Type: application/x-protobuf` | **zstd level 1 by default** (`serializer_compressor_kind`), one setting for every endpoint. 512,000 B compressed, 5 MiB decompressed, 10,000 points. v1 JSON only if `use_v2_api.series: false`. v3 columnar (`/api/intake/metrics/v3/series`) only to Datadog URLs (`use_v3_api.series.enabled: datadog_only`) — how the Agent classifies a URL is UNVERIFIED |
+| `/api/v2/series` | protobuf `MetricPayload` (`agent-payload` `metrics/agent_payload.proto`); `Content-Type: application/x-protobuf` | **zstd level 1 by default** (`serializer_compressor_kind`), one setting for every endpoint. 512,000 B compressed, 5 MiB decompressed, 10,000 points. v1 JSON only if `use_v2_api.series: false`. v3 columnar (`/api/intake/metrics/v3/series`) only to Datadog URLs (`use_v3_api.series.enabled: datadog_only`); W7b's Agent 7.83.3, with `dd_url` at a `datadog_in`, sent v2 protobuf only |
 | `/api/beta/sketches` | protobuf `SketchPayload`: `{metric, host, tags, dogsketches:[{ts, cnt, min, max, avg, sum, k: sint32[], n: uint32[]}]}` | DDSketch with `eps = 1/128` (gamma 1.015625), `min = 1e-9`, bias, 4,096-bin collapsing, int16 keys (`pkg/util/quantile`). No mapping parameters on the wire: the receiver assumes them |
 | `/api/v1/check_run` | JSON | |
 | `/intake/` | JSON: events and host metadata in one route | |
@@ -241,7 +241,8 @@ table, as the collectd codec does. The amendment to `lossless-transit.md` lands 
   per-signal `endpoints:` overrides so a pair test can point at another `logit`'s `datadog_in`,
   `compression: gzip`, `timeout`, `tls`. One request per endpoint per batch, outside the three
   encoder shapes for the same reason `prometheus` is: several endpoints per signal.
-  `duplicate_safe()` is false until W7 shows the intake dedupes a resent `(series, timestamp)`.
+  `duplicate_safe()` is false: W7b showed the intake dedupes a resent `(series, timestamp)`, last
+  write winning, but stores a resent log twice.
   Host, service, source, and tags come from attributes and the resource (an upstream `set`), not
   from per-sink fields. Metric kinds: delta monotonic `Sum` → `count` with `interval` from
   `datadog.interval` or the batch's `aggregate` window; `Gauge` → `gauge` (or `rate` when
@@ -413,10 +414,10 @@ Agent stats and no obfuscation of SQL or URLs unless the tracer did it, and is c
 `records.dropped{reason="not_datadog_origin"}`. So `datadog_trace_in` must not feed `datadog_out`
 directly (W8 documents this): the operator routes it to `datadog_trace_out` and a real Agent, or,
 once §14 exists, through that processor, which makes the same data ready by writing the same
-marks. The native leg is verified against the trial org in W7 (spans visible, service
-pages populated from relayed stats, 128-bit ids correlating with logs); if the intake rejects
-third-party `AgentPayload`s, the pair test runs against `datadog_in` and the leg becomes a
-tracked gap.
+marks. W7b verified the native leg against a trial org: an Agent's spans relayed by `datadog_in` and
+`datadog_out` arrived with their 128-bit ids and resource names, the relayed stats populated
+`trace.flask.request.hits`, `.errors`, and its duration distribution, and a `trace_context`-lifted
+log's hex `trace_id` finds the same trace's logs in a `trace_id:` search.
 
 ### 13. Ordering (all)
 
@@ -451,23 +452,23 @@ the OTel-direct topology is `otlp_out`.
 | W4b | **Landed** (`dd/w4b`). `statsd_in`/`statsd_out` over `transport: unix`/`unix_stream` on the existing datagram and stream drivers, a shared `unix.rs` bind helper, `\|e:`/`\|card:` carried; graph rule 64; schema; the example's socket component. | S | W0 |
 | W5 | **Landed** (`dd/w5`). `datadog_out`: one request per intake route, the stale filter, the `_top_level` trace gate (`logit_proto::datadog::trace_readiness`), a count-then-bisect request splitter, gzip with zlib-deflated distribution points; graph rule 65; schema; `datadog-direct.yaml`, pulled forward from W8; a `datadog_out -> datadog_in` pair test over every route. | M | W3 |
 | W6 | **Landed** (`dd/w6`). `datadog_trace_out` over TCP or the Agent's Unix socket: v0.4 or v0.7 traces with the tracer headers restored, `/v0.6/stats`, split by trace under the Agent's 25 MiB limit; `split_encode` shared with `datadog_out`; graph rule 66; schema; `datadog-agent-relay.yaml`; a `datadog_trace_in -> datadog_trace_out` pair test over TCP and the socket. | S | W4a |
-| W7 | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); trial-org end-to-end for `datadog_out`, including the `/api/v0.2/traces` leg and the stale window; pair fixed-point tests over the corpus; UNVERIFIED items resolved in this plan | M | W5, W6 |
+| W7a | Recorded fixtures via `script/record-fixtures` (an Agent container with `dd_url` at the capture; a `ddtrace` Python producer; DogStatsD over a Unix socket); pair fixed-point tests over the corpus; the UNVERIFIED items a recording settles | M | W5, W6 |
+| W7b | **Landed** (`dd/w7b`). Trial-org end-to-end: `datadog_out` direct (series, sketches, distribution points, logs, events, checks), the stale window, dedupe, size caps; a real Agent through `datadog_in` and `datadog_out`, traces and stats included; `datadog_trace_out` and `statsd_out` into a real Agent over TCP, UDP, and its Unix sockets; log correlation; `otlp_out` agentless. Found and fixed: events must go uncompressed; the Agent's `{}` startup probe on the series routes is an empty request. Commands and outcomes in the PR. | M | W5, W6, W8a |
 | W8a | **Landed** (`dd/w8a`). `trace_context` `format: datadog`: decimal and 128-bit hex `dd.trace_id`, decimal `dd.span_id`, `trace_id_high`; the Datadog id parsers moved into `logit_core::trace`; `datadog_out` writes a log's `TraceRef` as hex `trace_id`/`span_id` (§8); graph rule 67; schema; the ADR `log-record-trace-context` amendment; `datadog-logs-correlation.yaml`. Split out of W8 and landed ahead of W7, which it doesn't need (§13). | S | W6 |
 | W8b | `docs/datadog.md` (operator best practices from this plan, including that `datadog_trace_in` must not feed `datadog_out` directly); `deploying.md`; `known-gaps.md`; `AGENTS.md` tables; `telemetry-landscape.md` cells; four examples (`datadog-direct.yaml`, `datadog-via-agent.yaml`, `datadog-agent-standin.yaml`, `datadog-intake-standin.yaml`) and `DD_API_KEY` in `every_shipped_config_loads_and_validates`'s `!env` map (`crates/logit-cli/src/config.rs:257`) | M | W7 |
 
-Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7 → W8b, linear; W4b
+Landing order: W0 → W1 → W2a → W2b → W3 → W4a → W5 → W6 → W8a → W7a → W7b → W8b, linear; W4b
 stacks after W4a to keep the stack linear even though it depends only on W0, and W8a after W6
 because it needs nothing from W7. Each PR is based on and
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, and W8a
-complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main`
-once it merges. None of W3's receiver, W4a's, or W4b's Unix sockets has yet been pointed at a real
-Agent, tracer, or client; W5's `datadog_out` has sent only to `datadog_in`, never to Datadog; and
-W6's `datadog_trace_out` has sent only to `datadog_trace_in`, never to a real Agent. W7 does all
-three. W8a's `format: datadog` has read only hand-written log lines, never a real tracer's; W7's
-`ddtrace` producer can check it.
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), W2b, W3, W4a, W4b, W5, W6, W8a, and
+W7b complete on their stacked branches, nothing merged to `main`; W1 targets `dd/w0` and retargets
+to `main` once it merges. W7b pointed a real Agent at `datadog_in`, `datadog_out` at a trial org,
+`datadog_trace_out` at a real Agent's TCP port and `receiver_socket`, and W8a's `format: datadog`
+at a real `ddtrace` 4.15.2 log line. W7a's recordings, which settle the DogStatsD stream framing,
+the `|e:`/`|card:` segment order, and the tracer's own forms, are in progress.
 
 ## Verification
 
@@ -486,8 +487,9 @@ three. W8a's `format: datadog` has read only hand-written log lines, never a rea
 - W5/W6: the trial org shows series, distributions, logs, events, checks, and traces sent by
   `datadog_out` and `otlp_out`, with service pages and `trace.*` metrics populated from the
   relayed stats and a stats sketch re-encoded by `DdSketch` accepted; a real Agent accepts
-  `datadog_trace_out`'s traces and client stats and the trial org shows the spans.
-- W7: both pair tests hold over the recorded corpus; every UNVERIFIED item in this plan is
-  resolved and the text updated.
+  `datadog_trace_out`'s traces and client stats and the trial org shows the spans. Done in W7b,
+  except the service checks, which have no query API (`202` recorded only).
+- W7: both pair tests hold over the recorded corpus (W7a); every UNVERIFIED item in this plan is
+  resolved and the text updated (W7a and W7b; the PRs list what stays open and why).
 - W0 (this PR) is documentation only: every relative link resolves and `docs/plans/README.md`
   gained a row.

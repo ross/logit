@@ -54,7 +54,10 @@ Three facts from the survey drive the shape of the decision:
    root span carries the Agent-written `_top_level` metric has been through an Agent or an
    equivalent processor and goes out natively; one without it is counted
    `records.dropped{reason="needs_agent_processing"}`, so `datadog_trace_in` must not feed `datadog_out`
-   directly. `otlp_out` remains the path for OTel-origin spans.
+   directly. `otlp_out` remains the path for OTel-origin spans. A trial org accepts both routes
+   from a sender that isn't an Agent: spans an Agent sent to `datadog_in` and `datadog_out`
+   relayed arrived with their 128-bit ids, and the relayed stats populated `trace.*.hits`,
+   `.errors`, and the duration distribution.
 
 3. **`DdSketch` is hand-rolled** (`crates/logit-core/src/sketch.rs`), replacing
    `sketches-ddsketch`, and carries its bin mapping. `Mapping::agent` is the default for every
@@ -113,7 +116,9 @@ Three facts from the survey drive the shape of the decision:
 
 10. **`datadog_out` derives host, service, source, and tags from attributes and the resource**,
     never from per-sink fields; an upstream `set` supplies them. It drops and counts points older
-    than Datadog's windows (1 h for metrics, 18 h for logs, 10 min for checks) before sending.
+    than Datadog's documented windows (1 h for metrics, 18 h for logs, 10 min for checks) before
+    sending. The metrics window is stricter than the intake, which stored series points 3 h old;
+    the documented window stays, because no longer one is documented.
 
 11. **`datadog_trace_in` shares decision 5's bounded-wait-then-`503` mechanism, but a `503` there
     is loss, not deferral, and the bound is shorter.** Delivery is the same
@@ -173,13 +178,22 @@ Three facts from the survey drive the shape of the decision:
     - **`socket:` is an HTTP/1.1 client over the Unix socket**, a pooled `hyper_util` client whose
       connector dials the path for each new connection, beside `reqwest` for `endpoint:`; the two
       share request building and fault classification. A missing socket file or a refused connect
-      is `Fault::Clean`, as a refused TCP connect is. UNVERIFIED against a real Agent's socket
-      until W7.
+      is `Fault::Clean`, as a refused TCP connect is. Agent 7.83.3's `receiver_socket` accepts
+      it, traces and `/v0.6/stats` alike.
     - **Requests are cut by trace**, at most 1,000 traces and 25 MiB (the Agent's
       `max_request_bytes`) on the wire, through `datadog_out`'s splitter. The Agent has no count
       limit; the 1,000 bounds one request's encode and send.
     - **`duplicate_safe()` is `false`**: an Agent dedupes nothing, and one batch is up to two
       requests.
+
+14. **`datadog_out` sends events uncompressed and stays not duplicate-safe** (amendment,
+    2026-09-24, from the trial-org run in the plan's W7b). Datadog's `/api/v1/events` answers any
+    gzip or deflate body `400 Invalid JSON structure`, so that route goes out with no
+    `Content-Encoding` whatever `compression:` says. The intake stores a resent series point once
+    (the last write wins at its `(series, timestamp)`) but a resent log twice, and a batch is
+    several requests, so `duplicate_safe()` stays `false`. And `datadog_in` decodes a JSON metrics
+    body with no `series` member as an empty request: the Agent posts `{}` to each route when it
+    starts, and Datadog answers that `202`.
 
 ## Alternatives considered
 
@@ -234,8 +248,11 @@ Three facts from the survey drive the shape of the decision:
 - The Agent-equivalent trace processor (normalization, `_top_level`, sampler tags, a stats
   concentrator) for the no-Agent topology is a follow-up plan, not this one; until it exists the
   tracer-direct topology runs through `datadog_trace_out` and a real Agent.
-- Nine survey facts remain unverified against Datadog's closed backend and are settled by the
-  plan's W7 against a trial org and a real Agent; whichever changes a decision here amends it.
+- The plan's W7b settled the survey facts that needed a trial org: sketches, distribution points
+  (gzip or zlib, not raw deflate), `/api/v0.2/traces` and `/api/v0.2/stats` from a sender that
+  isn't an Agent, the series size cap, deduplication, and the stale windows. One changed a
+  decision (decision 14). Whether the intake accepts a stats sketch whose gamma isn't 1.0202 stays
+  open, because nothing in `logit` sends one yet.
 - The hand-rolled `DdSketch` store measures +4.2% CPU on `aggregate` and +4.4% on `json-parse` on
   the perf VM, both sketch-heavy paths, and no measurable cost anywhere else
   ([`docs/design/performance.md`](../design/performance.md) §9). Accepted: bin-for-bin Datadog
@@ -244,6 +261,5 @@ Three facts from the survey drive the shape of the decision:
   the deferral `datadog_in`'s is (decision 11); the tracer short-timeout, no-retry behavior behind
   that is UNVERIFIED until W7.
 - `statsd_in`/`statsd_out`'s `unix_stream` framing and `datadog_trace_in`'s `0666` socket mode
-  are UNVERIFIED until W7 (decision 12), as is `datadog_trace_out`'s Unix-socket client
-  (decision 13). A `unix` `statsd_out` whose receiver restarts mid-batch
+  are UNVERIFIED until W7 (decision 12). A `unix` `statsd_out` whose receiver restarts mid-batch
   fails that batch under the sink's usual rules; only a restart between batches is absorbed.

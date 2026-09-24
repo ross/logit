@@ -1762,7 +1762,7 @@
               "type": "string"
             },
             "compression": {
-              "description": "How request bodies are compressed. `gzip`, the default, gzips every route except distribution points, which Datadog accepts only zlib-deflated; `none` sends every body uncompressed.",
+              "description": "How request bodies are compressed. `gzip`, the default, gzips every route except distribution points, which are zlib-deflated, and events, which Datadog accepts only uncompressed; `none` sends every body uncompressed.",
               "default": "gzip",
               "allOf": [
                 {
@@ -2641,7 +2641,7 @@
       "description": "How `datadog_out` compresses its request bodies.",
       "oneOf": [
         {
-          "description": "gzip on every route but distribution points, which get zlib-wrapped deflate.",
+          "description": "gzip on every route but distribution points, which get zlib-wrapped deflate, and events, which go uncompressed.",
           "type": "string",
           "enum": [
             "gzip"
