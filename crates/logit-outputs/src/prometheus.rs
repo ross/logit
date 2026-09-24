@@ -100,12 +100,14 @@
 //! | Header | Value |
 //! |---|---|
 //! | `Content-Type` | [`remote_write::Version::content_type`] -- `application/x-protobuf;proto=prometheus.WriteRequest` for `version: 1`, `…;proto=io.prometheus.write.v2.Request` for `2` |
-//! | `Content-Encoding` | `snappy` -- the Snappy **block** format (`snap::raw`), never the framed one |
+//! | `Content-Encoding` | `compression:` -- `snappy`, the Snappy **block** format, never the framed one; or `zstd`, the VictoriaMetrics remote write protocol ([`compression`]) |
 //! | `X-Prometheus-Remote-Write-Version` | [`remote_write::Version::header_version`] -- `0.1.0` for 1.0 (the spec's own historical number), `2.0.0` for 2.0 |
 //! | `User-Agent` | `logit/<version>` |
 //!
-//! No negotiation and no fallback between versions: the operator picks the one their receiver
-//! speaks, as they pick an exposition dialect.
+//! No negotiation and no fallback between versions or encodings: the operator picks the one their
+//! receiver speaks, as they pick an exposition dialect. Rule 56 rejects `zstd` with `version: 2`,
+//! which mandates Snappy
+//! ([ADR `victoriametrics-interop`](../../../docs/adr/victoriametrics-interop.md)).
 //!
 //! **Timestamp partition, merged `TimeSeries`.** A remote-write `TimeSeries` is one label set and
 //! N samples; a `Series` is one label set and one point. So [`RemoteWriteOutput::send`] partitions
@@ -134,7 +136,7 @@
 //! |---|---|
 //! | 2xx | `Ok` |
 //! | 429, any 5xx | [`Fault::Ambiguous`] -- the request reached the server and may have been partly applied |
-//! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange |
+//! | any 3xx, any other 4xx | [`Fault::Permanent`], with the status and the first 256 bytes of the response body in the message and in a throttled `remote_write_rejected` diagnostic: Prometheus's own `400` text names the offending series and is the only useful thing in the exchange. Under `compression: zstd`, a `415` or `400` also names `compression: snappy` as the likely remedy, since those are the statuses a receiver that doesn't take zstd answers |
 //! | connect failure | [`Fault::Clean`] -- the destination provably never saw it |
 //! | any other transport error, timeout included | [`Fault::Ambiguous`] |
 //!
@@ -232,6 +234,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use logit_core::{Diagnostics, Event, EventBatch, Exemplar, Telemetry};
 use logit_pipeline::{Fault, Output};
+use logit_proto::prometheus::compression::{self, Encoding};
 use logit_proto::prometheus::{
     events_to_families, remote_write, text, Dialect, FamilyType, MetricFamily, Point,
     PrometheusEncoder, Series,
@@ -742,6 +745,7 @@ pub struct RemoteWriteOutput {
     /// and authority.
     endpoint: String,
     version: remote_write::Version,
+    encoding: Encoding,
     request_timeout: Duration,
     client: reqwest::Client,
     /// The operator's `headers:`, built once; see [`RemoteWriteOutput::request_headers`].
@@ -761,6 +765,7 @@ impl RemoteWriteOutput {
         Self {
             endpoint: endpoint.into(),
             version: remote_write::Version::V1,
+            encoding: Encoding::Snappy,
             request_timeout: DEFAULT_ENDPOINT_TIMEOUT,
             client: build_client(DEFAULT_ENDPOINT_TIMEOUT, None),
             headers: HeaderMap::new(),
@@ -774,6 +779,12 @@ impl RemoteWriteOutput {
     /// Which remote-write message to send (`version:`). No negotiation, no fallback.
     pub fn with_version(mut self, version: remote_write::Version) -> Self {
         self.version = version;
+        self
+    }
+
+    /// How each request body is compressed (`compression:`). No negotiation, no fallback.
+    pub fn with_compression(mut self, encoding: Encoding) -> Self {
+        self.encoding = encoding;
         self
     }
 
@@ -871,7 +882,7 @@ impl RemoteWriteOutput {
         );
         headers.insert(
             http::header::CONTENT_ENCODING,
-            HeaderValue::from_static(logit_proto::prometheus::compression::CONTENT_ENCODING_SNAPPY),
+            HeaderValue::from_static(self.encoding.as_str()),
         );
         headers.insert(
             HeaderName::from_static(remote_write::HEADER_VERSION),
@@ -920,12 +931,9 @@ impl Output for RemoteWriteOutput {
         }
         let (body, samples) =
             remote_write::encode_counted(&groups, self.version, &mut self.encoder);
-        // Snappy block format (`snap::raw`), what both specs mean by `Content-Encoding: snappy`,
-        // never the framed `snap::write`. Errors only past `u32::MAX`; reported, not unwrapped,
-        // so an absurd batch fails alone.
-        let compressed = snap::raw::Encoder::new()
-            .compress_vec(&body)
-            .context("snappy-compressing a remote-write request body")?;
+        // Errors only on a Snappy body past `u32::MAX`; reported, not unwrapped, so an absurd
+        // batch fails alone.
+        let compressed = compression::compress(self.encoding, &body)?;
 
         let request_timer = self.telemetry.timer(REQUEST_DURATION);
         let result = self
@@ -956,11 +964,27 @@ impl Output for RemoteWriteOutput {
                 // sample`, a bad label): the only actionable part. Read bounded.
                 let body = read_body_prefix(response, ERROR_BODY_SNIPPET_BYTES).await;
                 let snippet = body_snippet(&body, ERROR_BODY_SNIPPET_BYTES);
+                // A receiver that doesn't take zstd answers `415` (Prometheus, Mimir) or `400`,
+                // the two statuses vmagent's own downgrade keys on. Still permanent: there is no
+                // fallback, so the operator gets the remedy instead.
+                let hint = if self.encoding == Encoding::Zstd
+                    && matches!(
+                        status,
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::BAD_REQUEST
+                    ) {
+                    " (the receiver may not accept zstd; set 'compression: snappy')"
+                } else {
+                    ""
+                };
                 self.diag.warn_throttled(
                     "remote_write_rejected",
-                    format_args!("remote-write to {} failed ({status}): {snippet}", self.endpoint),
+                    format_args!(
+                        "remote-write to {} failed ({status}): {snippet}{hint}",
+                        self.endpoint
+                    ),
                 );
-                Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}")).context(fault)
+                Err(anyhow::anyhow!("remote-write failed ({status}): {snippet}{hint}"))
+                    .context(fault)
             }
             Err(err) => {
                 self.telemetry.count(REQUESTS, 1.0, &[("class", "network_error")]);
@@ -1857,7 +1881,7 @@ mod tests {
         method: Method,
         path: String,
         headers: http::HeaderMap,
-        /// Still Snappy-compressed, as it arrived.
+        /// Still compressed, as it arrived.
         body: Vec<u8>,
     }
 
@@ -1866,12 +1890,21 @@ mod tests {
             self.headers.get(name).and_then(|v| v.to_str().ok())
         }
 
-        /// The body decompressed as Snappy block format, so decoding at all proves the sink didn't
-        /// use the framed format.
+        /// The body decompressed by its own `Content-Encoding`. Snappy goes through `snap::raw`
+        /// directly, so decoding at all proves the sink didn't use the framed format; zstd goes
+        /// through the shared bounded decoder, whose `ruzstd` decoder is independent of the
+        /// encoder the sink used.
         fn decompressed(&self) -> Vec<u8> {
-            snap::raw::Decoder::new()
-                .decompress_vec(&self.body)
-                .expect("the body should be a snappy block")
+            match self.header("content-encoding") {
+                Some("snappy") => snap::raw::Decoder::new()
+                    .decompress_vec(&self.body)
+                    .expect("the body should be a snappy block"),
+                Some("zstd") => {
+                    compression::decompress_bounded(Encoding::Zstd, &self.body, 64 * 1024 * 1024)
+                        .expect("the body should be zstd")
+                }
+                other => panic!("unexpected content-encoding {other:?}"),
+            }
         }
 
         fn as_v1(&self) -> pb1::WriteRequest {
@@ -2118,6 +2151,26 @@ mod tests {
             request.header("user-agent"),
             Some(concat!("logit/", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    /// `compression: zstd` changes the `Content-Encoding` and the body, and nothing else.
+    #[tokio::test]
+    async fn zstd_compression_switches_the_content_encoding_and_the_body() {
+        let (url, seen) = canned_receiver(StatusCode::OK, "").await;
+        let mut sink = sender(&url).with_compression(Encoding::Zstd);
+        sink.send(&counter_batch(1_700_000_000_000_000_000, 5.0)).await.expect("2xx is Ok");
+
+        let request = only(&seen);
+        assert_eq!(request.header("content-encoding"), Some("zstd"));
+        assert_eq!(
+            request.header("content-type"),
+            Some("application/x-protobuf;proto=prometheus.WriteRequest")
+        );
+        assert_eq!(request.header("x-prometheus-remote-write-version"), Some("0.1.0"));
+        assert_eq!(&request.body[..4], &[0x28, 0xb5, 0x2f, 0xfd], "a zstd frame's magic");
+        let decoded = request.as_v1();
+        assert_eq!(decoded.timeseries.len(), 1);
+        assert_eq!(decoded.timeseries[0].samples[0].value, 5.0);
     }
 
     #[tokio::test]
@@ -2374,6 +2427,29 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("400"), "got: {message}");
         assert!(message.contains("out of order sample"), "got: {message}");
+    }
+
+    /// Under zstd, a `415` or `400` names the remedy and stays permanent; a Snappy sender's
+    /// `415`, and a zstd sender's `403`, don't.
+    #[tokio::test]
+    async fn a_415_or_400_under_zstd_names_compression_snappy_as_the_remedy() {
+        for (status, encoding, hinted) in [
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, Encoding::Zstd, true),
+            (StatusCode::BAD_REQUEST, Encoding::Zstd, true),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, Encoding::Snappy, false),
+            (StatusCode::FORBIDDEN, Encoding::Zstd, false),
+        ] {
+            let (url, _seen) = canned_receiver(status, "unsupported").await;
+            let mut sink = sender(&url).with_compression(encoding);
+            let err = sink.send(&counter_batch(1_000_000_000, 1.0)).await.expect_err("a 4xx");
+            assert_eq!(logit_pipeline::classify(&err), Fault::Permanent, "{status} {encoding:?}");
+            let message = format!("{err:#}");
+            assert_eq!(
+                message.contains("set 'compression: snappy'"),
+                hinted,
+                "{status} {encoding:?}: {message}"
+            );
+        }
     }
 
     /// A `500` with an endless body still classifies as a `5xx` promptly: the read stops.
