@@ -270,7 +270,21 @@ script is needed. This list is filled in as each workstream lands.
 - **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):** to be listed when `dur/w5`
   lands.
 - **`dur/w6`, the tail checkpoint (TAIL-05):** to be listed when `dur/w6` lands.
-- **`dur/w7`, `file_out` rotation (DISK-10):** to be listed when `dur/w7` lands.
+- **`dur/w7`, `file_out` rotation (DISK-10):**
+  - `crates/logit-outputs/src/file.rs`:
+    - `a_crash_at_any_rotation_step_loses_no_line_and_duplicates_none_after_restart`: for
+      `max_files` 2 and 3 with full retained history, pins the recorded operation order of one
+      rotation (commit-point rename before any retained file), then freezes at each operation in
+      turn, restarts, and writes on. No retained file changes before the commit point, and
+      afterwards the lines across `.N`, `.rotating`, and the active file are an in-order suffix of
+      everything written, with no duplicate, no orphan left, and every generation present.
+    - `promote_staged_keeps_every_generation_in_suffix_order_for_max_files_two_through_six`: the
+      cascade leaves `.N` holding the Nth-newest file for each `max_files` from 2 to 6.
+    - `a_failed_truncate_under_max_files_one_is_not_rotated_and_keeps_writing_to_the_existing_file`:
+      `rotate_failure` and `NotRotated`; later batches land in the existing file and retry the
+      truncate.
+  - `crates/logit-pipeline/src/graph.rs`: `file_out_with_max_files_over_the_ceiling_is_rejected`
+    and `file_out_with_max_files_at_the_ceiling_is_accepted` (decision 9).
 
 ## Consequences
 

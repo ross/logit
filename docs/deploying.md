@@ -311,6 +311,8 @@ budget spent
 **`file_out` never fsyncs**, with or without a `buffer.disk:` block: a power loss can lose its most
 recent writes or an in-progress rotation, by design
 ([ADR `rotating-file-output`](adr/rotating-file-output.md#amendment-file_out-makes-no-durability-promise-2026-09-24)).
+Its `rotate.max_files` can't exceed 1000 (999 rotated files plus the active one), because every
+rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
