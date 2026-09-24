@@ -927,9 +927,15 @@ impl DiskQueue {
     /// through the retained handle (opening one only if none is retained).
     ///
     /// The `flush` first waits for a cancelled push's write that is still running on a blocking
-    /// thread, and clears the error tokio stores from a failed one (which would otherwise fail
-    /// the next write). Its result doesn't matter: the truncate discards those bytes either way.
-    /// Truncating through any other handle wouldn't wait, and the write could land after it.
+    /// thread, and surfaces and clears the error tokio stores from a failed one
+    /// (`last_write_err`, tokio 1.53.1 `src/fs/file.rs:1096`, `:1104`), which would otherwise
+    /// fail the next write. A failed flush is counted `op="flush"` and diagnosed, and the repair
+    /// goes on: the truncate discards those bytes either way, and `set_len`'s own
+    /// `complete_inflight` still waits for the orphaned write. Truncating through any other
+    /// handle wouldn't wait, and the write could land after it.
+    ///
+    /// Untested: the error-clearing role. The `fault` seam fails an operation instead of running
+    /// it, so no test makes a real write fail inside tokio; that role rests on tokio's source.
     ///
     /// A failed truncate is counted `op="truncate"` and diagnosed, fails this push, and leaves
     /// `needs_repair` set, so nothing is written or rotated until a later push repairs.
@@ -942,7 +948,9 @@ impl DiskQueue {
         let path = segment_path(&self.dir, seq);
         let truncated = match held.file.as_mut() {
             Some(file) => {
-                let _ = file.flush().await;
+                if let Err(err) = fault_io!(SEGMENT_FLUSH, &path, seq, file.flush().await) {
+                    self.count_fs_error("flush", format_args!("flushing segment {seq}"), &err);
+                }
                 fault_io!(SEGMENT_SET_LEN, &path, seq, file.set_len(before).await)
             }
             None => {

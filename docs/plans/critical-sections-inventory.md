@@ -2150,6 +2150,10 @@ surveyor's.
   the compression test failed against the pre-fix code, as did the `spool_model_*` proptest.
   `a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push` passed there (bytes
   already on disk are truncated by any descriptor) and guards the repair's flush-then-truncate.
+  Test gap: the `fault` seam fails an operation instead of running it, so no test makes a real
+  write fail inside tokio. The repair flush's role of surfacing and clearing a failed orphan's
+  stored error is argued from tokio's source (`last_write_err`, `src/fs/file.rs:1096`, `:1104`),
+  not exercised.
 
 ---
 
@@ -2198,7 +2202,7 @@ surveyor's.
   (`a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed`, `a_failed_directory_fsync_is_counted`,
   `a_failed_segment_unlink_is_counted`); `a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation`
   confirms the self-heal. The fresh-fd `sync_data` holds (Linux `fsync(2)` flushes the inode, not the fd); moving it
-  to the retained write handle is `dur/w4`.
+  to the retained write handle is #331.
 
 ---
 
