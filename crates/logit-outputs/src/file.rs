@@ -14,7 +14,8 @@
 
 use anyhow::Context;
 use logit_core::Diagnostics;
-use logit_pipeline::Fault;
+use logit_pipeline::fault::{sites, Op, Point};
+use logit_pipeline::{fault_io, Fault};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
@@ -144,15 +145,27 @@ impl RotationState {
     }
 }
 
-/// The result of [`FileTarget::rotate`]. `NotRotated`: the active file's rename failed, nothing
-/// on disk changed, and the target keeps writing to its open handle. Not an error, but never
-/// counted in `logit.output.file.rotations`.
+/// The result of [`FileTarget::rotate`]. `NotRotated`: the active file's rename (or, under
+/// `max_files: 1`, its truncate) failed, nothing on disk changed, and the target keeps writing to
+/// its open handle. Not an error, but never counted in `logit.output.file.rotations`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum RotateOutcome {
     Rotated,
     NotRotated,
 }
+
+// Every filesystem mutation below is preceded by `fault::check` at one of these points
+// (`docs/adr/durable-checkpoint-writes-and-fault-injection.md`, decision 8). A retained file's
+// `arg` is its generation `N`; every other point passes 0.
+const ACTIVE_OPEN: Point = Point::new(sites::FILE_OUT_ACTIVE, Op::Open);
+const ACTIVE_TRUNCATE: Point = Point::new(sites::FILE_OUT_ACTIVE, Op::SetLen);
+const ACTIVE_WRITE: Point = Point::new(sites::FILE_OUT_ACTIVE, Op::Write);
+const ACTIVE_FLUSH: Point = Point::new(sites::FILE_OUT_ACTIVE, Op::Flush);
+const ACTIVE_RENAME: Point = Point::new(sites::FILE_OUT_ACTIVE, Op::Rename);
+const STAGING_RENAME: Point = Point::new(sites::FILE_OUT_STAGING, Op::Rename);
+const RETAINED_RENAME: Point = Point::new(sites::FILE_OUT_RETAINED, Op::Rename);
+const RETAINED_UNLINK: Point = Point::new(sites::FILE_OUT_RETAINED, Op::Unlink);
 
 /// Opens the active file at `path`, creating it if needed. `truncate: true` is `max_files: 1`'s
 /// in-place rotation; otherwise it appends.
@@ -181,7 +194,7 @@ pub struct FileTarget {
 impl FileTarget {
     pub fn open(path: impl AsRef<Path>, policy: RotatePolicy) -> anyhow::Result<Self> {
         let path = path.as_ref();
-        let std_file = open_active(path, false)
+        let std_file = fault_io!(ACTIVE_OPEN, path, 0, open_active(path, false))
             .with_context(|| format!("opening file target {}", path.display()))?;
         let metadata = std_file.metadata().ok();
         let written = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -202,26 +215,28 @@ impl FileTarget {
     /// Re-opens the active file if `self.file` is `None`, so a write after a failed post-rotation
     /// re-open heals itself. A failure is `Fault::Clean` for the reason [`FileTarget::rotate`]
     /// gives.
-    fn ensure_open(&mut self) -> anyhow::Result<&mut tokio::fs::File> {
+    fn ensure_open(&mut self) -> anyhow::Result<()> {
         if self.file.is_none() {
-            let std_file = open_active(&self.path, false)
+            let std_file = fault_io!(ACTIVE_OPEN, &self.path, 0, open_active(&self.path, false))
                 .with_context(|| format!("re-opening {} for write", self.path.display()))
                 .context(Fault::Clean)?;
             self.file = Some(tokio::fs::File::from_std(std_file));
         }
-        Ok(self.file.as_mut().expect("just set to Some above if it was None"))
+        Ok(())
     }
 
     /// Writes `bytes` to the active file, re-opening it first if a rotation's re-open failed.
     pub async fn write_all(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.ensure_open()?.write_all(bytes).await?;
+        self.ensure_open()?;
+        let file = self.file.as_mut().expect("ensure_open leaves a handle");
+        fault_io!(ACTIVE_WRITE, &self.path, 0, file.write_all(bytes).await)?;
         Ok(())
     }
 
     /// Flushes the active file to the OS (no `fsync`); a no-op with no open handle.
     pub async fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(file) = self.file.as_mut() {
-            file.flush().await?;
+            fault_io!(ACTIVE_FLUSH, &self.path, 0, file.flush().await)?;
         }
         Ok(())
     }
@@ -266,7 +281,12 @@ impl FileTarget {
         let max_files = self.state.policy.max_files.max(1);
         let oldest = self.rotated_path(max_files - 1);
         if oldest.exists() {
-            if let Err(e) = std::fs::remove_file(&oldest) {
+            if let Err(e) = fault_io!(
+                RETAINED_UNLINK,
+                &oldest,
+                u64::from(max_files - 1),
+                std::fs::remove_file(&oldest)
+            ) {
                 diag.warn_throttled(
                     "retention_failure",
                     format_args!("removing {}: {e}", oldest.display()),
@@ -277,7 +297,9 @@ impl FileTarget {
             let from = self.rotated_path(n);
             if from.exists() {
                 let to = self.rotated_path(n + 1);
-                if let Err(e) = std::fs::rename(&from, &to) {
+                if let Err(e) =
+                    fault_io!(RETAINED_RENAME, &from, u64::from(n), std::fs::rename(&from, &to))
+                {
                     diag.warn_throttled(
                         "retention_failure",
                         format_args!("renaming {} to {}: {e}", from.display(), to.display()),
@@ -287,7 +309,8 @@ impl FileTarget {
         }
 
         let rotated = self.rotated_path(1);
-        if let Err(e) = std::fs::rename(&staging, &rotated) {
+        if let Err(e) = fault_io!(STAGING_RENAME, &staging, 0, std::fs::rename(&staging, &rotated))
+        {
             diag.warn_throttled(
                 "retention_failure",
                 format_args!("renaming {} to {}: {e}", staging.display(), rotated.display()),
@@ -311,11 +334,10 @@ impl FileTarget {
     /// Failure policy:
     ///
     /// - Flushing before rotating: unclassified `Err`.
-    /// - Renaming the active file to its staging path: `rotate_failure` and
-    ///   [`RotateOutcome::NotRotated`]; nothing on disk or in state changed, so the next write
-    ///   retries.
-    /// - Re-opening `path` after the rename, or the `max_files: 1` truncate: `Err` with
-    ///   [`Fault::Clean`].
+    /// - Renaming the active file to its staging path, or the `max_files: 1` truncate:
+    ///   `rotate_failure` and [`RotateOutcome::NotRotated`]; nothing on disk or in state
+    ///   changed, so the next write retries.
+    /// - Re-opening `path` after the rename: `Err` with [`Fault::Clean`].
     /// - Cascading or promoting a retained file: `retention_failure`, continue.
     ///
     /// A re-open failure is `Fault::Clean`: the batch provably reached no file, so a retry is safe
@@ -334,23 +356,29 @@ impl FileTarget {
         open: fn(&Path, bool) -> std::io::Result<std::fs::File>,
     ) -> anyhow::Result<RotateOutcome> {
         if let Some(file) = self.file.as_mut() {
-            file.flush()
-                .await
+            fault_io!(ACTIVE_FLUSH, &self.path, 0, file.flush().await)
                 .with_context(|| format!("flushing {} before rotation", self.path.display()))?;
         }
 
         let max_files = self.state.policy.max_files.max(1);
         if max_files == 1 {
             // No room for a `.1`: start an empty file in place.
-            return match open(&self.path, true) {
+            return match fault_io!(ACTIVE_TRUNCATE, &self.path, 0, open(&self.path, true)) {
                 Ok(std_file) => {
                     self.file = Some(tokio::fs::File::from_std(std_file));
                     self.state.reset();
                     Ok(RotateOutcome::Rotated)
                 }
-                Err(e) => Err(e)
-                    .with_context(|| format!("re-opening {} after rotation", self.path.display()))
-                    .context(Fault::Clean),
+                // As with the commit-point rename below: the flushed handle and the rotation
+                // state are untouched, so this batch lands in the existing file and the next
+                // write retries.
+                Err(e) => {
+                    diag.warn_throttled(
+                        "rotate_failure",
+                        format_args!("truncating {}: {e}", self.path.display()),
+                    );
+                    Ok(RotateOutcome::NotRotated)
+                }
             };
         }
 
@@ -360,7 +388,9 @@ impl FileTarget {
         // Commit point. On failure nothing rotated: keep the flushed handle and retry on the
         // next write rather than failing the sink over a possibly transient permissions issue.
         let staging = self.staging_path();
-        if let Err(e) = std::fs::rename(&self.path, &staging) {
+        if let Err(e) =
+            fault_io!(ACTIVE_RENAME, &self.path, 0, std::fs::rename(&self.path, &staging))
+        {
             diag.warn_throttled(
                 "rotate_failure",
                 format_args!("renaming {} to {}: {e}", self.path.display(), staging.display()),
@@ -371,15 +401,16 @@ impl FileTarget {
         self.file = None;
         self.state.reset();
 
-        let reopened: anyhow::Result<()> = match open(&self.path, false) {
-            Ok(std_file) => {
-                self.file = Some(tokio::fs::File::from_std(std_file));
-                Ok(())
-            }
-            Err(e) => Err(e)
-                .with_context(|| format!("re-opening {} after rotation", self.path.display()))
-                .context(Fault::Clean),
-        };
+        let reopened: anyhow::Result<()> =
+            match fault_io!(ACTIVE_OPEN, &self.path, 0, open(&self.path, false)) {
+                Ok(std_file) => {
+                    self.file = Some(tokio::fs::File::from_std(std_file));
+                    Ok(())
+                }
+                Err(e) => Err(e)
+                    .with_context(|| format!("re-opening {} after rotation", self.path.display()))
+                    .context(Fault::Clean),
+            };
 
         // Whether or not the re-open succeeded, so the staged file still reaches `.1`.
         self.promote_staged(diag);
@@ -420,6 +451,7 @@ mod tests {
     use super::test_support::scratch_dir;
     use super::*;
     use logit_core::Registry;
+    use logit_pipeline::fault::{self, errno};
 
     fn diag() -> Diagnostics {
         Diagnostics::new("test")
@@ -893,25 +925,212 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_truncate_under_max_files_one_keeps_the_existing_file_and_never_creates_a_dot_1(
+    async fn a_failed_truncate_under_max_files_one_is_not_rotated_and_keeps_writing_to_the_existing_file(
     ) {
         let dir = scratch_dir("failed-truncate-max-files-one");
         let path = dir.join("events.log");
         let policy = RotatePolicy { max_bytes: Some(1), interval: None, max_files: 1 };
         let mut target = FileTarget::open(&path, policy).expect("open");
-        target.write_all(b"old").await.unwrap();
-        target.note_written(0, 3);
+        send(&mut target, b"old\n").await.expect("the first batch never rotates");
 
-        let err = target
-            .rotate_with(&mut diag(), failing_open)
-            .await
-            .expect_err("a failed truncate should propagate as an error");
-        assert_eq!(logit_pipeline::classify(&err), logit_pipeline::Fault::Clean);
+        let scope = fault::scope(&dir);
+        scope.fail(ACTIVE_TRUNCATE, errno::EACCES);
+        let registry = Registry::new();
+        let mut diag =
+            Diagnostics::new("f").with_telemetry(registry.telemetry_for("f", "file_out", "sink"));
+        let outcome = target.rotate(&mut diag).await.expect("a failed truncate must not be fatal");
+        assert_eq!(outcome, RotateOutcome::NotRotated);
+        assert_eq!(reported_diagnostic_keys(&registry), vec!["rotate_failure"]);
+        assert_eq!(target.state.written, 4, "a failed truncate must leave written untouched");
+        assert!(target.should_rotate(0, 1), "the next batch re-attempts the rotation");
 
-        target.flush().await.unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        for batch in [b"b1\n", b"b2\n"] {
+            send(&mut target, batch).await.expect("the batch is written, not dropped");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\nb1\nb2\n");
+
+        // With the fault gone, the very next batch's re-attempt truncates.
+        drop(scope);
+        send(&mut target, b"b3\n").await.expect("rotate and write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b3\n");
         assert!(!dir.join("events.log.1").exists(), "max_files: 1 must never create a .1");
-        assert_eq!(target.state.written, 3, "a failed truncate must leave written untouched");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Crash matrix: a freeze at every filesystem operation of one rotation ---
+
+    /// `StreamOutput::send`'s file-target sequence, at a fixed clock.
+    async fn send(target: &mut FileTarget, bytes: &[u8]) -> anyhow::Result<()> {
+        if target.should_rotate(0, bytes.len()) {
+            let _ = target.rotate(&mut diag()).await?;
+        }
+        target.note_written(0, bytes.len());
+        target.write_all(bytes).await?;
+        target.flush().await
+    }
+
+    /// Ten bytes, so under [`one_line_per_file`] every file holds exactly one line.
+    fn line(i: usize) -> String {
+        format!("line-{i:04}\n")
+    }
+
+    fn one_line_per_file(max_files: u32) -> RotatePolicy {
+        RotatePolicy { max_bytes: Some(10), interval: None, max_files }
+    }
+
+    fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    /// Every line in every file the target could have left, oldest first: `.N` from past
+    /// `max_files` down to `.1`, then `.rotating` (always newer than every `.N`), then `path`.
+    fn lines_oldest_first(path: &Path, max_files: u32) -> Vec<String> {
+        let mut files: Vec<PathBuf> =
+            (1..max_files + 3).rev().map(|n| suffixed(path, &format!(".{n}"))).collect();
+        files.push(suffixed(path, ".rotating"));
+        files.push(path.to_path_buf());
+        files
+            .iter()
+            .filter_map(|f| std::fs::read_to_string(f).ok())
+            .flat_map(|text| text.lines().map(|l| format!("{l}\n")).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// The contents of `.1` through `.{max_files - 1}`, and whether `.rotating` exists.
+    fn retained_snapshot(path: &Path, max_files: u32) -> (Vec<Option<String>>, bool) {
+        let retained = (1..max_files)
+            .map(|n| std::fs::read_to_string(suffixed(path, &format!(".{n}"))).ok())
+            .collect();
+        (retained, suffixed(path, ".rotating").exists())
+    }
+
+    /// Lines written before the rotating one: enough that every retained generation exists and
+    /// retention has already deleted some.
+    const HISTORY: usize = 8;
+
+    /// Writes [`HISTORY`] lines, then records every operation the next line's send (which
+    /// rotates) reaches.
+    async fn record_one_rotation(max_files: u32) -> Vec<Point> {
+        let dir = scratch_dir(&format!("crash-record-{max_files}"));
+        let path = dir.join("events.log");
+        let mut target = FileTarget::open(&path, one_line_per_file(max_files)).expect("open");
+        for i in 0..HISTORY {
+            send(&mut target, line(i).as_bytes()).await.expect("history write");
+        }
+        let scope = fault::scope(&dir);
+        scope.record();
+        send(&mut target, line(HISTORY).as_bytes()).await.expect("a clean rotation");
+        let points = scope.hits().iter().map(|hit| hit.point).collect();
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+        points
+    }
+
+    /// [`record_one_rotation`]'s setup, but freezing at the `n`th hit of `point`. Then drops the
+    /// target, revives, reopens a fresh one on the same path, writes two more lines (so at least
+    /// one rotation runs after the restart), and checks the oracle. `before_commit`: the crash
+    /// point precedes the commit-point rename.
+    async fn crash_and_restart(max_files: u32, point: Point, n: u64, before_commit: bool) {
+        let label = format!("max_files {max_files}, crash at {point:?} #{n}");
+        let dir = scratch_dir(&format!("crash-matrix-{max_files}"));
+        let path = dir.join("events.log");
+        let policy = one_line_per_file(max_files);
+        let mut target = FileTarget::open(&path, policy).expect("open");
+        for i in 0..HISTORY {
+            send(&mut target, line(i).as_bytes()).await.expect("history write");
+        }
+        let before = retained_snapshot(&path, max_files);
+
+        let scope = fault::scope(&dir);
+        scope.crash_at(point, n);
+        let rotating_line = line(HISTORY);
+        let result = send(&mut target, rotating_line.as_bytes()).await;
+        assert!(scope.crashed(), "{label}: the crash point was never reached");
+        assert!(result.is_err(), "{label}: a frozen send can't succeed");
+        if before_commit {
+            assert_eq!(retained_snapshot(&path, max_files), before, "{label}: retained touched");
+        }
+
+        // The seam can't recall a write tokio already handed to its blocking pool (`fault.rs`'s
+        // "Limitation"), so settle it outside the seam: it lands, as it would after a kill -9
+        // that followed the write syscall.
+        if let Some(file) = target.file.as_mut() {
+            let _ = file.flush().await;
+        }
+        drop(target);
+        scope.revive();
+
+        let mut target = FileTarget::open(&path, policy).expect("reopen after the crash");
+        let after = [line(HISTORY + 1), line(HISTORY + 2)];
+        for l in &after {
+            send(&mut target, l.as_bytes()).await.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        }
+
+        let present = lines_oldest_first(&path, max_files);
+        let mut written: Vec<String> = (0..HISTORY).map(line).collect();
+        if present.contains(&rotating_line) {
+            written.push(rotating_line);
+        }
+        written.extend(after);
+        assert!(
+            present.len() <= written.len() && present == written[written.len() - present.len()..],
+            "{label}: {present:?} is not an in-order suffix of {written:?} without duplicates"
+        );
+        assert_eq!(present.len(), max_files as usize, "{label}: a generation went missing");
+        assert!(!suffixed(&path, ".rotating").exists(), "{label}: an orphan was never promoted");
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_crash_at_any_rotation_step_loses_no_line_and_duplicates_none_after_restart() {
+        for max_files in [2, 3] {
+            let points = record_one_rotation(max_files).await;
+            let commit = points.iter().position(|p| *p == ACTIVE_RENAME).expect("a commit rename");
+            let first_retention = points
+                .iter()
+                .position(|p| p.site != sites::FILE_OUT_ACTIVE)
+                .expect("a retention step");
+            assert!(commit < first_retention, "the commit point runs first: {points:?}");
+            // Every generation exists, so the rotation unlinks the oldest and cascades the rest.
+            let cascade = vec![RETAINED_RENAME; max_files as usize - 2];
+            let expected: Vec<Point> = [ACTIVE_FLUSH, ACTIVE_RENAME, ACTIVE_OPEN, RETAINED_UNLINK]
+                .into_iter()
+                .chain(cascade)
+                .chain([STAGING_RENAME, ACTIVE_WRITE, ACTIVE_FLUSH])
+                .collect();
+            assert_eq!(points, expected, "max_files {max_files}");
+            for (index, point) in points.iter().enumerate() {
+                let n = points[..=index].iter().filter(|p| *p == point).count() as u64;
+                crash_and_restart(max_files, *point, n, index <= commit).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_staged_keeps_every_generation_in_suffix_order_for_max_files_two_through_six() {
+        for max_files in 2..=6u32 {
+            let dir = scratch_dir(&format!("promote-{max_files}"));
+            let path = dir.join("events.log");
+            let mut target = FileTarget::open(&path, one_line_per_file(max_files)).expect("open");
+            let total = 2 * max_files as usize + 1;
+            for i in 0..total {
+                send(&mut target, line(i).as_bytes()).await.expect("write");
+            }
+
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), line(total - 1));
+            for n in 1..max_files {
+                assert_eq!(
+                    std::fs::read_to_string(suffixed(&path, &format!(".{n}"))).unwrap(),
+                    line(total - 1 - n as usize),
+                    "max_files {max_files}: .{n}"
+                );
+            }
+            assert!(!suffixed(&path, &format!(".{max_files}")).exists(), "max_files {max_files}");
+            assert!(!suffixed(&path, ".rotating").exists(), "max_files {max_files}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

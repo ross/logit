@@ -1,6 +1,6 @@
 ---
 created: 2026-09-20
-updated: 2026-09-21
+updated: 2026-09-24
 ---
 
 # Verification plan: critical sections inventory
@@ -175,13 +175,13 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-02](#tail-02--start-offset-selection-inode-rebinding-and-the-resume-map) | P0 | Start-offset selection, inode rebinding, and the `resume` map | `crates/logit-inputs/src/tail/driver.rs:525-628` | unreviewed |
 | [TAIL-03](#tail-03--read--split--decode--batch-hot-loop-and-its-backpressure-contract) | P0 | Read → split → decode → batch hot loop, and its backpressure contract | `crates/logit-inputs/src/tail/driver.rs:636-661` | unreviewed |
 | [TAIL-04](#tail-04--linesplitter-framing-partial-carry-over-and-max_line_bytes-drop-semantics) | P0 | `LineSplitter`: framing, partial carry-over, and `max_line_bytes` drop semantics | `crates/logit-inputs/src/tail/line.rs:77-162` | unreviewed |
-| [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs:59-158` | unreviewed |
+| [TAIL-05](#tail-05--checkpoint-persistence-atomicity-durability-and-the-corrupt-file-fallback) | P0 | Checkpoint persistence: atomicity, durability, and the corrupt-file fallback | `crates/logit-inputs/src/tail/checkpoint.rs:59-158` | findings → #327 |
 | [TAIL-09](#tail-09--docker-json-file-envelope-decode-and-16-kib-partial-line-reassembly) | P0 | Docker json-file envelope decode and 16 KiB partial-line reassembly | `crates/logit-inputs/src/docker.rs:141-154` | unreviewed |
-| [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | unreviewed |
-| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | unreviewed |
-| [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | unreviewed |
-| [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | unreviewed |
-| [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | unreviewed |
+| [DISK-01](#disk-01--diskqueueopen--crash-recovery-torn-tail-truncation-cursor-reconciliation) | P0 | DiskQueue::open — crash recovery, torn-tail truncation, cursor reconciliation | `crates/logit-pipeline/src/disk_queue.rs:378-559` | findings → #328 |
+| [DISK-02](#disk-02--record-format-parse_record-and-walk_segments-resync-scan) | P0 | Record format, `parse_record`, and `walk_segment`'s resync scan | `crates/logit-pipeline/src/disk_queue.rs:54-63` | findings → #328 |
+| [DISK-03](#disk-03--diskqueuepush--write_record--torn-write-repair-write_in_flight-cancellation-safety) | P0 | `DiskQueue::push` / `write_record` — torn-write repair, `write_in_flight`, cancellation safety | `crates/logit-pipeline/src/disk_queue.rs:597-729` | findings → #331 |
+| [DISK-06](#disk-06--read-cursor-rollover-segment-deletion-and-checkpoint-cadence) | P0 | Read cursor rollover, segment deletion, and checkpoint cadence | `crates/logit-pipeline/src/disk_queue.rs:1009-1062` | findings → #333 |
+| [DISK-09](#disk-09--sink-shutdown-ordering-run_outputs-close-then-sweep-sinkstorefinish-and-the-at-least-once-window) | P0 | Sink shutdown ordering: `run_output`'s close-then-sweep, `SinkStore::finish`, and the at-least-once window | `crates/logit-pipeline/src/runtime.rs:588-744` | findings → #333 |
 | [RT-01](#rt-01--startup-orchestration-bind-pre-pass-channelfanout-construction-spawn-loop-scaffolding-drop) | P0 | Startup orchestration: bind pre-pass, channel/Fanout construction, spawn loop, scaffolding drop | `crates/logit-pipeline/src/runtime.rs:174-536` | unreviewed |
 | [RT-02](#rt-02--shutdown-signalling-grace-anchoring-and-the-join-loops-first-error-cascade) | P0 | Shutdown signalling, grace anchoring, and the join loop's first-error cascade | `runtime.rs:198-232` | unreviewed |
 | [RT-03](#rt-03--run_outputs-drainwrite-join-the-abandoned-inbox-sweep-and-finish_and_flush-ordering) | P0 | `run_output`'s drain/write join, the abandoned-inbox sweep, and `finish_and_flush` ordering | `runtime.rs:573-744` | unreviewed |
@@ -217,12 +217,12 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [TAIL-07](#tail-07--hand-rolled-inotify-backend-every-unsafesyscall-site-in-this-area) | P1 | Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area | `crates/logit-inputs/src/tail/watch.rs:236-501` | findings → libc/w3 |
 | [TAIL-08](#tail-08--the-runtime-select-wake-routing-timers-and-cancellation-safety) | P1 | The runtime `select!`: wake routing, timers, and cancellation safety | `crates/logit-inputs/src/tail/driver.rs:229-321` | unreviewed |
 | [TAIL-10](#tail-10--configv2json-identity-cache-refresh-and-de-selection) | P1 | `config.v2.json` identity cache, refresh, and de-selection | `crates/logit-inputs/src/docker.rs:325-346` | unreviewed |
-| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | unreviewed |
-| [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | unreviewed |
+| [DISK-04](#disk-04--segment-rotation-fsync-policy-and-finish) | P1 | Segment rotation, fsync policy, and `finish` | `crates/logit-pipeline/src/disk_queue.rs:298-300` | findings → #324 |
+| [DISK-05](#disk-05--overflow-policy-eviction-and-drop-accounting-on-the-spool) | P1 | Overflow policy, eviction, and drop accounting on the spool | `crates/logit-pipeline/src/disk_queue.rs:616-705` | findings → #331 |
 | [DISK-07](#disk-07--peek--read_record_at--read_at--the-delivery-read-path-and-live-corruption-resync) | P1 | `peek` / `read_record_at` / `read_at` — the delivery read path and live corruption resync | `crates/logit-pipeline/src/disk_queue.rs:1085-1140` | unreviewed |
 | [DISK-08](#disk-08--notifyclosed-wakeup-protocol-and-the-mutex-poison-posture) | P1 | `Notify`/`closed` wakeup protocol and the `Mutex`-poison posture | `crates/logit-pipeline/src/disk_queue.rs:352-370` | unreviewed |
-| [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | unreviewed |
-| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | unreviewed |
+| [DISK-10](#disk-10--file_out-rotation-commit-point-first-rename-staging-recovery-retention-cascade) | P1 | `file_out` rotation: commit-point-first rename, staging recovery, retention cascade | `crates/logit-outputs/src/file.rs:281-297` | findings → #326 |
+| [DISK-13](#disk-13--logit_protoframe-as-the-disk-record-envelope--sanity-caps-crc-lz4-resync) | P1 | `logit_proto::frame` as the disk record envelope — sanity caps, CRC, lz4, `resync` | `crates/logit-proto/src/frame.rs:24-62` | reviewed @e3aa53b |
 | [RT-05](#rt-05--deliver_with_retry-and-backoff_for-budget-enforcement-and-doubling-schedule) | P1 | `deliver_with_retry` and `backoff_for`: budget enforcement and doubling schedule | `runtime.rs:874-928` | unreviewed |
 | [RT-06](#rt-06--fanout-clone-vs-move-on-the-last-edge-provenance-stamping-closed-consumer-accounting) | P1 | `Fanout`: clone-vs-move on the last edge, provenance stamping, closed-consumer accounting | `crates/logit-pipeline/src/fanout.rs:167-414` | unreviewed |
 | [RT-07](#rt-07--sinkqueue--boundedqueue-the-notify-condvar-pattern-blocking-push-close-semantics) | P1 | `SinkQueue` / `BoundedQueue`: the `Notify` condvar pattern, blocking push, close semantics | `crates/logit-pipeline/src/queue.rs:147-182` | unreviewed |
@@ -1564,6 +1564,20 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   fallback should be `Beginning` rather than `read_from`.
 - **Priority:** P0 — this is the durability boundary, and its failure mode currently points at loss
   rather than duplication.
+- **Verified 2026-09-24** (#327): the loss lead is confirmed and fixed. Against the old code, an
+  empty, truncated, wrong-version, or stray-tmp checkpoint under `read_from: end` delivered none of
+  the pre-existing lines
+  (`an_unusable_checkpoint_starts_every_preexisting_file_at_the_beginning_even_under_read_from_end`
+  timed out); `CheckpointStore::load` now returns `Loaded::Unusable` for each, and the first scan
+  starts every file at 0, counted `logit.input.checkpoint.errors{op="load"}`. Every write goes
+  through `logit_pipeline::atomic_write::write_file_durably` on the blocking pool, so the missing
+  `fsync`s, the runtime-thread I/O, and the `with_extension` tmp collision are gone; a freeze or
+  an `EIO` at each of its four steps leaves the old (or, after the rename, the new) checkpoint
+  loadable and the store dirty for the next tick (`a_crash_at_any_step_of_a_write_leaves_the_previous_checkpoint_loadable`,
+  `a_failed_write_at_any_step_leaves_the_store_dirty_and_the_next_write_lands`). Graph rule 62
+  rejects two tailing listeners sharing a literal `checkpoint_path`. The flush-before-write and
+  close-flush-write shutdown orderings are unchanged and still covered by the driver tests above;
+  `load` stays a blocking read at bind, an accepted startup cost.
 
 ### TAIL-06 — Shutdown ordering and final flush of held state
 - **Location:** `crates/logit-inputs/src/tail/driver.rs:312-321` (loop exit, then close/flush/
@@ -1982,18 +1996,36 @@ surveyor's.
   - Re-opening the same directory from a second process fails at the lock rather than corrupting.
 - **Observed concerns (unverified):**
   - The double read of every segment at/after the cursor (validate pass `:428-441` then count pass `:481-497`) is a
-    known, still-open startup cost (`docs/known-gaps.md`'s `buffered` entry); at the default `segment_bytes` of
-    64 MiB plus a backlog, `open` reads the whole backlog into `Vec<u8>` with `std::fs::read` — peak RSS is
-    proportional to the largest segment. High confidence this is real; it is documented, not a surprise.
+    known, still-open startup cost (the `buffered` entry under `docs/known-gaps.md`'s
+    [Load-test harness and perf tooling](../known-gaps.md#load-test-harness-and-perf-tooling) section, not its
+    buffering section); at the default `segment_bytes` of 64 MiB plus a backlog, `open` reads the whole backlog
+    into `Vec<u8>` with `std::fs::read` — peak RSS is proportional to the largest segment. High confidence this is real; it is documented, not a surprise.
   - `persist_cursor` (`:292`) does `std::fs::write(tmp)` + `rename` with **no fsync of the tmp file and no fsync of
     the directory** at that point (only `finish` fsyncs the cursor). On a power loss the rename may land with
     stale-or-empty content. Medium confidence this matters in practice (ext4 `data=ordered` mostly saves it), but
     the ADR's durability claim doesn't cover it.
   - A persistently failing `persist_cursor` is only `warn_throttled` — replay grows without bound and nothing
     counts it. Low-medium.
+  - *Closed by #324:* both `persist_cursor` concerns above. The cursor now goes through
+    `atomic_write::write_file_durably` (tmp `fsync`, rename, directory `fsync`), and every failure counts
+    `buffer.disk.errors{op="cursor"}` (`a_cursor_persist_is_fsynced_before_its_rename_and_the_directory_after`,
+    `a_persistently_failing_cursor_write_is_counted_every_time`). The rest of this entry is `dur/w3`'s.
   - `list_segments` (`:121-125`) silently skips anything not matching the pattern, including a file whose seq
     parses but whose name isn't zero-padded; harmless today but the sort is on the parsed `u64`, not the name, so
     keep that the invariant.
+- **Verified 2026-09-24 (#328):** the in-cap corrupt length (F1) was confirmed: `open`
+  truncated every record after it. `walk_segment` now resyncs on `Truncated` too and treats it as a
+  torn tail only if nothing after it parses. `list_segments` accepts only 16-digit names, since an
+  unpadded twin was counted twice and a lone unpadded name failed `open`. A second `open` fails at
+  the lock and leaves the spool untouched. Checked by
+  `a_corrupted_length_field_below_the_sanity_cap_does_not_truncate_the_records_after_it`,
+  `a_segment_file_whose_name_is_not_zero_padded_is_ignored`,
+  `a_second_open_of_the_same_spool_directory_fails_at_the_lock`, and the proptest
+  `open_never_truncates_a_record_that_would_have_parsed`, which drives one mutation of a real
+  segment through `open` and a full drain. Each failed against the pre-fix code except the lock
+  test, which passed and failed only with the lock removed. Still open: the startup double read,
+  and `open` counting `events.dropped{reason="disk_corrupt"}` as the number of corrupt regions
+  rather than events.
 - **Existing coverage:** `disk_queue.rs` tests
   `a_segment_truncated_mid_record_recovers_to_the_last_good_frame_and_counts_truncated` (`:1426`),
   `a_crc_corrupted_record_mid_segment_is_skipped_via_resync_and_counted` (`:1458`),
@@ -2045,6 +2077,16 @@ surveyor's.
   - When nothing is recoverable, `walk_segment` sets `pos = bytes.len()` and counts exactly **one**
     `corrupt_skipped` (`:223-227`) regardless of how many records' worth of bytes were discarded — the drop counter
     under-reports. High confidence; may be deliberate.
+- **Verified 2026-09-24 (#328):** the `candidate < pos` rewind was confirmed reachable: a
+  record, 1 to 23 filler bytes, then a context-less frame emits a phantom record starting inside
+  the first. It can't loop forever, because the phantom's frame starts past `pos`. The resync scan
+  now starts at `pos + CONTEXT_LEN + 1`, so every candidate is past `pos`. The single
+  `corrupt_skipped` for an unrecoverable run is kept and documented as a lower bound. Checked by
+  `a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards` and the
+  proptest `walk_segment_recovers_every_record_outside_the_mutated_range` (bit flip, overwrite,
+  insert, truncation, or in-cap length rewrite over real segments with `MAGIC` in some
+  `trace_id`s; oracle: terminates, offsets strictly increase, every untouched record exactly once
+  at its offset, corruption counted exactly when present), both failing against the pre-fix code.
 - **Existing coverage:** the corruption tests listed in the previous entry, plus
   `a_v1_codec_record_spooled_before_this_change_still_replays_with_empty_provenance` (`:1369`) and
   `provenance_survives_a_spool_round_trip` (`:1345`). No fuzz target.
@@ -2106,6 +2148,26 @@ surveyor's.
   `tokio::time::timeout` around `push` with a paused clock, or a `poll_fn` driving one poll) and then asserts the
   next push repairs; strace to confirm the `set_len`/`write`/`fsync` ordering.
 - **Priority:** P0 — the write path for every batch on a disk-backed sink, with hand-rolled cancellation recovery.
+- **Verified 2026-09-24 (#331):** the cancellation hole is worse than the unchecked `set_len`.
+  `tokio::fs::File::poll_write` hands the write to a blocking thread and returns `Ready`
+  (tokio 1.53.1 `src/fs/file.rs:755-770`); only an operation on the same `File` waits for it
+  (`complete_inflight`, `:354`, `:392`), so the fresh-descriptor truncate could run first and the
+  orphaned write land after it. Both confirmed and fixed: one retained write handle behind a
+  `HeldWriteFile` guard, a repair that flushes then truncates through it, and a failed truncate
+  that counts `op="truncate"`, drops the batch, and blocks every write and rotation until a repair
+  succeeds. `last_write_error_disk_full` is gone (`write_record` returns `WriteError`). The
+  counters move in the same poll the flush completes, so a cancelled push never half-counts.
+  Checked by `an_orphaned_write_that_lands_after_the_next_push_began_never_desynchronizes_the_segment`
+  (deterministic, a second runtime holds the write back),
+  `cancelling_pushes_at_every_await_never_desynchronizes_the_segment`, both failed-repair tests,
+  and `every_configurable_disk_compression_is_encodable_by_write_frame` for the `expect`. All but
+  the compression test failed against the pre-fix code, as did the `spool_model_*` proptest.
+  `a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push` passed there (bytes
+  already on disk are truncated by any descriptor) and guards the repair's flush-then-truncate.
+  Test gap: the `fault` seam fails an operation instead of running it, so no test makes a real
+  write fail inside tokio. The repair flush's role of surfacing and clearing a failed orphan's
+  stored error is argued from tokio's source (`last_write_err`, `src/fs/file.rs:1096`, `:1104`),
+  not exercised.
 
 ---
 
@@ -2148,6 +2210,15 @@ surveyor's.
   reordering) to confirm only the active segment's tail can be lost.
 - **Priority:** P1 — the policy is documented and the loss window is accepted, but the silent failure of every
   fsync/create means a real durability regression would be invisible.
+- **Verified 2026-09-24** (#324): both concerns confirmed and fixed. Every rotation, `finish`, and unlink
+  fs call is now preceded by a `logit_pipeline::fault` check, and `disk_queue.rs`'s tests inject `EIO`/`ENOSPC`/
+  `EACCES` at each one and assert `logit.component.buffer.disk.errors{op}` plus a `disk_fs_error` diagnostic
+  (`a_failed_segment_fsync_at_rotation_is_counted_and_diagnosed`, `a_failed_directory_fsync_is_counted`,
+  `a_failed_segment_unlink_is_counted`); `a_failed_rotation_create_is_counted_and_the_next_push_retries_rotation`
+  confirms the self-heal. The fresh-fd `sync_data` holds (Linux `fsync(2)` flushes the inode, not the fd); moving it
+  to the retained write handle is #331.
+- **Perf follow-up (dur/w8):** `finish` now waits for the spool's persist worker to run every queued cursor
+  persist and unlink before its own flush and fsyncs (`finish_waits_for_every_queued_persist`).
 
 ---
 
@@ -2197,6 +2268,27 @@ surveyor's.
   a stress test with `max_bytes` just above one segment under `DropOldest` measuring worst-case work per push.
 - **Priority:** P1 — deliberate data destruction whose accounting is the only audit trail; the unbounded
   evict-loop is the concrete thing to size.
+- **Verified 2026-09-24 (#331):** the evict loop is confirmed and inherent to reclaiming by
+  whole segment: one push evicts every record in the head segment, each counted
+  `overflow_oldest`, and with the head segment active it evicts every queued record and then
+  writes past `max_bytes`. Pinned by
+  `drop_oldest_reclaims_space_a_whole_head_segment_at_a_time_and_counts_every_eviction` and
+  `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_rotates_to_make_room`, and
+  documented in the disk ADR and `docs/deploying.md` (keep `segment_bytes` well under
+  `max_bytes`). The model proptest `spool_model_every_push_is_delivered_dropped_or_queued` checks
+  that every push counts exactly one of queued or dropped. The `Block` concern is confirmed, not
+  refuted: when the reader has consumed the active segment and that segment's length plus the next
+  record exceeds `max_bytes` (reachable with `segment_bytes` equal to `max_bytes`), the push parks
+  on `not_full` and the reader on `not_empty`, and nothing wakes either, because the full check
+  runs before the push would rotate and the active segment is never deleted.
+- **Fixed in #333 (F5):** a push that finds the spool full with nothing queued now rotates the
+  consumed active segment away and deletes it, under every policy, and a commit that leaves
+  nothing queued wakes a parked push. `push` rolls the cursor under every policy (the "F1 gating"
+  is gone). So with the head segment active, a `drop_oldest` push still evicts every queued record
+  but then writes within `max_bytes`; the W4 pin is renamed
+  `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_rotates_to_make_room`.
+  Pinned by `a_blocked_push_makes_room_by_rotating_a_fully_consumed_active_segment`, its
+  `drop_newest` twin, and `spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake`.
 
 ---
 
@@ -2238,6 +2330,28 @@ surveyor's.
 - **Suggested verification approach:** crash injection at each of {cursor rename, each unlink} with a subsequent
   reopen, asserting no record is lost (duplicates allowed); proptest over multi-segment overshoot.
 - **Priority:** P0 — this is the commit point of the at-least-once contract; an off-by-one deletes undelivered data.
+- **Verified 2026-09-24 (#333):** a freeze at every recorded step of a roll (the cursor's
+  write, fsync, rename, and directory fsync, then the unlink) and of `finish`, followed by a reopen
+  and a drain, loses no uncommitted record; only committed ones replay
+  (`a_crash_at_any_point_of_a_segment_roll_loses_no_uncommitted_record`,
+  `a_crash_at_any_point_of_finish_loses_nothing`). Recorded hits show every unlink after the
+  cursor's directory fsync, for a commit, a `drop_oldest` eviction, a rotation to make room, and
+  `open` (`a_segment_is_unlinked_only_after_the_cursor_leaving_it_is_durable`); a failed persist
+  before an unlink costs replay only (`a_failed_cursor_persist_before_an_unlink_loses_nothing_on_reopen`).
+  One finding, fixed: a segment whose unlink failed was re-listed at the next `open`, counted
+  toward `max_bytes`, and never deleted (F4). `open` now leaves every segment behind the cursor out
+  of the bound and unlinks it after persisting the cursor, counted `op="unlink"` on failure
+  (`a_segment_left_behind_by_a_failed_unlink_is_removed_at_the_next_open`). The blocking cursor
+  write inside `commit` is unchanged and still unmeasured.
+- **Perf follow-up (dur/w8):** the line above, "The blocking cursor write inside `commit` is
+  unchanged and still unmeasured", no longer holds: it was measured, then moved. The durable
+  persist on every roll cost 16–27% of `buffered-small-segments`'s events/s on the perf VM
+  (`docs/design/performance.md` §3), so a roll now queues its cursor and unlinks to a per-spool
+  worker thread and `commit` returns without waiting. The worker still persists before it unlinks, and jobs queue under the state lock
+  in cursor order; `a_segment_roll_returns_before_its_cursor_is_durable_and_unlinks_after_it_is`,
+  `a_crash_before_the_worker_persists_replays_and_loses_nothing`,
+  `a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open`, and
+  `persist_jobs_never_move_the_cursor_backwards` pin it.
 
 ---
 
@@ -2275,6 +2389,14 @@ surveyor's.
     **forever** (`:1132-1137`) — it never re-checks `closed()` on that branch (the `closed()` check at `:1108` is
     only reachable when `has_data` is false). If a segment file is removed out of band, `write_loop` never sees
     `Closed` and shutdown depends entirely on the grace timer. Medium confidence, liveness only.
+- **Partly addressed in #328:** `read_record_at` now returns `Record`/`Skip`/`Unavailable`
+  and reads no further than the segment's in-memory length, so an in-cap corrupt length, or
+  garbage with nothing parseable after it, skips to the segment's end (counted `disk_corrupt`, zero
+  events) instead of making `peek` retry forever
+  (`a_closed_segment_with_an_in_cap_corrupt_length_does_not_stall_peek`,
+  `unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted`). The over-count,
+  the whole-remainder re-walk, and the `Unavailable` retry that never checks `closed()` are
+  unchanged; this entry stays unreviewed.
 - **Existing coverage:** `peek_is_cached_across_repeated_calls_until_commit` (`:1385`),
   `live_resync_past_corruption_advances_the_cursor_past_the_skipped_bytes` (`:1830`),
   `a_corrupted_length_field_does_not_silently_discard_the_rest_of_the_segment` (`:1897`);
@@ -2362,6 +2484,20 @@ surveyor's.
   a full spool under `overflow: block`.
 - **Priority:** P0 — the shutdown path decides whether spooled data survives, and the ordering here has already
   been fixed once (F3).
+- **Verified 2026-09-24 (#333):**
+  `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled` runs drain
+  first, grace expiry, permanent error, and closed and empty under both stores: batches sent equal
+  delivered plus `send_failed` plus `shutdown` plus spooled, and a disk store never counts
+  `shutdown` (so no batch is both spooled and counted). A grace expiry leaves the peeked head
+  uncommitted and it replays (`finish_after_a_peek_without_commit_replays_the_peeked_head_on_reopen`).
+  `Dropped ⇒ commit` is pinned for a disk sink
+  (`a_disk_sink_commits_a_batch_dropped_after_its_retry_budget_so_it_never_replays`) and recorded
+  as decision 7 of the durability ADR. One finding, fixed: a batch `drain_inbox` was pushing into a
+  full `block` store was lost uncounted when `run_output` dropped the future (F3). `drain_inbox`
+  now records it in an `in_hand` slot the sweep takes first
+  (`a_batch_parked_in_a_blocked_push_when_the_drain_is_abandoned_is_spooled_by_the_sweep`; the
+  memory twin now counts 3, not 2). This overlaps cluster 3 (RT-03, lead 11); its fix lives here.
+  `finish` stays unbounded after the grace, documented in the disk ADR's amendment.
 
 ---
 
@@ -2418,6 +2554,17 @@ surveyor's.
   `max_files` (graph rule) if the syscall-storm concern is confirmed.
 - **Priority:** P1 — custom retention logic with real delete/rename ordering, but the commit-point-first redesign
   is already well covered by tests.
+- **Verified 2026-09-24** (#326): every rotation step now runs behind a `logit_pipeline::fault` check, and
+  `a_crash_at_any_rotation_step_loses_no_line_and_duplicates_none_after_restart` freezes at each one in turn for
+  `max_files` 2 and 3, restarts, and finds no retained file touched before the commit point, no line lost beyond
+  retention or duplicated, and no orphan left; the design needed no change.
+  `promote_staged_keeps_every_generation_in_suffix_order_for_max_files_two_through_six` pins the cascade. Two
+  concerns confirmed and fixed: `max_files` is capped at 1000 by graph rule 29
+  (`file_out_with_max_files_over_the_ceiling_is_rejected`), and a failed `max_files: 1` truncate is now
+  `rotate_failure` + `NotRotated`, so batches keep landing in the existing file
+  (`a_failed_truncate_under_max_files_one_is_not_rotated_and_keeps_writing_to_the_existing_file`). No fsync (by
+  design, ADR `durable-checkpoint-writes-and-fault-injection` decision 6) and the `exists()` TOCTOU (single
+  writer) stay as accepted.
 
 ---
 
@@ -2512,9 +2659,13 @@ surveyor's.
   the crate can write fewer bytes than the buffer holds; nontrivial-3p-use(crc32c) — CRC over compressed bytes, by
   design.
 - **Invariants to verify:**
-  - `Truncated` is produced **only** for a genuine short buffer; every corrupt-length case is `Malformed`. Both
-    `uncompressed_len` (`:230`) and `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN`
-    (`:54-55`) is wide enough that `write_frame` can never emit a frame its own `read_frame` rejects.
+  - A `compressed_len` over `MAX_SANE_COMPRESSED_LEN` is `Malformed`; one at or below the cap but past the bytes
+    actually present is `Truncated` — indistinguishable, at this layer, from a genuine short read. `read_frame`
+    itself has no way to tell "more bytes are still coming" (a live connection) from "there will never be more"
+    (a closed disk segment); that call belongs to the *consumer*, per F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context. Both `uncompressed_len` (`:230`) and
+    `compressed_len` (`:236`) are capped before use; `MAX_SANE_COMPRESSED_LEN` (`:54-55`) is wide enough that
+    `write_frame` can never emit a frame its own `read_frame` rejects.
   - CRC is verified *before* `lz4_flex` sees the bytes (`:246` precedes `:252`).
   - The post-decompress length check (`:263-269`) is not a tautology — depends on `lz4_decompress`'s
     `out.truncate(written)` at `:297`.
@@ -2522,8 +2673,14 @@ surveyor's.
     spurious hit inside a `trace_id` (tested).
   - `HEADER_LEN` and the field offsets used by disk_queue's tests (`CONTEXT_LEN + 16` for `compressed_len`,
     disk_queue `:1908`) stay in sync with `FrameHeader::write` (`:103-113`).
-- **Observed concerns (unverified):** none spotted in the disk-facing behavior. `resync`'s linear scan is the
-  performance term in `walk_segment`'s worst case (see the parse entry), not a correctness issue.
+- **Observed concerns (unverified):**
+  - The consumer gap this layer's correct `Truncated` answer leaves open: `DiskQueue` can't tell, from
+    `Truncated` alone, whether more bytes might still arrive (a live connection) or never will (a closed
+    segment) — on a closed segment that silence means corruption, not a short read. F1 in ADR
+    `durable-checkpoint-writes-and-fault-injection`'s Context; tracked as DISK-01/DISK-02's finding, fixed in
+    `dur/w3`.
+  - `resync`'s linear scan is the performance term in `walk_segment`'s worst case (see the parse entry), not a
+    correctness issue.
 - **Existing coverage:** `frame.rs:316-514` — 16 unit tests, including
   `a_header_truncated_by_one_byte_is_truncated_not_malformed` (`:393`),
   `a_body_truncated_by_one_byte_is_truncated_not_malformed` (`:400`),
@@ -2536,6 +2693,12 @@ surveyor's.
 - **Suggested verification approach:** a `cargo-fuzz` target over `read_frame` (no fuzz targets exist in this repo
   today) asserting no panic and no allocation over the caps; a property test that `write_frame ∘ read_frame` is
   total for every payload up to the cap under both compressions.
+- **Verified (`dur/w2`):** `crates/logit-proto/tests/frame_fixed_point.rs` adds that property test (random and
+  compressible payloads up to 256 KiB, both compressions, concatenation, the lz4 worst-case bound, and the full
+  64 MiB cap), and pins that a `compressed_len` corrupted below the sanity cap reads as `Truncated` — which
+  corrected this entry's first invariant above (it previously claimed every corrupt length is `Malformed`; that
+  was wrong). The closed-segment consumer behavior F1 (ADR `durable-checkpoint-writes-and-fault-injection`'s
+  Context) flags is `dur/w3`'s fix, not this file's.
 - **Priority:** P1 — the caps and CRC are correct and tested, but this is the one decoder standing between corrupt
   disk bytes and an allocation, and the `Truncated`/`Malformed` distinction is load-bearing for disk recovery.
 

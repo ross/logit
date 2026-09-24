@@ -1,0 +1,32 @@
+# `buffered` with 1 MiB segments: the same graph and count, so the gap from `buffered`'s numbers
+# is the cost of segment rolls. `buffered`'s 64 MiB default rolls about once per run; this rolls
+# about 70 times, and each roll persists the read cursor durably (write, fsync, rename, directory
+# fsync) and unlinks the segment it left (docs/adr/durable-checkpoint-writes-and-fault-injection.md,
+# "Amendment: the spool persists its cursor on a worker thread"). Numbers:
+# docs/design/performance.md §3.
+#
+#   script/perf run --scenario buffered-small-segments
+#
+# `path` is this scenario's own, so it never shares a spool with `buffered`; the harness clears it
+# before every spawn (crates/logit-perf/src/spool.rs). Expect `buffered`'s disk-bound variance here
+# too.
+components:
+  gen:
+    type: generate_in
+    count: 1200000
+    event:
+      attributes:
+        method: GET
+        path: /x/{seq%50}
+        status: "200"
+        host: web-{seq%10}
+        region: us-east-1
+        service: web
+
+  out:
+    type: null_out
+    sources: [gen]
+    buffer:
+      disk:
+        path: ../results/spool-small-segments
+        segment_bytes: 1MiB
