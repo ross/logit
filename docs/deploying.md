@@ -291,9 +291,10 @@ alongside `disk:`, because disk replaces the in-memory bound instead of sizing b
 filesystem defeats the point, as it would for any durable state (`tail_in`'s checkpoint file in
 `crates/logit-inputs/src/tail/checkpoint.rs`, a database's data directory).
 
-**Durability level:** `logit` calls `fdatasync` on segment rotation, on the cursor file, and at
-shutdown, not per push. A process crash (including `SIGKILL`) loses nothing already written; a
-power loss can lose the most recent, not-yet-synced tail of the active segment.
+**Durability level:** `logit` `fsync`s every read-cursor write (and the spool directory after
+it), and each segment when it rotates away and at shutdown, not per push. A process crash
+(including `SIGKILL`) loses nothing already written; a power loss can lose the most recent,
+not-yet-synced tail of the active segment.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
@@ -308,6 +309,10 @@ disk-backed sink never emits `reason="shutdown"`, because it drops nothing at sh
 - `logit.component.buffer.disk.truncated` (count): a torn tail found and truncated at open. Nonzero
   means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
   alert on it alone.
+- `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
+  of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
+  durability level above no longer holds. A failed `cursor` write means more replay after a
+  restart; a failed `fsync` means a power loss can lose more.
 
 ## Listener intake
 
