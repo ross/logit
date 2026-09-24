@@ -321,8 +321,8 @@ or backed-up destination downstream is ridden out.
 To tune it, add a `receive:` block to the listener; see the commented example in
 [`examples/statsd-to-influxdb.yaml`](../examples/statsd-to-influxdb.yaml). Every field has a
 default, so omitting `receive:` gives the values below. Validation rejects `receive:` on any kind
-except a datagram listener or a tail listener (`tail_in`/`docker_in`). A tail listener has no
-receive *queue*, so only its four batch-assembly fields apply; see
+except a datagram listener, a TCP listener, or a tail listener (`tail_in`/`docker_in`). A TCP or
+tail listener has no receive *queue*, so only the four batch-assembly fields apply to it; see
 [Tailing files and Docker logs](#tailing-files-and-docker-logs).
 
 A TCP listener has no receive queue either; see

@@ -1,13 +1,12 @@
-# The wire-grouping variant of hostagents.yaml -- identical pipeline, ports, and taps; the only
-# difference is `receive.batch_max_events: 1` on the three accumulator-fronted legs
-# (`collectd_network`, `graphite_collectd`, `graphite_telegraf`), so `logit.shape.batch.events`
-# reads as the wire's own grouping instead of the accumulator's regrouping. See hostagents.yaml's
-# header for the full picture and tools/shape-survey/producers/hostagents.sh for how the two
-# configs are run back to back against the same collectd/Telegraf processes.
+# The wire-grouping variant of hostagents.yaml: the same pipeline, ports and taps, with
+# `receive.batch_max_events: 1` on the three accumulator-fronted legs (`collectd_network`,
+# `graphite_collectd`, `graphite_telegraf`) so `logit.shape.batch.events` reads as the wire's own
+# grouping instead of the accumulator's regrouping. hostagents.yaml's header has the wire map;
+# tools/shape-survey/producers/hostagents.sh runs the two configs back to back against the same
+# collectd/Telegraf processes.
 #
 # `prometheus_telegraf` and `otlp_telegraf` are unchanged: both bypass the accumulator in either
-# variant (`receive:` is not a valid field on either kind -- `logit validate` rejects it), so they
-# have no wire-grouping variant to provide.
+# variant, and graph rule 17 rejects `receive:` on either kind.
 admin:
   bind: 0.0.0.0:9600
 

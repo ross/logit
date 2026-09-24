@@ -1,58 +1,35 @@
-//! OTLP/JSON decoding: `serde_json::Value` → the same generated `prost` structs `../mod.rs`'s
-//! protobuf path decodes into, so every downstream rule (`../logs.rs`/`../traces.rs`/
-//! `../metrics.rs`, and the `EventBatch` construction in `../mod.rs`) runs unchanged regardless of
-//! which wire encoding a request arrived in. See [ADR `otlp-json-decoding`](../../../../../../docs/adr/otlp-json-decoding.md)
-//! for why this is hand-written against `serde_json::Value` rather than generated (short version:
-//! `pbjson` implements proto3 JSON's bytes-as-base64 rule, and OTLP's hex-encoded trace/span ids
-//! are exactly where OTLP deviates from that rule -- a real `traceId` would base64-decode to the
-//! wrong length).
+//! OTLP/JSON decoding into the same generated `prost` structs the protobuf path uses, so every
+//! mapping rule in `super`'s modules holds for both encodings. It's hand-written over
+//! `serde_json::Value` (ADR `otlp-json-decoding`) because `pbjson` applies proto3 JSON's
+//! bytes-as-base64 rule to trace and span ids, which OTLP writes as hex.
 //!
-//! **This module doc is the dialect table**, the same role `../mod.rs`'s module doc plays for wire
-//! types. Five rules, from the [OTLP spec](https://opentelemetry.io/docs/specs/otlp/):
+//! **This module doc is the dialect table.** From the
+//! [OTLP spec](https://opentelemetry.io/docs/specs/otlp/):
 //!
-//! - **Field names** are lowerCamelCase (`traceId`, `startTimeUnixNano`). The spec: *"The keys of
-//!   JSON objects are field names converted to lowerCamelCase. Original field names are not
-//!   valid."* [`get`] accepts the original snake_case name too -- **deliberate leniency beyond the
-//!   spec**, not an implementation of it, matching what the OTel Collector's own JSON unmarshaler
-//!   does and what Postel's law argues for in a receiver.
-//! - **`traceId`/`spanId`/`parentSpanId`** are case-insensitive hex strings, *not* base64 --
-//!   OTLP's own documented deviation from proto3 JSON's normal bytes-as-base64 rule. Every other
-//!   `bytes` field (`AnyValue.bytesValue`) follows proto3 JSON and *is* base64. See [`hex_bytes`]
-//!   vs [`base64_bytes`].
-//! - **64-bit integers** (`timeUnixNano`, `startTimeUnixNano`, `asInt`, ...) may be a JSON number
-//!   or a decimal string -- proto3 JSON's own rule for 64-bit fields, since not every JSON parser
-//!   preserves 64-bit integer precision. See [`u64_field`]/[`i64_field`].
-//! - **Enums** (`SpanKind`, `StatusCode`, `SeverityNumber`, `AggregationTemporality`) are the
-//!   integer value on the wire per spec (*"only integer enum values are allowed in OTLP JSON
-//!   Protobuf Encoding; the enum name strings MUST NOT be used"*). [`enum_field`] accepts the
-//!   proto enum name too (e.g. `"SPAN_KIND_SERVER"`) -- again leniency beyond the spec, for the
-//!   same reason snake_case keys are accepted.
-//! - **An explicit `null` is the same as an absent key** -- proto3 JSON's own rule (*"null is accepted
-//!   and treated as the default value"*), implemented once in [`get`] rather than at each field. This
-//!   is what makes `{"parentSpanId": null}` on a root span decode identically to the protobuf encoding
-//!   of that same span, which simply doesn't emit the field: producers in any language where "unset"
-//!   serializes as `null` rather than an omitted key are common, and a whole batch must not 400 over
-//!   one of them. A `null` *element inside an array* is a different thing and is still an error -- see
-//!   `metrics.rs`'s `u64_array`/`f64_array`.
+//! - **Field names** are lowerCamelCase (`traceId`, `startTimeUnixNano`); the spec says
+//!   "Original field names are not valid." [`get`] accepts the snake_case name too, **leniency
+//!   beyond the spec** matching the OTel Collector's own unmarshaler.
+//! - **`traceId`/`spanId`/`parentSpanId`** are case-insensitive hex, *not* base64: OTLP's
+//!   deviation from proto3 JSON. Every other `bytes` field (`AnyValue.bytesValue`) is base64 per
+//!   proto3 JSON. See [`hex_bytes`] vs [`base64_bytes`].
+//! - **64-bit integers** (`timeUnixNano`, `asInt`, ...) may be a JSON number or a decimal string,
+//!   proto3 JSON's rule, since not every JSON parser keeps 64-bit precision. See
+//!   [`u64_field`]/[`i64_field`].
+//! - **Enums** (`SpanKind`, `StatusCode`, `SeverityNumber`, `AggregationTemporality`) are integers;
+//!   the spec says enum name strings "MUST NOT be used". [`enum_field`] accepts the proto name too
+//!   (`"SPAN_KIND_SERVER"`), leniency like snake_case keys.
+//! - **An explicit `null` is an absent key**, proto3 JSON's rule, applied once in [`get`]. So
+//!   `{"parentSpanId": null}` decodes like the protobuf span that omits the field; a batch must
+//!   not 400 because a producer serializes "unset" as `null`. A `null` *array element* is still an
+//!   error (`metrics.rs`'s `u64_array`/`f64_array`).
+//! - **Unknown keys are ignored**, so a newer OTLP minor version's field can't fail a batch.
 //!
-//! **`ExportTraceServiceRequest`/`ExportLogsServiceRequest`/`ExportMetricsServiceRequest` decode
-//! the same as `TracesData`/`LogsData`/`MetricsData`.** Both message shapes have exactly one field
-//! -- `repeated ResourceSpans resource_spans = 1` and its log/metric equivalents -- and since this
-//! layer keys off field *names* rather than protobuf tag numbers, the top-level key
-//! (`resourceSpans`/`resourceLogs`/`resourceMetrics`) is the same for either. One parser reads
-//! both; see `../mod.rs`'s "Wire types" paragraph for the protobuf-side version of this fact.
+//! `Export*ServiceRequest` decodes the same as `TracesData`/`LogsData`/`MetricsData`: both have
+//! one field under the same key (`resourceSpans`, ...), and this layer keys off names.
 //!
-//! **Unknown keys are silently ignored** -- forward compatibility with a newer OTLP minor version
-//! adding a field must not fail an entire batch.
-//!
-//! **`exemplars` is parsed in `metrics.rs`'s `number_data_point`/`histogram_data_point`/
-//! `exponential_histogram_data_point`** -- one `Exemplar` JSON object per element (`timeUnixNano`,
-//! `asDouble`/`asInt`, `spanId`/`traceId` as the same case-insensitive hex `hex_bytes` uses
-//! elsewhere in this module, `filteredAttributes` via the shared `key_value` helper), feeding the
-//! same `../metrics.rs::decode_exemplar` the protobuf path does, so both wire encodings produce
-//! identical `Vec<Exemplar>`s for the same logical data. `summaryDataPoint` has no `exemplars` key
-//! at all in the OTLP spec, so nothing is parsed there -- matching the protobuf message shape,
-//! which has no field for it either.
+//! **`exemplars`** parse in `metrics.rs`'s `number_data_point`/`histogram_data_point`/
+//! `exponential_histogram_data_point`, ids as hex, feeding the same `decode_exemplar` the
+//! protobuf path does. A `summaryDataPoint` has no `exemplars` key, as in protobuf.
 
 mod logs;
 mod metrics;
@@ -74,14 +51,8 @@ fn malformed(msg: impl Into<String>) -> CodecError {
     CodecError::Malformed(msg.into())
 }
 
-/// The two-name lookup every field read in this module goes through -- see the module doc's
-/// leniency note, and its `null` rule: **an explicit `null` is reported as absent here, once**, so
-/// that neither an accessor below nor a hand-written call site has to remember proto3 JSON's "a
-/// `null` means the field's default" rule. Folding it in here rather than at each call site is what
-/// makes the rule unbypassable: a producer that serializes "unset" as `null` rather than omitting
-/// the key (Python's `json.dumps` of a `None`, a Go pointer field, a JS `undefined`-turned-`null`)
-/// gets the same decode as one that omits it, and as the protobuf encoding of the same message,
-/// which simply doesn't emit the field.
+/// The camelCase-then-snake_case lookup every field read goes through. **An explicit `null` is
+/// reported as absent here**, so no call site can forget proto3 JSON's null rule.
 fn get<'a>(obj: &'a JsonMap, camel: &str, snake: &str) -> Option<&'a JsonValue> {
     obj.get(camel).or_else(|| obj.get(snake)).filter(|v| !v.is_null())
 }
@@ -102,7 +73,7 @@ fn object_field<'a>(
     }
 }
 
-/// Missing/null is `&[]`, not an error -- a repeated field's default is the empty list.
+/// Missing or null is `&[]`, a repeated field's default.
 fn array_field<'a>(
     obj: &'a JsonMap,
     camel: &str,
@@ -131,8 +102,7 @@ fn bool_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<bool, CodecErro
     }
 }
 
-/// A 64-bit unsigned field: a JSON number, or (proto3 JSON's own rule for 64-bit fields) a decimal
-/// string.
+/// A 64-bit unsigned field: a JSON number or a decimal string.
 fn parse_u64(v: &JsonValue, field: &str) -> Result<u64, CodecError> {
     match v {
         JsonValue::Number(n) => n
@@ -179,8 +149,8 @@ fn i32_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<i32, CodecError>
     }
 }
 
-/// A `double` field: a JSON number, or proto3 JSON's `"NaN"`/`"Infinity"`/`"-Infinity"` (the OTel
-/// Collector's own `file` exporter emits these for a genuinely non-finite histogram sum).
+/// A `double` field: a JSON number, or proto3 JSON's `"NaN"`/`"Infinity"`/`"-Infinity"`, which
+/// the OTel Collector's `file` exporter emits for a non-finite histogram sum.
 fn parse_f64(v: &JsonValue, field: &str) -> Result<f64, CodecError> {
     match v {
         JsonValue::Number(n) => {
@@ -207,10 +177,8 @@ fn f64_field(obj: &JsonMap, camel: &str, snake: &str) -> Result<f64, CodecError>
     }
 }
 
-/// The mirror of [`f64_field`] for the three OTLP fields that are genuinely optional
-/// (`HistogramDataPoint`/`ExponentialHistogramDataPoint`'s `sum`/`min`/`max`) -- an absent key
-/// must decode to `None`, not `Some(0.0)`, or the trailing-infinite-bucket reconstruction in
-/// `../metrics.rs` gets a value it was never sent.
+/// [`f64_field`] for the optional `sum`/`min`/`max` of `HistogramDataPoint` and
+/// `ExponentialHistogramDataPoint`: an absent key is `None`, not `Some(0.0)`.
 fn f64_field_opt(obj: &JsonMap, camel: &str, snake: &str) -> Result<Option<f64>, CodecError> {
     match get(obj, camel, snake) {
         None => Ok(None),
@@ -218,9 +186,8 @@ fn f64_field_opt(obj: &JsonMap, camel: &str, snake: &str) -> Result<Option<f64>,
     }
 }
 
-/// An enum field: the integer value (spec-conformant), or -- leniency, see the module doc -- the
-/// proto enum name via `from_str_name`, one of prost's own generated methods, so this never hand-
-/// maintains a name table that could drift from `generated/`.
+/// An enum field: the integer value, or (leniency) the proto name via prost's generated
+/// `from_str_name`, so no hand-kept name table can drift from `generated/`.
 fn enum_field(
     obj: &JsonMap,
     camel: &str,
@@ -240,13 +207,9 @@ fn enum_field(
     }
 }
 
-/// Case-insensitive hex, no separators. An empty string decodes to an empty `Vec` unconditionally
-/// (OTLP's "no parent"/"not associated with a trace" convention -- valid for `parentSpanId` and a
-/// `Link`'s ids, and for a required id like `Span.traceId` the empty `Vec` this produces is
-/// rejected downstream by `../traces.rs`'s `ids::trace_id`/`ids::span_id`, the same generic
-/// wrong-length error the protobuf path already gives). A non-empty string must match
-/// `expected_len` exactly. Never actually sees a JSON `null` -- every call site reads its argument
-/// through [`get`], which already reports an explicit `null` as absent.
+/// Case-insensitive hex, no separators; a non-empty string must decode to `expected_len` bytes.
+/// An empty string decodes to an empty `Vec`, OTLP's "none". For a required id like
+/// `Span.traceId`, `traces.rs`'s `ids` then rejects it as the protobuf path would.
 fn hex_bytes(v: &JsonValue, expected_len: usize, field: &str) -> Result<Vec<u8>, CodecError> {
     let s = v.as_str().ok_or_else(|| malformed(format!("{field} must be a hex string")))?;
     if s.is_empty() {
@@ -279,10 +242,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Standard-alphabet base64 with padding -- proto3 JSON's own rule for a plain `bytes` field
-/// (unlike a trace/span id, `AnyValue.bytesValue` does *not* deviate from it). The URL-safe
-/// alphabet is a different, non-conforming choice some ad hoc producers make; accepting it
-/// silently would hide exactly the kind of producer bug this decoder exists to surface.
+/// Standard-alphabet base64 with padding, proto3 JSON's rule for a plain `bytes` field. The
+/// URL-safe alphabet is rejected: accepting it would hide a non-conforming producer.
 fn base64_bytes(v: &JsonValue, field: &str) -> Result<Vec<u8>, CodecError> {
     let s = v.as_str().ok_or_else(|| malformed(format!("{field} must be a base64 string")))?;
     base64::engine::general_purpose::STANDARD
@@ -303,9 +264,8 @@ fn key_values(obj: &JsonMap, camel: &str, snake: &str) -> Result<Vec<pb::KeyValu
     array_field(obj, camel, snake)?.iter().map(key_value).collect()
 }
 
-/// `AnyValue`'s oneof, dispatched by which single recognized key is present. `Null`/`{}` (no
-/// recognized key) both produce OTLP's "empty" `AnyValue { value: None }`, matching
-/// `common::any_value_to_value`'s treatment of the protobuf equivalent.
+/// `AnyValue`'s oneof, dispatched on the one recognized key present. `null` or `{}` is the empty
+/// `AnyValue { value: None }`, as in protobuf.
 fn any_value(v: &JsonValue) -> Result<pb::AnyValue, CodecError> {
     use pb::any_value::Value as Any;
     let obj = match v {
@@ -346,9 +306,7 @@ fn any_value(v: &JsonValue) -> Result<pb::AnyValue, CodecError> {
     Ok(pb::AnyValue { value: None })
 }
 
-/// `entity_refs` is parsed nowhere here -- `../common.rs`'s `pb_to_resource` (the function every
-/// signal's decode path feeds this through) never reads it, protobuf or JSON (OTLP's own
-/// experimental entity-relationship field, unused by this codec).
+/// `entityRefs` isn't parsed: `common::pb_to_resource` never reads it from either encoding.
 fn resource(obj: &JsonMap) -> Result<respb::Resource, CodecError> {
     Ok(respb::Resource {
         attributes: key_values(obj, "attributes", "attributes")?,
@@ -478,18 +436,16 @@ mod tests {
 
     #[test]
     fn a_trace_id_is_hex_decoded_not_base64_decoded() {
-        // 32 hex characters -- a real 16-byte OTLP traceId, exactly what a browser SDK sends.
-        let hex_id = "01010101010101010101010101010101010101010101010101010101010101"; // 64 chars
+        // 32 hex characters: a 16-byte traceId, as a browser SDK sends.
+        let hex_id = "01010101010101010101010101010101010101010101010101010101010101"; // 62 chars
         let hex_id = &hex_id[..32];
         let v = JsonValue::String(hex_id.to_string());
 
         let decoded = hex_bytes(&v, 16, "traceId").unwrap();
         assert_eq!(decoded, vec![0x01u8; 16], "a hex traceId must decode via hex, not base64");
 
-        // The permanent regression guard for the `pbjson` finding in the module doc: a `bytes`
-        // field's proto3-JSON-default base64 reading of this same string does NOT agree with the
-        // hex reading -- 32 base64 characters decode to 24 bytes, not 16. If this ever started
-        // agreeing, `hex_bytes` would have silently become a base64 decoder.
+        // The same string read as base64 is 24 bytes, not 16; agreement would mean `hex_bytes`
+        // had become a base64 decoder.
         let as_base64_len =
             base64::engine::general_purpose::STANDARD.decode(hex_id).map(|b| b.len()).unwrap_or(0);
         assert_ne!(

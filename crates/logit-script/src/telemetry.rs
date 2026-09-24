@@ -1,53 +1,44 @@
-//! Exposes `logit_core::telemetry::Telemetry` to Lua scripts, so `process()`/`flush()` can emit
-//! their own metrics -- domain-specific facts (an order value, a custom business counter) that no
-//! amount of Rust-side instrumentation could infer. See `docs/design/lua-api.md`'s "Emitting
-//! telemetry from a script" and `docs/adr/lua-authored-telemetry-cardinality.md`.
+//! Exposes `logit_core::telemetry::Telemetry` to Lua, so `process()`/`flush()` can emit metrics
+//! only the script knows (an order value, a business counter). See `docs/design/lua-api.md`'s
+//! "Emitting telemetry from a script" and `docs/adr/lua-authored-telemetry-cardinality.md`.
 //!
-//! **Cardinality is convention-enforced here, not type-system-enforced.** Every Rust-side
-//! `Telemetry` call takes `&'static str` names/tags specifically so cardinality is bounded by
-//! *code*, not traffic -- a guarantee the type system enforces. A Lua-provided `String` can't
-//! satisfy that directly, so [`static_str`] round-trips it through the process's own attribute
-//! interner (`logit_core::interner`): `resolve(intern(s))` genuinely returns a `&'static str` (the
-//! interner's own permanent storage), and re-interning a string it already holds allocates nothing
-//! (`docs/known-gaps.md`'s interner section). This reuses existing, already-accepted
-//! infrastructure rather than inventing a new leak mechanism -- but it does mean a script that
-//! constructs a metric name or tag value from per-event data (rather than a fixed literal in its
-//! own source) can leak the interner exactly the way a hand-rolled `kv_metrics` misuse already
-//! could. Author responsibility, not a type-system guarantee -- see the ADR for the full tradeoff.
+//! **Cardinality is convention-enforced here, not type-system-enforced.** Rust-side `Telemetry`
+//! calls take `&'static str` names and tags so cardinality is bounded by code, not traffic. A
+//! Lua string can't satisfy that, so [`static_str`] round-trips it through the process interner
+//! (`logit_core::interner`): `resolve(intern(s))` returns the interner's permanent storage, and
+//! re-interning a held string allocates nothing (`docs/known-gaps.md`'s interner section). A
+//! script that builds a metric name or tag value from per-event data, rather than a literal in its
+//! source, leaks the interner one entry at a time, as a misused `kv_metrics` can. That's the
+//! author's responsibility; the ADR has the tradeoff.
 //!
-//! Three more boundaries this module holds, all because a script's input is less constrained than
-//! a Rust call site's:
-//! - [`install`]'s closures take `mlua::String` arguments, not owned Rust `String`s, and check
-//!   `Telemetry::is_enabled` *before converting or reading them at all* -- a disabled handle must
-//!   cost nothing regardless of what a script passes it, and an eagerly-typed `String` parameter
-//!   would have `mlua` allocate and copy it during argument extraction, before the closure body
-//!   (and its `is_enabled` check) ever runs at all.
-//! - [`static_metric_name`] rejects the `logit.` prefix, reserved for the runtime's own metrics --
-//!   without it, a script could coalesce into (and corrupt) a runtime counter or gauge sharing its
-//!   exact name.
-//! - [`read_tags`] rejects a tag keyed `component`/`kind`/`role`, reserved for a point's own
-//!   identity (`logit_core::telemetry::is_reserved_tag_key`) -- the buffer itself already filters
-//!   these out before they can fragment cardinality, but a script that used one probably meant
-//!   something by it, so this surfaces a clear error instead of a silent no-op.
+//! Three more boundaries, because a script's input is less constrained than a Rust call site's:
+//! - [`install`]'s closures take `mlua::String`, not `String`, and check `Telemetry::is_enabled`
+//!   before reading it. A disabled handle must cost nothing whatever a script passes, and a
+//!   `String` parameter would make `mlua` allocate, copy, and UTF-8-check it during argument
+//!   extraction, before the closure body runs.
+//! - [`static_metric_name`] rejects the `logit.` prefix, reserved for the runtime's own metrics;
+//!   otherwise a script could coalesce into, and corrupt, a runtime point with the same name.
+//! - [`read_tags`] rejects a `component`/`kind`/`role` tag key, reserved for a point's identity
+//!   (`logit_core::telemetry::is_reserved_tag_key`). The buffer filters these anyway, but a script
+//!   that set one meant something by it, so it gets an error instead of a silent no-op.
 
 use logit_core::interner::{intern, resolve};
 use logit_core::telemetry::is_reserved_tag_key;
 use logit_core::Telemetry;
 use mlua::{Lua, String as LuaString, Table, Value as LuaValue};
 
-/// Converts a Lua-provided string into a genuine `&'static str` via intern-then-resolve. See this
-/// module's doc comment for what that does and doesn't guarantee.
+/// Converts a Lua string to a `&'static str` via intern-then-resolve; see the module doc for the
+/// cardinality cost.
 fn static_str(s: &str) -> &'static str {
     resolve(intern(s))
 }
 
-/// Converts and validates a Lua-provided metric name: rejects the `logit.` prefix, reserved for
-/// the runtime's own metrics (`docs/design/internal-telemetry.md`'s naming scheme). Without this,
-/// a script calling e.g. `telemetry.count("logit.component.events.received", 1)` would coalesce
-/// into -- and corrupt -- the exact buffer key the runtime itself writes to: a `(name, tags)` key
-/// carries no notion of which caller wrote to it, so `count` under a runtime gauge's name would
-/// silently convert it to a counter, and vice versa (`ComponentBuffer::upsert`'s kind-mismatch
-/// fallback).
+/// Converts a Lua metric name, rejecting the `logit.` prefix reserved for the runtime's own
+/// metrics (`docs/design/internal-telemetry.md`'s naming scheme).
+///
+/// A `(name, tags)` buffer key doesn't record its writer, so `count` under a runtime gauge's name
+/// would silently turn it into a counter, and vice versa (`ComponentBuffer::upsert`'s
+/// kind-mismatch fallback).
 fn static_metric_name(name: &str) -> mlua::Result<&'static str> {
     if name.starts_with("logit.") {
         return Err(mlua::Error::RuntimeError(format!(
@@ -58,15 +49,11 @@ fn static_metric_name(name: &str) -> mlua::Result<&'static str> {
     Ok(static_str(name))
 }
 
-/// Reads an optional Lua table of `{tag = "value", ...}` pairs into owned `Tag`s. Two things are
-/// clear Lua errors here, not a silent skip or a silent no-op -- matching this crate's existing
-/// stance that a script's mistake should fail loudly (`ScriptError`'s doc comments) rather than
-/// quietly produce a different result than intended:
-/// - a non-string value (`"tag '<key>' must be a string, got <type>"`);
-/// - a key reserved for a point's own identity (`is_reserved_tag_key`) -- the buffer itself
-///   already filters these out before they can fragment cardinality
-///   (`crates/logit-core/src/telemetry.rs`'s `PointKey::new`), but a script that set one probably
-///   meant something by it, so this surfaces the mistake instead of silently dropping it.
+/// Reads an optional `{tag = "value", ...}` table into interned tag pairs.
+///
+/// Two mistakes are Lua errors rather than a silent skip, as elsewhere in this crate: a
+/// non-string value, and a key reserved for a point's identity (`is_reserved_tag_key`), which
+/// `logit_core::telemetry`'s `PointKey::new` would otherwise drop.
 fn read_tags(table: Option<Table>) -> mlua::Result<Vec<(&'static str, &'static str)>> {
     let Some(table) = table else { return Ok(Vec::new()) };
     let mut tags = Vec::new();
@@ -90,16 +77,15 @@ fn read_tags(table: Option<Table>) -> mlua::Result<Vec<(&'static str, &'static s
     Ok(tags)
 }
 
-/// Installs the `telemetry` global table into `lua`, with `count(name, n, tags?)` and
-/// `gauge(name, v, tags?)` -- see this module's doc comment. No `timing()`: scripts have no clock
-/// exposed in the sandboxed stdlib (`sandbox_libs`, `TABLE | STRING | MATH` only), so there's no
-/// sensible way for a script to produce a duration; exposing one is a separate, bigger scope
-/// decision this doesn't make.
+/// Installs the `telemetry` global with `count(name, n, tags?)` and `gauge(name, v, tags?)`.
 ///
-/// Safe to call at any point after `Lua::new_with` -- Lua resolves a global lookup inside a
-/// function body at call time, not at the point the function was defined, so installing this
-/// after a script has already loaded (as [`crate::ScriptWorker::with_telemetry`] does, to avoid
-/// touching this crate's constructor) works identically to installing it before.
+/// No `timing()`: the sandboxed stdlib (`sandbox_libs`: `TABLE | STRING | MATH`) exposes no clock,
+/// so a script has no way to produce a duration.
+///
+/// Safe to call after the script has loaded, as [`crate::ScriptWorker::with_telemetry`] does,
+/// because a global lookup inside a function body resolves at call time. A top-level alias
+/// (`local t = telemetry`) captures `nil` instead; `crate::trace`'s module doc has why `trace` is
+/// installed first.
 pub fn install(lua: &Lua, telemetry: Telemetry) -> mlua::Result<()> {
     let table = lua.create_table()?;
 
@@ -107,17 +93,10 @@ pub fn install(lua: &Lua, telemetry: Telemetry) -> mlua::Result<()> {
     table.set(
         "count",
         lua.create_function(move |_, (name, n, tags): (LuaString, f64, Option<Table>)| {
-            // Checked before anything else touches the interner or allocates -- a disabled
-            // handle (no `internal` component configured) must cost nothing, the same guarantee
-            // every other `Telemetry` call site gives (`docs/design/internal-telemetry.md`).
-            // Interning/validating first, as an earlier version of this did, would mean a
-            // pipeline with telemetry entirely turned off still permanently grows the process
-            // interner for every distinct Lua-provided string it happens to see. `name` is typed
-            // `LuaString` rather than an owned Rust `String` for the same reason one level
-            // earlier: a `String` parameter would have `mlua` allocate and copy it during
-            // argument extraction, *before* this closure body -- and its `is_enabled` check --
-            // ever runs at all; `LuaString` borrows the Lua VM's own buffer until `.to_str()` is
-            // actually called, below, only once enabled.
+            // First, before anything interns or allocates: a disabled handle (no `internal`
+            // component) must cost nothing (`docs/design/internal-telemetry.md`), and interning
+            // first would grow the process interner permanently with telemetry off. `name` is a
+            // `LuaString` so it stays in the VM's buffer until `.to_str()`, only once enabled.
             if !count_telemetry.is_enabled() {
                 return Ok(());
             }
@@ -194,10 +173,6 @@ mod tests {
 
     #[test]
     fn repeated_calls_with_the_same_literal_name_do_not_grow_the_interner() {
-        // Mirrors `crates/logit-core/src/attrs.rs`'s
-        // `getting_an_absent_key_does_not_grow_the_interner` pattern: re-interning a string the
-        // table already holds allocates nothing, so a script calling with the same literal name
-        // repeatedly (the intended, common case) reaches a steady state rather than leaking.
         let lua = sandboxed_lua();
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("script", "lua", "transform");
@@ -240,8 +215,7 @@ mod tests {
             assert!(format!("{err}").contains("reserved"), "got: {err}");
         }
 
-        // Confirms this isn't just an error message -- no point was recorded from any of the
-        // three rejected calls above.
+        // No point was recorded, not only an error returned.
         assert_eq!(registry.drain(0).len(), 0);
     }
 
@@ -250,17 +224,9 @@ mod tests {
         let lua = sandboxed_lua();
         install(&lua, Telemetry::default()).unwrap();
         lua.load(r#"telemetry.count("m", 1); telemetry.gauge("g", 1)"#).exec().unwrap();
-        // Nothing to assert beyond "doesn't panic and doesn't error" -- there is no `Registry` to
-        // drain, matching `Telemetry::default()`'s disabled, no-op contract elsewhere.
     }
 
-    /// The bug a `Telemetry::is_enabled()` check has to prevent: without it, a disabled handle
-    /// (no `internal` component configured) would still intern every distinct name/tag a script
-    /// passes -- a real, permanent leak the moment a script builds one out of per-event data,
-    /// exactly contradicting "no config with an `internal` component pays nothing"
-    /// (`docs/design/internal-telemetry.md`). Uses genuinely distinct, never-interned-elsewhere
-    /// strings (not a fixed literal, which re-interning wouldn't grow the table for anyway) so a
-    /// regression back to interning-before-checking would actually be caught here.
+    /// A disabled handle interns nothing; the names are distinct so interning would grow the table.
     #[test]
     fn a_disabled_telemetry_handle_never_touches_the_interner_even_with_dynamic_looking_input() {
         let lua = sandboxed_lua();
@@ -281,20 +247,12 @@ mod tests {
         );
     }
 
-    /// Companion to the interner test above, at a level below it: `name`'s type is `mlua::String`
-    /// specifically so a disabled handle short-circuits before `LuaString::to_str()` -- which does
-    /// UTF-8 validation -- ever runs. Under the earlier version of this closure (`name: String`),
-    /// `mlua` would have performed that same UTF-8 conversion unconditionally while extracting the
-    /// argument, *before* the closure body (and its `is_enabled` check) ran at all -- so a
-    /// non-UTF-8 Lua string would have errored regardless of whether telemetry was enabled. This
-    /// proves that no longer happens: a disabled handle now means genuinely untouched, not "the
-    /// interning is skipped but the string is still read."
+    /// A disabled handle never UTF-8-checks `name`, so a non-UTF-8 string doesn't error.
     #[test]
     fn a_disabled_handle_never_reads_the_lua_argument_as_a_str_either() {
         let lua = sandboxed_lua();
         install(&lua, Telemetry::default()).unwrap();
-        // `\255` is a Lua 5.1 decimal byte escape -- a single byte that is not valid UTF-8 on its
-        // own. `LuaString::to_str()` would return an error if this were ever read as `&str`.
+        // `\255` is one non-UTF-8 byte; `LuaString::to_str()` would reject it.
         lua.load(r#"telemetry.count("\255", 1)"#).exec().unwrap();
     }
 
@@ -311,16 +269,13 @@ mod tests {
             .expect_err("a script writing into the runtime's own namespace should error");
         assert!(format!("{err}").contains("reserved"), "got: {err}");
 
-        // Confirms this isn't just an error message -- the runtime's own point is genuinely
-        // untouched, not merged with a rejected script value.
+        // No point was recorded, not only an error returned.
         assert_eq!(registry.drain(0).len(), 0);
     }
 
     #[test]
     fn a_reserved_name_rejected_while_disabled_still_costs_nothing() {
-        // A disabled handle short-circuits before the reserved-name check even runs (the whole
-        // point of checking `is_enabled()` first) -- so this must NOT error, unlike the enabled
-        // case above, and must not touch the interner either.
+        // `is_enabled()` short-circuits before the reserved-name check, so no error here.
         let lua = sandboxed_lua();
         install(&lua, Telemetry::default()).unwrap();
 

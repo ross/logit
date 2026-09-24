@@ -1,14 +1,12 @@
-//! LEB128 unsigned varints, plus zigzag encoding for signed integers reusing the same varint.
-//! The building block every count, length, and dictionary index in `native`'s payload is written
-//! with.
+//! LEB128 unsigned varints, and zigzag-encoded signed ones: every count, length, and dictionary
+//! index in the native payload, and the control messages' fields.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::CodecError;
 
 /// Writes `v` as an unsigned LEB128 varint: 7 payload bits per byte, high bit set on every byte
-/// but the last. Streams directly into `out` -- no intermediate buffer, since each byte's value
-/// only depends on bits already shifted out.
+/// but the last.
 pub fn write_uvarint(out: &mut BytesMut, mut v: u64) {
     loop {
         let byte = (v & 0x7f) as u8;
@@ -22,8 +20,8 @@ pub fn write_uvarint(out: &mut BytesMut, mut v: u64) {
     }
 }
 
-/// The inverse of [`write_uvarint`]. Bounded to 10 bytes (the maximum a 64-bit value ever needs)
-/// so a corrupt stream with the continuation bit always set can't spin forever.
+/// The inverse of [`write_uvarint`]. Stops at 10 bytes, a `u64`'s maximum, so a stream with the
+/// continuation bit always set can't spin forever.
 pub fn read_uvarint(bytes: &mut Bytes) -> Result<u64, CodecError> {
     let mut result: u64 = 0;
     for i in 0..10 {
@@ -39,9 +37,8 @@ pub fn read_uvarint(bytes: &mut Bytes) -> Result<u64, CodecError> {
     Err(CodecError::Malformed("varint longer than 10 bytes".to_string()))
 }
 
-/// Zigzag-encodes a signed value into the unsigned space `write_uvarint` carries -- small
-/// magnitudes (positive or negative) stay small on the wire, unlike two's-complement, which would
-/// make every negative `i64` encode as a full 10-byte varint.
+/// Maps `v` into the unsigned space `write_uvarint` carries so a small negative stays small; two's
+/// complement would make every negative `i64` 10 bytes.
 pub fn zigzag_encode(v: i64) -> u64 {
     ((v << 1) ^ (v >> 63)) as u64
 }
@@ -58,9 +55,7 @@ pub fn read_ivarint(bytes: &mut Bytes) -> Result<i64, CodecError> {
     read_uvarint(bytes).map(zigzag_decode)
 }
 
-/// Reads one byte, without `bytes::Buf::get_u8`'s panic-on-empty behavior -- every call site in
-/// this codec is decoding untrusted wire input, so "ran out of bytes" must be a `CodecError`, not
-/// a panic.
+/// Reads one byte, returning a `CodecError` on empty input where `Buf::get_u8` would panic.
 pub fn read_u8(bytes: &mut Bytes) -> Result<u8, CodecError> {
     if bytes.is_empty() {
         return Err(CodecError::Malformed("unexpected end of input reading a byte".to_string()));
@@ -103,7 +98,7 @@ mod tests {
 
     #[test]
     fn zigzag_keeps_small_negative_magnitudes_small_on_the_wire() {
-        // The whole point of zigzag over raw two's-complement: -1 should cost one byte, not ten.
+        // -1 costs one byte, not ten.
         let mut buf = BytesMut::new();
         write_ivarint(&mut buf, -1);
         assert_eq!(buf.len(), 1, "zigzag(-1) should be a single-byte varint");

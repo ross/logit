@@ -15,9 +15,7 @@ async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 socket2.workspace = true
-# tail_in/docker_in's checkpoint file (docs/adr/file-tailing-and-docker-json-logs.md) --
-# already present transitively (via schemars/reqwest) at these exact versions, so promoting them
-# to direct dependencies adds no new entry to the dependency tree.
+# tail_in/docker_in's checkpoint file (docs/adr/file-tailing-and-docker-json-logs.md).
 serde.workspace = true
 serde_json.workspace = true
 # otlp_in's HTTP/1.1+h2c and hand-rolled gRPC-over-HTTP/2 servers
@@ -28,57 +26,39 @@ http.workspace = true
 http-body-util.workspace = true
 # otlp_in's matching gzip request decode (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
-# otlp_in's TLS termination, both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md):
-# `rustls`/`rustls-pki-types` build a `rustls::ServerConfig` from config-supplied PEM,
-# `tokio-rustls` is the `TlsAcceptor` wrapping each accepted `TcpStream` before the existing
-# HTTP/1.1+h2c / gRPC-over-HTTP/2 serving paths ever see it.
+# Listener TLS termination (docs/adr/otlp-tls-and-pooled-grpc-client.md): `rustls`/
+# `rustls-pki-types` build a `rustls::ServerConfig` from config-supplied PEM, and `tokio-rustls`'s
+# `TlsAcceptor` wraps each accepted `TcpStream` before the serving path sees it.
 rustls.workspace = true
 rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
-# prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md) -- already a direct
-# dependency of `logit-outputs` at this exact version (its `otlp_out`/`influxdb_out` HTTP clients),
-# so promoting it here too adds no new crate version to `Cargo.lock`.
+# prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md).
 reqwest.workspace = true
 # `prometheus_in`'s remote-write receiver (docs/adr/prometheus-remote-write.md): Snappy *block*
 # decompression of every request body, the only `Content-Encoding` either wire version defines.
-# Already a direct dependency of `logit-proto` at this exact version (the codec itself), so
-# promoting it here adds no new crate version to `Cargo.lock`.
 snap.workspace = true
-# `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Every other
-# self-diagnostic in this crate goes through `logit_core::Diagnostics`, which is where `tracing`
-# normally lives -- this one can't: the perf harness reads `events`/`batches`/`elapsed` as
-# *fields* off the JSON log line, and `Diagnostics` renders a component/key pair plus one
-# already-formatted message. Emitting an event is not picking a subscriber; `logit-inputs` still
-# never installs one.
+# `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Not through
+# `logit_core::Diagnostics` like every other self-diagnostic here: the perf harness reads
+# `events`/`batches`/`elapsed` as fields off the JSON log line, and `Diagnostics` renders one
+# pre-formatted message. This crate emits events but never installs a subscriber.
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # tail_in/docker_in's inotify wake source (docs/adr/file-tailing-and-docker-json-logs.md) and the
-# UDP listener's batched `recvmmsg(2)` read
-# (docs/adr/udp-intake-batching-and-socket-visibility.md) -- already present transitively at this
-# exact version (see the workspace Cargo.toml comment).
+# UDP listener's batched `recvmmsg(2)` read (docs/adr/udp-intake-batching-and-socket-visibility.md).
 libc.workspace = true
 
 [dev-dependencies]
-# Test-only: `prometheus_in`'s receiver tests hand-build one remote-write 1.0 request that carries
-# no `metadata[]` at all -- the shape a real Prometheus sends, and the one `remote_write::encode`
-# deliberately never produces. Already in the tree at this exact version (`logit-proto`'s own
-# generated prompb types).
+# `prometheus_in`'s receiver tests hand-build a remote-write 1.0 request with no `metadata[]`:
+# the shape a real Prometheus sends, which `remote_write::encode` never produces.
 prost.workspace = true
-# Test-only: the end-to-end statsd -> aggregate integration test
-# (tests/statsd_to_aggregate.rs) needs a real `Aggregator` to prove a decoded `GaugeDelta`
-# actually resolves, not just that it decodes correctly in isolation. Not a production
-# dependency -- `logit-inputs` still doesn't depend on `logit-transforms` for the library itself
-# (AGENTS.md's crate layout).
+# tests/statsd_to_aggregate.rs needs a real `Aggregator` to prove a decoded `GaugeDelta`
+# resolves. Dev-only: the library never depends on `logit-transforms`.
 logit-transforms.workspace = true
-# `internal.rs`'s own tests drive `logit_core::TelemetryLayer` through a real `tracing` event
-# (docs/plans/operator-surface.md, workstream D) -- `logit-inputs` still never picks a subscriber
-# itself, which is what `tracing-subscriber` is needed for here. (`tracing` itself is a real
-# dependency now, for `generate_in`'s completion line -- see above.)
+# `internal.rs`'s tests drive `logit_core::TelemetryLayer` through a real `tracing` event, which
+# needs a subscriber; the library never installs one.
 tracing-subscriber.workspace = true
-# `test-util` (for `tokio::time::pause`/`#[tokio::test(start_paused = true)]`) for
-# `internal.rs`'s shutdown-drain tests, which advance a 60s drain interval by hand. Same shape
-# and same reason as `logit-pipeline`'s own override: it applies to test/bench/example builds
-# only, and it has to be declared here rather than inherited from a sibling, since
+# `test-util` (`tokio::time::pause`/`start_paused`) for `internal.rs`'s shutdown-drain tests,
+# which advance a 60s drain interval by hand. Declared here, not inherited from a sibling, because
 # `cargo test -p logit-inputs` builds this package's feature set alone.
 tokio = { workspace = true, features = ["test-util"] }

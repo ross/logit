@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1
-# Development/build image for logit.
-#
-# Not (yet) a production runtime image -- this is the container contributors build and test in,
-# so nobody needs Rust, LuaJIT build deps, or anything else installed on the host.
+# Development and build image for logit: the container contributors build and test in, so the host
+# needs no Rust or LuaJIT build deps. The production runtime image is Dockerfile.
 FROM rust:1.98.1-bookworm
 
 ARG USERNAME=dev
@@ -50,10 +48,9 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
 ENV CARGO_HOME=/home/${USERNAME}/.cargo
 RUN mkdir -p ${CARGO_HOME} && chown -R ${USER_UID}:${USER_GID} /home/${USERNAME}
 
-# Pre-create the mount point for the target/ named volume, owned by the dev user. Docker
-# initializes a fresh named volume from whatever already exists at its mount point in the image,
-# ownership included -- without this, Docker would create it root-owned on first `up` and every
-# `cargo build` in the container would fail to write to it.
+# Pre-create the target/ volume's mount point, owned by the dev user: Docker initializes a fresh
+# named volume from the image's mount point, ownership included, so without this the volume is
+# root-owned and every `cargo build` in the container fails to write to it.
 WORKDIR /work
 RUN mkdir -p /work/target && chown ${USER_UID}:${USER_GID} /work/target
 

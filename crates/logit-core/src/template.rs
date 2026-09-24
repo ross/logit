@@ -1,51 +1,33 @@
 //! A tiny `{name}` placeholder template: parsed once, name-resolved once, rendered per event.
 //!
-//! **The parser knows no names.** [`parse`] only splits literal text from placeholders; deciding
-//! which names mean something -- and rejecting the rest -- belongs entirely to the consumer, which
-//! walks [`Template::vars`] (config validation) and then [`Template::compile`]s each name into its
-//! own resolved value type (construction). That split is why this module lives in `logit-core`
-//! rather than next to its first consumer: the graph validation that rejects an unknown name and
-//! the component that actually renders live in different crates, and an implementation crate may
-//! not depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout).
-//!
-//! First consumer: `generate_in`'s event template (`docs/plans/load-test-harness.md`), which
-//! resolves `seq`/`seq%N` into a counter and renders a log body, attribute values, and a metric
-//! name per generated event. The shape is deliberately consumer-agnostic because a second one is
-//! already foreseen: a `stdio_out` line format, where the same `{name}` syntax would resolve
-//! `timestamp`, `log.message`, `attributes.host` and friends into field accessors against the
-//! event being written. Nothing in this module needs to change for that -- only the `resolve`
-//! closure passed to [`Template::compile`] and the `var` closure passed to [`Compiled::render`].
+//! **The parser knows no names.** [`parse`] only splits literal text from placeholders. The
+//! consumer decides which names mean something: it walks [`Template::vars`] at config validation,
+//! then [`Template::compile`]s each name into its own value type at construction. The module
+//! lives in `logit-core` because those two steps are in different crates, and an implementation
+//! crate may not depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate layout").
+//! Consumers today: `generate_in`'s event template (`seq`/`seq%N`) and `logit-perf`'s load specs.
 //!
 //! Syntax: `{name}` is a placeholder; `{{` and `}}` are a literal `{` and `}`. `name` is the raw
-//! text between the braces, passed through verbatim -- not trimmed, not validated, not split -- so
-//! a consumer whose names have their own inner syntax (`seq%1000`, `attributes.host`) receives it
-//! exactly as written.
+//! text between the braces, not trimmed, validated, or split, so a consumer's inner syntax
+//! (`seq%1000`, `attributes.host`) arrives as written.
 //!
-//! Hot path: [`Compiled::render`] walks pre-resolved segments, appending literals and calling the
-//! consumer's closure for each placeholder. No string matching, no name lookup, and no allocation
-//! beyond growing the caller's `String` -- so a caller that renders into a cleared, already-grown
-//! scratch buffer allocates nothing at all.
+//! Hot path: [`Compiled::render`] does no name lookup and allocates nothing beyond growing the
+//! caller's `String`, so rendering into a cleared, already-grown scratch buffer allocates nothing.
 
 use bytes::Bytes;
 
-/// Why a template string couldn't be parsed. Three shapes, each a typo rather than anything a
-/// consumer could meaningfully recover from -- and each carrying the byte offset of the character
-/// that made the template ambiguous, since a configured template is often long enough (a whole
-/// JSON log line, say) that naming the offset is the difference between a fixable error and a hunt.
+/// Why a template string couldn't be parsed: a typo, reported with the byte offset of the
+/// offending character, since a configured template can be a whole JSON log line.
 ///
-/// Hand-rolled rather than `thiserror`-derived: `logit-core` has no `thiserror` dependency and
-/// keeps its dependency list to the event model's own needs ([`crate::TimestampError`] and
-/// `HllDecodeError` are the precedent).
+/// Hand-rolled rather than `thiserror`-derived: `logit-core` has no `thiserror` dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateError {
     /// A `{` with no closing `}` after it.
     Unterminated { at: usize },
-    /// A `{}` naming nothing. Rejected rather than treated as a literal `{}`: a consumer's
-    /// resolver would have to invent a meaning for the empty name, and `{{}}` already writes a
-    /// literal empty pair.
+    /// A `{}` naming nothing. Not a literal: `{{}}` writes that.
     EmptyName { at: usize },
-    /// A `}` that closes no placeholder. Rejected rather than passed through as a literal, so a
-    /// mistyped `{name}}` is an error instead of silently rendering a trailing brace.
+    /// A `}` that closes no placeholder, so a mistyped `{name}}` is an error rather than a
+    /// trailing brace.
     StrayBrace { at: usize },
 }
 
@@ -73,32 +55,27 @@ impl std::error::Error for TemplateError {}
 /// One piece of a parsed [`Template`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
-    /// Literal text, already unescaped (`{{`/`}}` collapsed to one brace). [`Bytes`], not
-    /// `String`, because a consumer whose template is entirely literal clones the whole thing onto
-    /// every event -- a refcount bump rather than a copy (see [`Template::literal`]).
+    /// Literal text, already unescaped. [`Bytes`] so an all-literal template clones onto every
+    /// event as a refcount bump (see [`Template::literal`]).
     Lit(Bytes),
-    /// A placeholder's raw name, exactly as written between the braces.
+    /// A placeholder's raw name, as written between the braces.
     Var(String),
 }
 
 /// A parsed template: literal text interleaved with placeholder names.
 ///
-/// Adjacent literals are merged at parse time, so two `Lit` segments never sit next to each other
-/// and an all-literal template is exactly one segment. That's what makes [`Template::literal`] a
-/// reliable "is there anything at all to render per event?" test rather than a heuristic.
+/// `parse` merges adjacent literals, so an all-literal template is one segment; that's what makes
+/// [`Template::literal`] exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Template {
     pub segments: Vec<Segment>,
 }
 
-/// What [`Template::literal`] returns for an empty template -- a `&Bytes` has to point somewhere,
-/// and an empty template has no segment of its own to point at.
+/// What [`Template::literal`] borrows for an empty template, which has no segment to point at.
 static EMPTY_LITERAL: Bytes = Bytes::new();
 
 impl Template {
-    /// The placeholder names, in the order they appear, with duplicates repeated -- a consumer
-    /// validating a template (`logit-pipeline::graph`'s rules) walks this to reject a name it
-    /// doesn't know, before anything is constructed.
+    /// The placeholder names in order, duplicates repeated, for validation to reject unknown ones.
     pub fn vars(&self) -> impl Iterator<Item = &str> {
         self.segments.iter().filter_map(|segment| match segment {
             Segment::Var(name) => Some(name.as_str()),
@@ -106,17 +83,14 @@ impl Template {
         })
     }
 
-    /// Whether this template has no placeholders at all -- the case a consumer can render once and
-    /// reuse forever instead of per event.
+    /// Whether this template has no placeholders, so it can be rendered once rather than per event.
     pub fn is_literal(&self) -> bool {
         self.segments.iter().all(|segment| matches!(segment, Segment::Lit(_)))
     }
 
-    /// The whole template as one literal, when [`Template::is_literal`] holds (including the empty
-    /// template, which yields empty bytes). `None` as soon as any placeholder is present.
-    ///
-    /// This is the fast path's entry point: a consumer that gets `Some` here can clone these
-    /// `Bytes` onto every event and never touch [`Compiled::render`] at all.
+    /// The whole template as one literal (empty bytes for an empty template), or `None` if any
+    /// placeholder is present. On `Some`, a consumer clones these `Bytes` onto every event and
+    /// never calls [`Compiled::render`].
     pub fn literal(&self) -> Option<&Bytes> {
         match self.segments.as_slice() {
             [] => Some(&EMPTY_LITERAL),
@@ -125,10 +99,8 @@ impl Template {
         }
     }
 
-    /// Resolves every placeholder name once, up front, into whatever the consumer wants to carry
-    /// on the hot path -- its own `enum` of pre-computed accessors, typically. `resolve` returning
-    /// `Err` is how a consumer rejects a name it doesn't recognize; the first failure
-    /// short-circuits and is returned as-is, so the error type stays entirely the consumer's.
+    /// Resolves every placeholder name once into the consumer's hot-path value type. The first
+    /// `Err` from `resolve` (an unrecognized name) is returned as-is.
     pub fn compile<V, E>(
         &self,
         mut resolve: impl FnMut(&str) -> Result<V, E>,
@@ -136,10 +108,8 @@ impl Template {
         let mut segments = Vec::with_capacity(self.segments.len());
         for segment in &self.segments {
             segments.push(match segment {
-                // The literal becomes a `str` here, once, so `render` needs no UTF-8 check per
-                // event. `parse` builds every literal from a `&str`, so this lossy conversion is
-                // exact for any template that came from it; it stays lossy rather than fallible
-                // only because `Segment::Lit` is a public `Bytes` a caller could hand-build.
+                // Converted once so `render` needs no per-event UTF-8 check. Exact for anything
+                // `parse` built; lossy only because a caller can hand-build a `Segment::Lit`.
                 Segment::Lit(bytes) => CompiledSegment::Lit(
                     String::from_utf8_lossy(bytes).into_owned().into_boxed_str(),
                 ),
@@ -153,27 +123,23 @@ impl Template {
 /// One piece of a [`Compiled`] template: literal text, or a consumer-resolved placeholder value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompiledSegment<V> {
-    /// The same literal text [`Segment::Lit`] carries, held as a `str` so [`Compiled::render`]
-    /// can append it with no per-render UTF-8 check.
+    /// [`Segment::Lit`]'s text as a `str`, so rendering needs no UTF-8 check.
     Lit(Box<str>),
     Var(V),
 }
 
-/// A [`Template`] whose placeholder names have been resolved into `V` -- the form the hot path
-/// walks. Built by [`Template::compile`].
+/// A [`Template`] with its placeholder names resolved into `V`, built by [`Template::compile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compiled<V> {
     pub segments: Vec<CompiledSegment<V>>,
 }
 
 impl<V> Compiled<V> {
-    /// Appends this template's rendering to `out`, calling `var` for each placeholder with its
-    /// resolved value and the same `out` to append to.
+    /// Appends this template's rendering to `out`, calling `var` with each placeholder's value
+    /// and `out`.
     ///
-    /// Nothing is allocated here beyond whatever growing `out` needs, and nothing is matched by
-    /// name -- so the intended shape is one `String` scratch buffer per worker, `clear`ed and
-    /// re-rendered per event, which stops allocating entirely once it has grown to the widest
-    /// rendering it has seen.
+    /// Allocates only to grow `out`: use one scratch `String` per worker, cleared per event, and
+    /// it stops allocating once it reaches the widest rendering.
     pub fn render(&self, out: &mut String, mut var: impl FnMut(&V, &mut String)) {
         for segment in &self.segments {
             match segment {
@@ -186,13 +152,10 @@ impl<V> Compiled<V> {
 
 /// Parses a template: `{name}` placeholders in literal text, `{{`/`}}` for a literal brace.
 ///
-/// See this module's doc comment for the syntax, and for what is deliberately *not* checked here
-/// (anything at all about the names).
+/// Names aren't checked at all; see the module doc.
 pub fn parse(input: &str) -> Result<Template, TemplateError> {
     let mut segments = Vec::new();
-    // One accumulator for all literal text, flushed only when a placeholder starts or the input
-    // ends -- which is what merges adjacent literals (an escaped brace between two runs of plain
-    // text, say) into a single segment without a second pass.
+    // Flushed only when a placeholder starts or input ends, which merges adjacent literals.
     let mut lit = String::new();
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -223,9 +186,8 @@ pub fn parse(input: &str) -> Result<Template, TemplateError> {
             }
             b'}' => return Err(TemplateError::StrayBrace { at: i }),
             _ => {
-                // Copy the whole run up to the next brace in one `push_str` rather than a char at
-                // a time. Both braces are ASCII, so the run's end is always a char boundary -- a
-                // multi-byte UTF-8 sequence never contains a `{`/`}` byte.
+                // Copy the run up to the next brace at once. Braces are ASCII, so the run ends on
+                // a char boundary: no multi-byte UTF-8 sequence contains a `{`/`}` byte.
                 let next = bytes[i..]
                     .iter()
                     .position(|b| *b == b'{' || *b == b'}')
@@ -284,8 +246,7 @@ mod tests {
         assert_eq!(template.vars().collect::<Vec<_>>(), vec!["seq%10", "zone"]);
     }
 
-    /// A placeholder's name reaches the consumer byte for byte -- no trimming, no splitting on the
-    /// inner syntax a consumer's own names may have. `generate_in`'s `seq%1000` depends on it.
+    /// A placeholder's name reaches the consumer byte for byte, untrimmed and unsplit.
     #[test]
     fn a_placeholder_name_is_passed_through_verbatim() {
         let template = parse("{ seq % 1000 }{attributes.host}").unwrap();
@@ -313,8 +274,7 @@ mod tests {
         assert_eq!(template.vars().collect::<Vec<_>>(), vec!["seq"]);
     }
 
-    /// The escape is what makes an all-literal template with braces in it still a single segment:
-    /// adjacent literals are merged at parse time, never left for a second pass.
+    /// Escaped braces merge into one literal segment with the text around them.
     #[test]
     fn escaped_braces_merge_into_the_surrounding_literal() {
         let template = parse("a{{b}}c").unwrap();
@@ -351,14 +311,12 @@ mod tests {
     #[test]
     fn a_stray_closing_brace_is_rejected() {
         assert_eq!(parse("host}"), Err(TemplateError::StrayBrace { at: 4 }));
-        // The brace closing `{seq}` is consumed by the placeholder, so the *next* one is stray --
-        // a mistyped `}}` escape, not a second escape.
+        // `{seq}` consumes the first `}`, so the next one is stray, not an escape.
         assert_eq!(parse("{seq}}"), Err(TemplateError::StrayBrace { at: 5 }));
         assert!(parse("}").unwrap_err().to_string().contains("stray '}'"));
     }
 
-    /// What a consumer's resolved value type actually looks like: one small enum, and a resolver
-    /// that rejects everything else. `generate_in`'s own is this, near enough.
+    /// A consumer's resolved type and resolver, roughly `generate_in`'s.
     #[derive(Debug, PartialEq, Eq)]
     enum Resolved {
         Seq,
@@ -436,9 +394,7 @@ mod tests {
         assert_eq!(out, "seq=7");
     }
 
-    /// The hot-path guarantee: a scratch `String` that has already grown to hold one rendering
-    /// renders the next one with no reallocation at all. Exact equality on `capacity`, not a
-    /// bound -- a realloc is precisely what this test exists to catch (`AGENTS.md`).
+    /// A grown scratch `String` renders the next event with no reallocation (exact `capacity`).
     #[test]
     fn rendering_into_a_cleared_scratch_string_reallocates_nothing() {
         let compiled = parse("host-{seq%10}/{seq} done").unwrap().compile(resolve).unwrap();

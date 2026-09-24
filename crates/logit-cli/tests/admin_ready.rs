@@ -1,9 +1,7 @@
-//! `logit ready` against a real running `logit run` with `admin.bind` set
-//! (docs/plans/operator-surface.md, workstream C) -- blackbox, spawning the actual binary twice
-//! (once as the long-running service, once as the probe), unlike `crates/logit-cli/src/admin.rs`'s
-//! own in-module tests, which exercise `serve_on`/`handle` directly and can't reach `logit ready`
-//! (a private module of this binary crate, per `logging_flags.rs`'s own note on why every test
-//! here spawns the real binary rather than calling into `crate::*`).
+//! `logit ready` and `/readyz` against a real `logit run` with `admin.bind` set (ADR
+//! `admin-readiness-endpoint`), spawning the binary twice: once as the service, once as the
+//! probe. `crates/logit-cli/src/admin.rs`'s in-module tests drive `serve_on`/`handle` directly;
+//! `logit-cli` is a binary crate, so an integration test reaches the rest only by spawning it.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -73,8 +71,7 @@ async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
         .expect("spawning logit run");
     let mut child = KillOnDrop(child);
 
-    // Retry `logit ready` rather than a fixed sleep: it's the exact probe under test, so using
-    // it as its own readiness signal needs no separate synchronization primitive.
+    // Retry the probe under test as its own readiness signal rather than a fixed sleep.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let output = logit_ready(&admin_addr);
@@ -93,8 +90,8 @@ async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Kill the running pipeline, then confirm `logit ready` now fails against the closed port --
-    // proving it actually reflects live state, not a cached "yes" from the first success above.
+    // Kill the pipeline, then confirm `logit ready` fails against the closed port: it reflects
+    // live state, not a cached first success.
     child.0.kill().expect("killing the running logit process");
     child.0.wait().expect("waiting for logit to exit");
 
@@ -112,11 +109,9 @@ async fn logit_ready_reflects_a_real_runs_readiness_then_fails_once_it_exits() {
     }
 }
 
-/// The drain window is exactly what `/readyz` exists to report. Between the signal arriving and
-/// the process exiting, an orchestrator must get `503 draining` -- a definite "stop routing here,
-/// I am still finishing" -- not a refused connection, which it cannot tell from a crash. A
-/// regression test for the admin server closing its own port on the shutdown signal, which made
-/// `draining` unreachable in a real process no matter how long the drain took.
+/// Between SIGTERM and exit, `/readyz` answers `503 draining` for the whole drain: an
+/// orchestrator needs a definite "stop routing here, still finishing", not a refused connection
+/// it can't tell from a crash. So the admin server must keep its port open until the drain ends.
 ///
 /// The drain is made long enough to probe by giving a sink something it can never deliver:
 /// `internal` emits its own process gauges every 100ms with no traffic needed, `influxdb_out`
@@ -146,8 +141,7 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
     let pid = child.id();
     let _child = KillOnDrop(child);
 
-    // Poll `logit ready` until the pipeline reports itself ready, same as the happy-path test
-    // above.
+    // Wait for ready, as the test above does.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let output = logit_ready(&admin_addr);
@@ -164,8 +158,8 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Give the undeliverable sink time to accumulate a batch it cannot flush, so the drain the
-    // signal below starts is guaranteed to still be running when we start probing it.
+    // Give the undeliverable sink time to hold a batch it can't flush, so the drain SIGTERM
+    // starts is still running when probing begins.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // A real SIGTERM, not `Child::kill` (SIGKILL) -- only SIGTERM starts the graceful drain this
@@ -192,9 +186,8 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
             saw_draining = true;
             break;
         }
-        // The process may have already exited (drain finished, or admin port closed) -- either
-        // way, keep polling until the deadline; a `logit ready` connection failure is itself
-        // useful information in the failure message below.
+        // The process may already have exited; keep polling to the deadline, and a connection
+        // failure still lands in the failure message below.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -207,9 +200,8 @@ async fn readyz_answers_draining_for_the_whole_drain_after_a_sigterm() {
 
 #[test]
 fn logit_ready_against_nothing_listening_exits_1() {
-    // Port 1 -- nothing is listening there, and no real server (this test's own admin server
-    // included) ever binds it, so the connection simply fails, exactly the "no admin server
-    // reachable" case.
+    // Port 1: nothing listens there, so the connection fails, the "no admin server reachable"
+    // case.
     let output = logit_ready("127.0.0.1:1");
     assert_eq!(output.status.code(), Some(1));
 }

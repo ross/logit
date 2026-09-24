@@ -1,19 +1,18 @@
-# Arc-based fan-out to multiple sinks (docs/plans/load-test-harness.md's scenario table):
-# passthrough.yaml's exact event stream -- the same six attributes, the same count -- delivered
-# to three null_out sinks instead of one, so the only thing that differs between the two
-# scenarios is the consumer count. Read against `passthrough`, the difference is the Fanout's
-# per-edge Arc clone (crates/logit-pipeline/src/fanout.rs) plus two more sink-side hops
-# (drain_inbox -> SinkQueue -> write_loop, crates/logit-pipeline/src/runtime.rs).
+# Arc-based fan-out to multiple sinks: passthrough.yaml's event stream (same six attributes, same
+# count) delivered to three null_out sinks instead of one, so the only difference between the two
+# scenarios is the consumer count. Read against passthrough, the gap is the Fanout's per-edge Arc
+# clone (crates/logit-pipeline/src/fanout.rs) plus two more sink-side hops
+# (drain_inbox -> SinkQueue -> write_loop, crates/logit-pipeline/src/runtime.rs). Scenario table:
+# docs/plans/load-test-harness.md, "Scenarios".
 #
 #   script/perf run --scenario fanout
 #
-# `count` is *generated* events, and that is what the harness divides by: this scenario delivers
+# `count` is generated events, and that is what the harness divides by: this scenario delivers
 # 3 x count batch-events, so its CPU us/event is per generated event, not per delivery. Divide the
-# gap from `passthrough` by two for the marginal cost of one extra consumer.
+# gap from passthrough by two for the marginal cost of one extra consumer.
 #
-# History: this scenario used to generate a one-attribute event (`host: web-{seq%20}`) at 55M,
-# which made it look cheaper per event than `passthrough` -- it was measuring a 6x lighter
-# generator, not a cheaper delivery path. Keep the template in lockstep with passthrough.yaml.
+# Keep the event template and count in lockstep with passthrough.yaml: a lighter template here
+# measures a cheaper generator, not a cheaper delivery path.
 components:
   gen:
     type: generate_in

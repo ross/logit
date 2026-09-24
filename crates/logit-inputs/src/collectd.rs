@@ -1,13 +1,10 @@
-//! collectd's binary "`network` plugin" protocol over UDP -- the listener half of
+//! collectd's binary `network` plugin protocol over UDP: the listener half of
 //! [ADR `collectd-binary-relay`](../../../docs/adr/collectd-binary-relay.md)'s
-//! `collectd_in -> collectd_out` lossless-relay pair
-//! (`docs/plans/collectd-binary-relay.md`'s W2).
+//! `collectd_in -> collectd_out` lossless-relay pair.
 //!
-//! The wire format, the sticky-identity state machine, the `| Wire | Model |` mapping table and the
-//! permitted normalizations all live with the codec, in
-//! [`logit_proto::collectd`]'s module doc -- that doc is the spec, and this one deliberately does
-//! not restate it. What lives here is the *component*: its configuration, its socket behaviour, and
-//! what it reports.
+//! The wire format, the sticky-identity state machine, the model mapping, and the permitted
+//! normalizations are the codec's, in [`logit_proto::collectd`]'s module doc. This doc covers the
+//! component: its configuration, socket behaviour, and reporting.
 //!
 //! ```yaml
 //! components:
@@ -22,61 +19,47 @@
 //!
 //! ## `bind`, and multicast
 //!
-//! An ordinary `host:port` binds that address. A **multicast group** -- collectd's own defaults are
-//! `239.192.74.66` (IPv4) and `ff18::efc0:4a42` (IPv6), which is what a sender configured with a
-//! bare `Server "239.192.74.66"` writes to -- is detected from the address itself and joined
-//! automatically: `SO_REUSEADDR`, a bind of the unspecified address on that port, then an
-//! `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` on the default interface. There is no `multicast:` field,
-//! because the address already says everything there is to say. A failed join fails startup rather
-//! than warning -- see [`crate::udp`]'s `bind_one`. The `bound` info line names the group.
+//! An ordinary `host:port` binds that address. A multicast group (collectd's defaults are
+//! `239.192.74.66` and `ff18::efc0:4a42`, what a bare `Server "239.192.74.66"` sends to) is
+//! detected from the address and joined: `SO_REUSEADDR`, a bind of the unspecified address on that
+//! port, then `IP_ADD_MEMBERSHIP`/`IPV6_JOIN_GROUP` on the default interface. There is no
+//! `multicast:` field. A failed join fails startup (see [`crate::udp`]'s `bind_one`). The `bound`
+//! info line names the group.
 //!
-//! One consequence worth stating outright, since the config line does not: because the socket is
-//! bound to the **unspecified** address rather than to the group, a `bind: 239.192.74.66:25826`
-//! listener also accepts ordinary *unicast* datagrams sent to that port from any source, and
-//! [`CollectdInput::local_addr`] reports `0.0.0.0:<port>` rather than the group. Joining a group is
-//! additive -- it is not a filter that narrows what else the port receives.
+//! Because the socket binds the unspecified address, a `bind: 239.192.74.66:25826` listener also
+//! accepts unicast datagrams sent to that port from any source, and
+//! [`CollectdInput::local_addr`] reports `0.0.0.0:<port>`. Joining a group is additive, not a
+//! filter.
 //!
 //! ## `types_db`
 //!
-//! Zero or more paths to collectd `types.db` files (relative ones resolve against the config
-//! file's directory), read once at startup and merged in order -- a later file overrides an
-//! earlier file's definition of the same type. They supply **data-source names**, nothing else:
-//! a resolved multi-data-source list is named `<plugin>.<type>.<ds_name>` instead of
-//! `<plugin>.<type>.<i>`, and a resolved single-data-source list is `<plugin>.<type>` either way.
-//! A type the files do not define is index-named, silently; a type they define *differently* from
-//! what arrived is index-named with a `types_db_mismatch` diagnostic. See
-//! [`logit_proto::collectd::types_db`] for the file format and
-//! [`logit_proto::collectd::CollectdDecoder::with_types_db`] for the naming rule.
+//! Zero or more collectd `types.db` paths (relative ones resolve against the config file's
+//! directory), read once at startup and merged in order, a later file overriding an earlier one's
+//! type. An unreadable or unparseable file fails startup. They supply data-source names only; the
+//! naming rule and the `types_db_mismatch` case are
+//! [`logit_proto::collectd::CollectdDecoder::with_types_db`]'s, and the file format is
+//! [`logit_proto::collectd::types_db`]'s.
 //!
-//! Record names are display/cross-protocol only: `collectd_out` re-encodes from the `collectd.*`
-//! attributes, the `MetricList` order and each record's kind, so configuring `types_db` (or not)
-//! never changes what a `collectd_in -> collectd_out` relay puts back on the wire. It changes what
-//! an InfluxDB/Prometheus/statsd sink calls the series.
+//! **`types_db` never changes what a `collectd_in -> collectd_out` relay puts back on the wire**:
+//! `collectd_out` re-encodes from the `collectd.*` attributes, the `MetricList` order, and each
+//! record's kind, never the record name. It changes only what other sinks call the series.
 //!
-//! collectd's own `types.db` is GPL-licensed and is **not** shipped with `logit`; an operator
-//! points this at the copy their collectd installation already has.
+//! collectd's `types.db` is GPL-licensed and not shipped with `logit`; point this at the copy the
+//! collectd installation already has.
 //!
 //! ## Diagnostics
 //!
 //! Every one is throttled (`logit.component.diagnostics{key}`,
-//! `docs/design/internal-telemetry.md`):
-//!
-//! | Key | Meaning |
-//! |---|---|
-//! | `bad_datagram` | the whole datagram failed to decode and nothing was salvaged -- the shared listener's own key (`crate::udp`), raised here by a malformed first part |
-//! | `bad_part` | a malformed part *behind* at least one decoded value list: the earlier lists are kept, the rest of the datagram is abandoned |
-//! | `incomplete_identity` | a value list arrived with an empty host, plugin or type; skipped, exactly as collectd's own receiver rejects it |
-//! | `encrypted_packet_dropped` | a `SecurityLevel Encrypt` datagram: this codec holds no keys, so the rest of the datagram is dropped (`docs/known-gaps.md`) |
-//! | `types_db_mismatch` | the configured `types_db` defines this list's type with a different data-source count or kinds than arrived; index naming is used instead |
-//! | `notification_dropped` | a notification (`0x0100`/`0x0101`) arrived with an out-of-set severity, an empty message, or no host set; skipped, exactly as collectd's own receiver rejects the same notification |
+//! `docs/design/internal-telemetry.md`). The decoder's keys (`bad_part`, `incomplete_identity`,
+//! `encrypted_packet_dropped`, `types_db_mismatch`, `notification_dropped`) are in
+//! [`logit_proto::collectd`]'s mapping table. The driver adds `bad_datagram`: a datagram that
+//! failed with nothing salvaged, which a malformed first part causes.
 //!
 //! ## Telemetry
 //!
-//! All of it comes from the shared UDP listener driver, identically to `statsd_in`/`syslog_in`:
-//! `logit.input.datagrams`/`logit.input.datagram.bytes` (what actually arrived on the wire, which
-//! the `Fanout`-level `events.sent` cannot tell apart from one busy sender), the
-//! `logit.component.receive.*` receive-queue gauges, and `logit.input.receive_buffer.bytes`.
-//! This component adds none of its own.
+//! All from the shared UDP driver, as for `statsd_in`/`syslog_in`: `logit.input.datagrams`/
+//! `logit.input.datagram.bytes`, the `logit.component.receive.*` queue gauges, and
+//! `logit.input.receive_buffer.bytes`. This component adds none.
 
 use crate::udp::{UdpListener, UdpListenerConfig};
 use crate::Input;
@@ -86,11 +69,8 @@ use logit_proto::collectd::{CollectdDecoder, TypesDb};
 use std::sync::Arc;
 use tokio::sync::watch;
 
-/// Thin wrapper over [`UdpListener<CollectdDecoder>`] -- the read/decode split, the datagram-\>batch
-/// assembly and the multicast-aware bind all live there
-/// (`docs/adr/decoupled-listener-io.md`, [`crate::udp`]); this type is the decoder choice plus the
-/// builder surface `logit-cli::pipeline` wires a `collectd_in` component through. The direct
-/// counterpart of [`crate::statsd::StatsdInput`].
+/// A `collectd_in` listener: a thin wrapper over [`UdpListener<CollectdDecoder>`], which owns the
+/// read/decode split, batch assembly, and multicast-aware bind. See this module's doc.
 pub struct CollectdInput {
     inner: UdpListener<CollectdDecoder>,
 }
@@ -106,53 +86,43 @@ impl CollectdInput {
         }
     }
 
-    /// Attaches a component id to this listener's diagnostics -- and to the [`CollectdDecoder`] it
-    /// wraps, so both report under the same id. Both halves matter, for the same reason
-    /// [`crate::statsd::StatsdInput::with_diagnostics`] documents: `UdpListener`'s own `diag` is
-    /// what a whole-datagram decode failure reports through (`bad_datagram`), while the decoder's
-    /// own is what everything finer-grained goes through (`bad_part`, `incomplete_identity`,
-    /// `encrypted_packet_dropped`, `types_db_mismatch`) -- two distinct `Diagnostics` values that
-    /// must both carry the same id and telemetry handle, or one class of decode failure silently
-    /// reports under no component id and with telemetry disabled.
+    /// Attaches a component id to the driver's diagnostics and to the [`CollectdDecoder`]'s.
+    ///
+    /// They are two distinct `Diagnostics` values: the driver's carries `bad_datagram`, the
+    /// decoder's everything finer-grained (`bad_part`, `types_db_mismatch`, ...). Setting only one
+    /// leaves a whole class of failure reporting under no component id.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.inner =
             self.inner.with_diagnostics(diag.clone()).map_decoder(|d| d.with_diagnostics(diag));
         self
     }
 
-    /// Attaches a telemetry handle -- the wire-level datagram/byte counters the shared listener
-    /// emits (`docs/design/internal-telemetry.md`'s "layer 3").
+    /// Attaches a telemetry handle for the shared listener's datagram and byte counters.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.inner = self.inner.with_telemetry(telemetry);
         self
     }
 
-    /// Gives the wrapped decoder an already-loaded `types.db` -- see this module's doc. An `Arc`
-    /// because the decoder holds it for the process's lifetime while the caller keeps its own
-    /// handle; `logit-cli::pipeline`'s `build_spec` does one `TypesDb::load` per `collectd_in`
-    /// component and shares that one map with that component's decoder (two listeners naming the
-    /// same file each parse it, into two independent maps).
+    /// Gives the decoder an already-loaded `types.db` (see this module's doc). `logit-cli` loads
+    /// one per component, so two listeners naming the same file each parse their own copy.
     pub fn with_types_db(mut self, types_db: Arc<TypesDb>) -> Self {
         self.inner = self.inner.map_decoder(|d| d.with_types_db(types_db));
         self
     }
 
-    /// Overrides the receive-queue/batching/shutdown-grace knobs a `receive:` config block sets
-    /// (`docs/adr/decoupled-listener-io.md`). Defaults to [`UdpListenerConfig::default`] when
-    /// never called.
+    /// Sets the `receive:` block; every field applies. Defaults to [`UdpListenerConfig::default`].
     pub fn with_receive(mut self, config: UdpListenerConfig) -> Self {
         self.inner = self.inner.with_config(config);
         self
     }
 
-    /// The currently-configured receive-queue/batching/shutdown-grace knobs -- for test
-    /// introspection (`logit-cli::pipeline`'s `build_spec` wiring tests).
+    /// The configured `receive:` knobs, for `logit-cli::pipeline`'s wiring tests.
     pub fn receive_config(&self) -> UdpListenerConfig {
         self.inner.config()
     }
 
-    /// Passthrough to the wrapped [`UdpListener::local_addr`]: lets a caller (a round-trip test)
-    /// learn the real ephemeral port after `bind()`, with no bind-drop race.
+    /// The bound address once `bind()` has run, so a test learns an ephemeral port with no
+    /// bind-drop race.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner.local_addr()
     }
@@ -222,10 +192,7 @@ mod tests {
         out.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// The whole component against a real socket: bind an ephemeral port, run it, send one
-    /// hand-built datagram, and drain the `Fanout` it delivers into -- the same shape
-    /// `crates/logit-inputs/src/udp.rs`'s `bind_then_run_delivers_a_real_datagram` uses for the
-    /// driver itself, but through `CollectdInput`'s own decoder and builder surface.
+    /// A hand-built datagram sent to a real socket is delivered through `CollectdInput`.
     #[tokio::test]
     async fn a_real_datagram_decodes_into_delivered_events() {
         let mut input = CollectdInput::new("127.0.0.1:0");
@@ -259,9 +226,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `with_types_db` has to reach the *decoder*, not sit on the wrapper: the record name is the
-    /// only observable difference, so this asserts it through a real socket rather than by
-    /// introspection.
+    /// `with_types_db` reaches the decoder, observed as the record name through a real socket.
     #[tokio::test]
     async fn with_types_db_reaches_the_decoder_and_names_data_sources() {
         let types_db = Arc::new(
@@ -306,11 +271,7 @@ mod tests {
         handle.abort();
     }
 
-    /// The guard both sibling inputs carry (`statsd.rs`/`syslog.rs`'s own
-    /// `with_diagnostics_reaches_the_wrapped_decoder_too`): dropping `with_diagnostics`'s
-    /// `.map_decoder(..)` half compiles fine and silently leaves every decoder-side diagnostic
-    /// (`bad_part`, `incomplete_identity`, `encrypted_packet_dropped`, `types_db_mismatch`)
-    /// reporting under no component id and with telemetry disabled.
+    /// `with_diagnostics` reaches the decoder too; dropping `.map_decoder(..)` still compiles.
     #[test]
     fn with_diagnostics_reaches_the_wrapped_decoder_too() {
         let input = CollectdInput::new("127.0.0.1:0").with_diagnostics(Diagnostics::new("my-id"));
@@ -326,8 +287,7 @@ mod tests {
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
     }
 
-    /// `with_receive` is what a `receive:` block reaches, and `receive_config` is how
-    /// `logit-cli`'s `build_spec` test reads it back.
+    /// `receive_config` reads back what `with_receive` set.
     #[test]
     fn with_receive_round_trips_through_receive_config() {
         let config = UdpListenerConfig { max_datagrams: 4242, ..UdpListenerConfig::default() };
@@ -337,29 +297,23 @@ mod tests {
 
     // ---- recorded interop fixtures (testdata/interop/collectd/) --------------------------------
     //
-    // Real datagrams from a real collectd's own `network` plugin -- not this codec's encoder, not a
-    // hand-built `PacketBuilder` packet -- recorded by `script/record-fixtures collectd`. See
-    // testdata/interop/collectd/README.md for the provenance table and
-    // docs/plans/recorded-interop-fixtures.md for why the corpus exists at all.
+    // Real datagrams from a real collectd's `network` plugin, recorded by
+    // `script/record-fixtures collectd`; provenance in testdata/interop/collectd/README.md,
+    // rationale in docs/plans/recorded-interop-fixtures.md.
     //
-    // These assert on **decoded, identifiable values** (the host, which plugins arrived, a list's
-    // data-source count and kinds, the interval), never on the fixture bytes: re-running the
-    // recorder changes every measured value, every timestamp, and even which lists land in which
-    // datagram, and a test pinned to any of that would be testing this directory's stability rather
-    // than the decoder (testdata/interop/README.md's "Consuming these fixtures").
+    // Assertions are on decoded, identifiable values (the host, which plugins arrived, a list's
+    // data-source count and kinds, the interval), never on the bytes: a re-record changes every
+    // value, every timestamp, and which lists land in which datagram
+    // (testdata/interop/README.md's "Consuming these fixtures").
     //
-    // They live here rather than in `logit-proto` beside the codec's own unit tests for the same
-    // reason `syslog.rs`'s do: this is the component an operator actually points at a collectd, and
-    // `CollectdDecoder` plus `with_types_db` is exactly the surface `collectd_in` configures.
+    // They live here, not in `logit-proto`, because `CollectdDecoder` plus `with_types_db` is the
+    // surface `collectd_in` configures and an operator points at a real collectd.
 
     const INTEROP_FIXTURES: [&str; 3] =
         ["collectd-000.raw", "collectd-001.raw", "collectd-002.raw"];
 
-    /// A hand-written `types.db` covering exactly the six types these fixtures carry, in stock
-    /// collectd's own data-source layout. Hand-written on purpose: collectd's own `types.db` is
-    /// GPL-licensed and is never copied into this repo (see this module's doc and
-    /// [`logit_proto::collectd::types_db`]), and a fixture that only has to cover six types is
-    /// clearer than 200 lines of someone else's file anyway.
+    /// A hand-written `types.db` for the six types these fixtures carry, in stock collectd's
+    /// data-source layout. collectd's own file is GPL-licensed and never copied into this repo.
     const FIXTURE_TYPES_DB: &str = "\
 # hand-written for crates/logit-inputs/src/collectd.rs's interop tests -- not collectd's own file
 load\t\tshortterm:GAUGE:0:5000, midterm:GAUGE:0:5000, longterm:GAUGE:0:5000
@@ -370,15 +324,13 @@ if_errors\trx:DERIVE:0:U, tx:DERIVE:0:U
 if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 ";
 
-    /// Deliberately *before* the capture window (2023-11-14), so every "the timestamp came off the
-    /// wire" assertion below would fail loudly if the decoder ever fell back to receipt time for
-    /// these datagrams -- every list collectd sends carries a TimeHR part.
+    /// 2023-11-14, before the capture window, so a fallback to receipt time fails the timestamp
+    /// assertions: every list collectd sends carries a TimeHR part.
     const RECEIVED_AT: i64 = 1_700_000_000_000_000_000;
     /// 2026-09-12T00:00:00Z, the day these fixtures were recorded: a lower bound on every decoded
     /// timestamp.
     const CAPTURED_ON_OR_AFTER: i64 = 1_789_171_200_000_000_000;
-    /// 2100-01-01T00:00:00Z. Deliberately loose at this end: the capture date only ever moves
-    /// forward on a re-record, so a tight upper bound would be a test that expires.
+    /// 2100-01-01T00:00:00Z. Loose because a re-record only moves the capture date forward.
     const CAPTURED_BEFORE: i64 = 4_102_444_800_000_000_000;
 
     fn interop_fixture(name: &str) -> bytes::Bytes {
@@ -390,9 +342,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         bytes::Bytes::from(raw)
     }
 
-    /// Decodes one recorded datagram through a real [`CollectdDecoder`], with the diagnostics
-    /// mirrored into a drainable registry so a test can assert that *nothing* was diagnosed -- the
-    /// point of a recorded fixture being that a real sender's output should decode clean.
+    /// Decodes one recorded datagram, with diagnostics mirrored into a drainable registry so a
+    /// test can assert a real sender's output decodes clean.
     fn decode_interop(name: &str, types_db: Option<&str>) -> (Vec<Event>, Arc<Registry>) {
         let registry = Registry::new();
         let diag = Diagnostics::new("collectd_in").with_telemetry(registry.telemetry_for(
@@ -434,13 +385,9 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     /// The first `plugin`/`type_` list anywhere in the corpus, decoded with `types_db`.
     ///
-    /// Deliberately across `INTEROP_FIXTURES` in order rather than out of one named file:
-    /// collectd's own packing decides which lists land in which datagram, a read cycle is ~15 lists
-    /// against 23-26 per datagram, and nothing guarantees any one datagram holds a complete cycle.
-    /// A test naming `collectd-000.raw` would therefore pass today and panic on a re-record whose
-    /// first datagram happens to open late in a cycle -- exactly the instability
-    /// `docs/plans/recorded-interop-fixtures.md`'s amendment warns about. The corpus as a whole
-    /// spans several read cycles, so every plugin's lists are somewhere in it.
+    /// Searches the whole corpus, not one named file: collectd's packing decides which lists land
+    /// in which datagram, and no one datagram is guaranteed a complete read cycle. The corpus
+    /// spans several cycles, so every plugin's lists are somewhere in it.
     fn first_list_across_fixtures(plugin: &str, type_: &str, types_db: Option<&str>) -> Event {
         for name in INTEROP_FIXTURES {
             let (events, _) = decode_interop(name, types_db);
@@ -454,8 +401,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         panic!("no {plugin}/{type_} list anywhere in {INTEROP_FIXTURES:?}")
     }
 
-    /// How many parts of `part_type` the raw datagram carries, walked with the codec's own framing
-    /// reader. Used to state the identity-elision claim concretely, in terms of the wire.
+    /// How many parts of `part_type` the raw datagram carries, walked with the codec's reader.
     fn count_parts(raw: &bytes::Bytes, part_type: u16) -> usize {
         let mut at = 0usize;
         let mut found = 0usize;
@@ -509,11 +455,10 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     #[test]
     fn interop_fixture_sender_elided_identity_parts_across_a_packed_datagram() {
-        // The elision rule this codec's sticky-identity state machine exists for: collectd writes
-        // an identity part only when it differs from the last one written *in the same datagram*,
-        // so a packet holding ~25 value lists from three plugins carries exactly one Host part.
-        // Asserted against the raw bytes and the decoded events together -- either one alone would
-        // miss the point (many events, one Host part *is* the elision).
+        // Identity elision: collectd writes an identity part only when it differs from the last
+        // one in the same datagram, so ~25 lists from three plugins carry one Host part. Asserted
+        // on the raw bytes and the decoded events together; many events and one Host part is the
+        // elision.
         for name in INTEROP_FIXTURES {
             let raw = interop_fixture(name);
             let (events, _) = decode_interop(name, None);
@@ -544,8 +489,7 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     #[test]
     fn interop_fixture_load_is_three_gauges_index_named_without_a_types_db() {
-        // The multi-data-source case, from the real `load` plugin: three GAUGEs in one list, which
-        // a types.db-less deployment names by index.
+        // Multi-data-source: `load`'s three GAUGEs, index-named without a types.db.
         let load = first_list_across_fixtures("load", "load", None);
         let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["load.load.0", "load.load.1", "load.load.2"]);
@@ -562,10 +506,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     #[test]
     fn interop_fixture_load_is_named_from_a_types_db_and_memory_stays_single_data_source() {
-        // The same real list, with names: `load` resolves to three data sources, so the suffix
-        // becomes shortterm/midterm/longterm. `memory` is single-data-source, so it is
-        // `memory.memory` either way -- the omission rule, checked against a real single-DS list
-        // rather than a hand-built one.
+        // With names, `load` gets shortterm/midterm/longterm suffixes; single-data-source
+        // `memory` is `memory.memory` either way.
         let load = first_list_across_fixtures("load", "load", Some(FIXTURE_TYPES_DB));
         let names: Vec<&str> = load.metrics.iter().map(|r| resolve(r.name)).collect();
         assert_eq!(names, ["load.load.shortterm", "load.load.midterm", "load.load.longterm"]);
@@ -581,9 +523,8 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
 
     #[test]
     fn interop_fixture_if_octets_is_two_non_monotonic_cumulative_sums() {
-        // The other data-source kind, from the real `interface` plugin: DERIVE, which the model
-        // carries as a non-monotonic cumulative Sum (a counter that can be reset by a NIC reset or
-        // an interface going away, which is exactly why collectd has DERIVE and not just COUNTER).
+        // DERIVE, from `interface`: a non-monotonic cumulative Sum, since a NIC reset or a vanished
+        // interface can reset it.
         let if_octets =
             first_list_across_fixtures("interface", "if_octets", Some(FIXTURE_TYPES_DB));
         assert_eq!(if_octets.metrics.len(), 2, "if_octets is rx/tx");
@@ -603,12 +544,9 @@ if_dropped\trx:DERIVE:0:U, tx:DERIVE:0:U
         assert_eq!(if_octets.attributes.get("collectd.type_instance"), None);
     }
 
-    /// The `threshold`-plugin capture (W5 of `docs/plans/collectd-binary-relay.md`): a single
-    /// datagram carrying one notification, no value lists at all -- `tools/record-fixtures/
-    /// collectd.conf`'s `<Plugin threshold>` block sets both `WarningMax` and `FailureMax` to
-    /// `0.0` on `load`'s `shortterm` data source, so the very first read (a real load average is
-    /// essentially never exactly zero) breaches both and collectd's threshold plugin reports the
-    /// more severe one -- FAILURE, not WARNING.
+    /// A real `threshold`-plugin notification decodes to one FAILURE log record. Provenance:
+    /// `tools/record-fixtures/collectd.conf`'s `<Plugin threshold>` sets `WarningMax` and
+    /// `FailureMax` to `0.0` on `load`'s `shortterm`, so the first read breaches both.
     #[test]
     fn interop_fixture_notification_decodes_to_a_log_record() {
         let (events, registry) = decode_interop("collectd-notification-000.raw", None);

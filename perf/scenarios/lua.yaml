@@ -1,16 +1,15 @@
-# The Lua hop and its event proxy (docs/plans/load-test-harness.md's scenario table): generate_in
-# feeds a `lua` component running the same enrichment script logit-bench measures at the
-# component level, then null_out discards. Measures the cost of crossing into the LuaJIT OS
-# thread and back -- the event proxy's field access/write, the round trip through `ScriptWorker`
-# -- for a whole real graph rather than one already-constructed event
-# (crates/logit-bench/benches/pipeline.rs).
+# The Lua hop and its event proxy: generate_in feeds a `lua` component running the enrichment
+# script logit-bench measures at the component level, null_out discards. Measures the cost of
+# crossing into the LuaJIT OS thread and back (the event proxy's field access and write, the round
+# trip through `ScriptWorker`) for a whole graph rather than one constructed event
+# (crates/logit-bench/benches/pipeline.rs). Scenario table: docs/plans/load-test-harness.md,
+# "Scenarios".
 #
 #   script/perf run --scenario lua
 #
-# `host` is set on every generated event (`web-{seq%10}`, the same cardinality passthrough uses)
-# so the script's `if event.attributes.host ~= nil then` branch is actually taken on every event,
-# not skipped -- a script whose one conditional never fires isn't measuring what it looks like it
-# measures.
+# `host` is set on every generated event (`web-{seq%10}`, passthrough's cardinality) so the
+# script's `if event.attributes.host ~= nil then` branch is taken on every event; a script whose
+# one conditional never fires measures something else.
 components:
   gen:
     type: generate_in
@@ -19,9 +18,8 @@ components:
       attributes:
         host: "web-{seq%10}"
 
-  # Copied verbatim from crates/logit-bench/src/fixtures.rs's `LUA_ENRICH_SCRIPT` -- the same
-  # enrichment script logit-bench's own divan benches and allocation tests measure at the
-  # component level, so this scenario's Lua-hop cost is directly comparable to those numbers.
+  # `LUA_ENRICH_SCRIPT` from crates/logit-bench/src/fixtures.rs verbatim, so this scenario's
+  # Lua-hop cost is comparable to logit-bench's numbers for the same script.
   enrich:
     type: lua
     sources: [gen]
