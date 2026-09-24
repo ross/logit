@@ -1065,6 +1065,20 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   `MAX_CONCURRENT_CONNECTIONS`'s doc comment (`crates/logit-inputs/src/otlp.rs`) states the
   worst case across all connections is a finite multiple of the existing 4 GiB figure, but no one
   has measured the multiplier. **Revisit:** profile it before OTLP/JSON sees production volume.
+- **VictoriaTraces's OTLP/gRPC listener drops a batch whenever a request races its connection
+  close, and `otlp_out` doesn't retry it.** VictoriaTraces v0.11.1 closes every gRPC connection
+  about 5 seconds after it opens, with a TCP FIN and no HTTP/2 `GOAWAY`
+  ([`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings", leg
+  7). A request in flight at that moment gets no response frame and fails `Fault::Ambiguous`,
+  because the server may have processed it, so `otlp_out`, at-most-once by default, drops the
+  batch. An isolated 20 s run at 1 batch/s saw 3 closes and 2 dropped batches.
+  **Workaround:** OTLP over HTTP to VictoriaTraces (`docs/deploying.md`'s "VictoriaMetrics,
+  VictoriaLogs, and VictoriaTraces"), or `buffer: { delivery: at_least_once }`, which retries at
+  the cost of a duplicate span when the first attempt was stored. Whether `otlp_out` should retry
+  a gRPC request that got no response frame before the connection closed is a larger question:
+  without a `GOAWAY`, the request may have been processed. The upstream fix is VictoriaTraces
+  sending a `GOAWAY`. `script/victoria-interop`'s leg-7 row can pass a run in which no request
+  raced a close; it counts `send_failed` lines but can't force the race.
 - ~~**`otlp_in` only accepted OTLP/protobuf, not OTLP/JSON**~~ **Closed.** `otlp_in`
   (`crates/logit-inputs/src/otlp.rs`) accepts `Content-Type: application/json` alongside protobuf
   on the HTTP transport, through a hand-written dialect layer (`crates/logit-proto/src/otlp/json/`)
@@ -1216,6 +1230,34 @@ search for an old symptom still finds what fixed it and what, if anything, is st
   [Native wire format, `logit_in`/`logit_out`, and buffering](#native-wire-format-logit_inlogit_out-and-buffering).
   Narrow in practice (shutdown is per-connection and the window is the drain); closes when that open
   question does.
+
+- **VictoriaMetrics discards remote-write 2.0 silently, and `prometheus_out` can't tell.**
+  VictoriaMetrics v1.152.0 answers a 2.0 request `204` with an empty body and stores nothing, with
+  nothing in its log and `vm_http_request_errors_total` unchanged
+  ([`docs/plans/victoriametrics-interop.md`](plans/victoriametrics-interop.md)'s "Findings", leg
+  2). A `204` is success under both specs, and the sink doesn't read the 2.0
+  `X-Prometheus-Remote-Write-*-Written` headers, so `prometheus_out` `version: 2` counts every
+  batch delivered while all of it is lost. **Workaround:** `version: 1` for VictoriaMetrics
+  (`docs/deploying.md`'s "Choosing `version: 1` or `2`"). Reading the `-Written` headers would only
+  help against a receiver that sends them, which VictoriaMetrics doesn't.
+- **An `ExponentialHistogram` can't reach VictoriaMetrics's native-histogram ingest over
+  remote-write.** VictoriaMetrics accepts a remote-write native histogram and converts it to its
+  `vmrange` buckets, but `prometheus_out` skips and counts every `ExponentialHistogram` on both
+  wires: the native-histogram row under [Cross-protocol mappings](#cross-protocol-mappings).
+  **Workaround:** send it over OTLP instead. `otlp_out` to VictoriaMetrics's `/opentelemetry`
+  carries it, and VictoriaMetrics stores it as `_bucket` series with a `vmrange` label plus `_count`
+  and `_sum` (verified, leg 6). Closes with that native-histogram row.
+- **A `Distribution` isn't re-binned onto VictoriaMetrics's `vmrange` buckets.** Both are
+  log-bucketed, but `prometheus_out` sends a `Distribution` as the five-quantile summary it sends
+  any Prometheus receiver, so VictoriaMetrics's histogram functions (`prometheus_buckets()`,
+  `histogram_quantile()` over `vmrange`) don't apply to it and the quantiles can't be merged across
+  series. Not a loss VictoriaMetrics imposes: re-binning is a mapping nobody has built, a non-goal
+  of [ADR `victoriametrics-interop`](adr/victoriametrics-interop.md).
+- **A series scraped back from VictoriaMetrics's `/federate` is untyped.** `/federate` emits no
+  `# TYPE` or `# HELP`, so `prometheus_in` decodes every series as a `Gauge` tagged
+  `prometheus.type="untyped"`: a counter can't be told from a gauge, and a histogram's `_bucket`,
+  `_sum`, and `_count` arrive as unrelated series (verified, leg 9). VictoriaMetrics stores no
+  metric type, so there's nothing for `logit` to recover.
 
 ## File, stdio, and InfluxDB sinks
 
