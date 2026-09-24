@@ -101,6 +101,7 @@
 //! | `GaugeDelta`, `SetMembers`, `Histogram`, `ExponentialHistogram`, `Summary` | skipped by the series encoders | `skipped{metric_kind="gauge_delta"\|"set_members"\|"histogram"\|"exponential_histogram"\|"summary"}` |
 //! | a kind another metrics route carries | left for that route, uncounted: only the series encoders count skips, and only of kinds no route carries | -- |
 //! | record 0 of a service check (`statsd.service_check.name` present and a `Gauge` first metric) | left for the service-checks route, uncounted; any later record encodes as usual, without the check's `statsd.service_check.*` carriers as tags | -- |
+//! | every record of an APM stats event ([`stats::ATTR_STATS_NAME`] present; [`is_datadog_stats`]) | left for the stats routes, uncounted: its `Sum`s and summary `Distribution`s are a stats group, not series or sketches | -- |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped; Datadog has no no-value marker | `skipped{reason="no_recorded_value"}` |
 //! | a non-finite value or sample | skipped (JSON has no `NaN`) | `skipped{reason="non_finite_value"}` |
 //! | `Event::timestamp` | whole seconds, rounded toward negative infinity | -- |
@@ -211,7 +212,8 @@
 //! routes never disagree: a `log` carrying `statsd.event.title` is a Datadog event, sent only by
 //! `encode_events`; `statsd.service_check.name` with a `Gauge` first metric is a service check,
 //! whose record 0 is sent only by `encode_service_checks` (the metrics routes send its later
-//! records, as `statsd_out` does).
+//! records, as `statsd_out` does); `datadog.stats.name` marks APM stats, sent whole and only by
+//! the stats routes (see "APM stats" below).
 //!
 //! | Model | Wire | Counter |
 //! |---|---|---|
@@ -248,6 +250,179 @@
 //! 5. a log with `host.name`, `service.name`, or `datadog.source` but no `hostname`, `service`, or
 //!    `ddsource` leaves under the Datadog name;
 //! 6. tags reorder by attribute order, and an exact duplicate tag is dropped.
+//!
+//! # Traces (`traces`, `traces_msgpack`, `traces_proto`)
+//!
+//! Four forms, each a [`DatadogDecoder`] method taking one decompressed body and a matching
+//! `DatadogEncoder::encode_*` returning `None` when the batch has no span: the tracer API's
+//! `/v0.4/traces` msgpack (an array of traces, each an array of span maps;
+//! [`DatadogDecoder::decode_traces_v04`]), `/v0.5/traces` (`[dictionary, traces]`, 12-element
+//! span arrays of dictionary indices; [`DatadogDecoder::decode_traces_v05`]), `/v0.7/traces` (one
+//! msgpack `TracerPayload`; [`DatadogDecoder::decode_tracer_payload_v07`]), and the intake's
+//! `/api/v0.2/traces` protobuf `AgentPayload` ([`DatadogDecoder::decode_agent_payload`], one batch
+//! per `TracerPayload`). The v0.3/v0.4 JSON form and the v1.0 string-table form (`idx`) are not
+//! implemented. `received_at` is unused: every span has its own `start`. One [`traces`] mapping
+//! serves all four, so a span means the same thing on every route.
+//!
+//! msgpack decoding is the Agent's own (`span_gen.go`, `decoder_v05.go`): unknown keys are
+//! skipped, an absent or `nil` field is its zero value, any int format satisfies an integer field,
+//! and a string field also takes `bin`.
+//!
+//! ## Decode: spans → events
+//!
+//! | Wire | Model | Counter / diag |
+//! |---|---|---|
+//! | one span | one [`logit_core::Event::span`], in wire order | -- |
+//! | `trace_id` + `meta["_dd.p.tid"]` (1 to 16 hex digits, Go's `ParseUint(v, 16, 64)`) | `SpanRecord::trace_id`: high 8 bytes from `_dd.p.tid`, low 8 from `trace_id`, big-endian. Every span of the chunk (v0.4/v0.5: of the trace array) with the same `trace_id` gets the high half of the first span carrying a parseable one; `_dd.p.tid` stays a `Str` attribute on its own span only | -- |
+//! | an unparseable `_dd.p.tid` | kept as an attribute; the span takes the chunk's high half, else zero | `logit.input.spans.degraded{reason="bad_tid"}` |
+//! | `span_id`; `parent_id` (0 = none) | `span_id`; `parent_span_id` (big-endian) | -- |
+//! | `start`, `duration` (ns) | `Event::timestamp` = `start`; `end_timestamp` = `start + duration`, saturating | -- |
+//! | a negative `duration` | clamped to 0 | `degraded{reason="negative_duration"}` |
+//! | `name` | `SpanRecord::name` (`Str`) | -- |
+//! | `service`, `resource`, `type` | [`ATTR_SERVICE_NAME`], [`ATTR_RESOURCE_NAME`], [`ATTR_SPAN_TYPE`], each when non-empty | -- |
+//! | `error` | `status: Error` when nonzero, else `Unset`; a value other than 0 or 1 also as [`traces::ATTR_SPAN_ERROR`] (`I64`) | -- |
+//! | `meta` | attributes verbatim (`Str`), `span.kind`, `_dd.*`, `env`, `version` included | -- |
+//! | `metrics` | attributes verbatim (`F64`): `_sampling_priority_v1`, `_top_level`, `_dd.measured`, `_sample_rate`, ... | -- |
+//! | `meta_struct` | attributes verbatim (`Bytes`) | -- |
+//! | the final `span.kind` attribute | `kind` when `server`/`client`/`producer`/`consumer`/`internal`, else `Internal` | -- |
+//! | one key in two of `meta`/`metrics`/`meta_struct`, or a field spelled like a carrier | the later write wins, in that order, then `service`/`resource`/`type`/`error`, then the chunk's | `degraded{reason="key_collision"}` |
+//! | `span_links[]` | `SpanLink{trace_id: trace_id_high ‖ trace_id, span_id, attributes (Str), trace_state (when non-empty), flags}` | -- |
+//! | `span_events[]` | `SpanEvent{timestamp: time_unix_nano, name, attributes}`; `AttributeAnyValue` → `Str`/`Bool`/`I64`/`F64`/`Array` of those | -- |
+//! | a `time_unix_nano` above `i64::MAX` | `i64::MAX` | `degraded{reason="timestamp_range"}` |
+//! | an `AttributeAnyValue` of unknown `type` (or an array element of type `ARRAY_VALUE`) | the attribute is dropped | `degraded{reason="bad_attribute_type"}` |
+//! | a string that isn't UTF-8 | lossy UTF-8 | `degraded{reason="invalid_utf8"}` |
+//! | v0.7/`AgentPayload` chunk `priority` | [`traces::ATTR_CHUNK_PRIORITY`] (`I64`) on every span of the chunk, omitted when `-128` (`PriorityNone`); a v0.7 chunk with no `priority` key is 0, as in Go | -- |
+//! | chunk `origin`, `dropped_trace`, `tags` | [`traces::ATTR_CHUNK_ORIGIN`] (non-empty), [`traces::ATTR_CHUNK_DROPPED_TRACE`] (`true`), [`traces::ATTR_CHUNK_TAGS`] (`Map` of `Str`, non-empty), on every span | -- |
+//! | `TracerPayload` fields | batch resource `datadog.tracer.container_id`, `.language_name`, `.language_version`, `.tracer_version`, `.runtime_id`, `.env`, `.hostname`, `.app_version` (`Str`), `.tags` (`Map`), each when non-empty; `.container_debug` (`Map` of its non-zero fields) whenever present | -- |
+//! | `AgentPayload` fields | every batch's resource: [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`] (`Str`), `.target_tps`, `.error_tps` (`F64`, nonzero), `.rare_sampler_enabled` (`true`), `.tags` (`Map`) | -- |
+//! | `AgentPayload.idxTracerPayloads` (v1.0) | skipped | `logit.input.spans.skipped{reason="idx_payload"}`, one per payload |
+//! | a span (v0.5: wrong arity, a dictionary index out of range), trace array, or chunk that doesn't parse | dropped; the rest decodes | `skipped{reason="malformed"}` + diag `malformed_span` |
+//! | a body whose structure doesn't parse (not the top-level shape, truncated, bad protobuf) | -- | `CodecError::Malformed` |
+//!
+//! ## Encode: events → spans
+//!
+//! Every event with a `span`, grouped into one chunk per 128-bit trace id in first-appearance
+//! order, spans in batch order within it. Attributes are the resource merged with the event's
+//! (event wins); the carriers below are consumed, only when of the type decode gives them (a
+//! non-empty `Str` for the string ones): one of another type goes out by the typing rules like
+//! any attribute. Every map is sorted by key.
+//!
+//! | Model | Wire | Counter |
+//! |---|---|---|
+//! | `trace_id` | `trace_id` = low 8 bytes; `meta["_dd.p.tid"]` from the attribute where present, else synthesized as 16 hex digits on the chunk's first span when the high half is nonzero and no span carries one | -- |
+//! | `end_timestamp - Event::timestamp` | `duration`; negative → 0 | `logit.output.spans.degraded{reason="negative_duration"}` |
+//! | `service.name`, `resource.name`, `span.type` | `service`, `resource`, `type` (`""` when absent) | -- |
+//! | [`traces::ATTR_SPAN_ERROR`], else `status` | `error`: the attribute, else 1 for `Error`, 0 otherwise | -- |
+//! | `kind` | `meta["span.kind"]`, only when no `span.kind` attribute exists and `kind` isn't `Internal` | -- |
+//! | `Str` | `meta` | -- |
+//! | `F64`, `I64`, `U64` | `metrics` (`f64`) | `degraded{reason="int_as_f64"}` when an integer isn't exact |
+//! | `Bool` | `meta` `"true"`/`"false"` | -- |
+//! | `Bytes` | `meta_struct` | -- |
+//! | `Timestamp` | `meta` as RFC 3339 | -- |
+//! | `Array`, `Map`, `Null` | `meta` as JSON text | `degraded{reason="json_text"}` |
+//! | links; events (a scalar or an array of scalars natively, anything else as a string) | `span_links`, `span_events` | `int_as_f64` for a `U64` event value above `i64::MAX`; `json_text`; `timestamp_range` for a negative event time |
+//! | `datadog.chunk.*` of a chunk's first span | v0.7/`AgentPayload` chunk `priority` (`-128` when absent), `origin`, `dropped_trace`, `tags` | -- |
+//! | batch resource `datadog.tracer.*` / `datadog.agent.*` | v0.7: one `TracerPayload`; `AgentPayload`: one payload around one `TracerPayload` | -- |
+//! | a carrier the form has no field for: `datadog.chunk.*` in v0.4/v0.5 (per span), `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (per batch), `meta_struct`/links/events in v0.5 | dropped | `degraded{reason="no_wire_form"}`, one per item |
+//! | `status: Ok`, span `flags`, `SpanExt` status message / `trace_state` / dropped counts, a link's or event's dropped-attribute count | dropped: Datadog has no field | `degraded{reason="no_wire_form"}`, one per field |
+//!
+//! The encoders write the Agent's key sets and orders (`EncodeMsg`), omitting what its
+//! `omitempty` tags omit; an `AttributeAnyValue` carries `type` and its one value field. The
+//! protobuf encoder is hand-written rather than prost's, because prost's `HashMap` maps encode in
+//! a random order.
+//!
+//! ## Permitted normalizations (traces)
+//!
+//! `datadog_trace_in -> datadog_trace_out` on one form, and `datadog_in -> datadog_out` on
+//! `AgentPayload`, is a fixed point modulo this list (`tests/datadog_traces_fixed_point.rs` pins
+//! it):
+//!
+//! 1. batching: an `AgentPayload` decodes to one batch per `TracerPayload` and encodes one
+//!    `TracerPayload` per batch;
+//! 2. chunk regrouping: spans regroup into one chunk (trace array) per 128-bit trace id, in
+//!    first-appearance order; a chunk's fields come from its first span;
+//! 3. every map is sorted by key; a key in two of `meta`/`metrics`/`meta_struct` keeps one value;
+//! 4. v0.5's dictionary is rebuilt in first-use order, `""` at index 0;
+//! 5. a negative `duration` leaves as 0; a zero-valued or absent field leaves as the Agent writes
+//!    it (`priority` `-128` in no chunk, `nil` as the zero value);
+//! 6. a 128-bit trace id with no `_dd.p.tid` gains one on its chunk's first span;
+//! 7. across forms, a field the target has no home for is dropped and counted `no_wire_form`.
+//!
+//! # APM stats (`stats`)
+//!
+//! Two routes, both msgpack under the Agent's Go field names (`ClientStatsPayload` and friends
+//! have no `msg` tags, so the keys are `Hostname`, `Stats`, `HTTPStatusCode`, ...; the one
+//! exception is `srv_src`): a tracer's `/v0.6/stats` body, one `ClientStatsPayload`
+//! ([`DatadogDecoder::decode_client_stats_v06`], [`DatadogEncoder::encode_client_stats_v06`]),
+//! and the intake's `/api/v0.2/stats` body, one `StatsPayload` wrapping several
+//! ([`DatadogDecoder::decode_stats_payload`], one batch per `ClientStatsPayload`;
+//! [`DatadogEncoder::encode_stats_payload`]). `OkSummary`/`ErrorSummary` are `sketches-go`
+//! DDSketch protobufs, which carry their own mapping, so a decoded summary keeps it
+//! ([`logit_core::Mapping::logarithmic`]) and relays bin-for-bin. The decoded batch scope is
+//! `None`. The attribute and resource names are [`stats`]'s constants.
+//!
+//! ## Decode: stats → events
+//!
+//! | Wire | Model | Counter / diag |
+//! |---|---|---|
+//! | a body that isn't msgpack, a truncated value, a top level that isn't a map, or (v0.6) a `ClientStatsPayload` field of the wrong type | -- | `CodecError::Malformed` |
+//! | an intake `Stats` element that isn't a well-formed `ClientStatsPayload` | dropped; the other payloads decode | `logit.input.stats.skipped{reason="malformed_payload"}` + diag `malformed_stats` |
+//! | a bucket, or a group, with a field of the wrong type (or that isn't a map) | dropped; the rest decodes | `skipped{reason="malformed_bucket"\|"malformed_group"}` + diag `malformed_stats` |
+//! | an unknown key; a `nil` value | skipped; the field's zero value (msgp's own rules) | -- |
+//! | one `ClientGroupedStats` of a bucket | one `Event::metric`; `timestamp` = the bucket's `Start` (ns) | a `Start` above `i64::MAX`: clamped, `logit.input.stats.degraded{reason="bucket_start_overflow"}` |
+//! | a bucket with no groups | nothing | `skipped{reason="empty_bucket"}` |
+//! | `Hits`, `Errors`, `TopLevelHits` | `datadog.stats.hits`, `.errors`, `.top_level_hits`: delta monotonic `Sum` of the `uint64` as `f64`, always present | above 2^53 and not exactly representable: `degraded{reason="inexact_count"}` |
+//! | `Duration` | `datadog.stats.duration`: the same, unit `ns` | the same |
+//! | `OkSummary`, `ErrorSummary` | `datadog.stats.ok_summary`, `.error_summary`: `Distribution` under `Mapping::logarithmic(gamma, indexOffset, 2048)`, sparse `binCounts` and `contiguousBinCounts` both read (a key in both sums), `zeroCount`; the summary (`count`/`min`/`max`/`sum`) derived from the bins; absent when the wire bytes are empty | -- |
+//! | a summary whose `interpolation` isn't `NONE` | that record dropped; its keys aren't the logarithmic mapping's | `skipped{reason="interpolation"}` |
+//! | a summary that isn't a DDSketch, has no mapping, or has a `gamma`/`indexOffset` no mapping can use | that record dropped | `skipped{reason="bad_sketch"}` + diag `bad_stats_sketch` |
+//! | `Service`, `Resource`, `Type`, `SpanKind` | `service.name`, `resource.name`, `span.type`, `span.kind` (ADR decision 6), when non-empty | -- |
+//! | `Name` | [`stats::ATTR_STATS_NAME`], always, even empty: it is what marks the event as APM stats | -- |
+//! | `DBType`, `GRPCStatusCode`, `HTTPMethod`, `HTTPEndpoint`, `srv_src` | `datadog.stats.db_type`, `.grpc_status_code`, `.http_method`, `.http_endpoint`, `.service_source`, when non-empty | -- |
+//! | `HTTPStatusCode` | `datadog.stats.http_status_code` (`U64`), when nonzero | -- |
+//! | `Synthetics` | `datadog.stats.synthetics` = `Bool(true)`, when true | -- |
+//! | `IsTraceRoot` `1` / `2` / `0` | `datadog.stats.is_trace_root` `"true"` / `"false"` / absent | any other value: absent, `degraded{reason="unknown_trilean"}` |
+//! | `PeerTags`, `AdditionalMetricTags`, `SpanDerivedPrimaryTags` | `datadog.stats.peer_tags`, `.additional_metric_tags`, `.span_derived_primary_tags`: `Array` of `Str`, when non-empty | -- |
+//! | bucket `Duration`, `AgentTimeShift` | each of its groups' `datadog.stats.bucket.duration` (`U64`, always) and `.bucket.agent_time_shift` (`I64`, when nonzero) | -- |
+//! | `ClientStatsPayload` `Hostname`, `Env`, `Version`, `Lang`, `TracerVersion`, `RuntimeID`, `ContainerID` | batch resource `datadog.tracer.hostname`, `.env`, `.app_version`, `.language_name`, `.tracer_version`, `.runtime_id`, `.container_id`, when non-empty | -- |
+//! | `AgentAggregation`, `Service`, `GitCommitSha`, `ImageTag`, `ProcessTags` | resource `datadog.stats.agent_aggregation`, `.service`, `.git_commit_sha`, `.image_tag`, `.process_tags`, when non-empty | -- |
+//! | `Sequence`, `ProcessTagsHash`; `Tags` | resource `datadog.stats.sequence`, `.process_tags_hash` (`U64`), when nonzero; `datadog.stats.tags` (`Array` of `Str`), when non-empty | -- |
+//! | `StatsPayload` `AgentHostname`, `AgentEnv`, `AgentVersion` | every batch's resource [`RESOURCE_ATTR_AGENT_HOSTNAME`], `datadog.agent.env`, [`RESOURCE_ATTR_AGENT_VERSION`], when non-empty | -- |
+//! | `ClientComputed`, `SplitPayload` | every batch's resource `datadog.stats.client_computed`, `.split_payload` = `Bool(true)`, when true | -- |
+//!
+//! ## Encode: events → stats
+//!
+//! The stats routes send every event [`is_datadog_stats`] accepts and nothing else, uncounted,
+//! as ordinary fan-out; every other route skips such an event whole. Buckets are rebuilt by
+//! grouping on `(Event::timestamp, datadog.stats.bucket.duration,
+//! datadog.stats.bucket.agent_time_shift)`, in first-seen order; every map writes every key, in
+//! the Go struct's field order, as msgp's `EncodeMsg` does. `encode_stats_payload` wraps the
+//! batch's one `ClientStatsPayload`.
+//!
+//! | Model | Wire | Counter |
+//! |---|---|---|
+//! | a group attribute (the event's, else the resource's) | its field above; `""`, `0`, `false`, or `[]` when absent | a value of the wrong type: `logit.output.tags.dropped{reason="unrepresentable"}` |
+//! | any other event attribute; a resource attribute that is none of the fields above (`datadog.agent.*` and the two envelope flags count on the v0.6 route, which has no envelope) | dropped | `tags.dropped{reason="no_wire_form"}`, one per attribute (a resource's once per batch) |
+//! | a delta `Sum` hits/errors/top-level-hits/duration | `uint64`, rounded to the nearest integer | a fraction: `logit.output.stats.degraded{reason="fractional_count"}`; negative or non-finite: `0`, `degraded{reason="bad_count"}` |
+//! | an ok/error summary `Distribution` under a logarithmic mapping | a DDSketch protobuf: its `gamma` and `indexOffset`, `interpolation: NONE`, both stores as sparse `binCounts` in ascending key order, `zeroCount`. Hand-encoded, since prost's `HashMap` would order the bins at random | a bin limit other than 2048 (a receiver collapses at 2048): `degraded{reason="bin_limit"}`; a summary tracked from observations (`stats_exact`), which the protobuf has no field for: `degraded{reason="exact_summary"}` |
+//! | the same under `Mapping::agent` | `gamma = 1.015625`, `indexOffset = bias + 0.5`, keys unchanged: Datadog's own conversion, reading the Agent's round-half-to-even key as the logarithmic floor. Only a value on an exact tie keys differently, and the exact summary is lost | `degraded{reason="agent_mapping"}` |
+//! | a record of another name, or a known name of another kind (a cumulative `Sum`, say) | skipped | `logit.output.stats.skipped{reason="unrecognized_record"}` |
+//! | a negative `Event::timestamp` | bucket `Start` `0` | `degraded{reason="negative_timestamp"}` |
+//!
+//! ## Permitted normalizations (APM stats)
+//!
+//! `datadog_in -> datadog_out` on one stats route is a fixed point modulo this list
+//! (`tests/datadog_stats_fixed_point.rs` pins it):
+//!
+//! 1. every map key is written, in Go field order, zero values included: a tracer's omitted key or
+//!    `nil` leaves as the explicit zero value, and an unknown key is dropped;
+//! 2. a DDSketch's contiguous bins leave as sparse ones (a key in both summed), and a store over
+//!    2048 bins collapses from the lowest key on decode;
+//! 3. a bucket with no groups is dropped, and buckets sharing a start, duration, and time shift
+//!    merge, their groups in first-seen order;
+//! 4. an intake `StatsPayload` leaves as one `StatsPayload` per `ClientStatsPayload` (batching),
+//!    its envelope restated on each;
+//! 5. a count above 2^53 that `f64` can't hold exactly is rounded, and counted.
 
 pub mod generated;
 pub mod tags;
@@ -259,6 +434,12 @@ pub mod sketches;
 pub mod events;
 pub mod logs;
 pub mod service_checks;
+
+pub mod traces;
+pub mod traces_msgpack;
+pub mod traces_proto;
+
+pub mod stats;
 
 use logit_core::{Diagnostics, Event, MetricKind, Resource, Telemetry, Value};
 
@@ -299,6 +480,28 @@ pub const RESOURCE_ATTR_AGENT_TIMEZONE: &str = "datadog.agent.timezone";
 pub const RESOURCE_ATTR_AGENT_EPOCH: &str = "datadog.agent.epoch";
 pub const RESOURCE_ATTR_AGENT_INTERNAL_IP: &str = "datadog.agent.internal_ip";
 pub const RESOURCE_ATTR_AGENT_PUBLIC_IP: &str = "datadog.agent.public_ip";
+/// `datadog.agent.env`: an `AgentPayload`'s or a stats `StatsPayload` envelope's `env`, as a
+/// resource attribute. Shared by [`traces`] and [`stats`], so it lives here rather than in either.
+pub const RESOURCE_ATTR_AGENT_ENV: &str = "datadog.agent.env";
+/// `datadog.tracer.*`: a `TracerPayload`'s or a stats `ClientStatsPayload`'s fields, as batch
+/// resource attributes. Shared by [`traces`] and [`stats`], so they live here rather than in
+/// either; each module also has its own carriers with no counterpart in the other.
+pub const RESOURCE_ATTR_TRACER_CONTAINER_ID: &str = "datadog.tracer.container_id";
+pub const RESOURCE_ATTR_TRACER_LANGUAGE_NAME: &str = "datadog.tracer.language_name";
+pub const RESOURCE_ATTR_TRACER_VERSION: &str = "datadog.tracer.tracer_version";
+pub const RESOURCE_ATTR_TRACER_RUNTIME_ID: &str = "datadog.tracer.runtime_id";
+pub const RESOURCE_ATTR_TRACER_ENV: &str = "datadog.tracer.env";
+pub const RESOURCE_ATTR_TRACER_HOSTNAME: &str = "datadog.tracer.hostname";
+pub const RESOURCE_ATTR_TRACER_APP_VERSION: &str = "datadog.tracer.app_version";
+/// `service.name` / `resource.name` / `span.type` / `span.kind`: a span's `service`, `resource`,
+/// `type`, and (a `meta` key, kept verbatim, that also sets `SpanRecord::kind`) `span.kind` — the
+/// names Datadog's own OTLP receiver honors (ADR `datadog-agent-and-intake-relay` decision 6). An
+/// APM stats group's `Service`/`Resource`/`Type`/`SpanKind` carry the same names, so these live
+/// here rather than in [`traces`] or [`stats`] alone.
+pub const ATTR_SERVICE_NAME: &str = "service.name";
+pub const ATTR_RESOURCE_NAME: &str = "resource.name";
+pub const ATTR_SPAN_TYPE: &str = "span.type";
+pub const ATTR_SPAN_KIND: &str = "span.kind";
 
 /// The attribute `key` with the event's value winning over the resource's, as
 /// [`logit_core::attrs::merged`] resolves it, without the full merged walk.
@@ -318,6 +521,13 @@ pub(super) fn is_service_check(resource: &Resource, event: &Event) -> bool {
 /// [`DatadogEncoder::encode_events`] sends. The logs route skips it.
 pub(super) fn is_datadog_event(resource: &Resource, event: &Event) -> bool {
     event.log.is_some() && merged_get(resource, event, events::ATTR_EVENT_TITLE).is_some()
+}
+
+/// APM stats: `datadog.stats.name` present (the event's, else the resource's), exactly what
+/// [`DatadogEncoder::encode_client_stats_v06`] and [`DatadogEncoder::encode_stats_payload`] send.
+/// Every metrics route skips such an event whole: its records are a stats group's, not series.
+pub(super) fn is_datadog_stats(resource: &Resource, event: &Event) -> bool {
+    merged_get(resource, event, stats::ATTR_STATS_NAME).is_some()
 }
 
 /// Decodes Datadog intake bodies, one per route. Carries its [`Diagnostics`] and [`Telemetry`]

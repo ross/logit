@@ -3,7 +3,9 @@
 //! `encode_service_checks`'s alone, and a Datadog event (a `log` carrying `statsd.event.title`) is
 //! `encode_events`'s alone; every other route skips them silently. Any later metric on a service
 //! check still leaves as an ordinary series, as `statsd_out` sends `metrics[1..]` as ordinary
-//! lines. The fixed-point suites can't see this: each decodes and encodes on one route.
+//! lines. APM stats (an event carrying `datadog.stats.name`) are the stats routes' alone, whole:
+//! their `Sum`s and summary `Distribution`s never leave as series or sketches. The fixed-point
+//! suites can't see this: each decodes and encodes on one route.
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve};
@@ -103,4 +105,84 @@ fn a_service_checks_later_metrics_still_leave_as_series() {
     let relayed = DatadogDecoder::new().decode_service_checks(&body, RECEIVED_AT).unwrap();
     assert_eq!(relayed.events.len(), 2);
     assert_eq!(resolve(relayed.events[0].metrics[0].name), "db.up");
+}
+
+/// A tracer's `/v0.6/stats` body: one bucket, one group with an ok summary. Its events are
+/// `Sum`s and a `Distribution`, every one of which a metrics route would otherwise send.
+fn client_stats() -> EventBatch {
+    use logit_proto::msgpack::Writer;
+    let summary = logit_proto::datadog::generated::ddsketch::DdSketch {
+        mapping: Some(logit_proto::datadog::generated::ddsketch::IndexMapping {
+            gamma: 1.0202020202020203,
+            index_offset: 0.0,
+            interpolation: 0,
+        }),
+        positive_values: Some(logit_proto::datadog::generated::ddsketch::Store {
+            bin_counts: [(700, 3.0)].into_iter().collect(),
+            ..Default::default()
+        }),
+        negative_values: None,
+        zero_count: 0.0,
+    };
+    let mut w = Writer::new();
+    w.write_map_len(2);
+    w.write_str("Hostname");
+    w.write_str("web-1");
+    w.write_str("Stats");
+    w.write_array_len(1);
+    w.write_map_len(3);
+    w.write_str("Start");
+    w.write_u64(1_700_000_000_000_000_000);
+    w.write_str("Duration");
+    w.write_u64(10_000_000_000);
+    w.write_str("Stats");
+    w.write_array_len(1);
+    w.write_map_len(5);
+    w.write_str("Service");
+    w.write_str("web");
+    w.write_str("Name");
+    w.write_str("http.request");
+    w.write_str("Hits");
+    w.write_u64(3);
+    w.write_str("Duration");
+    w.write_u64(3_000_000);
+    w.write_str("OkSummary");
+    w.write_bin(&prost::Message::encode_to_vec(&summary));
+    DatadogDecoder::new().decode_client_stats_v06(w.as_slice(), RECEIVED_AT).unwrap()
+}
+
+#[test]
+fn apm_stats_never_leave_on_a_metrics_or_logs_route() {
+    let batch = client_stats();
+    assert_eq!(batch.events.len(), 1);
+    assert_eq!(batch.events[0].metrics.len(), 5, "four sums and the ok summary");
+    for (route, body) in series_routes(&batch) {
+        assert!(body.is_none(), "{route}: APM stats leaked onto a series route");
+    }
+    let mut e = DatadogEncoder::new();
+    assert!(e.encode_distribution_points(&batch).is_none());
+    assert!(e.encode_sketches(&batch).is_none(), "the ok summary leaked onto sketches");
+    assert!(e.encode_service_checks(&batch).is_none());
+    assert!(e.encode_logs(&batch).is_none());
+    assert!(e.encode_events(&batch, EventFormat::AgentEnvelope).is_empty());
+    assert!(e.encode_client_stats_v06(&batch).is_some(), "stats keep their own routes");
+    assert!(e.encode_stats_payload(&batch).is_some());
+}
+
+#[test]
+fn apm_stats_beside_a_series_leave_only_the_series_on_a_metrics_route() {
+    let mut batch = client_stats();
+    let checks = checks();
+    let mut gauge = checks.events[1].clone();
+    gauge.attributes = Default::default();
+    gauge.metrics[0] = MetricRecord::new(intern("queue.depth"), MetricKind::Gauge(4.0));
+    batch.events.push(gauge);
+    for (route, body) in series_routes(&batch) {
+        let relayed = decode_series(route, &body.expect("the gauge"));
+        assert_eq!(relayed.events.len(), 1, "{route}");
+        assert_eq!(resolve(relayed.events[0].metrics[0].name), "queue.depth", "{route}");
+    }
+    let body = DatadogEncoder::new().encode_client_stats_v06(&batch).unwrap();
+    let relayed = DatadogDecoder::new().decode_client_stats_v06(&body, RECEIVED_AT).unwrap();
+    assert_eq!(relayed.events.len(), 1, "the gauge is not a stats group");
 }

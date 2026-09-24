@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-09-24
 ---
 
 # Enabling plan: Datadog — direct API, Agent stand-in, intake stand-in
@@ -173,7 +173,7 @@ The event model already carries every Datadog field either in a typed field or i
 | span `error`, `meta`, `metrics`, `meta_struct`, `_sampling_priority_v1`, `_dd.*` | `status: Error`; attributes verbatim as `Str`/`F64`/`Bytes` | lossless |
 | OTel-only span fields (`kind`, `status: Ok`, `trace_state`, typed attributes) | — | Datadog can't carry them; `datadog_trace_out` counts them, a row in `known-gaps.md`'s cross-protocol table |
 | chunk `priority`, `origin`, `droppedTrace`, chunk `tags`; `TracerPayload` `languageName`, `languageVersion`, `tracerVersion`, `runtimeID`, `containerID`, `appVersion`, `tags`; `AgentPayload` `hostName`, `env`, `agentVersion`, `targetTPS`, `errorTPS`, `rareSamplerEnabled` | chunk fields as `datadog.chunk.*` attributes on every span of the chunk; tracer fields as `datadog.tracer.*` on the batch `Resource` (one batch per `TracerPayload`); Agent fields as `datadog.agent.*` on the `Resource` | lossless; a batch boundary per `TracerPayload` is the "batching" normalization |
-| APM stats (`StatsPayload`, and tracers' `/v0.6/stats`) | one metric event per bucket group: `Sum` `datadog.stats.hits`/`errors`/`top_level_hits` (delta, weighted), `Distribution` `datadog.stats.ok_summary`/`error_summary` decoded from the on-wire DDSketch, group keys (`service`, `name`, `resource`, `span.type`, `span.kind`, `http.status_code`, `synthetics`, peer tags, …) and payload keys (`env`, `version`, `container.id`, `datadog.tracer.lang`, …) as attributes, `Event::timestamp` = bucket start, `datadog.stats.bucket_duration` | lossless: `DdSketch` keeps the wire's own mapping (`Mapping::logarithmic`, §4) |
+| APM stats (`StatsPayload`, and tracers' `/v0.6/stats`) | one metric event per bucket group: `Sum` `datadog.stats.hits`/`errors`/`top_level_hits` (delta, weighted), `Distribution` `datadog.stats.ok_summary`/`error_summary` decoded from the on-wire DDSketch, group keys (`service`, `name`, `resource`, `span.type`, `span.kind`, `http.status_code`, `synthetics`, peer tags, …) and payload keys (`env`, `version`, `container.id`, `datadog.tracer.lang`, …) as attributes, `Event::timestamp` = bucket start, `datadog.stats.bucket.duration` | lossless: `DdSketch` keeps the wire's own mapping (`Mapping::logarithmic`, §4) |
 | OTel-origin span through the native protocol | needs Datadog semantics synthesized: `service`/`resource`/`type`, `_top_level`, priority, and stats | not in this stack (§14); `otlp_out` carries OTel-origin spans |
 | events, service checks | `statsd.event.*`, `statsd.service_check.*` (settled) | lossless |
 | timestamps: metrics in seconds, 1 h/10 min window; logs 18 h; checks 10 min | ns in the model; `datadog_out` drops and counts `stale` before sending | permitted normalization plus a counter |
@@ -415,7 +415,7 @@ the OTel-direct topology is `otlp_out`.
 | W0 | This plan and its index row | S | — |
 | W1 | **Landed** (`dd/w1`). Hand-rolled `DdSketch` with the Agent and logarithmic mappings, bins exposed, `sketches-ddsketch` removed, tripwires and wire doc updated; ADR `datadog-agent-and-intake-relay`; `lossless-transit` amendment; ADR index row. | M | W0 |
 | W2a | **Landed** (`dd/w2a`). Vendored `agent-payload` metrics proto as a third protogen family; `logit_proto::datadog` codecs for series v1/v2 (JSON and protobuf), distribution points, sketches, logs, events (Agent envelope and public v1), and service checks; two fixed-point suites. | L | W1 |
-| W2b | Traces codec: `AgentPayload` protobuf, `StatsPayload`/`ClientStatsPayload` msgpack, the msgpack v0.4/v0.5/v0.7 span forms; id, chunk, tracer, and stats mapping; hand-rolled msgpack | M | W2a |
+| W2b | **Landed** (`dd/w2b`). Hand-rolled msgpack; the Agent's trace protos and `ddsketch.proto` vendored; traces codecs for v0.4/v0.5/v0.7 and `AgentPayload`; the v0.6 and intake stats codecs with the DDSketch protobuf; three fixed-point suites. | M | W2a |
 | W3 | `datadog_in`: intake receiver, zstd decode, graph rules, schema | M | W2b |
 | W4a | `datadog_trace_in`: APM receiver, `/info`, stubs, schema | M | W2b |
 | W4b | `statsd_in`/`statsd_out` Unix sockets, `\|e:`, `\|card:` | S | W0 |
@@ -429,8 +429,8 @@ after W4a to keep the stack linear even though it depends only on W0. Each PR is
 targets its parent's branch and is brought up to date with `git merge origin/main`, never a
 rebase.
 
-**Status (2026-09-23):** W0 (#309), W1 (#311), and W2a complete on their stacked branches,
-nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it merges.
+**Status (2026-09-24):** W0 (#309), W1 (#311), W2a (#318), and W2b complete on their stacked
+branches, nothing merged to `main`; W1 targets `dd/w0` and retargets to `main` once it merges.
 
 ## Verification
 

@@ -1501,10 +1501,23 @@ The module doc of `logit_proto::datadog` has the full mapping-to-counter tables.
 | `logit.input.metrics.skipped{reason="malformed"\|"no_name"\|"invalid_status"}` | count | a service check that isn't an object, has no `check` name, or has a status outside 0 to 3 |
 | `logit.output.metrics.skipped{reason="invalid_status"}` | count | a service-check event with no status in 0 to 3, on either its `statsd.service_check.status` or its gauge |
 | `logit.output.tags.dropped{reason="reserved_key"}` | count | a log attribute named `message` or `timestamp`, which would collide with the log's own wire fields |
+| `logit.input.stats.skipped{reason="malformed_payload"\|"malformed_bucket"\|"malformed_group"}` | count | an APM stats `ClientStatsPayload` (in an intake `StatsPayload`), bucket, or group that isn't a well-formed map, dropped while the rest decodes |
+| `logit.input.stats.skipped{reason="empty_bucket"}` | count | an APM stats bucket with no groups, which decodes to no events |
+| `logit.input.stats.skipped{reason="interpolation"\|"bad_sketch"}` | count | an `OkSummary`/`ErrorSummary` dropped from its group: an interpolated DDSketch mapping, or bytes that aren't a usable DDSketch |
+| `logit.input.stats.degraded{reason="unknown_trilean"\|"bucket_start_overflow"\|"inexact_count"}` | count | an `IsTraceRoot` outside 0 to 2 (dropped), a bucket `Start` above `i64::MAX` (clamped), or a count above 2^53 that `f64` can't hold exactly |
+| `logit.output.stats.skipped{reason="unrecognized_record"}` | count | a record on an APM stats event that is none of the six stats records, or one of their names with another kind |
+| `logit.output.stats.degraded{reason="fractional_count"\|"bad_count"\|"negative_timestamp"}` | count | a stats count rounded to an integer, a negative or non-finite count sent as 0, or a negative timestamp sent as bucket start 0 |
+| `logit.output.stats.degraded{reason="agent_mapping"\|"bin_limit"\|"exact_summary"}` | count | a stats summary sent under the Agent mapping's logarithmic reading, with a bin limit other than 2048, or with an exact summary the DDSketch protobuf can't carry |
+| `logit.input.spans.skipped{reason="malformed"\|"idx_payload"}` | count | a span, trace array, or chunk that doesn't parse (a v0.5 span of the wrong arity or with a dictionary index out of range included), dropped while the rest decodes; an `AgentPayload`'s v1.0 `idxTracerPayloads` entry, which isn't implemented |
+| `logit.input.spans.degraded{reason="bad_tid"\|"negative_duration"\|"key_collision"\|"timestamp_range"\|"bad_attribute_type"\|"invalid_utf8"}` | count | an unparseable `_dd.p.tid` (kept as an attribute, high half zero), a negative duration clamped to 0, one key in two of `meta`/`metrics`/`meta_struct` (or a field spelled like a carrier) keeping one value, a span event time above `i64::MAX` clamped, a span event attribute of unknown type dropped, or a non-UTF-8 string read lossily |
+| `logit.output.spans.degraded{reason="no_wire_form"}` | count | a span field the target form has no home for, one per item: `status: Ok`, span `flags`, a status message, `trace_state`, a dropped count; `datadog.chunk.*` in v0.4/v0.5; `datadog.tracer.*` in v0.4/v0.5 and `datadog.agent.*` below `AgentPayload` (once per batch); `meta_struct`, links, and events in v0.5 |
+| `logit.output.spans.degraded{reason="int_as_f64"\|"json_text"\|"negative_duration"\|"timestamp_range"}` | count | an integer attribute sent as an inexact `metrics` double, an `Array`/`Map`/`Null` sent as JSON text, a span ending before it starts sent with duration 0, or a negative span event time sent as 0 |
 
 `Diagnostics` keys: `bad_series` and `bad_sketch`; `malformed_log`, `bad_timestamp` (a log
 timestamp that is neither a number nor RFC 3339, stamped with `received_at`), `malformed_event`,
-and `malformed_service_check`.
+`malformed_service_check`; `malformed_stats` (a dropped stats payload, bucket, or group) and
+`bad_stats_sketch` (a dropped stats summary); `malformed_span` (a dropped span, trace array, or
+chunk).
 
 ## Metrics from Lua scripts
 

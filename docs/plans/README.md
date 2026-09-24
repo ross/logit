@@ -10,7 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
-| [Enabling plan: Datadog — direct API, Agent stand-in, intake stand-in](datadog-relay.md) | 2026-09-23 | 2026-09-23 |
+| [Enabling plan: Datadog — direct API, Agent stand-in, intake stand-in](datadog-relay.md) | 2026-09-23 | 2026-09-24 |
 | [Enabling plan: `http_access` — access-log normalization from raw semconv fields](http-access-normalization.md) | 2026-09-22 | 2026-09-22 |
 | [Enabling plan: `flatten` — dotted-key expansion of nested attributes](flatten-transform.md) | 2026-09-21 | 2026-09-21 |
 | [Enabling plan: `Event` sizing and allocation strategy — a measured bake-off, then an ADR](event-sizing.md) | 2026-09-21 | 2026-09-21 |

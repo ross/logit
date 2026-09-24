@@ -14,11 +14,11 @@ use super::service_checks::{
 use super::tags::{insert_tags, render_tags};
 use super::time::{nanos_to_seconds, seconds_to_nanos};
 use super::{
-    is_service_check, DatadogDecoder, DatadogEncoder, ATTR_DEVICE, ATTR_HOST_NAME, ATTR_INTERVAL,
-    ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE, ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE,
-    ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE, RESOURCE_ATTR_AGENT_EPOCH,
-    RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP, RESOURCE_ATTR_AGENT_TIMEZONE,
-    RESOURCE_ATTR_AGENT_VERSION,
+    is_datadog_stats, is_service_check, DatadogDecoder, DatadogEncoder, ATTR_DEVICE,
+    ATTR_HOST_NAME, ATTR_INTERVAL, ATTR_ORIGIN_CATEGORY, ATTR_ORIGIN_METRIC_TYPE,
+    ATTR_ORIGIN_PRODUCT, ATTR_ORIGIN_SERVICE, ATTR_RESOURCES, ATTR_SOURCE_TYPE_NAME, ATTR_TYPE,
+    RESOURCE_ATTR_AGENT_EPOCH, RESOURCE_ATTR_AGENT_INTERNAL_IP, RESOURCE_ATTR_AGENT_PUBLIC_IP,
+    RESOURCE_ATTR_AGENT_TIMEZONE, RESOURCE_ATTR_AGENT_VERSION,
 };
 use crate::CodecError;
 use bytes::Bytes;
@@ -1085,8 +1085,13 @@ impl DatadogEncoder {
 
 /// The index of an event's first record a metrics route may send: `1` for a service check, whose
 /// record 0 is [`DatadogEncoder::encode_service_checks`]'s alone (skipped silently, as fan-out),
-/// else `0`.
+/// else `0`. For APM stats ([`is_datadog_stats`]), which belong wholly to the stats routes, it is
+/// `metrics.len()`: `each_series`, `encode_distribution_points`, and `encode_sketches` then skip
+/// the event silently.
 pub(super) fn first_metric(resource: &Resource, event: &Event) -> usize {
+    if is_datadog_stats(resource, event) {
+        return event.metrics.len();
+    }
     usize::from(is_service_check(resource, event))
 }
 
