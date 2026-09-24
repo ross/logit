@@ -286,3 +286,165 @@ Segment durability is unchanged: a segment is `fsync`ed when it rotates away and
 per push. Each of these operations is preceded by a `logit_pipeline::fault` check, so tests can fail
 or freeze it; see ADR
 [`durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md).
+
+## Amendment: an in-cap corrupt length is corruption, not a torn tail (2026-09-24)
+
+"Recovery" above says `MAX_SANE_COMPRESSED_LEN` keeps a corrupted length field from reading as
+`Truncated`. It does so only for a length over the 64 MiB cap. `frame::read_frame` reports any
+in-cap `compressed_len` longer than the bytes present as `Truncated`, exactly like a torn write.
+`frame::read_frame_with_header`'s `Truncated` arm shows this directly, and
+`crates/logit-proto/tests/frame_fixed_point.rs`'s
+`a_compressed_len_corrupted_below_the_cap_reads_as_truncated` (`dur/w2`, #323) pins it. So a record whose length
+field was corrupted to, say, 1 MiB mid-segment stopped `DiskQueue::open`'s walk, and `open`
+truncated every real record after it out of the active segment: permanent loss. On a closed
+segment the same record made `peek` retry forever, on every restart.
+
+**The walk tells a torn tail from corruption by what follows it.** On `Truncated`, `walk_segment`
+runs the same forward resync it runs for any other parse failure. If a later record parses, the
+region is corruption: counted `disk_corrupt`, and the walk continues from that record. Only if
+nothing after it parses is it a torn tail, truncated at its start. A torn write is always the last
+thing in the active segment, so this changes nothing for a real torn tail.
+
+**The resync never walks backwards.** The scan for the next `MAGIC` now starts `CONTEXT_LEN + 1`
+bytes past the failed record rather than one byte past it. The next real record's `MAGIC` can be
+no nearer, and every candidate record start then lies past the failed one. Before, a spurious
+`MAGIC` within 24 bytes of the failed record could parse as a phantom record starting inside the
+record before it.
+
+**The read path skips what it can't parse.** `DiskQueue::read_record_at` reads no further than the
+segment's in-memory length, which covers only whole, flushed records. A record that reads as
+`Truncated` with every byte up to that length in hand is corrupt, not waiting on a write. If a
+later record in the segment parses, it's delivered as before. If none does, the cursor skips to
+the segment's end as a commit would, counting one `disk_corrupt` batch with zero events (the count
+of events in undecodable bytes is unknowable).
+
+**Segment names must be zero-padded.** `list_segments` accepts only `segment-<16 digits>.lgit`, the
+form the spool writes. An unpadded name such as `segment-0.lgit` parsed to a sequence number that
+already named another file, which was then counted twice.
+
+**Known limit.** A resync accepts the first candidate that parses, so a record payload that embeds
+a complete, CRC-valid spool record could be read as a phantom record after corruption before it.
+That needs a batch carrying a whole frame as data, and it was already true of the resync before
+this change.
+
+## Amendment: one retained write handle, and what a failed repair does (2026-09-24)
+
+Correction 4 above says `DiskQueue` "tracks a `write_in_flight` flag and the last known-good
+segment length; a push that finds the flag set truncates back to that length before appending."
+That repair truncated through a freshly opened file descriptor and ignored the result. Either half
+could leave a segment longer on disk than in memory, and the reader skips everything past the
+in-memory length when it rolls to the next segment. The repair now waits for any write still
+running and truncates through the segment's one retained write handle, as described below, and
+`write_in_flight` is gone: `State::needs_repair` holds the length before an unconfirmed write.
+
+"Bound and overflow" above says "`write_in_flight` still gets set so the next push repairs any
+partial bytes the failed attempt left behind, exactly as a cancelled push does." The field no
+longer exists. A failed write leaves `needs_repair` set, and the next push repairs through the
+retained handle, exactly as after a cancelled push.
+
+**A cancelled push's write keeps running.** `tokio::fs::File::poll_write` copies the bytes, hands
+the write to a blocking thread with `spawn_mandatory_blocking`, and returns `Ready` at once
+(tokio 1.53.1, `src/fs/file.rs:728-770`). `run_output`'s `select!` can drop `drain_inbox` with a
+push parked at its `flush` await, and nothing recalls that write. Only `flush`, `sync_data`, and
+`set_len` on the *same* `File` wait for it (`complete_inflight`, `file.rs:354`, `:392`, `:1086`).
+A truncate through another descriptor can run first, and the orphaned write then lands after it
+at the file's new end (the segment is `O_APPEND`). A failed orphaned write is also stored in the
+handle and returned by the next write on it (`last_write_err`, `file.rs:737`, `:1096`).
+
+**The active segment has one write handle.** `DiskQueue` keeps it in `State::write_file`. A push
+takes it for its write inside a `HeldWriteFile` guard whose `Drop` puts it back, so a cancelled push
+leaves the handle, and tokio's record of its in-flight write, for the next push. Every `.await` on
+the active segment goes through it: the repair, the write, the flush, and rotation's `fsync` of the
+old segment. Rotation opens the next segment with `create` and `append` but not `truncate`, so a
+file left by a cancelled rotation is reused, and the new file becomes the retained handle only
+once it's recorded as the active segment. `finish` flushes through the handle, which waits for an
+orphaned write, and leaves any torn tail for `DiskQueue::open` to truncate.
+
+**The repair waits, then truncates through that handle.** `State::needs_repair` holds the active
+segment's length before any write that wasn't confirmed. The next push flushes the retained handle,
+which waits for an orphaned write and surfaces and clears a stored error, then `set_len`s back
+through the same handle. A failed flush is counted `op="flush"` and the repair goes on, because
+`set_len` still waits for the orphaned write. It opens a handle, `append` without `create`, only if
+none is retained. No test exercises the flush's error-clearing role: the `fault` seam fails an
+operation instead of running it, so nothing makes a real write fail inside tokio, and that role
+rests on tokio's source (`last_write_err`, `file.rs:1096`, `:1104`).
+
+**A failed repair drops the batch and writes nothing.** A failed truncate is counted
+`logit.component.buffer.disk.errors{op="truncate"}`, diagnosed under `disk_fs_error`, and drops
+the push that attempted it as `batches.dropped{reason="disk_full"}` (`ENOSPC`) or
+`reason="disk_io_error"`. `needs_repair` stays set, and until a later push's repair succeeds the
+spool neither writes nor rotates. Nothing is ever appended after unrepaired bytes, so only the
+active segment can have a torn tail, the property "Recovery" relies on.
+
+**`drop_oldest` reclaims a whole segment at a time.** This follows from the rejected
+deferred-skip-cursor design under "Alternatives considered": `total_bytes` shrinks only when a
+consumed segment is deleted. One push against a full spool can evict, reading and decoding each,
+every record in the oldest segment before space comes back. When that segment is the active one,
+which `segment_bytes` close to `max_bytes` allows, the push evicts every queued record, then writes
+past `max_bytes`. `docs/deploying.md` advises keeping `segment_bytes` well under `max_bytes`.
+[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+"Running it" section lists the tests that pin all of this.
+
+## Amendment: open cleans leaked segments, and a full spool with nothing queued rotates to make room (2026-09-24)
+
+Two ways for `total_bytes` to count bytes no consumer would ever free, and one way for
+"Shutdown" above to lose a batch, closed together.
+
+**`open` removes segments behind the cursor.** `roll_read_cursor` drops a segment from memory
+once the cursor leaves it, even when its unlink fails, and counts the failure
+`disk.errors{op="unlink"}` ([ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+decision 5 says why that's safe). The leaked file used to be re-listed by the next
+`DiskQueue::open`, counted toward `max_bytes`, and never deleted, so enough of them filled the
+bound. `open` now leaves every segment whose sequence number is below the recovered cursor's out
+of `total_bytes` and the segment count, and unlinks it once the cursor is persisted. A failed
+unlink is counted `op="unlink"` and diagnosed under `disk_fs_error`, and the next `open` tries
+again.
+
+**A full spool with nothing queued rotates to make room.** Once the reader has consumed every
+record, the active segment's bytes still count toward `max_bytes`, and the active segment is never
+deleted. With `segment_bytes` close to `max_bytes`, which validation allows, a push whose record
+didn't fit then waited forever under `block`: the full check runs before a push would rotate, so
+the reader parked on `not_empty` and the push on `not_full`, and nothing woke either. Under
+`drop_newest` every later push was dropped. Now a push that finds the spool full with nothing
+queued (the read cursor at the end of the active segment, no head reserved) rotates the active
+segment into a closed, fully consumed one and rolls the cursor off it, which persists the cursor
+and deletes the segment, then re-checks, under every overflow policy. A torn tail is repaired
+first; a failed repair drops the batch as any failed write does. If the rotation fails, the push
+doesn't retry it: `block` and `drop_oldest` write over the bound (there is nothing a consumer
+could free) and `drop_newest` drops.
+
+Before this, a rotation ran only once the active segment had reached `segment_bytes`, so the next
+write retried a cancelled one. A make-room rotation starts on a short segment, and `run_output` can
+drop `drain_inbox` inside it, after the next segment's create landed but before that segment
+became active. The shutdown sweep's push, on the closed store, never makes room itself, and would
+have appended to the old segment with an untracked, empty segment above it: bytes `DiskQueue::open`
+never validates, since it checks only the highest segment. So a rotation marks itself pending
+before its first `.await` and clears the mark once the new segment is active, and a write with a
+rotation pending rotates first, adopting the file a landed create left. If that create now fails
+while the file exists, the write drops its batch rather than fall back to the old segment. A
+rotation starts only once no torn-tail repair is pending, so the old segment is whole whenever the
+next one can exist, and `open` needs no change.
+
+Two changes make a parked `block` push see this state:
+`push` rolls the read cursor under every policy, not only `drop_oldest`, and a commit or eviction
+that leaves nothing queued notifies `not_full`.
+
+This supersedes the last sentence of the previous amendment's `drop_oldest` paragraph: with the
+head segment active, one push still evicts every queued record, but then rotates the consumed
+segment away and writes within the bound. The eviction burst is what `segment_bytes` well under
+`max_bytes` keeps small. Graph validation still accepts `segment_bytes == max_bytes`; it's now
+safe, only bursty under `drop_oldest`.
+
+**The batch a dropped `drain_inbox` was pushing is swept too.** "Shutdown" above says the
+abandoned-inbox sweep appends to the spool what never reached it. A batch `drain_inbox` had
+already received and was pushing, parked on a full `block` spool, was lost with the dropped
+future, neither spooled nor counted. `drain_inbox` now records it in an `in_hand` slot that
+`run_output` owns, cleared in the same poll its push returns, and the sweep takes it before the
+inbox: a disk store spools it and a memory store counts it `reason="shutdown"`. "Shutdown" above
+bounds the overshoot by the channel's capacity; with the in-hand slot it is the channel's capacity
+plus one batch.
+
+`DiskQueue::finish` is still unbounded: its cursor persist and `fsync`s run after the shutdown
+grace. Dropping the runtime waits for blocking file work anyway, so bounding `finish` alone
+wouldn't bound exit. [ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)'s
+"Running it" section lists the tests that pin this amendment.

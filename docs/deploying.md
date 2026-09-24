@@ -226,7 +226,8 @@ A sink that can't reach its destination drops and counts batches; it doesn't end
   temporarily down destination never trips this; only a failure `logit` can identify as a
   configuration problem does.
 - **On SIGTERM/SIGINT**, each sink gets up to `shutdown_grace` (5s by default) to drain its queue.
-  Anything still queued at that deadline is dropped and counted.
+  Anything still queued at that deadline, or still waiting to enter the queue, is dropped and
+  counted (a disk-backed sink spools it instead).
 
 ### Sink buffer sizing: `max_bytes` × number of sinks
 
@@ -259,7 +260,7 @@ buffering:
   destination; under `block`, it is also back-pressuring intake.
 - `logit.component.batches.dropped` (count, tagged `reason`): `overflow_oldest`/`overflow_newest`
   (a `drop_*` policy dropped something), `send_failed` (retry gave up on a batch), or `shutdown`
-  (the queue still held data when `shutdown_grace` expired). Any sustained nonzero rate is data
+  (the queue, or batches still waiting to enter it, held data when the sink stopped). Any sustained nonzero rate is data
   loss worth alerting on. The `reason` says whether the cause is an overflowing queue, a failing
   destination, or a slow drain racing shutdown.
 
@@ -286,6 +287,15 @@ in-memory queue's loss window is a real cost. Don't enable it on every sink by d
 real `write` per batch (a `logit_proto::native` encode plus one file append) that an in-memory
 queue never pays. Validation rejects a non-default `buffer.max_batches`/`buffer.max_bytes`
 alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it.
+
+**Under `overflow: drop_oldest`, keep `segment_bytes` well under `max_bytes`,** as the defaults
+(64MiB and 1GiB) do. The spool frees space only by deleting a whole consumed segment, so one push
+against a full spool can evict every record in the oldest segment, each counted
+`batches.dropped{reason="overflow_oldest"}`, before any space comes back. With `segment_bytes`
+close to `max_bytes`, the oldest segment is also the one being written, and that one push evicts
+every queued record. Any `segment_bytes` is safe under every policy: a push that finds the spool
+full with nothing left to deliver rotates the consumed segment away and deletes it instead of
+waiting or dropping.
 
 **Put the spool directory on a volume that survives the container.** An ephemeral container
 filesystem defeats the point, as it would for any durable state (`tail_in`'s checkpoint file in
@@ -328,9 +338,12 @@ disk-backed sink never emits `reason="shutdown"`, because it drops nothing at sh
   means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
   alert on it alone.
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
-  of `cursor`, `flush`, `fsync`, `create`, or `unlink`. Alert on any nonzero value: the
+  of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a
-  restart; a failed `fsync` means a power loss can lose more.
+  restart; a failed `fsync` means a power loss can lose more. A failed `truncate` also drops the
+  batch whose push attempted it (`batches.dropped{reason="disk_full"|"disk_io_error"}`): the spool
+  couldn't cut away the bytes a failed or cancelled write left, and appends nothing until a later
+  push succeeds at it.
 
 ## Listener intake
 
@@ -983,6 +996,15 @@ one, a newly selected container) always starts at its beginning, since it has no
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
 file it names.
 
+**A checkpoint that exists but can't be used replays every file from its beginning.** If
+`checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
+while `<checkpoint_path>.tmp` sits beside it (a crash before the first checkpoint landed), every
+file present at the first scan starts at offset 0, even under `read_from: end`. A previous run read
+those files, so skipping to their end would lose whatever they gained while `logit` was down.
+Expect a burst of duplicates; `logit.input.checkpoint.errors{op="load"}` and a `checkpoint_error`
+diagnostic say why. Only a missing checkpoint with no `.tmp` beside it is a first run that
+`read_from` decides.
+
 **Set `checkpoint_path` for `docker_in`.** It is optional and unset by default, in which case every
 restart re-applies `read_from` as if every file were newly discovered. A long-running container's
 log easily holds more than a restart reading from `end` would silently skip. **Put the checkpoint
@@ -994,6 +1016,12 @@ close and at shutdown, never per line. A crash between two writes can therefore 
 `checkpoint_interval` worth of already-emitted lines on restart. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
+directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
+one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
+tick. Give each `tail_in`/`docker_in` its own `checkpoint_path`: validation rejects two components
+that name the same one, or one that names another's `<checkpoint_path>.tmp`.
 
 ### `watch: auto | inotify | poll`
 

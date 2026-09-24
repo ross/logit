@@ -44,6 +44,17 @@ DISK-09, DISK-10, DISK-13, TAIL-05). Reading them against their ADRs found this:
 - **A dropped batch leaves the spool.** `runtime::write_loop` calls `store.commit()` on
   `Delivery::Dropped` exactly as on `Delivery::Delivered`, whichever store backs the sink. Neither
   the disk ADR nor `docs/deploying.md` says so.
+- **A leaked spool segment is never deleted.** `roll_read_cursor` drops a segment from memory
+  whether or not its unlink succeeds. The next `DiskQueue::open` re-lists the file, counts it in
+  `total_bytes`, and never deletes it, so enough of them fill `max_bytes`. Closed by #333.
+- **A full `block` spool with nothing queued waits forever.** Once the reader has consumed
+  everything, the active segment's bytes still count toward `max_bytes`, and the active segment
+  is never deleted. With `segment_bytes` close to `max_bytes`, a push that doesn't fit parks on
+  `not_full` while the reader parks on `not_empty`, and nothing wakes either; `drop_newest` drops
+  every later push. Closed by #333.
+- **A batch parked in a `block` push is lost uncounted at shutdown.** `run_output` drops
+  `drain_inbox` when `write_loop` finishes first, and the batch `drain_inbox` was pushing goes
+  with the future: not spooled, not counted `reason="shutdown"`. Closed by #333.
 - **None of the crash paths above has a test.** A test can't make `fsync` fail or stop a process
   between a `rename` and the next syscall. `crates/logit-cli/tests/durable_buffer_restart.rs`
   covers one `SIGKILL` at one point. `FileTarget::rotate_with` injects a failing opener and
@@ -263,13 +274,134 @@ script is needed. This list is filled in as each workstream lands.
     - `a_failed_segment_unlink_is_counted`: `op="unlink"`, with the segment left on disk.
     - `a_persistently_failing_cursor_write_is_counted_every_time`: `op="cursor"` and `cursor_error`
       on every persist, and a restart replays rather than loses.
-- **`dur/w2`, frame fixed-point properties (DISK-13):** to be listed when `dur/w2` lands.
-- **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):** to be listed when `dur/w3`
-  lands.
-- **`dur/w4`, the spool write path (DISK-03, DISK-05):** to be listed when `dur/w4` lands.
-- **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):** to be listed when `dur/w5`
-  lands.
-- **`dur/w6`, the tail checkpoint (TAIL-05):** to be listed when `dur/w6` lands.
+- **`dur/w2`, frame fixed-point properties (DISK-13):**
+  `crates/logit-proto/tests/frame_fixed_point.rs`:
+  - `write_then_read_round_trips_every_payload_under_both_compressions` — write/read is the
+    identity on codec, flags, compression, and payload, over generated payloads up to 256 KiB.
+  - `concatenated_frames_read_back_in_order_with_nothing_left_over` — one to eight frames read
+    back in the order they were written, with nothing left in the buffer.
+  - `lz4_expansion_on_incompressible_payloads_stays_within_n_plus_n_over_255_plus_16` — checks
+    that lz4's real worst-case output stays within the `n + n/255 + 16` bound
+    `MAX_SANE_COMPRESSED_LEN` is built on (it doesn't pin the constant itself: changing it leaves
+    this test green; only the over-the-cap test below would notice).
+  - `a_payload_at_the_uncompressed_cap_round_trips_under_lz4_and_none` — a full 64 MiB payload
+    round-trips at the cap; one byte past it is rejected.
+  - `a_compressed_len_corrupted_below_the_cap_reads_as_truncated` — pins finding F1's premise: a
+    `compressed_len` corrupted below the sanity cap reads as `Truncated`, not `Malformed`.
+  - `a_compressed_len_corrupted_over_the_cap_reads_as_malformed` — the complement: over the cap
+    is always `Malformed`.
+- **`dur/w3`, spool recovery and the read path (DISK-01, DISK-02):**
+  - `crates/logit-pipeline/src/disk_queue_verification.rs`:
+    - `walk_segment_recovers_every_record_outside_the_mutated_range`: a proptest over real
+      segments (some `trace_id`s containing `MAGIC`) with one bit flip, overwrite, insert,
+      truncation, or in-cap length rewrite. The walk terminates, never overlaps or goes
+      backwards, recovers every untouched record exactly once at its own offset, and counts
+      corruption exactly when there is some.
+    - `open_never_truncates_a_record_that_would_have_parsed`: the same generator through
+      `DiskQueue::open` and a peek/commit drain, checking `disk.truncated` and `disk_corrupt`.
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_corrupted_length_field_below_the_sanity_cap_does_not_truncate_the_records_after_it`:
+      `open` keeps and delivers the record after an in-cap corrupt length.
+    - `a_closed_segment_with_an_in_cap_corrupt_length_does_not_stall_peek`: `peek` resyncs past
+      it on a closed segment instead of retrying forever.
+    - `unrecoverable_garbage_at_the_end_of_a_closed_segment_is_skipped_and_counted`: `peek` skips
+      to the next segment, counting one `disk_corrupt` batch with zero events.
+    - `a_spurious_frame_inside_a_corrupt_records_context_never_moves_the_walk_backwards`: no
+      phantom record inside the record before the corruption.
+    - `a_segment_file_whose_name_is_not_zero_padded_is_ignored`: unpadded and signed names.
+    - `a_second_open_of_the_same_spool_directory_fails_at_the_lock`: and leaves the spool
+      untouched.
+- **`dur/w4`, the spool write path (DISK-03, DISK-05):**
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_push_cancelled_after_its_bytes_landed_is_truncated_by_the_next_push`: a push dropped at
+      its `flush` await once its bytes are on disk is truncated away, and never delivered.
+    - `an_orphaned_write_that_lands_after_the_next_push_began_never_desynchronizes_the_segment`:
+      a second runtime whose one blocking thread is held parks a cancelled push's write until the
+      next push is repairing, the order a fresh-descriptor truncate can't survive.
+    - `cancelling_pushes_at_every_await_never_desynchronizes_the_segment`: pushes cancelled after
+      1 to 8 polls, their blocking work delayed by a varying amount, across rotations. Every
+      segment's on-disk length matches its in-memory one after each push.
+    - `a_failed_torn_tail_truncate_drops_and_counts_the_batch_and_never_writes_past_the_torn_bytes`:
+      `op="truncate"`, a `disk_io_error` drop, nothing appended, and the next push repairs.
+    - `a_failed_repair_never_rotates_so_only_the_active_segment_can_be_torn`: no new segment while
+      a repair keeps failing.
+    - `every_configurable_disk_compression_is_encodable_by_write_frame`: pins the `expect` on
+      `write_frame` to `logit_config::Compression`'s variants.
+    - `drop_oldest_reclaims_space_a_whole_head_segment_at_a_time_and_counts_every_eviction` and
+      `drop_oldest_with_one_active_segment_evicts_every_queued_record_then_rotates_to_make_room`:
+      `drop_oldest`'s whole-segment reclamation and its worst case.
+  - `crates/logit-pipeline/src/disk_queue_verification.rs`:
+    - `spool_model_every_push_is_delivered_dropped_or_queued`: a model-based proptest over pushes,
+      cancelled pushes, peeks, commits, injected failures, and crash-reopens. Every push counted
+      queued is delivered, each push counts exactly one of queued or dropped, duplicates and
+      unconfirmed pushes appear only after a reopen, first deliveries are FIFO, no peek stops
+      responding, and the depth gauge matches.
+- **`dur/w5`, cursor rollover and shutdown (DISK-06, DISK-09):**
+  - `crates/logit-pipeline/src/disk_queue.rs`:
+    - `a_crash_at_any_point_of_a_segment_roll_loses_no_uncommitted_record`: a freeze at every
+      recorded step of a roll (the cursor's four steps, the unlink), then a reopen and a drain:
+      every uncommitted record arrives, and only committed ones repeat.
+    - `a_segment_is_unlinked_only_after_the_cursor_leaving_it_is_durable`: from recorded hits, for
+      a commit, a `drop_oldest` eviction, a rotation to make room, and `open`'s cleanup.
+    - `a_failed_cursor_persist_before_an_unlink_loses_nothing_on_reopen`: decision 5, pinned.
+    - `a_segment_left_behind_by_a_failed_unlink_is_removed_at_the_next_open`: out of the bound
+      even when `open`'s own unlink fails (counted `op="unlink"`), and gone at the next `open`.
+    - `finish_after_a_peek_without_commit_replays_the_peeked_head_on_reopen`: shutdown grace
+      expiring mid-delivery replays, never loses.
+    - `a_crash_at_any_point_of_finish_loses_nothing`: a freeze at every step of `finish`.
+    - `a_blocked_push_makes_room_by_rotating_a_fully_consumed_active_segment` and
+      `a_drop_newest_push_makes_room_by_rotating_a_fully_consumed_active_segment`: with
+      `max_bytes == segment_bytes`, a push after everything was delivered neither waits forever
+      nor drops.
+    - `a_rotation_cancelled_after_its_create_is_finished_by_the_next_write_never_appending_to_the_old_segment`:
+      a make-room rotation cancelled between its create and the new segment becoming active is
+      finished by the next write, even on a closed store, and a failed retry of the create drops
+      the batch rather than append to the old segment.
+  - `crates/logit-pipeline/src/disk_queue_verification.rs`:
+    - `spool_model_a_bounded_block_spool_never_parks_a_push_that_nothing_will_wake`: the spool
+      model under `block` with a `max_bytes` a few records fill, plus a consume-everything op. A
+      parked push is woken by the consumer's commits, and a push to a full spool with nothing
+      queued finishes on its own. It also closes the spool and cancels pushes inside a
+      rotation, and checks no segment newer than the active one survives a queued push.
+  - `crates/logit-pipeline/src/runtime.rs`:
+    - `every_run_output_exit_path_reconciles_received_against_delivered_dropped_and_spooled`:
+      drain first, grace expiry, permanent error, and closed and empty, under both stores.
+      Batches sent equal delivered plus `send_failed` plus `shutdown` plus spooled, and a disk
+      store counts no `shutdown`.
+    - `a_batch_parked_in_a_blocked_push_when_the_drain_is_abandoned_is_spooled_by_the_sweep`: the
+      sweep takes the batch `drain_inbox`'s dropped push held.
+    - `a_disk_sink_commits_a_batch_dropped_after_its_retry_budget_so_it_never_replays`:
+      decision 7, pinned.
+- **`dur/w6`, the tail checkpoint (TAIL-05):**
+  - `crates/logit-inputs/src/tail/checkpoint.rs`:
+    - `an_empty_checkpoint_is_unusable_not_missing`,
+      `a_truncated_checkpoint_document_is_unusable_and_counted`,
+      `an_unreadable_checkpoint_is_unusable`, `a_wrong_version_checkpoint_is_unusable`,
+      `a_missing_checkpoint_with_a_stray_tmp_beside_it_is_unusable`, and
+      `an_unreadable_tmp_beside_a_missing_checkpoint_is_unusable`: decision 4's unusable shapes,
+      each counted `op="load"` and diagnosed once.
+    - `a_missing_checkpoint_alone_is_missing`: the first-run case stays silent.
+    - `checkpoints_differing_only_in_extension_never_share_a_tmp`: `state.json` and `state.yaml`
+      write distinct tmp files.
+    - `a_failed_write_at_any_step_leaves_the_store_dirty_and_the_next_write_lands`: an `EIO` at
+      each of the helper's four steps counts `op="write"`, keeps the store dirty, and the next
+      unforced write lands.
+    - `a_crash_at_any_step_of_a_write_leaves_the_previous_checkpoint_loadable`: a freeze at each
+      step, then a reload, finds the old checkpoint (the new one after the directory `fsync`).
+    - `a_checkpoint_write_fsyncs_the_file_before_the_rename_and_the_directory_after`: decision 1's
+      order at the `tail.checkpoint` site, from recorded hits.
+  - `crates/logit-inputs/src/tail/driver.rs`:
+    - `an_unusable_checkpoint_starts_every_preexisting_file_at_the_beginning_even_under_read_from_end`:
+      empty, truncated, wrong-version, and stray-tmp checkpoints each replay every pre-existing
+      line, and shutdown's forced write replaces the unusable document.
+    - `a_missing_checkpoint_still_honours_read_from_end`: no checkpoint and no tmp still skips.
+    - `a_crash_between_checkpoint_write_and_rename_resumes_from_the_previous_checkpoint_with_duplicates_only`:
+      a freeze at the rename, then a restart under `read_from: end`, redelivers the line read
+      since the last checkpoint and skips nothing.
+  - `crates/logit-pipeline/src/graph.rs` (rule 62):
+    `two_tailing_listeners_sharing_a_checkpoint_path_are_rejected`,
+    `a_checkpoint_path_equal_to_another_components_tmp_path_is_rejected`, and
+    `tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine`.
 - **`dur/w7`, `file_out` rotation (DISK-10):**
   - `crates/logit-outputs/src/file.rs`:
     - `a_crash_at_any_rotation_step_loses_no_line_and_duplicates_none_after_restart`: for

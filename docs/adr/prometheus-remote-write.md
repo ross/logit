@@ -99,12 +99,13 @@ without a mode-specific carve-out.
 **Rule 40's body becomes scrape-mode-only.** Rule 40, not rule 9, is what made bind mode
 unreachable: it ran over every `PrometheusIn` and bailed when `scrape_targets` was empty
 (*"'scrape_targets' must name at least one scrape URL"*), and its `timeout: 0s` check, its header
-validation, and its "TLS settings with no `https` target" check (now at
-`crates/logit-pipeline/src/graph.rs:1927-1933`, bound to the very field this ADR renames
+validation, and its "TLS settings with no `https` target" check (still rule 40, in
+`crates/logit-pipeline/src/graph.rs`, bound to the very field this ADR renames
 `scrape_tls`) are all statements about a scrape that bind mode never performs — so rule 40's whole
 body is gated on a non-empty `scrape_targets`, the empty-list bail now a plain `continue`
-(`graph.rs:1895-1897`), and rule 55 owns everything about the mode itself: the exactly-one-of check, and the wrong-mode-field checks
-in both directions. Two rules, one gate each — rather than rule 40 silently acquiring a second job.
+(rule 40's own `continue` in `graph.rs`), and rule 55 owns everything about the mode itself: the
+exactly-one-of check, and the wrong-mode-field checks in both directions. Two rules, one gate each
+— rather than rule 40 silently acquiring a second job.
 
 **`prometheus_in`'s `tls:` is renamed `scrape_tls:`.** One kind now has two TLS-shaped roles —
 client TLS for outbound scrapes, server TLS for the inbound receiver — and a bare `tls:` next to a
@@ -157,7 +158,7 @@ receiver is correct and useful on its own — 2.0 is fully typed with no cache a
 ### Decode and encode work in timestamp groups
 
 A remote-write `TimeSeries` carries one label set and **N `Sample`s**. `Series`
-(`crates/logit-proto/src/prometheus/mod.rs:329`) holds exactly one `Point` and one `timestamp`, and
+(`crates/logit-proto/src/prometheus/mod.rs`) holds exactly one `Point` and one `timestamp`, and
 the assembler's `replace_once` counts a second value for one label set within a family as
 `duplicate_series`. The two shapes do not line up, and forcing them to would mean either inventing a
 multi-point `Series` — changing the type every mapping table in the older ADR is written against —
@@ -214,7 +215,7 @@ have produced.
 
 Suppressing the marker takes a decoder-side switch, because the marker is not the receiver's to
 omit today: `families_to_events` inserts `prometheus.timestamp: true` whenever `Series.timestamp`
-is `Some` (`crates/logit-proto/src/prometheus/mod.rs:572-579`), and on this transport it always is.
+is `Some` (`crates/logit-proto/src/prometheus/mod.rs`), and on this transport it always is.
 `PrometheusDecoder::with_timestamp_marker(bool)` defaults to **`true`**, which is exactly today's
 behaviour for the scrape path, and the receiver passes `false`: `Event::timestamp` is still set from
 the sample, only the marker attribute is omitted.
@@ -234,12 +235,12 @@ and no struct literal in the existing tests changes.
 
 **Decode:** a stale NaN on any sample makes that label set's series `Point::Stale`, and
 `families_to_events` maps it to the family type's zero-shaped kind with `FLAG_NO_RECORDED_VALUE`
-set, replacing the hardcoded `flags: 0` it used to build: `point_to_kind` (`mod.rs:604-610`) returns
+set, replacing the hardcoded `flags: 0` it used to build: `point_to_kind` (`mod.rs`) returns
 `(kind, flags)` now, and a `Point::Stale` is the one arm of it that returns a non-zero one.
 
 **Encode:** with `PrometheusEncoder::with_stale_markers(true)`, a flagged `Gauge`, `Sum`, or
 marker-untyped record becomes a `Point::Stale` series, bypassing the early
-`is_no_recorded_value()` skip at the top of `events_to_families` (`mod.rs:731-735`). A flagged
+`is_no_recorded_value()` skip at the top of `events_to_families` (`mod.rs`). A flagged
 `Histogram`, `Summary` or sketch kind stays **skipped and counted**, as it is today: those kinds
 expand to several derived series
 (`_bucket{le}`, `_sum`, `_count`), and a single flag carries no information about which of them
@@ -277,9 +278,9 @@ mapping and this transport has no reason to widen it.
 `MAX_REQUEST_BYTES = 4 * 1024 * 1024` is a **constant, not a config field**, checked against the
 *decompressed* size: Snappy's `decompress_len` is read from the block header and compared before a
 byte is decompressed, so a compression bomb is rejected without being expanded. This is the same
-number and the same hardcoded-not-configurable posture as `otlp_in`
-(`crates/logit-inputs/src/otlp.rs:203`), which already bounds a decompressed request the same way
-and explains the reasoning in its own module doc. Prometheus's default `max_samples_per_send` is
+number and the same hardcoded-not-configurable posture as `otlp_in`'s own `MAX_REQUEST_BYTES`
+(`crates/logit-inputs/src/otlp.rs`), which already bounds a decompressed request the same way and
+explains the reasoning in its own module doc. Prometheus's default `max_samples_per_send` is
 2000, so a real request is orders of magnitude under the cap; an operator who hits it has a
 misconfigured sender, not a tuning problem.
 
@@ -301,11 +302,11 @@ delays the `204` and the sender's own queue throttles. That is remote-write's fl
 working as designed, not a stalled receiver.
 
 **`405 + Allow: POST` is a deliberate divergence from `otlp_in`**, which answers `404` for a
-non-`POST` (`crates/logit-inputs/src/otlp.rs:607-609`). `prometheus_out`'s exposition server already
-answers `405` for a wrong method on `/metrics`, and this receiver lives on the same kind pair, so it
-matches its sibling rather than the unrelated input it copied its accept loop from. The receiver's
-module doc says so explicitly, so the next reader diffing the two inputs finds the reason instead of
-a bug.
+non-`POST` (`handle_http` in `crates/logit-inputs/src/otlp.rs`). `prometheus_out`'s exposition
+server already answers `405` for a wrong method on `/metrics`, and this receiver lives on the same
+kind pair, so it matches its sibling rather than the unrelated input it copied its accept loop
+from. The receiver's module doc says so explicitly, so the next reader diffing the two inputs
+finds the reason instead of a bug.
 
 A **missing `Content-Type` is a `415`, not a default**, where `otlp_in` treats an absent type as
 protobuf: `otlp_in` has a history of clients predating its JSON support, and remote-write has none —
@@ -361,12 +362,12 @@ only contribution is classifying the outcome into a `Fault`, exactly as `otlp_ou
 
 - 2xx → `Ok`.
 - 429 and 5xx → **`Fault::Ambiguous`**, via `is_retryable_http_status`
-  (`crates/logit-outputs/src/http.rs:125` — that whole table hoisted out of `otlp_out` into a shared
+  (`crates/logit-outputs/src/http.rs` — that whole table hoisted out of `otlp_out` into a shared
   module when this sender landed, rather than being copied). Ambiguous, not `Clean`: the request
   reached the server and may have been partially applied.
-- Transport errors → `classify_reqwest_error` (`http.rs:133`); only a connect failure is
+- Transport errors → `classify_reqwest_error` (`http.rs`); only a connect failure is
   `Fault::Clean`.
-- Any 3xx → permanent. `build_client` (`http.rs:46-56`) turns `reqwest`'s own `limited(10)` redirect
+- Any 3xx → permanent. `build_client` (`http.rs`) turns `reqwest`'s own `limited(10)` redirect
   policy off, which is what puts a status class nobody would otherwise see onto this table.
   Remote-write defines no redirect, and following one would break the table's premise that one
   request went to the configured URL: a `301`/`302`/`303` is replayed as a body-less `GET`, so a
@@ -383,8 +384,9 @@ only contribution is classifying the outcome into a `Fault`, exactly as `otlp_ou
 `duplicate_safe()` stays **`true`**, and this is load-bearing rather than incidental. A sample's
 identity on a remote-write receiver is `(label set, timestamp)`, so replaying an identical request
 is an idempotent overwrite, never a double count — which is what makes `true` honest. And `true` is
-what selects `DeliveryPosture::AtLeastOnce` (`crates/logit-pipeline/src/output.rs:82-88,158-169`),
-which is the *only* posture under which a `Fault::Ambiguous` is retried at all. Setting it `false`
+what selects `DeliveryPosture::AtLeastOnce`, via `DeliveryPosture::from_duplicate_safe`
+(`crates/logit-pipeline/src/output.rs`), which is the *only* posture under which a
+`Fault::Ambiguous` is retried at all. Setting it `false`
 would not make delivery safer; it would silently turn every 5xx into a dropped batch.
 
 The sink does not reorder across batches. Two upstream branches writing the same series can

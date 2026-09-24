@@ -2008,7 +2008,10 @@ pub struct TailOptions {
     /// Where read offsets are persisted, so a restart resumes instead of replaying or skipping.
     /// Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every
     /// file as if newly discovered. A relative path resolves against the config file's
-    /// directory.
+    /// directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp`
+    /// beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is
+    /// another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every
+    /// file from its beginning, whatever `read_from` says.
     #[serde(default)]
     pub checkpoint_path: Option<String>,
     #[serde(default)]

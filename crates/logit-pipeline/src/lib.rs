@@ -16,6 +16,8 @@
 pub mod accumulator;
 pub mod atomic_write;
 pub mod disk_queue;
+#[cfg(test)]
+mod disk_queue_verification;
 pub mod fanout;
 pub mod fault;
 pub mod graph;

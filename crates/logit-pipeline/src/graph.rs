@@ -171,6 +171,9 @@
 //! 61. A `sample` `rate` non-finite, outside `[0, 1]`, `1`, or `0` without `always_keep`; an empty
 //!     field name; an `always_keep` naming both or neither side, or with a non-finite value; or
 //!     `missing:` without `key:` (`docs/adr/consistent-sampling-component.md`).
+//! 62. Two `tail_in`/`docker_in` components sharing a literal `checkpoint_path`, or one whose
+//!     `checkpoint_path` is another's `<checkpoint_path>.tmp`: each would overwrite, or truncate
+//!     and rename away, the other's offsets (`docs/adr/file-tailing-and-docker-json-logs.md`).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -2630,6 +2633,51 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                     }
                 }
             }
+        }
+    }
+
+    // Rule 62: a tail listener's `checkpoint_path`
+    // (`docs/adr/file-tailing-and-docker-json-logs.md`). Two listeners sharing one would overwrite
+    // each other's offsets on every write, and each would resume from whichever wrote last. One
+    // whose path is another's tmp path (`crate::atomic_write::tmp_path`) would have its checkpoint
+    // truncated and renamed away by every write of the other, then load as missing and skip to
+    // `read_from`. Literal paths only, like rule 35's `disk.path`. Sorted as `(path, id)` so
+    // entries sharing a path are adjacent.
+    let mut checkpoint_paths: Vec<(&str, &str)> = components
+        .iter()
+        .filter_map(|(id, component)| match &component.kind {
+            ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => {
+                tail.checkpoint_path.as_deref().map(|path| (path, id.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    checkpoint_paths.sort_unstable();
+    for pair in checkpoint_paths.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            anyhow::bail!(
+                "components '{}' and '{}' both set 'checkpoint_path' to '{}' -- two tailing \
+                 listeners sharing one checkpoint would overwrite each other's offsets",
+                pair[0].1,
+                pair[1].1,
+                pair[0].0
+            );
+        }
+    }
+    for &(path, id) in &checkpoint_paths {
+        let tmp = crate::atomic_write::tmp_path(std::path::Path::new(path));
+        let tmp = tmp.to_string_lossy();
+        let clash = checkpoint_paths
+            .binary_search_by(|&(other, _)| other.cmp(tmp.as_ref()))
+            .ok()
+            .map(|at| checkpoint_paths[at]);
+        if let Some((other_path, other_id)) = clash {
+            anyhow::bail!(
+                "component '{other_id}' sets 'checkpoint_path' to '{other_path}', which is the tmp \
+                 file component '{id}' writes beside its own 'checkpoint_path' '{path}' -- every \
+                 checkpoint write of '{id}' would truncate and rename away the checkpoint of \
+                 '{other_id}'"
+            );
         }
     }
 
@@ -7354,6 +7402,86 @@ mod tests {
             ("out2", vec!["in"], sink(), disk_buffer("two")),
         ]))
         .expect("distinct disk paths should validate fine");
+    }
+
+    fn tail_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {
+        ComponentKind::TailIn {
+            paths: vec!["/var/log/app.log".to_string()],
+            tail: logit_config::TailOptions {
+                checkpoint_path: Some(checkpoint_path.to_string()),
+                ..logit_config::TailOptions::default()
+            },
+        }
+    }
+
+    fn docker_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {
+        ComponentKind::DockerIn {
+            root: "/var/lib/docker/containers".to_string(),
+            containers: vec!["nginx".to_string()],
+            discover: false,
+            labels: Vec::new(),
+            tail: logit_config::TailOptions {
+                checkpoint_path: Some(checkpoint_path.to_string()),
+                ..logit_config::TailOptions::default()
+            },
+        }
+    }
+
+    /// Rule 62: two tailing listeners writing one checkpoint would overwrite each other's
+    /// offsets every interval, and each would resume from whichever wrote last.
+    #[test]
+    fn two_tailing_listeners_sharing_a_checkpoint_path_are_rejected() {
+        let err = expect_err(cfg(vec![
+            ("logs", vec![], tail_in_checkpointing_to("state/tail.json")),
+            ("containers", vec![], docker_in_checkpointing_to("state/tail.json")),
+            ("out", vec!["logs", "containers"], sink()),
+        ]));
+        assert!(err.contains("'containers'") && err.contains("'logs'"), "got: {err}");
+        assert!(err.contains("both set 'checkpoint_path' to 'state/tail.json'"), "got: {err}");
+
+        let err = expect_err(cfg(vec![
+            ("a", vec![], tail_in_checkpointing_to("tail.json")),
+            ("b", vec![], tail_in_checkpointing_to("tail.json")),
+            ("out", vec!["a", "b"], sink()),
+        ]));
+        assert!(err.contains("both set 'checkpoint_path' to 'tail.json'"), "got: {err}");
+    }
+
+    /// Rule 62: `a.json`'s every write creates (truncating) `a.json.tmp` and renames it away, so a
+    /// second listener checkpointing to `a.json.tmp` would find its checkpoint gone at restart,
+    /// load it as missing, and skip to `read_from`.
+    #[test]
+    fn a_checkpoint_path_equal_to_another_components_tmp_path_is_rejected() {
+        for (first, second) in [("a", "b"), ("b", "a")] {
+            let err = expect_err(cfg(vec![
+                (first, vec![], tail_in_checkpointing_to("state/a.json")),
+                (second, vec![], docker_in_checkpointing_to("state/a.json.tmp")),
+                ("out", vec!["a", "b"], sink()),
+            ]));
+            assert!(
+                err.contains(&format!("component '{second}'"))
+                    && err.contains(&format!("component '{first}'")),
+                "got: {err}"
+            );
+            assert!(
+                err.contains("'state/a.json.tmp'") && err.contains("'state/a.json'"),
+                "got: {err}"
+            );
+            assert!(err.contains("tmp file"), "got: {err}");
+        }
+    }
+
+    /// Rule 62 compares literal paths only; distinct ones, and listeners with no checkpoint, pass.
+    #[test]
+    fn tailing_listeners_with_distinct_or_no_checkpoint_paths_validate_fine() {
+        resolve(cfg(vec![
+            ("a", vec![], tail_in_checkpointing_to("state/a.json")),
+            ("b", vec![], tail_in_checkpointing_to("state/a.yaml")),
+            ("c", vec![], tail_in(vec!["/var/log/c.log"])),
+            ("d", vec![], tail_in(vec!["/var/log/d.log"])),
+            ("out", vec!["a", "b", "c", "d"], sink()),
+        ]))
+        .expect("distinct checkpoint paths, or none, should validate fine");
     }
 
     #[test]

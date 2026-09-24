@@ -460,11 +460,11 @@ disk-backed sink:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit |
+| `logit.component.buffer.batches` | gauge | batches currently queued, sampled on every push/commit. For a disk-backed sink, skipping a corrupt region leaves it unchanged: corruption present at `DiskQueue::open` was never counted, and a record corrupted after its push over-counts by one until the next `open` re-derives the count |
 | `logit.component.buffer.bytes` | gauge | `EventBatch::estimated_heap_bytes` summed over what's queued (in-memory), or on-disk segment bytes (disk-backed) |
 | `logit.component.buffer.utilization` | gauge | `max(batches ratio, bytes ratio)` against the two configured bounds |
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room; only recorded when a push actually had to wait |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`write_loop`: shutdown grace expired with an in-memory queue still non-empty — never emitted for a disk-backed sink, which drops nothing at shutdown), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `send_failed` (`write_loop`: not retryable, or retryable but the budget ran out), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown — never emitted for a disk-backed sink, which spools them all), `frame_too_large`/`disk_corrupt`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
 
 Disk-backed sinks (`DiskQueue`) also emit:
 
@@ -473,11 +473,20 @@ Disk-backed sinks (`DiskQueue`) also emit:
 | `logit.component.buffer.disk.segments` | gauge | segment files currently on disk |
 | `logit.component.buffer.disk.replayed` | count | records found between the resume point and the end of all segments, at `DiskQueue::open` |
 | `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open` |
-| `logit.component.buffer.disk.errors{op=...}` | count | a failed spool filesystem operation that doesn't drop a batch, `op` one of `cursor` (a `cursor.json` write), `flush`, `fsync` (a segment or the spool directory), `create` (a rotation's new segment), `unlink` (a consumed segment) |
+| `logit.component.buffer.disk.errors{op=...}` | count | a failed spool filesystem operation, `op` one of `cursor` (a `cursor.json` write), `flush`, `fsync` (a segment or the spool directory), `create` (a rotation's new segment), `truncate` (the torn-tail repair), `unlink` (a consumed segment). Only `truncate` drops a batch: the push that attempted the repair, also counted `batches.dropped{reason="disk_full"\|"disk_io_error"}` |
 
 Each `disk.errors` point is also diagnosed: `op="cursor"` under
 `logit.component.diagnostics{key="cursor_error"}` (the key `DiskQueue::open` already uses for an
 unreadable or stale cursor), every other `op` under `key="disk_fs_error"`.
+
+`batches.dropped{reason="disk_corrupt"}` counts spooled bytes that don't parse as a record, in
+two places. `DiskQueue::open` counts each corrupt region it resyncs past, or skips to the end of a
+segment, from the resume point on. The delivery read path counts one when it resyncs past a
+corrupt region to the next record, or skips a corrupt region that runs to the end of its segment
+(advancing the cursor as a commit would). The same region can count once at open and again when
+delivery reaches it. A region counts once however many records it spanned, so the count is a lower
+bound, and a skipped region to the end of a segment counts zero `events.dropped`: how many events
+undecodable bytes held is unknowable.
 
 Two metrics from this document's original design were never built: a per-batch
 `buffer.wait.duration` (push-to-commit latency) and an `outcome`-tagged
@@ -857,6 +866,7 @@ own read-side counters:
 | `logit.input.files.open` | gauge | sampled after every `scan` |
 | `.files.rotated` / `.files.truncated` | count | a new inode at a known path, or the same inode shrinking |
 | `.checkpoint.writes` | count | only on an actual write; `checkpoint_interval` ticks that find nothing dirty record nothing |
+| `.checkpoint.errors{op="load"\|"write"}` | count | `load`: a checkpoint present but unusable at startup (unreadable, malformed, empty, wrong version, or missing beside a stray `.tmp`), after which every file present starts at its beginning; `write`: a failed durable write, retried on the next tick |
 | `.watch.wakes{source="inotify"\|"poll"}` | count | which wake source fired |
 | `.watch.overflows` | count | the `inotify` queue overflowing into a full rescan |
 | `.watch.watches` | gauge | sampled alongside `.files.open`. See below. |
@@ -876,7 +886,7 @@ the property the minimal-watch-set design is for.
 | `bad_line` / `long_line` / `invalid_utf8` | A line that wouldn't decode, exceeded `max_line_bytes`, or needed a lossy UTF-8 conversion. |
 | `open_error` / `read_error` | A file this driver is trying to track. |
 | `renamed` | A same-inode rebind following a *file* rename. Not the same as `docker_in`'s `container_renamed`, which is the same file with a new identity. |
-| `checkpoint_error` | Loading or writing the checkpoint file itself. |
+| `checkpoint_error` | Loading or writing the checkpoint file itself, one per `.checkpoint.errors` point. A write failure names the step that failed. |
 | `watch_error` | The one-shot cases: `auto` falling back to polling; a *file* watch that failed, which isn't retried (the file is still tailed, at `poll_interval`); or the `inotify` wake source itself becoming unusable, after which the listener runs poll-only. |
 | `watch_dir_error` | A directory watch that failed, carrying the errno. Its own key because it's retried, and so re-counted, on every later `scan` while the directory is missing, and `warn_throttled` logs a key only at powers of two of its count. Sharing a key would silence the one-shot cases above. |
 | `metadata_error` | `docker_in` only: `config.v2.json` missing or unparseable. Degrades to a `container.id`-only resource rather than refusing to tail. A missing file is retried on every poll tick; one that exists but won't parse is retried on its next stat change, because the stat cache caches a failed read the same way it caches a successful one. Diagnosed again only once it recovers or the stat changes, not once per tick. |
@@ -1243,10 +1253,10 @@ data loss.
 - `logit.output.messages.truncated` and
   `logit.output.messages.dropped{reason="oversize_header"|"oversize_datagram"}`: per-message size
   handling (`docs/adr/syslog-output.md`'s "Sizing" section).
-- `logit.output.structured_data.dropped{reason="invalid_sd_name"}`: an SD element skipped because
-  its SD-ID isn't a valid RFC 5424 `SD-NAME`, its `syslog.sd` value isn't a nested map of
-  PARAM-NAME to value, or an opt-in element collides with one the event already carries; or one
-  param skipped for an invalid PARAM-NAME.
+- `logit.output.structured_data.dropped{reason="invalid_sd_name"|"not_a_map"|"sd_id_collision"}`:
+  an SD-ID or PARAM-NAME that isn't a valid RFC 5424 `SD-NAME` (an invalid SD-ID skips the
+  element, an invalid PARAM-NAME that param); a `syslog.sd` element whose value isn't a map of
+  PARAM-NAME to value; the opt-in element colliding with an SD-ID the event already carries.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first. A climbing count in
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both take the same connect path

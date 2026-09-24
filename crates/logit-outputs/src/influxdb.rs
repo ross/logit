@@ -6,12 +6,15 @@
 //! timing belongs to `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`).
 //!
 //! It keeps its own client and classifier (`status_class`, `is_retryable_status`,
-//! `classify_transport_error`) rather than `crate::http`'s. The table is the same today, but its
-//! client never disables redirects, so it inherits `reqwest`'s `limited(10)`: a tracked gap in
-//! `docs/known-gaps.md`, closed by moving to `crate::http::build_client`.
+//! `classify_transport_error`) rather than `crate::http`'s, though it reads a rejection body
+//! through `crate::http::read_body_prefix`, the same bounded read `otlp_out` uses. The
+//! classifier table is the same today, but its client never disables redirects, so it inherits
+//! `reqwest`'s `limited(10)`: a tracked gap in `docs/known-gaps.md`, closed by moving to
+//! `crate::http::build_client`.
 //!
 //! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
 
+use crate::http::{body_snippet, read_body_prefix, ERROR_BODY_SNIPPET_BYTES};
 use crate::Output;
 use anyhow::Context;
 use bytes::Bytes;
@@ -168,7 +171,11 @@ impl Output for InfluxDbOutput {
                     1.0,
                     &[("class", status_class(status))],
                 );
-                let text = resp.text().await.unwrap_or_default();
+                // A bounded read, not `text()`: see `crate::http::read_body_prefix`.
+                let text = body_snippet(
+                    &read_body_prefix(resp, ERROR_BODY_SNIPPET_BYTES).await,
+                    ERROR_BODY_SNIPPET_BYTES,
+                );
                 let fault =
                     if is_retryable_status(status) { Fault::Ambiguous } else { Fault::Permanent };
                 Err(anyhow::anyhow!("InfluxDB write failed ({status}): {text}")).context(fault)
@@ -1337,6 +1344,8 @@ mod tests {
     const RESP_204: &str = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
     const RESP_400: &str =
         "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const RESP_400_WITH_BODY: &str =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\nConnection: close\r\n\r\nunable to parse points";
     const RESP_401: &str =
         "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     const RESP_429: &str =
@@ -1415,6 +1424,51 @@ mod tests {
         let err = output.send(&one_metric_batch()).await.expect_err("a 401 should fail send");
         assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
+    }
+
+    /// A rejection body is quoted verbatim in the error message when it fits the snippet bound.
+    #[tokio::test]
+    async fn a_short_error_body_is_quoted_verbatim() {
+        let (addr, count) = canned_server(vec![RESP_400_WITH_BODY]).await;
+        let mut output = output_against(addr).await;
+
+        let err = output.send(&one_metric_batch()).await.expect_err("a 400 should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Permanent);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
+        // `.context(fault)` makes `err`'s own `Display` the `Fault` alone; the send message with
+        // the quoted body is the wrapped cause.
+        let message = err.root_cause().to_string();
+        assert!(message.contains("unable to parse points"), "got: {message}");
+        assert!(!message.ends_with("..."), "a body under the bound isn't truncated: {message}");
+    }
+
+    /// A rejection body past the snippet bound is read only up to the bound (`read_body_prefix`),
+    /// not buffered whole, and quoted with an ellipsis.
+    #[tokio::test]
+    async fn an_oversized_error_body_is_quoted_truncated() {
+        let body = "x".repeat(64 * 1024);
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response: &'static str = Box::leak(response.into_boxed_str());
+        let (addr, count) = canned_server(vec![response]).await;
+        let mut output = output_against(addr).await;
+
+        let err = output.send(&one_metric_batch()).await.expect_err("a 500 should fail send");
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
+        let message = err.root_cause().to_string();
+        assert!(
+            message.len() < ERROR_BODY_SNIPPET_BYTES + 96,
+            "message should stay bounded regardless of body size: got {} bytes",
+            message.len()
+        );
+        assert!(
+            message.ends_with("..."),
+            "a truncated body should be quoted with an ellipsis: {message}"
+        );
     }
 
     /// A timeout against a server that accepts and never answers is `Ambiguous`, never `Clean`.
