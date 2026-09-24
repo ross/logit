@@ -1,46 +1,38 @@
-//! The `logit_in`/`logit_out` connection-level control messages: `Hello`/`HelloAck` (the
-//! version/codec/compression handshake), `Ack` (per-batch acknowledgement), and `Reject` (a clean
-//! refusal, e.g. no common codec). These travel inside an ordinary [`crate::frame`] frame with
-//! [`crate::frame::FLAG_CONTROL`] set -- a control frame's `codec` byte is meaningless (there is no
-//! payload codec to name), and its `compression` is always [`crate::frame::Compression::None`]:
-//! these messages are tiny and fixed-shape, not worth compressing, and compression itself is one of
-//! the things `Hello`/`HelloAck` are still negotiating.
+//! The `logit_in`/`logit_out` control messages: `Hello`/`HelloAck` (the version, codec, and
+//! compression handshake), `Ack` (cumulative acknowledgement), and `Reject` (a clean refusal).
+//! ADR `native-transport-handshake-and-ack` has the protocol.
 //!
-//! **Same TLV shape as [`crate::native::record`], same reason.** Every message field is
-//! `tag(u8) + len(uvarint) + payload(len bytes)`, so a field this reader doesn't recognize (a
-//! later protocol version's addition) is skipped whole rather than corrupting the rest of the
-//! message -- see [`decode`]'s own doc comment. `crates/logit-inputs/src/logit.rs` and
-//! `crates/logit-outputs/src/logit.rs` are the only callers; this module itself stays sync and
-//! tokio-free, like the rest of `logit-proto`.
+//! A control message rides in an ordinary frame with [`crate::frame::FLAG_CONTROL`] set. Its
+//! `codec` byte is meaningless, and its `compression` is always
+//! [`crate::frame::Compression::None`]: the messages are tiny, and compression is itself being
+//! negotiated.
+//!
+//! Every field is `tag(u8) + len(uvarint) + payload`, like [`crate::native::record`], so a field
+//! from a later protocol version is skipped whole. An unknown message type is an error (see
+//! [`ControlMessage::decode`]).
 
 use bytes::{Bytes, BytesMut};
 
 use crate::native::varint::{read_u8, read_uvarint, write_uvarint};
 use crate::CodecError;
 
-/// The connection-protocol version `Hello`/`HelloAck` negotiate over -- independent of
-/// [`crate::frame::VERSION`] (the frame *header's* version), since the frame envelope and the
-/// connection handshake can evolve on separate schedules.
+/// The connection-protocol version `Hello`/`HelloAck` negotiate, independent of the frame
+/// header's [`crate::frame::VERSION`].
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// A [`Reject`] reason -- codes, not an enum, so a future reason can be added without a version
-/// bump (an old reader that doesn't recognize a code still has the human-readable `message` to
-/// fall back on).
+/// A [`Reject`] reason. Codes, not an enum, so a new reason needs no version bump: a reader that
+/// doesn't know a code still has `message`.
 pub const REJECT_VERSION_MISMATCH: u16 = 1;
 pub const REJECT_NO_COMMON_CODEC: u16 = 2;
 pub const REJECT_FRAME_TOO_LARGE: u16 = 3;
 pub const REJECT_GOING_AWAY: u16 = 4;
 pub const REJECT_INTERNAL: u16 = 5;
 
-/// `Reject.message` is operator/log-facing text, not wire-critical data -- bounded so a hostile or
-/// buggy peer can't force an unbounded allocation with it. Same reasoning as
-/// `crate::native::dict`'s `MAX_SANE_DICT_ENTRIES`.
+/// Bounds `Reject.message` so a hostile peer can't force an unbounded allocation.
 const MAX_REJECT_MESSAGE_BYTES: usize = 1024;
 
-/// `Hello.codecs`/`Hello.compressions` and `HelloAck`'s own single choices are drawn from a small,
-/// fixed universe (`crate::frame::Compression` has 3 variants total) -- 16 is already generous
-/// headroom for either list to grow, and bounds the allocation a hostile peer's declared count can
-/// force before a single byte of the list has been read.
+/// Bounds `Hello.codecs`/`Hello.compressions`, each drawn from a handful of values, before a
+/// peer's declared count sizes an allocation.
 const MAX_CHOICE_LIST_ENTRIES: usize = 16;
 
 const MSG_HELLO: u8 = 1;
@@ -48,7 +40,7 @@ const MSG_HELLO_ACK: u8 = 2;
 const MSG_ACK: u8 = 3;
 const MSG_REJECT: u8 = 4;
 
-// -- shared TLV field helpers, same shape as `native::record`'s own `write_field`/tag loop --------
+// -- shared TLV field helpers, the same shape as `native::record`'s ---------------------------
 
 fn write_field(out: &mut BytesMut, tag: u8, build: impl FnOnce(&mut BytesMut)) {
     let mut tmp = BytesMut::new();
@@ -58,9 +50,8 @@ fn write_field(out: &mut BytesMut, tag: u8, build: impl FnOnce(&mut BytesMut)) {
     out.extend_from_slice(&tmp);
 }
 
-/// Reads one `tag + len + payload` field off the front of `body`, honouring `PROTOCOL_VERSION`-
-/// exceeded declared bounds via `body.len()` itself (a length-prefixed field can never claim more
-/// than what the connection actually sent). Returns `None` once `body` is exhausted.
+/// Reads one `tag + len + payload` field off the front of `body`; `None` once it's exhausted. A
+/// declared length past the end of `body` is `Malformed`.
 fn read_field(body: &mut Bytes) -> Result<Option<(u8, Bytes)>, CodecError> {
     if body.is_empty() {
         return Ok(None);
@@ -110,18 +101,18 @@ fn read_choice_list(field: Bytes, what: &str) -> Result<Vec<u8>, CodecError> {
 
 // -- Hello -----------------------------------------------------------------------------------
 
-/// Sent first, by the connecting side (`logit_out`) -- offers a protocol version and every
-/// codec/compression it can speak, plus the largest frame it will accept and the flow-control
-/// window it advertises. `window` is negotiated and recorded even though this plan's sender only
-/// ever uses 1 in flight -- see `docs/plans/native-transport.md`'s "In-flight" decision.
+/// Sent first, by the connecting side: its protocol version, every codec and compression it
+/// speaks, the largest frame it accepts, and its flow-control window. `window` is negotiated but
+/// unused; the sender keeps one frame in flight (`docs/plans/native-transport.md`'s "In-flight"
+/// decision).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub version: u16,
-    /// `crate::native::CODEC_NATIVE_V1`-shaped codec bytes this side can decode, in preference
-    /// order. Bounded to [`MAX_CHOICE_LIST_ENTRIES`] on decode.
+    /// Frame `codec` bytes this side can decode, in preference order. Bounded to
+    /// [`MAX_CHOICE_LIST_ENTRIES`] on decode.
     pub codecs: Vec<u8>,
-    /// `crate::frame::Compression as u8`-shaped bytes this side can decompress, in preference
-    /// order. Bounded to [`MAX_CHOICE_LIST_ENTRIES`] on decode.
+    /// `crate::frame::Compression as u8` bytes this side can decompress, in preference order.
+    /// Bounded to [`MAX_CHOICE_LIST_ENTRIES`] on decode.
     pub compressions: Vec<u8>,
     pub max_frame_bytes: u32,
     pub window: u32,
@@ -145,8 +136,7 @@ impl Hello {
         out.freeze()
     }
 
-    /// Decodes a `Hello` whose leading message-type byte has already been read and checked by the
-    /// caller ([`decode`]) -- `body` is just the TLV field stream that follows it.
+    /// Decodes the TLV fields after a message-type byte the caller already checked.
     fn decode_fields(mut body: Bytes) -> Result<Self, CodecError> {
         let mut version = 0u16;
         let mut codecs = Vec::new();
@@ -162,15 +152,15 @@ impl Hello {
                 }
                 HELLO_FIELD_MAX_FRAME_BYTES => max_frame_bytes = read_u32_field(field)?,
                 HELLO_FIELD_WINDOW => window = read_u32_field(field)?,
-                // Forward compatibility -- see this module's doc comment.
+                // A later protocol version's field; skip it.
                 _unknown => {}
             }
         }
         Ok(Hello { version, codecs, compressions, max_frame_bytes, window })
     }
 
-    /// Decodes a whole `Hello` control payload, message-type byte included. Fails with
-    /// [`CodecError::Malformed`] if the payload's message type isn't `Hello`'s.
+    /// Decodes a whole `Hello` payload, message-type byte included; a different message type is
+    /// [`CodecError::Malformed`].
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
         expect_msg_type(bytes, MSG_HELLO, "Hello")?;
         Self::decode_fields(bytes.split_off(0))
@@ -179,8 +169,8 @@ impl Hello {
 
 // -- HelloAck ----------------------------------------------------------------------------------
 
-/// The server's reply to a valid [`Hello`]: the chosen (intersection) codec and compression, this
-/// listener's own frame-size ceiling, and its advertised window.
+/// The listener's reply to a valid [`Hello`]: the chosen codec and compression from both sides'
+/// offers, its own frame-size ceiling, and its window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloAck {
     pub version: u16,
@@ -237,9 +227,8 @@ impl HelloAck {
 
 // -- Ack -------------------------------------------------------------------------------------
 
-/// Cumulative acknowledgement: "I have forwarded every data frame up to and including sequence
-/// `seq`." Sequence numbers are implicit -- TCP is ordered, so the Nth data frame on a connection
-/// is always seq N -- see `docs/plans/native-transport.md`'s "Sequence numbers" decision.
+/// Cumulative acknowledgement: every data frame through `seq` is forwarded. Sequence numbers are
+/// implicit: TCP is ordered, so the Nth data frame on a connection is seq N.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ack {
     pub seq: u64,
@@ -274,9 +263,8 @@ impl Ack {
 
 // -- Reject ------------------------------------------------------------------------------------
 
-/// A clean refusal -- version mismatch, no common codec, an oversized frame, a graceful
-/// going-away, or an internal error -- always followed by the sender closing the connection. See
-/// the `REJECT_*` constants above for `code`.
+/// A clean refusal, always followed by the sender closing the connection. `code` is one of the
+/// `REJECT_*` constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reject {
     pub code: u16,
@@ -325,9 +313,8 @@ impl Reject {
 
 // -- dispatch: read a control payload without knowing its type ahead of time -----------------
 
-/// One of the four control messages -- what a reader that doesn't yet know which message is
-/// coming next (any point after the handshake, where either side may send `Ack` or `Reject`)
-/// decodes into.
+/// Any control message, for a reader that doesn't know which comes next (after the handshake,
+/// either `Ack` or `Reject`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMessage {
     Hello(Hello),
@@ -346,10 +333,8 @@ impl ControlMessage {
         }
     }
 
-    /// Reads the leading message-type byte and dispatches to the matching message's own field
-    /// decoder -- an unrecognized message type is a decode error (unlike an unrecognized *field*
-    /// within a known message, which is skipped): a message type this reader has never heard of
-    /// carries no field layout it could possibly make sense of.
+    /// Dispatches on the leading message-type byte. An unknown message type is `Malformed`,
+    /// unlike an unknown field, which is skipped: there's no known layout to read it by.
     pub fn decode(bytes: &mut Bytes) -> Result<Self, CodecError> {
         let msg_type = read_u8(bytes)?;
         let body = bytes.split_off(0);
@@ -475,8 +460,7 @@ mod tests {
 
     #[test]
     fn an_unknown_field_tag_is_skipped_without_disturbing_known_fields() {
-        // Hand-build a Hello payload with an extra, unrecognized field tag 99 inserted before the
-        // real fields -- a future protocol version's addition, from this reader's perspective.
+        // A Hello with an unknown field tag 99 ahead of the real fields.
         let mut out = BytesMut::new();
         out.extend_from_slice(&[MSG_HELLO]);
         write_field(&mut out, 99, |buf| buf.extend_from_slice(b"future field, ignore me"));
@@ -535,9 +519,7 @@ mod tests {
 
     #[test]
     fn flag_control_marks_a_hello_frame() {
-        // The connection layer's own responsibility (not this module's), exercised here as a
-        // documentation test: a control message is framed with `crate::frame::FLAG_CONTROL` set,
-        // `codec`/`compression` otherwise meaningless.
+        // Framing is the connection layer's job; this shows the expected shape.
         use crate::frame::{
             read_frame_with_header, write_frame_with_flags, Compression, FLAG_CONTROL,
         };

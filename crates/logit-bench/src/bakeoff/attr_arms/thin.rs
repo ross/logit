@@ -1,34 +1,33 @@
-//! **Arm E -- per-embedding capacity.** `AttrMap` is embedded in six places that have nothing to do
+//! **Arm E: per-embedding capacity.** `AttrMap` is embedded in six places that have nothing to do
 //! with an event's own attribute width, and each pays `Event`'s inline capacity whether or not it
 //! can use it: `Resource`, `Scope`, `SeriesKey`, `SpanEvent`, `SpanLink`, and every boxed
 //! `Value::Map`. This module builds the two cases the survey says are worth measuring.
 //!
-//! **(1) `Value::Map`.** Today a nested map is `Value::Map(Box<AttrMap>)`: one heap allocation of
-//! `size_of::<AttrMap>()` -- the full eight inline slots -- for a map the survey measures at a
+//! **(1) `Value::Map`.** A shipped nested map is `Value::Map(Box<AttrMap>)`: one heap allocation of
+//! `size_of::<AttrMap>()`, the full eight inline slots, for a map the survey measures at a
 //! median width of **3** (`docs/design/data-shapes.md` §5.3, pino-http). A `Vec`-backed sorted map
 //! is 24 bytes, which fits inside `Value`'s existing 40 without the `Box` at all, and allocates
-//! exactly the entries it holds. [`ThinValue`]/[`ThinMap`] are that representation; the "today"
-//! side of the comparison is the real `logit_core` types, not a mirror of them.
+//! exactly the entries it holds. [`ThinValue`]/[`ThinMap`] are that representation; the `*_today`
+//! side of each comparison is the real `logit_core` types, not a mirror of them.
 //!
 //! **(2) `Scope` and `Resource`.** A `Scope` carries a median of **0** attributes and a `Resource`
 //! 0-6 outside a collector, 17 (p90 28, max 29) behind one (§3-§4). `Scope` is embedded in the
-//! batch, `Resource` is `Arc`-shared across it -- so the two are paid at completely different
-//! rates, and the benches keep them apart.
+//! batch and `Resource` is `Arc`-shared across it, so the two are paid at different rates, and
+//! the benches keep them apart.
 //!
 //! **What this mirror simplifies, and which way it cuts.**
 //!
 //! - [`ThinValue`] is a mirror of `Value`, not the real thing: ten variants with the same payloads
 //!   in the same order, differing only in the `Map` arm. `tests/attr_arms.rs` pins
-//!   `size_of::<ThinValue>() == size_of::<Value>()`, so the entry stride is identical and the only
-//!   thing that changes is where a nested map's storage lives. What it cannot reproduce is the
-//!   rest of `Value`'s real obligations (`serde`, the Lua proxy, the wire codecs), which is
-//!   precisely the part a production change would have to pay for and this arm does not measure.
-//! - `ThinMap` has no inline capacity at all, so it allocates on its **first** entry where an
-//!   `AttrMap` does not. That is the trade, not an oversight: at a median nested width of 3 the
-//!   allocation is 144 bytes against a 400-byte `Box`, but a one-entry map pays an allocation the
-//!   boxed `AttrMap` also pays, and a *zero*-entry map pays nothing where today's `Scope` pays 392
-//!   bytes of embedded footprint.
-//! - The nested fixtures here are built by hand at `docs/design/data-shapes.md`'s measured widths
+//!   `size_of::<ThinValue>() == size_of::<Value>()`, so the entry stride is identical and only
+//!   where a nested map's storage lives changes. It can't reproduce the rest of `Value`'s
+//!   obligations (`serde`, the Lua proxy, the wire codecs), which is the part a production change
+//!   would have to pay for and this arm doesn't measure.
+//! - `ThinMap` has no inline capacity, so it allocates on its **first** entry where an `AttrMap`
+//!   does not. That is the trade: at a median nested width of 3 the allocation is 144 bytes against
+//!   a 400-byte `Box`, a one-entry map pays an allocation the boxed `AttrMap` also pays, and a
+//!   *zero*-entry map pays nothing where a shipped `Scope` pays 392 bytes of embedded footprint.
+//! - The nested fixtures are built by hand at `docs/design/data-shapes.md`'s measured widths
 //!   rather than parsed out of `fixtures::PINO_HTTP_LOG_BODY`, so no JSON parsing sits inside a
 //!   timed region. The shape (10 top-level attributes, 4 maps, median width 3, depth 2) is the
 //!   fixture's, checked against it in `tests/attr_arms.rs`.
@@ -40,7 +39,7 @@ use logit_core::{AttrMap, Value};
 
 /// `Value` with one variant changed: a nested map is held inline as a [`ThinMap`] (24 bytes)
 /// instead of `Box<AttrMap>` (8 bytes pointing at ~400). Every other variant is identical, so the
-/// enum's size is unchanged -- see this module's doc.
+/// enum's size is unchanged.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum ThinValue {
     #[default]
@@ -66,8 +65,7 @@ impl ThinMap {
         Self(Vec::new())
     }
 
-    /// Pre-sized, which the `Vec` backing makes possible and `AttrMap` today does not expose at
-    /// all (`docs/plans/event-sizing.md`'s "what nobody can do today").
+    /// Pre-sized, which the `Vec` backing allows and `AttrMap` doesn't expose.
     pub fn with_capacity(n: usize) -> Self {
         Self(Vec::with_capacity(n))
     }
@@ -149,8 +147,8 @@ fn thin_value_at(scratch: &[(Symbol, Value)], i: usize) -> ThinValue {
 /// width 3, depth 2.
 pub const NESTED_WIDTH: usize = 3;
 
-/// One nested group's interned keys: the attribute the map hangs off, the keys inside it, and --
-/// for the pino shape, which is two levels deep -- a `headers` map inside that.
+/// One nested group's interned keys: the attribute the map hangs off, the keys inside it, and, for
+/// the two-level pino shape, a `headers` map inside that.
 pub struct NestedGroup {
     pub key: Symbol,
     pub inner: Vec<Symbol>,
@@ -201,8 +199,8 @@ pub fn synthetic_keys(maps: usize) -> NestedKeys {
     }
 }
 
-/// The nested record as it exists today: every nested map a **boxed `AttrMap`**, a full-size heap
-/// allocation whatever the three entries it holds.
+/// The nested record as shipped: every nested map a **boxed `AttrMap`**, a full-size heap
+/// allocation however few entries it holds.
 pub fn nested_today(keys: &NestedKeys, mix: shapes::Mix) -> AttrMap {
     let mut root = AttrMap::new();
     for (i, key) in keys.top.iter().enumerate() {

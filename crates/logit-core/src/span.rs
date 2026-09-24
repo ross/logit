@@ -17,14 +17,12 @@ pub struct SpanRecord {
     /// `SAMPLED`), the bits above them OTLP's own (`CONTEXT_HAS_IS_REMOTE`/`CONTEXT_IS_REMOTE`).
     /// `0` means unset.
     pub flags: u32,
-    /// Boxed: populated only on an error span or one carrying a `trace_state`/dropped counts, so
-    /// the overwhelmingly common span (no status message, no `tracestate`) doesn't pay for these
-    /// fields inline.
+    /// Boxed: only a span with a status message, `trace_state`, or dropped counts populates it, so
+    /// the common span doesn't pay for these fields inline.
     pub ext: Option<Box<SpanExt>>,
 }
 
-/// The rarely-populated half of a span's OTLP fidelity -- boxed out of [`SpanRecord`] itself, see
-/// its `ext` field's doc comment.
+/// The rarely populated OTLP span fields, boxed out of [`SpanRecord`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpanExt {
     pub status_message: Option<Bytes>,

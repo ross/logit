@@ -1,146 +1,101 @@
-//! `statsd_out` -> `statsd_in` round trip, over real UDP sockets -- the statsd counterpart to
-//! `syslog_round_trip.rs`/`otlp_round_trip.rs`/`logit_round_trip.rs`. Lives here (not a
-//! dev-dependency cycle between `logit-inputs`/`logit-outputs`) for the same reason those do:
-//! `logit-cli` already depends on both as ordinary dependencies.
+//! `statsd_out` -> `statsd_in` round trip over real UDP and TCP sockets. The components run
+//! in-process (a `StatsdOutput` sending to a bound, live `StatsdInput`), not through `logit run`.
+//! This lives in `logit-cli` because it already depends on both `logit-inputs` and
+//! `logit-outputs`; a dev-dependency between those two crates would be a cycle.
 //!
-//! `docs/plans/lossless-transit.md`'s W3 workstream, "Tests" bullet.
+//! Each fixture case asserts two things: the bytes on the wire equal the case's `.expected`
+//! bytes, and the live `statsd_in`'s decode of those bytes equals the original decode as a whole
+//! `EventBatch`. Receipt-time timestamps are zeroed first. That is the fixed point ADR
+//! `lossless-transit` requires, modulo the normalizations listed below. The one-way-lossy cases
+//! (`sanitizer-name-hash`, `sanitizer-tag-value-at`, and (6)) assert the wire bytes only.
 //!
 //! ## Fixture corpus (`tests/fixtures/statsd/`)
 //!
-//! One file pair per case: `<name>.in` (the raw line(s), exactly as a real client would put them
-//! on the wire) and `<name>.expected` (the exact bytes `statsd_out` must emit for that line's
-//! decode, or the literal marker [`SAME_AS_INPUT`] when the sink's own canonicalization happens to
-//! reproduce the input verbatim) -- the same convention `syslog_round_trip.rs`'s corpus uses. The
-//! DogStatsD-docs cases (`dogstatsd-*`) are the worked examples from Datadog's own DogStatsD
-//! protocol reference (`dogstatsd-event`/`dogstatsd-service-check` included -- the docs' own event
-//! and service check examples); everything else is hand-written to exercise a specific grammar
-//! corner or normalization, including the DogStatsD events/service checks W6 adds:
-//! `dogstatsd-event-all-fields`/`service-check-all-fields` (every optional field, already in
-//! canonical order), `event-text-with-pipe-and-escaped-newline` (`TEXT` containing `|`, `:`, and a
-//! `\n` escape), `event-multibyte-title-lengths` (a multi-byte UTF-8 title, pinning that
-//! `_e{TITLE_LEN,...}` counts bytes, not chars), `event-title-contains-pipe` (a title containing a
-//! literal `|`, which the length prefix -- not a `|` scan -- delimits), `service-check-no-message`
-//! (no `m:` field), `packed-datagram-counter-event-service-check` (an ordinary metric, an
-//! event, and a service check sharing one datagram), `event-text-trailing-space` (`TEXT`'s last
-//! byte is a space, immediately followed by the `.in` file's own trailing `\n` -- pins that
-//! `decode_into` doesn't trim it off), and `service-check-message-trailing-space` (same pin for
-//! an `m:` message, which consumes the rest of the line verbatim).
+//! One file pair per case: `<name>.in` (the raw line(s) as a client puts them on the wire) and
+//! `<name>.expected` (the bytes `statsd_out` must emit for that decode, or the marker
+//! [`SAME_AS_INPUT`] when the sink reproduces the input verbatim). The `dogstatsd-*` cases are the
+//! worked examples from Datadog's DogStatsD protocol reference, including its event and service
+//! check examples, except `dogstatsd-event-all-fields`. That one and every other case are
+//! hand-written to pin one grammar corner or normalization. The ones whose names don't say what
+//! they pin:
 //!
-//! ## Permitted normalizations (recorded here, per [`docs/adr/lossless-transit.md`])
+//! - `dogstatsd-event-all-fields`, `service-check-all-fields`: every optional field, already in
+//!   canonical order, so they stay [`SAME_AS_INPUT`] under normalization (9).
+//! - `event-text-with-pipe-and-escaped-newline`: `TEXT` also contains a `:`.
+//! - `service-check-no-message`: every optional field except `m:`.
+//! - `event-multibyte-title-lengths`: `_e{TITLE_LEN,...}` counts bytes, not chars.
+//! - `event-title-contains-pipe`: the length prefix, not a `|` scan, delimits the title.
+//! - `event-text-trailing-space`, `service-check-message-trailing-space`: the last byte of `TEXT`
+//!   or of an `m:` message is a space followed by the `.in` file's own trailing `\n`;
+//!   `decode_into` must not trim it.
 //!
-//! `statsd_out` is not byte-identical to its input in general -- these are the specific,
-//! documented ways it differs, each with the reason it's permitted rather than a lossiness bug:
+//! ## Permitted normalizations (per `docs/adr/lossless-transit.md`)
 //!
-//! 1. **Counter sample-rate folding.** `hits:1|c|@0.1` decodes to `Counter(10.0)` (the value
-//!    already extrapolated by `1 / sample_rate` at decode time -- `logit_inputs::statsd` has
-//!    always done this for `c`) and relays as `hits:10|c`, with no `@rate` on the way out: a
-//!    statsd counter's wire form has no concept of "this was extrapolated," so there is nothing
-//!    left to preserve. Exercised by `sampled-counter-rate-folded`. **This is not folding for a
-//!    timer/histogram/distribution** -- a `Samples` record's `sample_rate` is real, un-applied
-//!    information (`logit_outputs::statsd`'s module doc, "Sample rate: never for a counter, real
-//!    for `Samples`") and survives the relay untouched; see (2) and (6) below.
-//! 2. **`@1.0` (or any sample rate that normalizes to exactly `1.0`) is omitted.** `1.0` is the
-//!    grammar's own default, so writing it back adds nothing; `render_samples` only emits `@rate`
-//!    when `rate != 1.0`. Exercised by `explicit-rate-one-omitted`.
-//! 3. **Tags are emitted in `AttrMap` order.** `AttrMap` iterates in sorted-`Symbol` (global
-//!    intern) order, not lexicographic or wire order in general -- but for two tag keys neither of
-//!    which was ever interned before this decode, `Symbol` assignment happens in the order each is
-//!    first seen, which for one `#k1:v1,k2:v2` segment is simply wire order. So a line whose tag
-//!    keys are novel to the process relays with its tags in the same relative order they arrived
-//!    in, even when that order isn't alphabetical -- exercised (deliberately using
-//!    non-alphabetical key names) by `multi-tag-preserves-wire-order`.
-//! 4. **Number formatting (`push_float`).** A value's canonical rendering is `f64`'s `Display`
-//!    (`write!("{v}")`), not whatever the origin wrote: `0.500` decodes and relays as `0.5`, since
-//!    only the numeric value round-trips, not its textual spelling. Exercised by
+//! Where `statsd_out`'s output differs from its input, and why each is permitted rather than a
+//! loss. `crates/logit-outputs/src/statsd.rs`'s module doc explains the encoder side of each.
+//!
+//! 1. **Counter sample-rate folding.** `hits:1|c|@0.1` decodes to `Counter(10.0)` (extrapolated
+//!    by `1 / sample_rate` at decode) and relays as `hits:10|c`: a counter's wire form can't say
+//!    "this was extrapolated". Not applied to a `Samples` record, whose `sample_rate` is un-applied
+//!    information and survives the relay (`logit_outputs::statsd`'s "Sample rate: never for a
+//!    counter, real for `Samples`"). Fixture: `sampled-counter-rate-folded`.
+//! 2. **A sample rate of `1.0` is omitted**, since it's the grammar's default. Fixture:
+//!    `explicit-rate-one-omitted`.
+//! 3. **Tags are emitted in `AttrMap` order**, which is `Symbol` (intern) order. For tag keys the
+//!    process has never interned before, that is first-seen order, so one `#k1:v1,k2:v2` segment
+//!    relays in wire order even when it isn't alphabetical. Fixture:
+//!    `multi-tag-preserves-wire-order` (its key names are non-alphabetical for this reason).
+//! 4. **Numbers render with `f64`'s `Display`** (`push_float`): `0.500` relays as `0.5`. Fixture:
 //!    `number-formatting-trailing-zeros`.
-//! 5. **Sanitizer substitutions for injection safety.** A metric name or tag key containing any of
-//!    `: | @ # , \n \r \0`, another ASCII control character, or whitespace is substituted with
-//!    `_`; a tag value forbids the same set except `:` (deliberately preserved, since only a tag's
-//!    first colon is ever significant); a `SetMembers` member forbids only `:`, `|`, and control
-//!    characters -- its own, narrower rule, since `@`/`#`/`,`/whitespace are none of them
-//!    delimiter-sensitive in a member's own wire position and must survive untouched or distinct
-//!    members would collide. **Most of this is reachable from a real decode, not hypothetical**:
-//!    `statsd_in`'s decoder only trims a line's leading/trailing whitespace
-//!    (`line.trim_end_matches('\r').trim()`) -- it never strips or rejects an embedded delimiter
-//!    byte mid-line, so an embedded space, `@`, `#`, or `,` inside a name survives decode unchanged
-//!    (`a#b:1|c` decodes to the name `"a#b"`, not an error), and the same bytes inside a member
-//!    survive decode *and* this sink's own encode, unsubstituted. Exercised by
-//!    `sanitizer-name-hash` (`a#b:1|c` -> `a_b:1|c`), `sanitizer-tag-value-at`
-//!    (`x:1|c|#k:a@b` -> `x:1|c|#k:a_b`), and `sanitizer-member-space`
-//!    (`users:a b|s` -> `users:a b|s`, [`SAME_AS_INPUT`]) for the preserved case. The one byte that
-//!    genuinely can't reach a member through a real decode is `|` itself -- statsd's own grammar
-//!    treats it as a new segment before the decoder ever gets far enough to hand it to a member --
-//!    so that case alone is still exercised against a hand-built `EventBatch` rather than a decoded
-//!    fixture, by `sanitizer_substitution_in_a_set_member_is_sanitized_and_counted` below.
-//! 6. **`format: statsd` (the classic dialect) drops what only DogStatsD's grammar can express.**
-//!    Selected by the operator on the sink, so this is the "sink-configured dialect change"
-//!    normalization by name, not loss:
-//!    - The `|#k:v,...` tag segment is omitted entirely (never an empty `|#`).
-//!    - A `Samples` record's multi-value line (`name:v1:v2:v3|ms`) splits into one `name:v|ms`
-//!      line per value -- the "splitting a multi-value statsd line ... into several lines"
-//!      normalization, applied to the encode side here (the decode side already applies it to `s`
-//!      lines the other way, see `SetMembers` below). `sample_rate`, when not `1.0`, is repeated
-//!      on every split line.
-//!    - A timer's own wire-type letter collapses from `h`/`d` to the classic grammar's `ms`.
-//!    - `|c:<container-id>`/`|T<timestamp>` have no plain-statsd equivalent at all and are dropped.
-//!    - A DogStatsD event or service check has no `_e`/`_sc` wire form at all under the classic
-//!      grammar, so the whole event is dropped -- not normalized into anything -- and counted
-//!      `EncodeStats::dropped_dialect_events`.
+//! 5. **Sanitizer substitutions.** A metric name or tag key containing `: | @ # , \n \r \0`,
+//!    another ASCII control character, or whitespace gets `_` in its place. A tag value forbids the
+//!    same set except `:` (only a tag's first colon is significant). A `SetMembers` member forbids
+//!    only `:`, `|`, and control characters: `@`/`#`/`,`/whitespace aren't delimiters in a member's
+//!    position, and substituting them would make distinct members collide. Most of this is
+//!    reachable from a real decode: `statsd_in` only trims a line's leading and trailing
+//!    whitespace, so `a#b:1|c` decodes to the name `"a#b"`. Fixtures: `sanitizer-name-hash`
+//!    (`a#b:1|c` -> `a_b:1|c`), `sanitizer-tag-value-at` (`x:1|c|#k:a@b` -> `x:1|c|#k:a_b`), and
+//!    `sanitizer-member-space` (`users:a b|s`, [`SAME_AS_INPUT`]). A `|` can't reach a member
+//!    through a decode, since the grammar splits a segment on it first, so
+//!    `sanitizer_substitution_in_a_set_member_is_sanitized_and_counted` builds that batch by hand.
+//! 6. **`format: statsd` drops what only DogStatsD can express**, the "sink-configured dialect
+//!    change" normalization:
+//!    - The `|#k:v,...` tag segment is omitted (never an empty `|#`).
+//!    - A multi-value `Samples` line (`name:v1:v2:v3|ms`) splits into one `name:v|ms` line per
+//!      value, repeating a non-`1.0` `sample_rate` on each.
+//!    - A timer's `h`/`d` type letter becomes `ms`.
+//!    - `|c:<container-id>` and `|T<timestamp>` are dropped.
+//!    - A DogStatsD event or service check has no classic form, so the whole event is dropped and
+//!      counted in `EncodeStats::dropped_dialect_events`.
 //!
-//!    Exercised by `statsd-dialect-multi-value-timer-split`, `statsd-dialect-h-normalizes-to-ms`,
-//!    `statsd-dialect-drops-container-and-timestamp`, `statsd-dialect-drops-tags`, and
-//!    `events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd` (the last
-//!    one bypasses the UDP harness, calling [`logit_outputs::statsd::StatsdEncoder::encode_into`]
-//!    directly, since a wholly-dropped batch never sends a datagram for `capture_only` to receive
-//!    -- see that test). These are **one-way lossy by design** (the whole point of (6) is that the
-//!    classic dialect can't express what was dropped), so unlike every other case in this file they
-//!    are asserted against their `.expected` wire bytes (or, for the events/service-checks case,
-//!    the returned [`logit_outputs::statsd::EncodeStats`]) only -- no decoded-batch equality claim
-//!    is made for them.
-//! 7. **`SetMembers` always splits one member per line, in both dialects.** The classic grammar has
-//!    no multi-value extension for sets the way DogStatsD's timers get, so `statsd_in`'s own
-//!    multi-value `s` decode (`name:m1:m2|s`, one event) never has a matching multi-value encode:
-//!    `statsd_out` always emits one `name:<member>|s` line per member. This is the "splitting a
-//!    multi-value statsd line ... into several lines" normalization applied on the *encode* side
-//!    (`(6)`'s second bullet is the same normalization on decode's own multi-value `ms`/`h`/`d`
-//!    form). Exercised by `dogstatsd-set` (single member, so trivially one line) and by the
-//!    `statsd_in -> aggregate -> statsd_out` test below (two distinct members, two lines).
-//! 8. **A repeated tag key's exact-duplicate tokens dedupe.** `#team:a,team:b` is two live tags
-//!    now -- `statsd_in`'s `insert_tags` folds a repeated key into a `Value::Array` in wire order
-//!    (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section) and `statsd_out` expands it
-//!    back to one tag per element, so that case is byte-for-byte, not a normalization (see
-//!    `repeated-tag-key-round-trips` below). What *does* still collapse is an **exact** duplicate
-//!    token, `#team:a,team:a` -> `#team:a` (and a bare `#urgent,urgent` -> `#urgent`) -- the
-//!    Datadog agent's own dedupe rule, applied at decode so a `Value::Array` is never one element
-//!    long. Exercised by `repeated-tag-exact-duplicate-deduped` (`x:1|c|#team:a,team:a` ->
-//!    `x:1|c|#team:a`) and `bare-tag-exact-duplicate-deduped` (`x:1|c|#urgent,urgent` ->
-//!    `x:1|c|#urgent`).
-//! 9. **A DogStatsD event/service check's fields re-emit in canonical order, regardless of the
-//!    order they arrived in on the wire, and an event `TEXT`'s `\n` escape re-emits the same way it
-//!    decoded.** `_e{tlen,xlen}:title|text` canonical order is `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/
-//!    `c:`; `_sc|name|status` canonical order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:` always last,
-//!    since it consumes the rest of the line on decode). Nothing else about either shape
-//!    normalizes: a title/text/name/host/aggregation-key/source-type/message survives verbatim
-//!    (including an embedded `|`, which the byte-length prefix -- not a `|` scan -- delimits, so it
-//!    never needs sanitizing out of a title/text at all), and a multi-byte UTF-8 title's `TITLE_LEN`
-//!    is its byte length, not its char count. Exercised by `event-fields-reordered-canonicalized`
-//!    (order only) and, for the "nothing else changes" half,
-//!    `dogstatsd-event-all-fields`/`service-check-all-fields` (every optional field, already
-//!    canonical -- [`SAME_AS_INPUT`]), `event-text-with-pipe-and-escaped-newline`,
-//!    `event-multibyte-title-lengths`, and `event-title-contains-pipe`.
+//!    Fixtures: the `statsd-dialect-*` cases, plus
+//!    `events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd`, which
+//!    calls [`logit_outputs::statsd::StatsdEncoder::encode_into`] directly because a wholly-dropped
+//!    batch sends no datagram to capture.
+//! 7. **`SetMembers` splits one member per line in both dialects.** The classic grammar has no
+//!    multi-value set form, so `statsd_in`'s `name:m1:m2|s` decode always relays as one
+//!    `name:<member>|s` line per member. Covered by `dogstatsd-set` and by
+//!    `statsd_in_aggregate_statsd_out_relay_is_exact` (two members, two lines).
+//! 8. **An exact duplicate tag token dedupes at decode**: `#team:a,team:a` -> `#team:a`, and
+//!    `#urgent,urgent` -> `#urgent` (the Datadog agent's rule, so a `Value::Array` is never one
+//!    element long). A repeated key with distinct values is not a normalization: `insert_tags`
+//!    folds it into a `Value::Array` in wire order and `statsd_out` expands it back
+//!    (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags"). Fixtures:
+//!    `repeated-tag-exact-duplicate-deduped`, `bare-tag-exact-duplicate-deduped`.
+//! 9. **DogStatsD event and service check fields re-emit in canonical order.** `_e` order is
+//!    `d:`/`h:`/`p:`/`t:`/`k:`/`s:`/`#tags`/`c:`; `_sc` order is `d:`/`h:`/`#tags`/`c:`/`m:` (`m:`
+//!    last, since it consumes the rest of the line on decode). Nothing else changes: titles, text,
+//!    names, hosts, aggregation keys, source types, and messages survive verbatim, embedded `|`
+//!    and the `TEXT` `\n` escape included. Fixture: `event-fields-reordered-canonicalized`.
 //!
-//! Everything else -- the raw kinds a lossless relay must carry (`Samples`/`SetMembers`), `|c:`/
-//! `|T` round-tripping under DogStatsD, relative-gauge deltas, the negative-absolute-gauge
-//! two-line idiom, and a DogStatsD event/service check with no reordering to canonicalize -- is not
-//! a normalization at all: it relays byte-for-byte (modulo (3)/(4)/(9) above) because nothing about
-//! it needs to change.
+//! Everything else relays byte for byte, modulo (3), (4), and (9): the raw `Samples`/`SetMembers`
+//! kinds, `|c:`/`|T` under DogStatsD, relative-gauge deltas, and the negative-absolute-gauge
+//! two-line idiom.
 //!
-//! `mod tcp`/`mod tls` below add no new entry to this list -- `transport: tcp` (and TLS on top of
-//! it) changes framing and, for TLS, transport security, never message content. The one framing
-//! difference is mechanical: UDP newline-*joins* a batch's lines into one datagram, TCP
-//! newline-*terminates* each of them, so the captured TCP bytes are the UDP bytes plus one final
-//! `\n` (`mod tcp::strip_lf_framing`). Every normalization above still applies unchanged, since
-//! both transports share the same `StatsdEncoder`/`StatsdDecoder`.
+//! `mod tcp` and `mod tls` add no entry to this list: both transports share
+//! `StatsdEncoder`/`StatsdDecoder`, and only the framing differs. UDP newline-*joins* a batch's
+//! lines into one datagram; TCP newline-*terminates* each line, so the TCP capture is the UDP bytes
+//! plus one final `\n` (`mod tcp::strip_lf_framing`).
 
 use bytes::Bytes;
 use logit_core::{Event, EventBatch, Value};
@@ -156,8 +111,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-/// The `.expected` marker meaning "byte-identical to the `.in` file" -- see this file's module
-/// doc, mirroring `syslog_round_trip.rs`'s identical constant.
+/// The `.expected` marker meaning "byte-identical to the `.in` file", shared with the other
+/// round-trip corpora.
 const SAME_AS_INPUT: &[u8] = b"== SAME AS INPUT ==";
 
 fn fixtures_dir() -> PathBuf {
@@ -173,7 +128,7 @@ fn read_fixture(name: &str, ext: &str) -> Vec<u8> {
 }
 
 /// The bytes a case's sink output must equal: either the literal `.expected` file, or (when that
-/// file is exactly [`SAME_AS_INPUT`]) the case's own `.in` bytes.
+/// file is [`SAME_AS_INPUT`]) the case's own `.in` bytes.
 fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
     let expected = read_fixture(name, "expected");
     if expected.as_slice() == SAME_AS_INPUT {
@@ -183,15 +138,9 @@ fn expected_bytes(name: &str, input: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Zeroes an event's receipt-time `timestamp` **unless** it carries a `statsd.timestamp ==
-/// Value::U64(_)` carrier -- the raw wire seconds `logit_inputs::statsd` stamps when
-/// `Event::timestamp` came from a wire `|T<secs>` segment rather than receipt time (that module's
-/// own doc comment). The two independent decodes a round-trip test compares (the direct one, and
-/// the one a live `statsd_in` produces after a real send) can only legitimately differ in
-/// *receipt*-time timestamps -- this process's wall clock at the moment each decode ran -- never
-/// in a wire-supplied one, which is the same concrete instant either way. Mirrors
-/// `syslog_round_trip.rs`'s `normalize_receipt_time`, narrowed to the one case statsd actually has
-/// where "timestamp" isn't always receipt-time-dependent.
+/// Zeroes each event's receipt-time `timestamp`, the one field two independent decodes of the
+/// same bytes legitimately disagree on. An event with a `statsd.timestamp` `Value::U64` carrier
+/// keeps its timestamp: that came from a wire `|T<secs>` segment, so both decodes agree on it.
 fn normalize_receipt_time(batch: &mut EventBatch) {
     for event in &mut batch.events {
         let has_wire_timestamp =
@@ -209,11 +158,10 @@ fn direct_batch(raw: &[u8]) -> EventBatch {
     batch
 }
 
-/// Real UDP harness: a plain "byte capture" socket (for the raw-datagram half of every
-/// byte-for-byte assertion) alongside a real, bound [`StatsdInput`] draining into a [`Fanout`]
-/// channel (for the decoded-`EventBatch` half). Mirrors `syslog_round_trip.rs`'s `Harness`
-/// exactly: `bind()`-then-`local_addr()`-then-spawn, no bind-drop race and no sleep-based
-/// readiness guess.
+/// A plain UDP capture socket (the raw-bytes half of each assertion) beside a bound, live
+/// [`StatsdInput`] draining into a [`Fanout`] channel (the decoded-`EventBatch` half). The input
+/// is bound, then `local_addr()` read, then spawned, so there is no bind-drop race and no
+/// sleep-based readiness guess.
 struct Harness {
     capture: UdpSocket,
     capture_addr: SocketAddr,
@@ -239,10 +187,9 @@ impl Harness {
         Self { capture, capture_addr, input_addr, rx }
     }
 
-    /// Sends `batch` through a fresh [`StatsdOutput`] built from `encoder()` -- once at the raw
-    /// capture socket, once at the live `statsd_in` -- and returns the raw datagram bytes
-    /// alongside the [`EventBatch`] the real input decoded from them (receipt-time `timestamp`
-    /// fields already normalized).
+    /// Sends `batch` once to the capture socket and once to the live `statsd_in`, each through a
+    /// fresh [`StatsdOutput`], and returns the captured bytes and the receipt-time-normalized
+    /// decode.
     async fn round_trip(
         &mut self,
         batch: &EventBatch,
@@ -262,10 +209,8 @@ impl Harness {
         (captured, decoded)
     }
 
-    /// Sends `batch` through a fresh [`StatsdOutput`] at the capture socket only, returning the raw
-    /// datagram bytes -- no live-decode leg. Used by [`Self::round_trip`], and directly by the
-    /// statsd-dialect normalization tests (module doc (6)) and the aggregate-relay test below,
-    /// neither of which claims a lossless decode round trip.
+    /// Sends `batch` to the capture socket only and returns the datagram, for the tests that make
+    /// no decode-equality claim.
     async fn capture_only(&mut self, batch: &EventBatch, encoder: StatsdEncoder) -> Vec<u8> {
         let mut to_capture =
             StatsdOutput::udp(self.capture_addr.to_string()).unwrap().with_encoder(encoder);
@@ -280,9 +225,8 @@ impl Harness {
         buf
     }
 
-    /// Sends `raw` bytes directly to the live `statsd_in` listener, bypassing `StatsdOutput`
-    /// entirely -- for the aggregate-relay test, which needs a genuinely UDP-decoded `EventBatch`
-    /// to feed `Aggregator::process`, not one this harness's own encoder has already round-tripped.
+    /// Sends `raw` straight to the live `statsd_in`, bypassing `StatsdOutput`, so the aggregate
+    /// tests start from a UDP decode that no encoder has touched.
     async fn send_raw_and_decode(&mut self, raw: &[u8]) -> EventBatch {
         let sender =
             UdpSocket::bind("127.0.0.1:0").await.expect("binding an ephemeral sender socket");
@@ -295,11 +239,8 @@ impl Harness {
     }
 }
 
-/// One deterministic byte-for-byte case: a fixture's own decode round-trips through a live
-/// `statsd_in` unchanged (whole-`EventBatch` equality), and the raw datagram the far end actually
-/// received equals the case's `.expected` bytes (module doc's normalization list covers every
-/// place the two legitimately differ). `encoder` is a factory, not a value, so it can be called
-/// twice (once per socket) without moving anything shared.
+/// Asserts one fixture's wire bytes equal its `.expected` bytes and its live decode equals its
+/// direct decode. `encoder` is a factory because each of the two sends needs its own encoder.
 async fn assert_byte_for_byte(
     harness: &mut Harness,
     fixture: &str,
@@ -369,9 +310,8 @@ async fn hand_written_dogstatsd_fixtures_round_trip_byte_for_byte() {
     }
 }
 
-/// The `.expected`-differs-from-`.in` normalizations named in the module doc: counter rate
-/// folding, `@1.0` omission, and canonical number formatting. Each still round-trips through a
-/// full decode-equality check -- none of these is lossy, just re-spelled.
+/// Normalizations (1), (2), (4), and (9): the wire bytes change, but the decode still round-trips
+/// equal, since each only re-spells the same information.
 #[tokio::test]
 async fn explicit_normalizations_round_trip_byte_for_byte() {
     let mut harness = Harness::new().await;
@@ -386,11 +326,8 @@ async fn explicit_normalizations_round_trip_byte_for_byte() {
     }
 }
 
-/// Module doc normalization (5): sanitizer substitutions reachable from a real decode -- a name
-/// containing `#` and a tag value containing `@` both genuinely change (the substituted byte is
-/// gone for good, unlike normalizations (1)-(4) which only re-spell the same information), so
-/// these two are asserted against their `.expected` wire bytes only, the same way the one-way-lossy
-/// dialect cases (6) are -- no decoded-batch equality claim is made for them.
+/// Normalization (5), reachable from a real decode. The substituted byte is gone for good, so
+/// only the wire bytes are asserted.
 #[tokio::test]
 async fn sanitizer_substitutions_reachable_from_a_real_decode_produce_the_expected_wire_bytes() {
     let mut harness = Harness::new().await;
@@ -406,9 +343,8 @@ async fn sanitizer_substitutions_reachable_from_a_real_decode_produce_the_expect
     }
 }
 
-/// The contrasting case: a member's own space survives untouched rather than being substituted
-/// (unlike the name/tag-key rule above), so this one *is* a full byte-for-byte, decode-equality
-/// round trip -- nothing about the data changed.
+/// Normalization (5)'s contrasting case: a space in a set member isn't substituted, so this is a
+/// full byte-for-byte, decode-equality round trip.
 #[tokio::test]
 async fn a_member_with_a_space_round_trips_byte_for_byte() {
     let mut harness = Harness::new().await;
@@ -418,11 +354,10 @@ async fn a_member_with_a_space_round_trips_byte_for_byte() {
     .await;
 }
 
-// ---- Multi-value DogStatsD tags (module doc (8), W9) ----------------------------------------------
+// ---- Multi-value DogStatsD tags (normalization (8)) ---------------------------------------------
 
-/// A repeated tag key is byte-for-byte, not a normalization: `insert_tags` folds it into a
-/// `Value::Array` in wire order and `statsd_out` expands it back to one tag per element (module
-/// doc (8)).
+/// A repeated tag key with distinct values relays byte for byte, through a `Value::Array` in wire
+/// order.
 #[tokio::test]
 async fn a_repeated_tag_key_round_trips_byte_for_byte() {
     let mut harness = Harness::new().await;
@@ -454,9 +389,7 @@ async fn a_bare_and_valued_tag_sharing_a_key_round_trips_byte_for_byte() {
     .await;
 }
 
-/// The same fold applies to a DogStatsD event line's `#` field -- `insert_tags` backs every `#`
-/// field alike, metric line or event line (`crates/logit-inputs/src/statsd.rs`'s doc at the
-/// `insert_tags` call sites).
+/// The same fold applies to a DogStatsD event line's `#` field; `insert_tags` backs both.
 #[tokio::test]
 async fn a_repeated_tag_key_on_an_event_line_round_trips_byte_for_byte() {
     let mut harness = Harness::new().await;
@@ -466,9 +399,8 @@ async fn a_repeated_tag_key_on_an_event_line_round_trips_byte_for_byte() {
     .await;
 }
 
-/// Module doc (8): an *exact* duplicate token dedupes at decode -- the Datadog agent's own rule --
-/// so `#team:a,team:a` never becomes a one-element `Array`, it stays `Str("a")` and relays as
-/// `#team:a`.
+/// Normalization (8): `#team:a,team:a` decodes to `Str("a")`, never a one-element `Array`, and
+/// relays as `#team:a`.
 #[tokio::test]
 async fn an_exact_duplicate_tag_value_dedupes_to_a_single_tag() {
     let mut harness = Harness::new().await;
@@ -489,10 +421,8 @@ async fn an_exact_duplicate_bare_tag_dedupes_to_a_single_tag() {
     .await;
 }
 
-/// `statsd_in -> aggregate -> statsd_out`: two lines carrying the same multi-valued tag are the
-/// same series (`aggregate`'s `SeriesKey` recurses element-wise into an `Array`, so equal arrays
-/// key equal), so they merge into one flushed event whose tag bytes survive the round trip
-/// unchanged -- proof that a multi-valued tag is one series, not two.
+/// `statsd_in -> aggregate -> statsd_out`: two lines with the same multi-valued tag are one
+/// series (`SeriesKey` compares an `Array` element-wise), so they merge and the tag bytes survive.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_preserves_a_multi_valued_tag() {
     let mut harness = Harness::new().await;
@@ -533,13 +463,9 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_a_multi_valued_tag() {
     );
 }
 
-/// `influxdb_out`: a repeated tag key reaches this sink as a `Value::Array` too, and line
-/// protocol's tag set is a map, not a multiset, so `render_tag_suffix` renders only the **last**
-/// representable element and counts it (`crates/logit-outputs/src/influxdb.rs`'s
-/// `render_tag_suffix` doc, "Multi-value tags: last-value-wins, counted"). Decodes with the real
-/// statsd decoder (not a hand-built `EventBatch`) and encodes with `InfluxLineEncoder` directly --
-/// there is no influx round-trip fixture file in this crate's `tests/`, so this stays a
-/// unit-style case in the file that already owns the real-decoder path.
+/// `influxdb_out` renders only the last element of a repeated tag key and counts it: line
+/// protocol's tag set is a map (`render_tag_suffix`'s "Multi-value tags: last-value-wins,
+/// counted"). It lives here because this file already decodes real statsd lines.
 #[test]
 fn influxdb_out_renders_the_last_element_of_a_multi_valued_tag_and_counts_it() {
     let batch = direct_batch(b"x:1|c|#team:a,team:b");
@@ -555,11 +481,9 @@ fn influxdb_out_renders_the_last_element_of_a_multi_valued_tag_and_counts_it() {
 
 // ---- Relative gauges (opt-in `relative_gauges: true`) -------------------------------------------
 
-/// The documented negative-absolute-gauge idiom (`logit_outputs::statsd`'s "Negative absolute
-/// gauges" section): `Gauge(-5.0)` relays as `name:0|g` immediately followed by `name:-5|g`, one
-/// indivisible `MessageBuf` entry so the two lines can never be split across datagrams. Needs
-/// `relative_gauges: true` on the round-trip encoder -- without it, the second line's `GaugeDelta`
-/// would be dropped as unresolved, which isn't what this fixture tests.
+/// The `temp:0|g` then `temp:-5|g` idiom for a negative gauge (`logit_outputs::statsd`'s
+/// "Negative absolute gauges"). Needs `relative_gauges: true`: the second line decodes as a
+/// `GaugeDelta`, which the encoder otherwise drops as unresolved.
 #[tokio::test]
 async fn negative_absolute_gauge_idiom_round_trips_with_relative_gauges_enabled() {
     let mut harness = Harness::new().await;
@@ -569,8 +493,8 @@ async fn negative_absolute_gauge_idiom_round_trips_with_relative_gauges_enabled(
     .await;
 }
 
-/// `conns:+1|g` decodes to an unresolved `GaugeDelta(1.0)`; with `relative_gauges: true` it relays
-/// natively (statsd is the one protocol with real wire syntax for a relative adjustment).
+/// `conns:+1|g` decodes to an unresolved `GaugeDelta(1.0)` and, with `relative_gauges: true`,
+/// relays natively.
 #[tokio::test]
 async fn relative_gauge_delta_round_trips_with_relative_gauges_enabled() {
     let mut harness = Harness::new().await;
@@ -580,10 +504,9 @@ async fn relative_gauge_delta_round_trips_with_relative_gauges_enabled() {
     .await;
 }
 
-// ---- `format: statsd` dialect normalizations (module doc (6)), one-way lossy by design ----------
+// ---- `format: statsd` dialect normalizations (normalization (6)), one-way lossy ----------------
 
-/// Asserts a dialect-changing fixture's captured wire bytes only -- no decoded-equality claim,
-/// since `format: statsd` genuinely can't express what it drops (module doc (6)).
+/// Asserts the wire bytes only: `format: statsd` can't express what it drops.
 async fn assert_dialect_output(harness: &mut Harness, fixture: &str) {
     let raw = read_fixture(fixture, "in");
     let batch = direct_batch(&raw);
@@ -619,15 +542,9 @@ async fn statsd_dialect_drops_the_tag_segment_entirely() {
     assert_dialect_output(&mut harness, "statsd-dialect-drops-tags").await;
 }
 
-/// Module doc (6)'s events/service-checks bullet: neither shape has a `format: statsd` wire form
-/// at all, so the whole event is dropped -- not normalized -- and counted
-/// `EncodeStats::dropped_dialect_events`. This can't go through `Harness`/`assert_dialect_output`
-/// the way every other dialect case above does: a batch that drops to *no* lines never sends a
-/// datagram at all (`StatsdOutput::send` returns early on an empty `MessageBuf`), so
-/// `capture_only`'s `recv_from` would simply time out waiting for one. `StatsdEncoder::encode_into`
-/// is called directly instead -- the same pure, socket-free path `logit_outputs::statsd`'s own unit
-/// tests use -- so both halves of the drop are observable: the rendered `MessageBuf` is empty, and
-/// the returned `EncodeStats` counts it.
+/// Normalization (6): an event or service check is dropped and counted under `format: statsd`.
+/// Calls `StatsdEncoder::encode_into` directly: `StatsdOutput::send` returns early on an empty
+/// `MessageBuf`, so there'd be no datagram for `capture_only` to receive.
 #[tokio::test]
 async fn events_and_service_checks_produce_no_output_and_are_counted_under_plain_statsd() {
     for fixture in ["dogstatsd-event", "dogstatsd-service-check"] {
@@ -644,13 +561,10 @@ async fn events_and_service_checks_produce_no_output_and_are_counted_under_plain
     }
 }
 
-// ---- Sanitizer substitution (module doc (5)) -----------------------------------------------------
+// ---- Sanitizer substitution (normalization (5)) -------------------------------------------------
 
-/// A `SetMembers` member containing a forbidden byte (`|`, here) is substituted with `_` and
-/// counted -- real behavior, but unreachable from a decoded statsd fixture (see module doc (5)),
-/// so this builds the `EventBatch` directly rather than decoding one. Still goes over the real
-/// capture socket and the real live `statsd_in`, so the substituted line is confirmed to actually
-/// decode cleanly on the far end, not just render plausibly.
+/// A `|` in a set member becomes `_`, and the result decodes cleanly on the live `statsd_in`. The
+/// batch is hand-built because no decode can put a `|` in a member.
 #[tokio::test]
 async fn sanitizer_substitution_in_a_set_member_is_sanitized_and_counted() {
     let event = Event::metric(
@@ -679,24 +593,12 @@ async fn sanitizer_substitution_in_a_set_member_is_sanitized_and_counted() {
     }
 }
 
-// ---- `statsd_in -> aggregate -> statsd_out`, exact -----------------------------------------------
+// ---- `statsd_in -> aggregate -> statsd_out`, exact ----------------------------------------------
 
-/// The plan's explicit aggregate-relay requirement: three timer lines and two set lines of the
-/// same two series, decoded over real UDP by a live `statsd_in`, absorbed by an `Aggregator`
-/// configured to retain raw shapes (`distributions: samples`, `sets: members` --
-/// `docs/adr/lossless-transit.md`'s "summarization is opt-in and named"), flushed once, and
-/// re-encoded -- the sink emits one multi-value `ms` line carrying every timer value (sample rate
-/// preserved) and one `|s` line per distinct set member (module doc (7)). Every metric here must
-/// be absorbed (none passed through), and after one flush nothing survives to a second one --
-/// `distributions: samples`/`sets: members` accumulators are always drained, unlike a retained
-/// gauge series.
-///
-/// The two series (a `Samples` and a `SetMembers`) sit in the same `Aggregator`'s
-/// `HashMap<SeriesKey, SeriesState>`, whose iteration order across *distinct* series is not
-/// something this test may assume (ordinary `std::collections::HashMap`, randomized per process) --
-/// only the *values within* one series are order-preserving (a `SmallVec`/`Vec`, not a map). The
-/// assertion below is exact per line (module doc's "assert the exact lines") but order-independent
-/// across the two series.
+/// An `aggregate` that retains raw shapes (`distributions: samples`, `sets: members`) relays
+/// losslessly: every timer value on one multi-value `ms` line, and one `|s` line per member
+/// (normalization (7)). The lines are compared sorted, because the `Aggregator`'s series live in
+/// a `std::collections::HashMap` whose iteration order is randomized per process.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
     let mut harness = Harness::new().await;
@@ -733,8 +635,7 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
     };
     assert_eq!(out_batch.events.len(), 2, "one flushed event per series");
 
-    // A second flush of the same (now-drained) window emits nothing -- `distributions: samples`/
-    // `sets: members` accumulators are tumbling, same as their sketch/estimate counterparts.
+    // Raw-shape accumulators are tumbling, like their sketch/estimate counterparts.
     assert!(aggregator.flush(1_700_000_010_000_000_000).is_empty());
 
     let captured = harness.capture_only(&out_batch, StatsdEncoder::new(Format::DogStatsd)).await;
@@ -751,14 +652,11 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact() {
     );
 }
 
-// ---- `|T` carrier survives `aggregate`'s flush-time rebuild --------------------------------------
+// ---- `|T` carrier survives `aggregate`'s flush-time rebuild -------------------------------------
 
-/// The `|T` carrier round-trips through `aggregate` even though `aggregate` rebuilds
-/// `Event::timestamp` to the flush clock at flush time: `statsd.timestamp` rides on the series key
-/// like any other attribute, so the sink reads the carrier's own `Value::U64`, never the
-/// flush-time `Event::timestamp` -- this is the regression for the bug the carrier fix closes
-/// (a `Value::Bool(true)` marker plus `event.timestamp` would have re-emitted the *flush* second
-/// here, not the original wire value).
+/// The `|T` value survives `aggregate`, which sets `Event::timestamp` to the flush clock: the
+/// sink must read the `statsd.timestamp` carrier's `Value::U64`, which rides on the series key,
+/// never `Event::timestamp`.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
     let mut harness = Harness::new().await;
@@ -776,9 +674,8 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
     }
     assert!(forwarded.is_empty(), "a delta Counter is always absorbed by aggregate");
 
-    // Deliberately a different second from the wire value -- if the sink ever read
-    // `Event::timestamp` instead of the `statsd.timestamp` carrier, this would catch it emitting
-    // the flush second (1_800_000_000) instead of the wire one (1_700_000_000).
+    // A different second from the wire value, so a sink reading `Event::timestamp` would emit
+    // 1_800_000_000 instead of 1_700_000_000.
     let mut flushed = aggregator.flush(1_800_000_000_000_000_000);
     assert_eq!(flushed.len(), 1, "one (resource, scope) group");
     let (flush_resource, flush_scope, events) = flushed.remove(0);
@@ -793,9 +690,8 @@ async fn statsd_in_aggregate_statsd_out_relay_preserves_the_wire_timestamp() {
     assert_eq!(std::str::from_utf8(&captured).expect("ascii output"), "hits:1|c|T1700000000");
 }
 
-/// Two lines differing only in their `|T` value are distinct series by construction (the carrier
-/// rides on the series key, which is the event's whole attribute map), so they flush as two
-/// separate lines, never merged into one counter.
+/// Two lines differing only in their `|T` value are distinct series, since the carrier is part
+/// of the series key, so they flush as two lines.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_distinct_series() {
     let mut harness = Harness::new().await;
@@ -832,16 +728,11 @@ async fn statsd_in_aggregate_statsd_out_relay_keeps_distinct_timestamps_as_disti
     assert_eq!(lines, expected, "both |T values must survive the flush as separate lines");
 }
 
-// ---- `statsd_in -> aggregate -> statsd_out`, a service check -------------------------------------
+// ---- `statsd_in -> aggregate -> statsd_out`, a service check ------------------------------------
 
-/// A service check is a `MetricKind::Gauge`, so `aggregate` absorbs it exactly like an ordinary
-/// gauge ("last write wins" on the series' latest source timestamp,
-/// `docs/adr/aggregation-window-semantics.md`) rather than passing it through unmerged -- there is
-/// only one write here, so the flushed value is unchanged, but the point of this test is that the
-/// flush round trip doesn't lose any of the `statsd.service_check.*` carriers (or `statsd.timestamp`
-/// / `statsd.container_id`) riding on the series key alongside the gauge value: `_sc|name|status`
-/// plus its `d:`/`m:` fields survive a real `aggregate` window exactly, the same guarantee the two
-/// `|T`-carrier tests above pin for an ordinary counter.
+/// A service check is a `MetricKind::Gauge`, so `aggregate` absorbs it. Its
+/// `statsd.service_check.*` carriers ride on the series key, so `_sc|name|status` and its
+/// `d:`/`m:` fields survive the window unchanged.
 #[tokio::test]
 async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
     let mut harness = Harness::new().await;
@@ -881,27 +772,15 @@ async fn statsd_in_aggregate_statsd_out_relay_is_exact_for_a_service_check() {
 
 // ---- transport: tcp -----------------------------------------------------------------------
 
-/// `statsd_out(transport: tcp) -> statsd_in(transport: tcp)`, over the same fixture corpus the
-/// UDP tests above use, plus the two cases only a stream transport can exercise at all: a raw
-/// client whose line straddles two writes, and a line whose first byte is an ASCII digit (which a
-/// listener framing RFC 6587-style would read as an octet count and mis-frame the connection on).
-///
-/// The module doc's permitted-normalization list gains **no new entry** here: `transport: tcp`
-/// changes framing and nothing else. On UDP a batch's lines are newline-*joined* into one
-/// datagram with no trailing separator; on TCP each line is newline-*terminated*, so the captured
-/// frame is exactly the UDP bytes plus one final `\n`, which [`strip_lf_framing`] takes back off
-/// before the byte-for-byte comparison. Content, decode and every normalization above are shared:
-/// both transports run the same `StatsdEncoder`/`StatsdDecoder`.
+/// `statsd_out(transport: tcp) -> statsd_in(transport: tcp)` over the UDP fixture corpus, plus two
+/// stream-only cases: a line split across two writes, and a line starting with an ASCII digit.
 mod tcp {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 
-    /// TCP twin of the top-level [`Harness`]: same `bind()`-then-`local_addr()` readiness for the
-    /// live `statsd_in`, plus a raw TCP "capture" listener standing in for the UDP capture socket
-    /// above -- it accepts one connection per round trip and reads it to EOF, since a fresh
-    /// `StatsdOutput::tcp` per call closes its connection (and so EOFs the peer) the moment it is
-    /// dropped. Modelled line for line on `syslog_round_trip.rs`'s own `mod tcp::TcpHarness`.
+    /// TCP twin of [`Harness`]. The capture listener reads each connection to EOF, which works
+    /// because each round trip uses a fresh `StatsdOutput::tcp` and drops it after sending.
     struct TcpHarness {
         capture_addr: SocketAddr,
         capture_rx: mpsc::Receiver<Vec<u8>>,
@@ -941,11 +820,7 @@ mod tcp {
             Self { capture_addr, capture_rx, input_addr, rx }
         }
 
-        /// Sends `batch` through a fresh TCP [`StatsdOutput`] built from `encoder()` -- once at
-        /// the raw capture listener, once at the live `statsd_in` -- and returns the captured
-        /// wire bytes alongside the [`EventBatch`] the real input decoded from them (receipt-time
-        /// `timestamp` fields already normalized). Mirrors the UDP [`Harness::round_trip`]
-        /// exactly, modulo the transport.
+        /// TCP twin of [`Harness::round_trip`].
         async fn round_trip(
             &mut self,
             batch: &EventBatch,
@@ -978,17 +853,15 @@ mod tcp {
         }
     }
 
-    /// Strips the single trailing `LF` `statsd_out`'s TCP transport terminates its last line with,
-    /// asserting it was there -- the one framing difference between the two transports, and the
-    /// only thing a TCP round trip needs to account for that the UDP path above doesn't.
+    /// Strips the trailing `LF` that TCP framing adds after the last line, asserting it's there.
+    /// It's the only byte difference between the TCP and UDP output.
     fn strip_lf_framing(frame: &[u8]) -> &[u8] {
         let (last, rest) = frame.split_last().expect("a TCP frame is never empty");
         assert_eq!(*last, b'\n', "statsd_out's TCP transport terminates every line with LF");
         rest
     }
 
-    /// TCP twin of the top-level `assert_byte_for_byte`: same fixture, same `.expected` bytes, but
-    /// the captured wire bytes are LF-terminated lines rather than a bare UDP datagram.
+    /// TCP twin of `assert_byte_for_byte`, against the same `.expected` bytes.
     async fn assert_byte_for_byte_tcp(
         harness: &mut TcpHarness,
         fixture: &str,
@@ -1010,10 +883,7 @@ mod tcp {
         );
     }
 
-    /// `statsd_out(transport: tcp) -> statsd_in(transport: tcp)`, over the same corpus the UDP
-    /// tests above use -- the framing changes (LF-terminated lines), the content and permitted
-    /// normalizations don't (this file's module doc). One test rather than three so the corpus
-    /// shares a single harness, the way the UDP tests share theirs.
+    /// The UDP corpus over TCP, byte for byte. One test so the corpus shares one harness.
     #[tokio::test]
     async fn fixture_corpus_round_trips_over_tcp() {
         let mut harness = TcpHarness::new().await;
@@ -1060,11 +930,9 @@ mod tcp {
         }
     }
 
-    /// The pin for `statsd_in`'s framing choice, end to end through the real component: a statsd
-    /// line may legally begin with an ASCII digit, which RFC 6587's auto-detecting framing (the
-    /// shared driver's default, and what `syslog_in` wants) would latch as an octet count and
-    /// reframe the whole connection on. No `statsd_out` involved -- a raw client, so the bytes on
-    /// the wire are exactly what is asserted.
+    /// Pins `statsd_in`'s LF framing: a statsd line may begin with an ASCII digit, which RFC 6587's
+    /// auto-detecting framing (`syslog_in`'s) would read as an octet count. Uses a raw client, so
+    /// the bytes on the wire are the ones asserted.
     #[tokio::test]
     async fn a_raw_client_line_starting_with_a_digit_decodes_as_a_metric_name() {
         let mut input = StatsdInput::tcp("127.0.0.1:0");
@@ -1090,9 +958,7 @@ mod tcp {
         assert_eq!(logit_core::interner::resolve(batch.events[0].metrics[0].name), "1.hits");
     }
 
-    /// A line whose `\n` only arrives in the second write: the driver's framer buffers across
-    /// reads, so this is one event rather than two halves rejected as malformed. The stream-only
-    /// case the UDP corpus cannot express at all, since a datagram is always whole.
+    /// A line whose `\n` arrives in a second write is one event: the framer buffers across reads.
     #[tokio::test]
     async fn a_line_split_across_two_writes_is_one_event() {
         let mut input = StatsdInput::tcp("127.0.0.1:0");
@@ -1127,16 +993,12 @@ mod tcp {
 
 // ---- transport: tls -------------------------------------------------------------------------
 
-/// `statsd_out` -> `statsd_in` over TLS -- server TLS, mutual TLS, and the wrong-CA negative
-/// case, driven by the real sink, exactly the shape `syslog_round_trip.rs`'s `mod tls` has.
+/// `statsd_out` -> `statsd_in` over TLS: server TLS, mutual TLS, and the wrong-CA negative case,
+/// driven by the real sink's `tls:` block (`docs/adr/statsd-output.md`'s "Amendment: TLS").
 ///
-/// **Two clients, deliberately.** The three round trips run the real `statsd_out` with its own
-/// `tls:` block (`docs/adr/statsd-output.md`'s TLS amendment), which is what a deployment
-/// actually looks like and pins both halves at once. One raw `tokio_rustls` client survives
-/// alongside them, because it asserts something the sink cannot reach: that a *refused* handshake
-/// leaves the listener still serving everyone else. `statsd_out`'s own wrong-CA case asserts the
-/// sink-side `Fault` instead, which a raw client has no concept of -- the two are different
-/// halves of the same failure, not a duplicate.
+/// The two wrong-CA tests aren't duplicates. The `statsd_out` one asserts the sink-side `Fault`;
+/// the raw `tokio_rustls` one asserts that a refused handshake leaves the listener serving other
+/// clients, which the sink can't observe.
 mod tls {
     use super::*;
     use logit_inputs::tcp::TlsServerSettings;
@@ -1149,15 +1011,12 @@ mod tls {
     use tokio::net::TcpStream;
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-cli` lives at `crates/logit-cli`; the fixtures live at the repo root's
-        // `testdata/tls` -- two levels up from `CARGO_MANIFEST_DIR`, exactly
-        // `syslog_round_trip.rs`'s own `mod tls::testdata_dir`.
+        // The repo root's `testdata/tls`, two levels up from `crates/logit-cli`.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
-    /// Stands up a TLS-terminating TCP `statsd_in` with `settings`, returning its bound address
-    /// and the `Fanout` receiver every decoded batch lands on -- `bind()`-then-`local_addr()`
-    /// readiness, the same idiom every harness in this file uses, no sleep needed.
+    /// Spawns a TLS-terminating TCP `statsd_in`, returning its bound address and the receiver
+    /// its decoded batches land on.
     async fn spawn_tls_input(
         settings: &TlsServerSettings,
     ) -> (SocketAddr, mpsc::Receiver<Delivered>) {
@@ -1174,9 +1033,9 @@ mod tls {
         (addr, rx)
     }
 
-    /// A `tokio-rustls` client trusting exactly `ca_file` under `testdata/tls` -- `other-ca.pem`
-    /// is what makes the "wrong CA" case a real trust failure rather than a name mismatch.
-    /// `client_cert` is `(cert, key)` for the mTLS cases, `None` for a client presenting nothing.
+    /// A `tokio-rustls` client trusting only `ca_file` under `testdata/tls`, presenting
+    /// `client_cert` (`(cert, key)`) if given. `other-ca.pem` makes a wrong-CA case a trust
+    /// failure rather than a name mismatch.
     fn connector(ca_file: &str, client_cert: Option<(&str, &str)>) -> tokio_rustls::TlsConnector {
         let dir = testdata_dir();
         let mut roots = rustls::RootCertStore::empty();
@@ -1220,9 +1079,9 @@ mod tls {
         }
     }
 
-    /// Writes `line` over a completed TLS handshake and returns the batch `statsd_in` decoded
-    /// from it. The connection is dropped afterwards, which EOFs the listener's connection task
-    /// and flushes the accumulator immediately rather than on its 100ms timer.
+    /// Writes `line` over a completed TLS handshake and returns the batch `statsd_in` decoded.
+    /// Dropping the connection EOFs the listener's connection task, which flushes immediately
+    /// rather than on its 100ms timer.
     async fn send_over_tls(
         connector: &tokio_rustls::TlsConnector,
         addr: SocketAddr,
@@ -1250,10 +1109,9 @@ mod tls {
         logit_core::interner::resolve(batch.events[0].metrics[0].name)
     }
 
-    /// Sends `batch` through a real TLS `statsd_out` built with `settings` and returns what
-    /// `statsd_in` decoded on the other end (receipt-time `timestamp` fields normalized, exactly
-    /// as every other harness in this file does). `localhost` rather than `127.0.0.1`, since
-    /// `testdata/tls/server.pem`'s SAN is what the sink's own SNI has to match.
+    /// Sends `batch` through a TLS `statsd_out` and returns `statsd_in`'s normalized decode. The
+    /// endpoint is `localhost`, not `127.0.0.1`, because the sink's SNI must match
+    /// `server.pem`'s SAN.
     async fn round_trip_over_tls(
         addr: SocketAddr,
         rx: &mut mpsc::Receiver<Delivered>,
@@ -1278,10 +1136,7 @@ mod tls {
         decoded
     }
 
-    /// Server TLS only: `statsd_in` presents `server.pem`/`server.key` with no `client_ca_file`,
-    /// so any client is accepted once the handshake itself completes -- and a real
-    /// `statsd_out -> statsd_in` relay over it is a fixed point, tags and all, exactly as it is
-    /// in the clear.
+    /// Server TLS only (no `client_ca_file`): the relay is a fixed point, tags included.
     #[tokio::test]
     async fn server_tls_round_trips_a_batch() {
         let (addr, mut rx) = spawn_tls_input(&server_settings(None)).await;
@@ -1323,14 +1178,10 @@ mod tls {
         assert_eq!(decoded, sent);
     }
 
-    /// The sink-side negative: `statsd_out` trusts `other-ca.pem`, which never signed
-    /// `server.pem`, so *this* side's own certificate verification fails the handshake before a
-    /// single byte of the batch has left the host -- `Fault::Clean`, and deterministically so.
-    ///
-    /// Deterministic for the same reason `syslog_round_trip.rs`'s twin gives: a *server*-cert
-    /// rejection happens inside the client's own verification, before `TlsConnector::connect`
-    /// even completes, unlike a client-cert rejection, which under TLS 1.3 this write-only sink
-    /// never sees at all.
+    /// A `statsd_out` trusting `other-ca.pem` fails its own certificate verification before any
+    /// batch byte is written, so the error is `Fault::Clean`. That's deterministic because a
+    /// server-cert rejection happens inside `TlsConnector::connect`; a client-cert rejection,
+    /// under TLS 1.3, is one this write-only sink never sees.
     #[tokio::test]
     async fn a_statsd_out_trusting_the_wrong_ca_is_refused_and_classified_clean() {
         let (addr, _rx) = spawn_tls_input(&server_settings(None)).await;
@@ -1352,10 +1203,8 @@ mod tls {
         assert_eq!(classify(&err), Fault::Clean);
     }
 
-    /// The listener-side half of the same failure, and the one a `statsd_out` cannot assert: a
-    /// raw client trusting `other-ca.pem`, which never signed `server.pem`, is
-    /// refused inside its own certificate verification -- and the half that matters for a relay,
-    /// the listener keeps serving everyone else afterwards.
+    /// The listener-side half: after a raw client trusting `other-ca.pem` is refused, the
+    /// listener keeps serving other clients.
     #[tokio::test]
     async fn a_client_trusting_the_wrong_ca_is_refused_and_the_listener_keeps_serving() {
         let (addr, mut rx) = spawn_tls_input(&server_settings(None)).await;

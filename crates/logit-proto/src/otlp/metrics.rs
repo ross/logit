@@ -1,91 +1,72 @@
-//! `MetricRecord` ↔ OTLP `Metric` -- the hard direction, both ways.
+//! `MetricRecord` ↔ OTLP `Metric`.
 //!
-//! **Encode.** `time_unix_nano` is stamped with `Event::timestamp`; `start_time_unix_nano` is
-//! `record.start_timestamp` written through verbatim, with no fallback to `Event::timestamp` --
-//! OTLP's own `start_time_unix_nano` "unknown" sentinel is `0` (`start_time.proto`'s own doc
-//! comment: optional, `0` = unknown), the same convention this model's `start_timestamp == 0`
-//! already uses, so a `record.start_timestamp` of `0` must stay `0` on the wire rather than
-//! borrowing the event's own timestamp and advertising a zero-width interval a rate-computing
-//! backend can misread as real. `record.flags` (OTLP `DataPointFlags`,
-//! e.g. `NO_RECORDED_VALUE`) is written into every data point's own `flags`. `record.description`
-//! resolves onto `Metric.description` when `Some`, else the wire field stays empty. Event
-//! attributes become the data point's attributes; the metric name/unit come from the
-//! `MetricRecord` itself. One `MetricRecord` becomes exactly one OTLP `Metric` with exactly one
-//! data point -- this does **not** coalesce same-named metrics across events into one wire-level
-//! `Metric.data_points` list the way a canonical OTLP producer would. That's spec-legal (multiple
-//! `Metric` entries sharing a name is explicitly permitted; most consumers -- including this
-//! crate's own decoder -- treat them as more points of the same series) and keeps this mapping a
-//! pure per-record function instead of a batch-wide grouping pass.
+//! **Encode.** `time_unix_nano` is `Event::timestamp`. `start_time_unix_nano` is
+//! `record.start_timestamp` verbatim, with no fallback: `0` means unknown in both models
+//! (`metrics.proto`), and borrowing the event's timestamp would advertise a zero-width interval a
+//! rate-computing backend reads as real. `record.flags` (OTLP `DataPointFlags`, e.g.
+//! `NO_RECORDED_VALUE`) goes onto the data point's `flags`. `record.description`, when `Some`,
+//! becomes `Metric.description`. Event attributes become the data point's attributes.
 //!
-//! | `MetricKind` | Encodes to | Fidelity |
-//! |---|---|---|
-//! | `Sum{value,temporality,monotonic}` | `Sum{temporality,monotonic}` | exact -- both flags ride real fields now, not a well-known attribute; carries `record.exemplars` |
-//! | `Gauge(v)` | `Gauge` | exact; carries `record.exemplars` |
-//! | `Histogram{buckets,temporality,sum,min,max}` | `Histogram{temporality,sum,min,max}` | exact -- `buckets` is already per-bucket, not
-//! |   |   | cumulative (`metric.rs`'s doc comment, which describes the *count per bucket*, not the
-//! |   |   | series' own temporality); a trailing `f64::INFINITY` bound becomes the implicit final
-//! |   |   | bucket OTLP's `explicit_bounds` convention expects; carries `record.exemplars`. |
-//! | `ExponentialHistogram(e)` | `ExponentialHistogram` | exact -- 1:1 field mapping, kept as its own
-//! |   |   | variant specifically so `otlp_in -> otlp_out` is a fixed point for this type; carries `record.exemplars`. |
-//! | `Summary{quantiles,count,sum}` | `Summary{count,sum}` | exact on `quantiles`/`count`/`sum` --
-//! |   |   | **but `record.exemplars` is dropped**: `SummaryDataPoint` has no `exemplars` field on
-//! |   |   | the wire at all (OTLP spec), so this is a genuine, documented degradation, not this
-//! |   |   | module's choice. A `Samples`/`Distribution` degrading into a `Summary` below loses its
-//! |   |   | exemplars for the same reason. |
-//! | `Samples(s)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy, deliberately**
-//! |   |   | -- sketched into a temporary `DdSketch` first ([`Samples::sketch`], weighted by
-//! |   |   | `(1/sample_rate).round()` clamped to `[1, 1000]`), then takes the same degraded path
-//! |   |   | `Distribution` does. Counted via `logit.output.metrics.degraded{metric_kind="samples"}`. |
-//! | `Distribution(sketch)` | `Summary` of 5 fixed quantiles (p50/p75/p90/p95/p99) | **Lossy,
-//! |   |   | deliberately** -- see the module doc's "Lossy metric kinds" note below. Counted via
-//! |   |   | `logit.output.metrics.degraded{metric_kind="distribution"}`. |
-//! | `SetMembers(members)` | **skipped** | OTLP has no cardinality-estimate wire type to encode a
-//! |   |   | set into at all -- same reason `Set` skips below, not a "no real HLL" limitation
-//! |   |   | (`HyperLogLog` is real, `docs/plans/lossless-transit.md`'s W2). Counted via
-//! |   |   | `logit.output.metrics.skipped{metric_kind="set_members"}`. |
-//! | `Set(hll)` | **skipped** | Same reason -- OTLP has no cardinality-estimate concept on the
-//! |   |   | wire, so there's nowhere to put `hll.estimate()` even though it's a real number now.
-//! |   |   | Counted via `logit.output.metrics.skipped{metric_kind="set"}`, throttled-warned. |
+//! One `MetricRecord` becomes one `Metric` with one data point; same-named records across events
+//! aren't coalesced into one `data_points` list. OTLP permits several `Metric` entries sharing a
+//! name, consumers (this decoder included) read them as more points of one series, and it keeps
+//! encode a per-record function.
 //!
-//! `Samples`/`Distribution`/`SetMembers`/`Set` are the qualification [ADR `committed-pregenerated-otlp-protobuf`](../../../../docs/adr/committed-pregenerated-otlp-protobuf.md)
-//! spells out against [ADR `native-wire-format-with-otlp-bridge`](../../../../docs/adr/native-wire-format-with-otlp-bridge.md):
-//! here it's `logit`'s own model (raw samples/members with no OTLP wire type, a mergeable sketch, a
-//! cardinality stub) that can't be losslessly re-expressed *as* OTLP, not the other way around.
+//! Per kind:
+//! - `Sum{value,temporality,monotonic}` → `Sum`: exact; carries `record.exemplars`.
+//! - `Gauge(v)` → `Gauge`: exact; carries exemplars.
+//! - `Histogram{buckets,temporality,sum,min,max}` → `Histogram`: exact. `buckets` holds per-bucket
+//!   counts, not cumulative ones, and a trailing `f64::INFINITY` bound becomes the implicit final
+//!   bucket `explicit_bounds` expects. Carries exemplars.
+//! - `ExponentialHistogram(e)` → `ExponentialHistogram`: exact, field for field, so
+//!   `otlp_in -> otlp_out` is a fixed point. Carries exemplars.
+//! - `Summary{quantiles,count,sum}` → `Summary`: exact, **but `record.exemplars` is dropped**:
+//!   `SummaryDataPoint` has no `exemplars` field. A `Samples` or `Distribution` degraded into a
+//!   `Summary` loses its exemplars the same way.
+//! - `Samples(s)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy**. Sketched first
+//!   (`Samples::sketch`, each value weighted by `Samples::weight`), then degraded like
+//!   `Distribution`. Counts `logit.output.metrics.degraded{metric_kind="samples"}`.
+//! - `Distribution(sketch)` → `Summary` of `DISTRIBUTION_QUANTILES`: **lossy** (see "Lossy
+//!   metric kinds" below). Counts `logit.output.metrics.degraded{metric_kind="distribution"}`.
+//! - `SetMembers(members)`, `Set(hll)`: **skipped**; OTLP has no cardinality type to carry a set
+//!   or an estimate. Counts `logit.output.metrics.skipped{metric_kind="set_members"|"set"}` and
+//!   warns, throttled.
+//! - `GaugeDelta`: **skipped**. It's an unresolved relative adjustment (ADR
+//!   `relative-gauge-adjustments`), never an absolute value. Counts
+//!   `logit.output.metrics.skipped{metric_kind="gauge_delta"}` and warns under
+//!   `gauge_delta_unresolved`.
 //!
-//! **Decode.** `Sum` → `MetricKind::Sum{value,temporality,monotonic}` directly -- temporality and
-//! monotonicity both ride real fields now; a cumulative `Sum` no longer decodes as a `Gauge`, and
-//! this module never stamps or reads a well-known attribute for either flag any more
-//! (`docs/adr/lossless-transit.md` retires that convention for temporality). `Histogram` →
-//! `Histogram{buckets,temporality,sum,min,max}`, all real fields.
-//! `Histogram` reconstructs the trailing infinite bucket when `bucket_counts` has one more entry
-//! than `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`,
-//! all real fields now (`count`/`sum` used to be dropped). `ExponentialHistogram` →
-//! `ExponentialHistogram` 1:1 (scale, zero_count, zero_threshold, positive/negative
-//! offset+bucket_counts, temporality, count, sum/min/max) -- no bucket materialization, no
-//! `MAX_DERIVED_BUCKETS` cap, since the variant now carries the wire shape directly instead of
-//! deriving explicit bounds from it. `start_time_unix_nano` → `record.start_timestamp` verbatim
-//! (`0` stays `0`, this model's own "unknown" convention). `Metric.description`, when non-empty,
-//! interns onto `record.description`. A data point's `exemplars` decode onto `record.exemplars`
-//! for every kind that carries them on the wire (`Sum`/`Gauge`/`Histogram`/`ExponentialHistogram`
-//! -- `SummaryDataPoint` has none, per the encode table above).
+//! **Lossy metric kinds.** OTLP has no mergeable-sketch type. `ExponentialHistogram` is the nearest
+//! shape, but `DdSketch` exposes no bin iteration to convert from (`logit_core::metric`), and a
+//! fabricated one would be a non-mergeable stand-in, the mistake AGENTS.md warns against for
+//! `HyperLogLog`. So `Distribution` degrades to fixed quantiles. This is the
+//! qualification ADR `committed-pregenerated-otlp-protobuf` makes against ADR
+//! `native-wire-format-with-otlp-bridge`: `logit`'s model (raw samples and members, a mergeable
+//! sketch, a mergeable cardinality estimator) can't all be re-expressed *as* OTLP.
 //!
-//! **`NO_RECORDED_VALUE` keeps the point, flagged, rather than skipping it.** A data point with
-//! `DataPointFlags::FLAG_NO_RECORDED_VALUE` set (bit 0 of `flags`) decodes like any other point --
-//! `record.flags` carries the bit forward and the point's numeric value decodes exactly as sent
-//! (typically the wire's own zero value for a flagged point, since a well-behaved producer has
-//! nothing meaningful to put there) -- rather than being silently dropped. This is what makes
-//! `otlp_in -> otlp_out` a fixed point for a flagged point: encode below writes `record.flags`
-//! back onto the re-encoded data point unchanged. `docs/adr/metrics-model-v2.md`'s W4 amendment.
+//! **Decode.** `Sum` → `MetricKind::Sum{value,temporality,monotonic}` from real fields; a
+//! cumulative `Sum` stays a `Sum`. `Histogram` → `Histogram{buckets,temporality,sum,min,max}`,
+//! rebuilding the trailing infinite bucket when `bucket_counts` has one more entry than
+//! `explicit_bounds` (the OTLP-mandated shape). `Summary` → `Summary{quantiles,count,sum}`.
+//! `ExponentialHistogram` → `ExponentialHistogram` field for field (scale, zero count and
+//! threshold, positive and negative offset and bucket counts, temporality, count, sum/min/max),
+//! with no bucket materialization.
+//! `start_time_unix_nano` → `record.start_timestamp` verbatim. A non-empty `Metric.description`
+//! interns onto `record.description`. `exemplars` decode onto `record.exemplars` for every kind
+//! that carries them (all but `Summary`).
 //!
-//! `Metric.metadata` stays dropped both ways -- nothing in this model has anywhere to put a
-//! metric-level (not data-point-level) attribute set, and OTLP itself documents it as informational
-//! only (`metrics.proto`: "Consumers SHOULD NOT need to be aware of these attributes").
+//! **`NO_RECORDED_VALUE` keeps the point, flagged.** A point with `FLAG_NO_RECORDED_VALUE` (bit 0
+//! of `flags`) decodes like any other: `record.flags` carries the bit, and the value decodes as
+//! sent (usually zero). Encode writes `record.flags` back unchanged, so `otlp_in -> otlp_out` is
+//! a fixed point for a flagged point (ADR `metrics-model-v2`).
 //!
-//! The one decode-side skip -- a `Metric` with no recognized `data` oneof (`data: None`) -- counts
-//! via `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}` -- a distinct
-//! counter name from the encode side's `logit.output.metrics.{degraded,skipped}` since these are
-//! the two directions of one component (`OtlpEncoder`/`OtlpDecoder`), not two components sharing
-//! counters.
+//! `Metric.metadata` is dropped both ways: the model has nowhere to put metric-level attributes,
+//! and `metrics.proto` calls them informational ("Consumers SHOULD NOT need to be aware of these
+//! attributes").
+//!
+//! The one decode-side skip, a `Metric` with no `data` oneof, counts
+//! `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`. It's a different name
+//! from encode's `logit.output.metrics.*` because encoder and decoder serve different components.
 
 use crate::otlp::common;
 use crate::otlp::generated::opentelemetry::proto::metrics::v1 as pb;
@@ -95,10 +76,8 @@ use logit_core::{
     MetricRecord, Sum, Summary, Telemetry, Temporality, TraceRef,
 };
 
-/// The five quantiles every sketch-to-quantiles degradation in this crate reports -- shared with
-/// `crate::prometheus`, whose `Distribution`/`Samples` → `summary` path must degrade to the same
-/// five, or the same metric would come out of `otlp_out` and `prometheus_out` describing itself
-/// differently.
+/// The quantiles every sketch-to-quantiles degradation in this crate reports. `crate::prometheus`
+/// and `crate::graphite` share them so one metric describes itself the same way at every sink.
 pub(crate) const DISTRIBUTION_QUANTILES: [f64; 5] = [0.5, 0.75, 0.90, 0.95, 0.99];
 
 fn temporality_to_pb(t: Temporality) -> i32 {
@@ -108,8 +87,8 @@ fn temporality_to_pb(t: Temporality) -> i32 {
     }
 }
 
-/// Any wire value other than `CUMULATIVE` (including `UNSPECIFIED`, which OTLP says "MUST not be
-/// used" but a lenient decoder shouldn't fail a whole point over) decodes as `Delta`.
+/// Any wire value but `CUMULATIVE` decodes as `Delta`, including `UNSPECIFIED`, which OTLP says
+/// "MUST not be used" but isn't worth failing a point over.
 fn temporality_from_pb(raw: i32) -> Temporality {
     if raw == pb::AggregationTemporality::Cumulative as i32 {
         Temporality::Cumulative
@@ -118,17 +97,14 @@ fn temporality_from_pb(raw: i32) -> Temporality {
     }
 }
 
-/// `record.start_timestamp` written through verbatim -- OTLP's own `start_time_unix_nano`
-/// convention for "unknown" (`0`) matches this model's, so there is no separate sentinel to
-/// translate and no fallback to `Event::timestamp`: see the module doc's encode paragraph for why
-/// substituting the event's own timestamp would be wrong, not just unnecessary.
+/// `record.start_timestamp` verbatim; `0` means unknown in both models, and there's no fallback
+/// to `Event::timestamp` (see the module doc's "Encode").
 fn start_time(record_start: i64) -> u64 {
     record_start.max(0) as u64
 }
 
-/// OTLP's `Exemplar` message has no trace-flags field at all, so `e.trace`'s `TraceRef.flags` is
-/// dropped here -- a real, permanent lossy mapping (see `decode_exemplar`'s mirror note and
-/// `docs/known-gaps.md`'s cross-protocol table).
+/// Drops `TraceRef.flags`: OTLP's `Exemplar` has no trace-flags field, a permanent lossy mapping
+/// (`docs/known-gaps.md`'s cross-protocol table).
 fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
     let (trace_id, span_id) = match &e.trace {
         Some(t) => (t.trace_id.to_vec(), t.span_id.map(|id| id.to_vec()).unwrap_or_default()),
@@ -143,12 +119,9 @@ fn encode_exemplar(e: &Exemplar) -> pb::Exemplar {
     }
 }
 
-/// `trace`/`span` id bytes become a [`TraceRef`] only when `trace_id` is a genuine, non-empty,
-/// non-all-zero 16 bytes -- [`TraceRef::from_bytes`]'s own validity rule (the same one
-/// `../logs.rs` applies to a `LogRecord`'s trace context), since an `Exemplar`'s correlation is
-/// optional, best-effort metadata a decoder degrades gracefully without. `TraceRef.flags` is
-/// hardcoded to `0`: OTLP's `Exemplar` has no wire field to read it from (see `encode_exemplar`'s
-/// mirror note) -- a real, permanent lossy mapping, not a decode shortcut.
+/// The id bytes become a [`TraceRef`] only under [`TraceRef::from_bytes`]'s validity rule (a
+/// non-all-zero 16-byte `trace_id`), leniently, as for a log. `TraceRef.flags` is always `0`:
+/// OTLP's `Exemplar` has no field to read it from.
 fn decode_exemplar(e: pb::Exemplar) -> Exemplar {
     let value = match e.value {
         Some(pb::exemplar::Value::AsDouble(d)) => d,
@@ -196,8 +169,8 @@ fn number_value(value: Option<pb::number_data_point::Value>) -> f64 {
     }
 }
 
-/// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for `Set`/
-/// `SetMembers`/`GaugeDelta` (skipped, counted -- see the module doc's table).
+/// Encodes one `(Event, MetricRecord)` pair into one OTLP `Metric`, or `None` for a skipped
+/// `Set`/`SetMembers`/`GaugeDelta` (counted; see the module doc).
 pub(crate) fn encode_metric(
     event: &Event,
     record: &MetricRecord,
@@ -299,17 +272,14 @@ pub(crate) fn encode_metric(
                         value: *v,
                     })
                     .collect(),
-                // No `exemplars` field on the wire type at all -- see the module doc's encode
-                // table.
+                // `SummaryDataPoint` has no `exemplars` field.
                 flags: record.flags,
             }],
         }),
         MetricKind::Samples(s) => {
             telemetry.count("logit.output.metrics.degraded", 1.0, &[("metric_kind", "samples")]);
-            // Sketch first, then take the same degraded path `Distribution` does -- see the
-            // module doc. `Samples::sketch` weights each value by `Samples::weight`, the same
-            // bounded, NaN-safe extrapolation `crates/logit-inputs/src/statsd.rs` applies for its
-            // own sketch.
+            // Sketch, then degrade like `Distribution`. `Samples::weight` is the bounded,
+            // NaN-safe extrapolation `statsd_in` applies to its own sketch.
             let sketch = s.sketch();
             pb::metric::Data::Summary(pb::Summary {
                 data_points: vec![distribution_summary_point(
@@ -355,12 +325,9 @@ pub(crate) fn encode_metric(
             );
             return None;
         }
-        // A `GaugeDelta` reaching a sink means the pipeline is missing an `aggregate` component --
-        // it is explicitly unresolved (`docs/adr/relative-gauge-adjustments.md`) and must not
-        // be encoded as though it were an absolute value. Uses the same greppable
-        // `gauge_delta_unresolved` diagnostic key `influxdb_out` reports under, not the generic
-        // skip key above, so an operator can find every sink's occurrence of this one failure mode
-        // with a single grep.
+        // A `GaugeDelta` here means the pipeline lacks an `aggregate` (ADR
+        // `relative-gauge-adjustments`). The diagnostic key is `influxdb_out`'s, so one grep
+        // finds this failure at every sink.
         MetricKind::GaugeDelta(_) => {
             telemetry.count("logit.output.metrics.skipped", 1.0, &[("metric_kind", "gauge_delta")]);
             diagnostics.warn_throttled(
@@ -403,9 +370,8 @@ fn distribution_summary_point(
     }
 }
 
-/// Decodes one OTLP `Metric` into zero or more `Event`s (one per data point). Never fails the
-/// whole point/request -- see the module doc for the `NO_RECORDED_VALUE` handling (the point is
-/// kept, flagged, not skipped).
+/// Decodes one OTLP `Metric` into one `Event` per data point. Never fails; a `NO_RECORDED_VALUE`
+/// point is kept, flagged (see the module doc).
 pub(crate) fn decode_metric(
     metric: pb::Metric,
     base_attrs: &logit_core::AttrMap,
@@ -493,7 +459,7 @@ pub(crate) fn decode_metric(
                 let flags = dp.flags;
                 common::key_values_into_attrs(dp.attributes, &mut attrs);
                 let kind = MetricKind::Summary(Summary { quantiles, count: dp.count, sum: dp.sum });
-                // No `exemplars` field on the wire type at all -- see the module doc.
+                // `SummaryDataPoint` has no `exemplars` field.
                 let rec = record(kind, start_timestamp, flags, Vec::new());
                 Event::metric(ts, attrs, rec)
             })
@@ -574,8 +540,7 @@ mod tests {
         }
     }
 
-    /// A cumulative, non-monotonic sum round-trips both flags -- the case W1 adds real fields for
-    /// instead of a well-known attribute plus an always-`true` `is_monotonic`.
+    /// A cumulative, non-monotonic sum round-trips both flags.
     #[test]
     fn a_cumulative_non_monotonic_sum_round_trips_both_flags() {
         let kind = MetricKind::Sum(Sum {
@@ -692,8 +657,7 @@ mod tests {
         }
     }
 
-    /// The 1:1 mapping this module doc promises: every field survives an encode -> re-encode
-    /// comparison of the wire `ExponentialHistogramDataPoint` unchanged.
+    /// Every `ExponentialHistogramDataPoint` field survives decode and re-encode unchanged.
     #[test]
     fn an_exponential_histogram_encodes_to_identical_wire_fields_both_times() {
         let e = exp_histogram(Temporality::Cumulative);
@@ -758,9 +722,8 @@ mod tests {
         assert!(degraded.is_some(), "should count logit.output.metrics.degraded{{metric_kind}}");
     }
 
-    /// A NaN `sample_rate` must not empty the sketch: `Samples::weight` degrades it to `1`, so
-    /// the summary still carries every observation (`count == values.len()`), where a bare
-    /// `clamp`-then-`as u64` would have produced weight `0` and a `count: 0` point.
+    /// A NaN `sample_rate` weighs `1`, so the summary still counts every observation; a bare
+    /// `clamp`-then-`as u64` would give weight `0` and a `count: 0` point.
     #[test]
     fn a_samples_metric_with_a_nan_sample_rate_keeps_every_observation() {
         let mut samples = Samples::new([120.0, 130.0]);
@@ -847,11 +810,8 @@ mod tests {
         assert!(skipped.is_some(), "should count logit.output.metrics.skipped{{metric_kind}}");
     }
 
-    /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
-    /// component (`docs/adr/relative-gauge-adjustments.md`) -- it must be dropped, not
-    /// encoded as though it were an absolute value, and reported under the same greppable
-    /// `gauge_delta_unresolved` diagnostic key `influxdb_out` uses, not the generic `set`-style
-    /// per-kind skip key.
+    /// A `GaugeDelta` is dropped, not encoded as an absolute value, and reported under
+    /// `gauge_delta_unresolved`.
     #[test]
     fn a_gauge_delta_is_skipped_and_reports_its_own_diagnostic_key() {
         let registry = Registry::new();
@@ -927,10 +887,8 @@ mod tests {
         }
     }
 
-    /// A `Metric` with no recognized `data` oneof (`data: None`) decodes to no events, same as
-    /// before, but must now also count `logit.input.metrics.skipped{metric_kind="unknown",
-    /// reason="no_data"}` -- the counter this test pins was dead code before this fix (review
-    /// finding 4).
+    /// A `Metric` with no `data` oneof decodes to no events and counts
+    /// `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`.
     #[test]
     fn a_metric_with_no_data_is_skipped_and_counted() {
         let registry = Registry::new();
@@ -955,8 +913,7 @@ mod tests {
         );
     }
 
-    /// `NO_RECORDED_VALUE` keeps the point (flagged), rather than skipping it -- W4 amendment to
-    /// `docs/adr/metrics-model-v2.md`, see the module doc.
+    /// A `NO_RECORDED_VALUE` point is kept, flagged, not skipped.
     #[test]
     fn a_no_recorded_value_flag_keeps_the_point_flagged_rather_than_skipping_it() {
         let mut metric = encode(MetricKind::Gauge(1.0)).unwrap();
@@ -968,9 +925,7 @@ mod tests {
         assert_eq!(events[0].metrics[0].flags, MetricRecord::FLAG_NO_RECORDED_VALUE);
     }
 
-    /// Encode writes `record.flags` back onto the data point unchanged -- what makes
-    /// `otlp_in -> otlp_out` a fixed point for a flagged Sum/Gauge/Histogram/ExponentialHistogram/
-    /// Summary point.
+    /// Encode writes `record.flags` back unchanged for every kind that has a data point.
     #[test]
     fn a_flagged_record_round_trips_its_flags_for_every_kind() {
         let flags = MetricRecord::FLAG_NO_RECORDED_VALUE;
@@ -1091,8 +1046,7 @@ mod tests {
         }
     }
 
-    /// `SummaryDataPoint` has no `exemplars` field on the wire at all -- a documented degradation,
-    /// not a bug (see the module doc's encode table).
+    /// `SummaryDataPoint` has no `exemplars` field, so a summary's exemplars are dropped.
     #[test]
     fn a_summary_drops_its_exemplars_because_the_wire_type_has_nowhere_to_put_them() {
         let s = Summary { quantiles: vec![(0.5, 1.0)], count: 1, sum: 1.0 };
@@ -1150,12 +1104,8 @@ mod tests {
                 .prop_map(|(quantiles, count, sum)| Summary { quantiles, count, sum })
         }
 
-        /// Restricted to `Sum`/`Gauge`/`Histogram`/`Summary`, per the plan: `ExponentialHistogram`
-        /// already has its own dedicated 1:1 fixed-point tests above, and
-        /// `Samples`/`Distribution`/`SetMembers`/`Set`/`GaugeDelta` either degrade or skip on
-        /// encode by design (see the module doc's table) -- none of those five round-trips
-        /// `decode(encode(x)) == x` at all, so a generator that could produce them would be
-        /// asserting something this codec never promised.
+        /// `Sum`/`Gauge`/`Histogram`/`Summary` only: `ExponentialHistogram` has its own tests,
+        /// and the other kinds degrade or skip on encode, so no fixed point is promised.
         fn arb_kind() -> impl Strategy<Value = MetricKind> {
             prop_oneof![
                 arb_sum().prop_map(MetricKind::Sum),
@@ -1165,9 +1115,7 @@ mod tests {
             ]
         }
 
-        /// A fixed, non-zero id pattern -- `TraceRef::from_bytes`'s own validity rule rejects an
-        /// all-zero `trace_id` (see `crates/logit-core/src/trace.rs`), so the generator only needs
-        /// to vary *whether* a trace is present, not its exact bytes.
+        /// A fixed, non-zero id (`TraceRef::from_bytes` rejects all-zero); only presence varies.
         fn arb_exemplar() -> impl Strategy<Value = Exemplar> {
             (0i64..2_000_000_000_000_000_000i64, -1e6f64..1e6f64, any::<bool>()).prop_map(
                 |(timestamp, value, has_trace)| {
@@ -1181,11 +1129,8 @@ mod tests {
             )
         }
 
-        /// Non-empty on `Some` -- an empty `Some(String::new())` description would resolve to an
-        /// empty wire string, which `decode_metric` (correctly) treats the same as "absent"
-        /// (`Metric.description.is_empty()`), so it would decode back as `None`, not the `Some("")`
-        /// the record started with. A description is never really an empty string in practice, so
-        /// excluding it from the generator isn't a gap this proptest is pretending doesn't exist.
+        /// Non-empty on `Some`: an empty wire description decodes as `None`, so `Some("")` can't
+        /// round-trip.
         fn arb_description() -> impl Strategy<Value = Option<String>> {
             prop::option::of("[a-zA-Z][a-zA-Z0-9_]{0,11}")
         }
@@ -1211,21 +1156,15 @@ mod tests {
                         kind,
                     }
                 })
-                // A Summary data point has no `exemplars` field on the wire at all (see the
-                // module doc), so a record pairing Summary with a non-empty exemplars list can
-                // never be a fixed point by construction -- not a case this generator should
-                // produce, the same reasoning `a_summary_drops_its_exemplars_...` pins directly.
+                // A Summary drops its exemplars, so it can't round-trip with any.
                 .prop_filter("Summary carries no wire exemplars", |r| {
                     !(matches!(r.kind, MetricKind::Summary(_)) && !r.exemplars.is_empty())
                 })
         }
 
         proptest! {
-            /// `decode(encode(x)) == x` for every generated `MetricRecord` -- `start_timestamp`
-            /// now writes through verbatim regardless of the event's own timestamp (no more
-            /// "0 falls back to the event timestamp" encode rule to sidestep), so the event's
-            /// timestamp here is just a fixed, arbitrary value, not load-bearing for this fixed
-            /// point.
+            /// `decode(encode(x)) == x` for every generated `MetricRecord`; the event timestamp
+            /// is arbitrary because `start_timestamp` never falls back to it.
             #[test]
             fn decode_of_encode_is_the_identity(record in arb_metric_record()) {
                 let event = Event::empty(0, AttrMap::new());

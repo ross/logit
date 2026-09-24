@@ -1,8 +1,7 @@
 #!/bin/bash
 # Usage: script/bootstrap
-# Ensures the project's environment is ready. Run this first -- nothing else in script/ needs
-# Rust, LuaJIT, or anything else installed on the host; it all runs in the dev container this
-# builds. Safe to re-run any time; a no-op if the image is already up to date.
+# Builds the dev container image every other script runs in, so the host needs no Rust or LuaJIT.
+# Run it first; re-running is safe and a no-op when the image is current.
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"

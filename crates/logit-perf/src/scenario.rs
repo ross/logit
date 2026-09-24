@@ -1,26 +1,20 @@
-//! Discovers `perf/scenarios/*.yaml` and reads just enough out of each to drive the harness --
-//! never the whole config (docs/plans/load-test-harness.md's "Harness" section).
+//! Discovers `perf/scenarios/*.yaml` and reads the few fields the harness needs from each.
 //!
-//! Deliberately parses as a bare [`serde_norway::Value`], not [`logit_config::Config`]: this
-//! crate isn't a `logit-config`/`logit-pipeline` dependent (docs/plans/load-test-harness.md's W5
-//! row), and doesn't need to be -- it only ever reads a handful of things out of a YAML map, and
-//! never resolves `!env` (a scenario file never uses it; `logit run` resolves it for real when the
-//! harness spawns the binary). Reaching for the real config types here would mean a dependency
-//! this tool doesn't otherwise need, just to read a few fields.
+//! Parses a bare [`serde_norway::Value`], not `logit_config::Config`: the crate doesn't depend on
+//! `logit-config` for a handful of map lookups. `!env` goes unresolved here; no scenario uses it,
+//! and `logit run` resolves it in the spawned binary.
 //!
 //! ## Two kinds of scenario
 //!
-//! Every scenario up to [ADR `udp-intake-batching-and-socket-visibility`](../../../docs/adr/udp-intake-batching-and-socket-visibility.md)
-//! generated its own load in-process, from a `generate_in` component with a finite `count`. A UDP
-//! scenario can't: the thing under test *is* the socket path, so the load has to arrive over a real
-//! socket, from outside the process. [`Workload`] is that fork -- `Generated` is exactly what came
-//! before, `Driven` is a scenario with no generator at all plus a sidecar load spec under
-//! `perf/load/` telling `crate::load` what to send it.
+//! A `Generated` scenario makes its own load in-process from a `generate_in` with a finite
+//! `count`. A `Driven` one tests the socket path, so its load must arrive over a real socket from
+//! outside the process: it has no generator, and a sidecar spec under `perf/load/` tells
+//! `crate::load` what to send (docs/adr/udp-intake-batching-and-socket-visibility.md).
 //!
 //! **The sidecar lives in its own directory, not beside the scenario**, because both
-//! `script/validate` and `crates/logit-cli/src/config.rs`'s `every_shipped_config_loads_and_validates`
-//! glob `perf/scenarios/*.yaml` unconditionally: anything dropped in there has to be a valid
-//! `logit` config, and a load spec isn't one.
+//! `script/validate` and `crates/logit-cli/src/config.rs`'s
+//! `every_shipped_config_loads_and_validates` glob `perf/scenarios/*.yaml`: everything there must
+//! be a valid `logit` config, and a load spec isn't one.
 
 use crate::load::{self, LoadSpec};
 use anyhow::{bail, Context};
@@ -35,11 +29,10 @@ pub const LOAD_DIR: &str = "load";
 /// How a scenario's events come into being.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Workload {
-    /// A `generate_in` component with a finite `count`, generating in-process. Required to be
-    /// finite: a scenario the harness runs must have a denominator for events/s and
-    /// CPU-per-event -- an unbounded `generate_in` (soak / profiler-attach) is a real, valid config
-    /// the runtime supports, just not one this harness can turn into a measurement, so it's
-    /// rejected rather than left to hang.
+    /// A `generate_in` component with a finite `count`, generating in-process.
+    ///
+    /// The count is the denominator for events/s and CPU-per-event, so an unbounded `generate_in`
+    /// (valid for `logit`) is rejected here rather than left to hang.
     Generated { count: u64 },
     /// No generator: a real listener, fed over a real socket by `crate::load` from the sidecar
     /// spec at `perf/load/<name>.yaml`.
@@ -47,9 +40,9 @@ pub enum Workload {
 }
 
 impl Workload {
-    /// The one-line description `run`/`list` print beside a scenario's name. The two kinds have
-    /// no comparable "count" (one is events generated, the other datagrams sent), so this labels
-    /// the number rather than pretending they're the same quantity.
+    /// The one-line description `run`/`list` print beside a scenario's name.
+    ///
+    /// Labels the number, since one kind counts events generated and the other datagrams sent.
     pub fn describe(&self) -> String {
         match self {
             Workload::Generated { count } => format!("count={count}"),
@@ -65,31 +58,28 @@ impl Workload {
 /// What the harness needs to know about one `perf/scenarios/*.yaml` file to run it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scenario {
-    /// The file stem (`passthrough` for `perf/scenarios/passthrough.yaml`) -- also what
-    /// `--scenario` filters against and what a results file's `scenarios` map keys on.
+    /// The file stem (`passthrough` for `perf/scenarios/passthrough.yaml`); what `--scenario`
+    /// matches and what a results file's `scenarios` map keys on.
     pub name: String,
     pub path: PathBuf,
     pub workload: Workload,
-    /// Whether some other listener in the graph won't self-exit once `generate_in` stops sending
-    /// -- a socket listener (any other kind whose `type` ends in `_in`) or `internal` (a ticker
-    /// that runs until shutdown, docs/plans/load-test-harness.md's `internal` final-drain note).
-    /// When true, `run.rs` waits `--settle` after the completion line, then sends SIGTERM, rather
-    /// than waiting for the process to exit on its own. Always true for a `Driven` scenario, which
-    /// is a socket listener by construction.
+    /// Whether the process won't self-exit once `generate_in` stops sending.
+    ///
+    /// True when the graph has another listener (any `type` ending in `_in`) or `internal` (a
+    /// ticker that runs until shutdown), and always for a `Driven` scenario. `run.rs` then waits
+    /// `--settle` past the completion line and sends SIGTERM instead of waiting for an exit.
     pub needs_sigterm: bool,
-    /// Every `buffer.disk.path` this scenario declares, one per disk-backed sink, **as written in
-    /// the YAML** -- relative to this scenario's own file, exactly like every other path a
-    /// component config carries, and not yet resolved against it. `crate::spool::resolve_spool_dirs`
-    /// does that resolution the same way `logit` itself does
-    /// (`crates/logit-cli/src/pipeline.rs`'s `queue_config`), since it also needs to check the
-    /// result stays inside `perf/results/` before anything touches the filesystem.
+    /// Every `buffer.disk.path` this scenario declares, one per disk-backed sink, as written in the
+    /// YAML: relative to the scenario file and unresolved. `crate::spool::resolve_spool_dirs`
+    /// resolves them and checks they stay inside `perf/results/`.
     pub disk_spool_paths: Vec<PathBuf>,
 }
 
 impl Scenario {
     /// This scenario's sidecar load spec path, whether or not it exists: `perf/scenarios/x.yaml`
-    /// -> `perf/load/x.yaml`. One derivation, used by discovery and by every consumer that needs
-    /// to re-read the spec, so the two can never disagree about where it is.
+    /// maps to `perf/load/x.yaml`.
+    ///
+    /// Discovery and every later re-read share this one derivation, so they can't disagree.
     pub fn load_spec_path(&self) -> anyhow::Result<PathBuf> {
         load_spec_path(&self.path, &self.name)
     }
@@ -105,9 +95,9 @@ fn load_spec_path(scenario_path: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Ok(perf_dir.join(LOAD_DIR).join(format!("{name}.yaml")))
 }
 
-/// Discovers every `*.yaml` in `dir`, sorted by name for deterministic output. A single bad
-/// scenario file fails the whole discovery with its own name in the error, rather than silently
-/// skipping it -- an unreadable or malformed scenario is a bug to fix, not a scenario to drop.
+/// Discovers every `*.yaml` in `dir`, sorted by name.
+///
+/// One bad scenario file fails the whole discovery, naming the file, rather than being skipped.
 pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
     let mut scenarios = Vec::new();
     let entries = fs::read_dir(dir)
@@ -118,12 +108,10 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
         if !path.extension().is_some_and(|extension| extension == "yaml") {
             continue;
         }
-        // Dotfiles are not scenarios: `attribute` writes its rewritten copy here as
-        // `.<name>.attribute.<pid>.yaml` so relative paths inside it still resolve against this
-        // directory (crates/logit-perf/src/attribute.rs's `rewritten_config_path`). It removes it
-        // on every exit path, but a killed process could leave one, and discovering it as a
-        // scenario in its own right would be a confusing way to find that out. Shell globs
-        // (`script/validate`'s `perf/scenarios/*.yaml`) skip these for free; `read_dir` doesn't.
+        // Dotfiles are not scenarios: `attribute` and `run` write rewritten copies here as
+        // `.<name>.<purpose>.<pid>.yaml` so their relative paths still resolve
+        // (`telemetry_leg::rewritten_config_path`), and a killed process can leave one behind.
+        // Shell globs skip dotfiles; `read_dir` doesn't.
         if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
             continue;
         }
@@ -149,9 +137,9 @@ pub fn discover(dir: &Path) -> anyhow::Result<Vec<Scenario>> {
     Ok(scenarios)
 }
 
-/// The one scenario named `name`, or an error naming every scenario there is -- what the
-/// single-scenario subcommands (`attribute`, `flamegraph`) resolve `--scenario` through, so a typo
-/// reports the available names instead of a bare "not found".
+/// The one scenario named `name`, or an error listing every scenario there is.
+///
+/// `attribute` and `flamegraph` resolve `--scenario` through this, so a typo lists the names.
 pub fn find(dir: &Path, name: &str) -> anyhow::Result<Scenario> {
     let scenarios = discover(dir)?;
     let known = scenarios.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -163,17 +151,16 @@ pub fn find(dir: &Path, name: &str) -> anyhow::Result<Scenario> {
 /// What [`parse`] reads out of one scenario's YAML, before the sidecar has been looked for.
 #[derive(Debug, Clone, PartialEq)]
 struct Parsed {
-    /// `Some(count)` when the scenario has exactly one `generate_in` carrying a usable `count`.
-    /// `None` when it has no `generate_in` at all -- a `generate_in` that *is* present but
-    /// unusable (no `count`, `count: 0`, or a second one) is an error from [`parse`] itself, not
-    /// a `None` here, so those messages stay exactly where they were.
+    /// `Some(count)` when the scenario has one `generate_in` with a usable `count`, `None` when it
+    /// has none. An unusable `generate_in` (no `count`, `count: 0`, or a second one) is an error
+    /// from [`parse`], not a `None`.
     generated: Option<u64>,
     needs_sigterm: bool,
     disk_spool_paths: Vec<PathBuf>,
 }
 
-/// Decides which [`Workload`] a scenario has, from what's in the config and whether a sidecar load
-/// spec exists beside it. All four combinations are accounted for; two of them are errors.
+/// Decides a scenario's [`Workload`] from its config and whether a sidecar load spec exists.
+/// Having both or neither is an error.
 fn workload_for(parsed: &Parsed, spec_path: &Path) -> anyhow::Result<Workload> {
     let sidecar = spec_path.exists();
     match (parsed.generated, sidecar) {
@@ -194,8 +181,7 @@ fn workload_for(parsed: &Parsed, spec_path: &Path) -> anyhow::Result<Workload> {
     }
 }
 
-/// The parsing logic proper, split out from [`discover`] so it's testable against inline YAML
-/// strings with no filesystem involved.
+/// Parses one scenario's YAML; split from [`discover`] so tests need no filesystem.
 fn parse(yaml: &str) -> anyhow::Result<Parsed> {
     let value: Value = serde_norway::from_str(yaml).context("parsing YAML")?;
     let components = value
@@ -244,20 +230,17 @@ fn parse(yaml: &str) -> anyhow::Result<Parsed> {
     Ok(Parsed { generated, needs_sigterm, disk_spool_paths })
 }
 
-/// `component.buffer.disk.path`, if present -- the raw string as written in the YAML, unresolved.
-/// Any component can carry a `buffer:` block (graph validation rejects one on a non-sink kind, but
-/// this reads the bare `Value` before that check ever runs), so this simply looks for the shape
-/// and ignores anything that doesn't have it, rather than restricting itself to `type: null_out`
-/// or any other specific kind -- a disk-backed sink under any implemented kind spools the same
-/// way. See `crate::spool` for what resolves and validates this path before it's ever removed.
+/// `component.buffer.disk.path`, if present, unresolved.
+///
+/// Matches the shape on any component kind: a disk-backed sink of any kind spools the same way,
+/// and graph validation (not run here) is what rejects a `buffer:` on a non-sink. `crate::spool`
+/// resolves and checks the path before anything is removed.
 fn disk_spool_path(component: &Value) -> Option<PathBuf> {
     component.get("buffer")?.get("disk")?.get("path")?.as_str().map(PathBuf::from)
 }
 
-/// Renders a YAML mapping key for an error message -- the key is almost always a plain string
-/// (a component id), so this prints it the way a reader typed it rather than `serde_norway`'s
-/// `Debug` form (`String("gen")`); only a non-string key (a YAML oddity no shipped scenario
-/// produces) falls back to `Debug`.
+/// Renders a YAML mapping key for an error message: a string key as typed, not `serde_norway`'s
+/// `Debug` form (`String("gen")`); any other key as `Debug`.
 fn describe_key(key: &Value) -> String {
     key.as_str().map(str::to_string).unwrap_or_else(|| format!("{key:?}"))
 }

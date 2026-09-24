@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""The shape survey's acceptance test: does `shape` reproduce numbers somebody else already counted?
+"""The shape survey's acceptance test: does `shape` reproduce the statsd corpus's own packing?
 
-`testdata/interop/statsd/` is 56 real UDP datagrams from two real statsd clients, and how they are
-packed -- lines per datagram, tags per line, tagged versus tagless -- is independently known
-(`testdata/interop/statsd/README.md`). So the instrument this survey is built on can be checked
-rather than trusted: replay that corpus at `statsd_in`, let `shape` measure it, and assert the
-measurements equal what a completely separate parser derives from the same bytes.
+Replays testdata/interop/statsd/ (56 datagrams from two real clients) at `statsd_in` and asserts
+`shape`'s measurements equal what a separate parser derives from the same `.raw` bytes. See
+tools/shape-survey/README.md, "The acceptance test".
 
-**This script derives its expectations from the `.raw` files, not from the README** -- a number
-copied out of a document would only prove the document and this file agree. It also parses
-`shape.log` with its own reader rather than importing `summarize.py`'s: if the two shared a parser,
-a parser bug would cancel itself out on both sides of the comparison, which is exactly the failure
-this check exists to catch.
+Two independence rules: expectations come from the `.raw` files, never from the corpus README, and
+`shape.log` is read with this file's own reader, never `summarize.py`'s, so a shared parser bug
+can't cancel itself out.
 
-The mapping from wire to measurement is **not 1:1**, and the difference is the interesting part:
+The mapping from wire to measurement is not 1:1:
 
   logit.shape.batch.events  <-> events per datagram. Not *lines* per datagram: `statsd_in` emits
                                 one event per value for a `c`/`g` line (`v1:v2|c` is two counter
@@ -27,14 +23,12 @@ The mapping from wire to measurement is **not 1:1**, and the difference is the i
                                 emits one unprompted, having detected its own container),
                                 `statsd.timestamp` for a `|T<secs>` segment, and `statsd.type` on
                                 `ms`/`h`/`d` lines only -- the wire type letter, which those three
-                                share one `Samples` shape for. Repeated tag *keys* merge into one
+                                share one `Samples` shape for. Repeated tag keys merge into one
                                 attribute holding an array, so a tag count is distinct keys, not
                                 tokens.
 
-Both comparisons are over **multisets**: the survey never asks in what order datagrams arrived, and
-UDP would not promise one anyway.
-
-Stdlib only (`python:3.12-slim`, no pip). Exits non-zero, loudly and specifically, on any mismatch.
+Both comparisons are over multisets, since UDP promises no order. Stdlib only. Exits non-zero on
+any mismatch.
 
 Usage:
     check_interop.py --corpus /corpus/statsd --shape-log /out/shape.log
@@ -59,13 +53,11 @@ TAP = "tap_input"
 def parse_line(line: str) -> tuple[int, int] | None:
     """One statsd line -> (events it decodes to, attributes each of those events carries).
 
-    A deliberately tiny reimplementation of the grammar `crates/logit-inputs/src/statsd.rs` reads:
-    `<name>:<v1>[:<v2>...]|<type>[|@rate][|#tags][|c:<id>][|T<secs>]`. It knows nothing about
-    logit's decoder beyond what the wire says, which is the point.
+    A minimal reimplementation of the grammar `crates/logit-inputs/src/statsd.rs` reads:
+    `<name>:<v1>[:<v2>...]|<type>[|@rate][|#tags][|c:<id>][|T<secs>]`, from the wire alone.
 
-    Returns None for a line this check does not model -- DogStatsD events (`_e{`) and service
-    checks (`_sc|`), which the corpus does not contain (its README says so, and `--self-test`
-    pins that this function would refuse them rather than guess).
+    Returns None for a line this check doesn't model: DogStatsD events (`_e{`) and service checks
+    (`_sc|`), which the corpus doesn't contain.
     """
     if line.startswith("_e{") or line.startswith("_sc|"):
         return None
@@ -124,9 +116,8 @@ def derive(corpus: pathlib.Path) -> dict:
             events, attrs = parsed
             events_here += events
             attributes[attrs] += events
-            # Tags-per-line, the figure testdata/interop/statsd/README.md's table quotes, kept
-            # separately from the attribute count so the two can be reported side by side: the
-            # difference between them is exactly the `statsd.*` carriers.
+            # Tags per line, kept apart from the attribute count so the report can show both: the
+            # difference is the `statsd.*` carriers.
             tag_part = next((p[1:] for p in line.split("|")[2:] if p.startswith("#")), "")
             tags_per_line[len({t.split(":", 1)[0] for t in tag_part.split(",") if t})] += 1
         batch_events[events_here] += 1
@@ -148,9 +139,8 @@ def derive(corpus: pathlib.Path) -> dict:
 def read_reported(shape_log: pathlib.Path) -> dict[str, Counter]:
     """`logit.shape.batch.events` and `logit.shape.attributes` for the statsd tap, as multisets.
 
-    Its own reader, deliberately -- see this module's docstring. It needs only two facts out of
-    the render: which block an `attrs` line puts us in, and the `samples=[...]` on a `metric`
-    line, so the whole grammar it implements is those two shapes.
+    Its own reader (see the module docstring). It needs only which block an `attrs` line opens
+    and the `samples=[...]` on a `metric` line.
     """
     reported = {"batch_events": Counter(), "attributes": Counter()}
     in_scope = False

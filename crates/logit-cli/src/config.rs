@@ -1,17 +1,14 @@
 //! Loads a config file: read from disk, resolve every `!env VAR_NAME` tag against the process
 //! environment, then deserialize into [`Config`].
 //!
-//! `!env` is a YAML tag, resolved on the parsed [`serde_norway::Value`] tree *before* serde ever
-//! sees the document -- config types stay untouched by it (no env-specific field like the old
-//! `token_env` needed ever again), and the published JSON Schema needs no widening to admit it on
-//! every field. See `docs/adr/env-yaml-tag.md` for the design rationale and its accepted
-//! rough edges (also `docs/known-gaps.md`).
+//! `!env` is resolved on the parsed [`serde_norway::Value`] tree before serde sees the document,
+//! so config types need no env-specific fields and the JSON Schema needs no widening. See
+//! `docs/adr/env-yaml-tag.md`, and `docs/known-gaps.md` for its rough edges.
 //!
-//! This is the *only* place a config file should be read and parsed -- `logit run`, `logit
-//! validate`, and `logit graph` all go through [`load`], so `!env` (and its unknown-tag guard,
-//! see below) can't silently stop applying on one of the three. Every `!env` reference must
-//! resolve, unconditionally: there's no lenient mode for `logit graph` to render a config with
-//! secrets left unset -- see the ADR's Alternatives for why that was tried and reverted.
+//! The only place a config file is read and parsed: `logit run`, `logit validate`, and
+//! `logit graph` all go through [`load`], so `!env` and the unknown-tag guard apply to all three.
+//! Every `!env` reference must resolve; there's no lenient mode for `logit graph` (the ADR's
+//! "Alternatives considered").
 
 use anyhow::Context;
 use logit_config::Config;
@@ -24,16 +21,14 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     load_with(path, &|name| std::env::var(name).ok())
 }
 
-/// [`load`] with an injectable environment lookup, used by repository-wide config tests without
-/// mutating the test process's environment.
+/// [`load`] with an injectable environment lookup, so tests never mutate the process environment.
 fn load_with(path: &Path, lookup: &impl Fn(&str) -> Option<String>) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
     parse(&raw, lookup).with_context(|| format!("parsing config file {}", path.display()))
 }
 
-/// The rest of [`load`], parameterized over the environment lookup so tests can exercise `!env`
-/// resolution without touching the real process environment.
+/// [`load_with`] minus the file read.
 fn parse(raw: &str, lookup: &impl Fn(&str) -> Option<String>) -> anyhow::Result<Config> {
     let value: Value = serde_norway::from_str(raw)?;
     let mut path = Vec::new();
@@ -42,18 +37,16 @@ fn parse(raw: &str, lookup: &impl Fn(&str) -> Option<String>) -> anyhow::Result<
     serde_norway::from_value(value).map_err(|err| annotate(err, &substitutions))
 }
 
-/// One `!env` reference that resolved to something other than a string, recorded so a
-/// deserialization failure can point at it -- the most likely cause when a field expecting a
-/// string (a token, a URL) got a `!env`-supplied number or bool instead.
+/// A `!env` reference that resolved to a non-string, recorded so a deserialization failure can
+/// point at it: the likely cause when a string field (a token, a URL) got a number or bool.
 struct Substitution {
     path: String,
     var: String,
     type_name: &'static str,
 }
 
-/// If deserialization failed and any `!env` substitution resolved to a non-string value, append a
-/// note listing them (path, variable name, and resolved *type* -- never the value, since these
-/// are exactly the fields most likely to hold a secret).
+/// Appends a note naming each non-string `!env` substitution by path, variable, and resolved type,
+/// never the value: these are the fields most likely to hold a secret.
 fn annotate(err: serde_norway::Error, substitutions: &[Substitution]) -> anyhow::Error {
     if substitutions.is_empty() {
         return err.into();
@@ -98,8 +91,7 @@ fn path_string(path: &[PathSeg]) -> String {
     }
 }
 
-/// A short name for a `Value`'s kind, used both in error messages (`!env` used on a non-string
-/// argument) and to label a substitution's resolved type.
+/// A short name for a `Value`'s kind, for error messages and a substitution's resolved type.
 fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -113,12 +105,11 @@ fn value_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Recursively walks `value`, replacing every `!env VAR_NAME` tag with `VAR_NAME`'s value from
-/// `lookup`, re-parsed as a YAML scalar (so `!env PORT` with `PORT=8125` becomes the integer
-/// `8125`, not the string `"8125"` -- makes `!env` usable in any field, not just string ones).
-/// Rejects any other YAML tag outright: `serde_norway` silently drops an unrecognized tag on a
-/// non-enum target, so a typo'd `!emv` would otherwise deserialize as the literal variable name
-/// instead of failing.
+/// Replaces every `!env VAR_NAME` tag with `VAR_NAME`'s value re-parsed as a YAML scalar, so
+/// `!env PORT` works in an integer field.
+///
+/// Rejects any other non-core tag: `serde_norway` drops an unrecognized tag on a non-enum target,
+/// so a typo'd `!emv` would otherwise deserialize as the literal variable name.
 fn resolve(
     value: Value,
     lookup: &impl Fn(&str) -> Option<String>,
@@ -156,9 +147,8 @@ fn resolve(
             if tag == "env" {
                 resolve_env_tag(value, tag, lookup, path, substitutions)
             } else if tag.to_string().starts_with("!!") {
-                // A standard YAML core-schema tag (`!!str`, `!!int`, ...) -- not ours to
-                // interpret, but its contents might still nest an `!env` (however unlikely in
-                // practice), so recurse rather than skip.
+                // A core-schema tag (`!!str`, `!!int`, ...) isn't ours to interpret, but its
+                // contents could nest an `!env`.
                 let value = resolve(value, lookup, path, substitutions)?;
                 Ok(Value::Tagged(Box::new(TaggedValue { tag, value })))
             } else {
@@ -203,9 +193,9 @@ fn resolve_env_tag(
     Ok(resolved)
 }
 
-/// Re-parses an env var's raw string as a YAML scalar: `8125` becomes an integer, `true`/`false`
-/// a bool, anything else -- including a value that happens to parse as a mapping or sequence --
-/// stays the literal string. An empty variable is the empty string, never null.
+/// Re-parses an env var's value as a YAML scalar: `8125` becomes an integer, `true` a bool, and
+/// anything else, including something that parses as a mapping or sequence, stays the string. An
+/// empty variable is the empty string, never null.
 fn scalar_from_env(raw: String) -> Value {
     if raw.is_empty() {
         return Value::String(raw);
@@ -231,6 +221,8 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
+        // `perf/scenarios/` and `script/shape-survey`'s capture configs run only out of CI, so a
+        // field rename must fail here, not on their next run.
         let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
             std::fs::read_dir(&perf_scenarios_dir)
@@ -238,11 +230,6 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // The data-shape survey's own capture configs (`script/shape-survey`,
-        // docs/plans/data-shape-survey.md). They are ordinary `logit` YAML run against real
-        // traffic, so they join this glob for the same reason `perf/scenarios/` does: a component
-        // field rename must not leave a config that only fails the next time somebody runs a
-        // 15-minute capture with it.
         let shape_survey_dir = root.join("tools/shape-survey/configs");
         configs.extend(
             std::fs::read_dir(&shape_survey_dir)
@@ -256,9 +243,8 @@ mod tests {
         for path in configs {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
-                // `examples/prometheus-remote-write-send.yaml`'s `headers:` map -- the whole
-                // header value, `Bearer ` prefix included, since `!env` substitutes a field
-                // rather than interpolating into one.
+                // The whole header value, `Bearer ` included: `!env` substitutes a field, it
+                // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {
                     Some("Bearer logit-test-token".to_string())
                 }
@@ -282,11 +268,7 @@ mod tests {
         resolve(value, lookup, &mut Vec::new(), &mut Vec::new())
     }
 
-    /// `BufferConfig`'s `human_bytes`/`humantime_serde_duration` codecs are unit-tested against
-    /// `serde_json` in `logit-config` itself, a different `Deserializer` impl whose
-    /// `deserialize_any` behavior isn't guaranteed to match `serde_norway`'s -- this confirms they
-    /// also work through the actual production path (`parse`, via `serde_norway::from_value`),
-    /// not just in isolation.
+    /// `BufferConfig`'s codecs, unit-tested only against `serde_json`, also work through `parse`.
     #[test]
     fn buffer_config_round_trips_through_the_real_yaml_path() {
         let yaml = r#"
@@ -321,9 +303,7 @@ components:
         assert_eq!(out.buffer.shutdown_grace, std::time::Duration::from_secs(10));
     }
 
-    /// `sample`'s `key: trace_id` is a bare YAML string naming a unit variant, and `{attribute:
-    /// x}` a one-key map -- both through the real YAML path, not just `serde_json`, along with an
-    /// `always_keep.value: true` that must stay a `Bool` (`SetValue`'s untagged order).
+    /// `sample`'s unit-variant and map `key:` forms and a `Bool` `always_keep.value` read via YAML.
     #[test]
     fn sample_key_and_override_read_through_the_real_yaml_path() {
         let yaml = r#"
@@ -365,10 +345,7 @@ components:
         }
     }
 
-    /// The quoted-bare-number form of `max_bytes` (as opposed to `"64MiB"` above) through the
-    /// same real YAML path. `human_bytes` is string-only, both directions (an unquoted YAML
-    /// integer is rejected -- see `crates/logit-config/src/lib.rs`'s `human_bytes` module doc
-    /// comment for why), so this must be quoted.
+    /// A quoted bare-number `max_bytes` reads via YAML (`human_bytes` rejects an unquoted one).
     #[test]
     fn buffer_config_quoted_bare_number_max_bytes_round_trips_through_the_real_yaml_path() {
         let yaml = r#"
@@ -456,10 +433,7 @@ components:
         assert!(err.to_string().contains("components.out.token"), "got: {err}");
     }
 
-    /// `logit graph` used to get a lenient mode that substituted a placeholder for a missing
-    /// variable so it could still render a config's shape without every secret set -- reverted:
-    /// see `docs/adr/env-yaml-tag.md`'s Alternatives. Every `!env` reference must resolve,
-    /// unconditionally, for all three commands.
+    /// A missing variable errors in any field: no lenient mode (`docs/adr/env-yaml-tag.md`).
     #[test]
     fn a_missing_variable_errors_regardless_of_which_field_it_is_in() {
         let err = resolve_yaml("interval: !env WINDOW", &env(&[])).expect_err("expected an error");

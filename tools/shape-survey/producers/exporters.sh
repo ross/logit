@@ -1,42 +1,21 @@
-# The `exporters` producer: official Prometheus exporters, in their **default** configuration,
-# scraped by `prometheus_in` and measured by `shape`.
+# The `exporters` producer: official Prometheus exporters in default configuration, scraped by
+# `prometheus_in`. configs/exporters.yaml's header maps `logit.shape.*` onto "labels per series"
+# and "series per scrape".
 #
-# Sourced by script/shape-survey, which discovers this file by glob -- everything specific to this
-# producer lives here and in tools/shape-survey/configs/exporters.yaml (read that file's header
-# first: it is where the mapping from `logit.shape.*` to "labels per series" and "series per
-# scrape" is written down).
+# Representativeness and caveats: README "Producers" and "Caveats each author recorded". Label
+# structure is the exporter's own; series counts are a floor, because every subject is one idle,
+# empty instance. `go_runtime` is a stock `client_golang` registry, what a Go service exposes
+# before anyone adds an application metric.
 #
-# ---------------------------------------------------------------------------------------------
-# WHAT THESE NUMBERS ARE WORTH
-#
-# Good evidence: the **label and series structure** each exporter produces -- how many labels a
-# series carries, how long a label name and a label value are, how many distinct key-sets one
-# exporter's exposition contains, how many series arrive in one scrape response. That structure is
-# a property of the exporter's own metric definitions, and it does not change with load. Nobody
-# publishes it: of the exporters here, only node_exporter commits an exposition fixture at all.
-#
-# Not evidence: **series counts in a real estate.** Every service below is a single idle instance
-# with no data in it -- one empty Postgres database, a Redis with no keyspaces, an nginx serving
-# one location, a node_exporter seeing a container's view of the host rather than a host's. Every
-# per-object family (per database, per table, per keyspace, per device, per filesystem, per vhost)
-# is therefore at its smallest possible value. Series per scrape here is a **floor**.
-#
-# Nor is it evidence about how an application's own instrumentation looks: `go_runtime` below is a
-# stock `client_golang` default registry, which is what a Go service exposes *before* anybody adds
-# an application metric. It is labelled as exactly that.
-# ---------------------------------------------------------------------------------------------
+# Environment: SHAPE_SURVEY_DURATION (default 70s).
 
-#: How long the scrape capture runs, in seconds. The config scrapes every 5s and `prometheus_in`
-#: swallows its first immediate tick, so 70s is >=13 scrapes per target -- comfortably past the
-#: plan's "10 scrapes" box. `SHAPE_SURVEY_DURATION=180 script/shape-survey exporters` for longer.
+#: Capture window in seconds. The config scrapes every 5s and `prometheus_in` skips its first
+#: immediate tick, so 70s is at least 13 scrapes per target.
 SHAPE_SURVEY_EXPORTERS_DURATION_DEFAULT=70
 
-#: `nginx` (open source) exposes nothing to Prometheus by itself: `stub_status` is a module you
-#: turn on, and nginx-prometheus-exporter reads it. That makes this the one target whose subject is
-#: configured rather than default -- but `stub_status` *is* the open-source exporter's only input,
-#: so the exporter itself is still in its default configuration, and its output shape is what any
-#: open-source nginx yields. (NGINX Plus's API would be a bigger, different shape; noted in
-#: provenance.)
+#: Open-source nginx exposes nothing to Prometheus until `stub_status` is turned on, so this is the
+#: one configured subject. `stub_status` is the exporter's only input, so the exporter stays in its
+#: default configuration.
 survey_exporters_nginx_conf() {
     cat <<'EOF'
 server {
@@ -52,8 +31,8 @@ server {
 EOF
 }
 
-# Every service this producer starts, and the readiness check that proves it is up. `<suffix>` is
-# also the container's network alias, which is the hostname configs/exporters.yaml scrapes.
+# Every service this producer starts. Each `<suffix>` is the hostname configs/exporters.yaml
+# scrapes.
 survey_exporters_services() {
     local run_dir="${SURVEY_RUN_DIR}"
 
@@ -68,8 +47,8 @@ survey_exporters_services() {
         -v "${run_dir}/nginx.conf:/etc/nginx/conf.d/default.conf:ro,z" \
         nginx:1.29-alpine
 
-    # The exporters, each with default flags. Only the pointer at what to watch is configured --
-    # that is the one thing an exporter cannot default.
+    # The exporters, with default flags. Only what to watch is configured, which an exporter can't
+    # default.
     survey_start_service node-exporter --ready-http http://node-exporter:9100/metrics -- \
         prom/node-exporter:latest
 
@@ -88,18 +67,15 @@ survey_exporters_services() {
         prom/blackbox-exporter:latest
 }
 
-# The producer's own section of summary.md, generated into the run directory and run there rather
-# than committed beside this file: it is this producer's reading of its own numbers, it reads only
-# `summary.json` (never shape.log -- summarize.py's value->count tables are exact), and keeping it
-# here keeps the producer one file, the way demo.sh generates its config.
+# The producer's own summary.md section, written into the run directory and computed from
+# summary.json alone, so the producer stays one file.
 survey_exporters_section_py() {
     cat <<'PYEOF'
 #!/usr/bin/env python3
 """Renders the `exporters` producer's section of summary.md from /out/summary.json.
 
-Everything here is a statement about *Prometheus exposition*, which is why it is not in
-summarize.py: at a scrape-mode `prometheus_in` tap, `logit.shape.attributes` is labels per series
-and `logit.shape.batch.events` is series per scrape.
+At a scrape-mode `prometheus_in` tap, `logit.shape.attributes` is labels per series and
+`logit.shape.batch.events` is series per scrape.
 """
 
 import json
@@ -107,7 +83,7 @@ import pathlib
 
 SUMMARY = json.loads(pathlib.Path("/out/summary.json").read_text())
 
-# What each `prometheus_in` component was actually pointed at, for the table's first column.
+# What each `prometheus_in` component scraped, for the table's first column.
 SUBJECTS = {
     "node_exporter": "prom/node-exporter, container's view of the host",
     "postgres_exporter": "postgres-exporter -> one idle, empty postgres",

@@ -1,13 +1,17 @@
-//! `logit run`: resolves a config's component graph (`docs/design/pipeline-graph.md`,
-//! `docs/adr/component-graph-configuration.md`) into a runnable [`NodeSpec`] per component
-//! and hands it to `logit_pipeline::run`. See `docs/OVERVIEW.md` for the shape (`logit` as
-//! sidecar, host agent, or central aggregator is all just this, differing only by config).
+//! `logit run`: resolves a config's component graph (`docs/design/pipeline-graph.md`) into a
+//! [`NodeSpec`] per component and hands them to `logit_pipeline::run`.
 //!
-//! This module is now just the *registry* -- graph resolution/validation
-//! (`logit_pipeline::graph`) and the node runtime (`logit_pipeline::run`) both live in
-//! `logit-pipeline`; what's left here is turning one component's `ComponentKind` into the boxed
-//! implementation the runtime actually runs, which is exactly the "kind → impl" mapping this
-//! project has always kept in one place (previously `build_input`/`build_output`).
+//! Only the kind → implementation registry lives here: graph resolution/validation
+//! (`logit_pipeline::graph`) and the node runtime are in `logit-pipeline`. The free functions
+//! below are where each config type crosses into its implementation's own type: `logit-inputs`
+//! and `logit-outputs` don't depend on `logit-config` (`docs/design/pipeline-graph.md`'s "Crate
+//! layout"), and `logit-transforms` and `logit-pipeline` (`OverflowPolicy`, `DeliveryPosture`)
+//! keep their own types.
+//!
+//! Two check layers: `graph::resolve`, which [`validate_semantics`] runs for `logit validate`, and
+//! `build_spec`, which only `logit run` reaches. `build_spec` is where a referenced file is read
+//! (TLS material, `lua_file`, `types_db`), a UDP sink binds its local socket, and a check with no
+//! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
 use crate::config;
 use anyhow::Context;
@@ -68,18 +72,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The operator-chosen id, live [`Registry`], and `logs` threshold of a config's `internal`
-/// component -- what [`run_pipelines`] needs to [`logit_core::TelemetryLayer::activate`] it
-/// (`docs/plans/operator-surface.md`, workstream D). `None` means no `internal` component, so no
-/// `Registry` was built and the layer is never activated.
+/// A config's `internal` component: what [`run_pipelines`] needs to
+/// [`logit_core::TelemetryLayer::activate`] the layer. Absent when there's no `internal`, in which
+/// case no `Registry` is built and the layer is never activated.
 pub struct InternalInfo {
     pub registry: Arc<Registry>,
     pub id: String,
     pub logs: logit_config::InternalLogs,
 }
 
-/// `InternalInfo::logs` -> the threshold [`logit_core::TelemetryLayer::activate`] takes, or
-/// `None` for `off` (which means: never activate the layer at all).
+/// `InternalInfo::logs` -> the threshold [`logit_core::TelemetryLayer::activate`] takes; `None`
+/// for `off`, which never activates the layer.
 fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Severity> {
     match logs {
         logit_config::InternalLogs::Off => None,
@@ -91,33 +94,25 @@ fn severity_for_logs(logs: logit_config::InternalLogs) -> Option<logit_core::Sev
 /// Loads `path`, resolves its component graph, and runs it until the first component fails or a
 /// shutdown signal is received.
 ///
-/// Every listener/sink task loops forever in normal operation (a listener keeps listening, a
-/// sink keeps draining its inbox), so in the happy path this simply never returns -- matching
-/// "this is a service," not "this is a batch job." SIGTERM/SIGINT (Ctrl-C on non-Unix) triggers a
-/// graceful drain: every listener stops, which closes its downstream inboxes normally and
-/// triggers each node's existing close-time flush (`logit_pipeline::run_with_shutdown`,
-/// `crates/logit-pipeline/src/runtime.rs`) -- so an in-flight `aggregate` window is emitted rather
-/// than lost. A second signal before that drain finishes exits immediately (exit code 130): a
-/// wedged drain must stay killable by the same signal that started it, which matters once an
-/// unattended restart policy is the thing waiting on this process to actually exit.
+/// SIGTERM/SIGINT (Ctrl-C on non-Unix) starts a graceful drain: every listener stops, closing its
+/// downstream inboxes and triggering each node's close-time flush, so an in-flight `aggregate`
+/// window is emitted rather than lost. A second signal before the drain finishes exits at once
+/// with code 130, so a wedged drain stays killable by the signal that started it.
 ///
-/// `telemetry_layer` is `main`'s already-`.init()`-ed `TelemetryLayer` handle
-/// (`docs/plans/operator-surface.md`, workstream D) -- installed inactive, before any of this
-/// ran (there is no stable API to add a layer to an already-`.init()`-ed subscriber), and
-/// activated here, once the config's own `internal` component (if any) is known.
+/// Every failure before the pipeline reports ready is `RunError::Startup` (exit 1); after, it's a
+/// runtime failure (exit 2). See `docs/deploying.md`'s "Probes and exit codes".
+///
+/// `telemetry_layer` is `main`'s handle, installed inactive by `init_logging` and activated here
+/// once the config's `internal` component is known.
 pub async fn run_pipelines(
     path: PathBuf,
     telemetry_layer: logit_core::TelemetryLayer,
 ) -> Result<(), RunError> {
-    // An unset `!env` variable (a missing token, most likely) fails here, before anything starts
-    // listening.
     let config = config::load(&path).map_err(RunError::Startup)?;
 
-    // `docs/plans/operator-surface.md`'s stable lifecycle event names, for log-based alerting.
-    // Logged before `prepare` (which can still reject the config -- an empty graph, an unknown
-    // source, a cycle) so a config that never gets that far still leaves a `starting` line behind
-    // naming what was attempted; `config.components` (the raw, unresolved map) is what's on hand
-    // at this point, not yet the resolved `Graph`.
+    // `starting`/`exiting` are stable lifecycle event names for log-based alerting
+    // (`docs/deploying.md`'s "Self-logging"). Logged before `prepare`, which can still reject the
+    // config, so a config that fails resolution still leaves a `starting` line.
     tracing::info!(
         target: "logit",
         config = %path.display(),
@@ -137,21 +132,16 @@ pub async fn run_pipelines(
         }
     }
 
-    // Independent listener from the one `run_with_shutdown` races internally (below) -- multiple
-    // concurrent listeners on the same signal kind are supported and all get notified, so this
-    // doesn't compete with or consume the first one. Aborted once `run_with_shutdown` returns so
-    // it doesn't linger if shutdown never happens.
+    // Every concurrent listener on a signal kind is notified, so this doesn't consume the one
+    // `run_with_telemetry` races on. Aborted once that returns.
     let kill_switch = tokio::spawn(async {
         shutdown_signal().await;
         shutdown_signal().await;
         std::process::exit(130);
     });
 
-    // `admin.bind` set: bind its listener *synchronously*, here, before `run_with_telemetry` ever
-    // starts -- a bind failure is `RunError::Startup`, the same "fail before anything else spawns"
-    // guarantee `Input::bind`'s own pre-pass gives every ordinary listener. Not set: the
-    // `Readiness::disabled()` placeholder every test and every config without an `admin:` block
-    // already uses.
+    // The admin listener binds here, before `run_with_telemetry` spawns anything, so a bind
+    // failure is `RunError::Startup`: the guarantee `Input::bind`'s pre-pass gives every listener.
     let (readiness, admin_server) = match admin_bind {
         Some(bind) => {
             let listener = tokio::net::TcpListener::bind(&bind)
@@ -159,13 +149,9 @@ pub async fn run_pipelines(
                 .with_context(|| format!("admin: binding '{bind}'"))
                 .map_err(RunError::Startup)?;
             let (readiness, readiness_rx) = Readiness::channel();
-            // Deliberately *not* given a shutdown listener of its own. The drain that a signal
-            // starts is exactly the window `/readyz` has to answer `503 draining` in -- several
-            // seconds of sink flush and listener grace (`buffer.shutdown_grace`,
-            // `receive.shutdown_grace`) during which an orchestrator must be told "stop routing
-            // here, I am still finishing", not handed a refused connection it cannot tell from a
-            // crash. `abort()` below, once `run_with_telemetry` has already returned, is the sole
-            // teardown.
+            // No shutdown listener of its own: the drain a signal starts is the window `/readyz`
+            // answers `503 draining` in, and a refused connection then looks like a crash. The
+            // `abort()` below, after `run_with_telemetry` returns, is the only teardown.
             (readiness, Some(tokio::spawn(crate::admin::serve_on(listener, readiness_rx))))
         }
         None => (Readiness::disabled(), None),
@@ -187,32 +173,21 @@ pub async fn run_pipelines(
     result
 }
 
-/// A resolved `Graph`, one built `NodeSpec` and one [`Telemetry`] handle per component, and the
-/// config's own [`InternalInfo`] if it has an `internal` component -- [`prepare`]'s return type,
-/// factored out purely to keep clippy's `type_complexity` lint happy. The config's `admin` block
-/// is deliberately not in here: [`run_pipelines`] clones it off the `Config` before handing the
-/// config to [`prepare`], which consumes it.
+/// [`prepare`]'s return type, named for clippy's `type_complexity`.
 type PrepareResult =
     (graph::Graph, HashMap<String, NodeSpec>, HashMap<String, Telemetry>, Option<InternalInfo>);
 
-/// Resolves a config into a `Graph`, one built `NodeSpec` per component, one [`Telemetry`] handle
-/// per component, and the config's [`InternalInfo`] if it has an `internal` component -- the
-/// shared setup between [`run_pipelines`] and [`run_config`] (the latter used directly by tests
-/// below, which don't need shutdown wiring).
+/// Resolves a config into a `Graph`, a built `NodeSpec` and a [`Telemetry`] handle per component,
+/// and the config's [`InternalInfo`].
 ///
-/// The telemetry map is empty (every handle [`Telemetry::default`], the disabled no-op) unless
-/// `config` contains an `internal` component, in which case a single process-wide [`Registry`] is
-/// built and shared by every component -- one live handle per component id, reused for both its
-/// own instrumentation (`build_spec`, layer 3) and the node runtime's uniform instrumentation
-/// (`logit_pipeline::run_with_telemetry`, layer 2), so both land in the same buffer and drain
-/// together. See `docs/design/internal-telemetry.md`.
+/// Every handle is [`Telemetry::default`] (a no-op) unless `config` has an `internal` component.
+/// Then one process-wide [`Registry`] is built, and each component's handle serves both its own
+/// instrumentation (`build_spec`, layer 3) and the node runtime's (layer 2), so both drain from
+/// one buffer. See `docs/design/internal-telemetry.md`.
 fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let graph = graph::resolve(config)?;
 
-    // Read off the config's own `internal` component (graph rule 13 already guarantees at most
-    // one), rather than always calling `Registry::new`'s default -- an operator who set
-    // `span_sample_rate` explicitly (`demo/logit.yaml`'s `1.0`, say) would otherwise have their
-    // choice silently ignored.
+    // Graph rule 13 allows at most one `internal`; its `span_sample_rate` configures the registry.
     let internal_component = graph.components.iter().find_map(|(id, c)| match &c.kind {
         logit_config::ComponentKind::Internal { span_sample_rate, logs, .. } => {
             Some((id.clone(), *span_sample_rate, *logs))
@@ -222,11 +197,8 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     let registry: Option<Arc<Registry>> =
         internal_component.as_ref().map(|(_, rate, _)| Registry::with_span_sampling(*rate));
 
-    // Sorted, not raw `HashMap` iteration order: a startup failure (a missing lua_file) should be
-    // reproducible across runs, not depend on hash-seed-driven iteration order -- two
-    // independently-broken components should always report the same one first. Also what makes
-    // `Registry::drain`'s output order reproducible, incidentally -- components register with the
-    // registry in this same order.
+    // Sorted, so with two broken components the same one reports first on every run, and
+    // components register with the `Registry` (and so drain) in a stable order.
     let mut ids: Vec<&String> = graph.components.keys().collect();
     ids.sort();
 
@@ -248,10 +220,8 @@ fn prepare(config: Config, base_dir: PathBuf) -> anyhow::Result<PrepareResult> {
     Ok((graph, specs, telemetry, internal))
 }
 
-/// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix, where `SignalKind` doesn't exist). Each
-/// call installs its own independent listener -- see `run_pipelines`, which calls this three
-/// times (the graceful-shutdown trigger, plus twice more for the kill switch) and relies on all
-/// three being notified independently on the same signal.
+/// Waits for one SIGTERM or SIGINT (Ctrl-C on non-Unix). Each call installs its own listener, and
+/// `run_pipelines` relies on its three calls each being notified.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -269,8 +239,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// Test-only: [`run_pipelines`] minus shutdown handling and the on-disk `path`, so tests can drive
-/// an in-memory `Config` directly without a signal handler racing their assertions.
+/// [`run_pipelines`] for an in-memory `Config`, with no signal handler to race a test.
 #[cfg(test)]
 async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     let (graph, specs, telemetry, _internal) = prepare(config, base_dir)?;
@@ -285,34 +254,26 @@ async fn run_config(config: Config, base_dir: PathBuf) -> anyhow::Result<()> {
     .map_err(RunError::into_inner)
 }
 
-/// The same checks `logit run` needs before spawning anything, exposed for `logit validate` to
-/// share -- so the two commands can never again disagree about whether a config is acceptable.
-/// Takes `Config` by value (graph resolution consumes it) rather than by reference: `logit
-/// validate` has no further use for the config afterward either.
+/// The graph checks `logit run` makes before building anything, shared with `logit validate`.
+///
+/// Doesn't call `build_spec`, so its checks (a referenced file, a syslog `sd_id`) pass here and
+/// fail only at `run`.
 pub fn validate_semantics(config: Config) -> anyhow::Result<()> {
     graph::resolve(config)?;
     Ok(())
 }
 
-/// Turns one resolved component's kind into the boxed implementation the node runtime actually
-/// runs. The single source of truth for which `ComponentKind`s this binary can build. The match
-/// is exhaustive over `ComponentKind` -- there is no fallback arm, and none is needed:
-/// `graph::resolve`'s rule 8 rejects every kind `is_implemented` doesn't recognize before this
-/// function is ever called. Every declared kind is buildable again as of the perf harness's
-/// W2/W3 (`generate_in`, `null_out`), so there is no "declared but not yet implemented" arm left
-/// here either.
+/// Builds the boxed implementation the node runtime runs for one resolved component.
 ///
-/// `id` attaches a [`Diagnostics`] to every component that emits one
-/// (`docs/adr/service-lifecycle-and-output-retry.md`) via each kind's own `with_diagnostics`
-/// builder -- not a constructor parameter, so none of the ~60 existing tests across these four
-/// kinds needed to change.
+/// The match is exhaustive with no fallback arm: adding a `ComponentKind` variant doesn't compile
+/// until it has an arm here. Graph rule 8 rejects any kind `is_implemented` doesn't list before
+/// this runs.
 ///
-/// `registry` is `Some` only when the config being built contains an `internal` component
-/// (`prepare` below) -- every component gets a [`Telemetry`] handle from it either way
-/// (`Telemetry::default()`, the disabled no-op, when `registry` is `None`), attached to its own
-/// `Diagnostics` (so every existing `warn_throttled` call becomes a metric for free) and, for the
-/// two kinds instrumented as a worked example (`statsd_in`, `influxdb_out`), to the component
-/// itself. See `docs/design/internal-telemetry.md`.
+/// `id` names the component's [`Diagnostics`] (`docs/adr/service-lifecycle-and-output-retry.md`).
+/// `registry` is `Some` only when the config has an `internal` component; otherwise every
+/// [`Telemetry`] handle is the no-op default. The handle goes on a component's `Diagnostics`, so
+/// every `warn_throttled` call is also a metric, and on the component itself where it records
+/// points of its own. See `docs/design/internal-telemetry.md`.
 fn build_spec(
     id: &str,
     component: &ResolvedComponent,
@@ -320,18 +281,15 @@ fn build_spec(
     registry: Option<&Arc<Registry>>,
 ) -> anyhow::Result<(NodeSpec, Telemetry)> {
     use logit_config::ComponentKind::*;
-    // Never moved into a match arm below (every arm clones instead) -- kept alive to return
-    // alongside `spec`, so `prepare` can hand this exact handle to the node runtime too
-    // (`logit_pipeline::run_with_telemetry`), landing layer 2 and layer 3 in the same buffer.
+    // Every arm clones this rather than moving it: it's returned too, so the node runtime's layer 2
+    // points land in the same buffer as the component's layer 3.
     let telemetry: Telemetry = registry
         .map(|r| r.telemetry_for(id, component.kind_name(), component.role().as_str()))
         .unwrap_or_default();
     let spec = match &component.kind {
-        // The transport picks both the constructor and the matching `receive:` translation, the
-        // same shape the `SyslogIn` arm below uses: a TCP listener has no receive queue, so it
-        // takes `tcp_receive_config`'s four batching/shutdown fields, not `receive_config`'s eight
-        // (graph rule 17). `tls:` is TCP-only -- rule 43 has already rejected it under UDP, and
-        // `StatsdInput::with_tls` refuses it again on that arm.
+        // The transport picks the constructor and the `receive:` translation: a TCP listener has
+        // no receive queue, so it takes `tcp_receive_config`, not `receive_config` (graph rule 17).
+        // `tls:` is TCP-only: rule 43 rejects it under UDP, and `with_tls` refuses it again.
         StatsdIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::StatsdTransport::Udp => {
@@ -342,8 +300,7 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // Both are a no-op on the UDP arm, which has no connection to bound -- rules 45 and
-            // 53 have already rejected a value there, so nothing is silently discarded here.
+            // No-ops under UDP, where rules 45 and 53 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
@@ -351,12 +308,9 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        // `types_db` paths resolve against the config file's directory, exactly as `tail_in`'s
-        // `paths` and `lua_file`'s script do, and are read **here**, at startup: an unreadable or
-        // unparseable file is a config error that stops the process before it reports ready, not a
-        // listener that quietly runs with no data-source names (see
-        // `logit_proto::collectd::TypesDb::load`). One `Arc` per component, shared with its
-        // decoder.
+        // `types_db` paths resolve against the config file's directory, like every path here, and
+        // are read at startup: a bad file stops the process before it reports ready rather than
+        // leaving a listener with no data-source names.
         CollectdIn { bind, types_db } => {
             let mut input = CollectdInput::new(bind.clone())
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -370,15 +324,10 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        // Both transports go through one component (`logit_inputs::graphite::GraphiteInput`),
-        // which picks its own shared driver from `transport`: `UdpListener` under `udp`,
-        // `TcpListener` under `tcp`. `with_receive` is safe to call either way -- graph rule 17
-        // has already rejected a queue-bounding field on the TCP case, so what reaches the stream
-        // driver is only the batch-assembly half it actually reads. `handshake_timeout` and
-        // `idle_timeout` are both no-ops on the UDP arm, which has no connection to bound (rules
-        // 45 and 53 have already rejected a value there); `tls:` is TCP-only -- rule 43 has
-        // already rejected it under UDP, and `GraphiteInput::with_tls` refuses it again on that
-        // arm.
+        // `GraphiteInput` picks its own driver from `transport`, so `with_receive` is safe on
+        // either: rule 17 rejects the queue fields under TCP, leaving only the batch-assembly half
+        // the stream driver reads. The two timeouts are no-ops under UDP (rules 45 and 53 reject a
+        // value there); `tls:` is TCP-only (rule 43), and `with_tls` refuses it again.
         GraphiteIn {
             bind,
             transport,
@@ -406,11 +355,7 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        // The transport picks both the constructor and the matching `receive:` translation:
-        // a TCP listener has no receive queue, so it takes `tcp_receive_config`'s four
-        // batching/shutdown fields, not `receive_config`'s eight (graph rule 17,
-        // `docs/adr/syslog-tcp-ingress-and-tls.md`). `tls:` is TCP-only -- rule 43 has already
-        // rejected it under UDP, and `SyslogInput::with_tls` refuses it again on that arm.
+        // The `StatsdIn` arm's shape (`docs/adr/syslog-tcp-ingress-and-tls.md`).
         SyslogIn { bind, transport, tls, handshake_timeout, idle_timeout } => {
             let mut input = match transport {
                 logit_config::SyslogTransport::Udp => {
@@ -421,8 +366,7 @@ fn build_spec(
             }
             .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry.clone())
-            // Both are a no-op on the UDP arm, which has no connection to bound -- rules 45 and
-            // 53 have already rejected a value there, so nothing is silently discarded here.
+            // No-ops under UDP, where rules 45 and 53 reject a value.
             .with_handshake_timeout(*handshake_timeout)
             .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
@@ -434,9 +378,8 @@ fn build_spec(
             let mut input = OtlpInput::new(bind.clone(), otlp_in_transport(*protocol))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone())
-                // `handshake_timeout` does double duty on this listener: the pre-request budget,
-                // and the grace an idle close gives `hyper` to shut down in -- so it is passed
-                // once and read twice inside `OtlpInput` (`docs/adr/idle-connection-timeout.md`).
+                // `OtlpInput` reads `handshake_timeout` twice: as the pre-request budget and as
+                // the grace an idle close gives `hyper` (`docs/adr/idle-connection-timeout.md`).
                 .with_handshake_timeout(*handshake_timeout)
                 .with_idle_timeout(*idle_timeout);
             if let Some(tls) = tls {
@@ -444,12 +387,9 @@ fn build_spec(
             }
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
-        // Two modes, one kind -- graph rule 55 has already established that exactly one of
-        // `scrape_targets`/`bind` is set, so this dispatches on `bind` and trusts it. The two
-        // modes are two types (`PrometheusInput`, `PrometheusReceiver`) rather than one enum: a
-        // scrape client and an HTTP listener share no field and no builder, and `NodeSpec::Input`
-        // already takes a `Box<dyn Input>`, so the kind's config is the only thing that needs to
-        // know about both.
+        // Graph rule 55 guarantees exactly one of `scrape_targets`/`bind`, so this dispatches on
+        // `bind`. The modes are two types, not one enum: a scrape client and an HTTP listener
+        // share no field or builder, and `NodeSpec::Input` boxes either.
         PrometheusIn {
             scrape_targets,
             interval,
@@ -468,9 +408,8 @@ fn build_spec(
                         .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                         .with_telemetry(telemetry.clone())
                         .with_idle_timeout(*idle_timeout)
-                        // `max_families: 0` is the operator's "off" and the receiver reads it as
-                        // one, so this is passed through unconditionally rather than branched on
-                        // here -- rule 55 has already rejected a zero `ttl`.
+                        // Unconditional: the receiver reads `max_families: 0` as off, and rule 55
+                        // rejects a zero `ttl`.
                         .with_metadata_cache(metadata_cache.max_families, metadata_cache.ttl);
                     if let Some(bind_tls) = bind_tls {
                         receiver =
@@ -531,10 +470,8 @@ fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
-        // `span_sample_rate`/`logs` are both read by `prepare` (above) -- the former to build the
-        // `Registry` itself (already baked into the handle this arm receives), the latter to
-        // decide whether `main::init_logging` stacks a `TelemetryLayer` at all. Neither is this
-        // arm's concern.
+        // `prepare` reads `span_sample_rate` to build the `Registry`, and `logs` decides whether
+        // `run_pipelines` activates the `TelemetryLayer`.
         Internal { interval, span_sample_rate: _, logs: _ } => {
             let registry = registry
                 .cloned()
@@ -549,11 +486,9 @@ fn build_spec(
             )
         }
 
-        // Every `?` below is unreachable in practice: graph rule 42 has already parsed every one
-        // of these template strings and checked every placeholder in it against the same
-        // predicate `logit_inputs::generate`'s resolver mirrors. They stay errors rather than
-        // `expect`s anyway -- this is the config boundary, and a rule and a resolver that drift
-        // apart should fail startup with the resolver's own message, not panic.
+        // Rule 42 has already parsed every template and checked its placeholders, so these `?`s
+        // don't fire. They stay errors, not `expect`s, so a rule and resolver that drift apart fail
+        // startup instead of panicking.
         GenerateIn { count, batch, rate, event, resource } => {
             let mut input = GenerateInput::new(*count, *batch)
                 .with_rate(*rate)
@@ -577,10 +512,8 @@ fn build_spec(
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
-        // `component.targets` (`docs/adr/target-components.md`) is what the `NodeSpec::Lua` spawn
-        // arm turns into `run_lua`'s name -> slot table inside the VM, and what it resolves its
-        // slot-ordered target `Fanout`s from -- both from this same `ResolvedComponent` field, not
-        // carried on `NodeSpec::Lua` itself.
+        // The runtime reads a Lua router's `targets:` off the `ResolvedComponent`, not
+        // `NodeSpec::Lua` (`docs/adr/target-components.md`).
         Lua { script, interval } => NodeSpec::Lua { script: script.clone(), interval: *interval },
         LuaFile { lua_file, interval } => {
             let script_path = base_dir.join(lua_file);
@@ -662,9 +595,7 @@ fn build_spec(
             ScaleTransform::new(fields.iter().map(|(k, v)| (k.clone(), *v)).collect())
                 .with_telemetry(telemetry.clone()),
         )),
-        // The `?` here is unreachable in practice: `graph::resolve`'s rule 31 already compiled
-        // this exact pattern successfully, so `RegexParser::new` can only fail on a pattern
-        // validation let through -- which it doesn't.
+        // Rule 31 has already compiled this pattern, so the `?` doesn't fire.
         Regex { pattern, field } => NodeSpec::Transform(Box::new(
             RegexParser::new(pattern, field.as_deref())?.with_telemetry(telemetry.clone()),
         )),
@@ -690,10 +621,8 @@ fn build_spec(
             KeepValuesTransform::new(to_allow_lists(resource), to_allow_lists(attributes))
                 .with_telemetry(telemetry.clone()),
         )),
-        // `with_name(id)` is what makes the `tap` tag possible: the registry already knows this
-        // component's own id (it builds the telemetry handle above from it), so two `shape` taps
-        // feeding one `aggregate` stay distinct series with no new plumbing
-        // (`docs/adr/shape-observer-component.md`).
+        // `with_name(id)` becomes the `tap` tag, so two `shape` taps feeding one `aggregate` stay
+        // distinct series (`docs/adr/shape-observer-component.md`).
         Shape { interval, resource, max_tracked_keys, max_tracked_keysets } => {
             NodeSpec::Transform(Box::new(
                 ShapeTransform::new(*interval)
@@ -711,8 +640,8 @@ fn build_spec(
             )
             .with_telemetry(telemetry.clone()),
         )),
-        // The `?` is unreachable in practice: rule 60 already compiled every configured pattern,
-        // and the built-in ones are constants `http_access`'s own tests compile.
+        // Rule 60 has compiled every configured pattern and `http_access`'s tests compile the
+        // built-in ones, so the `?` doesn't fire.
         HttpAccess {
             routes,
             route_other,
@@ -742,10 +671,7 @@ fn build_spec(
             )
             .with_telemetry(telemetry.clone()),
         )),
-        // No conversion helper needed here, unlike `to_set_pairs`/`to_signal_set`:
-        // `ComponentKind::HasProvenance`'s fields are already the plain `Vec<String>`
-        // `HasProvenanceTransform::new` takes -- interning happens inside the transform itself
-        // (`crate::provenance::Matcher::new`), not at the config boundary.
+        // The config's `Vec<String>`s pass straight through; the transform interns them.
         HasProvenance { origin, previous } => NodeSpec::Transform(Box::new(
             HasProvenanceTransform::new(origin.clone(), previous.clone())
                 .with_telemetry(telemetry.clone()),
@@ -785,9 +711,7 @@ fn build_spec(
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
             if let Some(tls) = tls {
-                // `logit_outputs::logit::TlsClientSettings` and `logit_outputs::otlp::
-                // TlsClientSettings` are the same type (`logit_outputs::tls::TlsClientSettings`,
-                // re-exported at both paths) -- `to_tls_client_settings` already builds it.
+                // Both `logit` and `otlp` re-export `logit_outputs::tls::TlsClientSettings`.
                 output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
             }
             NodeSpec::Output(
@@ -800,14 +724,8 @@ fn build_spec(
             let output = match target {
                 StdioTarget::Stdout => StreamOutput::stdout(),
                 StdioTarget::Stderr => StreamOutput::stderr(),
-                // Resolved against `base_dir` (the config file's own directory), exactly as
-                // `LuaFile { lua_file, .. }` resolves its script path above -- `Path::join`
-                // leaves an already-absolute `path` untouched, so this is correct whether `path`
-                // is relative or absolute. Without it, a relative target resolves against the
-                // process's current working directory instead, which for `logit run
-                // /etc/logit/config.yaml` run from an unrelated directory silently writes
-                // somewhere other than "next to the config" (what this kind's own doc comment
-                // promises).
+                // Relative to the config file's directory, not the working directory, as
+                // `StdioTarget` documents; `Path::join` leaves an absolute path untouched.
                 StdioTarget::Path(path) => StreamOutput::open_path(base_dir.join(path))?,
             };
             let output = output.with_format(to_stream_encoder(*format, *compression));
@@ -818,7 +736,7 @@ fn build_spec(
             )
         }
         FileOut { path, rotate, format, compression } => {
-            // Resolved against `base_dir`, exactly as `StdioTarget::Path` above.
+            // Relative to the config file's directory, as `StdioTarget::Path` is.
             let output = StreamOutput::rotating(base_dir.join(path), to_rotate_policy(rotate))?
                 .with_format(to_stream_encoder(*format, *compression))
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -842,10 +760,8 @@ fn build_spec(
             structured_data,
             tls,
         } => {
-            // Eager for UDP (a bad local bind is a config error, `StreamOutput::open_path`'s
-            // precedent) -- requires an active tokio runtime, which holds here since `build_spec`
-            // only ever runs from inside `logit run`'s `runtime.block_on` (`main.rs`), never from
-            // `validate`/`graph`. Lazy for TCP -- see `logit_outputs::syslog::Conn`'s doc comment.
+            // Eager for UDP, so a bad local bind is a startup error; that needs a tokio runtime,
+            // which `logit run` always has here. Lazy for TCP (`logit_outputs::syslog::Conn`).
             let mut output = match transport {
                 logit_config::SyslogTransport::Udp => SyslogOutput::udp(endpoint.clone())?,
                 logit_config::SyslogTransport::Tcp => {
@@ -870,10 +786,8 @@ fn build_spec(
                 .with_encoder(encoder)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
-            // TCP only -- RFC 5425 is syslog over TLS over TCP, and `graph::resolve`'s rule 44
-            // already rejected a `tls:` block under `transport: udp` (`with_tls` errors on the
-            // UDP arm anyway). After `with_diagnostics`, so the `insecure_skip_verify` warning
-            // lands on this component's own diagnostics -- the `otlp_out` arm's ordering above.
+            // TCP only (RFC 5425; rule 44 rejects `tls:` under UDP). After `with_diagnostics`, so
+            // the `insecure_skip_verify` warning lands on this component's diagnostics.
             if let (logit_config::SyslogTransport::Tcp, Some(tls)) = (transport, tls) {
                 output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
             }
@@ -893,7 +807,7 @@ fn build_spec(
             connect_timeout,
             tls,
         } => {
-            // Eager for UDP, lazy for TCP -- same reasoning as `SyslogOut` above.
+            // Eager for UDP, lazy for TCP, as `SyslogOut`.
             let output = match transport {
                 logit_config::StatsdTransport::Udp => StatsdOutput::udp(endpoint.clone())?,
                 logit_config::StatsdTransport::Tcp => {
@@ -907,10 +821,7 @@ fn build_spec(
                 .with_max_packet_bytes(*max_packet_bytes as usize)
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
                 .with_telemetry(telemetry.clone());
-            // TCP only, and `graph::resolve`'s rule 52 already rejected a `tls:` block under
-            // `transport: udp` (`with_tls` errors on the UDP arm anyway). After
-            // `with_diagnostics`, so the `insecure_skip_verify` warning lands on this component's
-            // own diagnostics -- the `SyslogOut` arm's ordering above.
+            // TCP only (rule 52), after `with_diagnostics`, as `SyslogOut`.
             if let (logit_config::StatsdTransport::Tcp, Some(tls)) = (transport, tls) {
                 output = output.with_tls(&to_tls_client_settings(tls), base_dir)?;
             }
@@ -922,9 +833,7 @@ fn build_spec(
         }
 
         CollectdOut { endpoint, max_packet_bytes, hostname } => {
-            // Eager UDP bind, same reasoning as `StatsdOut`/`SyslogOut` above -- collectd's
-            // `network` plugin has no TCP mode to relay onto, so there's no lazy-connect branch
-            // to mirror here.
+            // Eager UDP bind, as `SyslogOut`; collectd's `network` protocol has no TCP mode.
             let output = CollectdOutput::udp(endpoint.clone())?;
             let mut encoder = CollectdEncoder::new();
             if let Some(hostname) = hostname {
@@ -952,7 +861,7 @@ fn build_spec(
             max_frame_bytes,
             connect_timeout,
         } => {
-            // Eager for UDP, lazy for TCP -- the `StatsdOut` split above.
+            // Eager for UDP, lazy for TCP, as `SyslogOut`.
             let output = match graphite_out_transport(*transport) {
                 GraphiteOutTransport::Udp => GraphiteOutput::udp(endpoint.clone())?,
                 GraphiteOutTransport::Tcp => {
@@ -987,15 +896,12 @@ fn build_spec(
             headers,
             endpoint_tls,
         } => {
-            // Graph rule 56 guarantees exactly one of the two mode fields is set, so this is the
-            // one place the choice is made; `PrometheusOutput` carries it from here as a variant
-            // and nothing downstream branches on it again.
+            // Graph rule 56 guarantees exactly one mode field; `PrometheusOutput` carries the
+            // choice as a variant from here on.
             let output: PrometheusOutput = match (bind, endpoint) {
                 (Some(bind), _) => {
-                    // Nothing is bound here: `ExposeOutput::bind` opens the listening socket in
-                    // the runtime's pre-spawn pass (`logit_pipeline::Output::bind`), which is what
-                    // turns an address already in use into a startup failure that names this
-                    // component.
+                    // Not bound here: the runtime's pre-spawn `Output::bind` pass opens it, so an
+                    // address in use is a startup failure naming this component.
                     ExposeOutput::new(bind.clone())
                         .with_path(path.clone())
                         .with_expire_after(*expire_after)
@@ -1012,9 +918,8 @@ fn build_spec(
                     .with_headers(headers)?
                     .with_tls(&to_tls_client_settings(endpoint_tls), base_dir)?
                     .into(),
-                // Unreachable behind rule 56, and an error rather than a panic for the same
-                // reason every other `build_spec` arm reports rather than asserts: `build_spec` is
-                // callable without `graph::resolve` having run.
+                // Unreachable behind rule 56. An error, not a panic: `build_spec` is callable
+                // without `graph::resolve` having run.
                 (None, None) => anyhow::bail!(
                     "component '{id}': prometheus_out needs exactly one of 'bind' or 'endpoint'"
                 ),
@@ -1026,26 +931,22 @@ fn build_spec(
             )
         }
 
-        // The `generate_in` arm's twin, for the same reason -- `logit_outputs::null::NullOutput`
-        // and this arm are the perf harness's W3 (`docs/plans/load-test-harness.md`). Same
-        // `queue_config`/`write_config` treatment as every other sink, so `buffer:` (disk
-        // included) works on it.
+        // A load-test sink (`docs/adr/load-test-harness.md`) that still honours `buffer:`, disk
+        // included, like every other sink.
         NullOut {} => NodeSpec::Output(
             Box::new(NullOutput),
             queue_config(&component.buffer, base_dir),
             write_config(&component.buffer),
         ),
 
-        // A target is a zero-cost alias -- nothing to build (`docs/adr/target-components.md`'s
-        // "Runtime: a target is a zero-cost alias"). `logit_pipeline::run_with_telemetry`'s
-        // pre-spawn pass is what gives it a real `Fanout`; `NodeSpec::Target` exists purely so
-        // the registry stays one spec per component.
+        // Nothing to build (`docs/adr/target-components.md`'s "Runtime: a target is a zero-cost
+        // alias"): the runtime's pre-spawn pass gives it a `Fanout`. `NodeSpec::Target` keeps the
+        // registry at one spec per component.
         Target {} => NodeSpec::Target,
 
-        // `Route::new` resolves every `routes:` value to its target's slot once, here, against
-        // this router's own slot-ordered `component.targets` (`graph::targets_of`'s output,
-        // rules 48/51 guaranteeing every value resolves). No `with_telemetry`: `route` records no
-        // layer-3 points of its own (see `logit_transforms::route`'s module doc).
+        // `Route::new` resolves each `routes:` value to a slot in `component.targets` once (rules
+        // 48 and 51 guarantee each resolves). No `with_telemetry`: `route` records no layer-3
+        // points (`logit_transforms::route`'s module doc).
         Route { by, routes } => {
             NodeSpec::Router(Box::new(RouteTransform::new(by.clone(), routes, &component.targets)))
         }
@@ -1053,13 +954,9 @@ fn build_spec(
     Ok((spec, telemetry))
 }
 
-/// Builds a sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`
-/// / `docs/adr/disk-backed-sink-buffer.md`) -- the sole place `logit_config::OverflowPolicy` is
-/// converted to `logit_pipeline::OverflowPolicy`, since neither config nor pipeline crate can see
-/// both types without violating the dependency direction (`logit-pipeline` depends on
-/// `logit-config`, never the reverse; `docs/design/pipeline-graph.md`'s crate layout).
-/// `buffer.disk` present selects `SinkStoreConfig::Disk`; `path` is resolved against `base_dir`
-/// exactly like `StdioTarget::Path`/`FileOut::path` above.
+/// A sink's `SinkStoreConfig` from its `BufferConfig` (`docs/adr/buffered-sink-delivery.md`,
+/// `docs/adr/disk-backed-sink-buffer.md`). `buffer.disk` selects `SinkStoreConfig::Disk`, its
+/// `path` relative to the config file's directory.
 fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
     match &buffer.disk {
         None => SinkStoreConfig::Memory(SinkQueueConfig {
@@ -1078,9 +975,8 @@ fn queue_config(buffer: &BufferConfig, base_dir: &Path) -> SinkStoreConfig {
     }
 }
 
-/// Builds a sink's `WriteLoopConfig` from its `BufferConfig`. `base_delay` (the initial backoff)
-/// is deliberately not exposed in `BufferConfig` -- only `retry_budget`/`retry_max_delay` are
-/// operator-tunable for now -- so it keeps `RetryConfig::default()`'s value.
+/// A sink's `WriteLoopConfig` from its `BufferConfig`. `base_delay` isn't config-exposed, so it
+/// keeps `RetryConfig::default()`'s value.
 fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
     WriteLoopConfig {
         retry: RetryConfig {
@@ -1093,9 +989,7 @@ fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
     }
 }
 
-/// Translates config's `OtlpProtocol` into `logit-inputs`'s own copy of the same two-value
-/// choice -- `logit-inputs` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s
-/// crate layout), the same reason `overflow_policy`/`delivery_posture` exist just below.
+/// Config's `OtlpProtocol` into `logit-inputs`'s own copy (see the module doc).
 fn otlp_in_transport(protocol: logit_config::OtlpProtocol) -> OtlpInTransport {
     match protocol {
         logit_config::OtlpProtocol::Http => OtlpInTransport::Http,
@@ -1103,12 +997,8 @@ fn otlp_in_transport(protocol: logit_config::OtlpProtocol) -> OtlpInTransport {
     }
 }
 
-/// Parses one `generate_in` template string, naming the dotted config path it came from
-/// (`event.log`, `event.attributes.host`) in any error so an operator is told what to fix.
-///
-/// Graph rule 42 already parsed every one of these, so this never actually fails in a
-/// `logit run`; it stays fallible rather than `expect`ing because a rule and a registry that
-/// drift apart should surface as a startup error, not a panic.
+/// Parses one `generate_in` template, naming its config path (`event.log`,
+/// `event.attributes.host`) in any error. Rule 42 has already parsed it (the `GenerateIn` arm).
 fn parse_generate_template(
     id: &str,
     field: &str,
@@ -1118,8 +1008,7 @@ fn parse_generate_template(
         .map_err(|err| anyhow::anyhow!("component '{id}': '{field}' is not a template: {err}"))
 }
 
-/// Translates config's `GenerateMetricKind` into `logit-inputs`'s own copy of the same three-value
-/// choice -- same reasoning as [`otlp_in_transport`].
+/// Config's `GenerateMetricKind` into `logit-inputs`'s own copy.
 fn generate_metric_kind(kind: logit_config::GenerateMetricKind) -> GenerateMetricKind {
     match kind {
         logit_config::GenerateMetricKind::Sum => GenerateMetricKind::Sum,
@@ -1136,8 +1025,7 @@ fn otlp_out_transport(protocol: logit_config::OtlpProtocol) -> OtlpOutTransport 
     }
 }
 
-/// Translates config's `OtlpCompression` into `logit-outputs`'s own copy of the same choice --
-/// same reasoning as `otlp_out_transport`.
+/// Config's `OtlpCompression` into `logit-outputs`'s own copy.
 fn to_otlp_compression(compression: logit_config::OtlpCompression) -> OtlpOutCompression {
     match compression {
         logit_config::OtlpCompression::None => OtlpOutCompression::None,
@@ -1145,9 +1033,7 @@ fn to_otlp_compression(compression: logit_config::OtlpCompression) -> OtlpOutCom
     }
 }
 
-/// The sole place `logit_config::RotateConfig` crosses into `logit_outputs::file::RotatePolicy`
-/// -- `logit-outputs` never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), the same reason `overflow_policy`/`delivery_posture`/`syslog_format` exist.
+/// Config's `RotateConfig` into `logit_outputs::file::RotatePolicy`.
 fn to_rotate_policy(cfg: &logit_config::RotateConfig) -> RotatePolicy {
     RotatePolicy {
         max_bytes: cfg.max_bytes,
@@ -1163,11 +1049,8 @@ fn to_rotate_interval(interval: logit_config::RotateInterval) -> OutputRotateInt
     }
 }
 
-/// The sole place `logit_config::StreamFormat`/`Compression` cross into
-/// `logit_outputs::stdio::StreamEncoder` -- same crate-layout reason as `to_rotate_policy` above.
-/// `compression` is read regardless of `format`; graph rule 33 already guarantees it's `none`
-/// whenever `format` isn't `native`, so ignoring it under `Human` here is never a silent
-/// behavior change, just dead weight `resolve` already rejected.
+/// Config's `StreamFormat`/`Compression` into a `StreamEncoder`. `compression` is ignored under
+/// `Human`, where graph rule 33 guarantees it's `none`.
 fn to_stream_encoder(
     format: logit_config::StreamFormat,
     compression: logit_config::Compression,
@@ -1195,9 +1078,8 @@ fn overflow_policy(cfg: logit_config::OverflowPolicy) -> logit_pipeline::Overflo
     }
 }
 
-/// Builds a UDP listener's `UdpListenerConfig` from its `ReceiveConfig`
-/// (`docs/adr/decoupled-listener-io.md`) -- the receive-side mirror of `queue_config`/
-/// `write_config` above.
+/// A UDP listener's `UdpListenerConfig` from its `ReceiveConfig`
+/// (`docs/adr/decoupled-listener-io.md`).
 fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::UdpListenerConfig {
     logit_inputs::udp::UdpListenerConfig {
         max_datagrams: receive.max_datagrams,
@@ -1212,12 +1094,11 @@ fn receive_config(receive: &logit_config::ReceiveConfig) -> logit_inputs::udp::U
     }
 }
 
-/// [`receive_config`]'s stream-transport sibling: a TCP listener's `TcpListenerConfig` from the
-/// same `receive:` block (`docs/adr/syslog-tcp-ingress-and-tls.md`). The queue fields
-/// (`max_datagrams`/`max_bytes`/`overflow`/`receive_buffer_bytes`) are deliberately *not*
-/// carried across -- a TCP listener has no receive queue at all, the connection's own flow
-/// control being the backpressure, which is exactly why graph rule 17 rejects those four by name
-/// on one. The four that do cross over are scoped per connection there, not per listener.
+/// A TCP listener's `TcpListenerConfig` from the same `receive:` block
+/// (`docs/adr/syslog-tcp-ingress-and-tls.md`).
+///
+/// The queue fields don't cross: a TCP listener has no receive queue, flow control being its
+/// backpressure, and graph rule 17 rejects them. The batching fields apply per connection.
 fn tcp_receive_config(
     receive: &logit_config::ReceiveConfig,
 ) -> logit_inputs::tcp::TcpListenerConfig {
@@ -1229,36 +1110,23 @@ fn tcp_receive_config(
     }
 }
 
-/// Builds any listener's `InputRuntimeConfig` from its `ReceiveConfig` -- safe to call
-/// unconditionally for every `NodeSpec::Input` arm, including `internal`: graph validation's rule
-/// 17 already guarantees a non-datagram-, non-tail-listener's `receive` is `ReceiveConfig::
-/// default()` by the time a resolved `Graph` reaches `build_spec`, so `internal` always gets
-/// `shutdown_grace: ReceiveConfig::default().shutdown_grace` here (5s today, not
-/// `Duration::ZERO`) regardless of what any `receive:` block would otherwise say. That fixed 5s
-/// is load-bearing for `internal` rather than merely harmless: `InternalInput` overrides `Input::
-/// run_until_shutdown` to drain its buffered points one final time when shutdown fires
-/// (`crates/logit-inputs/src/internal.rs`), so `run_input`'s grace backstop is what bounds that
-/// drain. One `Registry::drain` plus one `Fanout::send` fits inside 5s with room to spare.
+/// Any listener's `InputRuntimeConfig` from its `ReceiveConfig`; safe on every `NodeSpec::Input`
+/// arm.
 ///
-/// `tail_in`/`docker_in`, `logit_in` and `internal` are the listeners where this value is
-/// genuinely load-bearing rather than incidentally harmless: `TailInput`
-/// (`crates/logit-inputs/src/tail/driver.rs`) overrides `run_until_shutdown` to flush every
-/// tracked file's accumulator and write a final checkpoint, `LogitInput`
-/// (`crates/logit-inputs/src/logit.rs`) overrides it to close every idle connection with
-/// `Reject{GOING_AWAY}`, and `InternalInput` overrides it for the final drain above -- each of
-/// those has to fit inside `shutdown_grace` or `run_input`'s backstop cancels it by drop, losing
-/// whatever it hadn't flushed/closed/drained yet. `logit_in` and `internal` fall under rule 17's
-/// non-datagram, non-tail bucket, so unlike `tail_in`/`docker_in` they always get the fixed 5s
-/// default here -- there is no `receive:`-shaped knob to override it with
-/// (`docs/known-gaps.md` tracks this as the currently un-tunable case).
+/// `shutdown_grace` bounds each listener's `run_until_shutdown` before `run_input`'s backstop
+/// cancels it by drop. It matters where that's overridden: `TailInput` flushes every file and
+/// writes a final checkpoint, `LogitInput` closes idle connections with `Reject{GOING_AWAY}`, and
+/// `InternalInput` drains its buffered points once more. Graph rule 17 forces a non-datagram,
+/// non-tail listener's `receive` to the default, so `logit_in` and `internal` always get
+/// `ReceiveConfig::default()`'s 5s, with no knob (`docs/known-gaps.md`).
 fn input_runtime_config(receive: &logit_config::ReceiveConfig) -> InputRuntimeConfig {
     InputRuntimeConfig { shutdown_grace: receive.shutdown_grace }
 }
 
-/// Builds a tailing listener's `TailConfig` from its `TailOptions` plus the shared `receive:`
-/// block (`docs/adr/file-tailing-and-docker-json-logs.md`) -- the tail-side mirror of
-/// `receive_config` above. `checkpoint_path` is resolved against `base_dir` when relative,
-/// exactly like `StdioTarget::Path`/`LuaFile { lua_file, .. }` resolve their own paths.
+/// A tailing listener's `TailConfig` from its `TailOptions` plus the `receive:` block, whose
+/// `batch_*` fields and `shutdown_grace` become `TailBatching`
+/// (`docs/adr/file-tailing-and-docker-json-logs.md`). A relative `checkpoint_path` resolves
+/// against the config file's directory.
 fn tail_config(
     tail: &logit_config::TailOptions,
     receive: &logit_config::ReceiveConfig,
@@ -1294,9 +1162,7 @@ fn delivery_posture(cfg: logit_config::DeliveryPosture) -> logit_pipeline::Deliv
     }
 }
 
-/// The sole place `logit_config::SyslogFormat` crosses into `logit_outputs::syslog::Format` --
-/// `logit-outputs` never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), mirroring `overflow_policy`/`delivery_posture` above.
+/// Config's `SyslogFormat` into `logit_outputs::syslog::Format`.
 fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Format {
     match cfg {
         logit_config::SyslogFormat::Rfc3164 => logit_outputs::syslog::Format::Rfc3164,
@@ -1304,8 +1170,7 @@ fn syslog_format(cfg: logit_config::SyslogFormat) -> logit_outputs::syslog::Form
     }
 }
 
-/// The sole place `logit_config::StatsdFormat` crosses into `logit_outputs::statsd::Format` --
-/// same reasoning as [`syslog_format`].
+/// Config's `StatsdFormat` into `logit_outputs::statsd::Format`.
 fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Format {
     match cfg {
         logit_config::StatsdFormat::Dogstatsd => logit_outputs::statsd::Format::DogStatsd,
@@ -1313,10 +1178,7 @@ fn statsd_format(cfg: logit_config::StatsdFormat) -> logit_outputs::statsd::Form
     }
 }
 
-/// The sole place `logit_config::GraphiteTransport` crosses into
-/// `logit_inputs::graphite::Transport` -- same reasoning as [`syslog_format`]: `logit-inputs`
-/// never depends on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the two
-/// vocabularies meet here and nowhere else.
+/// Config's `GraphiteTransport` into `logit_inputs::graphite::Transport`.
 fn graphite_transport(cfg: logit_config::GraphiteTransport) -> logit_inputs::graphite::Transport {
     match cfg {
         logit_config::GraphiteTransport::Tcp => logit_inputs::graphite::Transport::Tcp,
@@ -1324,9 +1186,8 @@ fn graphite_transport(cfg: logit_config::GraphiteTransport) -> logit_inputs::gra
     }
 }
 
-/// The sole place `logit_config::GraphiteProtocol` crosses into
-/// `logit_proto::graphite::Protocol` -- same reasoning as [`graphite_transport`]. Graph rule 46 is
-/// what guarantees the `pickle`/`udp` pair never reaches here.
+/// Config's `GraphiteProtocol` into `logit_proto::graphite::Protocol` for `graphite_in`. Graph
+/// rule 46 keeps `pickle` off UDP.
 fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> logit_proto::graphite::Protocol {
     match cfg {
         logit_config::GraphiteProtocol::Plaintext => logit_proto::graphite::Protocol::Plaintext,
@@ -1334,12 +1195,8 @@ fn graphite_protocol(cfg: logit_config::GraphiteProtocol) -> logit_proto::graphi
     }
 }
 
-/// The sole place `logit_config::GraphiteTransport` crosses into `graphite_out`'s own transport
-/// choice -- `statsd_format`'s shape. Namespaced `graphite_out_*`, not bare `graphite_transport`:
-/// `graphite_in` needs the identical mapping onto its own, different (`logit_inputs`-side)
-/// transport type, and a same-named free function returning an incompatible type is a hard
-/// collision at merge, not a dedupe-able duplicate the way the shared `GraphiteTransport`/
-/// `GraphiteProtocol` config enums are -- so each side names its own.
+/// Config's `GraphiteTransport` into `graphite_out`'s transport, a different type from
+/// [`graphite_transport`]'s, hence the `graphite_out_` prefix.
 fn graphite_out_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTransport {
     match cfg {
         logit_config::GraphiteTransport::Udp => GraphiteOutTransport::Udp,
@@ -1347,9 +1204,7 @@ fn graphite_out_transport(cfg: logit_config::GraphiteTransport) -> GraphiteOutTr
     }
 }
 
-/// The sole place `logit_config::GraphiteProtocol` crosses into `logit_proto::graphite::Protocol`
-/// for `graphite_out`. `graphite_in` needs the identical mapping for its own decoder, but through
-/// its own namespaced converter -- same reasoning as [`graphite_out_transport`].
+/// Config's `GraphiteProtocol` into `logit_proto::graphite::Protocol` for `graphite_out`.
 fn graphite_out_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWireProtocol {
     match cfg {
         logit_config::GraphiteProtocol::Plaintext => GraphiteWireProtocol::Plaintext,
@@ -1357,9 +1212,7 @@ fn graphite_out_protocol(cfg: logit_config::GraphiteProtocol) -> GraphiteWirePro
     }
 }
 
-/// The sole place `logit_config::GraphiteTags` crosses into `logit_proto::graphite::Tags` --
-/// `graphite_out`-only, unlike [`graphite_out_transport`]/[`graphite_out_protocol`] (`graphite_in`
-/// has no `tags:` field), so no namespacing collision is possible here.
+/// Config's `GraphiteTags` into `logit_proto::graphite::Tags`.
 fn graphite_tags(cfg: logit_config::GraphiteTags) -> GraphiteWireTags {
     match cfg {
         logit_config::GraphiteTags::Carbon => GraphiteWireTags::Carbon,
@@ -1367,9 +1220,7 @@ fn graphite_tags(cfg: logit_config::GraphiteTags) -> GraphiteWireTags {
     }
 }
 
-/// The sole place `logit_config::GraphiteMultiValue` crosses into
-/// `logit_proto::graphite::MultiValue` -- `graphite_out`-only, same reasoning as
-/// [`graphite_tags`].
+/// Config's `GraphiteMultiValue` into `logit_proto::graphite::MultiValue`.
 fn graphite_multi_value(cfg: logit_config::GraphiteMultiValue) -> GraphiteWireMultiValue {
     match cfg {
         logit_config::GraphiteMultiValue::Skip => GraphiteWireMultiValue::Skip,
@@ -1377,9 +1228,7 @@ fn graphite_multi_value(cfg: logit_config::GraphiteMultiValue) -> GraphiteWireMu
     }
 }
 
-/// Converts config's `Vec<Signal>` (`logit-config`, which `logit-transforms` deliberately doesn't
-/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's
-/// boolean-flags `SignalSet`.
+/// Config's `Vec<Signal>` into the transform's boolean-flags `SignalSet`.
 fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
     let mut set = SignalSet::default();
     for signal in signals {
@@ -1392,9 +1241,7 @@ fn to_signal_set(signals: &[logit_config::Signal]) -> SignalSet {
     set
 }
 
-/// Converts config's `span:` block into the transform crate's `SpanLift` -- the same
-/// config-vocabulary-to-transform-type mapping `to_signal_set` does, `SpanKindConfig` to
-/// `logit_core::SpanKind` included.
+/// Config's `span:` block into the transform's `SpanLift`.
 fn to_span_lift(span: &logit_config::SpanLiftConfig) -> SpanLift {
     use logit_config::SpanKindConfig;
     SpanLift {
@@ -1418,10 +1265,7 @@ fn to_match_mode(mode: logit_config::MatchMode) -> TransformMatchMode {
     }
 }
 
-/// `logit_config::Distributions` -> `logit_transforms::Distributions` -- `logit-transforms`
-/// deliberately doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), so this wiring boundary maps every config enum `aggregate` is configured by, the same
-/// `to_match_mode` precedent above.
+/// `logit_config::Distributions` -> `logit_transforms::Distributions`.
 fn to_distributions(mode: logit_config::Distributions) -> TransformDistributions {
     match mode {
         logit_config::Distributions::Sketch => TransformDistributions::Sketch,
@@ -1429,7 +1273,7 @@ fn to_distributions(mode: logit_config::Distributions) -> TransformDistributions
     }
 }
 
-/// `logit_config::Sets` -> `logit_transforms::Sets` -- see [`to_distributions`]'s doc comment.
+/// `logit_config::Sets` -> `logit_transforms::Sets`.
 fn to_sets(mode: logit_config::Sets) -> TransformSets {
     match mode {
         logit_config::Sets::Estimate => TransformSets::Estimate,
@@ -1437,8 +1281,7 @@ fn to_sets(mode: logit_config::Sets) -> TransformSets {
     }
 }
 
-/// `logit_config::AggregateTemporality` -> `logit_transforms::AggregateTemporality` -- see
-/// [`to_distributions`]'s doc comment for why this mapping exists at all.
+/// `logit_config::AggregateTemporality` -> `logit_transforms::AggregateTemporality`.
 fn to_temporality(mode: logit_config::AggregateTemporality) -> TransformTemporality {
     match mode {
         logit_config::AggregateTemporality::Delta => TransformTemporality::Delta,
@@ -1446,9 +1289,7 @@ fn to_temporality(mode: logit_config::AggregateTemporality) -> TransformTemporal
     }
 }
 
-/// Converts config's `OtlpPaths` (`logit-config`, which `logit-outputs` deliberately doesn't
-/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's own
-/// identically-shaped `SignalPaths`.
+/// Config's `OtlpPaths` into `logit-outputs`'s identically shaped `SignalPaths`.
 fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
     SignalPaths {
         logs: paths.logs.clone(),
@@ -1457,9 +1298,7 @@ fn to_signal_paths(paths: &logit_config::OtlpPaths) -> SignalPaths {
     }
 }
 
-/// Converts config's `TlsClientConfig` (`logit-config`, which `logit-outputs` deliberately
-/// doesn't depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the output crate's
-/// own identically-shaped `TlsClientSettings`.
+/// Config's `TlsClientConfig` into `logit-outputs`'s identically shaped `TlsClientSettings`.
 fn to_tls_client_settings(
     tls: &logit_config::TlsClientConfig,
 ) -> logit_outputs::otlp::TlsClientSettings {
@@ -1471,10 +1310,7 @@ fn to_tls_client_settings(
     }
 }
 
-/// `logit_config`'s config-facing `version: 1 | 2` into the codec's own [`remote_write::Version`].
-/// The same translation `otlp_out_transport` does for `protocol:` and for the same reason:
-/// `logit-outputs` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), so `build_spec` is where the two spellings meet.
+/// Config's `version: 1 | 2` into the codec's own `remote_write::Version`.
 fn to_remote_write_version(
     version: logit_config::RemoteWriteVersion,
 ) -> logit_proto::prometheus::remote_write::Version {
@@ -1496,9 +1332,8 @@ fn to_tls_server_settings(
     }
 }
 
-/// [`to_tls_client_settings`]'s `logit-inputs` counterpart -- `prometheus_in` is a client, not a
-/// sink, so it needs `logit_inputs::prometheus::TlsClientSettings` (built on `reqwest`, per that
-/// module's own doc comment) rather than `logit_outputs::otlp::TlsClientSettings`.
+/// [`to_tls_client_settings`] for `prometheus_in`'s scrape client, whose `reqwest`-based type is
+/// `logit-inputs`'s own.
 fn to_input_tls_client_settings(
     tls: &logit_config::TlsClientConfig,
 ) -> logit_inputs::prometheus::TlsClientSettings {
@@ -1510,9 +1345,7 @@ fn to_input_tls_client_settings(
     }
 }
 
-/// Converts config's `MetricSpec` (`logit-config`, which `logit-transforms` deliberately doesn't
-/// depend on -- `docs/design/pipeline-graph.md`'s crate layout) into the transform crate's own
-/// identically-shaped type.
+/// Config's `MetricSpec` into the transform's identically shaped type.
 fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::MetricSpec> {
     specs
         .iter()
@@ -1524,16 +1357,8 @@ fn to_metric_specs(specs: &[logit_config::MetricSpec]) -> Vec<logit_transforms::
         .collect()
 }
 
-/// Converts `logit-config`'s `SetValue` map (`ComponentKind::Set`'s `resource`/`attributes`
-/// fields) into the plain `(String, logit_core::Value)` pairs `logit_transforms::Set::new` takes
-/// -- `logit-transforms` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), same reasoning as [`to_metric_specs`] above. A `BTreeMap` iterates in key order, which
-/// is why `Set`'s own tests don't need to assert an order beyond "whatever `AttrMap`'s sorted
-/// `Symbol` order ends up being" -- the interning happens once, at construction, inside `Set::new`.
-///
-/// Also the conversion for `has_attributes`/`drop_attributes` (`ComponentKind::HasAttributes`/
-/// `DropAttributes`), whose `resource`/`attributes` fields are the identical `SetValue` map shape
-/// -- reused unchanged, not reimplemented, so the two config surfaces cannot drift apart on what a
+/// A `SetValue` map into the `(String, logit_core::Value)` pairs `set`, `has_attributes`, and
+/// `drop_attributes` take. One conversion for all three, so they can't disagree on what a
 /// `SetValue` becomes.
 fn to_set_pairs(
     values: &std::collections::BTreeMap<String, logit_config::SetValue>,
@@ -1541,8 +1366,7 @@ fn to_set_pairs(
     values.iter().map(|(k, v)| (k.clone(), to_set_value(v))).collect()
 }
 
-/// Converts one `SetValue` -- shared by [`to_set_pairs`] and [`to_allow_lists`] so the two
-/// config surfaces cannot map the same literal to two different `logit_core::Value`s.
+/// One `SetValue`, shared by every caller so none maps a literal differently.
 fn to_set_value(v: &logit_config::SetValue) -> logit_core::Value {
     match v {
         logit_config::SetValue::Bool(b) => logit_core::Value::Bool(*b),
@@ -1552,10 +1376,7 @@ fn to_set_value(v: &logit_config::SetValue) -> logit_core::Value {
     }
 }
 
-/// Converts `logit-config`'s `ValueAllowList` map (`ComponentKind::KeepValues`'s `resource`/
-/// `attributes` fields) into the `logit_transforms::ClampConfig` tuples `KeepValues::new` takes --
-/// `logit-transforms` doesn't depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate
-/// layout), same reasoning as [`to_set_pairs`].
+/// `keep_values`' `ValueAllowList` map into the `ClampConfig` tuples `KeepValues::new` takes.
 fn to_allow_lists(
     values: &std::collections::BTreeMap<String, logit_config::ValueAllowList>,
 ) -> Vec<logit_transforms::ClampConfig> {
@@ -1576,10 +1397,7 @@ fn to_allow_lists(
         .collect()
 }
 
-/// Converts `logit-config`'s `FlattenFields` (`ComponentKind::Flatten`'s `attributes`/`resource`
-/// fields) into the `logit_transforms::Fields` `Flatten::new` takes -- `logit-transforms` doesn't
-/// depend on `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), same reasoning as
-/// [`to_allow_lists`].
+/// `flatten`'s `FlattenFields` into the `logit_transforms::Fields` `Flatten::new` takes.
 fn to_flatten_fields(fields: &logit_config::FlattenFields) -> TransformFields {
     match fields {
         logit_config::FlattenFields::Keyword(logit_config::FlattenKeyword::All) => {
@@ -1592,12 +1410,11 @@ fn to_flatten_fields(fields: &logit_config::FlattenFields) -> TransformFields {
     }
 }
 
-/// Converts `ComponentKind::HttpAccess`'s fields into the `logit_transforms::HttpAccessConfig`
-/// `HttpAccess::new` takes -- `logit-transforms` doesn't depend on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout), same reasoning as [`to_allow_lists`]. This is
-/// also where `max_length` is *resolved*: `logit_config::CAPPED_FIELDS`' defaults with the
-/// config's overrides applied, so the transform receives one complete cap list and never needs to
-/// know the defaults itself (`docs/adr/http-access-normalization.md`).
+/// `http_access`'s fields into the `HttpAccessConfig` `HttpAccess::new` takes.
+///
+/// `max_length` is resolved here, `logit_config::CAPPED_FIELDS`' defaults with the config's
+/// overrides applied, so the transform gets one complete cap list and never knows the defaults
+/// (`docs/adr/http-access-normalization.md`).
 fn to_http_access_config(
     routes: &[logit_config::HttpRouteRule],
     route_other: &Option<String>,
@@ -1644,9 +1461,7 @@ fn to_http_access_config(
     }
 }
 
-/// Converts `logit-config`'s `JsonInvalidUtf8` (`ComponentKind::Json`'s `invalid_utf8` field) into
-/// the `logit_transforms::InvalidUtf8` `JsonParser::with_invalid_utf8` takes -- same reasoning as
-/// [`to_allow_lists`].
+/// `json`'s `invalid_utf8` into the `logit_transforms::InvalidUtf8` `JsonParser` takes.
 fn to_invalid_utf8(mode: logit_config::JsonInvalidUtf8) -> TransformInvalidUtf8 {
     match mode {
         logit_config::JsonInvalidUtf8::Reject => TransformInvalidUtf8::Reject,
@@ -1654,8 +1469,7 @@ fn to_invalid_utf8(mode: logit_config::JsonInvalidUtf8) -> TransformInvalidUtf8 
     }
 }
 
-/// Converts `logit-config`'s `FlattenArrays` into `logit_transforms::Arrays` -- same reasoning as
-/// [`to_flatten_fields`].
+/// `flatten`'s `FlattenArrays` into `logit_transforms::Arrays`.
 fn to_flatten_arrays(arrays: logit_config::FlattenArrays) -> TransformArrays {
     match arrays {
         logit_config::FlattenArrays::Index => TransformArrays::Index,
@@ -1663,8 +1477,7 @@ fn to_flatten_arrays(arrays: logit_config::FlattenArrays) -> TransformArrays {
     }
 }
 
-/// Converts `logit-config`'s `SampleKey` into `logit_transforms::SampleKey` -- the transform owns
-/// its own types, same reasoning as [`to_flatten_fields`].
+/// `sample`'s `SampleKey` into `logit_transforms::SampleKey`.
 fn to_sample_key(key: &logit_config::SampleKey) -> logit_transforms::SampleKey {
     match key {
         logit_config::SampleKey::TraceId => logit_transforms::SampleKey::TraceId,
@@ -1691,7 +1504,7 @@ fn to_sample_missing(
 
 /// Converts `always_keep:`, folding rule 61's "exactly one of `attribute`/`resource`" into
 /// `SampleField`'s two variants. The literal goes through [`to_set_value`], so `always_keep`
-/// reads a YAML scalar exactly as `set`/`has_attributes` do.
+/// reads a YAML scalar as `set`/`has_attributes` do.
 fn to_sample_override(o: &logit_config::SampleOverride) -> logit_transforms::SampleOverride {
     let field = match (&o.attribute, &o.resource) {
         (Some(name), _) => logit_transforms::SampleField::Attribute(name.clone()),
@@ -1775,9 +1588,7 @@ mod tests {
         assert!(validate_semantics(cfg).is_ok());
     }
 
-    /// The headline regression test at the CLI layer, mirroring `logit-pipeline::graph`'s: a sink
-    /// shared by two upstream branches is accepted now, where the pre-graph `validate_semantics`
-    /// rejected any output referenced by more than one pipeline outright.
+    /// A sink shared by two upstream branches is valid.
     #[test]
     fn validate_semantics_accepts_a_sink_shared_by_two_branches() {
         let cfg = config(vec![
@@ -1913,8 +1724,7 @@ mod tests {
         ));
     }
 
-    /// `token` is a plain field now (no more `token_env` indirection, no more `std::env::var`
-    /// here) -- an unset `!env` variable is caught earlier, at `config::load` time, not here.
+    /// `token` is a plain field; an unset `!env` variable fails earlier, in `config::load`.
     #[test]
     fn build_spec_builds_an_influxdb_sink() {
         let component = ResolvedComponent {
@@ -1936,9 +1746,8 @@ mod tests {
         ));
     }
 
-    /// `#[tokio::test]`, unlike its sibling sink tests above/below: `CollectdOutput::udp` binds an
-    /// ephemeral local UDP socket eagerly (`StatsdOutput::udp`'s own precedent), which needs an
-    /// active tokio runtime to register with.
+    /// `#[tokio::test]`: `CollectdOutput::udp` binds a local UDP socket eagerly, which needs a
+    /// runtime.
     #[tokio::test]
     async fn build_spec_builds_a_collectd_sink_and_wires_a_configured_hostname_into_its_encoder() {
         let component = ResolvedComponent {
@@ -1975,8 +1784,7 @@ mod tests {
         }
     }
 
-    /// `#[tokio::test]`, `CollectdOutput::udp`'s own precedent: `GraphiteOutput::udp` binds an
-    /// ephemeral local UDP socket eagerly, which needs an active tokio runtime to register with.
+    /// `#[tokio::test]`: `GraphiteOutput::udp` binds eagerly, as `CollectdOutput::udp` does.
     #[tokio::test]
     async fn build_spec_builds_a_graphite_udp_sink() {
         let component = ResolvedComponent {
@@ -1996,9 +1804,7 @@ mod tests {
         ));
     }
 
-    /// TCP does not bind eagerly -- `GraphiteOutput::tcp` never touches a socket at construction
-    /// (`Conn::Tcp`'s own doc comment), so this needs no runtime either, unlike the UDP variant
-    /// above.
+    /// `GraphiteOutput::tcp` touches no socket at construction, so this needs no runtime.
     #[test]
     fn build_spec_builds_a_graphite_tcp_sink_without_binding_eagerly() {
         let component = ResolvedComponent {
@@ -2018,8 +1824,7 @@ mod tests {
         ));
     }
 
-    /// `bind: "127.0.0.1:0"` and no assertion about the port: `build_spec` must not bind anything
-    /// at all (that is `Output::bind`'s pre-spawn pass), so this test needs no runtime.
+    /// No runtime: `build_spec` must not bind; `Output::bind`'s pre-spawn pass does.
     #[test]
     fn build_spec_builds_a_prometheus_sink() {
         let component = ResolvedComponent {
@@ -2046,9 +1851,7 @@ mod tests {
         ));
     }
 
-    /// The other half of the same arm: `endpoint:` builds the remote-write sender, with the
-    /// config-facing integer `version:` translated into the codec's own `Version`. Nothing is
-    /// dialed here -- this sink connects per request.
+    /// `endpoint:` builds the remote-write sender; nothing is dialed, it connects per request.
     #[test]
     fn build_spec_builds_a_prometheus_remote_write_sink() {
         for version in [logit_config::RemoteWriteVersion::V1, logit_config::RemoteWriteVersion::V2]
@@ -2189,12 +1992,7 @@ mod tests {
         }
     }
 
-    /// Every template string on a `generate_in` -- the log body, each attribute value, the metric
-    /// name, each resource value -- crosses into `logit_inputs::generate` here, and each one can
-    /// fail to parse or name a placeholder the resolver rejects. Exercising the fully-populated
-    /// shape, not the default one, is what makes this test cover those four `?`s rather than none
-    /// of them. (`build_spec_builds_a_null_sink` above is W3's sink-side twin; neither kind has a
-    /// "declared but not buildable" test any more, because neither is.)
+    /// A fully populated `generate_in` builds, covering the arm's four template `?`s.
     #[test]
     fn build_spec_builds_a_generate_input() {
         let component = ResolvedComponent {
@@ -2258,9 +2056,7 @@ mod tests {
         ));
     }
 
-    /// The other half of the same kind: `bind:` set instead of `scrape_targets:` builds the
-    /// remote-write receiver rather than the scrape client, which is the whole of what the arm
-    /// dispatches on.
+    /// `bind:` instead of `scrape_targets:` builds the remote-write receiver.
     #[test]
     fn build_spec_builds_a_prometheus_receiver() {
         let component = ResolvedComponent {
@@ -2309,9 +2105,8 @@ mod tests {
         assert!(matches!(spec, NodeSpec::Input(..)));
     }
 
-    /// A `types_db` path is resolved against the config file's directory and actually read: a
-    /// relative path that exists under `base_dir` loads, and the same path with no file behind it
-    /// is a startup error naming it.
+    /// A relative `types_db` path resolves against `base_dir` and is read; a missing one is a
+    /// startup error naming it.
     #[test]
     fn build_spec_loads_a_collectd_types_db_relative_to_base_dir() {
         let dir = std::env::temp_dir().join(format!("logit-collectd-spec-{}", std::process::id()));
@@ -2367,11 +2162,8 @@ mod tests {
         }
     }
 
-    /// The `graphite_in` twin of `build_spec_wires_a_tls_server_config_into_a_tcp_syslog_input`,
-    /// with its negative half in the same test for the same reason: the positive case passes even
-    /// with the `with_tls` call deleted (`build_spec` would still hand back a `NodeSpec::Input`),
-    /// so only a cert path that does not exist actually pins that the certificate is being loaded.
-    /// Graph rule 43 never touches the filesystem, so `build_spec` is where a bad path first fails.
+    /// A TCP `graphite_in` loads its TLS cert. The missing-cert half is what pins the `with_tls`
+    /// call: the positive half passes without it. Rule 43 never reads the file.
     #[test]
     fn build_spec_builds_a_tls_graphite_input() {
         use logit_config::{GraphiteProtocol, GraphiteTransport};
@@ -2406,9 +2198,7 @@ mod tests {
         assert!(err.contains("does-not-exist.pem"), "got: {err}");
     }
 
-    /// Every `transport`/`protocol` pair rule 46 permits builds a real input, and the `receive:`
-    /// block reaches it on both transports -- the TCP one takes only the batch-assembly half, but
-    /// it is the same block and the same converter, so a wiring mistake would show up here.
+    /// Every `transport`/`protocol` pair rule 46 permits builds, with a `receive:` block on each.
     #[test]
     fn build_spec_builds_a_graphite_input_for_every_permitted_transport_and_protocol() {
         use logit_config::{GraphiteProtocol, GraphiteTransport};
@@ -2434,9 +2224,7 @@ mod tests {
         }
     }
 
-    /// The two converters are the only place `logit-config`'s vocabulary crosses into
-    /// `logit-inputs`'/`logit-proto`'s, so a mismapped arm (a `pickle` that built a plaintext
-    /// decoder, say) would be silent everywhere else.
+    /// The two converters map each arm correctly; a mismap would surface nowhere else.
     #[test]
     fn graphite_converters_map_every_variant() {
         use logit_config::{GraphiteProtocol, GraphiteTransport};
@@ -2502,12 +2290,8 @@ mod tests {
         ));
     }
 
-    /// `tail_config` is where `checkpoint_path`, `receive:`'s batching fields, and every other
-    /// `TailOptions` field actually turn into a `logit_inputs::tail::TailConfig` -- `build_spec`'s
-    /// own `TailIn` arm just calls it, and `NodeSpec::Input` boxes the result as `dyn Input`, with
-    /// no way to inspect what's inside from the outside. So the conversion logic is exercised
-    /// directly here, the same way `queue_config`/`write_config`/`receive_config` already are
-    /// implicitly through their own callers -- these are this function's only tests.
+    /// `tail_config` maps every `TailOptions` field and `receive:`'s batching fields. Tested
+    /// directly because `NodeSpec::Input` boxes the result opaquely.
     #[test]
     fn tail_config_resolves_a_relative_checkpoint_path_against_base_dir() {
         let tail = logit_config::TailOptions {
@@ -2602,10 +2386,8 @@ mod tests {
         }
     }
 
-    /// An `https://` endpoint under `protocol: grpc` used to be rejected outright (the hand-rolled
-    /// gRPC client had no TLS support at all); it's now the normal way to ask for gRPC-over-TLS
-    /// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`) and `build_spec` builds it like any other
-    /// endpoint.
+    /// An `https://` endpoint under `protocol: grpc` builds gRPC over TLS
+    /// (`docs/adr/otlp-tls-and-pooled-grpc-client.md`).
     #[test]
     fn build_spec_builds_an_otlp_sink_with_https_under_grpc() {
         let component = ResolvedComponent {
@@ -2629,8 +2411,7 @@ mod tests {
         ));
     }
 
-    /// `logit-cli`'s own home for `testdata/tls`'s fixtures -- `crates/logit-cli` is two levels
-    /// under the repo root, same as every other crate's `testdata_dir()` test helper.
+    /// The repo's `testdata/tls` fixtures, two levels up.
     fn testdata_tls_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
@@ -2661,10 +2442,8 @@ mod tests {
         ));
     }
 
-    /// `build_spec` (via `OtlpOutput::with_tls`) is where a bad `tls.ca_file` path actually loads
-    /// the file and fails -- `graph::resolve`'s rule 24 never touches the filesystem, so it can't
-    /// catch this (`docs/deploying.md`'s TLS section documents that `logit validate` doesn't
-    /// either, since `validate_semantics` only runs `graph::resolve`).
+    /// A bad `tls.ca_file` first fails in `build_spec`: rule 24 never reads the file, so `logit
+    /// validate` passes it (`docs/deploying.md`'s "`logit validate` as a preflight").
     #[test]
     fn build_spec_reports_a_missing_tls_ca_file_clearly() {
         let component = ResolvedComponent {
@@ -2718,8 +2497,7 @@ mod tests {
         ));
     }
 
-    /// A `syslog_in` component at whichever transport, with or without TLS -- the three shapes
-    /// the `SyslogIn` arm branches on.
+    /// A `syslog_in` at either transport, with or without TLS.
     fn syslog_in_component(
         transport: logit_config::SyslogTransport,
         tls: Option<logit_config::TlsServerConfig>,
@@ -2749,9 +2527,7 @@ mod tests {
         ));
     }
 
-    /// The TLS arm actually loads `testdata/tls/server.{pem,key}` -- `graph::resolve`'s rule 43
-    /// never touches the filesystem, so `build_spec` is where a bad path would first fail (the
-    /// same division of labour `build_spec_reports_a_missing_tls_ca_file_clearly` documents).
+    /// The TLS arm loads `testdata/tls/server.{pem,key}`.
     #[test]
     fn build_spec_wires_a_tls_server_config_into_a_tcp_syslog_input() {
         let component = syslog_in_component(
@@ -2768,12 +2544,8 @@ mod tests {
         ));
     }
 
-    /// The negative twin of the test above, and the one that actually pins the `with_tls` call:
-    /// the positive test passes even with that call deleted, since `build_spec` would still hand
-    /// back a `NodeSpec::Input`. A cert path that doesn't exist can only fail if the certificate
-    /// is really being loaded -- the same division of labour
-    /// `build_spec_reports_a_missing_tls_ca_file_clearly` documents for `otlp_out`, since graph
-    /// rule 43 never touches the filesystem.
+    /// A missing cert fails the build: this, not the positive test above, pins the `with_tls`
+    /// call. Rule 43 never reads the file.
     #[test]
     fn build_spec_reports_a_missing_syslog_tls_cert_file_clearly() {
         let component = syslog_in_component(
@@ -2803,8 +2575,7 @@ mod tests {
         ));
     }
 
-    /// `tcp_receive_config` carries the four batch/shutdown fields and drops the four queue ones
-    /// -- a TCP listener has no receive queue for them to configure (graph rule 17).
+    /// `tcp_receive_config` carries the batching and shutdown fields, not the queue ones.
     #[test]
     fn tcp_receive_config_carries_only_the_batch_and_shutdown_fields() {
         let receive = logit_config::ReceiveConfig {
@@ -2872,25 +2643,17 @@ mod tests {
 
     // ---- `handshake_timeout` reaches each of the three listeners -------------------------------
     //
-    // `NodeSpec::Input` is a `Box<dyn Input + Send>`, so there is nothing to read the field back
-    // off -- a `#[cfg(test)]` accessor on the concrete listener wouldn't be visible here anyway
-    // (this crate compiles `logit-inputs` without `cfg(test)`). These three tests therefore pin
-    // the wiring the way `build_spec_reports_a_missing_syslog_tls_cert_file_clearly` pins
-    // `with_tls`: by asserting something that can only be true if the call really happened.
-    // A 50ms budget, a connection that says nothing, and the server-side close it must produce --
-    // with `.with_handshake_timeout(..)` deleted from the arm, the listener's own 5s default
-    // applies and every one of these fails on its 1s read.
+    // A boxed `dyn Input` has no field to read back, so each test asserts a behavior only the call
+    // produces: a 50ms budget closes a silent connection within the 1s read, where the 5s default
+    // wouldn't.
 
-    /// A free loopback port, released again -- the bind-drop-rebind idiom this crate's own
-    /// integration tests use (`crates/logit-cli/tests/otlp_round_trip.rs`'s `ephemeral_addr`),
-    /// needed here because `Input` has no `local_addr` for a boxed listener to report through.
+    /// A free loopback port, bound and released: a boxed `Input` can't report its `local_addr`.
     async fn free_port() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         listener.local_addr().unwrap().to_string()
     }
 
-    /// Spawns a built `NodeSpec::Input` and asserts the server closes a connection that sends
-    /// nothing, within a second -- i.e. well inside the 5s default but well outside a 50ms one.
+    /// Spawns a built `NodeSpec::Input` and asserts it closes a silent connection within 1s.
     async fn assert_closes_a_silent_connection(spec: NodeSpec, addr: &str) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
@@ -2953,8 +2716,7 @@ mod tests {
         assert_closes_a_silent_connection(spec, &addr).await;
     }
 
-    /// `otlp_in`'s knob bounds the TLS accept and nothing else (`logit_inputs::otlp`'s "Handshake
-    /// timeout" doc section), so this one needs a real `tls:` block to have any phase to bound.
+    /// `otlp_in`'s knob bounds only the TLS accept, so this needs a real `tls:` block.
     #[tokio::test]
     async fn build_spec_wires_handshake_timeout_into_an_otlp_input() {
         let addr = free_port().await;
@@ -2982,17 +2744,11 @@ mod tests {
 
     // ---- `idle_timeout` reaches each TCP listener that honours it -------------------------------
     //
-    // The same "assert something only the real call could produce" shape as the
-    // `handshake_timeout` tests above, one phase later: a 50ms `idle_timeout`, a client that
-    // says its piece and then goes quiet, and the server-side close it must produce.
-    // `handshake_timeout` is deliberately left at its 5s default in all of them, so the close can
-    // only have come from the idle clock -- delete `.with_idle_timeout(..)` from a `build_spec`
-    // arm and that test fails on its 1s read.
+    // As above, one phase later: a 50ms `idle_timeout` closes a client gone quiet after one frame.
+    // `handshake_timeout` stays at its 5s default, so only the idle clock can close within 1s.
 
-    /// Spawns a built `NodeSpec::Input`, sends `wire` (one complete frame for that listener's
-    /// protocol -- or, for `otlp_in`, just enough to clear its first-byte peek), then asserts the
-    /// server closes the connection within a second of it going
-    /// quiet -- well inside a 5s `handshake_timeout` and well outside a 50ms `idle_timeout`.
+    /// Spawns a built `NodeSpec::Input`, sends `wire`, and asserts the server closes the connection
+    /// within 1s of it going quiet.
     async fn assert_closes_a_quiet_connection(spec: NodeSpec, addr: &str, wire: &[u8]) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
@@ -3081,12 +2837,8 @@ mod tests {
         assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
     }
 
-    /// `logit_in`'s own arm, which needs a handshake rather than a line before the idle clock is
-    /// even armed -- and, unlike the three plaintext listeners above, tells its peer *why* it is
-    /// closing. So this asserts the `Reject{GOING_AWAY}` specifically: with `handshake_timeout`
-    /// left at its 5s default, the only thing that can write that frame is the 50ms idle clock,
-    /// so a missing `.with_idle_timeout(..)` in the `LogitIn` arm shows up as a 1s read timeout
-    /// here.
+    /// `logit_in` arms the idle clock after its handshake and closes with `Reject{GOING_AWAY}`,
+    /// which only the 50ms idle clock can write within 1s.
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_a_logit_input() {
         use logit_proto::frame;
@@ -3116,10 +2868,8 @@ mod tests {
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        /// Reads one whole control frame off a connection and decodes it -- the listener's own
-        /// `write_control` in reverse, hand-rolled here rather than reached for through
-        /// `logit_out` (a real sink would probe and transparently reconnect, hiding exactly the
-        /// close this test is about).
+        /// Reads and decodes one control frame. Hand-rolled: a real `logit_out` would reconnect
+        /// and hide the close under test.
         async fn read_control_frame(stream: &mut tokio::net::TcpStream) -> control::ControlMessage {
             let mut header_buf = [0u8; frame::HEADER_LEN];
             stream.read_exact(&mut header_buf).await.unwrap();
@@ -3156,7 +2906,7 @@ mod tests {
             "the handshake itself must succeed"
         );
 
-        // Now go quiet. Nothing else on this listener can write to the peer.
+        // Quiet from here; nothing else on this listener writes to the peer.
         let reject = tokio::time::timeout(Duration::from_secs(1), read_control_frame(&mut client))
             .await
             .expect("a configured 50ms idle_timeout should close a quiet connection within 1s");
@@ -3169,13 +2919,9 @@ mod tests {
         }
     }
 
-    /// `otlp_in`'s own arm, which reads the field off a different variant and hands it to a
-    /// different listener implementation. The "wire" here is a single byte rather than a complete
-    /// request: that is all `otlp_in`'s first-byte peek waits for, and this listener's idle clock
-    /// starts at the connection rather than at a frame -- so a connection that produced one byte
-    /// and nothing else is exactly the thing `idle_timeout` closes
-    /// (`docs/adr/idle-connection-timeout.md`'s request-completion narrowing). A complete request
-    /// would be answered, and a response is not a close.
+    /// `otlp_in`: one byte clears its first-byte peek, and its idle clock runs from the connection,
+    /// so that byte and silence is what `idle_timeout` closes. A complete request would be
+    /// answered instead (`docs/adr/idle-connection-timeout.md`).
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_an_otlp_input() {
         let addr = free_port().await;
@@ -3242,9 +2988,7 @@ mod tests {
         ));
     }
 
-    /// The wiring this workstream adds: a non-default `buffer:` on the component actually reaches
-    /// the built `NodeSpec::Output`'s `SinkQueueConfig`/`WriteLoopConfig`, not just
-    /// `SinkQueueConfig::default()`/`WriteLoopConfig::default()` as before.
+    /// A non-default `buffer:` reaches the built sink's `SinkQueueConfig`/`WriteLoopConfig`.
     #[test]
     fn build_spec_wires_a_non_default_buffer_config_into_the_sink_queue_and_write_loop() {
         let component = ResolvedComponent {
@@ -3334,11 +3078,8 @@ mod tests {
         assert_eq!(disk_config.checkpoint_interval, Duration::from_secs(5));
     }
 
-    /// The load-test harness's `buffered` scenario (`docs/plans/load-test-harness.md`) is exactly
-    /// this shape: a `null_out` behind `buffer.disk`, proving a disk-backed spool builds and runs
-    /// with no real destination behind it -- `NullOutput` itself has nothing disk-related about
-    /// it, so this is really exercising `queue_config`'s disk branch for a sink that takes no
-    /// fields of its own.
+    /// A `null_out` behind `buffer.disk` (the perf harness's `buffered` scenario) gets a disk
+    /// `SinkStoreConfig`.
     #[test]
     fn build_spec_builds_a_null_sink_behind_a_disk_buffer_and_resolves_a_disk_sinkstoreconfig() {
         let component = ResolvedComponent {
@@ -3478,11 +3219,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A *relative* `target:` path must resolve against the config file's own directory
-    /// (`base_dir`), exactly as `LuaFile`'s `lua_file` already does -- not against the process's
-    /// current working directory, which for `logit run` invoked from an unrelated directory would
-    /// silently write somewhere other than "next to the config", contradicting `StdioTarget`'s own
-    /// doc comment.
+    /// A relative `target:` path resolves against `base_dir`, not the working directory.
     #[test]
     fn build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir() {
         let base_dir = std::env::temp_dir()
@@ -3509,9 +3246,7 @@ mod tests {
 
     #[test]
     fn build_spec_reports_a_clear_path_naming_error_for_an_unopenable_stdio_target() {
-        // `NodeSpec` isn't `Debug` (it embeds trait objects), so `Result::expect_err` -- which
-        // needs `Debug` on the `Ok` side to format its panic message -- doesn't work here. Same
-        // reason `logit-pipeline::graph`'s tests have their own `expect_err` helper.
+        // Not `expect_err`: `NodeSpec` isn't `Debug`.
         let path = std::env::temp_dir().join("logit-build-spec-no-such-dir").join("x.log");
         let component = stdio_out_component(StdioTarget::Path(path.display().to_string()));
         let err = match build_spec("tap", &component, Path::new(""), None) {
@@ -3599,9 +3334,7 @@ mod tests {
         ));
     }
 
-    /// A *relative* `path:` must resolve against the config file's own directory (`base_dir`),
-    /// exactly as `StdioTarget::Path` already does -- see
-    /// `build_spec_resolves_a_relative_stdio_target_against_the_config_base_dir` above.
+    /// A relative `path:` resolves against `base_dir`, as `StdioTarget::Path` does.
     #[test]
     fn build_spec_resolves_a_relative_file_out_path_against_the_config_base_dir() {
         let base_dir = std::env::temp_dir()
@@ -3715,10 +3448,8 @@ mod tests {
         ));
     }
 
-    /// Unlike `build_spec_builds_a_set_transform` above, this actually runs the built transform
-    /// against an event rather than only checking the `NodeSpec` variant -- specifically to catch
-    /// a swapped-argument-order regression (`trace_id`/`span_id`/`flags`/`keep_source` all being
-    /// the same shape of value at the call site makes that an easy mistake to introduce silently).
+    /// Runs the built transform, to catch swapped `trace_id`/`span_id`/`flags` arguments, which
+    /// share a type.
     #[test]
     fn build_spec_builds_a_working_trace_context_transform() {
         let component = ResolvedComponent {
@@ -3769,9 +3500,7 @@ mod tests {
         );
     }
 
-    /// The `span:` block reaches the transform: a config-vocabulary `kind: client` and the
-    /// default `name` land on the minted `SpanRecord`, and the event's timestamp becomes the
-    /// lifted start -- proving `to_span_lift`'s mapping, not just that the variant builds.
+    /// `to_span_lift`'s mapping: `kind: client` and the default `name` reach the minted span.
     #[test]
     fn build_spec_builds_a_span_lifting_trace_context_transform() {
         let component = ResolvedComponent {
@@ -3825,9 +3554,7 @@ mod tests {
         assert_eq!(span.end_timestamp, 1_725_000_000_005_000_000);
     }
 
-    /// Like `build_spec_builds_a_working_trace_context_transform` above, runs the built transform
-    /// against an event rather than only checking the `NodeSpec` variant -- proving the
-    /// `BTreeMap<String, f64>` config shape actually reaches `Scale::new` as the expected factor.
+    /// Runs the built transform: the configured factor reaches `Scale::new`.
     #[test]
     fn build_spec_builds_a_working_scale_transform() {
         let component = ResolvedComponent {
@@ -4010,9 +3737,7 @@ mod tests {
         ));
     }
 
-    /// Runs the built transform against an event rather than only checking the `NodeSpec`
-    /// variant -- proving `FlattenFields`/`FlattenArrays` actually reach `Flatten::new` as the
-    /// expected selection, `build_spec_builds_a_working_scale_transform`'s pattern.
+    /// Runs the built transform: `FlattenFields`/`FlattenArrays` reach `Flatten::new`.
     #[test]
     fn build_spec_builds_a_working_flatten_transform() {
         let component = ResolvedComponent {
@@ -4060,10 +3785,8 @@ mod tests {
         );
     }
 
-    /// Runs the built transform against a raw access line rather than only checking the
-    /// `NodeSpec` variant -- proving the route rules, `route_other`, the `max_length` override,
-    /// and `forwarded` all reach `HttpAccess::new` through `to_http_access_config`, and that the
-    /// defaults from `logit_config::CAPPED_FIELDS` apply to every field not overridden.
+    /// Runs the built transform: routes, `route_other`, a `max_length` override, and `forwarded`
+    /// reach it, and `CAPPED_FIELDS` defaults fill the rest.
     #[test]
     fn build_spec_builds_a_working_http_access_transform() {
         let component = ResolvedComponent {
@@ -4132,9 +3855,7 @@ mod tests {
         assert_eq!(get("client.address"), Some(logit_core::Value::str("192.0.2.1")), "trusted");
     }
 
-    /// `shape` also proves the `tap` tag's plumbing end to end: `build_spec` is handed the
-    /// component's own id, and that is what `Shape::with_name` turns into the tag
-    /// (`docs/adr/shape-observer-component.md`).
+    /// The component id becomes `shape`'s `tap` tag.
     #[test]
     fn build_spec_builds_a_shape_transform_carrying_its_own_id() {
         let component = ResolvedComponent {
@@ -4202,8 +3923,7 @@ mod tests {
         ));
     }
 
-    /// A `statsd_in` component at whichever transport, with or without TLS -- the shapes the
-    /// `StatsdIn` arm branches on, the twin of [`syslog_in_component`] above.
+    /// A `statsd_in` at either transport, with or without TLS.
     fn statsd_in_component(
         transport: logit_config::StatsdTransport,
         tls: Option<logit_config::TlsServerConfig>,
@@ -4233,11 +3953,7 @@ mod tests {
         ));
     }
 
-    /// The TLS arm actually loads `testdata/tls/server.{pem,key}` -- `graph::resolve`'s rule 43
-    /// never touches the filesystem, so `build_spec` is where a bad path would first fail. The
-    /// missing-file half is what really pins the `with_tls` call (the positive assertion above
-    /// would still pass with it deleted), exactly as
-    /// `build_spec_reports_a_missing_syslog_tls_cert_file_clearly` argues.
+    /// The TLS arm loads its cert; the missing-file half pins the `with_tls` call.
     #[test]
     fn build_spec_builds_a_tls_statsd_input() {
         let component = statsd_in_component(
@@ -4292,10 +4008,7 @@ mod tests {
         }
     }
 
-    /// The sink twin of `build_spec_builds_a_tls_statsd_input`: `graph::resolve`'s rule 52 never
-    /// touches the filesystem, so `build_spec` is where a bad `tls.ca_file` path first fails --
-    /// and the missing-file half is what really pins the `with_tls` call, since the positive
-    /// assertion would still pass with it deleted.
+    /// A TCP `statsd_out` loads its CA; the missing-file half pins the `with_tls` call.
     #[test]
     fn build_spec_builds_a_tls_statsd_output() {
         let component = statsd_out_component(

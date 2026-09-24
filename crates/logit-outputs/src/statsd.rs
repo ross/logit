@@ -1,342 +1,289 @@
-//! statsd / DogStatsD egress over UDP or TCP -- the mirror of `logit_inputs::statsd`, and a real
-//! relay: names, values, and tags round-trip through the real `StatsdDecoder` (pinned by this
-//! module's own tests), not just through hand-checked example lines.
+//! statsd / DogStatsD egress over UDP or TCP, the mirror of `logit_inputs::statsd`. Names, values,
+//! and tags round-trip through the real `StatsdDecoder`, which this module's tests pin.
 //!
-//! Split the way `syslog.rs`/`influxdb.rs` are: a pure [`StatsdEncoder`] (no socket anywhere,
-//! every grammar/sanitization/packing test runs against it directly) plus the thin
-//! [`StatsdOutput`] that owns the socket.
+//! A pure [`StatsdEncoder`] (no socket; every grammar, sanitization, and packing test runs against
+//! it) plus the thin [`StatsdOutput`] that owns the socket, the `syslog.rs`/`influxdb.rs` split.
 //!
-//! **This implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`.** The latter is
-//! `fn encode(&mut self, &EventBatch) -> Result<Bytes, CodecError>` -- one opaque buffer per
-//! batch, with no framing metadata -- and this sink genuinely needs per-message boundaries (one
-//! line per metric, packed into datagrams up to a size cap on UDP), which is exactly the shape
-//! `FramedEncoder` exists for: [`StatsdEncoder::encode_into`] fills one [`MessageBuf`] entry per
-//! line and reports every drop through [`EncodeStats`] instead of failing (ADR
-//! `framed-encoder`). [`crate::syslog::SyslogEncoder`] is the other implementor. The datagram
-//! size cap the encoder enforces per line is encoder state ([`StatsdEncoder::with_max_packet_bytes`],
-//! set once by [`StatsdOutput`] for its transport), not a per-call argument, so the trait's one
-//! `encode_into` signature fits both sinks.
+//! The encoder implements [`logit_proto::FramedEncoder`], not `logit_proto::Encoder`'s one opaque
+//! buffer per batch: UDP packs lines into datagrams, so it needs per-line boundaries.
+//! [`StatsdEncoder::encode_into`] fills one [`MessageBuf`] entry per line and reports every drop
+//! through [`EncodeStats`] instead of failing (`docs/adr/framed-encoder.md`;
+//! [`crate::syslog::SyslogEncoder`] is another implementor). The per-line size cap is encoder
+//! state ([`StatsdEncoder::with_max_packet_bytes`], set once by [`StatsdOutput`] for its
+//! transport), not a per-call argument, so the trait's one `encode_into` signature fits every
+//! implementor.
 //!
 //! ## Grammar and round-trip contract
 //!
 //! `<name>:<value>|<type>[|@<sample-rate>][|#<tag>[:<value>],...][|c:<container-id>][|T<unix-seconds>]`
-//! -- the same grammar `logit_inputs::statsd` parses. `@<sample-rate>` and `|T<unix-seconds>` are
-//! both real segments this sink emits, not omitted unconditionally -- see "Sample rate: never for
-//! a counter, real for `Samples`" and "`\|c:<container-id>` and `\|T<timestamp>`" below for
-//! exactly when each appears. Every sanitization rule exists because of a specific way
-//! `StatsdDecoder::parse_line` would otherwise misparse the result; see that module's grammar doc
-//! comment for the decoder side of each rule cited here.
+//! is the grammar `logit_inputs::statsd` parses. When `@` and `|T` appear is under "Sample rate:
+//! never for a counter, real for `Samples`" and "`\|c:<container-id>` and `\|T<timestamp>`" below.
+//! Every sanitization rule exists because `StatsdDecoder::parse_line` would otherwise misparse the
+//! result; that module's grammar doc has the decoder side of each.
 //!
 //! ## Dialects
 //!
-//! `Format::DogStatsd` (default) emits the `|#k:v,k:v` tag segment; `Format::Statsd` omits it
-//! entirely -- not an empty `|#`, which some plain-statsd receivers reject outright -- and counts
-//! every tag it drops (`EncodeStats::tags_dropped_dialect`). That counter's unit is a **wire
-//! tag**, not an attribute: a multi-value tag (see "Multi-value tags" below) counts once per
-//! element, since one element is exactly one `k:v` token the DogStatsD segment would have carried.
+//! `Format::DogStatsd` (default) emits the `|#k:v,k:v` tag segment. `Format::Statsd` omits it
+//! entirely (not an empty `|#`, which some plain-statsd receivers reject) and counts every tag it
+//! drops (`EncodeStats::tags_dropped_dialect`). The unit is a **wire tag**, not an attribute: a
+//! multi-value tag (see "Multi-value tags") counts once per element, one `k:v` token each.
 //!
-//! `Format::Statsd` also normalizes two shapes that only DogStatsD's grammar can express:
-//! `Samples` loses its multi-value line (`name:v1:v2|ms`) and becomes one `name:v|ms` line per
-//! value, and a timer's own wire-type letter collapses from `h`/`d` to the classic grammar's `ms`
-//! (counted `EncodeStats::type_normalized_dialect`) -- both are the "sink-configured dialect
-//! change" and "splitting a multi-value line" normalizations `docs/adr/lossless-transit.md`
-//! permits by name. `|c:<container-id>`/`|T<timestamp>` (below) have no plain-statsd equivalent at
-//! all and are dropped rather than normalized.
+//! `Format::Statsd` also normalizes two shapes only DogStatsD can express: a `Samples`
+//! multi-value line (`name:v1:v2|ms`) becomes one `name:v|ms` line per value, and a timer's `h`/`d`
+//! wire type collapses to `ms` (counted `EncodeStats::type_normalized_dialect`). These are the
+//! "sink-configured dialect change" and "splitting a multi-value line" normalizations
+//! `docs/adr/lossless-transit.md` permits by name. `|c:<container-id>`/`|T<timestamp>` have no
+//! plain-statsd equivalent and are dropped, not normalized.
 //!
 //! ## Sanitization
 //!
-//! A metric name has every one of `: | @ # , \n \r \0`, ASCII control characters, and whitespace
-//! replaced with `_` (substitution, not deletion, so distinct names stay distinct -- following
-//! `syslog.rs::sanitize_5424_field`'s approach). Each forbidden character earns its place against
-//! the decoder's own grammar: `:` splits name from values, `|` splits segments, `@`/`#` open the
+//! A metric name has every `: | @ # , \n \r \0`, ASCII control character, and whitespace character
+//! replaced with `_`. Substitution, not deletion, keeps distinct names distinct (as
+//! `syslog.rs::sanitize_5424_field` does). Each forbidden character is a delimiter in the
+//! decoder's grammar: `:` splits name from values, `|` splits segments, `@`/`#` open the
 //! sample-rate/tag segments, `,` separates tags, `\n` separates lines. Whitespace is substituted
-//! defensively, not because `decode_into` needs it to be gone: that function only trims a line's
-//! leading/trailing whitespace (`line.trim_end_matches('\r').trim()`), so an embedded space or tab
-//! inside a name survives a real decode unchanged (`my metric:1|c` decodes to the name
-//! `"my metric"`, not an error) and is a real, reachable byte this sink still has to sanitize --
-//! see `crates/logit-cli/tests/statsd_round_trip.rs`'s normalization (5) for the fixture.
+//! defensively: `decode_into` trims only a line's ends, so `my metric:1|c` decodes to the name
+//! `"my metric"`, and an embedded space is reachable input this sink still sanitizes
+//! (`crates/logit-cli/tests/statsd_round_trip.rs`'s normalization (5)).
 //!
-//! Tag *keys* forbid the same set as a name, plus nothing extra -- **and forbid `:`** for a
-//! different reason than the name does: `parse_line` splits a tag on its *first* colon
-//! (`tag.split_once(':')`), so a `:` inside a key would silently reparse as a shorter key with the
-//! remainder folded into the value. Tag *values* forbid the same set **except `:`, which is
-//! deliberately allowed**: since only the first colon is significant, `env:a:b` round-trips as key
-//! `env`, value `a:b` -- an asymmetry between key and value sanitization that is easy to get
-//! backwards, so it has its own test. A multi-value tag's key and value are sanitized **per
-//! element** under these same two rules, with no cross-element interaction at all (see
-//! "Multi-value tags" below).
+//! Tag *keys* forbid the same set as a name, **including `:`**, for a different reason:
+//! `parse_line` splits a tag on its *first* colon (`tag.split_once(':')`), so a `:` inside a key
+//! would reparse as a shorter key with the remainder folded into the value. Tag *values* forbid
+//! the same set **except `:`**: only the first colon is significant, so `env:a:b` round-trips as
+//! key `env`, value `a:b`. This key/value asymmetry is easy to get backwards and has its own test.
+//! A multi-value tag's key and value are sanitized per element under these same two rules, with no
+//! cross-element interaction.
 //!
-//! A `SetMembers` member is rendered through its own, narrower rule
-//! ([`is_forbidden_in_set_member`]: lossy UTF-8 first, since a member is arbitrary bytes off the
-//! wire, then that rule's substitution) -- **neither** the name/tag-key rule **nor** the tag-value
-//! rule, even though a member is a bare value: a member sits in `name:<member>|s`'s colon-
-//! separated *value* position, the same position `parse_line` splits on to find several values
-//! sharing one line (`name:v1:v2|c`), so `:` has to be forbidden here or it would silently
-//! re-decode a single member as two, and `|` would open a new segment. Nothing else about that
-//! position is delimiter-sensitive, though: `values_part` is only ever split on `:`, and the line
-//! only on `|`/newline, so `@`, `#`, `,`, and interior whitespace all survive a real decode intact
-//! -- forbidding them here (the name/tag-key rule's reason for forbidding them is that *they* open
-//! or separate segments, a role a member never plays) would sanitize bytes that never needed it
-//! and let distinct members collide. Control bytes (`\n`/`\r`/`\0` included) stay forbidden, since
-//! any of them would corrupt line/datagram framing regardless of position. A member that comes out
-//! different from its raw bytes, either because the bytes weren't valid UTF-8 or because a
-//! forbidden character was substituted, is counted (`EncodeStats::members_sanitized`).
+//! A `SetMembers` member has its own, narrower rule ([`is_forbidden_in_set_member`], applied after
+//! lossy UTF-8, since a member is arbitrary wire bytes), neither the name/tag-key rule nor the
+//! tag-value rule. A member sits in `name:<member>|s`'s *value* position, which `parse_line` splits
+//! on `:` to find several values sharing a line (`name:v1:v2|c`), so `:` would re-decode one member
+//! as two and `|` would open a new segment. Nothing else there is a delimiter: `values_part` is
+//! split only on `:`, and the line only on `|`/newline, so `@`, `#`, `,`, and interior whitespace
+//! survive a real decode, and forbidding them would only make distinct members collide. Control
+//! bytes (`\n`/`\r`/`\0` included) stay forbidden, since they corrupt line/datagram framing in any
+//! position. A member that differs from its raw bytes (invalid UTF-8, or a substituted character)
+//! is counted (`EncodeStats::members_sanitized`).
 //!
 //! ## Multi-value tags (a repeated tag key)
 //!
-//! A DogStatsD `|#` segment is a **list** of `key[:value]` tokens, not a map, so `#team:a,team:b`
-//! is two live tags and a query grouping by `team` places that point in both groups.
+//! A DogStatsD `|#` segment is a **list** of `key[:value]` tokens, not a map: `#team:a,team:b` is
+//! two live tags, and a query grouping by `team` places the point in both groups.
 //! `logit_inputs::statsd::insert_tags` folds a repeated key into a [`Value::Array`] in wire order
-//! (the same fold `syslog_in` uses for a repeated PARAM-NAME), and this sink is its inverse: an
-//! `Array`-valued attribute expands to one wire tag per element, in array order, each through the
-//! very same [`push_one_tag`] a scalar tag goes through. A `Bool(true)` element emits the bare form
-//! (`#urgent`), so a bare/valued mix (`#urgent,urgent:1`) relays intact too.
+//! (as `syslog_in` does for a repeated PARAM-NAME), and this sink inverts it: an `Array` attribute
+//! expands to one wire tag per element, in array order, each through the same [`push_one_tag`] a
+//! scalar tag uses. A `Bool(true)` element emits the bare form (`#urgent`), so a bare/valued mix
+//! (`#urgent,urgent:1`) relays intact.
 //!
-//! Three things this deliberately does *not* do:
+//! What it does *not* do:
 //!
 //! - **No encode-side dedupe.** The Datadog agent's "only exact duplicates are one tag" rule is
-//!   applied once, at decode; encode stays a pure function of the array. A Lua-authored
-//!   `Array[Str("a"), Str("a")]` therefore emits `#k:a,k:a`, which the agent itself then dedupes.
-//! - **No sorting.** Element order is array order -- unlike `syslog_out`'s SD-ID/PARAM-NAME
-//!   canonicalization, which exists only because `AttrMap` order is process-global intern order.
-//!   An `Array` carries real order, and that order is the wire's.
-//! - **No element-level union across the merge.** [`build_tag_suffix`]'s merged resource⊕event walk
-//!   ([`crate::attrs::merged`]) has the event's value win *whole* on an equal key, so an
-//!   event-level `Array` overrides a resource-level scalar entirely, and a resource-level `Array`
-//!   is overridden whole by an event-level scalar. The resource's value was never part of *this*
-//!   event's wire tag list, so unioning the two lists element-wise would emit tags nothing sent.
+//!   applied once, at decode; encode is a pure function of the array. A Lua-authored
+//!   `Array[Str("a"), Str("a")]` emits `#k:a,k:a`, which the agent itself dedupes.
+//! - **No sorting.** Element order is array order. `syslog_out` canonicalizes SD-ID/PARAM-NAME
+//!   order only because `AttrMap` order is process-global intern order; an `Array` carries real
+//!   order, and that order is the wire's.
+//! - **No element-level union across the merge.** [`build_tag_suffix`]'s merged resource⊕event
+//!   walk ([`crate::attrs::merged`]) has the event's value win *whole* on an equal key: an
+//!   event-level `Array` replaces a resource-level scalar, and an event-level scalar replaces a
+//!   resource-level `Array`. The resource's value was never in *this* event's wire tag list, so an
+//!   element-wise union would emit tags nothing sent.
 //!
-//! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`) is
-//! skipped and counted `EncodeStats::tags_dropped_unrepresentable` **per element**; an array whose
-//! every element drops emits no tag at all and leaves no stray `,` behind. A tag *literally named*
-//! `statsd.type` inside the `#` segment can now decode to an `Array` as well; it matches no
-//! [`Carriers`] arm (each expects a `Value::Str`/`Value::U64`) and is filtered out of the tag
-//! segment uncounted, exactly as a wrong-typed carrier already is.
+//! An element [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`)
+//! is skipped and counted `EncodeStats::tags_dropped_unrepresentable` **per element**; an array
+//! whose every element drops emits no tag and leaves no stray `,`. A tag named `statsd.type` in the
+//! `#` segment can decode to an `Array` too; it matches no [`Carriers`] arm (each expects a
+//! `Value::Str`/`Value::U64`) and is filtered out of the tag segment uncounted, like any
+//! wrong-typed carrier.
 //!
 //! ## Metric-kind coverage: raw kinds in, sketches still deferred
 //!
-//! A delta, monotonic `Sum` (`MetricKind::counter`, `|c`), `Gauge`/`GaugeDelta` (`|g`), `Samples`
-//! (`|ms`/`|h`/`|d`), and `SetMembers` (`|s`) are all encoded -- `Samples`/`SetMembers` are the
-//! raw, unsummarized shapes `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s
-//! "summarization is opt-in and named"), so a `statsd_in -> statsd_out` relay with no `aggregate`
-//! in between round-trips a timer or set line intact. `Distribution`, `Set`, `Histogram`,
-//! `ExponentialHistogram`, `Summary`, and a cumulative or non-monotonic `Sum` -- everything that
-//! only exists *after* some stage has already summarized -- are dropped with a clear "not
-//! implemented yet" message (`EncodeStats::dropped_unsupported_kind`) -- recorded in
-//! `docs/known-gaps.md`.
+//! Encoded: a delta, monotonic `Sum` (`MetricKind::counter`, `|c`), `Gauge`/`GaugeDelta` (`|g`),
+//! `Samples` (`|ms`/`|h`/`|d`), and `SetMembers` (`|s`). `Samples`/`SetMembers` are the raw shapes
+//! `statsd_in` decodes losslessly (`docs/adr/lossless-transit.md`'s "summarization is opt-in and
+//! named"), so a `statsd_in -> statsd_out` relay with no `aggregate` round-trips a timer or set
+//! line intact. Dropped and counted (`EncodeStats::dropped_unsupported_kind`, recorded in
+//! `docs/known-gaps.md`): `Distribution`, `Set`, `Histogram`, `ExponentialHistogram`, `Summary`,
+//! and a cumulative or non-monotonic `Sum`, the kinds that exist only after some stage summarized.
 //!
-//! **This means a `statsd_in -> aggregate -> statsd_out` relay still drops every timer/set metric
-//! whose window used `aggregate`'s default summarizing config.** `aggregate`'s default turns
-//! `Samples` into a `Distribution` sketch and `SetMembers` into a `Set` cardinality estimate,
-//! neither of which has a lossless statsd rendering (see the module doc's opening paragraph and
-//! `docs/adr/statsd-output.md`'s original deferral) -- configuring that `aggregate` component with
-//! `distributions: samples` / `sets: members` keeps the raw shapes flowing through instead, so
-//! this sink's real `Samples`/`SetMembers` encoding can relay them.
+//! **So a `statsd_in -> aggregate -> statsd_out` relay drops every timer/set metric under
+//! `aggregate`'s default summarizing config.** That default turns `Samples` into a `Distribution`
+//! sketch and `SetMembers` into a `Set` estimate, neither of which has a lossless statsd rendering
+//! (`docs/adr/statsd-output.md`'s "What's still deferred" section). Configuring that `aggregate`
+//! with `distributions: samples` / `sets: members` keeps the raw shapes flowing to this sink.
 //!
 //! ## Relative gauges
 //!
-//! statsd is the one protocol that natively expresses a *relative* gauge adjustment
-//! (`name:+5|g`/`name:-5|g`) -- exactly [`logit_core::MetricKind::GaugeDelta`]'s wire origin. By
-//! default a `GaugeDelta` reaching this sink is dropped with the same message
-//! `influxdb_out` uses (`gauge_delta_unresolved`): it means the pipeline is missing an `aggregate`
-//! component, not that this metric is malformed. Setting `relative_gauges: true` opts into
-//! encoding it natively instead -- the one sink that *can* round-trip a delta losslessly, since
-//! every other sink's wire format has no such concept at all.
+//! statsd is the one protocol with a native *relative* gauge adjustment (`name:+5|g`/`name:-5|g`),
+//! [`logit_core::MetricKind::GaugeDelta`]'s wire origin. By default a `GaugeDelta` reaching this
+//! sink is dropped with `influxdb_out`'s message (`gauge_delta_unresolved`): the pipeline is
+//! missing an `aggregate`, not carrying a malformed metric. `relative_gauges: true` encodes it
+//! natively instead; no other sink's wire format has the concept
+//! (`docs/adr/relative-gauge-adjustments.md`).
 //!
 //! A positive delta needs an explicit `+`: `write!("{}", 5.0)` yields `"5"`, which the decoder
-//! reads back as an *absolute* `Gauge`, not a delta -- silently corrupting the round-trip this
-//! sink exists to preserve.
+//! reads back as an *absolute* `Gauge`.
 //!
 //! ## Negative absolute gauges
 //!
-//! The statsd/DogStatsD grammar has no wire syntax for setting a gauge to a negative absolute
-//! value at all (`logit_inputs::statsd::build_event`'s `"g"` arm reads *any* leading `-` as a
-//! delta) -- so a naive `Gauge(-5.0)` would render as `name:-5|g` and decode back as
-//! `GaugeDelta(-5.0)`, a silent semantic corruption. This sink instead emits the idiom both Etsy
-//! statsd and DogStatsD document for exactly this case: `name:0|g` immediately followed by
-//! `name:-5|g`. The two lines are pushed into the [`MessageBuf`] as **one indivisible entry**
-//! (joined by an embedded `\n`) so the packer can never split them across two datagrams -- a lost
-//! first datagram would otherwise apply `-5` to whatever stale value the gauge already held at the
-//! receiver. This is the only place an entry contains a newline; every sanitizer above exists
-//! precisely to guarantee nothing else ever does.
+//! The grammar has no syntax for a negative absolute gauge (`logit_inputs::statsd::build_event`'s
+//! `"g"` arm reads *any* leading `-` as a delta), so a naive `Gauge(-5.0)` would render as
+//! `name:-5|g` and decode as `GaugeDelta(-5.0)`. This sink emits the idiom Etsy statsd and
+//! DogStatsD both document for the case: `name:0|g` immediately followed by `name:-5|g`. The two
+//! lines go into the [`MessageBuf`] as **one indivisible entry** (joined by an embedded `\n`) so
+//! the packer can never split them across two datagrams: if the first datagram were lost, `-5`
+//! would apply to whatever stale value the receiver's gauge held. This is the only entry that
+//! contains a newline; every sanitizer above exists to guarantee no other does.
 //!
-//! `Gauge(-0.0)` is deliberately *not* a pair: it is numerically zero, so its sign is normalized
-//! away and it renders as the plain `name:0|g` -- the naive `name:-0|g` would decode as a no-op
-//! `GaugeDelta`, since the decoder dispatches on the leading `-` without parsing the value.
+//! `Gauge(-0.0)` is *not* a pair: it is numerically zero, so its sign is normalized away and it
+//! renders as `name:0|g`. The naive `name:-0|g` would decode as a no-op `GaugeDelta`, since the
+//! decoder dispatches on the leading `-` without parsing the value.
 //!
 //! ## Packing and framing
 //!
-//! UDP **packs** several lines into one datagram, up to `max_packet_bytes`
-//! (`\n`-joined, no trailing `\n`, since the datagram boundary itself ends the last line). This is
-//! a deliberate divergence from `syslog_out`, which refuses to pack because packing there would
-//! depend on the receiver splitting on a delimiter its whole "injection safety" section exists to
-//! avoid relying on. The reasoning inverts here: splitting on `\n` **is** the statsd grammar
-//! (every statsd client packs a buffered send this way, and `StatsdDecoder::decode_into` splits on
-//! it directly), and the sanitizers above make an embedded `\n` unrepresentable in a name, key, or
-//! value -- so a packed datagram cannot forge an extra metric the way a packed syslog datagram
-//! could forge an extra log line. A line that would overflow the cap starts a new datagram rather
-//! than being split; a single line longer than the cap is **dropped whole**, never truncated
-//! (unlike `syslog_out`) -- a truncated statsd line decodes as a different metric or a parse
-//! error, never a shorter version of the same one.
+//! UDP **packs** several lines into one datagram, up to `max_packet_bytes` (`\n`-joined, no
+//! trailing `\n`; the datagram boundary ends the last line). `syslog_out` refuses to pack, since
+//! packing there would rely on the receiver splitting on a delimiter its "injection safety"
+//! section avoids relying on. Here splitting on `\n` **is** the grammar (every statsd client packs
+//! a buffered send this way, and `StatsdDecoder::decode_into` splits on it), and the sanitizers
+//! make an embedded `\n` unrepresentable in a name, key, or value, so a packed datagram can't
+//! forge an extra metric. A line that would overflow the cap starts a new datagram. A single line
+//! longer than the cap is **dropped whole**, never truncated (unlike `syslog_out`): a truncated
+//! statsd line decodes as a different metric or a parse error, never a shorter version of itself.
 //!
-//! TCP terminates **every** line with `\n`, including the last -- a stream has no per-batch EOF,
-//! so without a trailing separator the last line of one batch would glue onto the first line of
-//! the next. No octet-counting: statsd has no such framing convention and no receiver auto-detects
-//! one, unlike syslog's `go-syslog`.
+//! TCP terminates **every** line with `\n`, including the last: a stream has no per-batch EOF, so
+//! the last line of one batch would otherwise glue onto the first line of the next. No
+//! octet-counting: statsd has no such convention and no receiver auto-detects one, unlike syslog's
+//! `go-syslog`.
 //!
 //! ## TLS
 //!
-//! `transport: tcp` optionally runs over TLS ([`StatsdOutput::with_tls`]), the `syslog_out`
-//! arrangement ported verbatim (`docs/adr/statsd-output.md`'s TLS amendment): the `tls:` block's
-//! mere presence turns it on and makes it *required*, since `endpoint` is a bare `host:port` with
-//! no scheme to carry the signal and so no plaintext fallback to fall back to. statsd has no
-//! registered TLS port and no client in the wild speaks it, so this is for a `logit`-to-`logit`
-//! (or stunnel-shaped) relay hop, not for an application's own DogStatsD client. DTLS is out of
-//! scope, so `tls:` under `transport: udp` is a config error
-//! (`logit-pipeline::graph::resolve`'s rule 52) as well as an error here. A connect *after* the
-//! first counts `logit.output.reconnects`, on TLS and plaintext alike.
+//! `transport: tcp` optionally runs over TLS ([`StatsdOutput::with_tls`]) in `syslog_out`'s
+//! arrangement (`docs/adr/statsd-output.md`'s "Amendment: TLS" section). A `tls:` block's presence
+//! turns TLS on and makes it *required*: `endpoint` is a bare `host:port` with no scheme to carry
+//! the signal, so there is no plaintext fallback. No statsd client in the wild speaks TLS, so this
+//! is for a `logit`-to-`logit` (or stunnel-shaped) relay hop. DTLS is out of scope, so `tls:` under
+//! `transport: udp` is a config error (`logit-pipeline::graph::resolve`'s rule 52) as well as an
+//! error here. Every connect after the first counts `logit.output.reconnects`, on TLS and plaintext
+//! alike.
 //!
-//! TLS is **not** transparent to this sink's fault classification: a `tokio_rustls` stream's `Ok`
-//! from a write means "the session accepted these bytes", not "the kernel has them", and its
-//! `Err` is never proof that nothing left the host. [`StatsdOutput::send_tcp`]'s doc comment
-//! states the per-transport invariants and what changes because of them (no internal retry and no
-//! `Fault::Clean` after an application write on TLS, and a mandatory flush before any batch is
-//! called delivered).
+//! TLS changes this sink's fault classification: a `tokio_rustls` write's `Ok` means "the session
+//! accepted these bytes", not "the kernel has them", and its `Err` is never proof that nothing
+//! left the host. [`StatsdOutput::send_tcp`]'s doc has the per-transport rules that follow: no
+//! internal retry and no `Fault::Clean` after an application write on TLS, and a mandatory flush
+//! before any batch is called delivered.
 //!
 //! ## Sample rate: never for a counter, real for `Samples`
 //!
-//! A delta, monotonic `Sum`'s value (`MetricKind::counter`) already has its sample rate divided
-//! out at decode time, so this sink never emits `@<rate>` for `|c` -- doing so would
-//! double-extrapolate downstream. `Samples` is different: `statsd_in` no longer extrapolates
-//! timer/histogram samples at all (raw values are kept, unlike a counter's single scalar), so
-//! `Samples.sample_rate` is real, un-applied information that must reach the wire for a lossless
-//! relay -- `@<rate>` is emitted whenever it isn't `1.0` (see [`render_metric`]'s `Samples` arm).
-//! `MetricRecord::unit` still has no statsd wire representation and is dropped the same way it
-//! always was.
+//! A delta, monotonic `Sum` (`MetricKind::counter`) already has its sample rate divided out at
+//! decode, so this sink never emits `@<rate>` for `|c`: that would double-extrapolate downstream.
+//! `statsd_in` keeps timer/histogram samples raw instead, so `Samples.sample_rate` is un-applied
+//! information a lossless relay must carry: `@<rate>` is emitted whenever it isn't `1.0` (see
+//! [`render_metric`]'s `Samples` arm). `MetricRecord::unit` has no statsd wire representation and
+//! is dropped.
 //!
 //! ## `|c:<container-id>` and `|T<timestamp>`
 //!
-//! Both are DogStatsD-only line extensions this sink now round-trips: `statsd.container_id`
-//! (a `Value::Str` attribute `statsd_in` stamps from an incoming `|c:<id>` segment) renders as
-//! `|c:<id>` (sanitized like a tag value, so an embedded `:` survives); `statsd.timestamp ==
-//! Value::U64(secs)` (the raw wire seconds `statsd_in` stamps alongside moving the value onto
-//! `Event::timestamp`) renders as `|T<secs>` **using that carrier's own value, never
-//! `event.timestamp`** -- a stage that rebuilds `Event::timestamp` after decode (`aggregate`'s
-//! flush, notably) can't fabricate or collapse a `|T` this way, since the carrier rides on the
-//! series key exactly like any other attribute; a `statsd.timestamp` present but not a
-//! `Value::U64` (never produced by `statsd_in` itself, but reachable from a cross-protocol relay
-//! or a Lua-authored attribute) is simply not emitted. Both segments are appended after the tag
-//! segment, to every line this sink emits for that event -- see `append_dialect_extras`. Under
-//! `Format::Statsd` neither has anywhere to go (the classic grammar has no equivalent segment), so
-//! both are dropped and counted (`EncodeStats::dropped_dialect_fields`) rather than silently
-//! disappearing.
+//! Both are DogStatsD-only line extensions this sink round-trips. `statsd.container_id` (a
+//! `Value::Str` `statsd_in` stamps from an incoming `|c:<id>`) renders as `|c:<id>`, sanitized like
+//! a tag value so an embedded `:` survives. `statsd.timestamp == Value::U64(secs)` (the raw wire
+//! seconds `statsd_in` stamps alongside setting `Event::timestamp`) renders as `|T<secs>` **from
+//! the carrier, never from `event.timestamp`**: a stage that rebuilds `Event::timestamp` after
+//! decode (`aggregate`'s flush) can't fabricate or collapse a `|T`, since the carrier rides on the
+//! series key like any other attribute. A `statsd.timestamp` that isn't a `Value::U64` (reachable
+//! from a cross-protocol relay or Lua, never from `statsd_in`) isn't emitted. Both segments follow
+//! the tag segment on every line emitted for the event (`append_dialect_extras`). Under
+//! `Format::Statsd` neither has anywhere to go, so both are dropped and counted
+//! (`EncodeStats::dropped_dialect_fields`).
 //!
 //! `statsd.*` attributes (`statsd.type`, `statsd.container_id`, `statsd.timestamp`) are
-//! protocol-namespaced carriers for exactly this information, not ordinary tags -- they are never
-//! emitted through the `|#k:v,...` tag segment (`build_tag_suffix` filters the prefix), the same
-//! way `syslog_out` never re-emits its own `syslog.*` attributes as generic SD-ELEMENT fields.
-//! `build_tag_suffix`'s merged resource⊕event walk (the same one that filters them out of the tag
-//! segment) is also where all three carriers are captured, into [`EncodeCtx`]'s own fields, so a
-//! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored the
-//! same way an event-level one already is -- `append_dialect_extras`/`statsd_wire_type` read
-//! `EncodeCtx`, never `event.attributes`, directly, keeping the filter and the read symmetric.
+//! protocol-namespaced carriers, not tags: `build_tag_suffix` filters the prefix out of the
+//! `|#k:v,...` segment, as `syslog_out` never re-emits its own `syslog.*` attributes as SD-ELEMENT
+//! fields. The same merged resource⊕event walk captures all three carriers into [`EncodeCtx`], so a
+//! carrier set only on the resource (a `set` transform's `resource:` block, say) is honored like
+//! an event-level one. `append_dialect_extras`/`statsd_wire_type` read `EncodeCtx`, never
+//! `event.attributes`, which keeps the filter and the read symmetric.
 //!
 //! ## DogStatsD events and service checks
 //!
-//! An **event** is `event.log.is_some()` *and* carries `statsd.event.title` as a `Value::Str`
-//! (the shape `statsd_in`'s `parse_event` always produces), event value winning over the
-//! resource's on collision, mirroring `crate::attrs::merged`'s precedence for this one key; a
-//! **service check** is `statsd.service_check.name` present as a `Value::Str`. Detection is
-//! two-tier in [`StatsdEncoder::encode_into`], split on `event.metrics.is_empty()` -- a real
-//! event/service check never has both an empty `metrics` list and no event-ness, but the
-//! overwhelming majority of metrics-empty events are a plain log/span-only line with no
-//! `statsd.*` carriers at all (any log-only input, `statsd_in`'s own event lines aside), so:
-//! a metrics-empty event first gets a single, *unmerged* [`is_dogstatsd_event`] lookup
-//! (`event.attributes.get` then, only if absent, `resource.attributes.get`) -- cheap enough that
-//! the ordinary "not an event" case never touches [`build_tag_suffix`]'s full merged walk at all,
-//! and is counted straight into `skipped_no_metrics` without inflating `tags_dropped_dialect` for
-//! tags nothing was ever going to render; only once that lookup says "yes" does the full walk run
-//! (for every other carrier the line needs). An event with metrics (a service check, or an
-//! ordinary metric event) always runs the full walk first, exactly as before -- service-check
-//! detection reads `Carriers::service_check_name` off it, zero extra lookups. Either way, the
-//! full walk (into [`Carriers`]) is what `statsd.type`/`statsd.container_id`/`statsd.timestamp`
-//! are also captured from, so a carrier set only on the resource is honored the same way an
-//! event-level one is -- `event.attributes` is never read a second time for those.
+//! An **event** is `event.log.is_some()` *and* `statsd.event.title` present as a `Value::Str` (the
+//! shape `statsd_in`'s `parse_event` produces), the event's value winning over the resource's as
+//! in `crate::attrs::merged`. A **service check** is `statsd.service_check.name` present as a
+//! `Value::Str`. [`StatsdEncoder::encode_into`] detects them in two tiers, split on
+//! `event.metrics.is_empty()`, because most metrics-empty events are plain log/span lines with no
+//! `statsd.*` carrier at all:
 //!
-//! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, followed, in this order and only
-//! when the field is present and valid, by `|d:<secs>` (from the `statsd.timestamp` carrier --
-//! `d:`, never `|T`: an event/service-check line's timestamp is a named field of its own grammar,
-//! not the generic metric-line extension `append_dialect_extras` emits elsewhere in this module),
-//! `|h:<host>`, `|p:<priority>` (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/
-//! `warning`/`error` only), `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment
-//! (via [`build_tag_suffix`]/[`append_tags`], identical to a metric line's), then `|c:<container
-//! id>`. `title` is `statsd.event.title` verbatim; `text` is the log `message` -- must be a
-//! `Value::Str`, anything else drops the event and counts `EncodeStats::dropped_unencodable_value`
-//! -- with every real `\n` it contains escaped to the two bytes `\n` (`statsd_in`'s
-//! `unescape_event_text` is the decode-side mirror of exactly this). `tlen`/`xlen` are the *byte*
-//! lengths of the sanitized title and the escaped text as written, not char counts -- DogStatsD's
-//! `_e{TITLE_LEN,TEXT_LEN}` header is a byte-length-prefixed encoding, and `parse_event` slices by
-//! those exact byte counts, so a char count would silently corrupt a multi-byte title/text.
-//! Severity is never re-derived from `LogRecord.severity` to synthesize a `t:` field when
-//! `statsd.event.alert_type` is absent -- rule (b) (`docs/adr/lossless-transit.md`): the raw
-//! carrier outranks the normalized field on this protocol's own egress, and an absent carrier
-//! means an absent wire field, not an invented one.
+//! - A metrics-empty event gets one *unmerged* [`is_dogstatsd_event`] lookup (event attributes,
+//!   then resource). The common "not an event" case skips [`build_tag_suffix`]'s full merged walk
+//!   and counts only `skipped_no_metrics`, without inflating `tags_dropped_dialect` for tags
+//!   nothing would render. Only a "yes" runs the full walk, for the other carriers the line needs.
+//! - An event with metrics (a service check, or an ordinary metric event) always runs the full
+//!   walk, and service-check detection reads `Carriers::service_check_name` off it.
 //!
-//! **Service-check wire form**, one line: `_sc|<name>|<status>`, followed by `|d:<secs>`, `|h:
-//! <host>`, the `|#...` tag segment, `|c:<container id>`, and -- always last, since `m:` consumes
-//! the rest of the line verbatim on decode -- `|m:<message>`. The event's **first** metric is the
-//! service check; it must be a `Gauge`, else the whole event is dropped and counted
-//! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to an ordinary
-//! `name:v|g` line -- the point *is* the check, not a gauge that happens to share its value.
-//! `name` is the `statsd.service_check.name` carrier, **not** the metric's own (normalized) name
-//! -- rule (b) again, and unlike a metric name this is sanitized with [`is_forbidden_in_extended_field`]
-//! (`|`/control bytes only), not [`is_forbidden_in_name`], so a service check name keeps `.` and
-//! spaces exactly as sent. `status` is `statsd.service_check.status` when it's a `U64` in `0..=3`;
-//! otherwise the gauge's own value, if finite and rounding into `0..=3`; otherwise the service
-//! check is dropped and counted (`dropped_invalid_service_check`) rather than writing an
-//! out-of-range status DogStatsD's own decoder would reject. `message` is
-//! `statsd.service_check.message` verbatim except a newline or other control byte substituted
-//! with `_` -- unlike event text, there is no escape for this position, only substitution; `|`
-//! survives untouched since `m:` is always the last field. Any metrics after the first on a
-//! service-check event render as ordinary lines (`render_metric`), right after the `_sc` line.
+//! Either way the full walk into [`Carriers`] is where `statsd.type`/`statsd.container_id`/
+//! `statsd.timestamp` are captured too, so `event.attributes` is never read a second time.
 //!
-//! **Sanitization**, one rule per field, all substitution (never deletion, following this
-//! module's existing convention): event title -- control bytes -> `_` ([`is_forbidden_in_event_title`];
-//! a bare `|` is fine, since the length prefix delimits the field, not a scan for `|`). Event text
-//! -- a real newline becomes the two-byte escape `\n`; any other control byte -> `_`
-//! ([`append_event_text`]). Event host/aggregation-key/source, and service-check name/host --
-//! `|`/control bytes -> `_` ([`is_forbidden_in_extended_field`] -- shared by all five, since each
-//! sits in a `|letter:value` field a real decode splits on the *next* `|`, exactly the way a tag
-//! value does, except a tag value's own `:`-preserving rule doesn't apply here since none of these
-//! fields has a tag value's colon-splitting ambiguity). Event priority/alert-type are never
-//! sanitized at all -- either they exactly match the fixed allowed set (`normal`/`low`;
-//! `info`/`success`/`warning`/`error`) and are written verbatim, or they don't and are omitted,
-//! counting `EncodeStats::dropped_invalid_event_fields` (an out-of-set value has no sanitized form
-//! that would still mean the same thing, so there is nothing to substitute into -- and it's a
-//! dropped *field* on a line that still gets emitted, not a dropped message, hence its own counter
-//! rather than `dropped_unencodable_value`, which reports as a message drop). Service-check
-//! message -- control bytes (including a real newline) -> `_`, `|` left alone
-//! ([`is_forbidden_in_service_check_message`]).
+//! **Event wire form**, one line: `_e{tlen,xlen}:title|text`, then, in this order and only when
+//! present and valid: `|d:<secs>` (from the `statsd.timestamp` carrier; `d:`, never `|T`, since an
+//! event's timestamp is a named field of its own grammar), `|h:<host>`, `|p:<priority>`
+//! (`normal`/`low` only), `|t:<alert_type>` (`info`/`success`/`warning`/`error` only),
+//! `|k:<aggregation_key>`, `|s:<source_type>`, the `|#...` tag segment (via
+//! [`build_tag_suffix`]/[`append_tags`], as for a metric line), then `|c:<container id>`. `title`
+//! is `statsd.event.title`; `text` is the log `message`, which must be a `Value::Str` (anything
+//! else drops the event, counted `EncodeStats::dropped_unencodable_value`), with every real `\n`
+//! escaped to the two bytes `\n` (`statsd_in`'s `unescape_event_text` is the mirror). `tlen`/`xlen`
+//! are the *byte* lengths of the sanitized title and escaped text: `parse_event` slices by those
+//! byte counts, so a char count would corrupt a multi-byte title or text. Severity is never
+//! re-derived from `LogRecord.severity` to synthesize a missing `t:` field: under rule (b)
+//! (`docs/adr/lossless-transit.md`) the raw carrier outranks the normalized field on this
+//! protocol's own egress, and an absent carrier means an absent wire field.
 //!
-//! **`Format::Statsd` has no wire form for either shape at all** -- the classic grammar has no
-//! `_e`/`_sc` sigil -- so the whole event is dropped and counted
-//! (`EncodeStats::dropped_dialect_events`) before anything else about it is even inspected; a
-//! service check's gauge is not emitted as `name:v|g` either, since the point being made is the
-//! check, not a value that happens to coincide with one. A real event/service check dropped this
-//! way still had its full merged walk run first ([`is_dogstatsd_event`] said "yes"), so its
-//! ordinary attributes are also tallied into `tags_dropped_dialect` by that walk -- both counters
-//! incrementing for the one dropped line is expected, not a double-count bug.
+//! **Service-check wire form**, one line: `_sc|<name>|<status>`, then `|d:<secs>`, `|h:<host>`,
+//! the `|#...` tag segment, `|c:<container id>`, and always last `|m:<message>`, since `m:`
+//! consumes the rest of the line on decode. The event's **first** metric is the check and must be a
+//! `Gauge`; otherwise the whole event is dropped and counted
+//! (`EncodeStats::dropped_invalid_service_check`) rather than falling through to a `name:v|g`
+//! line, since the point is the check, not a gauge that shares its value. `name` is the
+//! `statsd.service_check.name` carrier, **not** the metric's normalized name (rule (b) again),
+//! sanitized with [`is_forbidden_in_extended_field`] rather than [`is_forbidden_in_name`], so it
+//! keeps `.` and spaces as sent. `status` is `statsd.service_check.status` when it's a `U64` in
+//! `0..=3`, else the gauge's value if finite and rounding into `0..=3`, else the check is dropped
+//! and counted (`dropped_invalid_service_check`) rather than written with a status DogStatsD's own
+//! decoder would reject. Metrics after the first render as ordinary lines (`render_metric`) right
+//! after the `_sc` line.
 //!
-//! `statsd.event.*`/`statsd.service_check.*` are protocol carriers exactly like `statsd.type`/
-//! `statsd.container_id`/`statsd.timestamp` -- filtered out of the generic `|#k:v,...` tag segment
-//! by the same `key_str.starts_with("statsd.")` check in [`build_tag_suffix`], never re-emitted as
-//! a tag on any line, event/service-check or otherwise.
+//! **Sanitization**, one rule per field, all substitution:
+//!
+//! - Event title: control bytes -> `_` ([`is_forbidden_in_event_title`]). A bare `|` is fine; the
+//!   length prefix delimits the field.
+//! - Event text: a real newline becomes the two-byte escape `\n`; any other control byte -> `_`
+//!   ([`append_event_text`]).
+//! - Event host/aggregation key/source, service-check name/host: `|` and control bytes -> `_`
+//!   ([`is_forbidden_in_extended_field`]). Each sits in a `|letter:value` field a decode ends at
+//!   the next `|`, as for a tag value, but none has a tag value's colon-splitting ambiguity.
+//! - Event priority/alert type: never sanitized. A value in the fixed set is written verbatim; any
+//!   other is omitted and counted `EncodeStats::dropped_invalid_event_fields`, since an
+//!   out-of-set value has no sanitized form that means the same thing. The line is still emitted,
+//!   so this is its own counter rather than `dropped_unencodable_value`, which reports a message
+//!   drop.
+//! - Service-check message: control bytes (a real newline included) -> `_`, with no escape; `|`
+//!   is left alone since `m:` is last ([`is_forbidden_in_service_check_message`]).
+//!
+//! **`Format::Statsd` has no wire form for either shape** (no `_e`/`_sc` sigil), so the whole
+//! event is dropped and counted (`EncodeStats::dropped_dialect_events`) before anything else about
+//! it is inspected; a service check's gauge isn't emitted as `name:v|g` either. Either shape
+//! dropped this way has already run the full merged walk, so its ordinary attributes are also
+//! tallied into `tags_dropped_dialect`: both counters incrementing for one dropped line is
+//! expected, not a double count.
+//!
+//! `statsd.event.*`/`statsd.service_check.*` are carriers like `statsd.type`: the same
+//! `key_str.starts_with("statsd.")` check in [`build_tag_suffix`] keeps them out of every line's
+//! `|#k:v,...` segment.
 
 use crate::influxdb::{push_float, tag_value};
-// The TLS pieces this sink shares with `syslog_out`/`logit_out`, which dial the same shape of
-// connection: a bare `host:port` over raw TCP that may or may not be TLS-wrapped. `AsyncStream` is
-// what lets `Conn::Tcp` hold either without `StatsdOutput` becoming generic; `host_only` derives
-// the SNI name from an endpoint with no scheme to read.
+// Shared with `syslog_out`/`logit_out`, which dial the same bare `host:port`, optionally
+// TLS-wrapped. `AsyncStream` lets `Conn::Tcp` hold either without `StatsdOutput` becoming generic;
+// `host_only` derives the SNI name from an endpoint with no scheme.
 use crate::tls::{host_only, poll_pending_close, AsyncStream, PendingClose};
 use crate::Output;
 use anyhow::Context;
@@ -355,144 +302,118 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
-/// `crate::tls::TlsClientSettings`, re-exported here for symmetry with `crate::syslog`'s and
-/// `crate::logit`'s own paths (every TLS-dialing sink shares the one definition in `crate::tls`).
+/// Re-exported for symmetry with `crate::syslog`'s and `crate::logit`'s paths; every TLS-dialing
+/// sink shares the one definition in `crate::tls`.
 pub use crate::tls::TlsClientSettings;
 
-/// Etsy statsd's own "commodity Ethernet LAN" recommendation, and also DataDog's documented
-/// DogStatsD client default -- 1500 MTU minus IPv4/UDP headers minus ~40 bytes of headroom for
-/// VXLAN/IPsec encapsulation, exactly the case where a 1472-byte datagram would silently fragment
-/// or `EMSGSIZE`. Unlike DataDog's loopback/UDS figure (8192, matching `syslog_out`'s
-/// `DEFAULT_MAX_MESSAGE_BYTES`) this doesn't assume the destination is local. Bounds one
-/// **datagram** (several packed lines), not a single line.
+/// Bounds one **datagram** (several packed lines), not one line. Etsy statsd's "commodity
+/// Ethernet LAN" recommendation and DataDog's DogStatsD client default: 1500 MTU minus IPv4/UDP
+/// headers minus ~40 bytes of headroom for VXLAN/IPsec encapsulation, where a 1472-byte datagram
+/// would fragment or fail with `EMSGSIZE`. DataDog's loopback/UDS figure (8192, `syslog_out`'s
+/// `DEFAULT_MAX_MESSAGE_BYTES`) assumes a local destination; this doesn't.
 pub const DEFAULT_MAX_PACKET_BYTES: usize = 1432;
 
-/// TCP only -- mirrors `syslog::DEFAULT_CONNECT_TIMEOUT`'s reasoning and value exactly: `logit-
-/// config`'s own `default_statsd_connect_timeout` hardcodes the same 5 seconds, kept in sync by
-/// hand.
+/// TCP only; `syslog::DEFAULT_CONNECT_TIMEOUT`'s value. `logit-config`'s
+/// `default_statsd_connect_timeout` hardcodes the same 5 seconds, kept in sync by hand.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Which statsd dialect [`StatsdEncoder`] emits. Deliberately its own tiny enum rather than
-/// `logit_config::StatsdFormat` -- `logit-outputs` never depends on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout); `logit-cli::pipeline::build_spec` is the sole
-/// place a config value crosses into this type.
+/// Which statsd dialect [`StatsdEncoder`] emits. Its own enum rather than
+/// `logit_config::StatsdFormat` because `logit-outputs` never depends on `logit-config`
+/// (`docs/design/pipeline-graph.md`'s "Crate layout" section); `logit-cli::pipeline::build_spec`
+/// is the one place a config value crosses into this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     DogStatsd,
     Statsd,
 }
 
-/// Per-batch outcome counts from [`StatsdEncoder::encode_into`] -- this sink's
-/// [`FramedEncoder::Stats`], what `StatsdOutput::send` turns into `logit.output.*` telemetry
+/// Per-batch outcome counts from [`StatsdEncoder::encode_into`], this sink's
+/// [`FramedEncoder::Stats`]; `StatsdOutput::send` turns them into `logit.output.*` telemetry
 /// (`docs/design/internal-telemetry.md`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeStats {
-    /// Events with no metrics (a log-only or span-only event, legal under
-    /// `docs/adr/multi-payload-events.md`) -- the same "nothing to render" skip `influxdb_out`
-    /// makes for the same shape of event.
+    /// Events with no metrics (log-only or span-only, legal under
+    /// `docs/adr/multi-payload-events.md`), the same skip `influxdb_out` makes.
     pub skipped_no_metrics: usize,
     pub dropped_gauge_delta: usize,
-    /// A `NO_RECORDED_VALUE`-flagged point -- statsd has no wire concept of "no value here," so
-    /// unlike `otlp_out` this sink can't keep the point flagged; it drops it rather than write its
-    /// default value as a fabricated real sample (`docs/adr/lossless-transit.md`,
-    /// `docs/known-gaps.md`'s cross-protocol table).
+    /// A `NO_RECORDED_VALUE`-flagged point. statsd has no "no value here" concept, so unlike
+    /// `otlp_out` this sink can't keep the point flagged; it drops it rather than write its default
+    /// value as a fabricated sample (`docs/known-gaps.md`'s cross-protocol table).
     pub dropped_no_recorded_value: usize,
     pub dropped_unsupported_kind: usize,
-    /// Also counts a non-finite value inside a `Samples`/`Sum`/`Gauge`/`GaugeDelta` record, an
-    /// out-of-range `Samples.sample_rate` (finite, `@rate` omitted rather than written), an
-    /// entirely empty `Samples`/`SetMembers` record -- see [`render_metric`]'s `Samples`/
-    /// `SetMembers` arms -- and, new in this workstream: an event whose log `message` isn't a
-    /// `Value::Str` (or isn't valid UTF-8), or whose `statsd.event.title` itself isn't valid UTF-8
-    /// (accepted by [`is_dogstatsd_event`] as any `Value::Str`, but with no `carriers.event_title`
-    /// to render), either of which drops the whole event ([`render_event`]). The shared name
-    /// follows this file's existing "one bucket per kind of unencodable input" convention rather
-    /// than adding a near-duplicate counter. An out-of-the-fixed-set
-    /// `statsd.event.priority`/`statsd.event.alert_type` is a *different* shape of problem --
-    /// the line still gets emitted, just without that one field -- so it's counted separately, in
-    /// [`Self::dropped_invalid_event_fields`], not here.
+    /// One bucket for every kind of unencodable input: a non-finite value in a
+    /// `Samples`/`Sum`/`Gauge`/`GaugeDelta`; an out-of-range `Samples.sample_rate` (the line is
+    /// still written, without `@rate`); an empty `Samples`/`SetMembers` record; or an event whose
+    /// log `message` isn't a UTF-8 `Value::Str`, or whose `statsd.event.title` isn't valid UTF-8
+    /// ([`is_dogstatsd_event`] accepts any `Value::Str`), which drops the whole event
+    /// ([`render_event`]). An out-of-set event priority/alert type still emits its line, so it
+    /// counts in [`Self::dropped_invalid_event_fields`] instead.
     pub dropped_unencodable_value: usize,
     pub dropped_empty_name: usize,
     pub dropped_oversize_line: usize,
-    /// Tags dropped because [`Format::Statsd`] has no tag segment at all. Counted **per wire
-    /// tag**, not per attribute: a multi-value `Array` attribute would have rendered one `k:v`
-    /// token per element, so it counts once per element (and an empty `Array`, which would have
-    /// rendered no token at all, counts nothing). See the module doc's "Dialects" section.
+    /// Tags dropped because [`Format::Statsd`] has no tag segment. Counted **per wire tag**: an
+    /// `Array` attribute counts once per element, and an empty `Array` counts nothing. See the
+    /// module doc's "Dialects" section.
     pub tags_dropped_dialect: usize,
-    /// A tag that [`tag_value`] has no plain-text rendering for (`Null`, `Bytes`, `Timestamp`,
-    /// `Map`, a nested `Array`), or whose key is empty/sanitizes to nothing. Counted **per wire
-    /// tag** for the same reason as [`Self::tags_dropped_dialect`]: one unrepresentable element of
-    /// a multi-value tag counts once, and an array whose every element drops counts once per
-    /// element. See the module doc's "Multi-value tags" section.
+    /// A tag [`tag_value`] can't render (`Null`, `Bytes`, `Timestamp`, `Map`, a nested `Array`),
+    /// or whose key is empty or sanitizes to nothing. Counted **per wire tag**, as
+    /// [`Self::tags_dropped_dialect`] is. See the module doc's "Multi-value tags" section.
     pub tags_dropped_unrepresentable: usize,
-    /// A timer's wire-type letter (`statsd.type`) was `h`/`d` and had to collapse to `ms` under
-    /// `Format::Statsd`, which has no such distinction -- counted once per `Samples` record
-    /// normalized, not once per split line.
+    /// A timer's `h`/`d` wire type (`statsd.type`) collapsed to `ms` under `Format::Statsd`.
+    /// Counted once per `Samples` record, not per split line.
     pub type_normalized_dialect: usize,
-    /// `statsd.container_id`/`statsd.timestamp` dropped under `Format::Statsd`, which has no
-    /// `|c:`/`|T` equivalent -- see `append_dialect_extras`. Counted once per field per emitted
-    /// line (so a negative-absolute-gauge's two-line pair, or a multi-member `SetMembers` record,
-    /// counts once per physical line, matching "every emitted line" in the module doc).
+    /// `statsd.container_id`/`statsd.timestamp` dropped under `Format::Statsd`
+    /// (`append_dialect_extras`). Counted once per field per emitted line, so a negative-gauge pair
+    /// or a multi-member `SetMembers` record counts once per physical line.
     pub dropped_dialect_fields: usize,
-    /// A `SetMembers` member came out different from its raw bytes after lossy UTF-8 plus
-    /// [`is_forbidden_in_set_member`]'s own, member-specific substitution -- see the module doc's
-    /// "Sanitization" section.
+    /// A `SetMembers` member that differs from its raw bytes after lossy UTF-8 and
+    /// [`is_forbidden_in_set_member`]'s substitution. See the module doc's "Sanitization" section.
     pub members_sanitized: usize,
     /// An event or service check dropped whole under [`Format::Statsd`], which has no `_e`/`_sc`
-    /// wire form at all -- counted before anything else about the event is inspected. See the
-    /// module doc's "DogStatsD events and service checks" section.
+    /// wire form. See the module doc's "DogStatsD events and service checks" section.
     pub dropped_dialect_events: usize,
-    /// A service check whose first metric wasn't a `Gauge` (the shape `statsd_in` always
-    /// produces), or whose status was neither a `statsd.service_check.status` carrier in `0..=3`
-    /// nor a gauge value finite and rounding into `0..=3` -- the whole event is dropped rather
-    /// than falling through to an ordinary `name:v|g` line. See [`render_service_check`].
+    /// A service check whose first metric isn't a `Gauge`, or with no status in `0..=3` from either
+    /// the `statsd.service_check.status` carrier or the gauge's rounded value. See
+    /// [`render_service_check`].
     pub dropped_invalid_service_check: usize,
-    /// An event's `statsd.event.priority`/`statsd.event.alert_type` carrier held a value outside
-    /// its fixed allowed set (`normal`/`low`; `info`/`success`/`warning`/`error`) -- that one
-    /// field is omitted, counted once per occurrence, but the rest of the line still renders and
-    /// is still emitted. Deliberately **not** `dropped_unencodable_value`: that field reports as
-    /// `logit.output.messages.dropped{reason="unencodable_value"}`, which would claim the whole
-    /// message was dropped when only one of its fields was. See [`render_event`].
+    /// An event priority/alert type outside its fixed set: that one field is omitted and the line
+    /// is still emitted. Not `dropped_unencodable_value`, whose
+    /// `logit.output.messages.dropped{reason="unencodable_value"}` would claim the whole message
+    /// was dropped. See [`render_event`].
     pub dropped_invalid_event_fields: usize,
 }
 
-/// Encodes events as statsd lines. Pure -- no socket anywhere -- so every grammar/sanitization/
-/// packing test runs directly against this, with no transport of any kind involved.
+/// Encodes events as statsd lines. Pure: no socket, so every grammar, sanitization, and packing
+/// test runs against it directly.
 pub struct StatsdEncoder {
     format: Format,
     relative_gauges: bool,
-    /// The longest single line this encoder will emit: a line longer than this is dropped whole
+    /// The longest line this encoder emits. A longer line is dropped whole
     /// (`EncodeStats::dropped_oversize_line`), never truncated, since the UDP packer
-    /// (`StatsdOutput::send_udp`) could never fit it in a datagram of that size. `usize::MAX`
-    /// (the default) is "uncapped" -- what TCP wants, having no datagram to overflow. Encoder
-    /// state rather than a per-call argument so `encode_into` has `FramedEncoder`'s one
-    /// signature; `StatsdOutput` sets it once for its transport at build time.
+    /// (`StatsdOutput::send_udp`) could never fit it in a datagram. `usize::MAX` (the default,
+    /// and TCP's) is uncapped. `StatsdOutput` sets it once for its transport.
     max_packet_bytes: usize,
     diag: Diagnostics,
-    /// The `|#k:v,k:v` tag segment for the event currently being encoded -- built once per event,
-    /// shared across that event's metrics (`influxdb.rs::render_tag_suffix`'s same split).
+    /// The current event's `|#k:v,k:v` tag segment, built once and shared across its metrics
+    /// (`influxdb.rs::render_tag_suffix`'s split).
     tag_suffix: String,
-    /// One rendered line (or, for a negative absolute gauge, the two-line pair joined by `\n`).
-    /// Cleared per metric, never reallocated -- `syslog.rs::SyslogEncoder::line`'s discipline.
+    /// One rendered line, or a negative-gauge pair joined by `\n`. Cleared per metric, never
+    /// reallocated (`syslog.rs::SyslogEncoder::line`'s discipline).
     line: String,
-    /// The sanitized metric name for the metric currently being encoded. Its own field, not a
-    /// local in `render_metric`, for the same reason `line` is -- a function-local `String::new()`
-    /// would reallocate on every single metric.
+    /// The current metric's sanitized name; a field, not a local, so it isn't reallocated per
+    /// metric.
     name: String,
-    /// The sanitized member text for the `SetMembers` member currently being rendered -- same
-    /// reallocation-avoidance reasoning as `name`, its own field since `SetMembers` renders one
-    /// line per member and needs `name` and the member's own text live at once.
+    /// The current `SetMembers` member's sanitized text; its own field because `name` is live at
+    /// the same time.
     member: String,
-    /// Scratch for [`tag_value`]'s non-`Str` formatting only -- every use within one event is
-    /// read-immediately-into-`tag_suffix`-then-cleared before the next, never overlapping in time.
+    /// Scratch for [`tag_value`]'s non-`Str` formatting. Each use is copied into `tag_suffix` and
+    /// cleared before the next.
     scratch: String,
-    /// The sanitized event title currently being rendered -- its own field for the same
-    /// reallocation-avoidance reason `name`/`member` are. Never live at the same time as `name`/
-    /// `member`: an event line and an ordinary metric line are never rendered from the same call.
+    /// The current event's sanitized title. Never live alongside `name`/`member`: an event line
+    /// and a metric line never render from the same call.
     title_buf: String,
-    /// The escaped event text (the log message, real `\n` turned into the two-byte `\n` escape)
-    /// currently being rendered -- computed into its own buffer, alongside `title_buf`, before
-    /// either is known to fit in the final line (the `_e{tlen,xlen}` header needs both lengths
-    /// first).
+    /// The current event's escaped text. Its own buffer because the `_e{tlen,xlen}` header needs
+    /// both lengths before either field is written into `line`.
     text_buf: String,
 }
 
@@ -518,8 +439,7 @@ impl StatsdEncoder {
         self
     }
 
-    /// Caps the longest single line this encoder emits -- see the field's doc comment.
-    /// `usize::MAX` means uncapped.
+    /// Caps the longest line this encoder emits; `usize::MAX` means uncapped.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         self
@@ -532,28 +452,21 @@ impl StatsdEncoder {
 }
 
 impl FramedEncoder for StatsdEncoder {
-    /// A statsd line is self-describing; the UDP packer only needs each entry's bytes (a
-    /// negative-absolute-gauge pair is one entry with an embedded `\n`, module doc), so there is
-    /// nothing to carry per message beyond them.
+    /// A statsd line is self-describing; the UDP packer needs only each entry's bytes.
     type Meta = ();
     type Stats = EncodeStats;
 
-    /// Encodes every event in `batch` into `out` (cleared first). Never fails -- a per-metric
+    /// Encodes every event in `batch` into `out` (cleared first). Never fails: a per-metric
     /// problem (an unsupported kind, an unresolved delta, a non-finite value, an oversize line) is
-    /// a drop counted in the returned [`EncodeStats`], not an error; there is nothing for a caller
-    /// to react to beyond what the stats already report. A line longer than
-    /// [`StatsdEncoder::with_max_packet_bytes`]'s cap is dropped whole.
+    /// a drop counted in the returned [`EncodeStats`].
     fn encode_into(&mut self, batch: &EventBatch, out: &mut MessageBuf) -> EncodeStats {
         out.clear();
         let mut stats = EncodeStats::default();
         for event in &batch.events {
             if event.metrics.is_empty() {
-                // A metrics-empty event is either a DogStatsD event or (overwhelmingly more
-                // often -- any log-only input, `statsd_in`'s own event lines aside) a plain log/
-                // span-only line with nothing to render. Deciding which needs only
-                // `statsd.event.title`'s own precedence, not the full merged walk
-                // `build_tag_suffix` runs -- see [`is_dogstatsd_event`] and the module doc's
-                // "DogStatsD events and service checks" section.
+                // Usually a plain log/span line, rarely a DogStatsD event; telling them apart
+                // needs only `statsd.event.title`, not the full merged walk (module doc's
+                // "DogStatsD events and service checks" section).
                 if !is_dogstatsd_event(&batch.resource, event) {
                     stats.skipped_no_metrics += 1;
                     continue;
@@ -571,10 +484,8 @@ impl FramedEncoder for StatsdEncoder {
                 );
 
                 if self.format == Format::Statsd {
-                    // No `Format::Statsd` wire form at all -- drop the whole event. The walk just
-                    // above already tallied this event's ordinary attributes into
-                    // `tags_dropped_dialect`, same as any other dialect-dropped tag; both counters
-                    // incrementing here is expected (module doc).
+                    // No `Format::Statsd` wire form. The walk above already counted this event's
+                    // attributes into `tags_dropped_dialect`; both counters rising is expected.
                     stats.dropped_dialect_events += 1;
                     continue;
                 }
@@ -601,8 +512,8 @@ impl FramedEncoder for StatsdEncoder {
                 continue;
             }
 
-            // An event with metrics: the full merged walk always runs (as it always has), and
-            // service-check detection reads it straight off `carriers` -- zero extra lookups.
+            // An event with metrics always runs the full walk; service-check detection reads
+            // `carriers` with no extra lookup.
             let mut carriers = Carriers::default();
             build_tag_suffix(
                 &mut self.tag_suffix,
@@ -617,8 +528,7 @@ impl FramedEncoder for StatsdEncoder {
             let is_service_check = carriers.service_check_name.is_some();
 
             if is_service_check && self.format == Format::Statsd {
-                // No `Format::Statsd` wire form at all -- drop the whole event before inspecting
-                // anything else about it (module doc).
+                // No `Format::Statsd` wire form; drop before inspecting anything else.
                 stats.dropped_dialect_events += 1;
                 continue;
             }
@@ -680,17 +590,11 @@ impl FramedEncoder for StatsdEncoder {
     }
 }
 
-/// Cheap detection for a metrics-empty event: does it carry `statsd.event.title` as a
-/// `Value::Str`, the event's own value winning over the resource's on collision (mirroring
-/// `crate::attrs::merged`'s precedence for this one key, without paying the full merged walk over
-/// every attribute)? `event.attributes.get`/`resource.attributes.get` are `O(log n)` binary
-/// searches on an already-sorted `AttrMap` (`crates/logit-core/src/attrs.rs`), not a scan -- so
-/// this costs at most two lookups, against the full walk [`build_tag_suffix`] would otherwise run
-/// (over every resource and event attribute, plus a `tags_dropped_dialect` tally under
-/// `Format::Statsd`) for what is, for the overwhelming majority of metrics-empty events, a plain
-/// log line carrying no `statsd.*` carrier at all. Used only to gate whether
-/// [`StatsdEncoder::encode_into`] pays that full walk for a metrics-empty event; an event with
-/// metrics always pays it regardless (service-check detection needs the rest of `Carriers` too).
+/// Whether a metrics-empty event is a DogStatsD event: a log carrying `statsd.event.title` as a
+/// `Value::Str`, the event's value winning over the resource's as in `crate::attrs::merged`. At
+/// most two `AttrMap::get` lookups (each a binary search, not a scan), so a plain log line skips
+/// [`build_tag_suffix`]'s walk over every attribute. Gates only the metrics-empty path of
+/// [`StatsdEncoder::encode_into`].
 fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
     if event.log.is_none() {
         return false;
@@ -702,15 +606,11 @@ fn is_dogstatsd_event(resource: &Resource, event: &Event) -> bool {
     matches!(title, Some(Value::Str(_)))
 }
 
-/// Bundles the per-batch context [`render_metric`] and its `Samples`/`SetMembers` helpers need but
-/// don't own -- one mutable borrow of this instead of six-plus loose parameters on every function
-/// in the call chain. `out`/`stats`/`diag` are threaded through as `&mut` since every line
-/// rendered writes into all three (a pushed line, an updated counter, a throttled diagnostic).
-/// `statsd_type`/`container_id`/`timestamp_secs` are the three `statsd.*` carriers
-/// [`build_tag_suffix`]'s merged resource⊕event walk captures (the event's value winning over the
-/// resource's, same as every other attribute) -- [`append_dialect_extras`]/[`statsd_wire_type`]
-/// read them from here, never from `event.attributes` directly, so a carrier set only on the
-/// resource is honored the same way an event-level one already is.
+/// The per-event context [`render_metric`] and its helpers need but don't own, as one borrow
+/// instead of a long parameter list. `statsd_type`/`container_id`/`timestamp_secs` come from
+/// [`build_tag_suffix`]'s merged resource⊕event walk; [`append_dialect_extras`]/
+/// [`statsd_wire_type`] read them here, never from `event.attributes`, so a resource-only carrier
+/// is honored.
 struct EncodeCtx<'a> {
     format: Format,
     tag_suffix: &'a str,
@@ -723,47 +623,38 @@ struct EncodeCtx<'a> {
     out: &'a mut MessageBuf,
 }
 
-/// Out-parameter for [`build_tag_suffix`]'s merged walk: the three `statsd.*` carriers, captured
-/// as they're skipped out of the generic tag segment rather than re-read from `event.attributes`
-/// afterward -- one pass does both jobs, and stays symmetric with what it filters out. Built
-/// separately from [`EncodeCtx`] because `EncodeCtx::tag_suffix` borrows the very `String`
-/// `build_tag_suffix` still needs `&mut` access to at the point these carriers are captured.
+/// Out-parameter for [`build_tag_suffix`]'s merged walk: the `statsd.*` carriers, captured as
+/// they're filtered out of the tag segment, so the read and the filter stay symmetric. Separate
+/// from [`EncodeCtx`] because `EncodeCtx::tag_suffix` borrows the `String` `build_tag_suffix` still
+/// holds `&mut` while capturing.
 #[derive(Debug, Default, Clone, Copy)]
 struct Carriers<'a> {
     statsd_type: Option<&'a str>,
     container_id: Option<&'a str>,
     timestamp_secs: Option<u64>,
-    /// `statsd.event.title` -- always present on a real `statsd_in`-decoded event; its presence
-    /// (alongside `event.log.is_some()`) is exactly [`StatsdEncoder::encode_into`]'s event
-    /// detection rule.
+    /// `statsd.event.title`, present only if valid UTF-8. [`is_dogstatsd_event`] detects an event
+    /// by the raw attribute, so this can be `None` on a detected event.
     event_title: Option<&'a str>,
     event_priority: Option<&'a str>,
     event_alert_type: Option<&'a str>,
     event_aggregation_key: Option<&'a str>,
     event_source_type: Option<&'a str>,
     event_host: Option<&'a str>,
-    /// `statsd.service_check.name` -- always present on a real `statsd_in`-decoded service check;
-    /// its presence is exactly the encoder's service-check detection rule.
+    /// `statsd.service_check.name`; its presence is the service-check detection rule.
     service_check_name: Option<&'a str>,
     service_check_status: Option<u64>,
     service_check_message: Option<&'a str>,
     service_check_host: Option<&'a str>,
 }
 
-/// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#` --
-/// [`render_metric`]/[`append_tags`] add that only if `suffix` ends up non-empty). Resource
-/// attributes first, event attributes overriding on key collision, merge-joined via
-/// [`crate::attrs::merged`]. Under [`Format::Statsd`] this always leaves `suffix` empty and counts
-/// every attribute that would otherwise have become a tag into `stats.tags_dropped_dialect`.
+/// Builds this event's DogStatsD tag segment into `suffix` (cleared first, **no** leading `|#`;
+/// [`append_tags`] adds that only if `suffix` is non-empty), walking [`crate::attrs::merged`]
+/// (event attributes override the resource's on key collision). Under [`Format::Statsd`] `suffix`
+/// stays empty and every would-be wire tag counts into `stats.tags_dropped_dialect`.
 ///
-/// Every tag is appended by [`push_one_tag`], once per attribute for a scalar value and once per
-/// **element** for a `Value::Array` -- a repeated DogStatsD tag key, see the module doc's
-/// "Multi-value tags" section. `stats.tags_dropped_dialect`/`tags_dropped_unrepresentable` are
-/// therefore counted per wire tag, not per attribute.
-///
-/// The same merged walk also captures the three `statsd.*` carriers into `carriers` -- see
-/// [`Carriers`]'s doc comment for why that happens here rather than as a second, separate read of
-/// `event.attributes` later.
+/// Each tag goes through [`push_one_tag`], once per scalar attribute and once per **element** of a
+/// `Value::Array` (module doc's "Multi-value tags"). The same walk captures the `statsd.*` carriers
+/// into `carriers`.
 fn build_tag_suffix<'a>(
     suffix: &mut String,
     scratch: &mut String,
@@ -776,13 +667,9 @@ fn build_tag_suffix<'a>(
     suffix.clear();
     for (key, value) in crate::attrs::merged(resource, event) {
         let key_str = logit_core::interner::resolve(key);
-        // `statsd.*` attributes are protocol carriers this decoder stamped from a line's own
-        // `|c:`/`|T`/wire-type segments (`statsd.container_id`/`statsd.timestamp`/`statsd.type`),
-        // not ordinary tags -- `append_dialect_extras`/`statsd_wire_type` read them (via `carriers`
-        // then `EncodeCtx`) and emit their own dedicated segments, so they must never also
-        // round-trip through the generic tag segment. Not counted: this is a carrier being read
-        // for its real purpose, not data being dropped (`syslog_out`'s identical `syslog.*` filter
-        // is the precedent).
+        // `statsd.*` attributes are protocol carriers `statsd_in` stamps from a line's own
+        // segments, emitted through their own segments, so never also as tags. Not counted as a
+        // drop: the carrier is being used, not lost (`syslog_out` filters `syslog.*` the same way).
         if key_str.starts_with("statsd.") {
             match (key_str, value) {
                 ("statsd.type", Value::Str(s)) => {
@@ -824,19 +711,14 @@ fn build_tag_suffix<'a>(
                 ("statsd.service_check.host", Value::Str(s)) => {
                     carriers.service_check_host = std::str::from_utf8(s).ok();
                 }
-                // Anything else (an absent/wrong-typed carrier, or a `statsd.*` key this sink
-                // doesn't know about) is ignored here the same way it's ignored as a tag --
-                // forward-compatible, not a hard error.
+                // A wrong-typed carrier or an unknown `statsd.*` key is ignored, not an error.
                 _ => {}
             }
             continue;
         }
 
         if format == Format::Statsd {
-            // Per *wire tag*, not per attribute: a multi-value `Array` would have rendered one
-            // `k:v` token per element, so that is what the classic dialect is dropping here (an
-            // empty `Array` would have rendered no token, and so counts nothing). See the module
-            // doc's "Dialects" and "Multi-value tags" sections.
+            // Per wire tag: an `Array` counts once per element, an empty one not at all.
             stats.tags_dropped_dialect += match value {
                 Value::Array(elements) => elements.len(),
                 _ => 1,
@@ -845,12 +727,8 @@ fn build_tag_suffix<'a>(
         }
 
         match value {
-            // A repeated DogStatsD tag key reaches this sink as a `Value::Array` in wire order
-            // (`logit_inputs::statsd::insert_tags`), and the `|#` segment is a list, not a map --
-            // so it expands back to one `key[:value]` token per element, in array order, with no
-            // encode-side dedupe and no sorting. The module doc's "Multi-value tags" section has
-            // the full rule, including why the merged resource-then-event walk this loop is
-            // walking never unions two arrays element-wise.
+            // A repeated tag key, folded at decode; one token per element, in array order, no
+            // dedupe, no sorting (module doc's "Multi-value tags").
             Value::Array(elements) => {
                 for element in elements {
                     push_one_tag(suffix, scratch, key_str, element, stats);
@@ -863,18 +741,14 @@ fn build_tag_suffix<'a>(
     }
 }
 
-/// Appends one `key[:value]` wire tag to `suffix`, comma-separated from whatever is already there,
-/// returning whether it did. On any reason not to (an empty key, a key that sanitizes to nothing,
-/// a `value` [`tag_value`] has no plain-text rendering for) it counts
-/// `stats.tags_dropped_unrepresentable` and leaves `suffix` **byte-identical to what it was on
-/// entry** -- including undoing the separator it had already pushed, which is what stops an array
-/// whose every element drops from leaving a stray `,` behind.
+/// Appends one `key[:value]` wire tag to `suffix`, comma-separated, returning whether it did. On
+/// an empty key, a key that sanitizes to nothing, or a `value` [`tag_value`] can't render, it
+/// counts `stats.tags_dropped_unrepresentable` and leaves `suffix` **byte-identical to entry**,
+/// separator included, so an array whose every element drops leaves no stray `,`.
 ///
-/// Factored out of [`build_tag_suffix`] so a multi-value tag (a `Value::Array`, see the module
-/// doc's "Multi-value tags" section) can call it once per element and get byte-for-byte the same
-/// grammar, sanitization and counting a scalar tag gets. `scratch` is rendered **and copied into
-/// `suffix`** before this returns, which is exactly what keeps [`StatsdEncoder::scratch`]'s
-/// single-use-at-a-time contract intact across a multi-element array.
+/// Scalar tags and each `Array` element share this, so both get the same grammar, sanitization,
+/// and counting. `scratch` is copied into `suffix` before this returns, which keeps
+/// [`StatsdEncoder::scratch`] single-use across a multi-element array.
 fn push_one_tag(
     suffix: &mut String,
     scratch: &mut String,
@@ -886,9 +760,8 @@ fn push_one_tag(
         stats.tags_dropped_unrepresentable += 1;
         return false;
     }
-    // `Bool(true)` is DogStatsD's own bare-tag idiom (`#urgent`, no `:value`) -- exactly what
-    // `logit_inputs::statsd::parse_line` produces for a valueless tag. Emitting `key:true`
-    // instead would round-trip as `Value::Str("true")`, silently changing the value's type.
+    // `Bool(true)` is what `logit_inputs::statsd::parse_line` produces for a bare tag
+    // (`#urgent`). Emitting `key:true` would round-trip as `Value::Str("true")`.
     let bare = matches!(value, Value::Bool(true));
     let rendered_value = if bare { None } else { tag_value(scratch, value) };
     if !bare && rendered_value.is_none() {
@@ -903,9 +776,8 @@ fn push_one_tag(
     let key_start = suffix.len();
     sanitize_into(suffix, key_str, is_forbidden_in_tag_key);
     if suffix.len() == key_start {
-        // Sanitized to nothing (only possible if `key_str` itself was empty, already handled
-        // above, but kept as a defensive no-op-key guard) -- rewind to exactly where this call
-        // started, separator included.
+        // Unreachable while substitution never shortens a non-empty key; a defensive guard that
+        // rewinds to entry, separator included.
         suffix.truncate(restore_to);
         stats.tags_dropped_unrepresentable += 1;
         return false;
@@ -917,8 +789,7 @@ fn push_one_tag(
     true
 }
 
-/// Appends `line`'s `|#`-prefixed tag segment, if `tag_suffix` is non-empty. Shared by every
-/// metric-kind arm in [`render_metric`], including both lines of a negative-gauge pair.
+/// Appends the `|#`-prefixed tag segment if `tag_suffix` is non-empty.
 fn append_tags(line: &mut String, tag_suffix: &str) {
     if !tag_suffix.is_empty() {
         line.push_str("|#");
@@ -926,17 +797,11 @@ fn append_tags(line: &mut String, tag_suffix: &str) {
     }
 }
 
-/// Appends `ctx`'s `|c:<container-id>`/`|T<timestamp>` segments under [`Format::DogStatsd`] --
-/// see the module doc's "`|c:<container-id>` and `|T<timestamp>`" section. Called once per
-/// physical line [`render_metric`] (or its `Samples`/`SetMembers` helpers) emits, *after*
-/// [`append_tags`], so a negative-absolute-gauge's two-line pair or a multi-line `Samples`/
-/// `SetMembers` record gets it on every line -- each is, on the wire, its own statsd line that
-/// genuinely carried (or would carry) its own `|c:`/`|T` segment. Reads `ctx.container_id`/
-/// `ctx.timestamp_secs` -- captured by `build_tag_suffix`'s merged walk, not re-read from
-/// `event.attributes` here -- so `|T` always emits exactly the wire seconds the carrier holds,
-/// never a value derived from `event.timestamp` (which a summarizing stage can rebuild at flush
-/// time). Under [`Format::Statsd`] neither field has anywhere to go, so both are dropped and
-/// counted (`EncodeStats::dropped_dialect_fields`) rather than silently omitted.
+/// Appends `|c:<container-id>`/`|T<timestamp>` under [`Format::DogStatsd`], or counts each
+/// present field into `EncodeStats::dropped_dialect_fields` under [`Format::Statsd`]. Called after
+/// [`append_tags`] on every physical metric line, both lines of a negative-gauge pair included,
+/// since each is its own statsd line on the wire. `|T` is the carrier's wire seconds, never
+/// `event.timestamp` (module doc's "`|c:<container-id>` and `|T<timestamp>`").
 fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
     match ctx.format {
         Format::DogStatsd => {
@@ -959,13 +824,9 @@ fn append_dialect_extras(line: &mut String, ctx: &mut EncodeCtx) {
     }
 }
 
-/// Appends `|c:<container-id>` only, **never** `|T` -- the counterpart to
-/// [`append_dialect_extras`] for an event/service-check line, whose own timestamp carriage
-/// already happened via its `d:<secs>` field (module doc's "DogStatsD events and service checks"
-/// section). Called only under `Format::DogStatsd`: [`StatsdEncoder::encode_into`] drops an
-/// event/service-check whole under `Format::Statsd` before either render function -- and
-/// therefore this -- is ever reached, so there is no dialect-drop accounting to do here the way
-/// `append_dialect_extras` has to for an ordinary metric line.
+/// [`append_dialect_extras`] for an event/service-check line: `|c:<container-id>` only, **never**
+/// `|T`, since the timestamp already went out as `d:<secs>`. No dialect accounting:
+/// [`StatsdEncoder::encode_into`] drops both shapes under `Format::Statsd` before rendering.
 fn append_container_id(line: &mut String, ctx: &EncodeCtx) {
     if let Some(id) = ctx.container_id {
         line.push_str("|c:");
@@ -973,15 +834,10 @@ fn append_container_id(line: &mut String, ctx: &EncodeCtx) {
     }
 }
 
-/// Renders one `_e{tlen,xlen}:title|text[...]` line for an event straight into `line`, or renders
-/// nothing (dropping and counting `EncodeStats::dropped_unencodable_value`) if the log `message`
-/// isn't valid UTF-8 text, or if `statsd.event.title` itself isn't -- [`is_dogstatsd_event`]
-/// accepts any `Value::Str` title, UTF-8 or not, so `carriers.event_title` (populated only when
-/// `from_utf8` succeeds) can legitimately be `None` here even though this function was correctly
-/// called. `title_buf`/`text_buf` are reused scratch (never live at the same time as
-/// `render_metric`'s `name`/`member` -- an event line and an ordinary metric line are never
-/// rendered from the same call). See the module doc's "DogStatsD events and service checks"
-/// section for the full field order and sanitization rules.
+/// Renders one `_e{tlen,xlen}:title|text[...]` event line and pushes it. Drops and counts
+/// `EncodeStats::dropped_unencodable_value` if the log `message` or the title isn't UTF-8 text
+/// ([`is_dogstatsd_event`] accepts a non-UTF-8 title, so `carriers.event_title` can be `None`).
+/// Field order and sanitization: the module doc's "DogStatsD events and service checks" section.
 fn render_event(
     line: &mut String,
     title_buf: &mut String,
@@ -1083,15 +939,12 @@ fn render_event(
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
 }
 
-/// Renders one `_sc|name|status[...]` line for a service check straight into `line`. `metric` is
-/// the event's first metric, already confirmed by the caller ([`StatsdEncoder::encode_into`]) to
-/// be a `MetricKind::Gauge`. Renders nothing (dropping and counting
-/// `EncodeStats::dropped_invalid_service_check`) if no valid `0..=3` status can be found on
-/// either the `statsd.service_check.status` carrier or the gauge's own value, or (dropping and
-/// counting `EncodeStats::dropped_empty_name`, mirroring [`render_metric`]'s identical guard) if
-/// the sanitized name is empty -- `_sc||0` is not a legal service check any more than an empty
-/// metric name is a legal metric line. See the module doc's "DogStatsD events and service checks"
-/// section.
+/// Renders one `_sc|name|status[...]` service-check line and pushes it. `metric` is the event's
+/// first metric, which the caller has confirmed is a `Gauge`. Drops and counts
+/// `EncodeStats::dropped_invalid_service_check` when neither the status carrier nor the gauge
+/// gives a status in `0..=3`, and `EncodeStats::dropped_empty_name` when the sanitized name is
+/// empty (`_sc||0` is no more legal than an empty metric name). See the module doc's "DogStatsD
+/// events and service checks" section.
 fn render_service_check(
     line: &mut String,
     carriers: &Carriers,
@@ -1159,10 +1012,8 @@ fn render_service_check(
     push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
 }
 
-/// Checks `line`'s length against `max_packet_bytes` and either pushes it to `out` or counts and
-/// logs the drop -- the single place every rendered line (one per `render_metric` call for most
-/// kinds, one per value/member for `Samples`/`SetMembers`) funnels through, so the oversize-drop
-/// behavior stays identical regardless of which arm produced the line.
+/// Pushes `line` to `out`, or drops and counts it if longer than `max_packet_bytes`. Every
+/// rendered line goes through here, so the oversize rule is the same for every kind.
 fn push_line(
     line: &str,
     max_packet_bytes: usize,
@@ -1184,12 +1035,9 @@ fn push_line(
     out.push(line);
 }
 
-/// Encodes one metric, pushing every line it produces straight into `ctx.out` (zero lines for a
-/// dropped metric, one for most kinds, two for a negative-absolute-gauge pair, or one per value/
-/// member for `Samples`/`SetMembers`). `name`/`member` are reused scratch buffers (cleared here or
-/// by the helper that owns them), not locals -- a fresh `String::new()` per metric/member would
-/// reallocate on every single call, the same reasoning `line`/`tag_suffix`/`scratch` are struct
-/// fields for.
+/// Encodes one metric into `ctx.out`: no entry for a dropped metric, one for most kinds (a
+/// negative-gauge pair is one two-line entry), one per member for `SetMembers`, and one per value
+/// for `Samples` under `Format::Statsd`. `name`/`member` are reused scratch buffers.
 fn render_metric(
     line: &mut String,
     name: &mut String,
@@ -1225,9 +1073,7 @@ fn render_metric(
     }
 
     match &metric.kind {
-        // A delta, monotonic `Sum` is what `MetricKind::Counter` used to mean -- encodes exactly
-        // as it did, `name:v|c`. Any other `Sum` (cumulative, or non-monotonic) has no `|c`
-        // meaning statsd can represent and falls through to the unsupported-kind arm below.
+        // Only a delta, monotonic `Sum` means `|c`; any other `Sum` falls to the next arm.
         MetricKind::Sum(s) if s.temporality == Temporality::Delta && s.monotonic => {
             if !s.value.is_finite() {
                 ctx.stats.dropped_unencodable_value += 1;
@@ -1263,20 +1109,14 @@ fn render_metric(
                 );
                 return;
             }
-            // `-0.0` is numerically zero, and `0` *is* representable as an absolute gauge -- but
-            // `f64`'s `Display` renders it `"-0"`, and `StatsdDecoder::build_event`'s `"g"` arm
-            // decides `Gauge` vs `GaugeDelta` on the leading `-` alone, without parsing the float
-            // first, so the naive rendering would decode back as a no-op `GaugeDelta(-0.0)`
-            // instead of an absolute reset to zero. Normalizing the sign away here emits the
-            // plain `name:0|g` that says exactly that, and keeps the two-line idiom below for
-            // values that really are negative. `stdio_out`'s
-            // `gauge_delta_negative_zero_does_not_double_the_sign` is the same
-            // `Display`-of-negative-zero trap in that sink.
+            // `f64`'s `Display` renders `-0.0` as `"-0"`, which the decoder's `"g"` arm reads as a
+            // no-op `GaugeDelta` (it checks the leading `-` before parsing). Normalize the sign so
+            // `-0.0` is a plain `name:0|g` reset and the pair below is only for real negatives.
+            // `stdio_out`'s `gauge_delta_negative_zero_does_not_double_the_sign` is the same trap.
             let v = if *v == 0.0 { 0.0 } else { *v };
             line.clear();
             if v.is_sign_negative() {
-                // No wire syntax for a negative absolute gauge -- emit the documented two-line
-                // idiom as one indivisible entry (module doc's "Negative absolute gauges").
+                // One indivisible entry (module doc's "Negative absolute gauges").
                 write_gauge_line(line, name, 0.0, ctx);
                 line.push('\n');
                 write_gauge_line(line, name, v, ctx);
@@ -1344,8 +1184,6 @@ fn render_metric(
         MetricKind::ExponentialHistogram(_) => {
             dropped_unsupported_kind(ctx.stats, ctx.diag, name, "ExponentialHistogram", None)
         }
-        // Raw, unsummarized data (statsd's own `ms`/`h`/`d`/`s` shapes, decoded losslessly by
-        // `statsd_in` -- `docs/adr/lossless-transit.md`) -- real encoding, not a drop.
         MetricKind::Samples(samples) => render_samples(line, name.as_str(), samples, ctx),
         MetricKind::SetMembers(members) => {
             render_set_members(line, member, name.as_str(), members, ctx)
@@ -1353,14 +1191,10 @@ fn render_metric(
     }
 }
 
-/// Shared by every `MetricKind` arm `render_metric` can't encode -- counts the drop and logs a
-/// throttled warning naming exactly which kind was unencodable. Extracted so the match above can
-/// stay one arm per variant (fully exhaustive, no wildcard) without repeating these lines per arm
-/// -- the exhaustiveness itself is the point: a future `MetricKind` variant is a compile error
-/// here, not a silent `unreachable!` panic at runtime. `hint`, when given, points at the
-/// `aggregate` config that would let this kind's *raw* form relay through this sink instead
-/// (`Distribution`/`Set` only -- the other unsupported kinds have no raw statsd counterpart at
-/// all, so no such hint applies to them).
+/// Counts and warns for a `MetricKind` [`render_metric`] can't encode. Its match stays exhaustive
+/// with no wildcard, so a new `MetricKind` variant is a compile error there. `hint` names the
+/// `aggregate` config that relays the kind's raw form instead (`Distribution`/`Set` only; the rest
+/// have no raw statsd counterpart).
 fn dropped_unsupported_kind(
     stats: &mut EncodeStats,
     diag: &mut Diagnostics,
@@ -1386,8 +1220,8 @@ fn dropped_unsupported_kind(
     };
 }
 
-/// Renders one `name:v|g` (or `name:+v|g`/`name:-v|g`) line into `line`, including the tag segment
-/// and, under `Format::DogStatsd`, `|c:`/`|T` -- shared by `Gauge`'s plain and negative-pair cases.
+/// Appends one `name:v|g` line, tags and dialect extras included; `Gauge`'s plain and pair cases
+/// share it.
 fn write_gauge_line(line: &mut String, name: &str, v: f64, ctx: &mut EncodeCtx) {
     line.push_str(name);
     line.push(':');
@@ -1397,10 +1231,7 @@ fn write_gauge_line(line: &mut String, name: &str, v: f64, ctx: &mut EncodeCtx) 
     append_dialect_extras(line, ctx);
 }
 
-/// `ctx.statsd_type`'s value when it names one of the timer wire types, else the default `"ms"` --
-/// see the module doc's "`|c:<container-id>` and `|T<timestamp>`" section for the sibling carriers
-/// this one is captured alongside. Reads `EncodeCtx`, not `event.attributes`, for the same reason
-/// [`append_dialect_extras`] does.
+/// The `statsd.type` carrier when it names a timer wire type (`ms`/`h`/`d`), else `"ms"`.
 fn statsd_wire_type(ctx: &EncodeCtx) -> &'static str {
     match ctx.statsd_type {
         Some("ms") => "ms",
@@ -1410,15 +1241,12 @@ fn statsd_wire_type(ctx: &EncodeCtx) -> &'static str {
     }
 }
 
-/// Encodes a `Samples` record (statsd's raw `ms`/`h`/`d` observations). Under `Format::DogStatsd`,
-/// every value shares one multi-value line (`name:v1:v2:...|<type>[|@rate]|#tags...`) -- the
-/// DogStatsD grammar's own multi-value extension, the same one `logit_inputs::statsd` parses on
-/// the way in. Under `Format::Statsd`, which has no such extension, each value becomes its own
-/// `name:v|ms[|@rate]` line (`h`/`d` normalize to `ms`, counted once per record via
-/// `EncodeStats::type_normalized_dialect`). A non-finite value is dropped and counted per value,
-/// not written as the text "NaN"/"inf"; an out-of-range `sample_rate` (not `1.0`, and not finite
-/// and in `(0, 1]`) omits `@rate` rather than writing bad wire text, counted once per record; an
-/// empty (or now-empty, every value non-finite) `values` list emits nothing, counted once.
+/// Encodes a `Samples` record (raw `ms`/`h`/`d` observations). `Format::DogStatsd` writes one
+/// multi-value line (`name:v1:v2:...|<type>[|@rate]|#tags...`); `Format::Statsd` writes one
+/// `name:v|ms[|@rate]` line per value, `h`/`d` normalized to `ms`. Each non-finite value is
+/// dropped and counted, never written as `NaN`/`inf`. A rate outside `(0, 1]` omits `@rate`,
+/// counted once per record. An empty `values` list emits nothing, counted once; one emptied by
+/// non-finite values emits nothing with no extra count.
 fn render_samples(
     line: &mut String,
     name: &str,
@@ -1476,8 +1304,7 @@ fn render_samples(
                 wrote_any = true;
             }
             if !wrote_any {
-                // Every value was non-finite -- nothing left to encode; each was already counted
-                // above, so this isn't the "empty to begin with" case and needs no extra count.
+                // Every value was non-finite and already counted.
                 return;
             }
             line.push('|');
@@ -1510,8 +1337,7 @@ fn render_samples(
                     line.push_str("|@");
                     push_float(line, rate);
                 }
-                // `ctx.tag_suffix` is already empty under `Format::Statsd` (`build_tag_suffix`),
-                // so this is a no-op -- kept for symmetry with the `DogStatsd` arm above.
+                // A no-op (`tag_suffix` is empty under `Format::Statsd`), kept for symmetry.
                 append_tags(line, ctx.tag_suffix);
                 append_dialect_extras(line, ctx);
                 push_line(line, ctx.max_packet_bytes, ctx.stats, ctx.diag, ctx.out);
@@ -1520,10 +1346,9 @@ fn render_samples(
     }
 }
 
-/// Encodes a `SetMembers` record (statsd's raw `s` set-membership observations) as one
-/// `name:<member>|s` line per member, in both dialects -- the classic grammar has no multi-value
-/// extension for sets the way DogStatsD's timers get. See the module doc's "Sanitization" section
-/// for the member-rendering rule. An empty member list emits nothing, counted once.
+/// Encodes a `SetMembers` record (raw `s` observations) as one `name:<member>|s` line per member,
+/// in both dialects. Member sanitization: the module doc's "Sanitization" section. An empty member
+/// list emits nothing, counted once.
 fn render_set_members(
     line: &mut String,
     member: &mut String,
@@ -1543,13 +1368,6 @@ fn render_set_members(
     for raw in members {
         let lossy = String::from_utf8_lossy(raw);
         member.clear();
-        // `is_forbidden_in_set_member`, not the name/tag-key or tag-value rule -- a member sits in
-        // `name:<member>|s`'s colon-separated *value* position, the same position `parse_line`
-        // splits on to find several values on one line (`name:v1:v2|c`), so `:` must still be
-        // forbidden here (unlike the tag-value rule, which allows it) or a member containing `:`
-        // would silently re-decode as two members instead of one. Unlike the name/tag-key rule,
-        // `@`/`#`/`,`/whitespace are all preserved: none of them is delimiter-sensitive in this
-        // position, so sanitizing them would only make distinct members collide.
         sanitize_into(member, &lossy, is_forbidden_in_set_member);
         if std::str::from_utf8(raw) != Ok(member.as_str()) {
             ctx.stats.members_sanitized += 1;
@@ -1566,69 +1384,51 @@ fn render_set_members(
     }
 }
 
-/// Appends `s` to `out` (does **not** clear it first -- callers that want a fresh buffer clear
-/// explicitly), replacing every character `forbidden` rejects with `_`. Substitution, not
-/// deletion, so distinct inputs stay distinct.
+/// Appends `s` to `out` (not cleared first), replacing each character `forbidden` rejects with
+/// `_`. Substitution, not deletion, so distinct inputs stay distinct.
 fn sanitize_into(out: &mut String, s: &str, forbidden: impl Fn(char) -> bool) {
     for c in s.chars() {
         out.push(if forbidden(c) { '_' } else { c });
     }
 }
 
-/// Forbidden in a metric name -- see the module doc's "Sanitization" section for why each
-/// character earns its place. Also the tag-*key* rule: `:` is forbidden there too, because
-/// `parse_line` splits a tag on its first colon, so a `:` in a key would silently reparse as a
-/// shorter key with the remainder folded into the value.
+/// Forbidden in a metric name and a tag key (module doc's "Sanitization" section). A `:` in a key
+/// would reparse as a shorter key, since `parse_line` splits a tag on its first colon.
 fn is_forbidden_in_name(c: char) -> bool {
     matches!(c, ':' | '|' | '@' | '#' | ',' | '\n' | '\r' | '\0')
         || c.is_control()
         || c.is_whitespace()
 }
 
-/// Alias for [`is_forbidden_in_name`], named for its other use site (tag keys) -- see that
-/// function's doc comment.
+/// [`is_forbidden_in_name`], named for the tag-key call site.
 fn is_forbidden_in_tag_key(c: char) -> bool {
     is_forbidden_in_name(c)
 }
 
-/// Tag *values* forbid the same set as a name **except `:`**, which is deliberately preserved:
-/// since `parse_line` only looks at the first colon, `env:a:b` round-trips as key `env`, value
-/// `a:b`.
+/// The name set **except `:`**: `parse_line` splits a tag on its first colon only, so `env:a:b`
+/// round-trips as key `env`, value `a:b`.
 fn is_forbidden_in_tag_value_only(c: char) -> bool {
     c != ':' && is_forbidden_in_name(c)
 }
 
-/// Forbidden in a `SetMembers` member -- its own, narrower rule, sharing nothing with
-/// [`is_forbidden_in_name`]/[`is_forbidden_in_tag_value_only`] beyond the two characters that
-/// genuinely matter here. A member sits in `name:<member>|s`'s colon-separated *value* position,
-/// the same position `parse_line` splits on to find several values sharing one line
-/// (`name:v1:v2|c`), so `:` has to be forbidden or it would silently re-decode a single member as
-/// two; `|` would open a new segment instead of staying part of the value. Control bytes
-/// (`\n`/`\r`/`\0` included, via `char::is_control`) are forbidden too, since any of them would
-/// corrupt line/datagram framing regardless of position. Nothing else is: `@`, `#`, `,`, and
-/// whitespace are only delimiter-sensitive at the *start* of a segment, a role a member never
-/// plays, so forbidding them here would sanitize bytes a real decode can hand back unchanged and
-/// let distinct members collide (module doc's "Sanitization" section).
+/// Forbidden in a `SetMembers` member: `:` (it would split one member into two values), `|` (it
+/// would open a segment), and control bytes (they corrupt framing). `@`, `#`, `,`, and whitespace
+/// survive a real decode in this position, so forbidding them would only make distinct members
+/// collide (module doc's "Sanitization" section).
 fn is_forbidden_in_set_member(c: char) -> bool {
     matches!(c, ':' | '|') || c.is_control()
 }
 
-/// Forbidden in an event title -- control bytes only ([`char::is_control`], which covers
-/// `\n`/`\r`/`\0`). A bare `|` is fine: `parse_event` slices `TITLE`/`TEXT` by the `_e{tlen,xlen}`
-/// header's own byte lengths, not by scanning for `|`, so nothing here is delimiter-sensitive the
-/// way a name/tag-key/member is. Control bytes still have to go: an embedded raw `\n` would look
-/// like a line boundary to a receiver once several statsd lines get packed into one `\n`-joined
-/// UDP datagram (module doc's "Packing and framing" section), which the byte-length header alone
-/// doesn't protect against.
+/// Forbidden in an event title: control bytes only. A `|` is fine, since `parse_event` slices the
+/// title by the `_e{tlen,xlen}` header's byte lengths. A raw `\n` would still look like a line
+/// boundary inside a packed UDP datagram (module doc's "Packing and framing" section).
 fn is_forbidden_in_event_title(c: char) -> bool {
     c.is_control()
 }
 
-/// Appends `raw` to `out` as DogStatsD event `TEXT`: a real newline becomes the two-byte escape
-/// `\n` (the wire encoding `statsd_in`'s `unescape_event_text` turns back into a real newline on
-/// decode), and any other control byte is substituted with `_` -- there is no escape for those,
-/// and, same reasoning as [`is_forbidden_in_event_title`], an unescaped one could corrupt a
-/// packed datagram's line framing.
+/// Appends `raw` as DogStatsD event `TEXT`: a real newline becomes the two-byte escape `\n`
+/// (`statsd_in`'s `unescape_event_text` reverses it), and any other control byte, which has no
+/// escape, becomes `_`.
 fn append_event_text(out: &mut String, raw: &str) {
     for c in raw.chars() {
         if c == '\n' {
@@ -1642,47 +1442,38 @@ fn append_event_text(out: &mut String, raw: &str) {
     }
 }
 
-/// Forbidden in an event's `host`/`aggregation_key`/`source_type` field and a service check's
-/// `name`/`host` field -- `|` and control bytes, substituted with `_`. Each of these sits in a
-/// `|letter:value` field a real decode reads up to the *next* `|` (or, for a service check's
-/// `name`, up to the second `|` on the line -- `parse_service_check`'s own `splitn(3, '|')`), so
-/// an embedded `|` would truncate the field and leak its remainder into whatever comes next --
-/// unlike a tag value, none of these fields has a colon-splitting ambiguity that would need `:`
-/// forbidden too. Deliberately **not** [`is_forbidden_in_name`]: a service check name keeps `.`
-/// and spaces exactly as sent (module doc), which the name/tag-key rule would substitute.
+/// Forbidden in an event's `host`/`aggregation_key`/`source_type` and a service check's
+/// `name`/`host`: `|` and control bytes. A decode reads each field up to the next `|` (a service
+/// check's `name` via `parse_service_check`'s `splitn(3, '|')`), so an embedded `|` would leak the
+/// remainder into the next field. None has a colon-splitting ambiguity. Not
+/// [`is_forbidden_in_name`]: a service check name keeps `.` and spaces as sent.
 fn is_forbidden_in_extended_field(c: char) -> bool {
     c == '|' || c.is_control()
 }
 
-/// Forbidden in a service check's `message` (`m:`) field -- control bytes only, substituted with
-/// `_`. Unlike event text, a real newline is *not* escaped here (there is no equivalent unescape
-/// on the decode side for this field): both are simply substituted, the same defensive reasoning
-/// as [`is_forbidden_in_event_title`]. `|` is deliberately left alone: `m:` is always the last
-/// field on the line (this module always renders it last, and `parse_service_check` always reads
-/// it last), so an embedded `|` can't be misread as the start of another field.
+/// Forbidden in a service check's `m:` message: control bytes only. A newline is substituted, not
+/// escaped, since the decoder has no unescape for this field. `|` is allowed: `m:` is always
+/// rendered and parsed last, so a `|` can't start another field.
 fn is_forbidden_in_service_check_message(c: char) -> bool {
     c.is_control()
 }
 
-/// The live half of a `statsd_out` sink: `Udp` binds eagerly (a bad local bind is a config error);
-/// `Tcp` connects lazily inside `send`, since a not-yet-up downstream receiver must not block
-/// `logit` from starting. Mirrors `syslog::Conn` exactly.
+/// The live half of a `statsd_out` sink, as `syslog::Conn`: `Udp` binds eagerly (a bad local bind
+/// is a config error); `Tcp` connects lazily inside `send`, so a receiver that isn't up yet can't
+/// block startup.
 enum Conn {
     Udp(UdpSocket),
-    /// `stream` is `Box<dyn AsyncStream>`, not `TcpStream`, so the same variant covers a plaintext
-    /// and a TLS-wrapped connection without making [`StatsdOutput`] generic -- exactly
-    /// `syslog_out`'s and `logit_out`'s `Conn::stream` shape, and for the same reason
-    /// (`logit-cli::pipeline::build_spec` builds one concrete sink type per kind). There is no
-    /// DTLS arm here: `logit-pipeline::graph::resolve`'s rule 52 rejects a `tls:` block under
-    /// `transport: udp` before construction.
+    /// `Box<dyn AsyncStream>` covers plaintext and TLS without making [`StatsdOutput`] generic,
+    /// since `logit-cli::pipeline::build_spec` builds one concrete sink type per kind. No DTLS arm:
+    /// `logit-pipeline::graph::resolve`'s rule 52 rejects `tls:` under `transport: udp`.
     Tcp {
         stream: Option<Box<dyn AsyncStream>>,
         connect_timeout: Duration,
     },
 }
 
-/// `logit_pipeline::Output` for `statsd_out`. Built via [`StatsdOutput::udp`] or
-/// [`StatsdOutput::tcp`] -- never a bare constructor, mirroring `SyslogOutput`.
+/// `logit_pipeline::Output` for `statsd_out`, built via [`StatsdOutput::udp`] or
+/// [`StatsdOutput::tcp`].
 pub struct StatsdOutput {
     endpoint: String,
     conn: Conn,
@@ -1691,22 +1482,18 @@ pub struct StatsdOutput {
     lines: MessageBuf,
     /// Reused across `send` calls: the packed UDP datagram, or the whole TCP frame.
     packet_buf: Vec<u8>,
-    /// TCP only. `Some` exactly when a `tls:` block was configured -- its mere presence turns TLS
-    /// on, the `syslog_out`/`logit_out` precedent, since `endpoint` here is a bare `host:port`
-    /// with no scheme to select TLS from. Built once at construction
-    /// ([`StatsdOutput::with_tls`]) and shared by every connect attempt.
+    /// TCP only. `Some` exactly when a `tls:` block was configured (presence turns TLS on). Built
+    /// once by [`StatsdOutput::with_tls`] and shared by every connect.
     tls: Option<Arc<rustls::ClientConfig>>,
-    /// `true` once this sink has ever connected -- the very first connect is not a "reconnect,"
-    /// only every one after it. Mirrors `syslog_out`'s/`logit_out`'s field of the same name
-    /// (`logit.output.reconnects`, `docs/design/internal-telemetry.md`).
+    /// Set by the first connect; every later connect counts `logit.output.reconnects`.
     has_connected_once: bool,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
 
 impl StatsdOutput {
-    /// Binds an ephemeral local UDP socket eagerly -- see `SyslogOutput::udp`'s doc comment for
-    /// why `endpoint` itself is resolved per `send`, not here.
+    /// Binds an ephemeral local UDP socket now; `endpoint` is resolved per `send`
+    /// (`SyslogOutput::udp` has why).
     pub fn udp(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")
             .context("binding statsd_out's local UDP socket")?;
@@ -1715,7 +1502,7 @@ impl StatsdOutput {
         Ok(Self::new(endpoint, Conn::Udp(socket)))
     }
 
-    /// Never connects here -- see [`Conn`]'s doc comment.
+    /// Never connects here; see [`Conn`].
     pub fn tcp(endpoint: impl Into<String>, connect_timeout: Duration) -> Self {
         Self::new(endpoint, Conn::Tcp { stream: None, connect_timeout })
     }
@@ -1736,10 +1523,8 @@ impl StatsdOutput {
         .with_max_packet_bytes(DEFAULT_MAX_PACKET_BYTES)
     }
 
-    /// The per-line cap the encoder enforces for this transport: the configured datagram size on
-    /// UDP, none on TCP (no datagram to overflow -- only the per-line oversize drop applies
-    /// there, and a cap of `usize::MAX` never triggers it). Decided here, once, whenever the
-    /// transport or `max_packet_bytes` is decided, so `send` never mutates the encoder per call.
+    /// The encoder's per-line cap for this transport: `max_packet_bytes` on UDP, uncapped on TCP.
+    /// Applied by the builders, so `send` never mutates the encoder.
     fn encoder_cap(&self) -> usize {
         if matches!(self.conn, Conn::Udp(_)) {
             self.max_packet_bytes
@@ -1748,16 +1533,13 @@ impl StatsdOutput {
         }
     }
 
-    /// Installs `encoder`, with this sink's transport-appropriate line cap applied on top of it
-    /// -- the cap is the sink's decision, not the encoder's caller's, whichever builder order the
-    /// caller uses.
+    /// Installs `encoder`, overriding its line cap with this sink's, whatever the builder order.
     pub fn with_encoder(mut self, encoder: StatsdEncoder) -> Self {
         self.encoder = encoder.with_max_packet_bytes(self.encoder_cap());
         self
     }
 
-    /// Bounds one UDP **datagram** (several packed lines), and therefore one line; ignored by
-    /// the encoder on TCP (see [`StatsdOutput::encoder_cap`]).
+    /// Bounds one UDP **datagram** (several packed lines), and so one line; no effect on TCP.
     pub fn with_max_packet_bytes(mut self, max_packet_bytes: usize) -> Self {
         self.max_packet_bytes = max_packet_bytes;
         let cap = self.encoder_cap();
@@ -1765,23 +1547,21 @@ impl StatsdOutput {
         self
     }
 
-    /// Turns on TLS for this sink's TCP connection (`tls:` in config) -- the `syslog_out` port
-    /// (`docs/adr/statsd-output.md`'s TLS amendment).
+    /// Turns on TLS for this sink's TCP connection (`tls:` in config;
+    /// `docs/adr/statsd-output.md`'s "Amendment: TLS" section).
     ///
     /// **Presence turns it on**, the `syslog_out`/`logit_out` shape rather than `otlp_out`'s:
-    /// this sink's `endpoint` is a bare `host:port` with no scheme to read the signal from, so an
-    /// empty `tls: {}` still means "TLS, with the bundled Mozilla roots and no client
-    /// certificate" -- deliberately *not* [`TlsClientSettings::is_empty`]'s early return, which
-    /// `otlp_out` can afford only because `https://` already selected TLS for it there. A `tls:`
-    /// block therefore means TLS is *required*: there is no plaintext fallback.
+    /// `endpoint` has no scheme to carry the signal, so an empty `tls: {}` still means TLS with the
+    /// bundled Mozilla roots and no client certificate. That is why this ignores
+    /// [`TlsClientSettings::is_empty`], which `otlp_out` can use only because `https://` already
+    /// selected TLS. TLS is then *required*; there is no plaintext fallback.
     ///
-    /// Errors on the UDP arm rather than silently ignoring the setting: DTLS is out of scope, and
-    /// `logit-pipeline::graph::resolve`'s rule 52 already rejects that config before `build_spec`
-    /// ever calls this -- this is the belt-and-braces half, so a future caller that bypasses graph
-    /// validation can't quietly get an unencrypted socket.
+    /// Errors on UDP (DTLS is out of scope). `logit-pipeline::graph::resolve`'s rule 52 already
+    /// rejects that config; this check stops a caller that skips graph validation from getting an
+    /// unencrypted socket.
     ///
-    /// Every path in `settings` is resolved against `base_dir` (the config file's own directory)
-    /// and loaded here, since `graph::resolve` never touches the filesystem.
+    /// Paths in `settings` resolve against `base_dir` (the config file's directory) and load here,
+    /// since `graph::resolve` never touches the filesystem.
     pub fn with_tls(
         mut self,
         settings: &TlsClientSettings,
@@ -1818,8 +1598,6 @@ impl StatsdOutput {
 #[async_trait::async_trait]
 impl Output for StatsdOutput {
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        // The encoder already carries this transport's line cap (`encoder_cap`, applied at build
-        // time), so nothing here varies per call.
         let stats = self.encoder.encode_into(batch, &mut self.lines);
         self.telemetry.count("logit.output.events.skipped", stats.skipped_no_metrics as f64, &[]);
         self.telemetry.count(
@@ -1940,9 +1718,8 @@ impl Output for StatsdOutput {
         result.map(|_| ())
     }
 
-    /// Implemented explicitly for the same reason `syslog_out` does: `send` performs one write per
-    /// batch and retains nothing between calls, so there's nothing buffered here at shutdown --
-    /// for TCP, this simply flushes the underlying stream.
+    /// `send` flushes and retains nothing between calls, so this only flushes the TCP stream as a
+    /// backstop at shutdown.
     async fn flush(&mut self) -> anyhow::Result<()> {
         if let Conn::Tcp { stream: Some(stream), .. } = &mut self.conn {
             stream.flush().await.context("flushing statsd_out TCP stream")?;
@@ -1951,36 +1728,33 @@ impl Output for StatsdOutput {
     }
 
     /// `false`: a redelivered `hits:5|c` **increments the destination counter a second time**,
-    /// silently corrupting the value with no trace at the receiver -- a stronger reason than
-    /// `syslog_out`'s (which only duplicates a log line). Under the derived `AtMostOnce` posture
-    /// this still lets a `Fault::Clean` retry succeed, covering the common receiver-restart
-    /// outage with zero duplicate risk.
+    /// corrupting the value with no trace at the receiver (worse than `syslog_out`'s duplicated
+    /// log line). The derived `AtMostOnce` posture still retries a `Fault::Clean` failure, which
+    /// covers the common receiver-restart outage with no duplicate risk.
     fn duplicate_safe(&self) -> bool {
         false
     }
 }
 
-/// Running totals for one [`StatsdOutput::send_udp`] call. `entries_in_packet` is the count that
-/// cannot be recovered from `packet_buf`'s bytes: a negative-absolute-gauge pair is **one**
-/// [`MessageBuf`] entry containing an embedded `\n` (module doc's "Negative absolute gauges"), so
-/// counting `\n` bytes in a packed datagram would report it as two messages over UDP where
-/// `send_tcp` (and `syslog_out`, on both transports) reports one.
+/// Running totals for one [`StatsdOutput::send_udp`] call. `entries_in_packet` can't be recovered
+/// from `packet_buf`'s bytes: a negative-gauge pair is **one** [`MessageBuf`] entry with an
+/// embedded `\n`, so counting `\n` bytes would report two messages where `send_tcp` (and
+/// `syslog_out`) report one.
 #[derive(Default)]
 struct UdpSendCounts {
-    /// [`MessageBuf`] entries actually written to the socket -- `logit.output.messages`.
+    /// [`MessageBuf`] entries written to the socket (`logit.output.messages`).
     messages: usize,
-    /// Datagrams actually written to the socket -- `logit.output.datagrams`.
+    /// Datagrams written to the socket (`logit.output.datagrams`).
     datagrams: usize,
-    /// Entries appended to `packet_buf` since the last flush; reset by every flush.
+    /// Entries appended to `packet_buf` since the last flush.
     entries_in_packet: usize,
 }
 
 impl StatsdOutput {
-    /// Packs `lines` into as few UDP datagrams as fit under `max_packet_bytes` (newline-joined, no
-    /// trailing newline), then sends one `send_to` per datagram. See the module doc's "Packing and
-    /// framing" section for why packing is correct here where `syslog_out` refuses it. A single
-    /// line already longer than `max_packet_bytes` was dropped by the encoder, so every line seen
-    /// here fits in its own datagram at minimum. Returns `(messages sent, datagrams sent)`.
+    /// Packs `lines` greedily into datagrams of at most `max_packet_bytes` (newline-joined, no
+    /// trailing newline), one `send_to` each (module doc's "Packing and framing" section). The
+    /// encoder already dropped any line over the cap, so every line fits a datagram alone. Returns
+    /// `(messages sent, datagrams sent)`.
     async fn send_udp(
         socket: &UdpSocket,
         endpoint: &str,
@@ -1990,8 +1764,7 @@ impl StatsdOutput {
         diag: &mut Diagnostics,
         telemetry: &Telemetry,
     ) -> anyhow::Result<(usize, usize)> {
-        // Resolved once per batch, not once per datagram -- see `syslog::send_udp`'s doc comment
-        // for why a non-numeric host must not be re-resolved on every call.
+        // Once per batch, not per datagram (`syslog::send_udp` has why).
         let mut addrs = lookup_host(endpoint)
             .await
             .context("resolving statsd_out endpoint")
@@ -2022,12 +1795,9 @@ impl StatsdOutput {
         Ok((counts.messages, counts.datagrams))
     }
 
-    /// Sends one packed datagram, clearing `packet_buf` and `counts.entries_in_packet` after.
-    /// Counts the datagram's [`MessageBuf`] **entries** -- not its `\n` bytes -- toward
-    /// `counts.messages`: one entry may itself be a negative-gauge pair (two statsd lines joined
-    /// by an embedded `\n`, module doc's "Negative absolute gauges"), and that is still one unit
-    /// of "messages", the same convention [`Self::send_tcp`] (`lines.len()`) and `syslog_out`
-    /// count by on both transports. The same count is what an oversize drop reports under
+    /// Sends one packed datagram, then clears `packet_buf` and `counts.entries_in_packet`. Counts
+    /// [`MessageBuf`] entries, not `\n` bytes (see [`UdpSendCounts`]), toward `counts.messages`
+    /// or, when the kernel rejects the datagram as too large,
     /// `logit.output.messages.dropped{reason="oversize_datagram"}`.
     async fn flush_datagram(
         socket: &UdpSocket,
@@ -2065,64 +1835,48 @@ impl StatsdOutput {
         Ok(())
     }
 
-    /// One newline-terminated frame (every line, including the last) per **batch**, written with
-    /// at most one internal reconnect-and-retry -- a near-verbatim port of `syslog::send_tcp`,
-    /// including both correctness properties documented on that function (cancellation safety via
-    /// `stream.take()`, and never resending once a byte has left this host). Returns `(messages
-    /// sent, 0)` -- there's no datagram count on TCP.
+    /// Writes the whole batch as one frame, every line `\n`-terminated including the last, with at
+    /// most one internal reconnect-and-retry. Shares `syslog::send_tcp`'s two properties:
+    /// cancellation safety via `stream.take()`, and never resending once a byte has left this
+    /// host. Returns `(messages sent, 0)`; TCP has no datagram count.
     ///
-    /// **What "written" proves is per transport, and TLS is the weaker of the two** -- the same
-    /// split `syslog_out` documents at length on its own `send_tcp` (review of the RFC 5425 work,
-    /// 2026-09-13). [`Conn::Tcp`]'s stream is a `Box<dyn AsyncStream>`, so the two cases are not
-    /// distinguishable from the write calls themselves and the code asks [`TcpDial`] which one it
-    /// is:
+    /// **What a write proves depends on the transport, and TLS proves less.** The stream is a
+    /// `Box<dyn AsyncStream>`, so the code asks [`TcpDial::is_tls`] which case applies:
     ///
     /// - **Plaintext.** One `write()` is one `write(2)`: `Ok(n)` means the kernel owns `n` bytes,
-    ///   and `Err` means zero bytes of *this* call were accepted (tokio only loops on
-    ///   `WouldBlock`). This transport's behaviour is unchanged by the TLS work: one internal
-    ///   reconnect-and-retry after a zero-byte failure, and `Fault::Clean` if that retry fails
-    ///   too.
-    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the rustls session and then
-    ///   loops socket writes until one returns `Pending`, at which point it returns `Ok(n)` with
-    ///   finished TLS records still queued in userspace -- so `Ok` proves only that the *session*
-    ///   accepted the bytes, never that they reached the peer, and `flush` is what makes them the
-    ///   kernel's. A failing `poll_write`, symmetrically, may already have completed several
-    ///   socket writes (rustls fragments at 16 KiB, and every record is a run of complete,
-    ///   LF-terminated statsd lines a receiver keeps and counts), so `Err` is never proof of a
-    ///   zero-byte attempt. Therefore, on TLS: no internal retry and no resend once an
-    ///   application write has been attempted at all, every such failure is `Fault::Ambiguous`,
-    ///   and `Fault::Clean` survives only for failures inside [`TcpDial::connect`], which
-    ///   genuinely precede every byte of the frame. This matters more here than it does for
-    ///   `syslog_out`: [`StatsdOutput::duplicate_safe`] is `false` because a redelivered
-    ///   `hits:5|c` *increments the destination counter a second time*, so a resend corrupts a
-    ///   value rather than duplicating a log line.
+    ///   and `Err` means zero bytes of *this* call were accepted (tokio loops only on
+    ///   `WouldBlock`). So one reconnect-and-retry after a zero-byte failure is safe, and a failed
+    ///   retry is `Fault::Clean`.
+    /// - **TLS.** `tokio_rustls`' `poll_write` copies plaintext into the rustls session and loops
+    ///   socket writes until one returns `Pending`, then returns `Ok(n)` with finished records
+    ///   still queued in userspace. `Ok` proves only that the *session* accepted the bytes; `flush`
+    ///   is what hands them to the kernel. A failing `poll_write` may already have completed
+    ///   several socket writes (rustls fragments at 16 KiB, and each record is a run of complete,
+    ///   LF-terminated lines a receiver keeps and counts), so `Err` never proves a zero-byte
+    ///   attempt. **A TLS write failure is never retried**: once an application write is attempted,
+    ///   every failure is `Fault::Ambiguous`, and `Fault::Clean` survives only for failures inside
+    ///   [`TcpDial::connect`], which precede every byte of the frame. A resend here would be worse
+    ///   than `syslog_out`'s duplicate log line: [`StatsdOutput::duplicate_safe`] is `false`
+    ///   because a redelivered `hits:5|c` increments the destination counter a second time.
     ///
-    /// **A reused connection is probed before the first write.** A pooled connection inherited
-    /// from an earlier `send` may have been closed by the receiver in the meantime -- a graceful
-    /// shutdown, a `logit`-side `idle_timeout:` on the far end, a relay hop cycling -- and
-    /// plaintext statsd has no ack and no error to tell the sender so: the write lands in the
-    /// local socket buffer, this function reports the batch delivered, and those counter
-    /// increments are gone. So a connection that came out of `*stream` (never a freshly-dialled
-    /// one) gets exactly one non-consuming `poll_read` first
-    /// ([`crate::tls::poll_pending_close`], whose doc comment has why one poll and not a
-    /// cancellable `timeout(read)`); anything but "still open" drops it and dials a fresh one
-    /// with nothing written yet. That is a plain reconnect -- counted `logit.output.reconnects`
-    /// by [`TcpDial::connect`] like any other -- and it deliberately does not consume the one
-    /// post-write-failure retry below, which is about a connection that *was* written to.
-    /// `docs/adr/idle-connection-timeout.md`.
+    /// **A reused connection is probed before the first write.** The receiver may have closed it
+    /// since the last `send` (a graceful shutdown, a far-end `idle_timeout:`, a relay hop cycling),
+    /// and plaintext statsd has no ack to reveal that: the write lands in the local socket buffer,
+    /// the batch is reported delivered, and the increments are lost. So a connection taken from
+    /// `*stream` (never a fresh one) gets one non-consuming `poll_read` first
+    /// ([`crate::tls::poll_pending_close`] has why one poll, not a `timeout(read)`); anything but
+    /// "still open" drops it and dials fresh with nothing written. That is an ordinary reconnect
+    /// (counted by [`TcpDial::connect`]) and doesn't consume the post-write-failure retry
+    /// (`docs/adr/idle-connection-timeout.md`).
     ///
-    /// **The success path always `flush`es**, on both transports, before the connection goes back
-    /// into `*stream` and this returns `Ok` -- the settled decision for this sink
-    /// (`docs/adr/statsd-output.md`'s TLS amendment). Three reasons, in order of force: TLS
-    /// *requires* it, since without it a batch could be reported delivered (and committed off the
-    /// sink queue, `docs/adr/buffered-sink-delivery.md`) with its records still in the rustls
-    /// buffer, to be discarded with the boxed stream by the next reconnect or cancelled attempt;
-    /// on plaintext a `TcpStream`'s `poll_flush` is a documented no-op, so it costs a function
-    /// call and cannot change behaviour; and one delivery rule for both transports is the safer
-    /// one to have exactly because `duplicate_safe() == false` -- nothing this sink reports
-    /// delivered is ever retried, so "delivered" had better mean the same thing on each. A failed
-    /// flush is `Fault::Ambiguous` -- some earlier record may well have landed -- and the
-    /// connection is dropped rather than reused.
+    /// **The success path always `flush`es**, on both transports, before the connection returns
+    /// to `*stream` and this returns `Ok`. TLS requires it: otherwise a batch could be reported
+    /// delivered (and committed off the sink queue, `docs/adr/buffered-sink-delivery.md`) with its
+    /// records still in the rustls buffer, discarded with the boxed stream on the next reconnect
+    /// or cancellation. On plaintext `TcpStream::poll_flush` is a no-op. One delivery rule for
+    /// both matters because nothing reported delivered is ever retried. A failed flush is
+    /// `Fault::Ambiguous` (an earlier record may have landed) and the connection is dropped
+    /// (`docs/adr/statsd-output.md`'s "Amendment: TLS" section).
     async fn send_tcp(
         stream: &mut Option<Box<dyn AsyncStream>>,
         dial: &mut TcpDial<'_>,
@@ -2138,11 +1892,8 @@ impl StatsdOutput {
         let mut retried_after_a_zero_byte_failure = false;
         loop {
             let mut conn: Box<dyn AsyncStream> = match stream.take() {
-                // A *reused* connection is polled once first -- see this function's doc
-                // comment's probe paragraph. `Eof`/`Bytes` fall through to a fresh connect with
-                // nothing written, so `retried_after_a_zero_byte_failure` is deliberately *not*
-                // consumed: this is not the one retry that follows a failed write, it is a
-                // connection that was never written to at all.
+                // A reused connection is probed first (doc comment). A closed one is replaced
+                // with nothing written, so the post-write retry isn't consumed.
                 Some(mut conn) => {
                     let mut probe = [0u8; 1];
                     let pending = poll_pending_close(&mut *conn, &mut probe).await;
@@ -2172,10 +1923,7 @@ impl StatsdOutput {
                     } else {
                         Ok(())
                     };
-                    // Then always flush, on both transports, before this batch may be called
-                    // delivered -- see this function's doc comment's flush paragraph. On a TLS
-                    // stream this is what moves finished records out of the rustls buffer and
-                    // into the kernel's; on a plaintext one it is a no-op.
+                    // Always flush before calling the batch delivered (doc comment).
                     let rest_result = match rest_result {
                         Ok(()) => conn.flush().await,
                         Err(err) => Err(err),
@@ -2185,19 +1933,13 @@ impl StatsdOutput {
                             *stream = Some(conn);
                             Ok((lines.len(), 0))
                         }
-                        // Part of this frame may already be at the peer -- on plaintext at least
-                        // one byte reached the kernel, on TLS some earlier record may have. Either
-                        // way resending could duplicate, so `Ambiguous`, and `*stream` is
-                        // deliberately left `None` (this now-partially-written connection is not
-                        // reusable).
+                        // Part of the frame may be at the peer, so a resend could duplicate.
+                        // `*stream` stays `None`: a partly written connection isn't reusable.
                         Err(err) => Err(anyhow::Error::new(err).context(Fault::Ambiguous)),
                     };
                 }
-                // Plaintext only: an `Err` from one `write(2)` proves zero bytes of this attempt
-                // were accepted, so `*stream` is already `None` (taken above) and the next loop
-                // iteration connects fresh and retries the whole frame exactly once. A TLS
-                // `poll_write` gives no such proof (doc comment above), so it never reaches this
-                // arm -- it falls straight through to `Ambiguous` with no resend.
+                // Plaintext only: the failed `write(2)` accepted zero bytes, so reconnect and
+                // retry the whole frame once. TLS has no such proof and falls to `Ambiguous`.
                 Err(_) if !dial.is_tls() && !retried_after_a_zero_byte_failure => {
                     retried_after_a_zero_byte_failure = true;
                     continue;
@@ -2211,11 +1953,9 @@ impl StatsdOutput {
     }
 }
 
-/// Everything [`StatsdOutput::send_tcp`] needs to open a *fresh* connection, grouped into one
-/// value rather than five more parameters on an already-long signature (`clippy`'s
-/// `too_many_arguments`). Borrowed per `send` from the sink's own fields, so `send_tcp` keeps
-/// touching nothing but the connection it is writing to. `syslog::TcpDial`'s twin -- the two
-/// sinks dial the identical bare-`host:port`-plus-SNI shape.
+/// What [`StatsdOutput::send_tcp`] needs to open a fresh connection, borrowed per `send` from the
+/// sink's fields (one value instead of five parameters, for `clippy::too_many_arguments`).
+/// `syslog::TcpDial`'s twin: both dial a bare `host:port` plus SNI.
 struct TcpDial<'a> {
     endpoint: &'a str,
     connect_timeout: Duration,
@@ -2226,18 +1966,16 @@ struct TcpDial<'a> {
 }
 
 impl TcpDial<'_> {
-    /// Whether this sink's connections are TLS-wrapped -- which decides what a write's outcome
-    /// proves, and so how [`StatsdOutput::send_tcp`] classifies a failure. See that function's
-    /// doc comment.
+    /// Whether connections are TLS-wrapped, which decides how [`StatsdOutput::send_tcp`]
+    /// classifies a write failure.
     fn is_tls(&self) -> bool {
         self.tls.is_some()
     }
 
-    /// One fresh connection: TCP connect, then -- when `tls` is set -- the TLS handshake. Each
-    /// phase is raced against `connect_timeout` *separately*, exactly as `syslog_out` and
-    /// `logit_out` race every step of their own connects, so a TLS connect can take up to twice
-    /// the configured value. Both phases fault `Fault::Clean` for the same reason: nothing of
-    /// this batch can have left the host while a connection is still being established.
+    /// One fresh connection: TCP connect, then the TLS handshake when `tls` is set. Each phase gets
+    /// its own `connect_timeout`, as in `syslog_out` and `logit_out`, so a TLS connect can take up
+    /// to twice the configured value. Both phases fail `Fault::Clean`: nothing of the batch has
+    /// left the host yet.
     async fn connect(&mut self) -> anyhow::Result<Box<dyn AsyncStream>> {
         let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.endpoint))
             .await
@@ -2265,10 +2003,8 @@ impl TcpDial<'_> {
             None => Box::new(tcp),
         };
 
-        // Only from the *second* successful connect onward -- the first connection this sink ever
-        // makes isn't a "re"-connect. Counted at connect rather than after the write, so a
-        // connection that is established and then immediately fails to write still shows up as
-        // the reconnect it was.
+        // Counted at connect, not after the write, so a reconnect whose first write fails still
+        // shows up.
         if *self.has_connected_once {
             self.telemetry.count("logit.output.reconnects", 1.0, &[]);
         } else {
@@ -2278,8 +2014,7 @@ impl TcpDial<'_> {
     }
 }
 
-/// `90` is `EMSGSIZE` on Linux specifically -- see `syslog::is_message_too_large`'s doc comment;
-/// this repo only ever ships/runs inside the Linux containers it builds.
+/// `90` is `EMSGSIZE` on Linux, the only target (`syslog::is_message_too_large` has more).
 fn is_message_too_large(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(errno) if errno == 90 /* EMSGSIZE, Linux */)
         || err.kind() == std::io::ErrorKind::InvalidInput
@@ -2369,11 +2104,8 @@ mod tests {
         assert_eq!(stats.skipped_no_metrics, 1);
     }
 
-    /// A plain log event (no `statsd.event.title`, so not a DogStatsD event) with ordinary
-    /// attributes must not pay the merged tag walk at all under `Format::Statsd` -- it's
-    /// `skipped_no_metrics`, full stop, not also `tags_dropped_dialect` for tags nothing was
-    /// ever going to render. Regression for a `syslog_in -> statsd_out` relay inflating that
-    /// counter for every ordinary log line.
+    /// A plain log line counts only `skipped_no_metrics`, not `tags_dropped_dialect` too, which a
+    /// `syslog_in -> statsd_out` relay would otherwise inflate on every line.
     #[test]
     fn a_plain_log_event_under_statsd_is_skipped_without_touching_tags_dropped_dialect() {
         let mut attributes = AttrMap::new();
@@ -2464,9 +2196,7 @@ mod tests {
 
     // -- Multi-value tags (a repeated tag key) ---------------------------------------------------
 
-    /// A batch whose resource carries attributes of its own -- `batch_with` always uses a default,
-    /// attribute-less `Resource`, and the resource⊕event merge precedence is part of the
-    /// multi-value contract (the event's value wins *whole*, never element-wise).
+    /// `encode` with a non-default `Resource`, for the resource⊕event precedence tests.
     fn encode_with_resource(resource: Resource, events: Vec<Event>) -> (Vec<String>, EncodeStats) {
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
@@ -2487,8 +2217,7 @@ mod tests {
         assert_eq!(stats, EncodeStats::default());
     }
 
-    /// `#urgent,urgent:1`: a bare token and a valued one sharing a key are two tags that differ in
-    /// *form*, and both forms survive, in array order.
+    /// `#urgent,urgent:1`: a bare and a valued token sharing a key both survive, in array order.
     #[test]
     fn an_array_tag_of_a_bare_and_a_valued_element_keeps_both_forms_in_order() {
         let (msgs, _) = encode(vec![metric_event(
@@ -2506,8 +2235,6 @@ mod tests {
         assert_eq!(msgs[0], "hits:1|c|#urgent:1,urgent");
     }
 
-    /// A Lua-authored numeric array gets the identical per-element formatting a scalar `I64` tag
-    /// gets -- both go through the same [`tag_value`].
     #[test]
     fn an_array_tag_of_numbers_gets_the_same_formatting_a_scalar_number_gets() {
         let (msgs, _) = encode(vec![metric_event(
@@ -2528,8 +2255,6 @@ mod tests {
         assert_eq!(msgs[0], "hits:1|c|#team:a_b,team:c_d");
     }
 
-    /// The key is sanitized per element too (the same key, the same way, every time) -- there is no
-    /// cross-element interaction and no "sanitize once, reuse" shortcut to get subtly wrong.
     #[test]
     fn an_array_tags_key_is_sanitized_identically_for_every_element() {
         let mut attrs = AttrMap::new();
@@ -2573,8 +2298,6 @@ mod tests {
         assert_eq!(stats.tags_dropped_unrepresentable, 2);
     }
 
-    /// An empty `Array` would have rendered no wire tag at all, so it drops the tag and counts
-    /// nothing -- neither `unrepresentable` (no element was unrepresentable) nor anything else.
     #[test]
     fn an_empty_array_tag_emits_no_tag_and_counts_nothing() {
         let (msgs, stats) = encode(vec![metric_event(
@@ -2586,9 +2309,8 @@ mod tests {
         assert_eq!(stats, EncodeStats::default());
     }
 
-    /// [`push_one_tag`] directly, because this is the one guarantee an end-to-end assertion can't
-    /// isolate: when every element of an array drops, the suffix a *previous* tag already wrote
-    /// must come back byte-identical, separator included.
+    /// Calls [`push_one_tag`] directly: an earlier tag's suffix survives byte-identical when every
+    /// element drops, which an end-to-end assertion can't isolate.
     #[test]
     fn an_all_unrepresentable_array_leaves_a_non_empty_tag_suffix_byte_identical() {
         let mut suffix = String::from("env:prod");
@@ -2601,9 +2323,7 @@ mod tests {
         assert_eq!(stats.tags_dropped_unrepresentable, 2);
     }
 
-    /// Pins the "no encode-side dedupe" decision: the agent's exact-duplicate rule is applied once,
-    /// at decode, and encode stays a pure function of the array. A duplicate can only get here from
-    /// a Lua-authored array in the first place, and the agent dedupes it again on receipt.
+    /// No encode-side dedupe (module doc's "Multi-value tags").
     #[test]
     fn duplicate_array_elements_are_not_deduped_on_encode() {
         let (msgs, stats) = encode(vec![metric_event(
@@ -2615,8 +2335,6 @@ mod tests {
         assert_eq!(stats, EncodeStats::default());
     }
 
-    /// [`crate::attrs::merged`] has the event's value win **whole** on an equal key, so there is no
-    /// element-level union: the resource's `team` was never part of this event's wire tag list.
     #[test]
     fn an_event_level_array_tag_overrides_a_resource_level_scalar_whole() {
         let mut resource = Resource::default();
@@ -2632,8 +2350,6 @@ mod tests {
         assert_eq!(msgs[0], "hits:1|c|#team:a,team:b");
     }
 
-    /// And the reverse direction, for the same reason: a resource-level `Array` is overridden whole
-    /// by an event-level scalar.
     #[test]
     fn an_event_level_scalar_tag_overrides_a_resource_level_array_whole() {
         let mut resource = Resource::default();
@@ -2661,7 +2377,6 @@ mod tests {
             "the counter's unit is a wire tag, so a two-element array costs two, not one"
         );
 
-        // An empty array would have rendered no wire tag, so the classic dialect drops nothing.
         let (_, stats) = encode_with_format(
             vec![metric_event(
                 "hits",
@@ -2704,9 +2419,7 @@ mod tests {
 
     #[test]
     fn a_metric_name_that_sanitizes_to_nothing_drops_the_metric_and_counts_it() {
-        // Substitution never produces an empty result except from an already-empty input --
-        // every forbidden character becomes `_`, not nothing (`:` alone sanitizes to `"_"`, a
-        // perfectly good one-character name, not a drop).
+        // Only an empty name sanitizes to nothing; `:` alone becomes `_`, a valid name.
         let (msgs, stats) = encode(vec![metric_event("", MetricKind::counter(1.0), &[])]);
         assert!(msgs.is_empty());
         assert_eq!(stats.dropped_empty_name, 1);
@@ -2721,9 +2434,8 @@ mod tests {
         assert_eq!(stats.dropped_unencodable_value, 1);
     }
 
-    /// A `NO_RECORDED_VALUE`-flagged point must be dropped and counted, not written as a
-    /// fabricated `name:0|g` -- fix 3 in PR #123's review (`docs/adr/lossless-transit.md`,
-    /// `docs/known-gaps.md`'s cross-protocol table).
+    /// A `NO_RECORDED_VALUE`-flagged point is dropped and counted, never written as a fabricated
+    /// `name:0|g`.
     #[test]
     fn a_no_recorded_value_point_is_dropped_and_counted() {
         let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
@@ -2812,10 +2524,6 @@ mod tests {
         assert_eq!(stats.dropped_unsupported_kind, 4);
     }
 
-    /// `ExponentialHistogram` (raw or lossless data with no statsd wire shape at all) falls through
-    /// to the unsupported-kind drop path -- not a panic, and not silently dropped uncounted.
-    /// `Samples`/`SetMembers` are real encoded kinds now (W3): see the dedicated `-- Samples --`/
-    /// `-- SetMembers --` sections below for their coverage.
     #[test]
     fn exponential_histogram_drops_with_a_clear_message() {
         let events = vec![metric_event(
@@ -2839,8 +2547,6 @@ mod tests {
         assert_eq!(stats.dropped_unsupported_kind, 1);
     }
 
-    /// A cumulative (or non-monotonic) `Sum` has no `|c` statsd can represent and is dropped, same
-    /// as any other unsupported kind -- only a delta, monotonic `Sum` still encodes as `|c`.
     #[test]
     fn a_cumulative_sum_is_dropped_and_a_delta_monotonic_sum_still_encodes_as_c() {
         let (msgs, stats) = encode(vec![
@@ -3041,10 +2747,7 @@ mod tests {
         assert_eq!(stats.members_sanitized, 1);
     }
 
-    /// A member containing `:` must be sanitized, not preserved: `:` is the multi-value separator
-    /// in a member's own wire position (`name:<member>|s`), so an unsanitized `a:b` would render
-    /// `tags:a:b|s` and `StatsdDecoder::parse_line` would split that into two members (`a`, `b`)
-    /// instead of decoding the original one member back.
+    /// An unsanitized `a:b` would render `tags:a:b|s`, which decodes as two members.
     #[test]
     fn a_member_containing_a_colon_is_sanitized_and_counted() {
         let (msgs, stats) = encode(vec![metric_event(
@@ -3056,8 +2759,6 @@ mod tests {
         assert_eq!(stats.members_sanitized, 1);
     }
 
-    /// The real-decoder regression for the same case: a colon-sanitized member re-decodes as
-    /// exactly one member, never two.
     #[test]
     fn a_member_containing_a_colon_re_decodes_as_one_member_not_two() {
         let (msgs, _) = encode(vec![metric_event(
@@ -3073,11 +2774,7 @@ mod tests {
         );
     }
 
-    /// Bytes the name/tag-key rule would substitute but a member's own, narrower rule preserves --
-    /// `@`, `#`, `,`, and a space are none of them delimiter-sensitive in a member's colon-
-    /// separated *value* position (`values_part` only ever splits on `:`; the line only on
-    /// `|`/newline), so a real decode hands each straight through and this sink must round-trip
-    /// it byte for byte, not substitute it the way it would in a name or tag key.
+    /// `@`, `,`, and a space, which the name rule would substitute, survive in a member.
     #[test]
     fn members_with_at_hash_comma_or_a_space_round_trip_byte_for_byte() {
         for line in ["users:a@b|s", "users:a,b|s", "users:a b|s"] {
@@ -3089,10 +2786,7 @@ mod tests {
                 "no substitution should have happened for {line:?}"
             );
             let relayed = decode_one(&msgs[0]);
-            // Compares metrics only, not the whole `Event`: both decodes carry a real receipt-time
-            // `Event::timestamp` (no `|T` on this line), which two independent `decode_one` calls
-            // never agree on down to the nanosecond -- `statsd_round_trip.rs`'s own
-            // `normalize_receipt_time` exists for exactly this reason.
+            // Metrics only: each decode stamps its own receipt time (no `|T` on this line).
             assert_eq!(
                 relayed[0].metrics, original[0].metrics,
                 "decode(encode(decode(line))) should equal decode(line) for {line:?}"
@@ -3100,9 +2794,7 @@ mod tests {
         }
     }
 
-    /// `:` is still forbidden in a member (unlike in a tag value): a real `users:a:b|s` decode
-    /// produces *two* members (`a`, `b`), and each one still re-encodes as its own untouched line
-    /// -- the colon is what changes structure here, not any per-member sanitization.
+    /// A real `users:a:b|s` decodes as two members, each re-encoding as its own untouched line.
     #[test]
     fn a_member_split_by_a_real_colon_decodes_as_two_members_each_re_encoding_untouched() {
         let events = decode_one("users:a:b|s");
@@ -3140,10 +2832,7 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|c:abcd1234"]);
     }
 
-    /// The resource-level counterpart: `build_tag_suffix`'s merged walk captures a `statsd.*`
-    /// carrier from *either* side of the resource⊕event merge, event winning on collision (same
-    /// as every other attribute) -- so a carrier a `set` transform's `resource:` block stamped
-    /// reaches the wire exactly like one `statsd_in` stamped directly on the event.
+    /// A resource-only carrier (a `set` transform's `resource:` block) reaches the wire too.
     #[test]
     fn a_container_id_on_the_resource_is_emitted_as_pipe_c_under_dogstatsd() {
         let mut resource_attrs = AttrMap::new();
@@ -3186,12 +2875,7 @@ mod tests {
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T5"]);
     }
 
-    /// `statsd.timestamp` present but not a `Value::U64` -- never produced by `statsd_in` itself,
-    /// but reachable from a cross-protocol relay or a Lua-authored attribute -- is simply not
-    /// emitted, since `EncodeCtx::timestamp_secs` only ever gets set from the `U64` arm of
-    /// `build_tag_suffix`'s merged walk. This is also the regression for the old
-    /// `Value::Bool(true)` marker representation this carrier used before it held the wire value
-    /// itself: it must not be misread as a timestamp of any kind.
+    /// A non-`U64` `statsd.timestamp` (a Lua or cross-protocol attribute) emits no `|T`.
     #[test]
     fn a_non_u64_statsd_timestamp_value_is_not_emitted() {
         let (msgs, _) = encode(vec![metric_event(
@@ -3231,8 +2915,7 @@ mod tests {
                 ("env", "prod".into()),
             ],
         )]);
-        // `statsd.container_id`/`statsd.timestamp` still show up, but only via their own dedicated
-        // segments -- never through the generic `|#k:v,...` tag segment alongside `env`.
+        // Carriers appear only in their own segments, never beside `env`.
         assert_eq!(msgs, vec!["hits:1|c|#env:prod|c:abcd1234|T0"]);
     }
 
@@ -3261,7 +2944,7 @@ mod tests {
 
     #[test]
     fn an_event_with_every_field_renders_the_canonical_line_with_byte_lengths() {
-        // "héllo" is 6 UTF-8 bytes but 5 chars -- proves `tlen` counts bytes, not chars.
+        // "héllo" is 6 UTF-8 bytes but 5 chars, so `tlen` must count bytes.
         let event = event_line_event(
             "héllo",
             "world",
@@ -3306,9 +2989,7 @@ mod tests {
         let event = event_line_event("t", "x", &[("statsd.event.priority", Value::str("urgent"))]);
         let (msgs, stats) = encode(vec![event]);
         assert_eq!(msgs, vec!["_e{1,1}:t|x"]);
-        // A dropped *field* on an otherwise-emitted line, not a dropped message -- its own
-        // counter, not `dropped_unencodable_value` (which would claim the whole event was
-        // dropped).
+        // A dropped field on an emitted line, not a dropped message.
         assert_eq!(stats.dropped_invalid_event_fields, 1);
         assert_eq!(stats.dropped_unencodable_value, 0);
     }
@@ -3345,10 +3026,8 @@ mod tests {
         assert_eq!(stats.dropped_unencodable_value, 1);
     }
 
-    /// [`is_dogstatsd_event`] accepts any `Value::Str` title, UTF-8 or not -- `Value::Str` doesn't
-    /// enforce its own "UTF-8 text" invariant at construction, only by convention -- so
-    /// `render_event` must handle a non-UTF-8 title as a dropped, counted event rather than
-    /// `expect`-panicking the whole sink (the bug this test pins).
+    /// `Value::Str` doesn't enforce UTF-8 at construction, so [`is_dogstatsd_event`] can accept a
+    /// title `render_event` can't render; that must be a counted drop, not a panic.
     #[test]
     fn an_event_with_a_non_utf8_title_is_dropped_and_counted_rather_than_panicking() {
         let mut attributes = AttrMap::new();
@@ -3489,9 +3168,7 @@ mod tests {
         assert_eq!(stats.dropped_invalid_service_check, 1);
     }
 
-    /// An empty (or sanitizes-to-empty) `statsd.service_check.name` must drop the whole event
-    /// rather than render `_sc||0` -- mirrors [`render_metric`]'s identical
-    /// sanitizes-to-nothing guard for an ordinary metric name.
+    /// An empty name drops the check rather than rendering `_sc||0`.
     #[test]
     fn a_service_check_with_an_empty_name_is_dropped_and_counted() {
         let event = service_check_event("", MetricKind::Gauge(0.0), &[]);
@@ -3545,12 +3222,8 @@ mod tests {
         assert_eq!(stats.dropped_dialect_events, 2);
     }
 
-    /// Unlike a plain log line (which is `skipped_no_metrics` without ever touching the merged
-    /// walk -- see `a_plain_log_event_under_statsd_is_skipped_without_touching_tags_dropped_
-    /// dialect` above), a *real* event dropped under `Format::Statsd` did have its full merged
-    /// walk run (that's how it was confirmed to be an event at all), so its ordinary attributes
-    /// are also tallied into `tags_dropped_dialect` by that walk -- both counters incrementing
-    /// for the one dropped line is expected, not a double-count bug (module doc).
+    /// Unlike a plain log line, a real event ran the full walk, so both counters rise (module
+    /// doc's "DogStatsD events and service checks" section).
     #[test]
     fn a_real_event_dropped_under_statsd_also_tallies_its_tags_into_tags_dropped_dialect() {
         let ev = event_line_event("t", "x", &[("env", "prod".into())]);
@@ -3618,16 +3291,12 @@ mod tests {
         assert_eq!(stats.dropped_oversize_line, 1);
     }
 
-    /// The cap is encoder state set once by the sink for its transport (ADR `framed-encoder`),
-    /// so the two halves have to be pinned together: a UDP sink's encoder carries the configured
-    /// `max_packet_bytes` and drops a line longer than it, a TCP sink's encoder is uncapped and
-    /// emits the same line -- whichever order `with_encoder`/`with_max_packet_bytes` were called
-    /// in, since `logit-cli` happens to call them encoder-first.
+    /// UDP caps the encoder at `max_packet_bytes` and TCP leaves it uncapped, in either builder
+    /// order (`logit-cli` calls `with_encoder` first).
     #[tokio::test]
     async fn the_encoder_line_cap_follows_the_transport_at_build_time() {
         let oversize = || batch_with(vec![metric_event("hits", MetricKind::counter(1.0), &[])]);
 
-        // UDP: capped at the configured datagram size, in either builder order.
         let udp_encoder_first = StatsdOutput::udp("127.0.0.1:1")
             .unwrap()
             .with_encoder(StatsdEncoder::new(Format::DogStatsd))
@@ -3638,16 +3307,14 @@ mod tests {
             .with_encoder(StatsdEncoder::new(Format::DogStatsd));
         for mut output in [udp_encoder_first, udp_cap_first] {
             assert_eq!(output.encoder.max_packet_bytes, 3);
-            // "hits:1|c" (8 bytes) is dropped whole: nothing encoded, so nothing sent.
+            // "hits:1|c" (8 bytes) is dropped whole, so nothing is sent.
             output.send(&oversize()).await.expect("an all-dropped batch performs no I/O");
             assert!(output.lines.is_empty());
         }
-        // ...and the default cap, with no builder called at all.
         let udp_default = StatsdOutput::udp("127.0.0.1:1").unwrap();
         assert_eq!(udp_default.encoder.max_packet_bytes, DEFAULT_MAX_PACKET_BYTES);
 
-        // TCP: the same configured value caps only the packer, never the encoder -- the line
-        // reaches the wire.
+        // TCP: the same value never caps the encoder, so the line reaches the wire.
         let (addr, received, _) = tcp_collector().await;
         let mut tcp = StatsdOutput::tcp(addr.to_string(), Duration::from_secs(2))
             .with_encoder(StatsdEncoder::new(Format::DogStatsd))
@@ -3664,9 +3331,7 @@ mod tests {
 
     #[test]
     fn a_negative_absolute_gauges_two_lines_are_never_split_across_datagrams() {
-        // The pair is pushed as one MessageBuf entry (an embedded '\n'), so the packer can never
-        // split it -- verified indirectly: it either fits whole in a datagram, or the *whole* pair
-        // is dropped as one oversize line, never half of it.
+        // One `MessageBuf` entry is one packer unit, so the pair can't be split.
         let mut encoder = StatsdEncoder::new(Format::DogStatsd);
         let mut out = MessageBuf::default();
         let stats = encoder.encode_into(
@@ -3784,11 +3449,9 @@ mod tests {
         assert!(got.iter().any(|b| String::from_utf8_lossy(b).contains("second")));
     }
 
-    /// [`tcp_collector`], except every connection is closed the moment it has read anything at
-    /// all -- the shape a receiver with an idle timeout of its own, or one restarting, presents
-    /// to a sink holding a pooled connection between batches. A clean FIN, not an RST: the
-    /// collector has read everything before it closes, which is exactly the case a plaintext
-    /// sender cannot detect from a write.
+    /// [`tcp_collector`], except each connection closes after its first read: a receiver's idle
+    /// timeout or restart, seen from a sink holding a pooled connection. A clean FIN, not an RST,
+    /// which a plaintext sender can't detect from a write.
     async fn tcp_collector_that_closes_after_one_read(
     ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3808,22 +3471,14 @@ mod tests {
                         buf.truncate(n);
                         received.lock().unwrap().push(buf);
                     }
-                    // `stream` drops here: one batch read, then a clean close.
                 }
             });
         }
         (addr, received, accepts)
     }
 
-    /// The pooled-connection probe (`StatsdOutput::send_tcp`'s doc comment;
-    /// `docs/adr/idle-connection-timeout.md`): the receiver closed the connection this sink was
-    /// holding between batches, and the second batch's counter increments must still arrive.
-    ///
-    /// This is the loss the probe exists to prevent, and nothing else in this file can catch it:
-    /// a write into a FIN'd socket *succeeds* locally, so without the probe `send` returns `Ok`,
-    /// the batch is committed off the sink queue, and those increments are simply gone -- statsd
-    /// has no ack to lose them against, and `duplicate_safe()` being false means nothing retries
-    /// them either. Hence the assertion on the collector's second accept and on the line itself.
+    /// The pooled-connection probe: a write into a FIN'd socket succeeds locally, so without it the
+    /// second batch would be reported delivered and lost.
     #[tokio::test]
     async fn a_pooled_connection_the_peer_closed_is_reconnected_before_writing_and_the_message_is_not_lost(
     ) {
@@ -3838,8 +3493,7 @@ mod tests {
             .await
             .expect("first send should succeed against a fresh connection");
 
-        // Let the collector's close land in this host's receive queue, so the probe has a FIN to
-        // find rather than a race to lose.
+        // Let the collector's FIN arrive before the probe looks for it.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         output
@@ -3888,14 +3542,11 @@ mod tests {
 
     // -- Sink: TCP over TLS (module doc's "TLS" section) ----------------------------------------
     //
-    // The `syslog_out` suite's twin (`crates/logit-outputs/src/syslog.rs`), since this sink's own
-    // TLS support is that one ported verbatim: the same fixtures, the same collector shape, and
-    // the same scripted-stream tests for the write/flush invariants a real socket can't provoke
-    // without depending on kernel send-buffer sizes.
+    // `syslog.rs`'s TLS suite's twin: the same fixtures, collector shape, and scripted-stream
+    // tests.
 
     fn testdata_dir() -> std::path::PathBuf {
-        // `logit-outputs` lives at `crates/logit-outputs`; the fixtures live at the repo root's
-        // `testdata/tls` (`testdata/tls/README.md`) -- two levels up from `CARGO_MANIFEST_DIR`.
+        // The repo root's `testdata/tls` (`testdata/tls/README.md`).
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/tls")
     }
 
@@ -3907,8 +3558,7 @@ mod tests {
 
     /// A `rustls::ServerConfig` presenting `testdata/tls/server.{pem,key}` (SANs `localhost` and
     /// `127.0.0.1`), optionally requiring a client certificate chaining to `testdata/tls/ca.pem`.
-    /// `syslog.rs`'s `server_tls_config` verbatim -- statsd over TLS has no ALPN identifier
-    /// either, so setting one here would be inventing wire behaviour the sink doesn't have.
+    /// No ALPN: statsd over TLS has no identifier.
     fn server_tls_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
         use rustls_pki_types::pem::PemObject;
         use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -3941,11 +3591,9 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// [`tcp_collector`]'s TLS twin: reads every *successfully handshaken* connection to EOF and
-    /// records its plaintext bytes. The third return is the number of completed handshakes, not
-    /// of accepted TCP connections -- a rejected client shows up as a connection that never
-    /// counted. Each connection is served on its own task so one failed handshake can't stall the
-    /// accept loop.
+    /// [`tcp_collector`]'s TLS twin: reads each handshaken connection to EOF. The third return
+    /// counts completed handshakes, not accepts, so a rejected client never counts. One task per
+    /// connection, so a failed handshake can't stall the accept loop.
     async fn tls_tcp_collector(
         require_client_auth: bool,
     ) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>, Arc<AtomicUsize>) {
@@ -3977,13 +3625,11 @@ mod tests {
         (addr, received, handshakes)
     }
 
-    /// TLS changes the transport, not the framing: the LF-terminated frame a trusting collector
-    /// reads over TLS is byte-for-byte the one the plaintext tests above assert.
+    /// TLS delivers the same LF-terminated frame plaintext does.
     #[tokio::test]
     async fn tls_tcp_round_trips_a_batch_to_a_trusting_collector() {
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        // `localhost` rather than `127.0.0.1:` -- both are SANs on `testdata/tls/server.pem`, and
-        // naming the host exercises `host_only`'s split on a real (non-IP) SNI name.
+        // `localhost`, not `127.0.0.1`, so `host_only` yields a non-IP SNI name.
         let mut output =
             StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
                 .with_tls(
@@ -4008,10 +3654,8 @@ mod tests {
         );
     }
 
-    /// Server-certificate verification is real: the sink trusts `other-ca.pem`, which never
-    /// signed `server.pem`, so the handshake fails on *this* side -- before any byte of the batch
-    /// has left the host, which is what makes it `Fault::Clean` (and so retryable) rather than
-    /// `Ambiguous`.
+    /// `other-ca.pem` never signed `server.pem`, so the handshake fails before any batch byte
+    /// leaves the host: `Fault::Clean`.
     #[tokio::test]
     async fn tls_tcp_against_an_untrusted_ca_fails_clean() {
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
@@ -4030,10 +3674,8 @@ mod tests {
         assert!(received.lock().unwrap().is_empty());
     }
 
-    /// A `tracing` subscriber that collects rendered events into a buffer, so the
-    /// `insecure_skip_verify` warning (`Diagnostics::warn`, which reports through `tracing` only
-    /// and has no telemetry counterpart) can actually be asserted on rather than assumed.
-    /// `syslog.rs`'s `CapturedLogs` verbatim.
+    /// A `tracing` writer that captures rendered events, so the `insecure_skip_verify` warning
+    /// (`Diagnostics::warn`, `tracing` only, no telemetry) can be asserted.
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -4066,8 +3708,7 @@ mod tests {
             .set_default();
 
         let (addr, received, handshakes) = tls_tcp_collector(false).await;
-        // The bundled Mozilla roots, which never signed `server.pem` -- so this connection can
-        // only succeed because verification was skipped.
+        // The bundled Mozilla roots never signed `server.pem`; only skipping verification works.
         let mut output =
             StatsdOutput::tcp(format!("localhost:{}", addr.port()), Duration::from_secs(2))
                 .with_diagnostics(Diagnostics::new("statsd_out"))
@@ -4088,10 +3729,7 @@ mod tests {
         );
     }
 
-    /// Mutual TLS: the collector requires a client certificate chaining to `ca.pem`, the sink
-    /// presents `client.pem`/`client.key` -- both signed by the same test CA
-    /// (`testdata/tls/regen.sh`). A handshake completing at all is the proof the certificate was
-    /// presented and accepted.
+    /// Mutual TLS: a completed handshake proves `client.pem` was presented and accepted.
     #[tokio::test]
     async fn tls_tcp_mutual_tls_presents_the_client_certificate() {
         let (addr, received, handshakes) = tls_tcp_collector(true).await;
@@ -4116,8 +3754,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&got[0]).contains("mutual"));
     }
 
-    /// Belt-and-braces for `graph::resolve`'s rule 52: DTLS is out of scope, so a `tls:` block on
-    /// the UDP arm is an error here too rather than a silently-ignored setting.
+    /// `tls:` on UDP is an error here too, not only under `graph::resolve`'s rule 52.
     #[tokio::test]
     async fn with_tls_on_a_udp_statsd_out_is_an_error() {
         let output = StatsdOutput::udp("127.0.0.1:8125").unwrap();
@@ -4129,9 +3766,7 @@ mod tests {
         assert!(err.to_string().contains("transport: tcp"), "got: {err}");
     }
 
-    /// `logit.output.reconnects` is counted on every connect *after* the first -- the counter
-    /// `statsd_out` gained with TLS (`docs/design/internal-telemetry.md`), on plaintext and TLS
-    /// alike since both take the same [`TcpDial::connect`] path.
+    /// `logit.output.reconnects` counts every connect after the first.
     #[tokio::test]
     async fn reconnects_are_counted_from_the_second_connect() {
         let (addr, _received, accepts) = tcp_collector().await;
@@ -4148,9 +3783,7 @@ mod tests {
             "the first connect must not be counted as a reconnect"
         );
 
-        // Break the *local* end of the inherited connection deterministically rather than racing
-        // a real peer-sent RST -- `tcp_reconnects_exactly_once_after_the_peer_resets_an_inherited
-        // _connection`'s trick, and `syslog_out`'s before it.
+        // Break the local end deterministically rather than racing a peer RST.
         if let Conn::Tcp { stream: Some(stream), .. } = &mut output.conn {
             stream.shutdown().await.expect("local shutdown should succeed");
         }
@@ -4167,9 +3800,7 @@ mod tests {
         );
     }
 
-    /// `logit.output.reconnects`' value out of a drained `Registry`, or `None` if the counter was
-    /// never touched at all -- which is itself the assertion for a sink that has only ever
-    /// connected once. `syslog.rs`'s helper of the same name.
+    /// `logit.output.reconnects` from a drained `Registry`, or `None` if never counted.
     fn reconnects_in(events: Vec<Event>) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
@@ -4185,25 +3816,21 @@ mod tests {
 
     // -- Sink: TCP over TLS, write/flush semantics ----------------------------------------------
     //
-    // The invariants `send_tcp` is built around are per transport (its own doc comment), and the
-    // TLS ones can't be provoked over a real socket without depending on kernel buffer sizes: the
-    // interesting state is "the rustls session accepted the frame but the socket took only part
-    // of it", which needs a backpressured socket, which needs a known send-buffer size. These
-    // tests drive `send_tcp` against a scripted [`FakeTlsStream`] instead -- `syslog.rs`'s own
-    // arrangement, verbatim, since this sink's `send_tcp` is that one ported.
+    // The TLS state that matters ("the session accepted the frame, the socket took part of it")
+    // needs a backpressured socket of known send-buffer size to provoke for real, so these tests
+    // drive `send_tcp` against a scripted [`FakeTlsStream`] instead.
 
-    /// An [`AsyncStream`] with `tokio_rustls`' write semantics rather than a socket's: `write`
-    /// accepts bytes into a userspace buffer and reports them written, and only `flush` hands
-    /// them to the notional wire. Failures are scripted per call so each of `send_tcp`'s arms can
-    /// be reached exactly.
+    /// An [`AsyncStream`] with `tokio_rustls`' write semantics: `write` buffers in userspace and
+    /// reports success, and only `flush` puts bytes on the notional wire. Failures are scripted
+    /// per call to reach each of `send_tcp`'s arms.
     #[derive(Clone, Default)]
     struct FakeTlsStream(Arc<Mutex<FakeState>>);
 
     #[derive(Default)]
     struct FakeState {
-        /// Accepted by `write`, not yet flushed -- `tokio_rustls`' `sendable_tls`.
+        /// Accepted by `write`, not yet flushed (`tokio_rustls`' `sendable_tls`).
         buffered: Vec<u8>,
-        /// What `flush` has actually put on the wire.
+        /// What `flush` has put on the wire.
         sent: Vec<u8>,
         writes: usize,
         flushes: usize,
@@ -4261,14 +3888,9 @@ mod tests {
     }
 
     impl tokio::io::AsyncRead for FakeTlsStream {
-        /// `Pending`, which is what a live, quiet stream really does: `statsd_out` reads exactly once,
-        /// non-blockingly, on a pooled connection before its first write
-        /// (`crate::tls::poll_pending_close`), and this fake stands in for a connection that is
-        /// still there -- an immediate `Ok(())` with nothing filled would be an EOF, i.e. "the
-        /// peer closed", and the probe would (rightly) replace it before any scripted write ever
-        /// happened. Nothing else here reads at all, and a waker is deliberately not registered:
-        /// anything that actually *awaited* a read on this would hang, which is a loud failure
-        /// rather than a silently wrong one.
+        /// `Pending`, as a live, quiet stream is: `Ok(())` with nothing filled is EOF, and
+        /// `crate::tls::poll_pending_close` would replace the stream before any scripted write.
+        /// No waker is registered, so anything that awaited a read here would hang loudly.
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
@@ -4278,8 +3900,7 @@ mod tests {
         }
     }
 
-    /// An `Arc<rustls::ClientConfig>` for a [`TcpDial`] that should report `is_tls()` -- built
-    /// from default settings (the bundled roots), since no handshake ever happens in these tests.
+    /// A client config so a [`TcpDial`] reports `is_tls()`; no handshake happens in these tests.
     fn any_client_config() -> Arc<rustls::ClientConfig> {
         Arc::new(
             crate::tls::build_client_config(&TlsClientSettings::default(), &testdata_dir())
@@ -4293,12 +3914,8 @@ mod tests {
         (lines, Vec::new())
     }
 
-    /// **The behavioural regression net for this workstream** (`send_tcp`'s `!dial.is_tls()`
-    /// guard): a write failure on a TLS stream may already have landed whole records, so it is
-    /// `Ambiguous` and the frame is never resent. A resend here would increment the destination
-    /// counter a second time -- silent corruption, not a duplicated log line, which is why this
-    /// sink cares about it more than `syslog_out` does
-    /// ([`StatsdOutput::duplicate_safe`] is `false`).
+    /// `send_tcp`'s `!dial.is_tls()` guard: a TLS write failure is `Ambiguous` and never resent,
+    /// since a resend would increment the destination counter twice.
     #[tokio::test]
     async fn a_tls_write_failure_is_ambiguous_and_never_retried() {
         let fake = FakeTlsStream::failing_write(1);
@@ -4307,8 +3924,7 @@ mod tests {
         let telemetry = Telemetry::default();
         let mut connected = true;
         let mut dial = TcpDial {
-            // Nothing listens here: were the TLS arm to take plaintext's reconnect-and-retry
-            // path, it would dial this and report the connect failure as `Clean` instead.
+            // Nothing listens here: a wrongly taken retry would fail its connect as `Clean`.
             endpoint: "127.0.0.1:1",
             connect_timeout: Duration::from_millis(200),
             tls: Some(&cfg),
@@ -4329,11 +3945,8 @@ mod tests {
         assert!(state.sent.is_empty());
     }
 
-    /// The plaintext half, unchanged by the TLS work -- the regression this stack must not break:
-    /// one `write(2)` failing proves zero bytes were accepted, so `send_tcp` reconnects once,
-    /// retries the whole frame, and reports `Fault::Clean` if that fails too. Drives the same
-    /// scripted stream through the plaintext arm (`tls: None`) so the two classifications are
-    /// pinned side by side.
+    /// The plaintext counterpart on the same scripted stream: a zero-byte write failure reconnects
+    /// once, and a failed retry is `Fault::Clean`.
     #[tokio::test]
     async fn a_plaintext_zero_byte_write_still_reconnects_once() {
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4365,9 +3978,8 @@ mod tests {
         );
     }
 
-    /// The success path's flush, on the transport that needs it: nothing may be left in the
-    /// session buffer once `send_tcp` has reported the batch delivered, and the flushed
-    /// connection is reusable.
+    /// Nothing is left in the session buffer once a TLS batch is reported delivered, and the
+    /// flushed connection is kept.
     #[tokio::test]
     async fn a_tls_batch_is_reported_delivered_only_once_the_stream_has_been_flushed() {
         let fake = FakeTlsStream::default();
@@ -4415,9 +4027,7 @@ mod tests {
         assert!(found, "expected a gauge_delta_unresolved diagnostic");
     }
 
-    /// The identical batch must report the identical `logit.output.messages` on both transports.
-    /// A negative-absolute-gauge pair is one `MessageBuf` entry holding two statsd lines; UDP
-    /// used to count its embedded `\n` as a second message where TCP counted the entry.
+    /// Both transports report the same `logit.output.messages`: a negative-gauge pair counts once.
     #[tokio::test]
     async fn udp_and_tcp_report_the_same_message_count_for_the_same_batch() {
         fn messages(registry: &logit_core::Registry) -> f64 {
@@ -4488,9 +4098,7 @@ mod tests {
         assert!(matches!(events[0].attributes.get("urgent"), Some(Value::Bool(true))));
     }
 
-    /// The workstream's headline claim, end to end through the real decoder: `#team:a,team:b` in,
-    /// byte-identical bytes out. Depends on the decoder's repeated-key fold -- before that landed,
-    /// the decoder collapsed `team` to `Str("b")` and this failed on the first assert.
+    /// `#team:a,team:b` relays byte for byte, through the decoder's repeated-key fold.
     #[test]
     fn a_repeated_tag_key_relays_byte_for_byte_through_the_real_statsd_decoder() {
         let line = "x:1|c|#team:a,team:b";
@@ -4505,8 +4113,6 @@ mod tests {
         assert_eq!(stats, EncodeStats::default());
     }
 
-    /// The same claim for the bare/valued mix, whose loss was the same gap in a second `Value`
-    /// type. Also depends on the decoder's repeated-key fold.
     #[test]
     fn a_bare_and_valued_tag_mix_relays_byte_for_byte_through_the_real_statsd_decoder() {
         let line = "x:1|c|#urgent,urgent:1";
@@ -4547,17 +4153,13 @@ mod tests {
     #[test]
     fn a_negative_absolute_gauge_round_trips_to_the_same_effective_value_not_a_delta() {
         let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-5.0), &[])]);
-        // The single MessageBuf entry contains two lines; decode both, in order.
+        // Reset to 0, then -5: the encoded value.
         let events = decode_one(&msgs[0]);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].metrics[0].kind, MetricKind::Gauge(v) if v == 0.0));
         assert!(matches!(events[1].metrics[0].kind, MetricKind::GaugeDelta(v) if v == -5.0));
-        // Applied in order against a starting gauge of 0, this reaches -5 -- the value we encoded.
     }
 
-    /// `f64`'s `Display` renders `-0.0` as `"-0"`, and the decoder's `"g"` arm dispatches on the
-    /// leading `-` without parsing the value -- so a naive rendering would come back as a no-op
-    /// `GaugeDelta`, not the absolute reset to zero it was. Regression for that.
     #[test]
     fn a_negative_zero_gauge_does_not_decode_as_a_gauge_delta() {
         let (msgs, _) = encode(vec![metric_event("free", MetricKind::Gauge(-0.0), &[])]);
@@ -4590,9 +4192,7 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("host").and_then(|v| v.as_str()), Some("web1"));
     }
 
-    /// A timer line round-trips byte-for-byte under dogstatsd: multi-value, `@rate`, and tags all
-    /// survive `statsd_in -> statsd_out` with no `aggregate` in between (W3's real `Samples`
-    /// encoding, not the v1 unsupported-kind drop).
+    /// Multi-value, `@rate`, and tags all survive a timer line's relay.
     #[test]
     fn a_timer_line_round_trips_byte_for_byte_through_the_real_statsd_decoder() {
         let original_line = "req.duration:12.5:34:56|ms|@0.5|#env:prod,host:web1";
@@ -4612,18 +4212,13 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("statsd.type").and_then(|v| v.as_str()), Some("ms"));
     }
 
-    /// A set line round-trips byte-for-byte under dogstatsd -- multiple members, one line in, one
-    /// line out, same members in the same order.
+    /// A multi-member set line relays as one line per member, members in order.
     #[test]
     fn a_set_line_round_trips_byte_for_byte_through_the_real_statsd_decoder() {
         let original_line = "unique.visitors:alice:bob|s";
         let original = decode_one(original_line);
         assert_eq!(original.len(), 1, "one SetMembers event per line");
         let (msgs, _) = encode(original);
-        // The classic multi-value `:`-joined form is DogStatsD's own decoder-side grammar for
-        // `s`, but this sink emits one line per member (module doc's "Sanitization" section) --
-        // so the round trip is two lines decoding back to two events, each a one-member set,
-        // rather than one two-member line. Both members still survive, in order.
         assert_eq!(msgs.len(), 2);
         let relayed: Vec<Event> = msgs.iter().flat_map(|m| decode_one(m)).collect();
         assert_eq!(relayed.len(), 2);
@@ -4637,8 +4232,7 @@ mod tests {
         assert_eq!(members, vec![b"alice".as_slice(), b"bob".as_slice()]);
     }
 
-    /// A `|c:`/`|T` line round-trips through the real decoder under dogstatsd: the container id
-    /// and timestamp marker both survive, and the timestamp lands on `Event::timestamp`.
+    /// `|c:` and `|T` survive a relay, and `|T` lands on `Event::timestamp`.
     #[test]
     fn a_container_id_and_timestamp_line_round_trips_through_the_real_statsd_decoder() {
         let original = decode_one("hits:1|c|c:abcd1234|T1700000000");
@@ -4654,8 +4248,6 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("statsd.timestamp"), Some(&Value::U64(1_700_000_000)));
     }
 
-    /// An event line round-trips through the real decoder: title/text, every optional field, and
-    /// a tag all survive `statsd_in -> statsd_out` with no `aggregate` in between.
     #[test]
     fn an_event_line_round_trips_through_the_real_statsd_decoder() {
         let original_line =
@@ -4678,8 +4270,7 @@ mod tests {
         assert_eq!(relayed[0].attributes.get("env").and_then(|v| v.as_str()), Some("prod"));
     }
 
-    /// A service check line round-trips through the real decoder: name, status, every optional
-    /// field, and a `|`-containing message all survive.
+    /// Every optional field, and a `|` inside the last field (`m:a|b`), survives the relay.
     #[test]
     fn a_service_check_line_round_trips_through_the_real_statsd_decoder() {
         let original_line = "_sc|my.check|2|d:1700000000|h:web1|#env:prod|c:cid1|m:a|b";
@@ -4702,10 +4293,10 @@ mod tests {
 
     // -- Fixed-point property: decode/encode agree with each other -----------------------------
     //
-    // `docs/plans/lossless-transit.md`'s W3 fixed-point requirement: for a small DogStatsD
-    // grammar generator, `decode(encode(decode(line))) == decode(line)` (whole `EventBatch`,
-    // receipt timestamps normalized when the line carries no `|T`) and `encode(decode(line))` is
-    // a fixed point of `encode . decode`. Mirrors `syslog.rs`'s `mod fixed_point` exactly.
+    // `docs/adr/lossless-transit.md`'s fixed point, over a small DogStatsD grammar generator:
+    // `decode(encode(decode(line))) == decode(line)` (whole `EventBatch`, receipt timestamps
+    // normalized when the line carries no `|T`), and `encode(decode(line))` is a fixed point of
+    // `encode . decode`. Same shape as `syslog.rs`'s `mod fixed_point`.
     mod fixed_point {
         use super::*;
         use logit_core::EventBatch;
@@ -4715,18 +4306,9 @@ mod tests {
             "[a-zA-Z][a-zA-Z0-9_.]{0,12}"
         }
 
-        /// 1-3 values -- for `c`/`ms`/`h`/`d`, plain decimal numbers; for `g`, a leading `-`/`+`
-        /// exercises the delta path too; for `s`, short member tokens with no `:`/`|` (or any
-        /// other genuinely forbidden character) in them, so every generated line already has its
-        /// values unambiguously delimited at the *grammar* level -- a member sanitized because it
-        /// embedded one of those is the dedicated `a_member_containing_a_colon_is_sanitized_and_
-        /// counted`/`..._re_decodes_as_one_member_not_two` unit tests' job, not this generic
-        /// property's. `@`/`#`/`,`/a space are deliberately included, though: none of them is
-        /// delimiter-sensitive in a member's own wire position (`is_forbidden_in_set_member`
-        /// preserves all four), so a real decode can hand any of them back unchanged and this
-        /// property should cover that, not just the alphanumeric case. Paired with its own
-        /// wire-type letter via `prop_flat_map` below so the shape always matches the type (a
-        /// top-level proptest parameter can't depend on another one).
+        /// 1-3 values shaped for `kind`: decimals for `c`/`ms`/`h`/`d`; for `g`, an optional
+        /// leading `-` for the delta path; for `s`, short members with no `:`/`|` (sanitized
+        /// members have their own unit tests) but with `@`/`#`/`,`/space, which a member keeps.
         fn values_for(kind: &'static str) -> impl Strategy<Value = Vec<String>> {
             let count = 1usize..=3;
             match kind {
@@ -4766,16 +4348,9 @@ mod tests {
             prop_oneof![Just(None), (1u32..=100).prop_map(Some)]
         }
 
-        /// One `key[:value]` tag token. The key is drawn from a deliberately **two-element pool**
-        /// so a repeated key -- the multi-value case (`#team:a,team:b` -> `Value::Array`, the
-        /// module doc's "Multi-value tags" section) -- is generated constantly rather than by
-        /// luck, and the value is an `Option` so the bare form (`#urgent`) and every bare/valued
-        /// mix (`#urgent,urgent:1`, `#urgent:1,urgent`) are generated too. Exact duplicates come
-        /// out of the same pool, which is what exercises the decoder's dedupe rule.
-        ///
-        /// Key *sanitization* is not this generator's job (both pool entries are already legal
-        /// wire keys) -- that has its own unit tests; what a small pool buys is collision
-        /// frequency.
+        /// One `key[:value]` tag token. A two-key pool makes repeated keys (multi-value tags) and
+        /// exact duplicates (the decoder's dedupe) common; an optional value generates the bare
+        /// form and bare/valued mixes.
         fn tag() -> impl Strategy<Value = (String, Option<String>)> {
             (
                 prop_oneof![Just("team".to_string()), Just("env".to_string())],
@@ -4787,8 +4362,7 @@ mod tests {
             prop::collection::vec(tag(), 0..=3)
         }
 
-        /// Appends a `|#`-prefixed tag segment, rendering a valueless token bare (`k`, no `:`) --
-        /// shared by all three `render_*` functions below, which write an identical segment.
+        /// Appends a `|#`-prefixed tag segment, a valueless token rendered bare.
         fn push_tag_segment(line: &mut String, tags: &[(String, Option<String>)]) {
             if tags.is_empty() {
                 return;
@@ -4814,8 +4388,7 @@ mod tests {
             prop_oneof![Just(None), (1u32..2_000_000_000).prop_map(Some)]
         }
 
-        /// Renders one syntactically valid line from the generated pieces -- deliberately
-        /// independent of `StatsdEncoder` (the thing under test).
+        /// Renders one valid line, independently of `StatsdEncoder` (the thing under test).
         #[allow(clippy::too_many_arguments)]
         fn render_line(
             name: &str,
@@ -4850,12 +4423,9 @@ mod tests {
 
         // -- Events and service checks: extra generators -----------------------------------
 
-        /// A small piece of an event `TITLE`/`TEXT`: plain ASCII, `|`/`:` (both legal in this
-        /// position -- the `_e{tlen,xlen}` header delimits by byte length, not by scanning for
-        /// either), the literal two-byte escape sequence `\n` (the wire's own encoding of a real
-        /// newline -- `parse_event`'s `unescape_event_text` turns it back into one on decode, and
-        /// `render_event`'s `append_event_text` turns a real one back into this on re-encode), and
-        /// a multi-byte UTF-8 character, so `tlen`/`xlen` byte-counting is exercised too.
+        /// A piece of an event `TITLE`/`TEXT`: ASCII, `|`/`:` (legal, since the header delimits
+        /// by byte length), the two-byte escape `\n` (decoded to a newline and re-escaped), and a
+        /// multi-byte character for `tlen`/`xlen` byte counting.
         fn event_piece() -> impl Strategy<Value = String> {
             prop::collection::vec(
                 prop_oneof![
@@ -4889,10 +4459,8 @@ mod tests {
             prop_oneof![Just(None), "[a-z][a-z0-9]{0,6}".prop_map(Some)]
         }
 
-        /// One generated line, of any of the three shapes this fixed point covers. Carries
-        /// exactly the pieces its own `render_*` function needs -- kept as one enum, rather than
-        /// three separate `proptest!` blocks, so all three shapes exercise the same
-        /// decode-encode-decode/encode-is-a-fixed-point body below.
+        /// One generated line of any of the three shapes, as one enum so all three share the
+        /// property body below.
         #[derive(Debug)]
         #[allow(clippy::large_enum_variant)]
         enum GeneratedLine {
@@ -4928,11 +4496,8 @@ mod tests {
             },
         }
 
-        /// Renders a `GeneratedLine::Event` -- field order matches [`render_event`]'s own
-        /// canonical order exactly (`d:`,`h:`,`p:`,`t:`,`k:`,`s:`,tags,`c:`): `AttrMap` sorts by
-        /// key regardless of insertion order, so this doesn't matter for `d1 == d2` below, but
-        /// matching it anyway keeps `e1 == e2` (the literal re-encoded bytes) trivially true
-        /// rather than merely equal-after-reordering.
+        /// Renders a `GeneratedLine::Event` in [`render_event`]'s field order (`d:`, `h:`, `p:`,
+        /// `t:`, `k:`, `s:`, tags, `c:`).
         #[allow(clippy::too_many_arguments)]
         fn render_event_line(
             title: &str,
@@ -4972,8 +4537,7 @@ mod tests {
             line
         }
 
-        /// Renders a `GeneratedLine::ServiceCheck` -- field order matches [`render_service_check`]
-        /// exactly (name, status, `d:`, `h:`, tags, `c:`, `m:` last).
+        /// Renders a `GeneratedLine::ServiceCheck` in [`render_service_check`]'s field order.
         fn render_service_check_line(
             name: &str,
             status: u32,
@@ -5050,8 +4614,7 @@ mod tests {
                 opt_word(),
                 tags(),
                 opt_container_id(),
-                // Reuses `event_piece`'s richer alphabet (including `|`) for the message: `m:` is
-                // always the last field, so an embedded `|` must survive untouched.
+                // `event_piece` includes `|`, which must survive in the last field, `m:`.
                 prop_oneof![Just(None), event_piece().prop_map(Some)],
             )
                 .prop_map(|(name, status, secs, host, tags, container_id, message)| {
@@ -5126,26 +4689,18 @@ mod tests {
                 let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()));
                 let mut d1 = match decoder.decode(bytes::Bytes::from(line.clone())) {
                     Ok(batch) => batch,
-                    Err(_) => return Ok(()), // a generated edge case the grammar allows but the
-                                              // decoder rejects (e.g. an out-of-range value) --
-                                              // not what this property tests.
+                    Err(_) => return Ok(()), // a line the decoder rejects; not this property
                 };
                 match &generated {
-                    // A generated ordinary metric line can legitimately decode to zero events for
-                    // reasons unrelated to what this property tests (e.g. a `parse_line` edge case
-                    // this generator doesn't otherwise filter out) -- keep the early-out here.
+                    // A metric line can decode to zero events for reasons outside this property.
                     GeneratedLine::Metric { .. } => {
                         if d1.events.is_empty() {
                             return Ok(());
                         }
                     }
-                    // An `_e{`/`_sc|` line is never blank-line-skipped and either the whole line
-                    // decodes to exactly one event or `decoder.decode` above already returned
-                    // early on `Err`. Asserting this (rather than silently early-returning on
-                    // empty, the way the metric arm does) is what catches a decode bug that
-                    // corrupts the line into something `parse_line` silently drops zero events
-                    // for instead of rejecting outright -- exactly the bug trailing whitespace on
-                    // these two shapes used to cause before `decode_into` stopped trimming it.
+                    // An `_e{`/`_sc|` line decodes to one event or errors. Asserting it catches a
+                    // decode bug that yields zero events instead of an error (trimming trailing
+                    // whitespace off these shapes was one).
                     GeneratedLine::Event { .. } | GeneratedLine::ServiceCheck { .. } => {
                         prop_assert_eq!(
                             d1.events.len(),
@@ -5156,10 +4711,7 @@ mod tests {
                     }
                 }
 
-                // `relative_gauges: true` -- otherwise every generated `g` line with a leading
-                // sign decodes to an unresolved `GaugeDelta` that the default encoder drops
-                // outright (`a_gauge_delta_is_dropped_by_default`), which isn't what this
-                // property tests.
+                // Otherwise the default encoder drops every signed `g` line's `GaugeDelta`.
                 let mut encoder = StatsdEncoder::new(Format::DogStatsd).with_relative_gauges(true);
                 let mut out1 = MessageBuf::default();
                 encoder.encode_into(&d1, &mut out1);
@@ -5176,12 +4728,9 @@ mod tests {
                 normalize_receipt_time(&mut d1, secs.is_some());
                 normalize_receipt_time(&mut d2, secs.is_some());
                 if is_set_members {
-                    // `SetMembers` splits from one line (one event, N members) into N one-member
-                    // lines regardless of dialect (the module doc's "Sanitization" section) -- a
-                    // permitted normalization (`docs/adr/lossless-transit.md`'s "splitting a
-                    // multi-value statsd line ... into several lines, or the reverse"), so `d1`/
-                    // `d2` legitimately differ in event *count* even though every member survives.
-                    // Compare the flat multiset of members instead of whole-batch equality.
+                    // One N-member line re-encodes as N one-member lines, a permitted
+                    // normalization (`docs/adr/lossless-transit.md`'s "splitting a multi-value
+                    // statsd line"), so compare the members in order, not the event count.
                     let members_of = |batch: &EventBatch| -> Vec<Vec<u8>> {
                         batch
                             .events

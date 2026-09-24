@@ -1,18 +1,13 @@
-//! `keep`/`remove`: attribute allowlist and denylist transforms. Both are stateless -- only
-//! `process` is overridden, `flush_interval`/`flush` keep the `Transform` trait's defaults -- and
-//! share one piece of filtering machinery, differing only in which side of the named set survives.
+//! `keep`/`remove`: stateless attribute allowlist and denylist transforms, sharing one filter.
 //!
-//! **`keep` is the important one, deliberately.** A denylist (`remove`) can only ever protect
-//! against fields a config author already knows about; a new field appearing in a log format
-//! later (an nginx `log_format` gaining a directive, say) would silently become a new InfluxDB tag
-//! dimension with `remove` alone. `keep`'s allowlist makes that impossible by construction --
-//! anything not explicitly named is dropped, known or not.
+//! **Prefer `keep`.** A denylist only protects against fields the config author already knows
+//! about: a directive later added to an nginx `log_format` becomes a new InfluxDB tag dimension
+//! with `remove` alone. `keep` drops anything not named, known or not.
 //!
-//! **Place `keep` before `aggregate` in a pipeline.** `aggregate`'s `SeriesKey` includes the whole
-//! of `event.attributes` (`crates/logit-transforms/src/aggregate.rs`), so an un-pruned
-//! high-cardinality attribute (client address, user agent, a full request path) sitting on an
-//! event when it reaches `aggregate` explodes both series cardinality and per-window memory --
-//! `keep` ahead of it is what bounds the tag set `aggregate` ever keys on.
+//! **Place `keep` before `aggregate` in a pipeline.** `aggregate`'s `SeriesKey` includes all of
+//! `event.attributes`, so an unpruned high-cardinality attribute (client address, user agent, a
+//! full request path) that reaches `aggregate` explodes both series cardinality and per-window
+//! memory. `keep` ahead of it is what bounds the tag set `aggregate` keys on.
 
 use logit_core::interner::resolve;
 use logit_core::{AttrMap, Event, Resource, Telemetry};
@@ -20,8 +15,9 @@ use logit_pipeline::Transform;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Retains only the named attributes, dropping the rest. An **empty** `fields` list is legal and
-/// means "drop every attribute" -- a real, if blunt, operation, not rejected as a config error.
+/// Retains only the named attributes, dropping the rest.
+///
+/// An empty `fields` list is legal and drops every attribute; it isn't a config error.
 pub struct Keep {
     fields: HashSet<String>,
     telemetry: Telemetry,
@@ -32,9 +28,10 @@ impl Keep {
         Self { fields: fields.into_iter().collect(), telemetry: Telemetry::default() }
     }
 
-    /// Attaches a telemetry handle -- no `Diagnostics` builder alongside it, unlike most other
-    /// transforms: filtering an `AttrMap` against a fixed set can't fail and has nothing to warn
-    /// about, so there's no `warn_throttled` call site for one to bridge.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: filtering against a fixed set can't fail, so there's
+    /// nothing to warn about.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -60,7 +57,7 @@ impl Remove {
         Self { fields: fields.into_iter().collect(), telemetry: Telemetry::default() }
     }
 
-    /// See [`Keep::with_telemetry`] -- same reasoning, no `Diagnostics` here either.
+    /// Attaches a telemetry handle; see [`Keep::with_telemetry`].
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -75,17 +72,13 @@ impl Transform for Remove {
     }
 }
 
-/// Shared by [`Keep`] and [`Remove`]: rebuilds an `AttrMap` from whichever entries `retain`
-/// accepts. `AttrMap::iter` yields sorted-`Symbol` order (its own doc comment), and inserting in
-/// that order into a fresh `AttrMap` reproduces the same sorted order for whatever survives --
-/// preserving relative order "for free," but see the tests for an explicit assertion of that
-/// rather than a silent assumption.
+/// Rebuilds an `AttrMap` from the entries `retain` accepts, for [`Keep`] and [`Remove`].
 ///
-/// Records `logit.transform.attributes.kept`/`.dropped` -- the cardinality story `aggregate`'s
-/// `logit.transform.series.active` gauge tells from the other end: `keep` is documented as the
-/// mechanism that's supposed to bound what reaches `aggregate`, so knowing how much it's actually
-/// suppressing (or not) is what confirms that's really happening (`docs/design/
-/// internal-telemetry.md`).
+/// `AttrMap::iter` yields sorted-`Symbol` order, so the survivors keep their relative order.
+///
+/// Records `logit.transform.attributes.kept`/`.dropped`: the other end of the cardinality story
+/// `aggregate`'s `logit.transform.series.active` gauge tells, showing whether `keep` is bounding
+/// what reaches `aggregate` (`docs/design/internal-telemetry.md`).
 fn filtered(attrs: &AttrMap, telemetry: &Telemetry, retain: impl Fn(&str) -> bool) -> AttrMap {
     let mut out = AttrMap::new();
     for (sym, value) in attrs.iter() {
@@ -144,9 +137,8 @@ mod tests {
 
     #[test]
     fn keep_preserves_the_relative_order_of_what_remains() {
-        // `AttrMap` sorts by interned `Symbol` (assignment order), not alphabetically and not by
-        // insertion order -- so the right invariant to check is "whatever order a fresh `AttrMap`
-        // holding just the surviving keys would already have," not a specific string ordering.
+        // `AttrMap` sorts by `Symbol` (interning order), neither alphabetically nor by insertion,
+        // so the expected order is whatever a fresh `AttrMap` of the survivors has.
         let mut keep = Keep::new(vec!["m".to_string(), "z".to_string(), "a".to_string()]);
         let resource = default_resource();
         let mut event = event_with_attrs(&[("z", "1"), ("a", "2"), ("m", "3"), ("x", "4")]);
@@ -217,9 +209,8 @@ mod tests {
         assert_eq!(event.log.as_ref().unwrap().message, original_message);
     }
 
-    // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it
-    // empties every buffer via `mem::take`), so calling it once per assertion in the same test
-    // would make every assertion after the first see an already-emptied registry.
+    // Takes drained `events`, not a `&Registry`: `Registry::drain` empties every buffer, so a
+    // second drain in the same test would see nothing.
     fn counter_value(events: &[Event], name: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             e.metrics.iter().find_map(|m| match &m.kind {
@@ -259,8 +250,7 @@ mod tests {
 
     #[test]
     fn a_disabled_telemetry_handle_is_the_default() {
-        // No `.with_telemetry(...)` call at all -- should behave exactly as before this change,
-        // just without any recorded points (nothing to assert beyond "doesn't panic").
+        // Without `.with_telemetry`, filtering still works and records nothing.
         let mut keep = Keep::new(vec!["a".to_string()]);
         let resource = default_resource();
         let mut event = event_with_attrs(&[("a", "1")]);

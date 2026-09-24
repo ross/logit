@@ -1,11 +1,11 @@
-//! Decoding one collectd datagram into events -- the `| Wire | Model |` half of [`super`]'s module
-//! doc, which is the spec for everything here.
+//! Decoding one collectd datagram into events: the decode half of [`super`]'s module doc, which is
+//! the spec for everything here.
 //!
-//! The shape is a flat walk over [`super::part::read_part`] with a small block of **sticky** state
-//! reset per datagram, exactly the way collectd's own `parse_packet` works: an identity part sets a
-//! field, a Values part dispatches one value list against whatever is currently set. Every string
-//! part becomes a zero-copy [`bytes::Bytes::slice`] of the datagram, so an event's attributes share
-//! the receive buffer's allocation rather than copying out of it (`docs/design/memory.md` §2).
+//! A flat walk over [`super::part::read_part`] with a block of **sticky** state reset per datagram,
+//! as collectd's own `parse_packet` does: an identity part sets a field, a Values part dispatches
+//! one value list against whatever is set. Every string part becomes a zero-copy
+//! [`bytes::Bytes::slice`] of the datagram, so attributes share the receive buffer's allocation
+//! (`docs/design/memory.md` §2).
 
 use super::part::{self, DsValue, PartError, PartHeader};
 use super::types_db::{DataSource, TypesDb};
@@ -21,31 +21,24 @@ use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Decodes collectd binary-protocol datagrams. Split out from `collectd_in` (W2) so every framing,
-/// stickiness and malformed-input test runs against this with no socket involved.
+/// Decodes collectd binary-protocol datagrams, with no socket, so framing, stickiness, and
+/// malformed-input tests run against it directly.
 pub struct CollectdDecoder {
-    /// One shared resource for every batch this decoder ever produces -- **not** one per host. See
-    /// [`super`]'s module doc: `logit_pipeline::BatchAccumulator::absorb` keys accumulation on
-    /// `Arc::ptr_eq`, so a per-host resource would split every batch by sender. The host rides on
-    /// `collectd.host` instead.
+    /// One shared resource for every batch, **not** one per host (see [`super`]'s module doc).
     resource: Arc<Resource>,
     diag: Diagnostics,
-    /// Scratch for the record name currently being built (`<plugin>.<type>[.<i>]`). A struct field
-    /// rather than a local so a 64-data-source list allocates no `String`s at all -- the same
-    /// discipline `crates/logit-outputs/src/statsd.rs`'s `StatsdEncoder::name` follows.
+    /// Scratch for the record name being built (`<plugin>.<type>[.<i>]`), a field so a
+    /// 64-data-source list allocates no `String`.
     name: String,
-    /// The six attribute keys, interned once at construction so the per-list hot path uses
-    /// [`AttrMap::insert_sym`] instead of re-hashing the same six strings per value list.
+    /// The `collectd.*` attribute keys, interned once so the per-list path uses
+    /// [`AttrMap::insert_sym`] instead of re-hashing them.
     keys: AttrKeys,
-    /// The operator-supplied `types.db`, if `collectd_in`'s `types_db:` named one -- one load per
-    /// component (`logit-cli::pipeline`'s `build_spec`), shared with that component's decoder as an
-    /// `Arc` rather than moved, so the caller keeps its own handle. `None` -- the default -- means
-    /// index naming, which is what a `types.db`-less deployment gets. See
-    /// [`super::types_db`] for what this changes and, more importantly, what it does not.
+    /// The operator-supplied `types.db`, loaded once per component; `None` means index naming.
+    /// [`super::types_db`] says what it changes and what it doesn't.
     types_db: Option<Arc<TypesDb>>,
 }
 
-/// The interned `collectd.*` attribute keys -- see [`CollectdDecoder::keys`].
+/// The interned `collectd.*` attribute keys; see [`CollectdDecoder::keys`].
 struct AttrKeys {
     host: Symbol,
     plugin: Symbol,
@@ -83,44 +76,41 @@ impl CollectdDecoder {
     /// Resolves data-source *names* from an operator-supplied `types.db`
     /// ([`super::types_db::TypesDb`]), turning `load.load.0` into `load.load.shortterm`.
     ///
-    /// Naming rule, per value list, exactly once per Values part:
+    /// Naming rule, once per Values part:
     ///
     /// - the list's `type` resolves **and** the entry's data-source count and kinds match the
-    ///   wire's: `<plugin>.<type>` for a single-data-source type (the lone data source, which
-    ///   collectd conventionally calls `value`, is omitted -- `write_graphite`'s own default), else
+    ///   wire's: `<plugin>.<type>` for a single-data-source type (the lone data source,
+    ///   conventionally `value`, is omitted, as `write_graphite` does), else
     ///   `<plugin>.<type>.<ds_name>`;
     /// - it resolves but the count or a kind disagrees: index naming, plus a throttled
-    ///   `types_db_mismatch` diagnostic. A mismatch means the configured file is not the one the
-    ///   sender is running against, and inventing names from it would attach the wrong label to a
-    ///   real measurement -- worse than an honest index;
+    ///   `types_db_mismatch` diagnostic. The configured file is not the sender's, and naming from
+    ///   it would mislabel a real measurement;
     /// - it does not resolve: index naming, **no** diagnostic. A type missing from `types.db` is
-    ///   routine (a custom plugin, a newer collectd), not a misconfiguration.
+    ///   routine (a custom plugin, a newer collectd).
     ///
-    /// Never changes what `collectd_out` puts back on the wire -- see [`super::types_db`]'s module
+    /// Never changes what `collectd_out` puts back on the wire; see [`super::types_db`]'s module
     /// doc, and `collectd_fixed_point.rs`'s `names_do_not_affect_the_fixed_point`.
     pub fn with_types_db(mut self, types_db: Arc<TypesDb>) -> Self {
         self.types_db = Some(types_db);
         self
     }
 
-    /// This decoder's own diagnostics handle. Public, unlike `StatsdDecoder`/`SyslogDecoder`'s
-    /// `#[cfg(test)] pub(crate)` equivalents, for one reason: `collectd_in` lives in
-    /// `logit-inputs` while this decoder lives here, so the regression test both sibling inputs
-    /// carry -- that `CollectdInput::with_diagnostics`'s `map_decoder` half actually reached the
-    /// decoder, and did not silently leave every decoder-side diagnostic reporting under no
-    /// component id -- cannot reach a crate-private accessor.
+    /// This decoder's diagnostics handle.
+    ///
+    /// Public, unlike `StatsdDecoder`/`SyslogDecoder`'s test-only equivalents, because
+    /// `collectd_in` lives in `logit-inputs`, and its test that `with_diagnostics` reached the
+    /// decoder can't call a crate-private accessor.
     pub fn diag(&self) -> &Diagnostics {
         &self.diag
     }
 }
 
-/// The identity, time and interval a Values part is dispatched against. Reset per datagram, never
-/// carried across one -- collectd's receiver does the same, and a sender that relied on otherwise
-/// would be broken by any dropped packet.
+/// The identity, time, and interval a Values part is dispatched against. Reset per datagram, as
+/// collectd's receiver does; a sender relying on otherwise would break on any dropped packet.
 ///
-/// The five identity fields hold *byte ranges into the datagram*, not copies: `None` means either
-/// "no such part arrived" or "a part arrived carrying the empty string," which are the same thing
-/// on this wire (an empty string part is how a sender clears an instance).
+/// The five identity fields hold *byte ranges into the datagram*. `None` means "no such part" or
+/// "an empty string part", which are the same thing on this wire (an empty string part is how a
+/// sender clears an instance).
 #[derive(Debug, Default)]
 struct Sticky {
     host: Option<Range<usize>>,
@@ -128,28 +118,24 @@ struct Sticky {
     plugin_instance: Option<Range<usize>>,
     type_: Option<Range<usize>>,
     type_instance: Option<Range<usize>>,
-    /// Unix nanoseconds; `0` means no Time/TimeHR part has arrived, which makes the list borrow the
-    /// datagram's own `received_at`.
+    /// Unix nanoseconds; `0` means no Time/TimeHR part yet, so the list takes `received_at`.
     time_ns: i64,
     /// Raw `cdtime_t`; `0` means unspecified, which leaves `collectd.interval` absent.
     interval_cdtime: u64,
-    /// The raw wire severity from the most recent `0x0101` Severity part; `0` (no valid severity
-    /// is ever `0`) means none has arrived yet in this datagram. Read only when a Message part
-    /// dispatches a notification -- see [`CollectdDecoder::decode_notification`].
+    /// The raw severity from the latest `0x0101` part; `0` (never a valid severity) means none yet.
+    /// Read only by [`CollectdDecoder::decode_notification`].
     severity: u64,
 }
 
-/// Whether to keep walking this datagram after a part. Only an Encryption part stops early -- every
-/// other unhandled type is skipped by its own length.
+/// Whether to keep walking this datagram after a part. Only an Encryption part stops early.
 enum Step {
     Advance,
     Stop,
 }
 
-/// Why a part could not be decoded. Distinct from [`PartError`] (which is only about framing) so a
-/// payload-shape problem reports what was actually wrong with the payload. Every variant abandons
-/// the rest of the datagram; see [`CollectdDecoder::decode_into`] for what happens to the events
-/// already decoded from it.
+/// Why a part could not be decoded: [`PartError`] covers framing only, so a payload-shape problem
+/// reports what was wrong with the payload. Every variant abandons the rest of the datagram; see
+/// [`CollectdDecoder::decode_into`] for the events already decoded from it.
 #[derive(Debug, thiserror::Error)]
 enum PartFault {
     #[error(transparent)]
@@ -182,14 +168,10 @@ impl Decoder for CollectdDecoder {
             match self.decode_part(&bytes, at, &mut sticky, received_at, out) {
                 Ok((Step::Advance, len)) => at += len,
                 Ok((Step::Stop, _)) => break,
-                // A malformed part means the rest of the datagram cannot be located, let alone
-                // trusted -- there is no resync point in a length-prefixed part stream. But lists
-                // decoded *before* it are genuine, independent metrics that happened to share a
-                // packet (collectd packs up to 1452 bytes of unrelated lists together), so
-                // discarding them would let one bad part take down everything alongside it -- the
-                // same per-line isolation stance `logit_inputs::statsd::decode_into` takes. With
-                // nothing decoded yet there is nothing to keep, so the datagram fails as a whole
-                // and the listener's own `bad_datagram` counter fires.
+                // A length-prefixed part stream has no resync point, so the rest of the datagram is
+                // lost. Lists decoded before the bad part are independent metrics that shared a
+                // packet, so they are kept. With nothing decoded yet, the datagram fails as a
+                // whole and the listener's `bad_datagram` counter fires.
                 Err(fault) => {
                     let kept = out.len() - pushed_before;
                     if kept > 0 {
@@ -206,8 +188,7 @@ impl Decoder for CollectdDecoder {
                 }
             }
         }
-        // collectd datagrams carry no OTLP instrumentation-scope concept -- `None`, always; and the
-        // resource is this decoder's own shared one (see the `resource` field's doc).
+        // collectd has no instrumentation-scope concept.
         Ok((self.resource.clone(), None))
     }
 }
@@ -234,15 +215,14 @@ impl CollectdDecoder {
             part::TYPE_TYPE_INSTANCE => {
                 sticky.type_instance = string_range(&header, payload, payload_at)?
             }
-            // Legacy, second-resolution Time: widened to nanoseconds here and re-emitted as a
-            // TimeHR part on the way out (normalization 1 in [`super`]'s list).
+            // Legacy second-resolution Time; re-emitted as TimeHR (normalization 1).
             part::TYPE_TIME => {
                 let seconds = read_number(&header, payload)?;
                 sticky.time_ns =
                     i64::try_from(seconds.saturating_mul(1_000_000_000)).unwrap_or(i64::MAX);
             }
             part::TYPE_TIME_HR => sticky.time_ns = cdtime_to_nanos(read_number(&header, payload)?),
-            // Legacy Interval, likewise: seconds scaled into cdtime ticks, exactly.
+            // Legacy Interval, likewise; seconds scale into cdtime ticks exactly.
             part::TYPE_INTERVAL => {
                 sticky.interval_cdtime =
                     read_number(&header, payload)?.saturating_mul(CDTIME_ONE_SECOND)
@@ -251,17 +231,14 @@ impl CollectdDecoder {
             part::TYPE_VALUES => {
                 self.decode_values(bytes, payload, sticky, received_at, out)?;
             }
-            // Sets sticky state; the notification itself is dispatched at the Message part below,
-            // exactly the way a Values part dispatches against sticky identity (this module doc's
-            // "Notifications" section).
+            // Sticky; the notification is dispatched at the Message part, as a Values part is.
             part::TYPE_SEVERITY => sticky.severity = read_number(&header, payload)?,
             part::TYPE_MESSAGE => {
                 let message_range = string_range(&header, payload, payload_at)?;
                 self.decode_notification(bytes, message_range, sticky, received_at, out);
             }
-            // Everything after an Encryption part is ciphertext, and this codec holds no keys
-            // (`docs/known-gaps.md`): stop, rather than walking what would look like garbage parts
-            // and reporting each one as malformed.
+            // Everything after an Encryption part is ciphertext and this codec holds no keys
+            // (`docs/known-gaps.md`): stop, rather than report each garbage part as malformed.
             part::TYPE_ENCRYPTION => {
                 self.diag.warn_throttled(
                     "encrypted_packet_dropped",
@@ -270,13 +247,10 @@ impl CollectdDecoder {
                 );
                 return Ok((Step::Stop, header.len));
             }
-            // A Signature part signs the *plaintext* that follows it, so the rest of the datagram
-            // is still readable -- it is simply unverified. Skipped by length, silently: a
-            // diagnostic per signed packet would fire on every datagram from a `SecurityLevel Sign`
-            // sender forever.
+            // A Signature part signs the plaintext that follows, which stays readable, unverified.
+            // No diagnostic: it would fire on every datagram from a `SecurityLevel Sign` sender.
             part::TYPE_SIGNATURE => {}
-            // An unknown part type is skipped by its own length, which is the whole reason `len`
-            // exists: a newer collectd can add a part type without breaking this decoder.
+            // Skipped by length, so a newer collectd can add a part type without breaking this.
             _ => {}
         }
         Ok((Step::Advance, header.len))
@@ -285,10 +259,9 @@ impl CollectdDecoder {
     /// Decodes one Values part into one [`Event`] carrying one [`MetricRecord`] per data source, in
     /// wire order.
     ///
-    /// **Every length and type check happens before a single allocation.** The declared
-    /// data-source count is attacker-controlled (`u16`, so up to 65535), and sizing anything from it
-    /// before checking it against the part's own length is precisely the shape of bug
-    /// `crates/logit-proto/tests/robustness.rs` exists to catch.
+    /// **Every length and type check happens before any allocation.** The declared data-source
+    /// count is attacker-controlled (up to 65535), and sizing anything from it before checking it
+    /// against the part's length is the bug `crates/logit-proto/tests/robustness.rs` catches.
     fn decode_values(
         &mut self,
         bytes: &Bytes,
@@ -316,9 +289,8 @@ impl CollectdDecoder {
             }
         }
 
-        // collectd's own `network_dispatch_values` rejects a list with an empty host, plugin or type
-        // (`-EINVAL`), because none of the three has a meaningful default. Skipped rather than
-        // treated as malformed: the part itself is well formed, and the lists around it are fine.
+        // collectd's `network_dispatch_values` rejects a list with an empty host, plugin, or type
+        // (`-EINVAL`). Skipped, not malformed: the part is well formed, and so are its neighbors.
         let (Some(host), Some(plugin), Some(type_)) = (&sticky.host, &sticky.plugin, &sticky.type_)
         else {
             self.diag.warn_throttled(
@@ -340,24 +312,20 @@ impl CollectdDecoder {
             attrs.insert_sym(self.keys.type_instance, string_value(bytes, range.clone()));
         }
         if sticky.interval_cdtime != 0 {
-            // Exact: a cdtime is a count of 2^-30-second ticks, and both the numerator and the
-            // divisor are exactly representable, so no interval that fits in a `u64` loses anything
-            // here beyond `f64`'s own mantissa above 2^53 ticks (~97 days).
+            // Exact up to `f64`'s 2^53-tick mantissa (~97 days): the divisor is a power of two.
             let seconds = sticky.interval_cdtime as f64 / CDTIME_ONE_SECOND as f64;
             attrs.insert_sym(self.keys.interval, Value::F64(seconds));
         }
 
-        // Lenient where collectd is strict: its receiver rejects a `time == 0` list outright, but
-        // `logit` observes rather than polices, and every other input in the tree stamps receipt
-        // time when the wire carried none (`crate::Decoder::decode_into`'s `received_at` contract).
+        // collectd's receiver rejects a `time == 0` list; this stamps receipt time instead, like
+        // every other input (`crate::Decoder::decode_into`'s `received_at` contract).
         let timestamp = if sticky.time_ns != 0 { sticky.time_ns } else { received_at };
         let mut event = Event::empty(timestamp, attrs);
 
         let plugin_bytes = &bytes[plugin.clone()];
         let type_bytes = &bytes[type_.clone()];
-        // One `types.db` lookup per Values part, not per data source (see `with_types_db`). Borrows
-        // `self.types_db` while `self.name`/`self.diag` are used below -- disjoint fields, so the
-        // borrow checker is happy and nothing has to be cloned per list.
+        // One `types.db` lookup per Values part, not per data source. It borrows `self.types_db`
+        // alongside `self.name`/`self.diag` (disjoint fields), so nothing is cloned per list.
         let data_sources =
             resolve_data_sources(self.types_db.as_deref(), type_bytes, types, &mut self.diag);
         let values_at = 2 + count;
@@ -373,10 +341,8 @@ impl CollectdDecoder {
             push_lossy(&mut self.name, plugin_bytes);
             self.name.push('.');
             push_lossy(&mut self.name, type_bytes);
-            // A single-data-source list is `<plugin>.<type>` either way: collectd's own
-            // `write_graphite` omits the lone data source's name (conventionally `value`), and with
-            // nothing to omit there is nothing for `types.db` to add. Everything is written into
-            // the reused `name` scratch, so even a 64-data-source list allocates no `String`.
+            // A single-data-source list is `<plugin>.<type>` either way, as collectd's
+            // `write_graphite` omits the lone data source's name (conventionally `value`).
             match data_sources {
                 Some(sources) if count > 1 => {
                     self.name.push('.');
@@ -414,9 +380,8 @@ impl CollectdDecoder {
                     }),
                     0,
                 ),
-                // NaN *is* collectd's "no value for this interval" -- see [`super`]'s decode table
-                // for why it becomes a flagged point carrying the type's default rather than a
-                // `Gauge(NaN)` no `PartialEq` fixed-point test could ever compare equal.
+                // NaN is collectd's "no value for this interval": a flagged point, not a
+                // `Gauge(NaN)` that never compares equal ([`super`]'s decode table).
                 DsValue::Gauge(v) if v.is_nan() => {
                     (MetricKind::Gauge(0.0), MetricRecord::FLAG_NO_RECORDED_VALUE)
                 }
@@ -428,11 +393,10 @@ impl CollectdDecoder {
         Ok(())
     }
 
-    /// Dispatches a notification at a Message part -- this module doc's "Notifications" section is
-    /// the spec. Unlike [`Self::decode_values`], there is no structural-error path here: framing and
-    /// NUL-termination were already validated by [`string_range`] before this is called, so every
-    /// failure from here on is a *semantic* one (an invalid severity, an empty message, no host),
-    /// each a skip-and-count rather than a `PartFault`.
+    /// Dispatches a notification at a Message part, per [`super`]'s "Notifications" section.
+    ///
+    /// [`string_range`] has already validated framing, so every failure here is semantic (an
+    /// invalid severity, an empty message, no host): a skip-and-count, never a `PartFault`.
     fn decode_notification(
         &mut self,
         bytes: &Bytes,
@@ -441,9 +405,8 @@ impl CollectdDecoder {
         received_at: i64,
         out: &mut Vec<Event>,
     ) {
-        // collectd's own `notification_t` has no interval field at all -- unlike a value list, a
-        // notification never carries `collectd.interval`, even when an earlier list in the same
-        // datagram set one.
+        // `notification_t` has no interval field, so a notification never carries
+        // `collectd.interval`, even when an earlier list in the datagram set one.
         let severity = match sticky.severity {
             1 => Severity::Error,
             2 => Severity::Warn,
@@ -491,8 +454,7 @@ impl CollectdDecoder {
         }
         attrs.insert_sym(self.keys.severity, Value::U64(sticky.severity));
 
-        // Lenient exactly where the Values path is: collectd's own receiver rejects `time == 0`,
-        // this codec stamps receipt time instead.
+        // Receipt time when the wire carried none, as on the Values path.
         let timestamp = if sticky.time_ns != 0 { sticky.time_ns } else { received_at };
         let message = string_value(bytes, message_range);
         out.push(Event::log(
@@ -513,15 +475,12 @@ impl CollectdDecoder {
 
 /// The `types.db` entry to name this value list's data sources from, or `None` for index naming.
 ///
-/// `None` covers all three no-name cases -- no `types.db` configured, a type it does not define,
-/// and a type it defines *differently* from what arrived -- because the naming site treats them
-/// identically. Only the third is worth telling an operator about, so only it emits a diagnostic
-/// (and a throttled one: a sender running against a different `types.db` will repeat the same
-/// mismatch on every interval, forever).
+/// `None` covers no `types.db`, a type it doesn't define, and a type it defines *differently* from
+/// what arrived. Only the last emits a diagnostic, throttled, since a mismatched sender repeats it
+/// every interval.
 ///
-/// The kinds are compared, not just the count: `types.db` is what says a two-data-source
-/// `if_octets` is `rx`/`tx` **DERIVE**, and a file that agrees on the count while disagreeing on
-/// the kinds is describing a different type that happens to be the same width.
+/// The kinds are compared, not just the count: a file that agrees on the count but not the kinds
+/// describes a different type of the same width.
 fn resolve_data_sources<'a>(
     types_db: Option<&'a TypesDb>,
     type_bytes: &[u8],
@@ -529,8 +488,7 @@ fn resolve_data_sources<'a>(
     diag: &mut Diagnostics,
 ) -> Option<&'a [DataSource]> {
     let types_db = types_db?;
-    // A non-UTF-8 type name simply cannot match a `types.db` key (which is text); it falls through
-    // to index naming like any other unresolved type, with no diagnostic.
+    // A non-UTF-8 type name can't match a `types.db` key; it gets index naming, no diagnostic.
     let type_name = std::str::from_utf8(type_bytes).ok()?;
     let sources = types_db.get(type_name)?;
     let matches = sources.len() == ds_types.len()
@@ -555,12 +513,11 @@ fn resolve_data_sources<'a>(
     None
 }
 
-/// The byte range of a string part's content -- the payload minus its NUL terminator -- or `None`
-/// for the empty string, which clears the sticky field it sets ([`Sticky`]'s own doc).
+/// The byte range of a string part's content (the payload minus its NUL), or `None` for the empty
+/// string, which clears the sticky field.
 ///
-/// A string part with no terminator rejects the datagram, exactly as collectd's
-/// `parse_part_string` does: without the NUL there is no way to know where the string was meant to
-/// end, and guessing "the whole payload" would silently accept a packet collectd itself refuses.
+/// A string part with no NUL rejects the datagram, as collectd's `parse_part_string` does; taking
+/// the whole payload would accept a packet collectd refuses.
 fn string_range(
     header: &PartHeader,
     payload: &[u8],
@@ -584,9 +541,8 @@ fn read_number(header: &PartHeader, payload: &[u8]) -> Result<u64, PartFault> {
 }
 
 /// One string part's content as an attribute value, sharing the datagram's allocation:
-/// [`Value::Str`] when the bytes are valid UTF-8, [`Value::Bytes`] when they are not. collectd's
-/// strings are bytes, not text -- a host name from a non-UTF-8 locale is a real thing to receive,
-/// and lossily replacing its bytes here would make `collectd_in -> collectd_out` not a fixed point.
+/// [`Value::Str`] when valid UTF-8, else [`Value::Bytes`]. collectd's strings are bytes (a host
+/// name from a non-UTF-8 locale is real), and lossy replacement would break the fixed point.
 fn string_value(bytes: &Bytes, range: Range<usize>) -> Value {
     let slice = bytes.slice(range);
     if std::str::from_utf8(&slice).is_ok() {
@@ -596,9 +552,8 @@ fn string_value(bytes: &Bytes, range: Range<usize>) -> Value {
     }
 }
 
-/// Appends `bytes` to `out` as UTF-8, one U+FFFD per invalid sequence -- the allocation-free half of
-/// `String::from_utf8_lossy`, so building a record name for a non-UTF-8 plugin costs no allocation
-/// either (the name has to be `&str` to be interned; the *attribute* keeps the raw bytes).
+/// Appends `bytes` to `out` as UTF-8, one U+FFFD per invalid sequence, without allocating. A record
+/// name must be `&str` to be interned; the *attribute* keeps the raw bytes.
 fn push_lossy(out: &mut String, bytes: &[u8]) {
     for chunk in bytes.utf8_chunks() {
         out.push_str(chunk.valid());
@@ -622,10 +577,9 @@ pub(crate) mod tests {
     /// `1_700_000_000` seconds as a `cdtime_t`.
     pub(crate) const TIME_HR: u64 = 1_700_000_000 << 30;
 
-    /// Builds collectd datagrams byte by byte, **deliberately independent of
-    /// [`super::super::part`]'s writers**: a fixture built by the same code the encoder uses would
-    /// make every decode test a tautology, and would not be able to express the malformed shapes
-    /// (a missing NUL, an inflated count, a `len` of 0) that half these tests are about.
+    /// Builds collectd datagrams byte by byte, **independent of [`super::super::part`]'s
+    /// writers**: sharing the encoder's code would make decode tests tautological, and couldn't
+    /// express malformed shapes (a missing NUL, an inflated count, a `len` of 0).
     #[derive(Default)]
     pub(crate) struct PacketBuilder {
         bytes: Vec<u8>,
@@ -643,7 +597,7 @@ pub(crate) mod tests {
             self.part(part_type, &payload)
         }
 
-        /// A string part with **no** NUL terminator -- a malformed shape collectd itself rejects.
+        /// A string part with **no** NUL terminator, which collectd rejects.
         pub(crate) fn unterminated_string(self, part_type: u16, value: &[u8]) -> Self {
             self.part(part_type, value)
         }
@@ -653,8 +607,7 @@ pub(crate) mod tests {
             self.part(part_type, &value.to_be_bytes())
         }
 
-        /// A Values part from `(ds_type, raw 8 bytes)` pairs -- raw bytes on purpose, so a test can
-        /// assert the exact byte order a gauge or a counter is written in.
+        /// A Values part from `(ds_type, raw 8 bytes)` pairs; raw so a test controls byte order.
         pub(crate) fn values(self, values: &[(u8, [u8; 8])]) -> Self {
             let mut payload = Vec::new();
             payload.extend_from_slice(&(values.len() as u16).to_be_bytes());
@@ -667,7 +620,7 @@ pub(crate) mod tests {
             self.part(part::TYPE_VALUES, &payload)
         }
 
-        /// A Values part whose declared data-source count is a lie -- the hostile-length case.
+        /// A Values part whose declared data-source count is a lie: the hostile-length case.
         pub(crate) fn values_with_declared_count(
             self,
             declared: u16,
@@ -679,8 +632,7 @@ pub(crate) mod tests {
             self.part(part::TYPE_VALUES, &payload)
         }
 
-        /// A part with a hand-written header and payload -- `len` is computed, so this is the
-        /// "well-framed" primitive every helper above goes through.
+        /// A well-framed part (`len` computed); every helper above goes through it.
         pub(crate) fn part(mut self, part_type: u16, payload: &[u8]) -> Self {
             let len = (part::HEADER_LEN + payload.len()) as u16;
             self.bytes.extend_from_slice(&part_type.to_be_bytes());
@@ -725,8 +677,7 @@ pub(crate) mod tests {
         (part::DS_ABSOLUTE, v.to_be_bytes())
     }
 
-    /// A minimal, complete single-gauge datagram -- the base every "and now break one thing" test
-    /// starts from.
+    /// A minimal, complete single-gauge datagram.
     pub(crate) fn single_gauge_packet() -> Bytes {
         PacketBuilder::new()
             .string(part::TYPE_HOST, b"web-1")
@@ -743,8 +694,8 @@ pub(crate) mod tests {
         CollectdDecoder::new(Arc::new(Resource::default()))
     }
 
-    /// A decoder whose diagnostics mirror into a drainable registry, so a test can assert on
-    /// `logit.component.diagnostics{key}` rather than capturing the log stream.
+    /// A decoder whose diagnostics mirror into a drainable registry, for asserting on
+    /// `logit.component.diagnostics{key}`.
     fn decoder_with_diag() -> (CollectdDecoder, Arc<Registry>) {
         let registry = Registry::new();
         let diag = Diagnostics::new("collectd_in").with_telemetry(registry.telemetry_for(
@@ -793,8 +744,7 @@ pub(crate) mod tests {
         assert_eq!(attr(event, ATTR_INTERVAL), Some(Value::F64(10.0)));
     }
 
-    /// The one byte-order assertion this whole codec turns on: a gauge is little-endian, every
-    /// other value type big-endian (`part.rs`'s module doc).
+    /// A gauge is little-endian, every other value type big-endian.
     #[test]
     fn a_gauge_is_read_little_endian_and_every_other_type_big_endian() {
         let events = decode(
@@ -860,8 +810,7 @@ pub(crate) mod tests {
                 .string(part::TYPE_TYPE, b"cpu")
                 .string(part::TYPE_TYPE_INSTANCE, b"user")
                 .values(&[derive(10)])
-                // An unheard-of part type in the middle: skipped by its own length, and the sticky
-                // identity behind it must survive untouched.
+                // An unknown part type, skipped by length; sticky identity survives it.
                 .part(0x0999, b"whatever this is")
                 .string(part::TYPE_TYPE_INSTANCE, b"system")
                 .values(&[derive(20)])
@@ -876,8 +825,7 @@ pub(crate) mod tests {
         assert_eq!(attr(&events[1], ATTR_TYPE_INSTANCE), Some(Value::from("system")));
     }
 
-    /// An empty string part is how a sender *clears* an instance mid-datagram, so it must leave the
-    /// attribute absent rather than present-and-empty.
+    /// An empty string part *clears* an instance mid-datagram, leaving the attribute absent.
     #[test]
     fn an_empty_instance_part_clears_the_attribute_rather_than_setting_it_empty() {
         let events = decode(
@@ -971,8 +919,7 @@ pub(crate) mod tests {
             attr(&events[0], ATTR_HOST),
             Some(Value::Bytes(Bytes::from_static(&[0xFF, 0xFE, b'h'])))
         );
-        // The record *name* has to be text, so it goes through lossy replacement -- the attribute
-        // is what keeps the raw bytes.
+        // The record *name* must be text, so it is lossy; the attribute keeps the raw bytes.
         assert_eq!(resolve(events[0].metrics[0].name), "p.t");
     }
 
@@ -1051,10 +998,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_message_before_any_identity_part_is_dropped_for_missing_host() {
-        // A Message dispatched before any Host part has ever arrived in this datagram --
-        // `sticky.host` is `None`, so the notification is dropped even though it otherwise has a
-        // valid severity and a non-empty message. The value list right behind it, once identity is
-        // set, still decodes.
         let (mut decoder, registry) = decoder_with_diag();
         let mut out = Vec::new();
         decoder
@@ -1078,7 +1021,7 @@ pub(crate) mod tests {
 
     // --- notifications (0x0100 Message / 0x0101 Severity) --------------------------------------
 
-    /// One notification per stock severity, verbatim: the mapping this module doc's table pins.
+    /// Each stock severity maps per [`super::super`]'s "Notifications" table.
     #[test]
     fn every_severity_maps_to_its_own_log_severity() {
         for (wire, expected) in
@@ -1107,9 +1050,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A notification never carries `collectd.interval`, even when an `IntervalHR` part set one
-    /// earlier in the same datagram for a value list -- collectd's own `notification_t` has no such
-    /// field.
+    /// A notification never carries `collectd.interval`, even when a sticky `IntervalHR` is set.
     #[test]
     fn a_notification_never_carries_an_interval_even_when_one_is_sticky() {
         let events = decode(
@@ -1125,8 +1066,7 @@ pub(crate) mod tests {
         assert_eq!(attr(&events[0], ATTR_INTERVAL), None);
     }
 
-    /// Plugin and type may be absent on a notification -- unlike a value list, which requires
-    /// both.
+    /// Plugin and type may be absent on a notification, unlike a value list.
     #[test]
     fn a_notification_with_no_plugin_or_type_still_decodes() {
         let events = decode(
@@ -1197,8 +1137,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// No Severity part at all: `sticky.severity` stays `0`, which is not in `{1, 2, 4}` either --
-    /// the same drop path as an explicit out-of-set value.
+    /// No Severity part leaves `0`, dropped like any out-of-set value.
     #[test]
     fn a_message_with_no_severity_part_at_all_is_dropped() {
         let events = decode(
@@ -1210,8 +1149,7 @@ pub(crate) mod tests {
         assert!(events.is_empty());
     }
 
-    /// Sticky severity resets at the datagram boundary like every other sticky field: a second,
-    /// independent `decode_into` call must not inherit the first datagram's severity.
+    /// Sticky severity resets at the datagram boundary, like every other sticky field.
     #[test]
     fn sticky_severity_resets_per_datagram() {
         let mut decoder = decoder();
@@ -1229,8 +1167,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(out.len(), 1);
 
-        // A second, independent datagram with no Severity part of its own: if severity leaked
-        // across the `decode_into` call, this would decode too.
+        // No Severity part of its own: it decodes only if severity leaked across datagrams.
         decoder
             .decode_into(
                 PacketBuilder::new()
@@ -1244,8 +1181,8 @@ pub(crate) mod tests {
         assert_eq!(out.len(), 1, "the second datagram's severity-less message must be dropped");
     }
 
-    /// A datagram mixing a value list and a notification under one shared identity -- the ordinary
-    /// case a `threshold` plugin produces alongside `load`/`memory` reads on the same host.
+    /// A value list and a notification under one shared identity, as a `threshold` plugin
+    /// produces alongside `load` reads on the same host.
     #[test]
     fn a_datagram_mixing_a_value_list_and_a_notification_decodes_both() {
         let events = decode(
@@ -1300,8 +1237,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every malformed shape, from a datagram that has decoded nothing yet: the whole datagram
-    /// fails, so the listener's `bad_datagram` counter is what fires.
+    /// With nothing decoded yet, every malformed shape fails the whole datagram (`bad_datagram`).
     #[test]
     fn every_malformed_part_shape_fails_the_datagram_when_nothing_decoded_yet() {
         let cases: Vec<(&str, Bytes)> = vec![
@@ -1367,9 +1303,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The same malformed shapes, but *behind* a valid list: the earlier list is kept, the rest of
-    /// the datagram is abandoned, and `bad_part` reports it -- one bad part must not take down the
-    /// unrelated metrics packed alongside it.
+    /// A malformed part *behind* a valid list keeps the list and reports `bad_part`.
     #[test]
     fn a_malformed_part_behind_a_valid_list_keeps_the_list_and_reports_bad_part() {
         let prefix = PacketBuilder::new()
@@ -1386,10 +1320,7 @@ pub(crate) mod tests {
         assert!(diagnosed(&registry, "bad_part"));
     }
 
-    /// The other half of the per-datagram contract, and the one a malformed part planted *last*
-    /// cannot show: a malformed part **abandons the rest of the datagram**, it does not skip the bad
-    /// part and resume. The mirror of `an_encryption_part_stops_the_walk_and_reports_it`, with a
-    /// perfectly good list behind the break that must not appear.
+    /// A malformed part **abandons the rest of the datagram**; decoding never resumes past it.
     #[test]
     fn a_malformed_part_abandons_the_rest_of_the_datagram_rather_than_resuming_past_it() {
         let (mut decoder, registry) = decoder_with_diag();
@@ -1399,8 +1330,7 @@ pub(crate) mod tests {
             .string(part::TYPE_TYPE, b"t")
             .values(&[gauge(1.0)])
             .unterminated_string(part::TYPE_TYPE_INSTANCE, b"broken")
-            // Structurally valid, and unreachable: there is no resync point in a length-prefixed
-            // part stream, so everything after the break is bytes of unknown meaning.
+            // Structurally valid, but unreachable: a length-prefixed stream has no resync point.
             .string(part::TYPE_TYPE_INSTANCE, b"fine")
             .values(&[gauge(2.0)])
             .build();
@@ -1411,9 +1341,8 @@ pub(crate) mod tests {
         assert!(diagnosed(&registry, "bad_part"));
     }
 
-    /// A `count` inflated far past what the buffer holds must be rejected on the declared-length
-    /// check, before anything is sized from it -- `crates/logit-proto/tests/robustness.rs` measures
-    /// the allocation side of the same property.
+    /// An inflated `count` is rejected on the length check, before anything is sized from it
+    /// (`crates/logit-proto/tests/robustness.rs` measures the allocation side).
     #[test]
     fn an_inflated_values_count_is_rejected_without_reading_a_value() {
         let bytes = PacketBuilder::new().values_with_declared_count(65535, b"tiny").build();
@@ -1472,8 +1401,7 @@ pub(crate) mod tests {
         (names, registry)
     }
 
-    /// Outcome 1: the type resolves with a matching data-source count and kinds, so each record
-    /// takes its own data source's name.
+    /// A type resolving with matching count and kinds names each record after its data source.
     #[test]
     fn a_resolved_multi_data_source_type_names_its_records_after_its_data_sources() {
         let (names, registry) = names_with_types_db(list_packet(
@@ -1485,16 +1413,14 @@ pub(crate) mod tests {
         assert!(!diagnosed(&registry, "types_db_mismatch"), "a clean match must be silent");
     }
 
-    /// Outcome 2: a resolved **single**-data-source type drops the lone name (`value`) entirely --
-    /// collectd's own `write_graphite` default, and identical to what index naming produces.
+    /// A resolved **single**-data-source type omits the lone name (`value`), as index naming does.
     #[test]
     fn a_resolved_single_data_source_type_omits_the_lone_data_source_name() {
         let (names, _) = names_with_types_db(list_packet(b"cpu", b"cpu", &[derive(7)]));
         assert_eq!(names, vec!["cpu.cpu"], "not `cpu.cpu.value`");
     }
 
-    /// Outcome 3: the type is defined, but not the way the sender is sending it -- once on the
-    /// count, once on the kinds. Both fall back to index naming and report it.
+    /// A count or kind mismatch falls back to index naming and reports `types_db_mismatch`.
     #[test]
     fn a_types_db_mismatch_falls_back_to_index_naming_and_reports_it() {
         // Right type, wrong data-source count: the fixture's `load` has three.
@@ -1510,8 +1436,7 @@ pub(crate) mod tests {
         assert!(diagnosed(&registry, "types_db_mismatch"));
     }
 
-    /// Outcome 4: a type the file never defines is routine -- index naming, and **no** diagnostic,
-    /// or every custom plugin in a fleet would produce a permanent warning.
+    /// An undefined type is routine: index naming, **no** diagnostic.
     #[test]
     fn an_unresolved_type_falls_back_to_index_naming_without_a_diagnostic() {
         let (names, registry) =
@@ -1520,8 +1445,7 @@ pub(crate) mod tests {
         assert!(!diagnosed(&registry, "types_db_mismatch"), "an unknown type is not a mismatch");
     }
 
-    /// A non-UTF-8 type name can never match a `types.db` key, and must fall through the *quiet*
-    /// path rather than the mismatch one.
+    /// A non-UTF-8 type name takes the quiet unresolved path, not the mismatch one.
     #[test]
     fn a_non_utf8_type_name_falls_back_quietly() {
         let (names, registry) =
@@ -1531,8 +1455,7 @@ pub(crate) mod tests {
         assert!(!diagnosed(&registry, "types_db_mismatch"));
     }
 
-    /// Without a `types.db` the same packet is index-named, silently -- the default every
-    /// deployment that never sets `types_db:` gets.
+    /// With no `types.db`, the same packet is index-named with no diagnostic.
     #[test]
     fn no_types_db_configured_means_index_naming_and_no_diagnostic() {
         let (mut decoder, registry) = decoder_with_diag();
@@ -1559,7 +1482,7 @@ pub(crate) mod tests {
                 .values(&[counter(u64::MAX), absolute(u64::MAX)])
                 .build(),
         );
-        // The precision loss above 2^53 is a documented known gap, not a decode failure.
+        // Precision loss above 2^53 is a known gap (`docs/known-gaps.md`), not a failure.
         assert_eq!(
             events[0].metrics[0].kind,
             MetricKind::Sum(Sum {

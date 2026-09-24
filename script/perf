@@ -4,37 +4,25 @@
 #        script/perf attribute --scenario NAME [--interval 1s] [--settle 1s] [--no-build] [--profile release] [--logit-bin PATH]
 #        script/perf flamegraph --scenario NAME [--out perf/results/NAME.svg] [--freq 999] [--no-build]
 #        script/perf list
-# `--logit-bin PATH` measures that binary instead of building one (implies --no-build) -- a
-# relative path resolves against the repo root. Its sha256, and, next to a `script/vm build`-style
-# `<path>.json` sidecar, its source ref/commit, are recorded in the results file
-# (docs/adr/disposable-azure-perf-vm.md's multi-source model).
-# Out-of-CI load-test harness (crates/logit-perf, docs/adr/load-test-harness.md): spawns the real
-# release `logit` binary against perf/scenarios/*.yaml and measures throughput, CPU per event, and
-# peak RSS. `attribute` adds a temporary `internal` telemetry leg and decodes its native dump into
-# a per-node breakdown; `flamegraph` profiles a scenario with `perf record` and renders an SVG.
+# Load-test harness (crates/logit-perf): runs the release `logit` binary against
+# perf/scenarios/*.yaml and measures throughput, CPU per event, and peak RSS. `--logit-bin PATH`
+# (relative to the repo root) measures a stashed binary instead of building one. See
+# docs/adr/load-test-harness.md.
 #
-# Deliberately NOT part of script/cibuild, for the same reason script/bench is not: this loads the
-# machine heavily (a release build plus several million-event runs) and its numbers describe a
-# shared CI runner's contention, not the code -- see docs/adr/load-test-harness.md's "out of CI"
-# decision. When and how it gets run in the ongoing process (per-PR, nightly, manually triggered)
-# is deliberately still open.
+# Not part of script/cibuild: it loads the machine heavily, and on a shared runner its numbers
+# measure the runner (ADR `load-test-harness`).
 
 set -e
 SCRIPT_PATH="$(dirname -- "$(readlink -f -- "${0}")")"
 source "${SCRIPT_PATH}/common.sh"
 
-# Computed here, on the host: a git-worktree checkout's `.git` file points at an absolute host
-# path the dev container's bind mount doesn't include, so `git` run *inside* the container against
-# a worktree checkout routinely can't answer at all (crates/logit-perf/src/run.rs's `git_info` doc
-# has the full story, and falls back to shelling out there too, for a non-worktree checkout or a
-# run outside the container).
+# Computed on the host: a git worktree's `.git` file points at a host path the dev container's
+# bind mount doesn't include, so `git` inside the container can't answer (see `git_info` in
+# crates/logit-perf/src/run.rs).
 #
-# Handed to the container as argv to `env`, not through `compose.yaml`'s `environment:` block:
-# `run()`'s docker-compose path is `sudo docker compose run`, and `sudo` strips the calling shell's
-# environment before `docker compose` ever gets to interpolate a `${VAR}` there, so an
-# `environment:` entry can never see a value exported here. `run()`'s argv, by contrast, reaches
-# the container (or, in CI, the directly-exec'd process) unchanged either way -- `env` is what sets
-# these two vars for the `cargo run` that follows, in whichever process actually runs it.
+# Passed as argv to `env`, not through compose.yaml's `environment:` block: `sudo` strips the
+# calling shell's environment before compose interpolates `${VAR}`, while `run()`'s argv reaches
+# the process unchanged, locally or in CI.
 LOGIT_PERF_GIT_SHA="$(git rev-parse HEAD 2>/dev/null)" || LOGIT_PERF_GIT_SHA=""
 if LOGIT_PERF_GIT_PORCELAIN="$(git status --porcelain 2>/dev/null)"; then
     if [ -n "${LOGIT_PERF_GIT_PORCELAIN}" ]; then
@@ -46,31 +34,20 @@ else
     LOGIT_PERF_GIT_DIRTY=""
 fi
 
-# `flamegraph` is the one subcommand the dev image can't serve: `perf`/`inferno` live only in the
-# throwaway profiling image (crates/logit-perf/Dockerfile), and `perf record` needs capabilities
-# `compose.yaml`'s `dev` service neither has nor should have. Routed through a plain `docker run`
-# rather than a second compose service, the same way script/protogen runs its own throwaway image
-# -- with the `dev` service's own mounts named explicitly (the bind mount, and the two named
-# volumes compose.yaml gives fixed `name:`s precisely so something outside compose can reuse the
-# warm caches).
+# `flamegraph` runs in its own image (crates/logit-perf/Dockerfile): `perf`/`inferno` aren't in
+# the dev image, and `perf record` needs capabilities the `dev` service shouldn't have. It mounts
+# the `dev` service's bind mount and the two named volumes compose.yaml pins with `name:`, so it
+# reuses the warm caches.
 #
-# Three security relaxations, each verified necessary on this repo's own dev box (Fedora, SELinux
-# Enforcing) rather than copied from a blog post:
-#   --cap-add SYS_ADMIN          perf_event_open is refused outright at the host's default
-#                                kernel.perf_event_paranoid=2 without CAP_SYS_ADMIN/CAP_PERFMON.
-#   --security-opt label=disable SELinux's container_t denies the perf_event class regardless of
-#                                capabilities -- with the default label, `perf record` writes a
-#                                zero-sample perf.data and the paranoid-setting advice above,
-#                                which reads like a capability problem but isn't.
-#   --security-opt seccomp=...   docker's default seccomp profile gates perf_event_open on
-#                                CAP_PERFMON, which not every docker/kernel pair grants alongside
-#                                CAP_SYS_ADMIN.
-# No `:z` on the bind mount: with SELinux labeling off for this container there is nothing to
-# relabel for, and `:z` would recursively relabel the whole checkout (target/ included) each run.
+# Three security flags (docs/design/performance.md, "Flamegraph"): SYS_ADMIN because the kernel's
+# default perf_event_paranoid refuses perf_event_open, seccomp=unconfined because Docker's default
+# profile gates it on CAP_PERFMON, and label=disable because SELinux's container_t denies perf
+# events with a zero-sample perf.data that looks like a capability problem. No `:z` on the bind
+# mount: with labeling disabled there's nothing to relabel, and `:z` would recursively relabel the
+# whole checkout, target/ included, on every run.
 if [ "${1:-}" = "flamegraph" ] && ! in_project_environment; then
-    # `FROM logit-dev:local`, so the dev image has to exist first -- on a fresh checkout nothing
-    # has built it yet, and `docker build` would fail on the FROM line rather than on anything to
-    # do with profiling.
+    # The profiling image is `FROM logit-dev:local`, so build that first or a fresh checkout fails
+    # on the FROM line.
     build_image
     ${DOCKER} build -t logit-perf:local -f crates/logit-perf/Dockerfile crates/logit-perf
     exec ${DOCKER} run --rm \

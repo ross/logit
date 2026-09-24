@@ -1,13 +1,9 @@
-//! The built-in `kv_metrics` transform: turns attributes already on an event (typically merged
-//! there by `json`) into metrics on that *same* event -- nginx's access-log body becomes
-//! `nginx.requests`/`nginx.bytes_sent`/`nginx.request_time` without a second round trip through a
-//! Lua script. See `docs/adr/kv-metrics-semantics.md` for the skip rules, the numeric
-//! coercion rules, and the deliberate absence of a `tags:` field on this config surface -- tag
-//! selection is `keep`'s job (`crate::keep`), not something restated on every metrics producer.
+//! `kv_metrics`: turns attributes already on an event (typically from `json`) into metrics on
+//! that same event, such as nginx's `nginx.requests`/`nginx.bytes_sent`/`nginx.request_time`.
+//! See `docs/adr/kv-metrics-semantics.md` for the skip and numeric-coercion rules, and for why
+//! there's no `tags:` field (tag selection is `keep`'s job).
 //!
-//! Stateless as far as events go -- like `json`, `flush_interval`/`flush` keep the `Transform`
-//! trait's defaults. The one piece of state it does carry is a per-batch telemetry tally
-//! ([`Tally`]), emitted from `end_batch` rather than per event.
+//! No flush state; its only state is a per-batch telemetry [`Tally`].
 
 use crate::numeric;
 use logit_core::interner::{intern, resolve};
@@ -17,30 +13,26 @@ use logit_core::{
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// One counter/gauge/distribution entry, as configured. Mirrors `logit_config::MetricSpec`
-/// field-for-field but is a distinct type: `logit-transforms` doesn't depend on `logit-config`
-/// (`docs/design/pipeline-graph.md`'s crate layout), so `logit-cli::pipeline::build_spec` is the
-/// place that converts one into the other.
+/// One counter/gauge/distribution entry, as configured.
+///
+/// Mirrors `logit_config::MetricSpec` field for field; `logit-cli`'s `build_spec` converts.
 pub struct MetricSpec {
     pub name: String,
-    /// The attribute to read this metric's value from. `None` means "+1 per event" for a counter
-    /// or "set to 1" for a gauge; a distribution with no `field` is a config error rejected at
-    /// graph-validation time (`crates/logit-pipeline/src/graph.rs`), not here -- a distribution of
-    /// nothing is meaningless. Names an attribute literally, not a path: `field: http.status`
-    /// means the attribute named `http.status`, never a `status` key nested under `http` in a
-    /// `Value::Map` (`docs/adr/kv-metrics-semantics.md`).
+    /// The attribute to read the value from.
+    ///
+    /// `None` means +1 per event for a counter or 1 for a gauge; graph rule 11 rejects it on a
+    /// distribution. Names an attribute literally: `http.status` is the attribute named
+    /// `http.status`, never a `status` key nested in a `Value::Map` under `http`.
     pub field: Option<String>,
     pub unit: Option<String>,
 }
 
-/// [`MetricSpec`], interned once at construction ([`KvMetrics::new`]) rather than per event --
-/// `intern`/`lookup`/`resolve` are all hash probes on the process-wide interner, and this runs on
-/// the hot path once per metric per event. `field` included: it is a config string fixed at
-/// startup, so interning it here lets `process` read the attribute through
-/// [`AttrMap::get_sym`] -- a plain binary search on the event's own map -- instead of
-/// `AttrMap::get`'s lookup-hash-then-search round trip. The interner-growth argument
-/// `AttrMap::get` makes for *not* interning arbitrary keys (`docs/design/memory.md` §4) doesn't
-/// apply to a bounded, operator-written set of field names.
+/// [`MetricSpec`] interned once, in [`KvMetrics::new`], to keep interner probes off the per-event
+/// path.
+///
+/// Interning `field` lets `process` use [`AttrMap::get_sym`] (a binary search) instead of
+/// `AttrMap::get`'s hash-then-search. `AttrMap::get`'s reason not to intern arbitrary keys
+/// (interner growth, `docs/design/memory.md` §4) doesn't apply to operator-written field names.
 struct CompiledMetric {
     name: Symbol,
     field: Option<Symbol>,
@@ -78,17 +70,13 @@ impl Kind {
     }
 }
 
-/// Per-batch `derived`/`skipped` counts, one pair per [`Kind`], accumulated by `process` as
-/// plain integer increments and emitted by [`KvMetrics::end_batch`] with at most six
-/// `Telemetry::count` calls per *batch*. Before this existed `process` called `Telemetry::count`
-/// once per configured metric per event -- four calls on the reference config, each a
-/// `PointKey` build, a mutex acquire and a hash-map upsert
-/// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::upsert`) -- a cost the `json-parse`
-/// load-test flamegraph showed and `crates/logit-bench`'s `kv_metrics` bench never saw, because
-/// its fixture carries no telemetry handle. The counters' names, tags and sum-coalescing
-/// semantics are unchanged; only the point at which the coalescing happens moved from per-call
-/// to per-batch, which is invisible to a reader of the drained points (they were already summed
-/// until the next drain).
+/// Per-batch `derived`/`skipped` counts, one pair per [`Kind`], emitted by
+/// [`KvMetrics::end_batch`] in at most six `Telemetry::count` calls.
+///
+/// Each `Telemetry::count` is a `PointKey` build, a mutex acquire, and a hash-map upsert
+/// (`ComponentBuffer::upsert`); calling it per metric per event showed in the `json-parse`
+/// load-test flamegraph. `logit-bench`'s `kv_metrics` bench can't see that cost: its fixture has
+/// no telemetry handle. Drained points are the same either way, since counts sum until a drain.
 #[derive(Default)]
 struct Tally {
     derived: [u64; 3],
@@ -104,8 +92,7 @@ impl Tally {
         }
     }
 
-    /// Emits and resets. Emits only the non-zero cells so a config with no gauges never
-    /// manufactures a zero-valued `gauge` point.
+    /// Emits the non-zero cells and resets, so a config with no gauges emits no `gauge` point.
     fn flush(&mut self, telemetry: &Telemetry) {
         for kind in Kind::ALL {
             let i = kind as usize;
@@ -158,8 +145,7 @@ impl KvMetrics {
         self
     }
 
-    /// Attaches a telemetry handle -- see `process`'s `logit.transform.derived`/`.derived.skipped`
-    /// counters.
+    /// Attaches a telemetry handle for the `logit.transform.derived`/`.derived.skipped` counters.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -167,22 +153,16 @@ impl KvMetrics {
 }
 
 impl Transform for KvMetrics {
-    /// Appends zero or more metrics to `event.metrics`, in config order (counters, then gauges,
-    /// then distributions) -- never replacing what's already there, and never dropping the event:
-    /// this always returns `true`. `log`/`span`/`attributes`/`timestamp` are untouched.
+    /// Appends the configured metrics to `event.metrics` in config order (counters, gauges, then
+    /// distributions); never replaces existing metrics or drops the event.
     ///
-    /// Tallies `logit.transform.derived{metric_kind}`/`.derived.skipped{metric_kind}` for every
-    /// configured metric, whether or not `metric_value`/`numeric` below actually produced a value
-    /// -- the skipped-vs-derived ratio is the visible signal for the documented silent-skip path
-    /// (a missing field, a non-numeric value) this transform deliberately never turns into a
-    /// diagnostic (`docs/design/internal-telemetry.md`). Emitted once per batch from `end_batch`,
-    /// not here ([`Tally`]'s doc comment says why). Tagged `metric_kind`, not `kind` -- `kind`
-    /// is reserved for a point's own component-kind identity
-    /// (`crates/logit-core/src/telemetry.rs::ComponentBuffer::drain`).
+    /// Tallies `logit.transform.derived{metric_kind}` or `.derived.skipped{metric_kind}` for every
+    /// configured metric. A missing or non-numeric field is never a diagnostic, so the ratio is
+    /// the only visible signal for it. The tag is `metric_kind` because `kind` is reserved for the
+    /// point's component kind (`ComponentBuffer::drain`).
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
-        // One `MetricList` growth for the whole append, not one per doubling: `MetricList` keeps
-        // a single record inline (`crates/logit-core/src/event.rs`), so on the reference config
-        // (four metrics) the second push would spill to the heap and a later push regrow it.
+        // One growth for the whole append: `MetricList` keeps one record inline, so on the
+        // reference config (four metrics) the second push would spill and a later one regrow.
         let total = self.counters.len() + self.gauges.len() + self.distributions.len();
         event.metrics.reserve(total);
 
@@ -211,10 +191,8 @@ impl Transform for KvMetrics {
             self.tally.record(Kind::Gauge, derived);
         }
         for m in &self.distributions {
-            // Graph validation (`crates/logit-pipeline/src/graph.rs`) already rejects a
-            // fieldless distribution before a config carrying one ever reaches `build_spec` --
-            // this is defense in depth for a direct `KvMetrics::new` caller (e.g. a test) that
-            // bypasses graph resolution, not a path a real config can take.
+            // Graph rule 11 rejects a fieldless distribution; this guards a direct
+            // `KvMetrics::new` caller that bypasses graph resolution.
             let Some(field) = m.field else {
                 self.diag.warn_throttled(
                     "distribution_no_field",
@@ -228,11 +206,9 @@ impl Transform for KvMetrics {
             };
             let derived = match event.attributes.get_sym(field).and_then(numeric) {
                 Some(value) => {
-                    // A raw single-observation `Samples`, not a one-sample `DdSketch`: the
-                    // sketch is `aggregate`'s summarization to make (`MetricKind::Distribution`'s
-                    // own doc comment, `docs/adr/lossless-transit.md`), and a `Samples` of one
-                    // value sits entirely inline -- no bins `Vec` per distribution per event.
-                    // `docs/adr/kv-metrics-semantics.md` records the change.
+                    // Raw `Samples`, not a one-sample `DdSketch`: summarizing is `aggregate`'s
+                    // job (`docs/adr/lossless-transit.md`), and one sample sits inline with no
+                    // bins `Vec` per event.
                     let mut record =
                         MetricRecord::new(m.name, MetricKind::Samples(Samples::new([value])));
                     record.unit = m.unit;
@@ -246,19 +222,17 @@ impl Transform for KvMetrics {
         true
     }
 
-    /// Emits the batch's tallied `derived`/`skipped` counts -- see [`Tally`]. A disabled handle
-    /// makes each `Telemetry::count` an immediate return, so the tally is still reset but nothing
-    /// else happens.
+    /// Emits and resets the batch's [`Tally`].
     fn end_batch(&mut self) {
         self.tally.flush(&self.telemetry);
     }
 }
 
-/// A counter/gauge entry's value for this event: `1.0` with no `field` (per-event
-/// increment/set-to-1), or the named attribute's coerced numeric value -- `None` when the field
-/// is missing, non-numeric, or non-finite, meaning "skip this metric for this event," never an
-/// error and never a dropped event (`docs/adr/kv-metrics-semantics.md`). This is the common
-/// path, not an edge case: nginx's `$upstream_response_time` is `-` on a non-proxied request and a
+/// A counter/gauge entry's value for this event: `1.0` with no `field`, else the attribute's
+/// coerced numeric value.
+///
+/// `None` (missing, non-numeric, or non-finite) skips this metric for this event, never an error.
+/// That's a common path: nginx's `$upstream_response_time` is `-` on a non-proxied request and a
 /// comma-separated list on a retried one.
 fn metric_value(m: &CompiledMetric, attrs: &AttrMap) -> Option<f64> {
     match m.field {
@@ -522,9 +496,8 @@ mod tests {
         assert!(metric_named(&event, "rt").is_none());
     }
 
-    // Takes already-drained `events`, not a `&Registry` -- `Registry::drain` is consuming (it
-    // empties every buffer via `mem::take`), so calling it once per assertion in the same test
-    // would make every assertion after the first see an already-emptied registry.
+    // Takes drained `events`, not a `&Registry`: `Registry::drain` empties every buffer, so a
+    // second drain in the same test would see nothing.
     fn derived_count(events: &[Event], name: &str, kind: &str) -> Option<f64> {
         events.iter().find_map(|e| {
             if e.attributes.get("metric_kind").and_then(|v| v.as_str()) != Some(kind) {
@@ -547,7 +520,6 @@ mod tests {
         let mut event = event_with_attrs(&[]);
         assert!(kv.process(&resource, &mut event));
 
-        // Nothing is emitted until the batch closes -- the tally is per batch, not per event.
         assert!(registry.drain(0).is_empty(), "no telemetry before end_batch");
         kv.end_batch();
 

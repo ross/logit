@@ -1,30 +1,24 @@
 # Taps a flow with `shape` (docs/adr/shape-observer-component.md) without perturbing it: the real
 # leg (`statsd -> rollup -> metrics`) is untouched, and a second branch off the same listener turns
-# every event into a *measurement of its own shape* -- how many attributes it carried, how long its
-# keys and values were, how deeply its values nested, how many metric records rode on it -- which a
-# second `aggregate` folds into distributions for an ordinary sink.
+# every event into a measurement of its own shape (attribute counts, key and value lengths,
+# nesting depth, metric record counts), which a second `aggregate` folds into distributions.
 #
 #   statsd ─┬─> rollup ─> metrics        (the real pipeline, unchanged)
 #           └─> tap ─> shape_rollup ─> shape_out
 #
-# `shape` emits **counts and lengths only** -- never an attribute key, an attribute value, a log
-# body, or a metric name from an observed event, in any metric, tag or diagnostic. That is what
-# lets this output leave an environment the traffic itself can't: what comes out of `shape_out` is
-# a description of the traffic's shape, not a sample of the traffic.
+# `shape` emits counts and lengths only, never an observed key, value, log body, or metric name,
+# so `shape_out`'s output can leave an environment the traffic itself can't.
 #
-# Two things to know before running this against a production flow:
+# Before running this against a production flow:
 #
-#   * A tap turns a single-consumer edge into a fan-out, and `shape` mutates, so one of the two
-#     branches pays a batch clone (docs/design/memory.md §3 has the shape-by-shape account).
-#     Measure, then remove the tap.
-#   * `shape` never summarizes -- every distribution-shaped quantity goes out as raw
-#     `MetricKind::Samples`, and the `aggregate` below is what turns them into distributions
-#     (docs/adr/lossless-transit.md's "summarization is opt-in and named"). Swap in
-#     `distributions: samples` there if you want the exact values rather than a sketch.
+#   * A tap turns a single-consumer edge into a fan-out, and `shape` mutates, so one branch pays a
+#     batch clone (docs/design/memory.md). Measure, then remove the tap.
+#   * `shape` never summarizes: distribution-shaped quantities go out as raw `Samples`, and the
+#     `aggregate` below turns them into sketches. Set `distributions: samples` there to keep the
+#     exact values.
 #
-# Place a second `shape` at the far end of a transform chain to measure how much wider events get
-# on their way through -- the two taps stay distinct series downstream because each one tags its
-# output with its own component name (`tap`).
+# A second `shape` at the far end of a transform chain measures how much wider events get on the
+# way through; each tap tags its output with its own component name, so the two stay distinct.
 components:
   statsd:
     type: statsd_in
@@ -45,17 +39,14 @@ components:
   tap:
     type: shape
     sources: [statsd]
-    # How often the per-batch measurements (events, resource/scope attributes and distinct
-    # key-sets per batch) and the cumulative gauges (distinct keys, distinct key-sets, the share of
-    # events the most common one and five key-sets carry) are emitted. The per-event measurements
-    # ride out on the events themselves and never wait for this.
+    # How often the per-batch measurements and the cumulative gauges are emitted. Per-event
+    # measurements ride out on the events themselves.
     interval: 10s
-    # `drop` (the default) replaces the batch's Resource with an empty one, so no resource
-    # attribute value flows out. Set `keep` only if a per-service breakdown downstream is worth
-    # that identity travelling with the measurements.
+    # `drop` (the default) replaces the batch resource with an empty one. `keep` lets that
+    # identity travel with the measurements, for a per-service breakdown.
     resource: drop
-    # Bounds on the two cumulative tables -- a DoS/memory guard, not a tuning knob. Past either,
-    # new keys/key-sets are counted rather than tracked and `logit.shape.tracking_overflow` goes
+    # Bounds on the two cumulative tables, a memory guard rather than a tuning knob. Past either,
+    # new keys or key-sets are counted but not tracked, and `logit.shape.tracking_overflow` goes
     # to 1.
     max_tracked_keys: 4096
     max_tracked_keysets: 4096

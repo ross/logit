@@ -1,21 +1,21 @@
 //! Exact allocation counts for each stage of the reference nginx pipeline.
 //!
 //! These are the numbers `docs/design/memory.md` quotes. They're assertions rather than a report
-//! so that an allocation regression fails a build: `script/test` runs them in normal CI, and
-//! `cargo nextest`'s process-per-test isolation is what makes the counts reproducible rather than
-//! order-dependent.
+//! so that an allocation regression fails the build. `cargo nextest`'s process-per-test isolation
+//! makes the counts reproducible rather than order-dependent.
 //!
 //! **When one of these fails, read the printed actual/expected line before changing the constant.**
-//! A drop is worth keeping (update the constant and the doc's table together); a rise is the thing
-//! this file exists to catch.
+//! A count is a tripwire, not a score (`docs/adr/event-sizing-and-allocation-strategy.md`): decide
+//! whether the change is worth it, then update the constant and `docs/design/memory.md`'s table in
+//! the same commit. Never relax an assertion to `<=`.
 //!
-//! Two things every measurement here does deliberately:
+//! Every measurement here:
 //!
-//! - **Warms its subject first**, because plenty of things allocate exactly once on first use (the
+//! - **Warms its subject first**, because plenty of things allocate once on first use (the
 //!   `OnceLock` interner, a `HashMap`'s first table). See [`logit_bench::alloc::measure`].
-//! - **Counts only `alloc`, not `realloc`.** Reallocation is reported alongside but asserted
-//!   separately where it's interesting: it means a container was grown, i.e. a missing
-//!   `with_capacity`, which is a different (and usually cheaper) problem than a missing reuse.
+//! - **Asserts `alloc`, not `realloc`.** Reallocation is printed alongside and asserted separately
+//!   where it matters: it means a container grew, i.e. a missing `with_capacity`, which is a
+//!   different (and usually cheaper) problem than a missing reuse.
 
 use logit_bench::alloc::{measure, CountingAlloc, Stats};
 use logit_bench::fixtures;
@@ -57,31 +57,27 @@ fn expect_allocs(label: &str, stats: Stats, expected: u64) {
 // Inputs
 // ---------------------------------------------------------------------------------------------
 
-/// One allocation: the `Vec<Event>` the batch is collected into. Every *field* of the event --
-/// message, tag, hostname, timestamp -- is a refcounted slice of the datagram `Bytes` that was
-/// passed in, so the decode itself adds nothing per field. This is the zero-copy design in
-/// `docs/design/data-model.md` working exactly as intended, and it's the bar the statsd decoder
-/// below does not currently clear.
+/// One allocation: the `Vec<Event>` the batch is collected into. Every field of the event
+/// (message, tag, hostname, timestamp) is a refcounted slice of the datagram `Bytes`, so the decode
+/// adds nothing per field (`docs/design/data-model.md`'s zero-copy design).
 ///
-/// Note what's excluded: `SyslogInput::run` does one `Bytes::copy_from_slice` per datagram before
-/// calling this, which this measurement deliberately doesn't cover -- see
-/// [`datagram_copy_is_one_right_sized_allocation`].
+/// Excludes the listener's one `Bytes::copy_from_slice` per datagram, which
+/// [`datagram_copy_is_one_right_sized_allocation`] pins.
 #[test]
 fn syslog_decode_one_line() {
     let mut decoder = fixtures::syslog_decoder();
     let datagram = fixtures::nginx_syslog_datagram(1);
-    drop(decoder.decode(datagram.clone())); // warm: interns every syslog.* key exactly once
+    drop(decoder.decode(datagram.clone())); // warm: interns every syslog.* key once
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
     expect_allocs("syslog_in: decode 1 line", stats, 1);
 }
 
-/// Still one allocation for 100 lines -- but five *reallocations*, because `decode` collects into
-/// a `Vec::new()` and grows it 4 -> 8 -> ... -> 128. A `with_capacity` hint (lines can be counted
-/// with one `memchr` pass) would remove those; it's the cheapest item on
-/// `docs/design/memory.md`'s list and the least valuable, which is why it's recorded rather than
-/// done.
+/// One allocation for 100 lines, plus five reallocations: `decode` collects into a `Vec::new()` and
+/// grows it 4 -> 8 -> ... -> 128. A `with_capacity` hint (one `memchr` pass counts the lines) would
+/// remove them; it's recorded rather than done because it's the least valuable item on
+/// `docs/design/memory.md`'s list.
 #[test]
 fn syslog_decode_100_lines() {
     let mut decoder = fixtures::syslog_decoder();
@@ -94,16 +90,13 @@ fn syslog_decode_100_lines() {
     assert_eq!(stats.reallocs, 5, "the events Vec grows 4 -> 8 -> 16 -> 32 -> 64 -> 128");
 }
 
-/// Two allocations for one line, down from eight: `statsd.rs`'s tag values are now sliced out of
-/// the datagram with the same `slice_of` pointer-arithmetic `syslog.rs` uses, instead of going
-/// through `impl From<&str> for Value` -> `Bytes::from(String)` (a fresh copy) and then a second
-/// copy when `build_event`'s `attributes.clone()` promoted it to a shared `Bytes`.
+/// Two allocations for one line. Tag values are `slice_of` slices of the datagram, as in
+/// `syslog.rs`, so they cost nothing ([`statsd_tag_values_share_the_datagram_allocation`] pins
+/// that structurally).
 ///
-/// What's left, unlike syslog's single `Vec<Event>`: statsd's multi-value grammar
-/// (`name:1:2:3|c`) means `parse_line` collects one line's events into its own `Vec` before
-/// `decode` appends them into the batch's `Vec`, so this is one allocation per line plus one for
-/// the batch rather than syslog's one total. See
-/// [`statsd_tag_values_share_the_datagram_allocation`] for the same finding stated structurally.
+/// Syslog pays one `Vec<Event>` total; statsd pays two. The multi-value grammar (`name:1:2:3|c`)
+/// makes `parse_line` collect one line's events into its own `Vec` before `decode` appends them to
+/// the batch's `Vec`: one allocation per line plus one per batch.
 #[test]
 fn statsd_decode_one_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -115,14 +108,9 @@ fn statsd_decode_one_line() {
     expect_allocs("statsd_in: decode 1 line", stats, 2);
 }
 
-/// `ms`/`h`/`d` now decode straight to a raw `MetricKind::Samples` (`docs/adr/lossless-transit.md`'s
-/// W3, `crates/logit-inputs/src/statsd.rs`) instead of sketching into a `DdSketch` at decode time
-/// -- one value fits inline in `Samples`'s `SmallVec` (`SAMPLES_INLINE = 19`,
-/// `crates/logit-core/src/metric.rs`), so building it costs nothing beyond the per-line/per-batch
-/// `Vec<Event>` allocations [`statsd_decode_one_line`] already pins; the `DdSketch` bin `Vec`
-/// this test used to also pay for is gone. [`statsd_decode_one_sampled_distribution_line`] pins
-/// the sampled case at the same count, since `sample_rate` now rides verbatim with no
-/// decode-time extrapolation to allocate for.
+/// `ms`/`h`/`d` decode to a raw `MetricKind::Samples` (`docs/adr/lossless-transit.md`), not a
+/// sketch. One value fits inline in `Samples`'s `SmallVec` (`SAMPLES_INLINE`), so the count is
+/// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair and nothing more.
 #[test]
 fn statsd_decode_one_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -141,12 +129,9 @@ fn statsd_decode_one_distribution_line() {
     expect_allocs("statsd_in: decode 1 distribution line", stats, 2);
 }
 
-/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1`. Pre-W3 this
-/// extrapolated to 10 weighted `DdSketch::add_weighted` samples at decode time; now the raw
-/// `sample_rate` rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`'s W3) --
-/// `aggregate` is the only component that still does the extrapolation, and only when it chooses
-/// to sketch. Same allocation count as the unsampled case: nothing here scales with the rate any
-/// more.
+/// Same line as [`statsd_decode_one_distribution_line`], sampled at `@0.1`: the same count. The
+/// raw `sample_rate` rides verbatim on the decoded `Samples` (`docs/adr/lossless-transit.md`);
+/// only `aggregate` extrapolates, and only when it sketches, so nothing here scales with the rate.
 #[test]
 fn statsd_decode_one_sampled_distribution_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -165,10 +150,10 @@ fn statsd_decode_one_sampled_distribution_line() {
     expect_allocs("statsd_in: decode 1 sampled distribution line", stats, 2);
 }
 
-/// `s` decodes to a raw `MetricKind::SetMembers` -- a `Vec<Bytes>` of zero-copy datagram slices,
-/// one per line (`docs/adr/lossless-transit.md`'s W3). The member `Vec` itself is a third
-/// allocation beyond the per-line/per-batch `Vec<Event>`s [`statsd_decode_one_line`] pins, since
-/// (unlike `Samples`'s inline `SmallVec`) `SetMembers` has no small-size optimization.
+/// `s` decodes to a raw `MetricKind::SetMembers`, a `Vec<Bytes>` of zero-copy datagram slices
+/// (`docs/adr/lossless-transit.md`). Three allocations: [`statsd_decode_one_line`]'s
+/// per-line/per-batch `Vec<Event>` pair plus the member `Vec`, since `SetMembers`, unlike
+/// `Samples`, has no inline storage.
 #[test]
 fn statsd_decode_one_set_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -187,13 +172,11 @@ fn statsd_decode_one_set_line() {
 }
 
 /// A repeated DogStatsD tag key folds into a `Value::Array` at decode
-/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section) -- **two** allocations beyond
-/// [`statsd_decode_one_line`]'s pair (the per-line and per-batch `Vec<Event>`s), not one: `insert_tags`
-/// builds the `Array`'s `Vec` spine (`vec![existing, value]`), and then `build_event`'s own
-/// `attributes.clone()` -- run once even for this single-value counter line -- deep-copies that
-/// same spine a second time to build the `Event`. A scalar-valued tag's share of that same clone
-/// costs nothing (a `SmallVec` memcpy plus a `Bytes` refcount bump), which is what makes the
-/// `Array` case different rather than free like every other attribute here.
+/// (`crates/logit-inputs/src/statsd.rs`'s "DogStatsD tags" section). Four allocations:
+/// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair, plus two for the `Array`.
+/// `insert_tags` builds its `Vec` spine (`vec![existing, value]`), and `build_event`'s
+/// `attributes.clone()`, run once even for a single-value line, deep-copies that spine. A scalar
+/// tag's share of the same clone is free (a `SmallVec` memcpy plus a `Bytes` refcount bump).
 #[test]
 fn statsd_decode_one_line_with_a_repeated_tag_key() {
     let mut decoder = fixtures::statsd_decoder();
@@ -209,16 +192,10 @@ fn statsd_decode_one_line_with_a_repeated_tag_key() {
     expect_allocs("statsd_in: decode 1 line with a repeated tag key", stats, 4);
 }
 
-/// The same repeated tag key, on a multi-value counter line (`name:v1:v2:v3|c`): `parse_line`
-/// decodes this to three `Event`s sharing one `AttrMap`, and `build_event` clones that map once
-/// per value (`crates/logit-inputs/src/statsd.rs`'s `build_event` doc). Every scalar-valued tag
-/// clones cheaply -- a `SmallVec` memcpy plus a refcount bump on its already-shared `Bytes` slices
-/// of the datagram -- but the repeated tag's `Value::Array` holds a real `Vec` spine, which
-/// `Clone` deep-copies: one fresh allocation per value event (three, here), on top of the one
-/// `insert_tags` itself builds -- four `Array`-shaped allocations in total, plus the same
-/// per-line/per-batch `Vec<Event>` pair every decode pays, for six overall. This is the measured
-/// correction to `build_event`'s doc comment's "memcpy plus a refcount bump" claim, which holds
-/// for a scalar tag but not for an `Array`-valued one.
+/// The same repeated tag key on a multi-value counter line (`name:v1:v2:v3|c`): three `Event`s
+/// whose `build_event` clones one shared `AttrMap` once per value. Six allocations: the
+/// per-line/per-batch `Vec<Event>` pair, the `Array` spine `insert_tags` builds, and one deep copy
+/// of that spine per value event (three). Scalar tags clone for free; an `Array` tag doesn't.
 #[test]
 fn statsd_decode_one_multi_value_counter_line_with_a_repeated_tag_key() {
     let mut decoder = fixtures::statsd_decoder();
@@ -236,12 +213,9 @@ fn statsd_decode_one_multi_value_counter_line_with_a_repeated_tag_key() {
     expect_allocs("statsd_in: decode 1 multi-value counter line with a repeated tag key", stats, 6);
 }
 
-/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape to unescape
-/// -- `parse_event`'s `unescape_event_text` takes its zero-copy path (a `slice_of`-backed slice of
-/// the datagram, same as `statsd.event.title` and every other string-valued attribute this decoder
-/// stamps), so this costs nothing beyond the per-line/per-batch `Vec<Event>` pair
-/// [`statsd_decode_one_line`] already pins -- same count, same reasoning, just a different line
-/// shape.
+/// A DogStatsD event (`_e{tlen,xlen}:title|text|...`) whose `TEXT` has no `\n` escape:
+/// `unescape_event_text` takes its zero-copy `slice_of` path, so the count is
+/// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair.
 #[test]
 fn statsd_decode_one_event_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -254,14 +228,12 @@ fn statsd_decode_one_event_line() {
     expect_allocs("statsd_in: decode 1 event line", stats, 2);
 }
 
-/// The one case `unescape_event_text` can't slice: `TEXT` contains a `\n` (backslash, `n`)
-/// two-byte escape, so the decoded message needs a real newline byte the wire text doesn't have.
-/// **One** extra allocation beyond [`statsd_decode_one_event_line`]'s zero-copy baseline: the
-/// decoded length is known up front (each two-byte escape becomes one byte), so
-/// `unescape_event_text` sizes its `Vec` exactly and `bytes::Bytes::from(Vec<u8>)` takes its
-/// `len == capacity` promotion path -- no realloc while unescaping, and no second, eager
-/// `Shared`-control-block allocation of the kind a slack-capacity `String::replace` result would
-/// cost (compare [`logfmt_parse_escaped_value_event`], which `shrink_to_fit`s for the same reason).
+/// The one case `unescape_event_text` can't slice: `TEXT` holds a two-byte `\n` escape, so the
+/// message needs a newline byte the wire doesn't have. One allocation over
+/// [`statsd_decode_one_event_line`]: the decoded length is known up front, so the `Vec` is sized
+/// to fit and `Bytes::from(Vec<u8>)` takes its `len == capacity` path, with no realloc and no
+/// second `Shared` control-block allocation a slack-capacity buffer would cost (compare
+/// [`logfmt_parse_escaped_value_event`], which `shrink_to_fit`s for the same reason).
 #[test]
 fn statsd_decode_one_event_line_with_an_escaped_newline() {
     let mut decoder = fixtures::statsd_decoder();
@@ -275,10 +247,9 @@ fn statsd_decode_one_event_line_with_an_escaped_newline() {
     expect_allocs("statsd_in: decode 1 event line with an escaped newline", stats, 3);
 }
 
-/// A DogStatsD service check (`_sc|name|status|...`) -- decodes to one `MetricKind::Gauge` event
-/// carrying the `statsd.service_check.*` carriers as zero-copy datagram slices, same shape as an
-/// ordinary metric line: no allocation beyond the per-line/per-batch `Vec<Event>` pair
-/// [`statsd_decode_one_line`] already pins.
+/// A DogStatsD service check (`_sc|name|status|...`) decodes to one `Gauge` event whose
+/// `statsd.service_check.*` attributes are zero-copy datagram slices: the count is
+/// [`statsd_decode_one_line`]'s per-line/per-batch `Vec<Event>` pair.
 #[test]
 fn statsd_decode_one_service_check_line() {
     let mut decoder = fixtures::statsd_decoder();
@@ -291,15 +262,10 @@ fn statsd_decode_one_service_check_line() {
     expect_allocs("statsd_in: decode 1 service check line", stats, 2);
 }
 
-/// The logs-only workload `docs/design/memory.md` §0 names as unmeasured: a plain-text syslog
-/// line with no JSON body anywhere in the pipeline (`fixtures::SSHD_SYSLOG_LINE`). Same zero-copy
-/// decode as [`syslog_decode_one_line`] -- one allocation for the `Vec<Event>`, nothing per
-/// field, for the same reason. What's new is the attribute count: six
-/// (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`), the top of the "4-6
-/// attributes" range §1 estimates for this workload -- comfortably inside `AttrMap`'s 8-slot
-/// inline capacity, unlike the nginx shape (10 attributes) which spills. That's the concrete data
-/// point `docs/design/memory.md`'s item 9 (re-picking `AttrMap`'s inline capacity) was missing
-/// for a plain-syslog pipeline specifically.
+/// The logs-only shape: a plain-text syslog line with no JSON body (`fixtures::SSHD_SYSLOG_LINE`).
+/// One allocation, the `Vec<Event>`, for the same zero-copy reason as [`syslog_decode_one_line`].
+/// Its six attributes (`syslog.facility`/`severity`/`timestamp`/`hostname`/`tag`/`pid`) fit
+/// `AttrMap`'s 8-slot inline capacity, unlike the nginx shape's 10, which spills.
 #[test]
 fn syslog_decode_one_logs_only_line() {
     let mut decoder = fixtures::syslog_decoder();
@@ -312,14 +278,10 @@ fn syslog_decode_one_logs_only_line() {
     expect_allocs("syslog_in: decode 1 logs-only line", stats, 1);
 }
 
-/// The measurement `syslog_decode_one_line` above deliberately doesn't cover
-/// (`docs/adr/decoupled-listener-io.md`): `decode_into` called against a buffer the caller
-/// *reuses* across datagrams -- `logit-inputs::udp::decode_loop`'s actual hot path -- rather than
-/// `decode()`'s convenience default, which always hands `decode_into` a fresh `Vec::new()` and so
-/// can never show this. Zero, not one: the `Vec<Event>` is cleared (keeping capacity), not
-/// replaced, between calls, so pushing into it costs nothing once warm. Not the same claim as
-/// `syslog_decode_one_line` -- that one is a real, unavoidable per-datagram cost when nothing
-/// downstream reuses the output buffer; this one exists only because a caller can.
+/// `decode_into` against a buffer the caller reuses across datagrams, the listener's hot path
+/// (`logit-inputs::udp::decode_loop`, `docs/adr/decoupled-listener-io.md`), rather than
+/// `decode()`'s fresh `Vec::new()`. Zero: the `Vec<Event>` is cleared, keeping its capacity,
+/// between calls. [`syslog_decode_one_line`]'s one is the cost when nothing reuses the buffer.
 #[test]
 fn syslog_decode_into_a_warm_reused_buffer_costs_nothing() {
     let mut decoder = fixtures::syslog_decoder();
@@ -334,11 +296,9 @@ fn syslog_decode_into_a_warm_reused_buffer_costs_nothing() {
     expect_allocs("syslog_in: decode_into into a warm buffer", stats, 0);
 }
 
-/// The statsd analogue of the syslog test above -- drops from 2 (via `decode()`, unchanged and
-/// still asserted by `statsd_decode_one_line`) to 1 once the caller reuses its output buffer: the
-/// per-line `Vec<Event>` `parse_line` collects into is still a real, unavoidable allocation (it's
-/// internal to `decode_into`, not something this caller's buffer can absorb), but the *outer*
-/// `Vec::new()` `decode()` pays on top of that is the one this measurement shows going away.
+/// The statsd analogue of the syslog test above: 1, against [`statsd_decode_one_line`]'s 2. The
+/// reused buffer absorbs the batch `Vec<Event>`; the per-line `Vec<Event>` `parse_line` collects
+/// into is internal to `decode_into` and stays.
 #[test]
 fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
     let mut decoder = fixtures::statsd_decoder();
@@ -355,11 +315,9 @@ fn statsd_decode_into_a_warm_reused_buffer_costs_one_not_two() {
 
 // -- collectd_in (docs/adr/collectd-binary-relay.md) -------------------------------------------
 
-/// One allocation, matching `syslog_in`: the `Vec<Event>` the batch is collected into. Every
-/// identity field is a refcounted slice of the datagram (`decode.rs`'s `string_value`), the record
-/// name is built into the decoder's reused scratch `String` before interning, and a
-/// single-data-source list fits `MetricList`'s inline capacity -- so the value list itself costs
-/// nothing.
+/// One allocation, the `Vec<Event>`, as for `syslog_in`. Every identity field is a refcounted
+/// datagram slice (`string_value`), the record name is built in a reused scratch `String` before
+/// interning, and a single-data-source list fits `MetricList`'s inline capacity.
 #[test]
 fn collectd_decode_one_list() {
     let mut decoder = fixtures::collectd_decoder();
@@ -372,9 +330,8 @@ fn collectd_decode_one_list() {
     expect_allocs("collectd_in: decode 1 list", stats, 1);
 }
 
-/// The listener's actual hot path (`docs/adr/decoupled-listener-io.md`): `decode_into` against a
-/// buffer `decode_loop` reuses across datagrams. Zero -- there is nothing left to allocate once the
-/// caller's `Vec<Event>` keeps its capacity, which is the strongest statement this codec can make.
+/// The listener's hot path (`docs/adr/decoupled-listener-io.md`): `decode_into` against a buffer
+/// `decode_loop` reuses across datagrams. Zero once the caller's `Vec<Event>` keeps its capacity.
 #[test]
 fn collectd_decode_into_a_warm_reused_buffer_costs_nothing() {
     let mut decoder = fixtures::collectd_decoder();
@@ -389,9 +346,8 @@ fn collectd_decode_into_a_warm_reused_buffer_costs_nothing() {
     expect_allocs("collectd_in: decode_into into a warm buffer", stats, 0);
 }
 
-/// Two: the `Vec<Event>`, plus one spill of the event's `MetricList`. `logit_core::MetricList` is a
-/// `SmallVec` inlined at 1, so a three-data-source `load` list is the first shape that has to move
-/// its records to the heap -- exactly once, not once per record (`docs/design/memory.md` §3).
+/// Two: the `Vec<Event>`, plus one spill of the event's `MetricList`, a `SmallVec` inlined at 1.
+/// A three-data-source `load` list spills once, not once per record (`docs/design/memory.md` §3).
 #[test]
 fn collectd_decode_one_three_value_list() {
     let mut decoder = fixtures::collectd_decoder();
@@ -404,11 +360,9 @@ fn collectd_decode_one_three_value_list() {
     expect_allocs("collectd_in: decode 1 three-value list", stats, 2);
 }
 
-/// A 25-list datagram -- what a real collectd host agent packs into one 1452-byte packet. Still one
-/// allocation, not 25: the per-list cost is the `Vec<Event>`'s own growth, which shows up as
-/// *reallocs* rather than allocs (4 -> 8 -> 16 -> 32, three of them) because `decode_into` cannot
-/// know the list count in advance -- a collectd datagram has no header saying how many Values parts
-/// it holds, only a flat part stream.
+/// A 25-list datagram, what a collectd agent packs into one 1452-byte packet. One allocation, not
+/// 25; the per-list cost is three reallocs growing the `Vec<Event>` (4 -> 8 -> 16 -> 32), because
+/// a collectd datagram has no header giving its Values-part count.
 #[test]
 fn collectd_decode_a_25_list_packet() {
     let mut decoder = fixtures::collectd_decoder();
@@ -422,10 +376,9 @@ fn collectd_decode_a_25_list_packet() {
 }
 
 /// The same three-data-source list decoded through a decoder holding a `types.db`, which renames
-/// its records `load.load.shortterm`/`midterm`/`longterm`. **The same count as without it**: the
+/// its records `load.load.shortterm`/`midterm`/`longterm`. The same count as without it: the
 /// lookup is one `HashMap::get` per Values part returning a borrowed slice, and the names are
-/// written into the same reused scratch `String` before interning, so resolving them costs no
-/// allocation at all.
+/// written into the reused scratch `String` before interning.
 #[test]
 fn collectd_decode_one_list_with_types_db_resolution() {
     let mut decoder = fixtures::collectd_decoder_with_types_db();
@@ -443,14 +396,13 @@ fn collectd_decode_one_list_with_types_db_resolution() {
 
 // -- graphite_in (docs/adr/graphite-carbon-relay.md) --------------------------------------------
 
-/// One allocation, matching `syslog_in`/`collectd_in`: the `Vec<Event>` the batch is collected
-/// into. The path is interned (warmed below), the value is an `f64` in the record, and a single
-/// `Gauge` fits `MetricList`'s inline capacity -- so the line itself costs nothing.
+/// One allocation, the `Vec<Event>`, as for `syslog_in`/`collectd_in`. The path is interned, the
+/// value is an `f64`, and a single `Gauge` fits `MetricList`'s inline capacity.
 #[test]
 fn graphite_decode_one_plaintext_line() {
     let mut decoder = fixtures::graphite_decoder();
     let datagram = fixtures::graphite_datagram(1);
-    drop(decoder.decode(datagram.clone())); // warm: interns the path exactly once
+    drop(decoder.decode(datagram.clone())); // warm: interns the path once
 
     let (batch, stats) = measure(|| decoder.decode(datagram.clone()).expect("should decode"));
     assert_eq!(batch.events.len(), 1);
@@ -458,10 +410,8 @@ fn graphite_decode_one_plaintext_line() {
     expect_allocs("graphite_in: decode 1 plaintext line", stats, 1);
 }
 
-/// **The same count with two carbon tags on the line.** Every tag value is a zero-copy
-/// `Bytes::slice` of the datagram (`logit_proto::graphite::decode`'s `slice_of`), so the
-/// attributes share the receive buffer's allocation instead of copying out of it, and two entries
-/// still fit `AttrMap`'s inline capacity -- the `Vec<Event>` is all that is left.
+/// The same count with two carbon tags on the line: each tag value is a zero-copy datagram slice
+/// (`logit_proto::graphite::decode`'s `slice_of`), and two entries fit `AttrMap`'s inline capacity.
 #[test]
 fn graphite_decode_one_tagged_line() {
     let mut decoder = fixtures::graphite_decoder();
@@ -473,10 +423,8 @@ fn graphite_decode_one_tagged_line() {
     expect_allocs("graphite_in: decode 1 tagged line (2 tags)", stats, 1);
 }
 
-/// The listener's actual hot path: `decode_into` against a buffer the read loop reuses across
-/// datagrams (`crate::udp`'s `decode_loop`, and `crate::tcp`'s per-connection `scratch`).
-/// Zero -- there is nothing left to allocate once the caller's `Vec<Event>` keeps its capacity,
-/// which is the strongest statement this codec can make.
+/// The listener's hot path: `decode_into` against a buffer the read loop reuses (`udp`'s
+/// `decode_loop`, `tcp`'s per-connection `scratch`). Zero once the `Vec<Event>` keeps its capacity.
 #[test]
 fn graphite_decode_into_a_warm_reused_buffer_costs_nothing() {
     let mut decoder = fixtures::graphite_decoder();
@@ -491,10 +439,9 @@ fn graphite_decode_into_a_warm_reused_buffer_costs_nothing() {
     expect_allocs("graphite_in: decode_into into a warm buffer", stats, 0);
 }
 
-/// A 25-line datagram -- what a UDP carbon sender packs into one MTU-sized packet. Still one
-/// allocation, not 25: the per-line cost is the `Vec<Event>`'s own growth, which shows up as
-/// *reallocs* rather than allocs because a carbon datagram has no header saying how many lines it
-/// holds, so `decode_into` cannot size the `Vec` up front.
+/// A 25-line datagram, what a UDP carbon sender packs into one MTU-sized packet. One allocation,
+/// not 25; the per-line cost is reallocs growing the `Vec<Event>`, because a carbon datagram has
+/// no header giving its line count.
 #[test]
 fn graphite_decode_a_25_line_datagram() {
     let mut decoder = fixtures::graphite_decoder();
@@ -507,11 +454,10 @@ fn graphite_decode_a_25_line_datagram() {
     expect_allocs("graphite_in: decode a 25-line datagram", stats, 1);
 }
 
-/// The other wire, same claim: a 100-datapoint pickle payload costs one allocation plus the
-/// `Vec<Event>`'s growth. The restricted reader's stack, arenas and memo are decoder fields
-/// cleared per frame rather than rebuilt (`logit_proto::graphite::pickle::PickleReader`), so
-/// walking a hundred datapoints through the stack machine allocates nothing of its own -- which is
-/// the whole reason those are fields and not locals.
+/// Pickle: a 100-datapoint frame costs one allocation plus the `Vec<Event>`'s growth. The
+/// reader's stack, arenas, and memo are decoder fields cleared per frame
+/// (`logit_proto::graphite::pickle::PickleReader`), not locals, so the stack machine allocates
+/// nothing of its own.
 #[test]
 fn graphite_decode_a_100_datapoint_pickle_frame() {
     let mut decoder = fixtures::graphite_pickle_decoder();
@@ -524,14 +470,11 @@ fn graphite_decode_a_100_datapoint_pickle_frame() {
     expect_allocs("graphite_in: decode a 100-datapoint pickle frame", stats, 1);
 }
 
-/// `prometheus_in`'s decode path has no `Decoder` trait to go through (`docs/adr/
-/// prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section) -- it's the two
-/// plain functions a real scrape tick calls in sequence: `text::parse_with` (bytes -> families)
-/// then `families_to_events` (families -> `Event`s), against `fixtures::PROMETHEUS_SCRAPE_BODY`'s
-/// 11-series scrape (a histogram's buckets and a summary's quantiles are each one composite series,
-/// not one per wire sample line). Warmed first so every metric/label name's one-time
-/// `interner::intern` cost (paid once per process, not per scrape) doesn't inflate the steady-state
-/// count this pins.
+/// One scrape through the two functions a scrape tick calls (`prometheus_in` has no `Decoder`;
+/// `docs/adr/prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section):
+/// `text::parse_with` (bytes -> families), then `families_to_events`. The fixture is
+/// `fixtures::PROMETHEUS_SCRAPE_BODY`'s 11 series (a histogram's buckets and a summary's quantiles
+/// are each one composite series). Warm, so names are already interned.
 #[test]
 fn prometheus_decode_one_scrape() {
     use logit_proto::prometheus::families_to_events;
@@ -554,12 +497,9 @@ fn prometheus_decode_one_scrape() {
 
 /// The other Prometheus ingress: one remote-write request through
 /// `logit_proto::prometheus::remote_write::decode`, over
-/// `fixtures::remote_write_request_v1`'s 100 single-sample gauge series. Only the *codec* is
-/// measured -- Snappy and HTTP are the receiver's, and `families_to_events` is the row above's.
-///
-/// Where a scrape decodes bytes into families, this decodes protobuf into families through the same
-/// shared assembler, so the two numbers are comparable per series. Warmed first so prost's own
-/// one-time costs and the interner don't inflate the steady state.
+/// `fixtures::remote_write_request_v1`'s 100 single-sample gauge series, warm. Only the codec is
+/// measured: Snappy and HTTP are the receiver's, and `families_to_events` is the row above's. It
+/// decodes into families through the same assembler a scrape uses, so the two compare per series.
 #[test]
 fn remote_write_decode_one_request_v1() {
     use logit_proto::prometheus::remote_write::{decode, Version};
@@ -575,15 +515,13 @@ fn remote_write_decode_one_request_v1() {
     expect_allocs("prometheus_in: decode 1 remote-write 1.0 request (100 series)", stats, 1526);
 }
 
-/// The same request in 2.0: 1428 against 1.0's 1526, so the symbol table pays for itself on the way
-/// in as well as on the wire. Both versions build the same owned `String` label pairs for the model
-/// -- `MetricFamily` holds owned labels -- so the difference is upstream of this codec, in what
-/// prost has to materialize: 1.0 decodes a `Label { name, value }` pair per label per series (~200
-/// `String`s here), 2.0 decodes the symbol table once (~105) and `labels_refs` as plain `u32`s.
+/// The same request in 2.0: 1428 against 1.0's 1526. Both build the same owned `String` label
+/// pairs for `MetricFamily`; the difference is what prost materializes. 1.0 decodes a
+/// `Label { name, value }` pair per label per series (~200 `String`s here); 2.0 decodes the symbol
+/// table once (~105) and `labels_refs` as plain `u32`s.
 ///
-/// The per-series `Metadata` 2.0 repeats on every one of a family's series costs nothing extra,
-/// because declarations are deduplicated by family name before any group opens -- without that,
-/// this row was 1624 and every repeat also counted a bogus `duplicate_metadata`.
+/// The `Metadata` 2.0 repeats on every series of a family costs nothing: declarations are
+/// deduplicated by family name before any group opens. Without that, this count would be 1624.
 #[test]
 fn remote_write_decode_one_request_v2() {
     use logit_proto::prometheus::remote_write::{decode, Version};
@@ -603,18 +541,13 @@ fn remote_write_decode_one_request_v2() {
 /// `Event` is rendered once at construction and `clone`d per generated event with only
 /// `timestamp` overwritten (`crates/logit-inputs/src/generate.rs`'s module doc).
 ///
-/// One allocation for a hundred events -- the batch's own `Vec<Event>` -- and nothing per event
-/// at all: this shape's `Event::clone` is *free*, since one attribute fits `AttrMap`'s 8-entry
-/// inline capacity, one metric fits `MetricList`'s inline capacity of 1, and the log body's
-/// `Bytes` is a refcount bump rather than a copy. (Contrast `Event::clone (nginx shape)`'s 4
-/// below, whose attributes have spilled.) That is what makes the generator itself effectively
-/// free next to whatever a scenario puts downstream of it, which is the whole point of having
-/// this path.
+/// One allocation for a hundred events, the batch's `Vec<Event>`, and nothing per event: this
+/// shape's `Event::clone` is free. One attribute fits `AttrMap`'s inline capacity, one metric fits
+/// `MetricList`'s, and the log body's `Bytes` clone is a refcount bump. That keeps the generator
+/// negligible next to whatever a scenario puts downstream.
 ///
-/// Warmed first, twice over: `build_batch`'s first call is what settles the render path and
-/// renders the prototype (including the one `#[cold]` `Bytes` promotion the first clone of a
-/// freshly-built buffer pays -- `docs/design/memory.md`'s "Fixtures" section), and the
-/// `Vec::with_capacity` below is the only thing left to count afterwards.
+/// The warm-up call renders the prototype and pays the one `#[cold]` `Bytes` promotion a
+/// freshly built buffer's first clone costs (`docs/design/memory.md`'s "Fixtures" section).
 #[test]
 fn generate_render_literal_100_events() {
     let mut input = fixtures::generate_literal();
@@ -625,19 +558,14 @@ fn generate_render_literal_100_events() {
     expect_allocs("generate_in: render 100 events (literal)", stats, 1);
 }
 
-/// `generate_in`'s **per-event** render path, with exactly two templated fields (`{seq%50}` in the
-/// log body, `{seq%10}` in the `host` attribute).
+/// `generate_in`'s per-event render path, with two templated fields (`{seq%50}` in the log body,
+/// `{seq%10}` in the `host` attribute).
 ///
-/// `1 + 2 × 100`: the batch's `Vec<Event>` as above, plus exactly one `Bytes::copy_from_slice`
-/// per templated field per event and nothing else -- the scratch `String` every rendering goes
-/// through has already grown to its widest rendering, so it never reallocates
-/// (`logit_core::template::Compiled::render`'s own guarantee, pinned by
-/// `rendering_into_a_cleared_scratch_string_reallocates_nothing` in that module). The literal
-/// fields alongside them (the metric name's interned `Symbol`, the resource) still cost nothing.
-///
-/// This is the number `docs/plans/load-test-harness.md` calls the risk of `{seq}` on the hot
-/// path: placeholders are a cardinality knob, not decoration, and each one costs an allocation
-/// per event forever.
+/// `1 + 2 × 100`: the batch's `Vec<Event>`, plus one `Bytes::copy_from_slice` per templated field
+/// per event. The scratch `String` has already grown to its widest rendering, so it never
+/// reallocates (`logit_core::template::Compiled::render`, pinned by
+/// `rendering_into_a_cleared_scratch_string_reallocates_nothing`). Literal fields cost nothing.
+/// Each placeholder costs an allocation per event (`docs/plans/load-test-harness.md`).
 #[test]
 fn generate_render_templated_100_events() {
     let mut input = fixtures::generate_templated();
@@ -652,15 +580,12 @@ fn generate_render_templated_100_events() {
 // Listener receive queue and batch accumulator (docs/adr/decoupled-listener-io.md)
 // ---------------------------------------------------------------------------------------------
 
-/// A push immediately followed by a pop, once the underlying `VecDeque` is warm (past its initial
-/// `with_capacity` sizing, `crates/logit-proto/src/buffer.rs`) -- the steady-state cost
-/// `read_loop`/`decode_loop` actually pay per datagram, not counting the datagram's own
-/// `Bytes::copy_from_slice` (a separate, already-measured cost, `datagram_copy_is_one_right_sized_
-/// allocation` below).
+/// A push then a pop on a warm queue: the steady-state cost `read_loop`/`decode_loop` pay per
+/// datagram, excluding the datagram's own copy
+/// ([`datagram_copy_is_one_right_sized_allocation`]).
 ///
-/// A `current_thread` runtime, not a bare hand-rolled poll: neither `push` (room available) nor
-/// `pop` (an item present) actually suspends here, but driving a real `Future` still needs a real
-/// executor to call `.await` from a non-`async` `measure()` closure.
+/// Neither call suspends here, but a `current_thread` runtime is still needed to drive the futures
+/// from a non-`async` `measure()` closure.
 #[test]
 fn receive_queue_push_then_pop_costs_nothing() {
     use logit_inputs::udp::{Datagram, RECEIVE_QUEUE_METRICS};
@@ -672,9 +597,8 @@ fn receive_queue_push_then_pop_costs_nothing() {
         &RECEIVE_QUEUE_METRICS,
         Telemetry::default(),
     );
-    // Built once, outside the measured region -- `Bytes::clone()` is a refcount bump, not a copy,
-    // so cloning this per push measures the queue, not `fixtures::statsd_datagram`'s own
-    // `String::with_capacity` allocation (which the fixture call itself pays every invocation).
+    // Built once, outside the measured region: cloning the `Bytes` per push is a refcount bump,
+    // where calling the fixture would allocate its `String` each time.
     let payload = fixtures::statsd_datagram(1);
     let warm = || Datagram { bytes: payload.clone(), received_at: 0 };
     rt.block_on(queue.push(warm()));
@@ -688,13 +612,10 @@ fn receive_queue_push_then_pop_costs_nothing() {
     expect_allocs("receive queue: push then pop, warm", stats, 0);
 }
 
-/// The batched twin of the row above (ADR `udp-intake-batching-and-socket-visibility`): a whole
-/// batch through `push_many` and back out through `pop_many` must cost the same nothing per
-/// datagram that the single-item pair does. Both `Vec`s are the caller's own, reused across calls
-/// and drained rather than replaced -- `push_many`'s `Drain` empties the input while keeping its
-/// capacity, `pop_many` appends into an output the caller clears -- so the only way this row could
-/// be nonzero is if one of them had been rebuilt instead of reused, which is exactly the mistake
-/// `decode_loop`'s own reused `Vec<Datagram>` exists to avoid.
+/// The batched twin of the row above (`docs/adr/udp-intake-batching-and-socket-visibility.md`):
+/// `push_many` then `pop_many` costs nothing either. Both `Vec`s are the caller's, reused:
+/// `push_many` drains the input keeping its capacity, and `pop_many` appends into an output the
+/// caller clears. A nonzero count means one of them was rebuilt instead of reused.
 #[test]
 fn receive_queue_push_many_then_pop_many_costs_nothing() {
     use logit_inputs::udp::{Datagram, RECEIVE_QUEUE_METRICS};
@@ -710,9 +631,8 @@ fn receive_queue_push_many_then_pop_many_costs_nothing() {
     );
     let payload = fixtures::statsd_datagram(1);
     let datagram = || Datagram { bytes: payload.clone(), received_at: 0 };
-    // Both buffers are filled and drained once outside the measured region, exactly as
-    // `decode_loop` reuses its own -- so what's measured below is a steady-state batch, not the
-    // first one that has to grow two `Vec`s and the underlying `VecDeque`.
+    // One round outside the measured region grows both `Vec`s and the `VecDeque`, as
+    // `decode_loop`'s reuse does, so the measured round is steady state.
     let mut inbound: Vec<Datagram> = Vec::new();
     let mut outbound: Vec<Datagram> = Vec::new();
     let round = |inbound: &mut Vec<Datagram>, outbound: &mut Vec<Datagram>| {
@@ -728,11 +648,9 @@ fn receive_queue_push_many_then_pop_many_costs_nothing() {
     expect_allocs("receive queue: push_many then pop_many, warm", stats, 0);
 }
 
-/// `BatchAccumulator::absorb`'s own doc comment names this as the whole point of taking `&mut
-/// Vec<Event>` rather than an owned `EventBatch`: `Vec::append` drains the caller's buffer while
-/// leaving its capacity intact, so a second `absorb` call against the same (now-empty-but-still-
-/// allocated) buffer costs nothing -- unlike `std::mem::take`, which would silently replace it
-/// with a fresh, capacity-0 `Vec` and reintroduce exactly the allocation this exists to avoid.
+/// `BatchAccumulator::absorb` into a warm buffer costs nothing. It takes `&mut Vec<Event>` so
+/// `Vec::append` can drain the caller's buffer and keep its capacity; `std::mem::take` would
+/// replace it with a capacity-0 `Vec` and allocate on the next call.
 #[test]
 fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
     use logit_core::{AttrMap, Event, Resource};
@@ -741,7 +659,7 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
     let mut acc = BatchAccumulator::new(1_000, u64::MAX);
     let resource = Arc::new(Resource::default());
     let mut events = vec![Event::empty(0, AttrMap::new())];
-    assert!(acc.absorb(Arc::clone(&resource), None, &mut events).is_none()); // warm: grows acc's own Vec
+    assert!(acc.absorb(Arc::clone(&resource), None, &mut events).is_none()); // warm: grows acc
     events.push(Event::empty(0, AttrMap::new())); // re-fill the (now-empty, still-capacity) buffer
 
     let (flushed, stats) = measure(|| acc.absorb(Arc::clone(&resource), None, &mut events));
@@ -753,23 +671,17 @@ fn accumulator_absorb_into_a_warm_buffer_costs_nothing() {
 // Transforms
 // ---------------------------------------------------------------------------------------------
 
-/// `json.rs`'s `ValueSeed` deserializes straight into `Value` -- no intermediate
-/// `serde_json::Value` tree -- and keeps unescaped strings as zero-copy slices of the message
-/// buffer. The intermediate is still there -- a malformed object can't leave attributes
-/// half-populated, so the parsed pairs are built up separately from `event.attributes` and only
-/// merged in on full success -- but it's now a scratch `Vec<(Symbol, Value)>` held on `JsonParser`
-/// and cleared per call (mirroring `InfluxLineEncoder`'s reused buffers) rather than a fresh
-/// `AttrMap` from `deserialize`, and object keys are interned straight off the deserializer
-/// (`KeySeed`) instead of passing through an owned `String` first. That was where 6 of the
-/// original 7 allocations were -- one per JSON key -- not the intermediate map itself, which fits
-/// `AttrMap`'s 8-entry inline capacity for this fixture's 6 fields regardless. What's left is the
-/// one allocation from `event.attributes` itself spilling its inline capacity once the merge pushes
-/// the count from 4 to 10.
+/// `json` on the nginx shape, warm: one allocation, `event.attributes` spilling its inline capacity
+/// as the merge takes it from 4 to 10 entries.
 ///
-/// The warm-up call matters for more than the interner now: it also fills the parser's per-node
-/// key cache (`logit_core::interner::KeyCache`, one `Box<str>` per *first-seen* key), so the
-/// measured call is the steady state -- every key a cache hit, merged by `Symbol`
-/// (`AttrMap::insert_sym`), no interner probe at all. A cold parser would show 6 more.
+/// `ValueSeed` deserializes straight into `Value`, keeping unescaped strings as zero-copy slices of
+/// the message. Parsed pairs collect in a scratch `Vec<(Symbol, Value)>` held on `JsonParser` and
+/// cleared per call, merged only on full success so a malformed object can't half-populate the
+/// event. Keys are interned straight off the deserializer (`KeySeed`), never an owned `String`.
+///
+/// The warm-up also fills the parser's key cache (`logit_core::interner::KeyCache`, one `Box<str>`
+/// per first-seen key), so every measured key is a cache hit merged by `Symbol`
+/// (`AttrMap::insert_sym`). A cold parser would show 6 more.
 #[test]
 fn json_parse_one_event() {
     let mut json = fixtures::json_parser();
@@ -790,18 +702,10 @@ fn json_parse_one_event() {
     expect_allocs("json: parse + merge 1 event", stats, 1);
 }
 
-/// The wide-JSON workload `docs/design/memory.md` §0 names as unmeasured: 28 flat top-level
-/// fields (`fixtures::WIDE_JSON_SYSLOG_LINE`, modeled on pino's default output shape) against the
-/// nginx fixture's 6.
-///
-/// **This test was originally written against the pre-item-5 `json.rs`**, where 28 keys cost 30
-/// allocations -- dominated by `collect_attrmap`'s `map.next_key::<String>()?`, which allocated
-/// one `String` per JSON object key regardless of value type, scaling close to linearly with
-/// field count. Item 5's rework (`crates/logit-transforms/src/json.rs`) replaced exactly that
-/// mechanism: keys are now interned straight off the deserializer (`KeySeed`/`KeyVisitor`) instead
-/// of collected into an owned `String` first. The result generalizes past the case item 5 was
-/// measured against: 28 keys now costs the same **1** allocation [`json_parse_one_event`] measures
-/// for 6, confirming the per-key cost is actually gone, not just reduced for a small field count.
+/// The wide-JSON shape: 28 flat top-level fields (`fixtures::WIDE_JSON_SYSLOG_LINE`, modeled on
+/// pino's default output) against the nginx fixture's 6. The same one allocation (the spill) as
+/// [`json_parse_one_event`]: keys are interned straight off the deserializer, so nothing scales
+/// with field count.
 #[test]
 fn json_parse_wide_json_event() {
     let mut json = fixtures::json_parser();
@@ -823,10 +727,9 @@ fn json_parse_wide_json_event() {
 }
 
 /// The key cache's off-path: warmed on [`fixtures::NGINX_SYSLOG_LINE`], then fed the same six
-/// keys in the reverse order (`fixtures::NGINX_SYSLOG_LINE_REVERSED_KEYS`). Every key is still a
-/// hit -- found by the cache's wrapping scan rather than at its cursor -- so resynchronising costs
-/// the same single allocation (the `AttrMap` spill) as the in-order line, not a re-intern or a
-/// new cache entry per key.
+/// keys in reverse order (`fixtures::NGINX_SYSLOG_LINE_REVERSED_KEYS`). Every key is still a hit,
+/// found by the cache's wrapping scan rather than at its cursor, so the count is the in-order
+/// line's one `AttrMap` spill, with no re-intern or new cache entry.
 #[test]
 fn json_parse_reordered_keys_event() {
     let mut json = fixtures::json_parser();
@@ -846,10 +749,9 @@ fn json_parse_reordered_keys_event() {
     expect_allocs("json: parse + merge 1 event with the keys reordered", stats, 1);
 }
 
-/// `csv`'s counterpart to [`json_parse_one_event`]: seven columns, one a quoted field containing
-/// the delimiter (`"/a,b"`) but no doubled quote, so it still slices the message buffer directly
-/// rather than allocating -- `docs/adr/csv-positional-columns.md`'s zero-copy path. `columns` and
-/// `header_line` are interned/built once at construction (`fixtures::csv_parser`), not per event.
+/// `csv`'s counterpart to [`json_parse_one_event`]: zero for seven columns. The quoted field holds
+/// the delimiter (`"/a,b"`) but no doubled quote, so it still slices the message
+/// (`docs/adr/csv-positional-columns.md`'s zero-copy path), and seven entries stay inline.
 #[test]
 fn csv_parse_one_event() {
     let mut csv = fixtures::csv_parser();
@@ -866,8 +768,7 @@ fn csv_parse_one_event() {
 }
 
 /// The one path in `csv` that allocates: a quoted field containing a doubled `""`, which
-/// `unescape` (`crates/logit-transforms/src/csv.rs`) must copy into a fresh buffer rather than
-/// slicing the message -- every other field on this same line stays zero-copy.
+/// `unescape` must copy. Every other field on the line stays zero-copy.
 #[test]
 fn csv_parse_quoted_field_with_doubled_quotes() {
     let mut csv = fixtures::csv_parser();
@@ -884,8 +785,7 @@ fn csv_parse_quoted_field_with_doubled_quotes() {
     expect_allocs("csv: parse + merge 1 event (one doubled-quote field)", stats, 1);
 }
 
-/// Sixteen unquoted columns -- past `AttrMap`'s 8 inline slots, so `event.attributes` itself must
-/// spill to the heap once (the only allocation `csv` doesn't directly cause).
+/// Sixteen unquoted columns: one allocation, `event.attributes` spilling past its 8 inline slots.
 #[test]
 fn csv_parse_wide_row_event() {
     let mut csv = fixtures::csv_wide_parser();
@@ -901,11 +801,9 @@ fn csv_parse_wide_row_event() {
     expect_allocs("csv: parse + merge 1 wide row (16 columns)", stats, 1);
 }
 
-/// Three named captures onto a bare event whose `AttrMap` starts empty -- well inside its 8-entry
-/// inline capacity even after the captures land, so nothing spills to the heap.
-/// `docs/adr/regex-transform.md`'s zero-allocation claim: `captures_read` fills a struct-held
-/// `CaptureLocations` rather than allocating a fresh `Captures`, and every capture is
-/// `haystack.slice(start..end)` -- a `Bytes` refcount bump, never a `String`.
+/// Three named captures onto an event with no attributes: zero, and the map stays inline
+/// (`docs/adr/regex-transform.md`). `captures_read` fills a struct-held `CaptureLocations` rather
+/// than a fresh `Captures`, and each capture is a `Bytes` slice of the haystack.
 #[test]
 fn regex_capture_into_an_inline_map() {
     let mut re = fixtures::regex_parser();
@@ -920,9 +818,8 @@ fn regex_capture_into_an_inline_map() {
     expect_allocs("regex: capture into an inline map", stats, 0);
 }
 
-/// The sshd shape: `syslog_in` has already put six `syslog.*` attributes on the event, so
-/// `regex`'s three captures push the map from 6 to 9 entries -- past `AttrMap`'s 8-entry inline
-/// capacity, spilling to the heap once.
+/// The sshd shape: three captures on top of six `syslog.*` attributes take the map to 9 entries,
+/// one spill past `AttrMap`'s 8 inline slots.
 #[test]
 fn regex_parse_one_event() {
     let mut re = fixtures::regex_parser();
@@ -937,8 +834,7 @@ fn regex_parse_one_event() {
     expect_allocs("regex: parse 1 event (sshd shape)", stats, 1);
 }
 
-/// A non-matching line: no capture is written, so nothing beyond the transform's own bookkeeping
-/// happens -- confirms the no-match path is exactly as cheap as the design predicts.
+/// A non-matching line: no capture is written, and nothing allocates.
 #[test]
 fn regex_no_match_one_event() {
     let mut re = fixtures::regex_parser();
@@ -954,11 +850,8 @@ fn regex_no_match_one_event() {
     expect_allocs("regex: no match, 1 event", stats, 0);
 }
 
-/// `logfmt`'s zero-copy claim, stated as an allocation count: [`fixtures::LOGFMT_LINE`]'s 9 fields
-/// are all unquoted or escape-free-quoted, so every value is a `raw.slice(..)` -- a `Bytes`
-/// refcount bump, not a copy -- and every key is warm in the interner after the first call. What's
-/// left is `event.attributes` itself spilling its inline capacity once the merge pushes the count
-/// past `AttrMap`'s 8-entry inline `SmallVec`.
+/// `logfmt` on [`fixtures::LOGFMT_LINE`]'s 9 unquoted or escape-free fields: every value is a
+/// `Bytes` slice of the line, so the one allocation is `event.attributes` spilling past 8 entries.
 #[test]
 fn logfmt_parse_one_event() {
     let mut logfmt = fixtures::logfmt_parser();
@@ -973,9 +866,8 @@ fn logfmt_parse_one_event() {
     expect_allocs("logfmt: parse + merge 1 event", stats, 1);
 }
 
-/// [`fixtures::LOGFMT_ESCAPED_LINE`]'s `query` value contains an escaped quote, so it's the one
-/// value in this line `logfmt.rs`'s `unescape` can't slice -- a real `String` allocation, on
-/// top of whatever `event.attributes`' own merge costs.
+/// [`fixtures::LOGFMT_ESCAPED_LINE`]'s `query` value contains an escaped quote, so `unescape` must
+/// copy it: one allocation. The three attributes stay inline.
 #[test]
 fn logfmt_parse_escaped_value_event() {
     let mut logfmt = fixtures::logfmt_parser();
@@ -990,8 +882,8 @@ fn logfmt_parse_escaped_value_event() {
     expect_allocs("logfmt: parse + merge 1 escaped-value event", stats, 1);
 }
 
-/// `kv`'s mirror of [`logfmt_parse_one_event`]: [`fixtures::KV_LINE`]'s three values are all
-/// `raw.slice(..)`s, no quoting or escaping ever in play for this kind.
+/// `kv`'s mirror of [`logfmt_parse_one_event`]: zero. [`fixtures::KV_LINE`]'s three values are
+/// slices of the line (`kv` has no quoting or escaping), and three entries stay inline.
 #[test]
 fn kv_parse_one_event() {
     let mut kv = fixtures::kv_parser();
@@ -1006,11 +898,9 @@ fn kv_parse_one_event() {
     expect_allocs("kv: parse + merge 1 event", stats, 0);
 }
 
-/// The zero-copy claim for `logfmt`, stated structurally rather than as an allocation count: an
-/// unquoted value and a quoted-without-escapes value both point *into* the original message
-/// buffer, while the one value with an escaped quote does not (it went through `unescape`, the
-/// only allocating path in this module). If either of the first two regresses to a copy, or the
-/// third stops copying, this is the test that catches it.
+/// `logfmt`'s zero-copy claim, stated structurally: an unquoted value and a quoted, escape-free
+/// value both point into the message buffer, and a value with an escaped quote doesn't (it went
+/// through `unescape`, the module's only allocating path).
 #[test]
 fn logfmt_values_share_the_message_allocation() {
     let mut logfmt = fixtures::logfmt_parser();
@@ -1065,11 +955,9 @@ fn logfmt_values_share_the_message_allocation() {
     );
 }
 
-/// Four metrics attached: exactly the one `MetricList` spill (past its single inline slot),
-/// grown once up front by `process`'s `reserve`. 3 -> 1: the two distributions used to each
-/// build a single-sample `DDSketch` (one `bins` Vec apiece); they are raw inline
-/// `MetricKind::Samples` now (`docs/adr/kv-metrics-semantics.md`), so describing two `f64`s
-/// costs nothing on the heap.
+/// Four metrics attached: one allocation, the `MetricList` spill past its single inline slot,
+/// sized once by `process`'s `reserve`. The two distributions are raw `MetricKind::Samples` whose
+/// one value sits inline (`docs/adr/kv-metrics-semantics.md`), so they cost nothing.
 #[test]
 fn kv_metrics_one_event() {
     let mut kv = fixtures::kv_metrics();
@@ -1093,9 +981,8 @@ fn kv_metrics_one_event() {
     expect_allocs("kv_metrics: derive 4 metrics", stats, 1);
 }
 
-/// Free, in allocation terms: `filtered` rebuilds the map, but three surviving attributes fit
-/// inside `AttrMap`'s inline capacity, so nothing reaches the heap. The `resolve` -> `intern`
-/// round trip it does per key is real CPU cost that this measurement can't see.
+/// Zero: `filtered` rebuilds the map, but three surviving attributes fit inline. Its per-key
+/// `resolve` -> `intern` round trip is CPU cost this count can't see.
 #[test]
 fn keep_one_event() {
     let mut keep = fixtures::keep();
@@ -1110,10 +997,8 @@ fn keep_one_event() {
     expect_allocs("keep: filter to 3 attributes", stats, 0);
 }
 
-/// Free: `nginx_event`'s `host` is already `static.local` -- on the allow-list and already
-/// lowercase, so `Clamp::normalize` returns `None` (nothing to write back) and the allowed path
-/// never calls `insert_sym` at all. The reference example's `bounded` component pays nothing in
-/// steady state, the same "the common case costs nothing" property `keep`'s own test above pins.
+/// Zero: `nginx_event`'s `host` is `static.local`, allowed and already lowercase, so
+/// `Clamp::normalize` returns `None` and the allowed path never calls `insert_sym`.
 #[test]
 fn keep_values_one_event() {
     let mut kv = fixtures::keep_values();
@@ -1129,9 +1014,8 @@ fn keep_values_one_event() {
 }
 
 /// One allocation: `STATIC.LOCAL` has an uppercase byte, so `normalize: [lower]` builds a new
-/// `Bytes` to write back -- the one path in `keep_values` that isn't free, and the reason
-/// `normalize:`'s cardinality win (folding casing variants of a legitimate value into one series)
-/// isn't also a free one. Compare [`keep_values_one_event`], the already-conforming case.
+/// `Bytes` to write back, the one path in `keep_values` that isn't free. Compare
+/// [`keep_values_one_event`].
 #[test]
 fn keep_values_one_event_needs_lowering() {
     let mut kv = fixtures::keep_values();
@@ -1146,10 +1030,8 @@ fn keep_values_one_event_needs_lowering() {
     expect_allocs("keep_values: host needs lowering before it's allowed", stats, 1);
 }
 
-/// Free: `nginx_event`'s attributes are all flat strings/numbers, so `flatten`'s phase-1 scan
-/// selects nothing -- no buffer is touched, no `Symbol` is interned, nothing is removed or
-/// reinserted. `docs/adr/flatten-transform.md`'s "a flat event is untouched" property, in
-/// allocation terms.
+/// Zero: `nginx_event`'s attributes are all flat, so `flatten`'s phase-1 scan selects nothing and
+/// nothing is interned, removed, or reinserted (`docs/adr/flatten-transform.md`).
 #[test]
 fn flatten_already_flat_event() {
     let mut f = fixtures::flatten();
@@ -1163,14 +1045,10 @@ fn flatten_already_flat_event() {
     expect_allocs("flatten: already-flat event", stats, 0);
 }
 
-/// `pino_http_event`'s `req`/`res` (and their nested `headers`) expand into flat, dot-joined
-/// attributes -- warmed first so every path this shape produces is already in the component's
-/// `KeyCache` (`docs/adr/flatten-transform.md`'s steady-state case), leaving only the result
-/// `AttrMap`'s own growth: six flat attributes survive untouched plus the eight leaves `req`/`res`
-/// expand into, 14 total, spilling the map past its 8-slot inline capacity -- one allocation
-/// (`bytes=768` is exactly 16 slots at 48 bytes each), not one per inserted entry, because
-/// `SmallVec`'s first over-capacity push grows straight to a capacity the rest of this event's
-/// inserts fit inside.
+/// `pino_http_event`'s `req`/`res` (and their nested `headers`) expand into dot-joined attributes,
+/// with every path already in the `KeyCache`. One allocation: six flat attributes plus eight
+/// leaves, 14 total, spill the map past 8 slots. `SmallVec`'s first over-capacity push grows to 16
+/// slots (`bytes=768`, 48 bytes each), which the remaining inserts fit inside.
 #[test]
 fn flatten_pino_http_event_warm() {
     let mut f = fixtures::flatten();
@@ -1189,12 +1067,11 @@ fn flatten_pino_http_event_warm() {
     expect_allocs("flatten: pino-http shape, warm KeyCache", stats, 1);
 }
 
-/// [`flatten_pino_http_event_warm`]'s first-ever call against this shape: every distinct
-/// `req.method`/`req.headers.host`/... path is a `KeyCache` miss, so each one pays lasso's
-/// per-new-key allocation plus the cache's own `Box<str>` copy of the path
-/// (`logit_core::interner::KeyCache`'s doc comment) on top of the warm case's `AttrMap` growth --
-/// the cost `docs/design/data-shapes.md`'s pino-http finding says this shape pays "again" on every
-/// event that carries it for the first time in a process's life.
+/// [`flatten_pino_http_event_warm`]'s shape on a cold component: 12. Each of the eight distinct
+/// paths (`req.method`, `req.headers.host`, ...) is a `KeyCache` miss that stores its own
+/// `Box<str>` copy, and the component's scratch buffers (`pending`, `path`, the cache's `Vec`)
+/// grow for the first time, on top of the warm case's one spill. A process pays this once per
+/// new path, not per event.
 #[test]
 fn flatten_pino_http_event_cold_key_cache() {
     let mut f = fixtures::flatten();
@@ -1212,9 +1089,8 @@ fn flatten_pino_http_event_cold_key_cache() {
 // Every `sample` path is free: the key and override names are interned once at construction,
 // lookups are `AttrMap::get_sym`, a trace id is hex-encoded into a stack array, a number is
 // formatted straight into the streaming hasher (`logit_core::sampling`'s `KeyHasher`), and the
-// per-batch telemetry tally is plain integers. `sample` sits on every event of the streams it
-// exists for, so each of its four decision paths is pinned separately. Each measurement runs the
-// same event twice (warm, then measured) so the verdict is the same both times.
+// per-batch telemetry tally is plain integers. Each of the four decision paths is pinned
+// separately, on the same event twice (warm, then measured) so the verdict matches.
 
 /// `key: trace_id` on a span -- hex-encode the 16 bytes on the stack, one XXH64.
 #[test]
@@ -1275,9 +1151,8 @@ fn sample_override_hit_one_event() {
 
 // -- http_access (docs/adr/http-access-normalization.md) ----------------------------------------
 
-/// A metric-only event, matching `http_access`'s own contract exactly (`process`'s doc comment):
-/// "an event with no log passes through untouched". Warmed on a real conforming line first, so the
-/// number pinned here is the steady-state no-op cost, not a cold first call's.
+/// A metric-only event passes through `http_access` untouched: zero, on a component warmed with a
+/// conforming line.
 #[test]
 fn http_access_ignores_an_event_with_no_log() {
     let mut ha = fixtures::http_access();
@@ -1292,8 +1167,8 @@ fn http_access_ignores_an_event_with_no_log() {
     expect_allocs("http_access: ignores an event with no log", stats, 0);
 }
 
-/// The reference shape: a fully conforming semconv line, warm component (every lazily-built
-/// `span.name`/`error.type` cell already filled, every alias/cap key already interned).
+/// A fully conforming semconv line on a warm component (every lazy `span.name`/`error.type` cell
+/// filled, every alias/cap key interned): zero.
 #[test]
 fn http_access_normalizes_a_conforming_line_warm() {
     let mut ha = fixtures::http_access();
@@ -1309,20 +1184,14 @@ fn http_access_normalizes_a_conforming_line_warm() {
     expect_allocs("http_access: normalize a conforming line, warm", stats, 0);
 }
 
-/// The same line through a brand-new component -- no warm-up call at all. **Not** the
-/// `span.name`/`error.type` lazy cells this module's own doc comment names (isolated: with no
-/// `url.path` and no `user_agent.original` present, this exact line costs 0 -- the `span.name`
-/// cell for "no route" is `static_str(method)`, not a `format!`, so it never allocates even cold).
-/// The whole 228 is the `regex` crate's own per-compiled-pattern, per-thread lazy cache
-/// (`regex-automata`'s pooled `Cache`, built by the *first* `is_match`/`captures_read` against a
-/// given `Regex` on a given thread, then reused for free) -- not anything `http_access.rs` does:
-/// this fixture's UA matches `browser`, the last of the four built-in rules, so
-/// `classify_user_agent` tries all four before matching (176 allocs, confirmed in isolation); the
-/// path matches none of the four route rules, so `classify_route` also tries all four plus builds
-/// the `span.name` cell's one `format!`+`shared()` pair (52 allocs, confirmed in isolation:
-/// 176 + 52 = 228). `docs/adr/http-access-normalization.md`'s "Scanned with `is_match`, which
-/// allocates nothing" claim holds for the *warm* case the row below pins -- this row is what a
-/// process pays exactly once per compiled pattern, not per event.
+/// The same line through a new component, unwarmed: 228, paid once per compiled pattern per
+/// thread, not per event. Nearly all of it is the `regex` crate's lazy per-pattern `Cache`, built
+/// by the first match against each `Regex`. The fixture's UA matches `browser`, the last of four
+/// built-in rules, so `classify_user_agent` builds all four (176). The path matches none of the
+/// four route rules, so `classify_route` builds all four too, plus the `span.name` cell's one
+/// `format!` + `shared()` pair (52). Measured in isolation: 176 + 52 = 228. Without `url.path` or
+/// `user_agent.original`, the line costs 0 cold. The ADR's "scanned with `is_match`, which
+/// allocates nothing" holds for the warm row above.
 #[test]
 fn http_access_normalizes_a_conforming_line_cold() {
     let mut ha = fixtures::http_access();
@@ -1336,8 +1205,7 @@ fn http_access_normalizes_a_conforming_line_cold() {
 }
 
 /// [`fixtures::http_access_dashed_event`]: the same line, every key in its dashed alias --
-/// `dealias` renames each one before step 1 ever runs, so the rest of the pipeline sees the exact
-/// same dotted attributes as the warm conforming-line case above.
+/// `dealias` renames each before step 1 runs, so the count matches the warm conforming line: zero.
 #[test]
 fn http_access_normalizes_a_dashed_line_warm() {
     let mut ha = fixtures::http_access();
@@ -1354,18 +1222,13 @@ fn http_access_normalizes_a_dashed_line_warm() {
 }
 
 /// [`fixtures::http_access_event_with_control_byte`]: the same conforming line, except
-/// `user_agent.original` carries one raw `0x01` byte -- step 7's cap-and-clean is the one path
-/// that isn't free, since it must copy the value into `scratch` to blank the control byte out.
+/// `user_agent.original` carries one raw `0x01` byte. Step 7's cap-and-clean copies the value
+/// through `scratch` to blank it, the one path that isn't free.
 ///
-/// **Two, not one**, warmed only on a clean line as above: this component's `scratch: Vec<u8>`
-/// starts at `Vec::new()` (`HttpAccess::new`) and the clean warm-up event never takes the dirty
-/// branch (no control byte, no redacted query key), so `scratch` reaches this call still at
-/// capacity 0. `cap_and_clean`'s dirty arm then pays for two separate things: `scratch.extend`
-/// growing that Vec's backing buffer from nothing (a real `alloc`, not a `realloc` -- there is no
-/// prior allocation to grow), and the final `Bytes::copy_from_slice(scratch)` copying it out into
-/// the new, exact-size `Value`. Confirmed by isolation: pre-warming `scratch` with one earlier
-/// dirty pass drops this to exactly **1** -- the steady-state cost the module doc's "one exact-size
-/// copy" describes, once any prior event in the process has ever taken this branch.
+/// Two, not one: the clean warm-up line never takes the dirty branch, so `scratch` (a
+/// `Vec::new()`) arrives at capacity 0. The dirty arm pays its first growth (an `alloc`, with
+/// nothing to `realloc`) and the exact-size `Bytes::copy_from_slice` out. Once any earlier event
+/// has taken this branch the count is 1, the module doc's "one exact-size copy".
 #[test]
 fn http_access_cleans_a_control_byte() {
     let mut ha = fixtures::http_access();
@@ -1385,17 +1248,14 @@ fn http_access_cleans_a_control_byte() {
     expect_allocs("http_access: cleans a control byte", stats, 2);
 }
 
-/// `shape` is the one transform here that deliberately *doesn't* aim for zero
+/// `shape` is the one transform here that doesn't aim for zero
 /// ([ADR `shape-observer-component`](../../../docs/adr/shape-observer-component.md)): a
 /// measurement event carries a dozen-odd metric records, so it always spills `MetricList`'s single
-/// inline slot. These three pins record what that costs on the three fixture shapes rather than
-/// leaving it to be discovered, and they are the numbers `docs/design/memory.md` §2 quotes.
+/// inline slot. This and the next two tests pin that cost on three fixture shapes.
 ///
-/// The statsd shape is the cheap end: a handful of attributes, one metric, no log and no span. One
-/// allocation, and it is exactly that spill -- the incoming `MetricList` holds its single record
-/// inline, so `reserve`ing room for the dozen measurement records has to go to the heap. Nothing
-/// else does: the tags fit `AttrMap`'s inline capacity, and every `Samples` here is well inside
-/// `SAMPLES_INLINE`.
+/// The statsd shape (a few attributes, one metric, no log or span): one allocation, the spill.
+/// The incoming `MetricList` holds its record inline, so `reserve`ing room for the measurement
+/// records goes to the heap. The tags fit inline, and every `Samples` fits `SAMPLES_INLINE`.
 #[test]
 fn shape_one_statsd_event() {
     let mut shape = fixtures::shape();
@@ -1409,13 +1269,11 @@ fn shape_one_statsd_event() {
     expect_allocs("shape: measure 1 statsd event", stats, 1);
 }
 
-/// The nginx shape: 10 attributes, 4 metrics, a log body -- *more* measurements than the statsd
-/// shape above, and **cheaper**: zero allocations, one realloc. That inversion is the whole point
-/// of clearing and refilling `event.attributes`/`event.metrics` rather than replacing them. This
-/// event arrives with both already spilled (10 attributes past `AttrMap`'s 8, 4 records past
-/// `MetricList`'s 1), so the tags land in storage that already exists and `reserve` grows the
-/// existing `MetricList` buffer -- a realloc, which this file counts separately and deliberately
-/// (see the module doc). A wider event costs the tap less than a narrow one, not more.
+/// The nginx shape (10 attributes, 4 metrics, a log body): more measurements than the statsd shape
+/// and cheaper, zero allocations and one realloc. `shape` clears and refills
+/// `event.attributes`/`event.metrics` rather than replacing them, and this event arrives with both
+/// already spilled, so the tags land in existing storage and `reserve` grows the existing
+/// `MetricList` buffer (a realloc, not an alloc). A wider event costs the tap less, not more.
 #[test]
 fn shape_one_nginx_event() {
     let mut shape = fixtures::shape();
@@ -1430,12 +1288,10 @@ fn shape_one_nginx_event() {
     expect_allocs("shape: measure 1 nginx event", stats, 0);
 }
 
-/// The wide-JSON shape: 32 attributes, all strings. Three allocations, and the split says where a
-/// wide event's cost actually is: one `MetricList` spill, plus one each for
-/// `logit.shape.key_bytes` and `logit.shape.value_bytes`, which carry 32 values apiece and so run
-/// past `SAMPLES_INLINE`'s 19. Those two are inherent -- a per-attribute measurement of a 32-
-/// attribute event *is* 32 numbers -- and they are the reason `shape` belongs on a tap branch
-/// rather than in the flow.
+/// The wide-JSON shape (32 string attributes): three allocations. One `MetricList` spill, plus one
+/// each for `logit.shape.key_bytes` and `logit.shape.value_bytes`, whose 32 values apiece exceed
+/// `SAMPLES_INLINE`'s 19. Those two are inherent (a per-attribute measurement of 32 attributes is
+/// 32 numbers), which is why `shape` belongs on a tap branch rather than in the flow.
 #[test]
 fn shape_one_wide_json_event() {
     let mut shape = fixtures::shape();
@@ -1464,11 +1320,9 @@ fn shape_one_wide_json_event() {
     expect_allocs("shape: measure 1 wide-JSON event", stats, 3);
 }
 
-/// Also free in steady state, and that is *because* `keep` ran first. `aggregate` clones the whole
-/// attribute map into a `SeriesKey` per metric per event, but three attributes fit inline, so the
-/// clone is a 400-byte memcpy rather than a heap allocation, and the `HashMap` entry hits.
-///
-/// Compare [`aggregate_absorb_without_keep`], which is the same code path on an un-trimmed event.
+/// Zero in steady state, because `keep` ran first. `aggregate` clones the attribute map into a
+/// `SeriesKey` per metric per event, but three attributes fit inline, so the clone is a 400-byte
+/// memcpy and the `HashMap` entry hits. Compare [`aggregate_absorb_without_keep`].
 #[test]
 fn aggregate_absorb_one_event() {
     let mut agg = fixtures::aggregator();
@@ -1490,14 +1344,12 @@ fn aggregate_absorb_one_event() {
     expect_allocs("aggregate: absorb 1 event (after keep)", stats, 0);
 }
 
-/// The measurement behind `logit_transforms::keep`'s "put `keep` before `aggregate`" advice, and
-/// behind the reference config's ordering. Same events, same aggregator, `keep` removed: the
-/// 10-attribute map no longer fits inline, so `SeriesKey`'s clone becomes a heap allocation *per
-/// metric per event*.
+/// The measurement behind "put `keep` before `aggregate`" (`logit_transforms::keep`'s docs). Same
+/// events with `keep` removed: 4, one `SeriesKey` clone of the spilled 10-attribute map per metric
+/// per event.
 ///
-/// The cardinality half of that advice is worse still and isn't visible here: `syslog.timestamp`
-/// is distinct per line, so without `keep` every event would also open its own series and the
-/// window would grow without bound. This test pins only the per-event allocation half.
+/// The cardinality cost isn't visible here: `syslog.timestamp` is distinct per line, so without
+/// `keep` every event would also open its own series and the window would grow without bound.
 #[test]
 fn aggregate_absorb_without_keep() {
     let mut agg = fixtures::aggregator();
@@ -1512,15 +1364,12 @@ fn aggregate_absorb_without_keep() {
     expect_allocs("aggregate: absorb 1 event (no keep)", stats, 4);
 }
 
-/// 6, not the pre-flush-linking 2 -- re-measured, not assumed, when `Transform::flush` widened to
-/// carry each series' `Vec<SpanLink>` (`docs/adr/trace-context-propagation-on-delivered.md`'s
-/// flush-side linking). The 4 new allocations are exactly the 4 series: this fixture never calls
-/// `observe_batch_context`, so every absorbed event records the same (default, all-zero)
-/// `TraceContext`, and each series' `ContributingContexts` ends up with exactly one distinct
-/// context -- one `SpanLink` -- which `into_links()`'s `.collect()` allocates its own `Vec<SpanLink>`
-/// for. One allocation per series, unavoidable even at the minimum (a non-empty `Vec` always
-/// allocates), so this is the honest floor for a flush where every series has any contributor at
-/// all.
+/// Flushing 4 series: 6, the flush's `events` and `result` `Vec`s plus one `Vec<SpanLink>` per
+/// series (`docs/adr/trace-context-propagation-on-delivered.md`'s flush-side linking). The fixture
+/// never calls `observe_batch_context`, so each series' `ContributingContexts` holds one default
+/// context, and `into_links()` collects it into its own `Vec`. A non-empty `Vec` always
+/// allocates, so one per series is the floor, and more contributors (up to the cap) don't add to
+/// it.
 #[test]
 fn aggregate_flush_100_series() {
     let resource = fixtures::resource();
@@ -1538,20 +1387,14 @@ fn aggregate_flush_100_series() {
     expect_allocs("aggregate: flush 4 series", stats, 6);
 }
 
-/// The retention path's own allocation cost, isolated on purpose from the fixture above:
-/// `flush`'s retain branch (`series_retention > 0`, `crates/logit-transforms/src/aggregate.rs`)
-/// clones `key.attributes` for a retained series -- unlike the default tumbling path, which
-/// moves it -- because the series' key has to survive to become its own map key again for the
-/// next window. `aggregate_flush_100_series` never exercises this branch at all
-/// (`series_retention: 0` there, the fixture-default `Aggregator`), and its `keep`-trimmed
-/// attributes fit inline, so it couldn't pin this cost even if it did. This fixture is
-/// deliberately *not* `keep`-trimmed (12 attributes, past `AttrMap`'s 8-slot inline capacity),
-/// specifically so the clone this measures is a real heap allocation, not a memcpy that would
-/// hide the cost the plan asked this test to pin.
+/// The retention path's flush cost: 209 for 100 retained gauge series. `flush`'s retain branch
+/// (`series_retention > 0`) clones `key.attributes` where the tumbling path moves it, because the
+/// key must survive into the next window. The fixture isn't `keep`-trimmed (12 attributes, past 8
+/// inline slots) so that clone allocates, one per series. The rest is each series'
+/// `Vec<SpanLink>`, the flush's own `Vec`s, and the emptied `series` `HashMap` regrowing its table
+/// as the survivors go back in (`docs/design/memory.md`'s "Series retention's own cost" section).
 ///
-/// Measured over a *second* flush, after a warm-up flush has already retained all 100 series once
-/// -- the steady-state cost of continuously updating-and-retaining the same series indefinitely,
-/// not the one-time cost of the first window these series were ever seen in.
+/// Measured over a second flush, after a warm-up flush retained all 100 series: the steady state.
 #[test]
 fn aggregate_flush_retained_gauges() {
     let resource = fixtures::resource();
@@ -1573,16 +1416,12 @@ fn aggregate_flush_retained_gauges() {
     expect_allocs("aggregate: flush 100 retained gauge series (spilled attrs)", stats, 209);
 }
 
-/// `temporality: cumulative`'s own flush cost (`docs/adr/aggregation-window-semantics.md`'s
-/// cumulative amendment), measured against [`aggregate_flush_retained_gauges`] deliberately: same
-/// 100 series, same spilled 12-attribute maps, same steady-state second flush, a retained delta
-/// `Sum` instead of a retained `Gauge`. The point of the comparison is that the number is *the
-/// same*: a retained `Sum` reports through the identical copy-then-keep path a retained gauge does
-/// (`Accumulator::kind_for_retained`, `Copy` fields both), so cumulative counters cost a flush
-/// nothing beyond what gauge retention already costs -- the `key.attributes.clone()` plus the
-/// per-series `Vec<SpanLink>`, and nothing else. A cumulative `Histogram` is the one shape that
-/// would add to this (one bucket-`Vec` clone per series per flush); it has no wire producer in this
-/// workstream, so there is nothing honest to fixture it from yet.
+/// `temporality: cumulative`'s flush cost (`docs/adr/aggregation-window-semantics.md`'s cumulative
+/// amendment): [`aggregate_flush_retained_gauges`]'s 100 series, spilled maps, and second flush,
+/// with a retained delta `Sum` in place of a `Gauge`. The same 209 is the finding: a retained `Sum`
+/// reports through the same copy-then-keep path (`Accumulator::kind_for_retained`, `Copy` fields
+/// both), so cumulative counters cost nothing beyond gauge retention. A cumulative `Histogram`
+/// would add one bucket-`Vec` clone per series per flush; it has no fixture yet.
 #[test]
 fn aggregate_flush_cumulative_sums() {
     let resource = fixtures::resource();
@@ -1604,12 +1443,9 @@ fn aggregate_flush_cumulative_sums() {
     expect_allocs("aggregate: flush 100 cumulative sum series (spilled attrs)", stats, 209);
 }
 
-/// The absorb-path cost of a raw `Samples` record in the default `distributions: sketch` mode
-/// (`docs/plans/lossless-transit.md`'s W2): every value sketches directly into the series'
-/// `DdSketch` accumulator (`Accumulator::Distribution`) via `add_weighted` -- no raw values are
-/// ever retained, so this is the steady-state cost of continuing to absorb into an already-open
-/// sketch, the same shape [`aggregate_absorb_one_event`] measures for the nginx fixture's own
-/// metrics.
+/// Absorbing a raw `Samples` record in the default `distributions: sketch` mode: zero. Each value
+/// sketches via `add_weighted` into the series' already-open `DdSketch`
+/// (`Accumulator::Distribution`), and no raw values are retained.
 #[test]
 fn aggregate_absorb_one_samples_event_sketch_mode() {
     let mut agg = fixtures::aggregator();
@@ -1624,18 +1460,14 @@ fn aggregate_absorb_one_samples_event_sketch_mode() {
     expect_allocs("aggregate: absorb one Samples event (sketch mode)", stats, 0);
 }
 
-/// The absorb-path cost in `distributions: samples` mode: raw values concatenate into the
-/// series' own `Samples` accumulator (`held.values.extend(..)`,
-/// `crates/logit-transforms/src/aggregate.rs`). `SAMPLES_INLINE` (`logit_core::metric`) is 19, so
-/// a series already holding a few inline values that then absorbs 25 more in one record spills
-/// the accumulator's `SmallVec` on *this* call -- the cost this test pins, not the free
-/// still-inline case.
+/// Absorbing in `distributions: samples` mode: raw values concatenate into the series' `Samples`
+/// accumulator (`held.values.extend(..)`). A series holding a few inline values that absorbs 25
+/// more in one record spills past `SAMPLES_INLINE` (19) on this call: one allocation.
 #[test]
 fn aggregate_absorb_25_samples_values_into_one_series_samples_mode() {
     let mut agg = fixtures::aggregator_with_samples_retention(1_000);
     let resource = fixtures::resource();
-    // Warm with a small, still-inline series -- isolates the spill on the *measured* record
-    // rather than whatever the very first record into this series happens to cost.
+    // Warm with a small, still-inline series so the measured record is the one that spills.
     for _ in 0..4 {
         let mut event = fixtures::samples_event("app.latency", [1.0]);
         agg.process(&resource, &mut event);
@@ -1651,14 +1483,11 @@ fn aggregate_absorb_25_samples_values_into_one_series_samples_mode() {
 // Fan-out
 // ---------------------------------------------------------------------------------------------
 
-/// What each extra fan-out consumer costs per event: `Fanout::send` deep-clones the batch for
-/// every consumer but the last. Two allocations (the spilled `AttrMap` and the spilled
-/// `MetricList`) plus an 800-byte memcpy, per event, per extra branch. 4 -> 2: the two
-/// distributions were single-sample `DdSketch`es with a `bins` Vec each to clone; they are inline
-/// `Samples` now ([`kv_metrics_one_event`]).
-///
-/// The `Arc<EventBatch>` copy-on-write change in `docs/design/memory.md` is aimed at exactly this:
-/// a branch that only reads -- every sink -- would pay none of it.
+/// `Event::clone` on the nginx shape, the per-event cost of a fan-out branch that must copy a
+/// shared batch: two allocations (the spilled `AttrMap` and the spilled `MetricList`) plus an
+/// 800-byte memcpy. The two distributions are inline `Samples` ([`kv_metrics_one_event`]), so they
+/// add nothing. A read-only branch (every sink) shares the `Arc<EventBatch>` and pays none of it
+/// (`docs/adr/arc-eventbatch-copy-on-write.md`).
 #[test]
 fn clone_one_event() {
     let event = fixtures::nginx_event();
@@ -1669,9 +1498,9 @@ fn clone_one_event() {
     expect_allocs("Event::clone (nginx shape)", stats, 2);
 }
 
-/// The cheap end of the range: a statsd counter with three tags and one metric fits entirely
-/// within `Event`'s inline capacity, so cloning it is a pure 800-byte memcpy. Same 800 bytes as
-/// the nginx event above -- that size is paid unconditionally, whatever the event carries.
+/// The cheap end: a statsd counter with three tags and one metric fits `Event`'s inline capacity,
+/// so cloning it is an 800-byte memcpy and zero allocations. The 800 bytes are paid whatever the
+/// event carries.
 #[test]
 fn clone_one_statsd_event() {
     let event = fixtures::statsd_event();
@@ -1681,16 +1510,12 @@ fn clone_one_statsd_event() {
     expect_allocs("Event::clone (statsd shape)", stats, 0);
 }
 
-/// The number behind PR #33's review item 1: `Fanout::send` now takes a fast path for a
-/// single-consumer edge (`docs/adr/arc-eventbatch-copy-on-write.md`) -- no `Arc` at all, the
-/// batch moves through as `Delivered::Owned`. This is the common case (every listener's first hop,
-/// and every interior edge of a linear chain like the v0.1 reference config's three
-/// single-consumer edges), so it needs to cost nothing, not just less than a deep clone.
+/// A single-consumer edge costs nothing: `Fanout::send` skips the `Arc` and moves the batch
+/// through as `Delivered::Owned` (`docs/adr/arc-eventbatch-copy-on-write.md`). This is the common
+/// case: every listener's first hop and every interior edge of a linear chain.
 ///
-/// Runs on a `current_thread` runtime built outside the measured region -- `CountingAlloc`'s
-/// counters are thread-local (see `logit_bench::alloc`'s module doc), so this has to stay on one
-/// thread for the count to mean anything, and a `current_thread` runtime never spawns worker
-/// threads to begin with. Warmed once first, same as every other measurement in this file.
+/// `CountingAlloc`'s counters are thread-local (`logit_bench::alloc`'s module doc), so this runs
+/// on a `current_thread` runtime, which spawns no worker threads.
 #[test]
 fn fanout_send_one_consumer_costs_nothing() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1714,18 +1539,13 @@ fn fanout_send_one_consumer_costs_nothing() {
     expect_allocs("fanout: send + receive, 1 consumer", stats, 0);
 }
 
-/// The test above proves the *disabled*-telemetry path is free, but `Fanout::send` now opens a
-/// span too (`docs/adr/internal-span-emission-and-deterministic-sampling.md`), and a
-/// disabled `Telemetry` handle (`Telemetry::default()`, `Option::None` inside) never reaches
-/// `Telemetry::span`'s sample-decision branch at all -- it can't stand in for the *live-but-
-/// unsampled* path a production pipeline with an `internal` component and the default (0.1, never
-/// 0.0 by default, but a rate below `1.0` is the common case) sample rate actually runs.
-/// This is that path, proven directly: a real `Registry` (`with_span_sampling(0.0)`, so every
-/// trace is dropped deterministically -- see `trace_is_sampled`), attached the same way
-/// `crates/logit-cli/src/pipeline.rs::prepare` attaches one in production. `SpanGuard::disabled()`
-/// is what `Telemetry::span` returns once `trace_is_sampled` says no, exactly like the
-/// `Option::None` case -- same expected count, 0, now actually exercising the branch that decides
-/// it rather than skipping it.
+/// The test above runs with telemetry disabled, which never reaches `Telemetry::span`'s sampling
+/// decision. This is the live-but-unsampled path a production pipeline with an `internal`
+/// component runs for most traces
+/// (`docs/adr/internal-span-emission-and-deterministic-sampling.md`): a real `Registry` with
+/// `with_span_sampling(0.0)`, attached as `logit_cli::pipeline::prepare` attaches one.
+/// `trace_is_sampled` says no, `Telemetry::span` returns `SpanGuard::disabled()`, and the count is
+/// still zero.
 #[test]
 fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1734,11 +1554,8 @@ fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
 
-    // Warms both the usual first-call cost (`CountingAlloc`'s own module doc) and this
-    // `ComponentBuffer`'s point map -- `logit.component.batches.sent`/`.events.sent`/
-    // `.send.blocked.duration` all need their first-insert growth to happen here, not inside the
-    // measured region below, same reasoning as `docs/design/memory.md`'s "first call after a
-    // drain" cost: an update to an already-resident map key is free, a fresh insert isn't.
+    // Also warms this `ComponentBuffer`'s point map: `logit.component.batches.sent`/`.events.sent`/
+    // `.send.blocked.duration` each pay a first-insert growth; updating a resident key is free.
     let warm = fixtures::nginx_batch(1);
     rt.block_on(async {
         fanout.send(warm).await;
@@ -1756,27 +1573,18 @@ fn fanout_send_one_consumer_with_a_live_unsampled_registry_costs_nothing() {
     expect_allocs("fanout: send + receive, 1 consumer, live unsampled registry", stats, 0);
 }
 
-/// The other half of the same story, measured honestly rather than assumed: a real fan-out (two
-/// consumers here) still costs *one* branch a full `EventBatch` deep clone -- one `Vec<Event>`
-/// allocation plus the 2 allocations [`clone_one_event`] measures for the one nginx-shaped event
-/// inside it, so 3 -- exactly like the pre-`Arc<EventBatch>` code's "clone all but the last
-/// consumer" did for this same two-branch shape. The other branch, once its sibling has already
-/// dropped its handle, costs nothing. **The difference from before this PR is `Arc::new`'s one
-/// extra allocation, not a reduction** -- so the total here (4) is one *more* than the equivalent
-/// pre-`Arc` code would have paid (3), not less. Compare [`fanout_send_one_consumer_costs_nothing`],
-/// which really is a strict improvement; this test exists so that claim isn't quietly assumed to
-/// extend to real fan-outs too, when the numbers say otherwise under the current no-trait-change
-/// design (`docs/adr/arc-eventbatch-copy-on-write.md`'s "What this change actually saves"
-/// section). Four is still far short of two fully independent copies (6, i.e. this same 3 paid by
-/// *both* branches, which is what a naive per-`Event` `Arc` or a design with no sharing at all would
-/// cost), so isolation is not getting more expensive as fan-out width grows -- it just isn't getting
-/// cheaper than the code this PR replaces, either. (These were 6/5/10 while the nginx event's
-/// clone cost 4 -- see [`clone_one_event`] for the 4 -> 2.)
+/// A two-consumer fan-out where both branches mutate: 4. One `Arc::new` per send, plus one full
+/// `EventBatch` deep clone for the branch that unwraps while its sibling still holds the `Arc` (1
+/// for the `Vec<Event>` plus [`clone_one_event`]'s 2). The branch that unwraps last is free.
 ///
-/// Unwraps branch "a" while branch "b" still holds its handle, then "b" last, to pin the
-/// deterministic case rather than the timing-dependent one -- `unwrap_batch`'s doc comment
-/// (`runtime.rs`) explains why concurrent unwrapping on a real multi-thread runtime can cost *more*
-/// than this best case (more than one branch failing to unwrap for free), never less.
+/// Sharing doesn't make a mutating fan-out cheaper than cloning for all but the last consumer
+/// would (3); it costs one more, for the `Arc`
+/// (`docs/adr/arc-eventbatch-copy-on-write.md`'s "What this change actually saves" section). Two
+/// fully independent copies would cost 6.
+///
+/// Branch "a" unwraps while "b" still holds its handle, then "b", to pin the deterministic case.
+/// On a multi-thread runtime, concurrent unwrapping can cost more, never less (`unwrap_batch`'s
+/// doc comment).
 #[test]
 fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1808,8 +1616,6 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     assert_eq!(b.events.len(), 1);
     // 1 (Arc::new, once per send) + 3 (one EventBatch deep clone: 1 for the Vec<Event>, 2 for the
     // one nginx-shaped Event inside it, matching clone_one_event) + 0 (the other branch, free).
-    // The pre-Arc code would pay 3 for this same shape (the clone, with the other branch's move
-    // costing nothing) -- so this is 1 *more*, not less; see the doc comment above.
     expect_allocs(
         "fanout: send + receive, 2 consumers (1 clones, 1 free, +1 for the Arc)",
         stats,
@@ -1817,9 +1623,7 @@ fn fanout_send_two_consumers_costs_one_clone_plus_one_arc() {
     );
 }
 
-/// The same unwrap `runtime.rs`'s `unwrap_batch` does, duplicated here rather than exposed from
-/// `logit-pipeline` just for this test -- `Delivered`'s two variants and what to do with each are
-/// already public (`docs/adr/arc-eventbatch-copy-on-write.md`).
+/// A copy of `logit_pipeline::unwrap_batch`'s body.
 fn unwrap_delivered(delivered: Delivered) -> EventBatch {
     match delivered {
         Delivered::Owned(batch, _ctx) => batch,
@@ -1829,9 +1633,8 @@ fn unwrap_delivered(delivered: Delivered) -> EventBatch {
     }
 }
 
-/// The same borrow `runtime.rs`'s `run_output` does, now that `Output::send` takes `&EventBatch`
-/// instead of an owned one -- no `Arc::try_unwrap`, no clone, ever, regardless of how many sibling
-/// branches still hold their own handle to the same batch.
+/// The borrow `run_output` does for `Output::send(&EventBatch)`: no unwrap and no clone, however
+/// many sibling branches still hold a handle.
 fn borrow_delivered(delivered: &Delivered) -> &EventBatch {
     match delivered {
         Delivered::Owned(batch, _ctx) => batch,
@@ -1839,15 +1642,10 @@ fn borrow_delivered(delivered: &Delivered) -> &EventBatch {
     }
 }
 
-/// The number the second round of PR #33's review asked for, after `Output::send` was changed to
-/// take `&EventBatch`: a fan-out where every consumer is an `Output` (two sinks off one node --
-/// `stdio_out`'s `tap` and an `influxdb_out`, say, both reading the same batch) now costs *only*
-/// the one `Arc::new` per send. Neither branch ever calls `Arc::try_unwrap` or clones at all --
-/// both just borrow through their own `Delivered::Shared` handle, exactly as `run_output` does.
-/// This is the saving `docs/design/memory.md` §8 item 4 originally recommended, and the one the
-/// first round of this PR's review found `Delivered` alone didn't deliver
-/// (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`, above) -- `Output::send(&EventBatch)`
-/// is what closes that gap, for this shape.
+/// A fan-out whose consumers are all `Output`s (two sinks off one node) costs only the one
+/// `Arc::new` per send: both branches borrow through their `Delivered::Shared` handle, as
+/// `run_output` does, and neither unwraps or clones. Compare
+/// [`fanout_send_two_consumers_costs_one_clone_plus_one_arc`], where the branches mutate.
 #[test]
 fn fanout_send_two_output_consumers_costs_only_the_arc() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1870,7 +1668,7 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
             fanout.send(batch).await;
             let delivered_a = rx_a.recv().await.expect("a should receive");
             let delivered_b = rx_b.recv().await.expect("b should receive");
-            // Both sides borrow only, exactly as `run_output` does -- never unwrap, never clone.
+            // Both sides borrow only, as `run_output` does.
             (
                 borrow_delivered(&delivered_a).events.len(),
                 borrow_delivered(&delivered_b).events.len(),
@@ -1882,15 +1680,10 @@ fn fanout_send_two_output_consumers_costs_only_the_arc() {
     expect_allocs("fanout: send + receive, 2 Output consumers (borrow only)", stats, 1);
 }
 
-/// Residual item from workstream C (`docs/plans/buffered-sink-delivery.md`): the
-/// `fanout_send_*` tests above measure `Fanout::send` alone, stopping short of the actual
-/// `run_output`/`drain_inbox` hop a sink's `Delivered` batch takes next
-/// (`docs/adr/buffered-sink-delivery.md`). Drives `drain_inbox` directly (not through a full
-/// `run`) against a single-consumer `Delivered::Owned` batch: exactly one allocation, the
-/// `Arc::new` `drain_inbox` performs to hand the batch to its `SinkQueue`
-/// (`crates/logit-pipeline/src/runtime.rs`) -- previously zero on this path, since a
-/// single-consumer `Fanout::send` alone never allocates (`fanout_send_one_consumer_costs_nothing`
-/// above) and nothing between there and this hop used to exist at all.
+/// The sink-side hop after `Fanout::send` (`docs/adr/buffered-sink-delivery.md`): `drain_inbox`,
+/// driven directly, on a single-consumer `Delivered::Owned` batch. One allocation, the `Arc::new`
+/// that hands the batch to its `SinkQueue`. The single-consumer edge before it is free
+/// ([`fanout_send_one_consumer_costs_nothing`]).
 #[test]
 fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -1899,10 +1692,8 @@ fn drain_inbox_single_consumer_owned_batch_costs_exactly_the_arc() {
         Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    // Warm: one full push+commit round trip through the exact same `SinkQueue`, so its `VecDeque`
-    // backing allocation (and the interner, etc.) is already grown before the measured run --
-    // otherwise the queue's first-ever push would fold its own one-time allocation into the
-    // `Arc::new` this test means to isolate.
+    // Warm: one push+commit round trip grows the `SinkQueue`'s `VecDeque`, so the queue's first
+    // push doesn't fold into the `Arc::new` this test isolates.
     let warm = fixtures::nginx_batch(1);
     rt.block_on(async {
         tx.send(Delivered::Owned(warm, BatchContext::default()))
@@ -1952,16 +1743,12 @@ fn route_by_stream() -> logit_transforms::Route {
     )
 }
 
-/// The partition pass's whole allocation story, pinned exactly (`crates/logit-pipeline/src/
-/// router.rs`'s own `RouterScratch`/`route_batch` doc comments): **one `Vec::with_capacity` for
-/// the returned partition list, plus exactly one `reserve_exact` per destination that actually
-/// received an event this batch** -- never per event, and never for a destination nothing was
-/// routed to. 64 events split evenly host/app: both targets are used, so `1 + 2 = 3`.
+/// The partition pass (`RouterScratch`/`route_batch`'s doc comments): one `Vec::with_capacity`
+/// for the returned partition list, plus one `reserve_exact` per destination that received an
+/// event, never per event. 64 events split evenly host/app, both targets used: `1 + 2 = 3`.
 ///
-/// Warmed once first so `RouterScratch`'s `marks`/`counts` buffers are already grown to this
-/// batch's size -- see `RouterScratch`'s own doc comment for why that's a one-time cost and the
-/// per-destination `reserve_exact` isn't (`dests[n]` is always handed out by `mem::take`, which
-/// leaves capacity 0 behind, so every batch pays its `reserve_exact` again by design).
+/// The warm-up grows `RouterScratch`'s `marks`/`counts` once. The per-destination `reserve_exact`
+/// recurs every batch: `dests[n]` is handed out by `mem::take`, which leaves capacity 0 behind.
 #[test]
 fn route_batch_two_targets_costs_one_vec_per_used_destination() {
     let mut route = route_by_stream();
@@ -1979,9 +1766,8 @@ fn route_batch_two_targets_costs_one_vec_per_used_destination() {
     expect_allocs("route_batch: 64 events, 2 targets both used", stats, 3);
 }
 
-/// The same partition, but every event resolves to the *same* target (`route`'s `routes:` maps
-/// both `host` and `app` onto one target, the many-to-one case) -- one destination used, `1 + 1
-/// = 2`.
+/// The same partition with `host` and `app` both mapped to one target (many-to-one): one
+/// destination used, `1 + 1 = 2`.
 #[test]
 fn route_batch_all_to_one_target_costs_two() {
     let mut route = logit_transforms::Route::new(
@@ -2005,9 +1791,8 @@ fn route_batch_all_to_one_target_costs_two() {
 }
 
 /// The other one-destination case: nothing matches, so every event lands on the router's own
-/// `Forward` partition (`Destination::Forward` is a destination too, slot 0) -- `1 + 1 = 2`, the
-/// same cost as the all-matched case above, because the cost is "destinations used," not "events
-/// routed to a target."
+/// `Forward` partition (slot 0): `1 + 1 = 2`, the same as above, because the cost is per
+/// destination used, not per event routed.
 #[test]
 fn route_batch_all_unrouted_costs_two() {
     let mut route = logit_transforms::Route::new(
@@ -2031,36 +1816,21 @@ fn route_batch_all_unrouted_costs_two() {
 
 /// The comparison the ADR cites (`docs/adr/target-components.md`'s "Two costs are structural to
 /// this shape"): the *same* 64-event host/app split, expressed the way it has to be without
-/// targets -- a `Fanout` to two ordinary `Transform` consumers, each running its own
-/// `has_attributes` over the *whole* batch to keep its one-half. **194**, composed of two
-/// directly-measured pieces (each confirmed independently, not assumed from the one-event
-/// numbers elsewhere in this file):
+/// targets: a `Fanout` to two `Transform` consumers, each running `has_attributes` over the whole
+/// batch to keep its half. 194:
 ///
-/// - **1 `Arc::new`.** `Fanout::deliver`'s once-per-send wrap for a >1-consumer edge
-///   (`fanout_send_two_consumers_costs_one_clone_plus_one_arc`'s own "+1 for the Arc").
-/// - **193 for the forced `EventBatch` deep clone.** The branch that unwraps first (`a`, while
-///   `b`'s handle is still alive) can't take the `Arc`, so it deep-clones: 1 for the clone's own
-///   `Vec<Event>` backing allocation, plus 64 * 3 for the events themselves. That per-event **3**
-///   is measured directly against *this* fixture (`fixtures::nginx_batch_alternating_stream`),
-///   not assumed from [`clone_one_event`]'s plain-nginx **2** -- one more than the reference
-///   pipeline's own nginx shape, because this fixture's event is `nginx_event` plus one `stream`
-///   attribute inserted afterward (`fixtures::nginx_event_with_stream`), which changes the
-///   already-spilled `AttrMap`'s own capacity growth on top of what `kv_metrics` left it with.
-///   (Was 5 and 4 respectively while `kv_metrics` put a `bins` Vec per distribution on every
-///   event; those are inline `Samples` now, [`kv_metrics_one_event`].)
-///   The other branch (`b`, unwrapping last with nothing else holding the `Arc`) is free, exactly
-///   as in the one-event case.
-/// - **0 for the two `has_attributes` passes.** `process_batch_through_has_attributes` pins a
-///   `has_attributes` pass at 0 allocations *per batch* since `Transform::process` went in place
-///   (ADR `in-place-transform-process`) -- it used to be 1 apiece for `process_batch`'s own output
-///   `Vec`, which is where this total's missing 2 went. Each pass still scans the *whole* 64-event
-///   batch, since neither filter narrows what the other has to do; the CPU cost this comparison is
-///   about is unchanged, only its allocation share went away.
+/// - **1**: `Arc::new`, once per send to a multi-consumer edge.
+/// - **193**: the `EventBatch` deep clone for branch `a`, which unwraps while `b` still holds the
+///   `Arc`: 1 for the `Vec<Event>` plus 64 × 3. This fixture's per-event clone is 3, not
+///   [`clone_one_event`]'s 2, because `fixtures::nginx_event_with_stream` inserts a `stream`
+///   attribute into the already-spilled `AttrMap`, changing its capacity growth. Branch `b`
+///   unwraps last and is free.
+/// - **0**: the two `has_attributes` passes, which run in place
+///   ([`process_batch_through_has_attributes`]). Each still scans all 64 events.
 ///
-/// `1 + 193 + 0 = 194`. The point isn't the exact total -- it's that this shape's cost scales with
-/// `branches * events`, while
-/// [`route_batch_two_targets_costs_one_vec_per_used_destination`]'s scales with `destinations
-/// used` alone, flat in both event count and branch count.
+/// The cost scales with `branches × events`;
+/// [`route_batch_two_targets_costs_one_vec_per_used_destination`]'s scales with destinations used
+/// alone.
 #[test]
 fn fan_out_plus_two_has_attributes_for_the_same_split() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2071,8 +1841,7 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
     let mut host_filter = fixtures::has_attributes_stream("host");
     let mut app_filter = fixtures::has_attributes_stream("app");
 
-    // Warm: one full round trip through the exact same Fanout/filters, same reasoning as every
-    // other `fanout_send_*` test in this file.
+    // Warm: one full round trip through the same Fanout and filters.
     let warm = fixtures::nginx_batch_alternating_stream(64);
     rt.block_on(async {
         fanout.send(warm).await;
@@ -2086,9 +1855,8 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
     let ((host_out, app_out), stats) = measure(|| {
         rt.block_on(async {
             fanout.send(batch).await;
-            // `a` unwraps first, while `b`'s handle is still alive -- forces `a`'s clone; `b`
-            // unwraps last, free -- the deterministic case, exactly
-            // `fanout_send_two_consumers_costs_one_clone_plus_one_arc`'s own ordering.
+            // `a` unwraps while `b`'s handle is alive and clones; `b` unwraps last, free. The same
+            // ordering as `fanout_send_two_consumers_costs_one_clone_plus_one_arc`.
             let a = unwrap_delivered(rx_a.recv().await.expect("a should receive"));
             let b = unwrap_delivered(rx_b.recv().await.expect("b should receive"));
             let host_out = process_batch(&mut host_filter, a, &telemetry);
@@ -2109,9 +1877,9 @@ fn fan_out_plus_two_has_attributes_for_the_same_split() {
 // Disk-backed sink buffer (docs/adr/disk-backed-sink-buffer.md)
 // ---------------------------------------------------------------------------------------------
 
-/// A scratch spool directory, cleaned up by the OS's own tmp reaper rather than at the end of
-/// each test -- matches `crates/logit-pipeline/src/disk_queue.rs`'s own `test_support::scratch_dir`
-/// (no `tempfile` dependency, ADR `file-tailing-and-docker-json-logs`).
+/// A scratch spool directory, left for the OS's tmp reaper, as `disk_queue.rs`'s
+/// `test_support::scratch_dir` does (no `tempfile` dependency, ADR
+/// `file-tailing-and-docker-json-logs`).
 fn disk_scratch_dir(label: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2122,18 +1890,13 @@ fn disk_scratch_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The runtime every `disk_queue_*` measurement below runs on. `max_blocking_threads(1)` is
-/// load-bearing for determinism, not a performance choice: `DiskQueue`'s writes and reads go
-/// through `tokio::fs`, i.e. `spawn_blocking`, and the counters in `logit_bench::alloc` are
-/// thread-local -- the blocking worker's own allocations are invisible, which is fine, but
-/// *spawning a new worker thread* allocates on the calling (measuring) thread. tokio only reuses
-/// an existing worker when one is already marked idle at the moment `spawn_blocking` is called,
-/// and the worker that ran the warm-up's last operation has to re-take the pool lock to mark
-/// itself idle after handing back its result. If it is preempted in that window (as happened
-/// twice on CI, with ~1500 test processes starting at once), the measured `push` wins the race,
-/// finds no idle worker, spawns a fresh OS thread, and reports exactly `+4` allocations. Capping
-/// the pool at one thread means the warm-up's first blocking call is the only spawn that can ever
-/// happen: everything after it queues for that worker instead.
+/// The runtime every `disk_queue_*` measurement runs on. `max_blocking_threads(1)` is for
+/// determinism: `DiskQueue` does I/O through `tokio::fs` (`spawn_blocking`), and while the blocking
+/// worker's allocations are invisible to the thread-local counters, spawning a new worker
+/// allocates on the measuring thread. tokio reuses a worker only if it is already marked idle, and
+/// the warm-up's worker must re-take the pool lock to mark itself idle. If it's preempted in that
+/// window (seen on CI under heavy parallel load), the measured `push` spawns a fresh thread and
+/// reports `+4`. With one blocking thread, the warm-up's spawn is the only one.
 fn disk_queue_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2153,12 +1916,11 @@ fn disk_queue_config(dir: std::path::PathBuf) -> logit_pipeline::DiskQueueConfig
     }
 }
 
-/// `DiskQueue::push` = `native::encode_batch_v2` (`encode_batch` plus a provenance trailer,
-/// `docs/adr/batch-provenance-on-delivered.md`) + `frame::write_frame` + one `write_all` to the
-/// active segment -- the cost the disk-backed buffer's ADR names as breaking
-/// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property *by design*. Warmed first
-/// (one full push+commit round trip) so the queue's own one-time setup (the lock file, the first
-/// segment's `tokio::fs::File` open) doesn't fold into the measured push.
+/// `DiskQueue::push`: `native::encode_batch_v2` (`encode_batch` plus a provenance trailer,
+/// `docs/adr/batch-provenance-on-delivered.md`), `frame::write_frame`, and one `write_all` to the
+/// active segment. The disk buffer's ADR accepts that this encode breaks
+/// `buffered-sink-delivery`'s zero-clone `Arc<EventBatch>` property. The warm-up push+commit pays
+/// the one-time setup (the lock file, the first segment's open).
 #[test]
 fn disk_queue_push_one_batch() {
     let rt = disk_queue_runtime();
@@ -2180,23 +1942,12 @@ fn disk_queue_push_one_batch() {
     let ((), stats) =
         measure(|| rt.block_on(queue.push((Arc::clone(&batch), BatchContext::default()))));
 
-    // 25 -> 27: `encode_batch_v2` builds v1's payload as its own `Bytes` (one allocation) then
-    // copies it into a fresh, larger `BytesMut` alongside the (here empty) provenance trailer
-    // (one more) rather than extending the original buffer in place -- see
-    // `docs/adr/batch-provenance-on-delivered.md`.
-    // 27 -> 36 (W1, metrics-model-v2): `encode_batch`'s per-record TLV reshape
-    // (`crates/logit-proto/src/native/record.rs`) adds two new `write_field` temp-buffer
-    // allocations per `MetricRecord` in `nginx_event`'s four metrics -- one from
-    // `write_record_list` now length-prefixing each list entry so a record with unrecognized
-    // fields can still be skipped (the old positional metrics list read/wrote records
-    // back-to-back with no per-entry length at all), and one from `MetricRecord`'s own `kind`
-    // field now being wrapped in `write_field(MR_KIND, ..)` instead of written straight into the
-    // record's buffer -- plus one more from `LogRecord.message` gaining the same `write_field`
-    // wrapper it didn't have before. 4*2 + 1 = 9.
-    // 36 -> 34: `kv_metrics` emits its two distributions as inline `Samples` rather than
-    // single-sample `DdSketch`es, and the native codec writes a `Samples` straight from its
-    // values where a `Distribution` first serialized its sketch through `to_java_bytes` (one
-    // blob per record) -- same -2 as `native_encode_one_event`.
+    // Among the 34: `encode_batch_v2` builds v1's payload as its own `Bytes`, then copies it into
+    // a larger `BytesMut` beside the (here empty) provenance trailer: 2. `write_field`'s
+    // temp buffers: 2 per `MetricRecord` (`write_record_list`'s per-entry length prefix, which
+    // lets a reader skip a record with unknown fields, and the `MR_KIND` field) for the four
+    // metrics, plus 1 for `LogRecord.message`: 9. The two `Samples` are written straight from
+    // their values, with no serialized sketch blob.
     expect_allocs("disk_queue: push one batch (encode + write)", stats, 34);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2227,24 +1978,16 @@ fn disk_queue_peek_cached_costs_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The actually-common shape (the nginx reference config's `tap` (`stdio_out`)/`trimmed`
-/// (`keep` -> `aggregate` -> ...) split): one `Output` branch and one `Transform`/`ScriptWorker`
-/// branch off the same fan-out. The `Output` branch costs nothing, as above -- it only ever
-/// borrows, and never itself calls `Arc::try_unwrap`. The `Transform` branch still needs an owned
-/// `Event` to mutate, so it goes through `unwrap_batch` exactly as before this round of changes.
+/// The common shape (the nginx reference config's `tap`/`trimmed` split): one `Output` branch and
+/// one mutating branch off the same fan-out. The `Output` branch only borrows; the mutating branch
+/// needs an owned batch, so it goes through `unwrap_batch`.
 ///
-/// **This is one of the two reachable outcomes for this shape, not the only one -- genuinely racy,
-/// not deterministic.** `run_output`'s loop (`runtime.rs`) drops its own `Delivered` the moment
-/// `output.send` returns, immediately before its next receive -- it does *not* hold the handle for
-/// the rest of its loop. So whether the `Transform` branch's unwrap here succeeds for free or falls
-/// back to a clone comes down to real tokio scheduling: whichever happens first, `Output`
-/// completing its `send` and dropping its handle, or the `Transform` branch's `unwrap_batch` call
-/// actually running. This test pins the case where `Transform` runs first (`Output`'s handle still
-/// alive) by unwrapping the `Transform` side before the `Output` side is ever touched --
-/// [`fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`] below pins the
-/// other reachable outcome, where `Output` finishes first. In production, `Output::send` typically
-/// performs real I/O (network, file), which tends to be slower than a `Transform`'s local
-/// processing -- so *this* outcome is the likelier one in practice, not the only possible one.
+/// Racy, with two reachable outcomes. `run_output` drops its `Delivered` as soon as `output.send`
+/// returns, so the mutating branch's unwrap is free or a clone depending on which happens first.
+/// This test pins the outcome where the mutating branch unwraps first, while the `Output` handle
+/// is alive: 4, the same as [`fanout_send_two_consumers_costs_one_clone_plus_one_arc`].
+/// [`fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first`] pins the other.
+/// A real `Output::send` does I/O, so this outcome is the likelier one in production.
 #[test]
 fn fanout_send_mixed_output_and_transform_consumers() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2267,10 +2010,8 @@ fn fanout_send_mixed_output_and_transform_consumers() {
             fanout.send(batch).await;
             let out = rx_out.recv().await.expect("output branch should receive");
             let xform = rx_xform.recv().await.expect("transform branch should receive");
-            // The Transform branch unwraps first, while the Output branch's handle is still alive
-            // -- forcing the Transform branch's clone. The Output branch only ever borrows, then
-            // is dropped once this block ends, matching `run_output`'s loop moving to its next
-            // receive once `output.send` has returned.
+            // The Transform branch unwraps while the Output branch's handle is alive, forcing
+            // its clone. The Output branch borrows, then drops at the end of the block.
             let xform_batch = unwrap_delivered(xform);
             let out_len = borrow_delivered(&out).events.len();
             (out_len, xform_batch.events.len())
@@ -2280,40 +2021,22 @@ fn fanout_send_mixed_output_and_transform_consumers() {
     assert_eq!(xform_len, 1);
     // 1 (Arc::new, once per send) + 3 (the Transform branch's forced deep clone: 1 for the
     // Vec<Event>, 2 for the one nginx-shaped Event inside it) + 0 (the Output branch, which never
-    // unwraps or clones at all). Same total as the all-Transform 2-consumer case measured above --
-    // this is the "Output hasn't finished yet" outcome, not the only reachable one; see
-    // `fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first` below for the
-    // other. The pre-`Arc` code paid a flat, unconditional clone (3 today) for any 2-consumer
-    // fan-out regardless of kind -- so this specific outcome is 1 allocation worse than that, same
-    // as the all-Transform case, though (unlike that case) it's not the only place this shape can
-    // land.
+    // unwraps or clones).
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output not yet finished (racy outcome A)",
         stats,
-        // 6 -> 4 with [`clone_one_event`]'s 4 -> 2: the clone is what this outcome pays.
+        // The clone this outcome pays scales with `clone_one_event`.
         4,
     );
 }
 
-/// The *other* reachable outcome for the same mixed shape as
-/// [`fanout_send_mixed_output_and_transform_consumers`] above, not a hypothetical: if `Output`'s
-/// task happens to complete its `send` and drop its `Delivered` handle *before* the `Transform`
-/// branch's `unwrap_batch` call runs -- plausible whenever `Output::send` is fast, local, or simply
-/// wins the scheduling race -- `Arc::try_unwrap` finds itself the sole remaining reference and
-/// succeeds for free. Total cost collapses to just the one `Arc::new` per send, the same number
-/// [`fanout_send_two_output_consumers_costs_only_the_arc`] measures for two `Output` consumers,
-/// because at that point neither branch has paid anything beyond the `Arc` itself.
+/// The other reachable outcome for [`fanout_send_mixed_output_and_transform_consumers`]'s shape:
+/// the `Output` branch finishes and drops its handle before the mutating branch unwraps, so
+/// `Arc::try_unwrap` succeeds for free. 1, the `Arc::new`, as in
+/// [`fanout_send_two_output_consumers_costs_only_the_arc`].
 ///
-/// Simulated by dropping the `Output` side's `Delivered` (standing in for `run_output` having
-/// already returned from `output.send` and moved on) *before* the `Transform` side ever calls
-/// `unwrap_batch` -- the mirror image of the ordering the test above pins.
-///
-/// **The two tests together are the honest picture for this shape: 1 or 4, decided by real
-/// scheduling, never anything in between** (there's no path to landing on the pre-`Arc` code's
-/// flat 3, since `Arc::new` is always paid the moment there are 2+ consumers). Whether this design
-/// is a net win, a wash, or a regression for a given deployment depends on how its `Output`
-/// implementations and `Transform`/Lua stages actually get scheduled relative to each other -- not
-/// something a fixed allocation count can answer on its own.
+/// Together the two tests bound this shape at 1 or 4, decided by scheduling; `Arc::new` is paid
+/// whenever there are two or more consumers, so nothing lands between.
 #[test]
 fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2336,9 +2059,8 @@ fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first()
             fanout.send(batch).await;
             let out = rx_out.recv().await.expect("output branch should receive");
             let xform = rx_xform.recv().await.expect("transform branch should receive");
-            // The Output branch finishes and drops its handle first -- matching `run_output`
-            // having already returned from `output.send` and moved past this batch entirely --
-            // *before* the Transform branch ever attempts its unwrap.
+            // The Output branch drops its handle, as `run_output` does once `output.send`
+            // returns, before the Transform branch unwraps.
             let out_len = borrow_delivered(&out).events.len();
             drop(out);
             let xform_batch = unwrap_delivered(xform);
@@ -2348,10 +2070,7 @@ fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first()
     assert_eq!(out_len, 1);
     assert_eq!(xform_len, 1);
     // 1 (Arc::new, once per send) + 0 (the Transform branch's try_unwrap now succeeds, since the
-    // Output branch already dropped its handle) + 0 (the Output branch, as always). Against the
-    // pre-`Arc` code's flat, unconditional 3 for this shape, this outcome is a real, substantial
-    // improvement -- the other reachable outcome (the test above) is 1 allocation worse than
-    // that. Which one a given run lands on is decided by scheduling, not by this design.
+    // Output branch already dropped its handle) + 0 (the Output branch, as always).
     expect_allocs(
         "fanout: send + receive, 1 Output + 1 Transform, Output finished first (racy outcome B)",
         stats,
@@ -2359,15 +2078,10 @@ fn fanout_send_mixed_output_and_transform_consumers_when_output_finishes_first()
     );
 }
 
-/// Cloning [`fixtures::distribution_heavy_event`] -- five *distinct* `MetricKind::Distribution`
-/// metrics, against the nginx shape's two. `clone_one_event` above costs 4 allocations for 2
-/// distributions (a spilled `AttrMap`, a spilled `MetricList`, and a `bins` Vec per sketch); this
-/// fixture's three attributes stay inline (no `AttrMap` spill), so the difference isolates what
-/// distribution *count* costs on its own: one `MetricList` spill (past its single inline slot)
-/// plus one `bins` Vec per sketch. This is exactly the number `docs/design/memory.md`'s item 8
-/// (`Box` the `DdSketch`) was missing -- boxing turns every one of these `bins`-Vec clones into an
-/// *additional* allocation, which is the "distribution-heavy metrics" side of that trade the doc
-/// flags as unmeasured.
+/// Cloning [`fixtures::distribution_heavy_event`]: five `MetricKind::Distribution` sketches and
+/// three inline attributes. 6: one `MetricList` spill plus one `bins` `Vec` per sketch. Boxing the
+/// `DdSketch` would add one allocation per sketch on top (`docs/design/memory.md`'s
+/// "Recommendations" section, "`Box` the `DdSketch`").
 #[test]
 fn clone_distribution_heavy_event() {
     let event = fixtures::distribution_heavy_event();
@@ -2378,24 +2092,14 @@ fn clone_distribution_heavy_event() {
     expect_allocs("Event::clone (distribution-heavy shape)", stats, 6);
 }
 
-/// Cloning [`fixtures::span_event`] -- the one payload shape with no coverage at all before this
-/// change. `SpanRecord` holds a `Vec<SpanEvent>` (2 entries here) and a `Vec<SpanLink>` (1 entry),
-/// each a heap allocation on clone regardless of contents -- that's the 2 allocations measured.
-/// What's notably *not* here: every `AttrMap` involved (the event's own 4 attributes, each
-/// `SpanEvent`'s 2, the link's 1) is small enough to stay inside `AttrMap`'s 8-slot inline
-/// capacity, so none of them spills to the heap on clone.
+/// Cloning [`fixtures::span_event`]: 2, the `SpanRecord`'s `Vec<SpanEvent>` (2 entries) and
+/// `Vec<SpanLink>` (1 entry), each a heap allocation on clone. Every `AttrMap` involved (the
+/// event's 4 attributes, each `SpanEvent`'s 2, the link's 1) stays inline.
 ///
-/// **This is cheaper to clone than the nginx shape, not more expensive** -- 2 allocations (1320
-/// bytes) against `clone_one_event`'s 4 (3552 bytes). That's the opposite of what a first read of
-/// `docs/design/memory.md`'s item 4 ("far more expensive to deep-clone than anything measured
-/// here") suggests, and the reason is exactly the inline-attribute point above: this fixture is
-/// narrow enough on attribute count everywhere that nothing about it spills. It does **not** show
-/// spans are cheap in general -- a span whose `SpanEvent`s/`SpanLink`s (or the span itself)
-/// carried more than 8 attributes each would spill those maps on clone just as the nginx event's
-/// 10 attributes do, costing more accordingly; this measurement only speaks to the narrow shape
-/// this fixture actually builds. What does generalize regardless of attribute width is the fixed
-/// cost of the two `Vec`s existing at all: `Box`ing `SpanRecord` (item 7) would add exactly one
-/// more allocation on top of whatever a given span shape's total turns out to be.
+/// That makes this narrow span as cheap to clone as the nginx shape, not dearer. A span with more
+/// than 8 attributes on itself, an event, or a link would spill those maps and cost more. The two
+/// `Vec`s are a fixed cost; boxing `SpanRecord` would add one more
+/// (`docs/design/memory.md`'s "Recommendations" section, "`Box` `SpanRecord`").
 #[test]
 fn clone_span_event() {
     let event = fixtures::span_event();
@@ -2410,35 +2114,20 @@ fn clone_span_event() {
 // Runtime
 // ---------------------------------------------------------------------------------------------
 //
-// Everything above this section calls a decoder/transform/encoder directly, or drives `Fanout`
-// alone -- never `logit-pipeline::runtime`'s node loops themselves. That's a real gap, not a
-// stylistic choice: `run_transform`/`run_output` are private `async fn`s, and PR #37
-// (`docs/design/internal-telemetry.md`) added telemetry accounting to both without this file
-// gaining any coverage of what that accounting costs. `run_transform`'s per-batch body is now
-// exported as `logit_pipeline::process_batch` (a synchronous fn -- no channel hop, no runtime
-// needed), and `run_output`'s as `logit_pipeline::send_batch` (async, since `Output::send` is, but
-// still callable with no channel via a `current_thread` runtime -- see `fanout_send_one_consumer`
-// et al. above for why that's still safe to count allocations across), specifically so both can be
-// measured here directly, the same "call the real thing" rule `docs/design/memory.md` §7 already
-// applies to every stage above. `unwrap_batch` is exported for the same reason.
+// The node loops' per-batch bodies, including their telemetry accounting. `run_transform`'s is
+// exported as `logit_pipeline::process_batch` (synchronous) and `run_output`'s as
+// `logit_pipeline::send_batch` (async, driven on a `current_thread` runtime with no channel), so
+// both can be measured directly. `unwrap_batch` is exported for the same reason.
 //
-// **A second, sharper gap this section closes, found in review of the first draft: "telemetry
-// live" below only ever measured a component buffer already warmed with the same keys.** In
-// production, `internal`'s every tick calls `Registry::drain`, and `ComponentBuffer::drain`
-// (`crates/logit-core/src/telemetry.rs`) `mem::take`s the whole `points` map -- so the *next*
-// `count`/`timer` call for each key is a fresh insert into an empty map, not an update to an
-// existing entry, and costs more than the steady-state number the first draft's tests measured.
-// Both states are covered below, for both `process_batch` and `send_batch`: "telemetry live"
-// (steady state, matching every occurrence between two drains) and "first call after a drain"
-// (once per drain interval, forever, for as long as `internal` runs).
+// Telemetry has two states, both covered for both functions. `ComponentBuffer::drain`
+// `mem::take`s the `points` map on every `internal` tick, so the next `count`/`timer` per key is
+// a fresh insert into an empty map. "Telemetry live" is the steady state between drains; "first
+// call after a drain" is paid once per drain interval for as long as `internal` runs.
 
-/// The per-batch body with telemetry disabled (`Telemetry::default()`, what every component has
-/// with no `internal` component configured) -- **0**, nothing at all above `keep`'s own cost
-/// (`keep_one_event`, 0). Was 1 while `process_batch` collected survivors into its own
-/// `Vec::with_capacity(batch.events.len())`; `Transform::process` takes `&mut Event` and answers a
-/// bool now (ADR `in-place-transform-process`, `docs/design/memory.md` §8 item 14), so
-/// `process_batch` is a `Vec::retain_mut` over the batch's own `events` and there is no `out` `Vec`
-/// to allocate. Every `process_batch_*` pin below dropped by exactly that 1.
+/// The per-batch body with telemetry disabled (`Telemetry::default()`, as with no `internal`
+/// component): 0, nothing above `keep_one_event`'s 0. `Transform::process` takes `&mut Event` and
+/// returns a bool (ADR `in-place-transform-process`), so `process_batch` is a `Vec::retain_mut`
+/// over the batch's own `events`, with no output `Vec`.
 #[test]
 fn process_batch_through_keep() {
     let mut keep = fixtures::keep();
@@ -2453,10 +2142,8 @@ fn process_batch_through_keep() {
     expect_allocs("runtime: process_batch through keep, telemetry disabled", stats, 0);
 }
 
-/// `set`'s attribute-only path through `process_batch` -- `map_resource` returns `None`
-/// immediately (`resource_pairs` is empty), so this costs exactly what `keep`'s equivalent test
-/// above costs: **0**, nothing from `process_batch`'s `retain_mut` loop and nothing from `Set`
-/// itself.
+/// `set`'s attribute-only path through `process_batch`: 0, as for `keep`. `map_resource` returns
+/// `None` immediately (`resource_pairs` is empty).
 #[test]
 fn process_batch_through_set_attributes_only() {
     let mut set = fixtures::set_attributes();
@@ -2471,11 +2158,8 @@ fn process_batch_through_set_attributes_only() {
     expect_allocs("runtime: process_batch through set (attributes only)", stats, 0);
 }
 
-/// `trace_context` lifting a valid `trace_id` -- **0**, identical to `keep`/`set`'s own
-/// process_batch tests now that `process_batch` allocates nothing of its own. `parse_trace_id`
-/// (`logit_core::trace`) works on stack arrays, and `AttrMap::remove` (the default
-/// `keep_source: false` path) is an in-place `SmallVec` shift -- `TraceContext` itself contributes
-/// nothing.
+/// `trace_context` lifting a valid `trace_id`: 0. `parse_trace_id` works on stack arrays, and
+/// `AttrMap::remove` (the default `keep_source: false` path) is an in-place `SmallVec` shift.
 #[test]
 fn trace_context_lifts_a_valid_trace_id() {
     let mut trace_context = fixtures::trace_context();
@@ -2501,13 +2185,10 @@ fn trace_context_lifts_a_valid_trace_id() {
 }
 
 /// `trace_context` with a `span:` block, minting a `SpanRecord` from the convention attributes
-/// (`docs/adr/trace-context-span-lifting.md`) -- **0**, the same as the log-only row above.
-/// Everything the span lift does is on the stack or in place: ids parse into
-/// stack arrays (`parse_traceparent`/`parse_trace_id`/`parse_span_id`), the timing arithmetic is
-/// integer, the span's `name` is the transform's pre-built `Value` cloned (a `Bytes` refcount
-/// bump), `events`/`links` are `Vec::new()` (no allocation until a push), and every consumed
-/// attribute is an in-place `AttrMap::remove`. `SpanRecord` itself is inline in `Event`
-/// (`docs/design/memory.md` §1), so setting `event.span` moves 136 bytes, allocating nothing.
+/// (`docs/adr/trace-context-span-lifting.md`): 0, as for the log-only lift above. Ids parse into
+/// stack arrays, the timing arithmetic is integer, `name` clones a pre-built `Value` (a refcount
+/// bump), `events`/`links` are empty `Vec::new()`s, and each consumed attribute is an in-place
+/// `AttrMap::remove`. `SpanRecord` is inline in `Event`, so setting `event.span` moves 136 bytes.
 #[test]
 fn trace_context_mints_a_span_from_the_convention() {
     let mut trace_context = fixtures::trace_context_with_span();
@@ -2529,10 +2210,8 @@ fn trace_context_mints_a_span_from_the_convention() {
     expect_allocs("transform: trace_context, minting a span from the convention", stats, 0);
 }
 
-/// `Set::map_resource`'s one-entry cache (`crates/logit-transforms/src/set.rs`): a second call
-/// with the same input `Arc<Resource>` must hit the cache and cost nothing, in contrast to a
-/// cache miss (`set_resource_map_resource_cache_miss` below), which allocates a rebuilt
-/// `AttrMap`/`Resource`/`Arc`.
+/// `Set::map_resource`'s one-entry cache: a second call with the same input `Arc<Resource>` hits
+/// and costs 0. Compare [`set_resource_map_resource_cache_miss`].
 #[test]
 fn set_resource_map_resource_cache_hit_costs_nothing() {
     let mut set = fixtures::set_resource();
@@ -2544,13 +2223,9 @@ fn set_resource_map_resource_cache_hit_costs_nothing() {
     expect_allocs("transform: set.map_resource, cached (same input Arc)", stats, 0);
 }
 
-/// The cache-miss cost `set_resource_map_resource_cache_hit_costs_nothing` contrasts with: a
-/// distinct input `Arc<Resource>` each call, exactly what a listener that mints a fresh `Arc` per
-/// request (`otlp_in`) would drive. **Just 1, not the naively-expected "clone the map, insert,
-/// wrap in an Arc" 2+** -- the fixture resource's `AttrMap` starts empty, and cloning/inserting
-/// into an empty `SmallVec` under its 8-slot inline capacity (`docs/design/data-model.md`'s
-/// small-map layout) never touches the heap; the one allocation is `Arc::new(Resource { .. })`
-/// itself.
+/// A cache miss: a distinct input `Arc<Resource>` each call, as a listener minting a fresh `Arc`
+/// per request (`otlp_in`) drives. 1, the `Arc::new(Resource { .. })`: the fixture resource's
+/// `AttrMap` starts empty, so cloning it and inserting stays inline.
 #[test]
 fn set_resource_map_resource_cache_miss() {
     let mut set = fixtures::set_resource();
@@ -2562,19 +2237,17 @@ fn set_resource_map_resource_cache_miss() {
     expect_allocs("transform: set.map_resource, cache miss (distinct input Arc)", stats, 1);
 }
 
-/// `resource:` attribute for [`has_attributes_resource`]/[`fixtures::has_attributes_resource`]'s
-/// config -- built directly, not via `fixtures::resource()`, because that fixture is always empty
-/// and this needs `service.name` present to match.
+/// A resource carrying `service.name`, which [`fixtures::has_attributes_resource`]'s config matches
+/// on; `fixtures::resource()` is always empty.
 fn resource_with_service_name() -> Arc<Resource> {
     let mut attrs = AttrMap::new();
     attrs.insert("service.name", Value::str("nginx"));
     Arc::new(Resource { attributes: attrs, ..Default::default() })
 }
 
-/// `has_attributes` matching on a single event attribute -- free, same reasoning as
-/// [`keep_one_event`]: nothing here touches the heap. `Matcher::matches`'s `AttrMap::get_sym`
-/// probe is a `binary_search_by_key` over a `SmallVec`, and `value_matches`' numeric coercion
-/// (config `status: 200` against `nginx_event`'s JSON-sourced `status`) parses on the stack.
+/// `has_attributes` matching one event attribute: 0. The `AttrMap::get_sym` probe is a binary
+/// search over a `SmallVec`, and `value_matches`' numeric coercion (config `status: 200` against
+/// the JSON-sourced `status`) parses on the stack.
 #[test]
 fn has_attributes_one_event() {
     let mut has = fixtures::has_attributes();
@@ -2588,8 +2261,7 @@ fn has_attributes_one_event() {
     expect_allocs("has_attributes: match 1 attribute", stats, 0);
 }
 
-/// [`has_attributes_one_event`]'s exact complement -- also free, same config, an event that
-/// matches is dropped rather than forwarded, but nothing about deciding that allocates either.
+/// [`has_attributes_one_event`]'s complement: the matching event is dropped instead. Also 0.
 #[test]
 fn drop_attributes_one_event() {
     let mut drop_attrs = fixtures::drop_attributes();
@@ -2603,9 +2275,8 @@ fn drop_attributes_one_event() {
     expect_allocs("drop_attributes: match 1 attribute (dropped)", stats, 0);
 }
 
-/// The resource-match cache's hit path (`crates/logit-transforms/src/attributes.rs`'s `Matcher`,
-/// `Set::map_resource`'s `ptr_eq` idiom applied to a read): a second call with the same input
-/// `Arc<Resource>` must cost nothing, in contrast to a miss (below).
+/// The resource-match cache's hit path (`Matcher`'s `ptr_eq` check on the input
+/// `Arc<Resource>`): 0.
 #[test]
 fn has_attributes_resource_match_cache_hit() {
     let mut has = fixtures::has_attributes_resource();
@@ -2619,12 +2290,10 @@ fn has_attributes_resource_match_cache_hit() {
     expect_allocs("has_attributes: resource match, cache hit (same input Arc)", stats, 0);
 }
 
-/// The cache-miss cost `has_attributes_resource_match_cache_hit` contrasts with -- and, unlike
-/// `Set::map_resource`'s miss (which rebuilds an `AttrMap`/`Resource`/`Arc` and costs 1), this
-/// stays **0**: a miss here only re-evaluates `resource.attributes.get_sym` against the *existing*
-/// `Arc` a caller already holds, never builds a new one. This is what makes the always-missing
-/// `logit_in` fan-out topology (`docs/adr/attribute-filtering-components.md`) safe -- the cache
-/// exists to help the sidecar case, but costs nothing extra when it can't.
+/// The resource-match cache's miss path: also 0, unlike `Set::map_resource`'s miss (1). A miss
+/// only re-evaluates `get_sym` against the caller's existing `Arc`, never building a new one, so
+/// the always-missing `logit_in` fan-out topology (`docs/adr/attribute-filtering-components.md`)
+/// pays nothing for the cache.
 #[test]
 fn has_attributes_resource_match_cache_miss() {
     let mut has = fixtures::has_attributes_resource();
@@ -2638,9 +2307,8 @@ fn has_attributes_resource_match_cache_miss() {
     expect_allocs("has_attributes: resource match, cache miss (distinct input Arc)", stats, 0);
 }
 
-/// `has_attributes` through `process_batch` -- **0**, identical to `keep`/`set`'s own
-/// `process_batch` tests: the `retain_mut` loop allocates nothing whether the batch's one event is
-/// forwarded (here) or dropped (below).
+/// `has_attributes` through `process_batch`: 0, as for `keep`/`set`. The `retain_mut` loop
+/// allocates nothing whether the event is forwarded (here) or dropped (below).
 #[test]
 fn process_batch_through_has_attributes() {
     let mut has = fixtures::has_attributes();
@@ -2655,11 +2323,9 @@ fn process_batch_through_has_attributes() {
     expect_allocs("runtime: process_batch through has_attributes", stats, 0);
 }
 
-/// The other outcome: every event in the batch dropped. Still **0** -- `retain_mut` drops each
-/// rejected event in place, so a batch that ends up fully filtered out costs exactly what a fully
-/// forwarded one does, the same fact `process_batch_fully_absorbed` (below) pins for `aggregate`.
-/// (Both were 1 while `process_batch` built an output `Vec` up front and then threw it away
-/// unused -- the cost the in-place `Transform::process` removed.)
+/// Every event in the batch dropped: still 0. `retain_mut` drops each rejected event in place, so
+/// a fully filtered batch costs what a forwarded one does ([`process_batch_fully_absorbed`] pins
+/// the same for `aggregate`).
 #[test]
 fn process_batch_through_has_attributes_dropping_every_event() {
     let mut drop_attrs = fixtures::drop_attributes();
@@ -2673,16 +2339,9 @@ fn process_batch_through_has_attributes_dropping_every_event() {
     expect_allocs("runtime: process_batch through drop_attributes, dropping every event", stats, 0);
 }
 
-/// The other outcome `process_batch` can produce: every event absorbed, nothing forwarded.
-/// `fixtures::statsd_event` is metrics-only (`clone_one_statsd_event` above), which is what lets
-/// `Aggregator::process` return `None` for it (`logit-transforms`'
-/// `a_metric_only_event_fully_absorbed_returns_none`) rather than forwarding a log/span half.
-///
-/// **This costs the same 0** as the forwarding case above: `retain_mut` empties the batch's own
-/// `Vec` in place, so a batch that turns out to be *entirely* absorbed allocates nothing. This is
-/// the case the earlier draft of this file flagged as worth revisiting for a metrics-heavy
-/// `internal`-fed pipeline (mostly-absorbed batches, by construction) -- it used to pay 1 for an
-/// output `Vec` it never pushed into, and the in-place `Transform::process` removed it.
+/// Every event absorbed, nothing forwarded: 0. `fixtures::statsd_event` is metrics-only, so
+/// `aggregate` absorbs all of it rather than forwarding a log/span half, and `retain_mut` empties
+/// the batch's `Vec` in place. A metrics-heavy `internal`-fed pipeline hits this case constantly.
 #[test]
 fn process_batch_fully_absorbed() {
     let mut agg = fixtures::aggregator();
@@ -2701,19 +2360,10 @@ fn process_batch_fully_absorbed() {
     expect_allocs("runtime: process_batch, fully absorbed (aggregate)", stats, 0);
 }
 
-/// What live telemetry costs on top of the disabled path above, in **steady state** -- every
-/// `count`/`timer` call here updates a `(name, tags)` key already resident in the component
-/// buffer from the warm-up, exactly like every occurrence between two `internal` drains in
-/// production (`ComponentBuffer::upsert`'s `get_mut` branch, `crates/logit-core/src/telemetry.rs`).
-/// The *other* case -- the first call after a drain, where every key is a fresh insert -- is
-/// measured separately below (`process_batch_first_call_after_a_drain`); this test's own claim is
-/// narrower than the first draft's was, on review.
-///
-/// **Measured, not assumed: in this steady state, it costs exactly what the disabled path costs**
-/// -- both this test and `process_batch_through_keep` above assert 0, i.e. nothing at all.
-/// `count`/`timer` update an existing map entry in place
-/// (`docs/design/internal-telemetry.md`); an `internal`-fed pipeline's steady-state cost between
-/// drains is not distinguishable from `internal` being off at all.
+/// Live telemetry in steady state: 0, the same as [`process_batch_through_keep`]'s disabled path.
+/// Every `count`/`timer` updates a `(name, tags)` key the warm-up left resident
+/// (`ComponentBuffer::upsert`'s `get_mut` branch), as between two `internal` drains.
+/// [`process_batch_first_call_after_a_drain`] pins the fresh-insert case.
 #[test]
 fn process_batch_with_live_telemetry() {
     let mut keep = fixtures::keep();
@@ -2729,17 +2379,10 @@ fn process_batch_with_live_telemetry() {
     expect_allocs("runtime: process_batch through keep, telemetry live (steady state)", stats, 0);
 }
 
-/// The case steady state above doesn't cover, found in review: `internal`'s every tick calls
-/// `Registry::drain`, which `mem::take`s the component buffer's whole map
-/// (`ComponentBuffer::drain`) -- so the *first* `process_batch` call after each drain re-inserts
-/// all three of its keys (`batches.received`, `events.received`, `process.duration`) into a map
-/// that was just emptied, rather than updating existing entries. Two allocations, not zero: the
-/// map's backing table (first insert into an empty `HashMap` after `mem::take` reset it to no
-/// capacity) plus the fresh `DdSketch` `process.duration`'s `Timer` creates on `Drop` (a `Pending`
-/// this key has no prior value to merge into). Was 3 while `process_batch` also allocated an
-/// output `Vec` of its own. This is not a one-time cost -- it recurs once per
-/// `internal` drain interval, for as long as `internal` runs, which is why it needs its own
-/// assertion rather than being folded into (or assumed equal to) the steady-state number above.
+/// The first `process_batch` after an `internal` drain, which `mem::take`s the component buffer's
+/// map, so all three keys (`batches.received`, `events.received`, `process.duration`) are fresh
+/// inserts. 2: the emptied `HashMap`'s new table, plus the fresh `DdSketch` `process.duration`'s
+/// `Timer` creates on `Drop` (nothing to merge into). Recurs once per drain interval.
 #[test]
 fn process_batch_first_call_after_a_drain() {
     let mut keep = fixtures::keep();
@@ -2756,9 +2399,7 @@ fn process_batch_first_call_after_a_drain() {
     expect_allocs("runtime: process_batch, first call after an internal drain", stats, 2);
 }
 
-/// `unwrap_batch`'s free path: `Delivered::Owned` is already the owned `EventBatch` -- no `Arc`
-/// was ever involved (a single-consumer edge, `Fanout::send`'s common case), so this is a plain
-/// match with nothing to allocate.
+/// `unwrap_batch` on `Delivered::Owned` (a single-consumer edge): a plain match, 0.
 #[test]
 fn unwrap_batch_owned() {
     let batch = fixtures::nginx_batch(1);
@@ -2767,10 +2408,8 @@ fn unwrap_batch_owned() {
     expect_allocs("runtime: unwrap_batch, Delivered::Owned", stats, 0);
 }
 
-/// `unwrap_batch`'s other free path: a real fan-out's `Arc`, but this handle is the only one left
-/// (every sibling branch already dropped its own) -- `Arc::try_unwrap` succeeds with no clone,
-/// same property `a_shared_batchs_arc_is_uniquely_held_only_once_every_sibling_handle_is_dropped`
-/// (`runtime.rs`) pins at the `Fanout` level, measured here at the unwrap itself.
+/// `unwrap_batch` on `Delivered::Shared` when every sibling has dropped its handle:
+/// `Arc::try_unwrap` succeeds, 0.
 #[test]
 fn unwrap_batch_shared_sole_reference() {
     let batch = fixtures::nginx_batch(1);
@@ -2780,13 +2419,9 @@ fn unwrap_batch_shared_sole_reference() {
     expect_allocs("runtime: unwrap_batch, Delivered::Shared, sole reference", stats, 0);
 }
 
-/// The documented racy fallback: a sibling branch still holds its own handle to the same `Arc`
-/// when this one unwraps, so `Arc::try_unwrap` fails and `unwrap_batch` falls back to a full
-/// `EventBatch::clone` -- 1 allocation for the cloned `Vec<Event>` plus `clone_one_event`'s 2 for
-/// the one nginx-shaped `Event` inside it, matching the per-branch cost
-/// `fanout_send_two_consumers_costs_one_clone_plus_one_arc` measures at the `Fanout::send` level
-/// (that test's 4 is this 3 plus the one `Arc::new` per send, which happens outside this measured
-/// region).
+/// `unwrap_batch` while a sibling still holds the `Arc`: `try_unwrap` fails and it falls back to
+/// `EventBatch::clone`. 3: 1 for the `Vec<Event>` plus [`clone_one_event`]'s 2.
+/// [`fanout_send_two_consumers_costs_one_clone_plus_one_arc`]'s 4 is this plus the `Arc::new`.
 #[test]
 fn unwrap_batch_shared_contended() {
     let warm_shared = Arc::new(fixtures::nginx_batch(1));
@@ -2805,10 +2440,8 @@ fn unwrap_batch_shared_contended() {
     );
 }
 
-/// A no-op `Output`, so `send_batch`'s own accounting (the two receive counters, the
-/// `send.duration` timer, the error counter) is what's measured here, not any real sink's
-/// encode/write cost -- `crates/logit-outputs`' own encoders already have their own coverage
-/// above (`mod encode`, `crates/logit-bench/benches/pipeline.rs`).
+/// A no-op `Output`, so the `send_batch` tests measure its own accounting (the two receive
+/// counters, the `send.duration` timer, the error counter), not a sink's encode cost.
 struct NoopOutput;
 
 #[async_trait::async_trait]
@@ -2818,9 +2451,8 @@ impl logit_pipeline::Output for NoopOutput {
     }
 }
 
-/// Always fails, so `send_batch`'s error path -- the `logit.component.errors` counter and
-/// `result.with_context(...)`'s error-only work -- is exercised at all. Found missing in review:
-/// every test above this point uses `NoopOutput`, which always succeeds.
+/// Always fails, to exercise `send_batch`'s error path: the `logit.component.errors` counter and
+/// `result.with_context(...)`.
 struct FailingOutput;
 
 #[async_trait::async_trait]
@@ -2830,18 +2462,11 @@ impl logit_pipeline::Output for FailingOutput {
     }
 }
 
-/// `send_batch`'s failure path, telemetry disabled -- the direct counterpart to
-/// `send_batch_through_a_noop_output_disabled_telemetry`, closing the gap found in the second
-/// round of review: every prior `send_batch` test used `NoopOutput`, which always succeeds, so
-/// none of them ever exercised `logit.component.errors` or `result.with_context(...)`'s
-/// error-only work.
-///
-/// **4, not 1 -- fully decomposed, not just asserted:** the `async_trait` box (1, same as
-/// success) plus `anyhow::anyhow!(...)` constructing `FailingOutput`'s error (1, confirmed in
-/// isolation) plus `.with_context(|| format!(...))` (2: the `format!` itself, and wrapping the
-/// original error and the new context into one boxed `anyhow::Error` node -- confirmed in
-/// isolation too, both parts require a real `anyhow::Context`, not just a closure that never
-/// runs). `1 + 1 + 2 = 4`, matching what's measured below exactly.
+/// `send_batch`'s failure path, telemetry disabled: 4, against
+/// [`send_batch_through_a_noop_output_disabled_telemetry`]'s 1. The `async_trait` box (1), plus
+/// `anyhow!` building `FailingOutput`'s error (1), plus `.with_context(|| format!(...))` (2: the
+/// `format!`, and the boxed `anyhow::Error` node joining error and context). Each part was
+/// measured in isolation.
 #[test]
 fn send_batch_through_a_failing_output_disabled_telemetry() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2860,13 +2485,9 @@ fn send_batch_through_a_failing_output_disabled_telemetry() {
     expect_allocs("runtime: send_batch through a failing Output, telemetry disabled", stats, 4);
 }
 
-/// `send_batch`'s failure path with live telemetry, steady state for the three success-path keys
-/// (warmed with a real success first) but the *first* failure this component has seen -- so
-/// `logit.component.errors` is a brand-new fourth key, not an update to an existing one. One more
-/// allocation than the disabled baseline above (5, not 4): inserting a 4th key can grow the
-/// `ComponentBuffer`'s map even though the first 3 already fit, the same `HashMap`-growth
-/// mechanism `send_batch_first_call_after_a_drain` already relies on, just triggered by key count
-/// growing rather than by `mem::take` emptying the map outright.
+/// `send_batch`'s failure path with live telemetry: the three success-path keys are resident, but
+/// this is the component's first failure, so `logit.component.errors` is a new fourth key. 5, one
+/// more than the disabled path: the fourth key grows the `ComponentBuffer`'s `HashMap`.
 #[test]
 fn send_batch_through_a_failing_output_telemetry_live() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2895,13 +2516,10 @@ fn send_batch_through_a_failing_output_telemetry_live() {
     );
 }
 
-/// The compounding case: the first call after an `internal` drain, and that call fails. Every
-/// key `send_batch` touches is a fresh insert this time (`batches.received`, `events.received`,
-/// `send.duration`, *and* `errors` -- four, not the three `send_batch_first_call_after_a_drain`
-/// covers for a successful send), on top of the same `anyhow!`/`.with_context()` cost the
-/// disabled test above pins. 7 total: not simply `4 (failure) + 3 (post-drain success)`, because
-/// a map absorbing a 4th fresh key in one call can need more than one growth step -- this is
-/// measured, not derived, for exactly that reason.
+/// The first call after an `internal` drain, failing: all four keys (`batches.received`,
+/// `events.received`, `send.duration`, `errors`) are fresh inserts, on top of the failure path's
+/// `anyhow!`/`.with_context()` cost. 7, which is measured rather than derived: a fourth fresh key
+/// can take the map through more than one growth step.
 #[test]
 fn send_batch_failing_first_call_after_a_drain() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2922,21 +2540,10 @@ fn send_batch_failing_first_call_after_a_drain() {
     expect_allocs("runtime: send_batch, failing, first call after an internal drain", stats, 7);
 }
 
-/// `run_output`'s per-batch body, `logit_pipeline::send_batch`, with telemetry disabled -- the
-/// direct counterpart to `process_batch_through_keep` above, closing the coverage gap found in
-/// review: the first draft of this section measured `process_batch`/`unwrap_batch` but never
-/// `run_output`'s own loop, despite `docs/known-gaps.md` claiming that gap closed for all three of
-/// `run_transform`/`run_output`/`Fanout::send`.
-///
-/// **This baseline is 1, not 0 -- and telemetry has nothing to do with it.** `Output` is
-/// `#[async_trait]` (`crates/logit-pipeline/src/output.rs`); the macro desugars `async fn send`
-/// into a fn returning `Pin<Box<dyn Future<...>>>`, so *every* call to `output.send(..).await`
-/// heap-allocates its future -- confirmed by measuring `NoopOutput::send` called directly (no
-/// `dyn Output`, no vtable) alongside the `dyn Output` call this test actually makes: both cost
-/// exactly 1 (16 bytes), so this is `async_trait`'s boxing, not dynamic dispatch and not this PR's
-/// `Delivered`/telemetry work. A real, previously unmeasured, per-batch cost on every output sink
-/// in production -- worth its own follow-up (a hand-written `Pin<Box<dyn Future>>` impl, or
-/// waiting on stable `dyn`-safe async fn in traits), out of scope here.
+/// `run_output`'s per-batch body, `logit_pipeline::send_batch`, telemetry disabled: 1, from
+/// neither telemetry nor dispatch. `Output` is `#[async_trait]`, which boxes every `send`'s future
+/// (16 bytes); calling `NoopOutput::send` directly, with no `dyn Output`, costs the same 1. It's a
+/// per-batch cost on every sink (`docs/known-gaps.md`).
 #[test]
 fn send_batch_through_a_noop_output_disabled_telemetry() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2958,16 +2565,10 @@ fn send_batch_through_a_noop_output_disabled_telemetry() {
     expect_allocs("runtime: send_batch through a no-op Output, telemetry disabled", stats, 1);
 }
 
-/// `send_batch` with live telemetry, steady state -- the `send_batch` counterpart to
-/// `process_batch_with_live_telemetry` above. Same three keys' shape (two counters, one timing),
-/// same steady-state claim, same narrower scope: this is the cost *between* `internal` drains, not
-/// the first call after one (see `send_batch_first_call_after_a_drain` below).
-///
-/// **Same 1 as the disabled baseline above -- telemetry itself still adds nothing in steady
-/// state**, the `async_trait` box is the entire cost either way. (A reallocation can show up here
-/// depending on which `DdSketch` bucket a given run's elapsed time lands in -- expected and
-/// harmless: `expect_allocs` asserts `allocs`, not `reallocs`, for exactly this kind of
-/// timing-dependent noise; see this file's own module doc.)
+/// `send_batch` with live telemetry between drains, the counterpart to
+/// [`process_batch_with_live_telemetry`]: 1, the same as the disabled path, all of it the
+/// `async_trait` box. A realloc can appear depending on which `DdSketch` bucket the elapsed time
+/// lands in; `expect_allocs` doesn't assert reallocs.
 #[test]
 fn send_batch_through_a_noop_output_telemetry_live() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -2994,14 +2595,10 @@ fn send_batch_through_a_noop_output_telemetry_live() {
     );
 }
 
-/// `send_batch`'s counterpart to `process_batch_first_call_after_a_drain` -- the same
-/// `mem::take`-empties-the-map effect, recurring once per `internal` drain interval, on
-/// `send_batch`'s own three keys (`batches.received`, `events.received`, `send.duration`). Three
-/// allocations here too, but composed differently than `process_batch`'s: the `async_trait` box
-/// (1, present on every call regardless of telemetry, per the disabled test above) plus the
-/// `HashMap`'s backing table (1, first insert since `mem::take` reset it) plus the fresh `DdSketch`
-/// `send.duration`'s `Timer` creates on `Drop` (1) -- where `process_batch`'s 3 is instead its own
-/// `Vec::with_capacity` (1) plus the same map-table and sketch costs.
+/// `send_batch`'s counterpart to [`process_batch_first_call_after_a_drain`], on its three keys
+/// (`batches.received`, `events.received`, `send.duration`). 3: that test's 2 (the emptied
+/// `HashMap`'s new table, and the fresh `DdSketch` `send.duration`'s `Timer` creates on `Drop`)
+/// plus the `async_trait` box every `send` pays.
 #[test]
 fn send_batch_first_call_after_a_drain() {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime should build");
@@ -3029,27 +2626,20 @@ fn send_batch_first_call_after_a_drain() {
 // Outputs
 // ---------------------------------------------------------------------------------------------
 
-/// Was the dominant cost in the whole pipeline at ~180 allocations per event -- more than ingest
-/// and fan-out combined -- and is now 0.3, after the encoder was reworked to escape and format
-/// straight into reused buffers instead of building a `String` per tag, per field name, per field
-/// value, and per line. See `docs/design/memory.md`.
+/// `influxdb_out` encoding 100 nginx events: 230, 30 of the encoder's own plus 200 re-sketching.
 ///
-/// What's left of the encoder's *own* cost is genuinely per-batch rather than per-event: one
-/// `Bytes` for the finished body, one `String` key per *distinct* series on its first sighting,
-/// and the growth of the per-series timestamp maps -- the 30 this pinned before `kv_metrics`
-/// changed what it emits. The other 200 are 2 per event and deliberate: the fixture's two
-/// distributions arrive as raw `MetricKind::Samples` now ([`kv_metrics_one_event`],
-/// `docs/adr/kv-metrics-semantics.md`) instead of single-sample `DdSketch`es, and rendering a
-/// `Samples` re-sketches it (`Samples::sketch`'s `bins` Vec, the identical cost
-/// [`graphite_encode_into_100_samples_events_expanded`] documents for the same input). That is the
-/// per-event allocation *moved* out of `kv_metrics` -- which used to pay exactly these two per
-/// event, for every downstream, whether or not anything needed a sketch -- into the one consumer
-/// shape that does: this fixture feeds `kv_metrics` output straight into the encoder with no
-/// `aggregate` between, so the sketch is built here instead. The reference pipeline runs
-/// `aggregate` first and sketches once per series, not per event
-/// ([`aggregate_absorb_one_samples_event_sketch_mode`]: 0). If the *per-batch* 30 starts
-/// tracking batch size, something has regressed to per-line allocation in the encoder itself;
-/// a single-value `Samples` fast path in `render_fields` would take the 200 back.
+/// The encoder escapes and formats straight into reused buffers. Its 30 are per batch: one `Bytes`
+/// for the body, one `String` key per distinct series on first sighting, and the per-series
+/// timestamp maps' growth. If that 30 starts tracking batch size, the encoder has regressed to
+/// per-line allocation.
+///
+/// The 200 are 2 per event: the fixture's two distributions are raw `Samples`
+/// ([`kv_metrics_one_event`], `docs/adr/kv-metrics-semantics.md`), and rendering one re-sketches
+/// it (`Samples::sketch`'s `bins` `Vec`, the cost
+/// [`graphite_encode_into_100_samples_events_expanded`] documents). This fixture feeds
+/// `kv_metrics` output straight to the encoder; the reference pipeline runs `aggregate` first,
+/// which sketches once per series ([`aggregate_absorb_one_samples_event_sketch_mode`]: 0). A
+/// single-value `Samples` fast path in `render_fields` would remove the 200.
 #[test]
 fn influx_encode_100_events() {
     let mut encoder = InfluxLineEncoder::default();
@@ -3061,25 +2651,12 @@ fn influx_encode_100_events() {
     expect_allocs("influxdb_out: encode 100 events", stats, 230);
 }
 
-/// Down from 1801 (~18/event) to 101 (~1/event), via the same treatment `influxdb_out` got
-/// (`docs/design/memory.md`): merge-join the resource and event attribute maps instead of cloning
-/// and re-inserting one, and format numbers straight into the output buffer via `write!` instead
-/// of a `format!`/`to_string()` per rendered value. The remaining allocation is one
-/// `format_rfc3339_utc` call per event (`logit_core::time`, out of this encoder's scope) plus one
-/// for the output `String`'s own first growth -- `influxdb_out` still comes out ahead at ~0.3
-/// allocations/event, since it also reuses its per-line buffers across events, which this encoder
-/// doesn't need (every `render_*` function here already writes straight into the one buffer this
-/// returns; see `EventDump::render`'s doc comment for why there's no equivalent scratch state left
-/// to hoist onto the struct).
-///
-/// Measured through `Encoder::encode` (`&EventBatch` -> `Bytes`), the same trait
-/// `InfluxLineEncoder` above is measured through and what `StreamOutput::send` actually calls in
-/// production -- not the inherent `EventDump::render` (`&EventBatch` -> `String`) directly. That
-/// costs one allocation on top of `render`'s own 101 (measured: 102): `Bytes::from(String)` still
-/// reuses `render`'s `String` buffer rather than copying its bytes, but converting it into `Bytes`
-/// needs its own small shared-refcount allocation, which a bare `String` never carries. Accepted
-/// as the (tiny, one-time-per-batch) price of `EventDump` joining the same `Encoder` seam
-/// `InfluxLineEncoder` is already on -- see `docs/adr/rotating-file-output.md`.
+/// `stdio_out` encoding 100 nginx events: 102. It merge-joins the resource and event attribute
+/// maps and formats numbers with `write!` straight into one output buffer. The 102 are one
+/// `format_rfc3339_utc` per event (`logit_core::time`), one first growth of the output `String`,
+/// and one for `Encoder::encode`'s `Bytes::from(String)`, which reuses the buffer but needs its
+/// own shared-refcount allocation. Measured through `Encoder::encode`, as `StreamOutput::send`
+/// calls it (`docs/adr/rotating-file-output.md`), not the inherent `EventDump::render`.
 #[test]
 fn stdio_encode_100_events() {
     let mut dump = EventDump::new(Format::Human);
@@ -3091,17 +2668,10 @@ fn stdio_encode_100_events() {
     expect_allocs("stdio_out: encode 100 events", stats, 102);
 }
 
-/// First measured at 401 (~4/event): `encode_event`'s header/message text, the pre-sanitize
-/// render, the sanitized-message copy, and each sanitized header field (hostname/app-name) were
-/// all fresh per-event `String` allocations -- three of those four were function-locals recreated
-/// on *every* call, so even warming `encode_into` once (per this file's own discipline) didn't
-/// help, since the very next call's locals started from empty capacity again. `SyslogEncoder`
-/// now holds `line`/`raw_msg`/`scratch` as reused struct fields instead (mirroring
-/// `InfluxLineEncoder`'s own scratch buffers), which is what brought this down to 100 (exactly
-/// 1/event). What's left is `format_rfc3339_utc`'s own per-call allocation
-/// (`push_rfc5424_timestamp`, `logit_core::time`) -- the same shared, already-accepted cost
-/// `stdio_out`'s own encoder documents for its own timestamp line, out of this encoder's scope to
-/// avoid without changing that function's signature. See `docs/design/memory.md`.
+/// `syslog_out` encoding 100 nginx events as RFC 5424: 100, one per event, from
+/// `format_rfc3339_utc` (`push_rfc5424_timestamp`), the same timestamp cost `stdio_out` pays.
+/// `SyslogEncoder` holds `line`/`raw_msg`/`scratch` as reused struct fields; as function locals
+/// they would start from empty capacity on every call, and warming wouldn't help.
 #[test]
 fn syslog_encode_into_100_events() {
     let mut encoder = SyslogEncoder::new(SyslogFormat::Rfc5424, 16);
@@ -3114,11 +2684,9 @@ fn syslog_encode_into_100_events() {
     expect_allocs("syslog_out: encode_into 100 events", stats, 100);
 }
 
-/// The one generic consumer of `logit_proto::FramedEncoder` in the tree (ADR `framed-encoder`):
-/// one warm-up call (the encoder's own struct-held scratch buffers and `out`'s backing `Vec`s
-/// reach their working capacity), then the measured call, on the same `out`. Generic over `Meta`
-/// (not just `Meta = ()`) so `collectd_out`'s `MessageBuf<usize>` row below goes through this too --
-/// every framed sink's row is one more call, not a copy of the warm-then-measure pattern.
+/// Warm-then-measure for any `FramedEncoder` (ADR `framed-encoder`): the warm-up call grows the
+/// encoder's scratch buffers and `out`'s backing `Vec`s, then the measured call reuses the same
+/// `out`. Generic over `Meta` so `MessageBuf<usize>` sinks use it too.
 fn measure_framed<M, E: FramedEncoder<Meta = M>>(
     encoder: &mut E,
     batch: &EventBatch,
@@ -3128,13 +2696,10 @@ fn measure_framed<M, E: FramedEncoder<Meta = M>>(
     measure(|| encoder.encode_into(batch, out))
 }
 
-/// Zero: `StatsdEncoder` was built with every per-metric buffer (`line`/`name`/`tag_suffix`/
-/// `scratch`/...) as a reused struct field from the start (`syslog_out`'s lesson above, applied
-/// before rather than after measurement), and, unlike syslog's RFC 5424 header, a statsd line
-/// has no timestamp to format through `format_rfc3339_utc` -- so once `MessageBuf`'s backing
-/// `Vec`s are warm, a batch of 100 single-counter DogStatsD events touches the allocator not at
-/// all. Measured through `FramedEncoder::encode_into` with the encoder's default (uncapped)
-/// `max_packet_bytes`, exactly what `StatsdOutput::send` calls on TCP.
+/// Zero for 100 single-counter DogStatsD events: every per-metric buffer
+/// (`line`/`name`/`tag_suffix`/`scratch`/...) is a reused struct field, and a statsd line has no
+/// timestamp to format. Uses the default (uncapped) `max_packet_bytes`, as `StatsdOutput::send`
+/// does on TCP.
 #[test]
 fn statsd_encode_into_100_events() {
     let mut encoder = StatsdEncoder::new(StatsdFormat::DogStatsd);
@@ -3147,14 +2712,10 @@ fn statsd_encode_into_100_events() {
     expect_allocs("statsd_out: encode_into 100 events", stats, 0);
 }
 
-/// Zero, fixed (was 300, ~3/event): `CollectdEncoder` already held its own reused `packet`/`list`/
-/// `values` scratch, but `pack_list`'s `last.clone_from(cur)` (`Identity`, the sticky previous-list
-/// state) fell through to `Clone`'s *default* `clone_from` -- `#[derive(Clone)]` only generates
-/// `clone()`, and the trait's own default `clone_from` is `*self = source.clone()`, which allocates
-/// a fresh `Vec` per non-empty identity field and drops `last`'s old one, every single list. A
-/// hand-written override that clears and `extend_from_slice`s each field in place instead is what
-/// brought this to 0 -- see `docs/design/memory.md`. `MessageBuf<usize>` (the per-datagram
-/// value-list count is its `Meta`) was already warm after `measure_framed`'s own warm-up call.
+/// Zero: `CollectdEncoder` reuses its `packet`/`list`/`values` scratch, and `Identity` has a
+/// hand-written `clone_from` that refills each field in place. `#[derive(Clone)]`'s default
+/// `clone_from` is `*self = source.clone()`, which would allocate a `Vec` per non-empty identity
+/// field on every list (~3/event).
 #[test]
 fn collectd_encode_into_100_events() {
     let mut encoder = fixtures::collectd_encoder()
@@ -3168,11 +2729,8 @@ fn collectd_encode_into_100_events() {
     expect_allocs("collectd_out: encode_into 100 events", alloc_stats, 0);
 }
 
-/// Zero, the same shape as `collectd_out`/`statsd_out` above: every per-record buffer
-/// (`tag_suffix`/`path`/`line`/...) is a reused struct field
-/// (`crates/logit-proto/src/graphite/encode.rs`'s own module doc), so a warm plaintext encode of
-/// 100 single-gauge events touches the allocator not at all. `MessageBuf<usize>` (the per-line
-/// datapoint count is its `Meta`) was already warm after `measure_framed`'s own warm-up call.
+/// Zero for 100 single-gauge events in plaintext: every per-record buffer
+/// (`tag_suffix`/`path`/`line`/...) is a reused struct field.
 #[test]
 fn graphite_encode_into_100_plaintext_events() {
     let mut encoder = fixtures::graphite_encoder();
@@ -3185,9 +2743,8 @@ fn graphite_encode_into_100_plaintext_events() {
     expect_allocs("graphite_out: encode_into 100 plaintext events", alloc_stats, 0);
 }
 
-/// Zero as well: pickle packing writes straight into the same reused `frame`/`datapoint` `Vec<u8>`
-/// struct fields (`GraphiteEncoder`'s own doc comment), patching the length prefix in place rather
-/// than copying, so this pays no more than the plaintext row above.
+/// Zero in pickle too: packing writes into reused `frame`/`datapoint` fields and patches the
+/// length prefix in place.
 #[test]
 fn graphite_encode_into_100_pickle_events() {
     let mut encoder =
@@ -3201,9 +2758,8 @@ fn graphite_encode_into_100_pickle_events() {
     expect_allocs("graphite_out: encode_into 100 pickle events", alloc_stats, 0);
 }
 
-/// Zero: expanding a `Distribution` into its `.count`/`.sum`/`.q*` sub-paths reads an
-/// already-built `DdSketch` in place (`expand_sketch`) -- no new sketch is built, unlike the
-/// `Samples` row below, so this pays exactly what the plaintext row above pays.
+/// Zero: expanding a `Distribution` into `.count`/`.sum`/`.q*` sub-paths reads the existing
+/// `DdSketch` in place (`expand_sketch`).
 #[test]
 fn graphite_encode_into_100_distribution_events_expanded() {
     let mut encoder =
@@ -3216,13 +2772,9 @@ fn graphite_encode_into_100_distribution_events_expanded() {
     expect_allocs("graphite_out: encode_into 100 Distribution events (expand)", alloc_stats, 0);
 }
 
-/// Not zero, and not meant to be: expanding a raw `Samples` record first calls
-/// `Samples::sketch()`, which builds a fresh `DdSketch` accumulator from the record's raw values
-/// -- inherent to re-summarizing a `Samples` on the way out, and the identical cost
-/// `influxdb_out`'s own `Samples` expansion already pays (`crates/logit-proto/src/graphite/
-/// encode.rs`'s `expand` doc comment). Pinned so a *rise* here is still caught, exactly like every
-/// other row in this file -- see `docs/design/memory.md` §3 for the one-`DdSketch`-per-record
-/// accounting.
+/// 100, one per event: expanding a raw `Samples` record calls `Samples::sketch()`, which builds a
+/// `DdSketch` from the values (its `bins` `Vec`). Inherent to summarizing `Samples` on the way
+/// out, and the same cost `influxdb_out` pays per `Samples`.
 #[test]
 fn graphite_encode_into_100_samples_events_expanded() {
     let mut encoder =
@@ -3235,12 +2787,10 @@ fn graphite_encode_into_100_samples_events_expanded() {
     expect_allocs("graphite_out: encode_into 100 Samples events (expand)", alloc_stats, 100);
 }
 
-/// `prometheus_out`'s encode path, like `prometheus_in`'s, is two plain functions rather than a
-/// `Decoder`/`Encoder` trait call (`docs/adr/prometheus-scrape-and-exposition.md`'s "No
-/// `logit_proto::Encoder`" section): `events_to_families` (a stateful sink's `send`) then
-/// `text::write` (a scrape request's own render) -- against 100 distinct gauge series under one
-/// family (`fixtures::prometheus_gauge_events`), the shape `prometheus_out`'s own registry walks on
-/// every scrape.
+/// `prometheus_out`'s exposition path, two plain functions rather than an `Encoder`
+/// (`docs/adr/prometheus-scrape-and-exposition.md`'s "No `logit_proto::Encoder`" section):
+/// `events_to_families` (the sink's `send`) then `text::write` (a scrape's render), over 100
+/// distinct gauge series in one family (`fixtures::prometheus_gauge_events`).
 #[test]
 fn prometheus_encode_100_series() {
     use logit_proto::prometheus::events_to_families;
@@ -3267,10 +2817,9 @@ fn prometheus_encode_100_series() {
     expect_allocs("prometheus_out: encode 100 series", stats, 414);
 }
 
-/// `prometheus_out`'s other egress: `remote_write::encode` over the 100-series gauge family
-/// `fixtures::remote_write_families` holds -- the protobuf half only, the same way the decode rows
-/// measure only the codec. `events_to_families` is already pinned by the row above and Snappy is
-/// the sink's.
+/// `prometheus_out`'s remote-write egress: `remote_write::encode` over
+/// `fixtures::remote_write_families`' 100-series gauge family. The protobuf codec only;
+/// `events_to_families` is pinned above and Snappy is the sink's.
 #[test]
 fn remote_write_encode_100_series_v1() {
     use logit_proto::prometheus::remote_write::{encode, Version};
@@ -3285,12 +2834,10 @@ fn remote_write_encode_100_series_v1() {
     expect_allocs("prometheus_out: encode 100 series, remote-write 1.0", stats, 1223);
 }
 
-/// And in 2.0, where every label name, label value and help string goes through the symbol table
-/// once instead of being repeated inline: a smaller body for more bookkeeping, and the bookkeeping
-/// is what this pair prices. 1434 against 1.0's 1223 -- the extra ~2/series is the symbol table's
-/// owned-`String` key per distinct value, which for this fixture's `shard` labels is one per
-/// series by construction. Note this is the opposite sign to the decode pair above, where 2.0
-/// wins: interning costs the sender and saves the receiver.
+/// The same in 2.0, where every label name, label value, and help string goes through the symbol
+/// table: 1434 against 1.0's 1223. The extra ~2/series is the table's owned-`String` key per
+/// distinct value, one per series for this fixture's `shard` labels. The decode pair has the
+/// opposite sign: interning costs the sender and saves the receiver.
 #[test]
 fn remote_write_encode_100_series_v2() {
     use logit_proto::prometheus::remote_write::{encode, Version};
@@ -3310,32 +2857,21 @@ fn remote_write_encode_100_series_v2() {
 // ---------------------------------------------------------------------------------------------
 
 /// One round trip across the Rust/Lua boundary for a script that reads one attribute and writes
-/// one. Down from 21 (`docs/design/memory.md` §8, item 13) via three independent fixes: `process`
-/// is a cached `RegistryKey` instead of a `_G` lookup per call, `event.attributes` returns the
-/// same cached `AttrsProxy` userdata on every access instead of a fresh one, and both metamethods
-/// take `mlua::String` instead of an owned Rust `String` (no metamethod-key allocation at all).
+/// one: 9. `process` is a cached `RegistryKey`, `event.attributes` returns one cached `AttrsProxy`
+/// per event, and both metamethods take `mlua::String`, so no key is copied.
 ///
-/// The 9 that remain, measured directly rather than assumed (by comparing this script against
-/// narrower ones isolating each piece -- a passthrough with no `.attributes` touch at all, a
-/// `nil`-returning script to isolate the final `Box`, a read-only access, a write-only access, and
-/// two reads against an already-cached proxy):
+/// The breakdown, each piece isolated against a narrower script:
 ///
-/// - **4** for any call at all, win or lose: the `Rc<RefCell<Event>>` and the `EventProxy`
-///   userdata itself account for 2 of those; the other 2 are inside mlua/LuaJIT's own per-call
-///   bookkeeping (reference-table and GC upkeep as objects from the *previous* call become
-///   collectible), not attributable to a specific line in this crate.
-/// - **+1** for the `Box` on the way out (`ProcessOutcome::Emit`) -- confirmed by comparing
-///   against a script that returns `nil` instead, which skips it and lands at 4.
-/// - **+3** for creating and caching the `AttrsProxy` on the *first* `event.attributes` access of
-///   an event, whether that access reads or writes -- a second access against the same
-///   already-cached proxy costs nothing more (measured directly: two reads still total 8, the
-///   same as one).
-/// - **+1** for the one attribute write this fixture's script actually makes, from
-///   `lua_to_value` allocating a `Bytes` to hold the new `"prod"` string.
+/// - **4** for any call: the `Rc<RefCell<Event>>` and the `EventProxy` userdata (2), plus 2 in
+///   mlua/LuaJIT's per-call bookkeeping (reference-table and GC upkeep as the previous call's
+///   objects become collectible).
+/// - **+1** for the `Box` on the way out (`ProcessOutcome::Emit`); a `nil`-returning script lands
+///   at 4.
+/// - **+3** for creating and caching the `AttrsProxy` on an event's first `event.attributes`
+///   access, read or write. Later accesses are free: two reads total 8, the same as one.
+/// - **+1** for the attribute write: `lua_to_value` allocates a `Bytes` for `"prod"`.
 ///
-/// This is the number `docs/known-gaps.md` has been carrying as an unbenchmarked assumption. It
-/// does not invalidate the proxy design -- see `lua::to_table` in `benches/pipeline.rs` for the
-/// comparison against the alternative -- but it does show the boundary is not free.
+/// `lua::to_table` in `benches/pipeline.rs` compares the proxy against a full table conversion.
 #[test]
 fn lua_process_one_event() {
     let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
@@ -3347,12 +2883,9 @@ fn lua_process_one_event() {
     expect_allocs("lua: process 1 event", stats, 9);
 }
 
-/// `run_lua`'s full per-batch resource contract (`crates/logit-script/src/resource.rs`): a
-/// `set_resource` call before `process`, then `take_resource` after -- for a script that never
-/// touches `resource` at all, this must cost exactly what `lua_process_one_event` above costs.
-/// `set_resource`/`take_resource` on their own don't allocate: `set_resource` only assigns two
-/// fields, and `take_resource` returns `None` (`ResourceState::modified` stays `None`) without
-/// touching the heap.
+/// `run_lua`'s per-batch resource contract (`set_resource`, `process`, `take_resource`) for a
+/// script that never touches `resource`: 9, the same as [`lua_process_one_event`].
+/// `set_resource` assigns two fields, and `take_resource` returns `None` without allocating.
 #[test]
 fn lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_process_alone() {
     let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
@@ -3372,16 +2905,11 @@ fn lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_proc
     expect_allocs("lua: set_resource + process + take_resource, no write", stats, 9);
 }
 
-/// The cost a script that writes `resource` (`docs/adr/operator-declared-resource-attributes.md`)
-/// actually pays -- measured, not derived from the no-write path above, since
-/// `LUA_RESOURCE_WRITE_SCRIPT` never touches `event.attributes` at all and so skips the `+3` for
-/// creating and caching an `AttrsProxy` that `lua_process_one_event`'s script pays. **7**: the 4
-/// baseline per-call allocations every `process()` call costs regardless of what a script touches
-/// (`lua_process_one_event`'s own breakdown), `+1` for the `Box` on `ProcessOutcome::Emit`, `+1`
-/// for `lua_to_resource_value`'s `Bytes` allocation for the new `"nginx"` string, and `+1` for
-/// `take_resource`'s `Arc::new(Resource { .. })` commit -- the copy-on-write `AttrMap` clone
-/// itself is free here for the same reason `set_resource_map_resource_cache_miss` above is: the
-/// fixture resource starts with an empty, inline `AttrMap`.
+/// A script writing `resource` (`docs/adr/operator-declared-resource-attributes.md`), touching no
+/// event attribute: 7. The 4-allocation call baseline, `+1` for the `Box` on
+/// `ProcessOutcome::Emit`, `+1` for `lua_to_resource_value`'s `Bytes` for `"nginx"`, and `+1` for
+/// `take_resource`'s `Arc::new(Resource { .. })` commit. The copy-on-write `AttrMap` clone is
+/// free because the fixture resource's map is empty and inline.
 #[test]
 fn lua_process_one_event_writing_resource() {
     let worker =
@@ -3403,13 +2931,10 @@ fn lua_process_one_event_writing_resource() {
     expect_allocs("lua: set_resource + process + take_resource, writing resource", stats, 7);
 }
 
-/// What a script reading `event.log.trace_id` costs (`crates/logit-script/src/proxy.rs`'s
-/// `LogProxy`, `docs/adr/log-record-trace-context.md`). **9** -- the same total as
-/// `lua_process_one_event`'s `AttrsProxy`-touching script, despite `LUA_LOG_TRACE_READ_SCRIPT`
-/// never touching `event.attributes` at all: creating and caching a `LogProxy` userdata on first
-/// access costs the same as `AttrsProxy` did there, and `to_hex`'s returned `String` costs what
-/// the attribute write cost there. Measured, not derived from that breakdown -- the two scripts
-/// don't share enough of their allocation shape to assume the numbers would just add up.
+/// A script reading `event.log.trace_id` (`LogProxy`, `docs/adr/log-record-trace-context.md`): 9,
+/// the same total as [`lua_process_one_event`] without touching `event.attributes`. Creating and
+/// caching the `LogProxy` costs what `AttrsProxy` does (+3), and `to_hex`'s returned `String`
+/// costs what the attribute write does (+1). Measured, not derived.
 #[test]
 fn lua_process_one_event_reading_log_trace() {
     let worker =
@@ -3427,36 +2952,21 @@ fn lua_process_one_event_reading_log_trace() {
     expect_allocs("lua: process 1 event, reading event.log.trace_id", stats, 9);
 }
 
-/// What a script reading `event.metrics[1].value` costs (`crates/logit-script/src/proxy.rs`'s
-/// `MetricsProxy`/`MetricProxy`). **11**, not the 9 a naive add-up from
-/// [`lua_process_one_event_reading_log_trace`]'s breakdown would predict (4 baseline + 1 `Box` +
-/// 3 for creating and caching `MetricsProxy` on the first `event.metrics` access, the same cost
-/// `AttrsProxy`/`LogProxy` pay for their own first access, + 1 for the "one small allocation"
-/// `MetricsProxy`'s own doc comment says a per-index `MetricProxy` costs).
+/// A script reading `event.metrics[1].value` (`MetricsProxy`/`MetricProxy`): 11. 4 baseline, +1
+/// `Box` on `Emit`, +3 for creating and caching `MetricsProxy` on the first `event.metrics` access
+/// (as [`lua_process_one_event_reading_metric_len`] pins), and +3 for the per-index `MetricProxy`.
 ///
-/// Measured, not assumed, against two narrower scripts: one indexing `event.metrics[1]` but
-/// never reading `.value` off it (still 11 -- confirming the field read itself, a plain `f64`
-/// copied into `LuaValue::Number`, costs nothing, the same reason `event.span.name`'s
-/// `create_string` doesn't show up below either), and one indexing `event.metrics[1]` *twice*
-/// (14 -- confirming each index costs exactly +3, not +1, since 14 - 11 = 11 - 8 =
-/// [`lua_process_one_event_reading_metric_len`]'s own baseline). So a fresh, uncached
-/// `MetricProxy` costs the *same* 3 allocations `AttrsProxy`/`LogProxy`/`SpanProxy` pay for
-/// create-**and**-cache via a `RegistryKey`, even though `MetricProxy` never calls
-/// `create_registry_value` at all -- `lua.create_userdata` alone, returned as a fresh value from
-/// an `Index` metamethod rather than handed to Lua as a call argument the way `EventProxy` itself
-/// is, is evidently not the single cheap allocation `MetricsProxy`'s doc comment assumes when it
-/// argues against caching per-index handles. **Not changed here** (out of this crate's scope,
-/// `crates/logit-script/src/proxy.rs`) -- reported as a finding: a script that indexes the same
-/// metric repeatedly (`event.metrics[1].value`, then `.temporality`, then `.monotonic`, say) pays
-/// this 3-allocation mint on *every* index, not once per event the way every other sub-proxy in
-/// this module does.
+/// Two narrower scripts isolate the pieces. Indexing `event.metrics[1]` without reading `.value`
+/// is still 11, so the `f64` read is free. Indexing it twice is 14, so each index costs +3
+/// (14 - 11 = 11 - 8). An uncached `MetricProxy` minted by `lua.create_userdata` in an `Index`
+/// metamethod costs the same 3 that `AttrsProxy`/`LogProxy`/`SpanProxy` pay to create and cache
+/// through a `RegistryKey`. `MetricsProxy` doesn't cache per-index handles, so a script indexing
+/// the same metric repeatedly pays the 3 on every index (`MetricsProxy`'s doc comment weighs that
+/// trade).
 ///
-/// Unaffected by `MetricProxy::event`'s field being a `Weak<RefCell<Event>>` rather than a
-/// strong `Rc` -- that change moved a *different* cost (a possible `Event::clone` on the way out,
-/// see [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] below), not this one.
-/// `sum_metric_event`'s attributes are empty and its one metric stays inline, so `Event::clone`
-/// was already free here even before that field changed -- this row's total is identical either
-/// way, which is exactly why the spilled-fixture row below exists as its own, separate guard.
+/// `sum_metric_event` has empty attributes and one inline metric, so an `Event::clone` on the way
+/// out would be free here. [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] is
+/// the guard for that.
 #[test]
 fn lua_process_one_event_reading_metric_value() {
     let worker =
@@ -3469,33 +2979,17 @@ fn lua_process_one_event_reading_metric_value() {
     expect_allocs("lua: process 1 event, reading event.metrics[1].value", stats, 11);
 }
 
-/// [`lua_process_one_event_reading_metric_value`]'s own script, run against
-/// [`fixtures::sum_metric_event_with_spilled_attributes`] instead of the plain, empty-`AttrMap`
-/// fixture -- the regression guard for `MetricProxy::event` being a `Weak<RefCell<Event>>`
-/// (`crates/logit-script/src/proxy.rs`) rather than a strong `Rc`.
+/// [`lua_process_one_event_reading_metric_value`]'s script on
+/// [`fixtures::sum_metric_event_with_spilled_attributes`]: the guard that `MetricProxy::event`
+/// stays a `Weak<RefCell<Event>>`. 11, the same as the plain fixture:
+/// [`lua_process_one_event_passthrough_on_a_spilled_event`]'s 5 plus the +6 that
+/// `event.metrics[1].value` costs.
 ///
-/// **11, identical to the plain-fixture row above** -- confirmed against
-/// [`lua_process_one_event_passthrough_on_a_spilled_event`] just below, which measures this same
-/// spilled fixture through a script that touches nothing at all and also lands at the bare 5
-/// (baseline `EventProxy::into_inner`'s `Rc::try_unwrap` fast path always succeeds when nothing
-/// ever creates a second strong reference). So this fixture's own spill costs nothing on its own
-/// (nothing ever clones its `AttrMap`), and this row's total is exactly that passthrough's 5 plus
-/// the same +6 `event.metrics[1].value` costs against the plain fixture (11 - 5 = 6, matching
-/// `lua_process_one_event_reading_metric_value`'s own 11 minus its own baseline).
-///
-/// **Would not hold with a strong `Rc`.** Before `MetricProxy::event` was a `Weak`, a leftover,
-/// not-yet-GC'd `event.metrics[1]` temporary held a strong reference to the same
-/// `Rc<RefCell<Event>>` `EventProxy` holds -- if that temporary was still alive when `process()`
-/// returned (LuaJIT's GC is incremental, not deterministic, so a temporary going out of Lua-side
-/// scope is not the same as it being collected), `EventProxy::into_inner`'s `Rc::try_unwrap` would
-/// find two strong references, fail, and fall back to `rc.borrow().clone()` -- a real `Event`
-/// clone that this fixture's spilled `AttrMap` (unlike `sum_metric_event`'s empty, inline one)
-/// would make allocate for real. That regression was invisible against `sum_metric_event`'s own
-/// row above no matter which representation `MetricProxy::event` used, since an empty `AttrMap`
-/// clones for free either way -- this fixture exists specifically to make it visible: if this
-/// number ever climbs above the passthrough row's 5 plus this test's own +6 without a
-/// corresponding rise in the passthrough row itself, `MetricProxy` has regressed back to holding
-/// event alive past the call.
+/// If a `MetricProxy` held a strong `Rc`, an uncollected `event.metrics[1]` temporary (LuaJIT's GC
+/// is incremental) could still be alive when `process()` returns. `EventProxy::into_inner`'s
+/// `Rc::try_unwrap` would then fail and fall back to cloning the `Event`, and this fixture's
+/// spilled `AttrMap` makes that clone allocate. If this count rises while the passthrough row
+/// holds, `MetricProxy` is keeping the event alive past the call.
 #[test]
 fn lua_process_one_event_reading_metric_value_on_a_spilled_event() {
     let worker =
@@ -3512,14 +3006,10 @@ fn lua_process_one_event_reading_metric_value_on_a_spilled_event() {
     );
 }
 
-/// [`fixtures::sum_metric_event_with_spilled_attributes`] through a script that touches nothing
-/// at all -- the baseline
-/// [`lua_process_one_event_reading_metric_value_on_a_spilled_event`] above is measured against.
-/// **5** = 4 (baseline) + 1 (`Box` on `Emit`), identical to every other untouched-event baseline
-/// in this file: a script that creates no proxy leaves `EventProxy`'s own `Rc` as the *only*
-/// strong reference to the event, so `into_inner`'s `Rc::try_unwrap` fast path always succeeds,
-/// regardless of whether the event's own `AttrMap` is spilled -- spilling costs nothing when
-/// nothing ever clones it.
+/// [`fixtures::sum_metric_event_with_spilled_attributes`] through a script that touches nothing,
+/// the baseline for the row above. 5 = 4 (baseline) + 1 (`Box` on `Emit`). With no proxy created,
+/// `EventProxy`'s `Rc` is the only strong reference, so `into_inner`'s `Rc::try_unwrap` succeeds
+/// and the spilled map is never cloned.
 #[test]
 fn lua_process_one_event_passthrough_on_a_spilled_event() {
     let worker = ScriptWorker::new(fixtures::LUA_PASSTHROUGH_SCRIPT).expect("script should load");
@@ -3531,12 +3021,10 @@ fn lua_process_one_event_passthrough_on_a_spilled_event() {
     expect_allocs("lua: process 1 event (spilled attrs), passthrough", stats, 5);
 }
 
-/// What a script reading only `#event.metrics` costs -- no `event.metrics[i]` indexing at all, so
-/// this isolates `MetricsProxy`'s own first-access cost (**+3**, same as `AttrsProxy`/`LogProxy`)
-/// from the per-index `MetricProxy` [`lua_process_one_event_reading_metric_value`] above also
-/// pays. **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (`MetricsProxy` create-and-cache) -- 3
-/// less than that test's 11, confirming the `MetricProxy` index (not merely touching
-/// `event.metrics` at all) is exactly where that test's extra 3 allocations come from.
+/// A script reading only `#event.metrics`, with no indexing: 8 = 4 (baseline) + 1 (`Box` on
+/// `Emit`) + 3 (`MetricsProxy` create-and-cache). Three less than
+/// [`lua_process_one_event_reading_metric_value`]'s 11: the difference is the per-index
+/// `MetricProxy`.
 #[test]
 fn lua_process_one_event_reading_metric_len() {
     let worker =
@@ -3549,14 +3037,9 @@ fn lua_process_one_event_reading_metric_len() {
     expect_allocs("lua: process 1 event, reading #event.metrics", stats, 8);
 }
 
-/// What a script reading `event.span.name` costs (`crates/logit-script/src/proxy.rs`'s
-/// `SpanProxy`). **8** = 4 (baseline) + 1 (`Box` on `Emit`) + 3 (creating and caching the
-/// `SpanProxy` userdata on the first `event.span` access, the same cost every other first-access
-/// proxy in this file pays). `span.name` is a `Value::Str`, read via the same `value_to_lua` ->
-/// `lua.create_string` path `event.attributes`/`event.log.message` use -- no Rust-side allocation
-/// of its own, the same reason `event.metrics[1].value`'s plain number above costs nothing extra
-/// either: LuaJIT's own string/number representations aren't tracked by this file's counting
-/// allocator.
+/// A script reading `event.span.name` (`SpanProxy`): 8 = 4 (baseline) + 1 (`Box` on `Emit`) + 3
+/// (`SpanProxy` create-and-cache on first access). The name goes through `lua.create_string`,
+/// which allocates in LuaJIT's own heap, invisible to the counting allocator.
 #[test]
 fn lua_process_one_event_reading_span_name() {
     let worker =
@@ -3569,13 +3052,9 @@ fn lua_process_one_event_reading_span_name() {
     expect_allocs("lua: process 1 event, reading event.span.name", stats, 8);
 }
 
-/// `run_lua`'s full per-batch `scope` contract (`crates/logit-script/src/scope.rs`): a
-/// `set_scope` call before `process`, then `take_scope` after -- for a script that never touches
-/// `scope` at all, this must cost exactly what `lua_process_one_event` costs, the same contract
-/// `lua_process_one_event_with_resource_hooks_but_no_write_costs_the_same_as_process_alone`
-/// already establishes for `resource`. `set_scope` only assigns two fields (`ScopeState::base`/
-/// `modified`) and `take_scope` returns `None` (`modified` stays `None`) without touching the
-/// heap -- neither has a reason to cost anything, and this confirms it.
+/// `run_lua`'s per-batch `scope` contract (`set_scope`, `process`, `take_scope`) for a script that
+/// never touches `scope`: 9, the same as [`lua_process_one_event`]. `set_scope` assigns two
+/// fields and `take_scope` returns `None` without allocating.
 #[test]
 fn lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process_alone() {
     let worker = ScriptWorker::new(fixtures::LUA_ENRICH_SCRIPT).expect("script should load");
@@ -3595,13 +3074,8 @@ fn lua_process_one_event_with_scope_hooks_but_no_write_costs_the_same_as_process
     expect_allocs("lua: set_scope + process + take_scope, no write", stats, 9);
 }
 
-/// What a script reading `scope.name` costs. **5** = 4 (baseline) + 1 (`Box` on `Emit`) -- no
-/// `+3` first-access cost the way `event.attributes`/`event.log`/`event.metrics`/`event.span` all
-/// pay, because `scope` (unlike every `EventProxy` sub-proxy) is installed **once**, in
-/// `ScriptWorker::new`, before this measurement's warm-up call ever runs -- there is no per-event
-/// userdata to create or cache, only a global table lookup and a field read off state already in
-/// hand. `scope.name`'s `lua.create_string` call is the same LuaJIT-internal, host-allocation-free
-/// path `event.span.name` uses above.
+/// A script reading `scope.name`: 5 = 4 (baseline) + 1 (`Box` on `Emit`). No +3 first-access
+/// cost: `scope` is a global installed once in `ScriptWorker::new`, not per-event userdata.
 #[test]
 fn lua_process_one_event_reading_scope_name() {
     let worker =
@@ -3622,18 +3096,11 @@ fn lua_process_one_event_reading_scope_name() {
     expect_allocs("lua: set_scope + process (reading scope.name) + take_scope", stats, 5);
 }
 
-/// What a script's first write to `scope.attributes` in a batch costs
-/// (`crates/logit-script/src/scope.rs`'s `ensure_modified` copy-on-write path). **7** = 4
-/// (baseline) + 1 (`Box` on `Emit`) + 1 (`lua_to_scope_value`'s `Bytes::copy_from_slice` for the
-/// new `"v"` string, the same cost an event-attribute write pays) + 1 (`take_scope`'s
-/// `Arc::new(Scope { .. })` commit, the same cost `take_resource`'s does for `resource`) -- and
-/// **not** a separate allocation for `ensure_modified`'s `Scope` clone itself: the fixture's
-/// `scope.name`/`version` are `Bytes::from_static` (never-allocated, refcount-free) and its
-/// `attributes` map starts empty and inline, so cloning the whole `Scope` struct is a plain
-/// memcpy here, the same reason `lua_process_one_event_writing_resource`'s own `AttrMap` clone is
-/// free. Confirms the module doc comment's claim that `modified: None` -- not the clone itself --
-/// is what makes an *unwritten* batch allocation-free; a write's cost is the new value plus the
-/// commit, not the copy-on-write step in between.
+/// A script's first write to `scope.attributes` in a batch (`ensure_modified`'s copy-on-write
+/// path): 7 = 4 (baseline) + 1 (`Box` on `Emit`) + 1 (`lua_to_scope_value`'s `Bytes` for `"v"`) +
+/// 1 (`take_scope`'s `Arc::new(Scope { .. })` commit). The `Scope` clone itself is free: the
+/// fixture's `name`/`version` are `Bytes::from_static` and its `attributes` map is empty and
+/// inline.
 #[test]
 fn lua_process_one_event_writing_scope_attribute() {
     let worker =
@@ -3655,17 +3122,10 @@ fn lua_process_one_event_writing_scope_attribute() {
     expect_allocs("lua: set_scope + process (writing scope.attributes.k) + take_scope", stats, 7);
 }
 
-/// What a script writing `resource.schema_url` costs
-/// (`crates/logit-script/src/resource.rs`'s `write_schema_url`), over
-/// [`lua_process_one_event_writing_resource`]'s attribute-write baseline above. **7** = 4
-/// (baseline) + 1 (`Box` on `Emit`) + 1 (`Bytes::copy_from_slice` for the new URL, the same
-/// `write_schema_url` cost an attribute write pays through `lua_to_resource_value`) + 1
-/// (`take_resource`'s `Arc::new(Resource { .. })` commit) -- the same total as
-/// `lua_process_one_event_writing_resource` even though the two scripts write different fields,
-/// because both pay exactly one "new value" allocation and one commit allocation on top of the
-/// same 5-allocation baseline (4 + `Box`), and this fixture's `Resource::default()` starts with
-/// `schema_url: None` and an empty, inline `AttrMap`, so `ensure_modified`'s clone is free here
-/// too.
+/// A script writing `resource.schema_url` (`write_schema_url`): 7 = 4 (baseline) + 1 (`Box` on
+/// `Emit`) + 1 (`Bytes::copy_from_slice` for the URL) + 1 (`take_resource`'s
+/// `Arc::new(Resource { .. })` commit), the same as [`lua_process_one_event_writing_resource`].
+/// `ensure_modified`'s clone is free: `Resource::default()` has no `schema_url` and an empty map.
 #[test]
 fn lua_process_one_event_writing_resource_schema_url() {
     let worker = ScriptWorker::new(fixtures::LUA_RESOURCE_SCHEMA_URL_WRITE_SCRIPT)
@@ -3691,13 +3151,9 @@ fn lua_process_one_event_writing_resource_schema_url() {
     );
 }
 
-/// `scope.name = scope.name` -- an identity write, which `crate::scope`'s no-op check
-/// (`scope_name(&state) == s`, a byte-slice comparison against the string already installed)
-/// must catch *before* ever calling `ensure_modified`, mirroring `AttrsProxy`/`ResourceProxy`'s
-/// own identity-write no-ops. Must cost exactly what
-/// [`lua_process_one_event_reading_scope_name`] costs (**5**): the comparison reads `scope.name`
-/// the same way that test does, then a string-equality check that touches no heap, and
-/// `take_scope` still returns `None` since `modified` was never set.
+/// `scope.name = scope.name`, an identity write: 5, the same as
+/// [`lua_process_one_event_reading_scope_name`]. The no-op check (a byte-slice comparison against
+/// the installed name) runs before `ensure_modified`, so `take_scope` still returns `None`.
 #[test]
 fn lua_process_one_event_identity_write_to_scope_name_is_free() {
     let worker =
@@ -3719,31 +3175,22 @@ fn lua_process_one_event_identity_write_to_scope_name_is_free() {
 }
 
 /// `Event.new{timestamp = "1", attributes = {env = "prod"}, log = {message = "hi"}}` returned
-/// from `process()` in place of the incoming event (`crates/logit-script/src/construct.rs`,
-/// `docs/adr/lua-event-constructor.md`) -- the smallest useful constructed event, measured the
-/// same way as every row above. Additive: a script that never calls `Event.new` pays nothing
-/// new, which is what every other `lua:` pin in this section staying put guarantees.
+/// from `process()` in place of the incoming event (`docs/adr/lua-event-constructor.md`), the
+/// smallest useful constructed event. A script that never calls `Event.new` pays none of this.
 ///
-/// **17**, broken down by measuring narrower scripts against this one (the same method
-/// [`lua_process_one_event`] used), not derived:
+/// 17, each piece isolated against a narrower script:
 ///
-/// - **4** for any call at all (`lua_process_one_event`'s baseline, confirmed again here with a
-///   `return nil` script).
-/// - **+6** for `Event.new{timestamp = "1"}` itself, whether or not the result is returned
-///   (constructing one and returning `nil` lands at 10): the `Rc<RefCell<Event>>` and the
-///   `EventProxy` userdata a fresh handle costs -- the same pair the incoming event's proxy
-///   accounts for in the baseline -- plus what mlua spends calling into a Rust closure and
-///   handing its userdata result back to Lua; not attributable line by line, the same caveat
-///   the baseline's own bookkeeping carries. `raw_get`/`pairs` over the argument table and the
-///   `timestamp` parse allocate nothing, and every error-path `format!` is lazy.
-/// - **+1** for the `Box` on `ProcessOutcome::Emit` (returning it: 11).
-/// - **+3** for `attributes = {env = "prod"}`: 1 for the sub-table (an empty `attributes = {}`
-///   lands at 12) and 2 for its one entry, one of which is `lua_to_value`'s `Bytes` for `"prod"`
-///   -- a second attribute adds exactly 1 more, so the other 1 is the map's first insert, not
-///   per-entry.
-/// - **+3** for `log = {message = "hi"}`, symmetrically: 1 for the sub-table and 2 for
-///   `message`, `lua_to_value`'s `Bytes` for `"hi"` among them. `LogRecord` is inline in
-///   `Event`, so there is no box for the record itself.
+/// - **4** for any call (a `return nil` script).
+/// - **+6** for `Event.new{timestamp = "1"}`, returned or not (returning `nil` lands at 10): the
+///   new handle's `Rc<RefCell<Event>>` and `EventProxy` userdata, plus mlua's cost of calling a
+///   Rust closure and handing back userdata, not attributable line by line. Reading the argument
+///   table and parsing `timestamp` allocate nothing, and error-path `format!`s are lazy.
+/// - **+1** for the `Box` on `ProcessOutcome::Emit` (11).
+/// - **+3** for `attributes = {env = "prod"}`: 1 for the sub-table (`attributes = {}` lands at
+///   12) and 2 for the entry, one of them `lua_to_value`'s `Bytes` for `"prod"`. A second
+///   attribute adds 1, so the other is the map's first insert, not per entry.
+/// - **+3** for `log = {message = "hi"}`: 1 for the sub-table and 2 for `message`, including
+///   the `Bytes` for `"hi"`. `LogRecord` is inline in `Event`, so the record needs no box.
 #[test]
 fn lua_process_one_event_constructing_a_log_event() {
     let worker = ScriptWorker::new(fixtures::LUA_EVENT_NEW_LOG_SCRIPT).expect("script should load");
@@ -3756,27 +3203,24 @@ fn lua_process_one_event_constructing_a_log_event() {
 }
 
 /// `Event.new{timestamp = "1", metrics = {{name = "tick", kind = "gauge", value = 1}}}` returned
-/// from `process()` in place of the incoming event -- the smallest useful constructed *metric*
-/// event, the shape a `flush(now)` tick emits. Same method and baseline as
-/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way.
+/// from `process()` in place of the incoming event: the smallest useful constructed metric event,
+/// the shape a `flush(now)` tick emits. Measured as
+/// [`lua_process_one_event_constructing_a_log_event`] is.
 ///
-/// **16**, broken down by measuring narrower scripts against this one, not derived:
+/// 16, each piece isolated against a narrower script:
 ///
-/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
-///   `ProcessOutcome::Emit`: 11, exactly the log row's first three terms.
-/// - **+1** for the `metrics` array table (`metrics = {}` lands at 12; an empty list costs no
-///   `MetricList`/`Vec` growth -- `with_capacity(0)` and the one-record case both stay inline).
-/// - **+4** for the one metric: 1 for its own sub-table; 1 for `validated_sequence_len`'s key
-///   `Vec` over the array (paid once per event, not per metric -- a second metric adds 3 plus
-///   the `MetricList` spill past its one inline slot, 20 in all); 1 for the `format!`'d
-///   `metrics[i]` path each record's field errors are prefixed with (the same script with a
-///   static path lands at 15 -- the one deliberate per-metric cost, cheaper than threading the
-///   index through every helper); and 1 that every non-empty *record* sub-table carries beyond
-///   its own table and fields, the same bucket the log row folds into `message` -- `log =
-///   {message = 1}` lands at 13 against 12 for an empty sub-table, and a second field adds
-///   nothing. `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk and
-///   every nil-defaulted field allocate nothing; `unit = "ms"` and an empty `exemplars = {}`
-///   add 0 and 1 (the table) respectively.
+/// - **11**: the log row's first three terms (4 baseline, +6 `Event.new`, +1 `Box`).
+/// - **+1** for the `metrics` array table (`metrics = {}` lands at 12; `with_capacity(0)` and a
+///   one-record list both stay inline).
+/// - **+4** for the one metric: its sub-table; `validated_sequence_len`'s key `Vec` over the array
+///   (once per event: a second metric adds 3 plus the `MetricList` spill, 20 in all); the
+///   `format!`'d `metrics[i]` path field errors are prefixed with (a static path lands at 15; the
+///   one per-metric cost, cheaper than threading the index through every helper); and the 1 every
+///   non-empty record sub-table carries beyond its table and fields (`log = {message = 1}` lands
+///   at 13 against 12 for an empty one, and a second field adds nothing).
+///
+/// `intern("tick")`, `kind`'s borrowed `to_string_lossy`, the `expect_keys` walk, and nil-defaulted
+/// fields allocate nothing; `unit = "ms"` adds 0 and an empty `exemplars = {}` adds 1 (the table).
 #[test]
 fn lua_process_one_event_constructing_a_gauge_event() {
     let worker =
@@ -3790,32 +3234,27 @@ fn lua_process_one_event_constructing_a_gauge_event() {
 }
 
 /// `Event.new{timestamp = "1", span = {trace_id = <hex>, span_id = <hex>, name = "GET /"}}`
-/// returned from `process()` in place of the incoming event -- the smallest useful constructed
-/// *span* event, every core default applied (`kind` internal, `status` unset, `end_timestamp`
-/// the event's own, no `SpanExt`, empty `events`/`links`). Same method and baseline as
-/// [`lua_process_one_event_constructing_a_log_event`]; additive in the same way, and the last
-/// payload kind `Event.new` builds.
+/// returned from `process()` in place of the incoming event: the smallest useful constructed span
+/// event, every core default applied (`kind` internal, `status` unset, `end_timestamp` the event's
+/// own, no `SpanExt`, empty `events`/`links`). Measured as
+/// [`lua_process_one_event_constructing_a_log_event`] is.
 ///
-/// **14**, broken down by measuring narrower scripts against this one, not derived:
+/// 14, each piece isolated against a narrower script:
 ///
-/// - **4** baseline, **+6** for `Event.new{timestamp = "1"}` itself and **+1** for the `Box` on
-///   `ProcessOutcome::Emit`: 11, exactly the log and gauge rows' first three terms.
-/// - **+3** for the `span` sub-table with its three required fields: 1 for the table itself,
-///   1 for `lua_to_value`'s `Bytes` for the `name` (`name = 1` lands at 13), and the same 1 that
-///   every non-empty record sub-table carries beyond its own table and fields (the log row's
-///   `message` bucket, the gauge row's fourth per-record allocation). The two hex ids parse
-///   straight into their `[u8; N]` arrays, `SpanRecord` is inline in `Event` (no box), and
-///   `Vec::new()` for `events`/`links` is free.
-/// - **+0** for every defaulted or scalar field: `kind = "server", status = "ok", end_timestamp
-///   = "2", parent_span_id = <hex>` together land at 14 too (enum names are looked up through
-///   borrowed `to_string_lossy`, the nanos string parses in place), as does an explicit
-///   `dropped_events_count = 0, flags = 0` -- a default value never earns the `SpanExt` box.
-/// - Beyond the pin, for scale: `status_message = "boom"` adds 2 (the `Box<SpanExt>` and the
-///   `Bytes`); an empty `events = {}` or `links = {}` adds 1 each (the Lua table --
-///   `with_capacity(0)` allocates nothing); one span event `{timestamp = "1", name = "e"}` adds
-///   7 (the `events` table, the row's table, `validated_sequence_len`'s key `Vec`, the
-///   `format!`'d `span.events[1]` path, the name's `Bytes`, the `Vec<SpanEvent>` itself, and the
-///   per-record bucket), and one link with just its ids adds 6 (the same minus the `Bytes`).
+/// - **11**: the log row's first three terms (4 baseline, +6 `Event.new`, +1 `Box`).
+/// - **+3** for the `span` sub-table: the table, `lua_to_value`'s `Bytes` for `name`
+///   (`name = 1` lands at 13), and the 1 every non-empty record sub-table carries. The hex ids
+///   parse into `[u8; N]` arrays, `SpanRecord` is inline in `Event`, and empty
+///   `events`/`links` are free.
+/// - **+0** for defaulted or scalar fields: `kind = "server", status = "ok",
+///   end_timestamp = "2", parent_span_id = <hex>` also land at 14, as does an explicit
+///   `dropped_events_count = 0, flags = 0`. A default value never earns the `SpanExt` box.
+///
+/// Beyond the pin: `status_message = "boom"` adds 2 (the `Box<SpanExt>` and the `Bytes`); an
+/// empty `events = {}` or `links = {}` adds 1 (the Lua table); one span event
+/// `{timestamp = "1", name = "e"}` adds 7 (the `events` table, its row table, the key `Vec`, the
+/// `format!`'d path, the name's `Bytes`, the `Vec<SpanEvent>`, and the per-record 1); one link
+/// with only its ids adds 6 (the same minus the `Bytes`).
 #[test]
 fn lua_process_one_event_constructing_a_span_event() {
     let worker =
@@ -3836,14 +3275,11 @@ fn lua_process_one_event_constructing_a_span_event() {
 /// for the reference config. Excludes the output encoders, which run once per flush window rather
 /// than once per event, and excludes fan-out, which the config's `tap` branch adds.
 ///
-/// 3 = 1 (decode) + 1 (json) + 1 (kv_metrics) + 0 (keep) + 0 (keep_values) + 0 (aggregate). Was 5
-/// while `kv_metrics` sketched each distribution per event ([`kv_metrics_one_event`]); `aggregate`
-/// absorbs the raw `Samples` it emits now into its per-series sketch without allocating
-/// ([`aggregate_absorb_one_samples_event_sketch_mode`]), so the two allocations are gone from the
-/// chain, not moved along it. `keep_values` costs nothing here specifically because the fixture's
-/// `host` is already `static.local` -- on the allow-list and already lowercase
-/// ([`keep_values_one_event`]); a line whose `Host` header actually needed clamping would cost the
-/// same one allocation [`keep_values_one_event_needs_lowering`] pins, not reflected in this count.
+/// 3 = 1 (decode) + 1 (json) + 1 (kv_metrics) + 0 (keep) + 0 (keep_values) + 0 (aggregate).
+/// `kv_metrics` emits raw `Samples`, which `aggregate` absorbs into its per-series sketch without
+/// allocating ([`aggregate_absorb_one_samples_event_sketch_mode`]). `keep_values` is free because
+/// the fixture's `host` is already allowed and lowercase; a `Host` needing lowering would add
+/// [`keep_values_one_event_needs_lowering`]'s 1.
 #[test]
 fn full_chain_one_line() {
     let resource = fixtures::resource();
@@ -3879,10 +3315,8 @@ fn full_chain_one_line() {
 // Structural guards on claims docs/design/memory.md makes
 // ---------------------------------------------------------------------------------------------
 
-/// The zero-copy claim, stated structurally rather than as a count: every field a syslog line
-/// yields points *into* the datagram buffer it was decoded from. If this stops holding, the
-/// "`bytes::Bytes` everywhere" story in `docs/design/data-model.md` is no longer true of the one
-/// input that best exemplifies it.
+/// Syslog's zero-copy claim, stated structurally: the message and tag point into the datagram
+/// buffer they were decoded from (`docs/design/data-model.md`).
 #[test]
 fn syslog_fields_share_the_datagram_allocation() {
     let datagram = fixtures::nginx_syslog_datagram(1);
@@ -3900,10 +3334,8 @@ fn syslog_fields_share_the_datagram_allocation() {
     assert!(points_into(&datagram, tag), "syslog.tag should slice the datagram too");
 }
 
-/// The zero-copy claim for statsd, stated structurally: every DogStatsD tag value points *into*
-/// the datagram buffer it was decoded from, same as [`syslog_fields_share_the_datagram_allocation`]
-/// above. `statsd.rs`'s `slice_of` is what makes this true -- if it regresses back to copying tag
-/// values into a fresh `Bytes`, this is the test that catches it.
+/// statsd's zero-copy claim, stated structurally: a DogStatsD tag value points into the datagram
+/// buffer, via `statsd.rs`'s `slice_of`.
 #[test]
 fn statsd_tag_values_share_the_datagram_allocation() {
     let datagram = fixtures::statsd_datagram(1);
@@ -3917,11 +3349,10 @@ fn statsd_tag_values_share_the_datagram_allocation() {
     assert!(points_into(&datagram, env), "env tag value should slice the datagram, not copy it");
 }
 
-/// `StatsdInput::run`/`SyslogInput::run` copy each datagram out of the reusable 64 KB receive
-/// buffer with `Bytes::copy_from_slice`, which is one allocation sized to the datagram, not to the
-/// buffer. That right-sizing is the point: reading straight into a large shared `BytesMut` would
-/// save this allocation but let one retained log line pin 64 KB. Guarded here so the "considered
-/// and rejected" note in `docs/design/memory.md` has something holding it up.
+/// A UDP listener copies each datagram out of the reusable 64 KB receive buffer with
+/// `Bytes::copy_from_slice`: one allocation sized to the datagram, not the buffer. Reading into a
+/// large shared `BytesMut` would save the allocation but let one retained line pin 64 KB
+/// (`docs/design/memory.md`'s "Retention: what pins what" section).
 #[test]
 fn datagram_copy_is_one_right_sized_allocation() {
     let recv_buffer = vec![0u8; 65_507];
@@ -3949,14 +3380,10 @@ fn points_into(haystack: &bytes::Bytes, needle: &bytes::Bytes) -> bool {
 // Interning
 // ---------------------------------------------------------------------------------------------
 
-/// The property that makes interning the right call for a bounded key space, and the reason
-/// `AttrMap::get`'s interning is a CPU problem rather than a memory one: re-interning a string the
-/// table already holds allocates **nothing**. A pipeline whose keys and metric names come from a
-/// fixed schema reaches steady state and stays there.
-///
-/// The corollary is what `docs/design/memory.md`'s interner section is about: the table only grows
-/// for a *distinct* string, so the exposure is names that are real but never repeat -- not lookups
-/// that miss.
+/// Re-interning a string the table already holds allocates nothing, so a pipeline whose keys and
+/// metric names come from a fixed schema reaches steady state and stays there. The table grows
+/// only for a distinct string: the exposure is names that never repeat, not lookups that miss
+/// (`docs/design/memory.md`'s "Interning: the bargain, and its bounds" section).
 #[test]
 fn re_interning_an_existing_string_is_free() {
     let names: Vec<String> = (0..1000).map(|i| format!("steady.state.metric.{i}")).collect();
@@ -3973,15 +3400,11 @@ fn re_interning_an_existing_string_is_free() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// AttrMap growth (docs/plans/event-sizing.md W1)
+// AttrMap growth (docs/plans/event-sizing.md)
 // ---------------------------------------------------------------------------------------------
 
-/// `AttrMap`'s spill-and-grow ladder, pinned exactly -- the thing every sizing argument in
-/// [`docs/plans/event-sizing.md`](../../../docs/plans/event-sizing.md) rests on, and which until
-/// this test was **inferred** from smallvec 1.x's documented amortized doubling rather than
-/// measured here (`crates/logit-core/src/attrs.rs` pins the inline capacity of 8 and nothing else).
-///
-/// What it measures, per attribute count `k`, building one map a sorted `insert_sym` at a time:
+/// `AttrMap`'s spill-and-grow ladder, which every sizing argument in `docs/plans/event-sizing.md`
+/// rests on. Per attribute count `k`, building one map a sorted `insert_sym` at a time:
 ///
 /// | k | allocs | reallocs | heap bytes | capacity |
 /// |--:|--:|--:|--:|--:|
@@ -3990,18 +3413,14 @@ fn re_interning_an_existing_string_is_free() {
 /// | 17, 24, 32 | 1 | 1 | 1536 | 32 |
 /// | 33 | 1 | 2 | 3072 | 64 |
 ///
-/// So: the 9th entry spills to a heap buffer of **twice the inline capacity**, not to an
-/// exactly-sized one, and every doubling after that is a `realloc` rather than a fresh `alloc` --
-/// which is why the alloc column stays at 1 all the way out and the growth chain only shows up in
-/// the realloc column this file counts separately (see the module doc). A 24-attribute map
-/// therefore holds 1536 bytes of heap for 1152 bytes of entries, on top of the 392 inline bytes it
-/// has already paid for and abandoned.
+/// The 9th entry spills to a heap buffer of twice the inline capacity, and every doubling after
+/// that is a `realloc`, so allocs stay at 1 and the growth shows only in reallocs. A 24-attribute
+/// map holds 1536 bytes of heap for 1152 bytes of entries, on top of 392 abandoned inline bytes.
 ///
-/// Capacity is read off `peak_live_bytes` rather than asked for: `AttrMap` exposes no `capacity`
-/// (nor `reserve`/`with_capacity` -- that absence is the plan's lead finding), and at 48 bytes per
-/// `(Symbol, Value)` entry (`crates/logit-core/tests/type_sizes.rs`) the live heap at the end of
-/// the region *is* `capacity * 48`. Nothing else allocates inside the measured region: the symbols
-/// are interned up front and the values are `I64`s.
+/// Capacity is read off `peak_live_bytes`: `AttrMap` exposes no `capacity` (nor
+/// `reserve`/`with_capacity`), and at 48 bytes per `(Symbol, Value)` entry
+/// (`crates/logit-core/tests/type_sizes.rs`) the live heap is `capacity * 48`. The symbols are
+/// interned up front and the values are `I64`s, so nothing else allocates.
 #[test]
 fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
     let syms: Vec<logit_core::interner::Symbol> =
@@ -4039,32 +3458,27 @@ fn attr_map_spills_to_double_its_inline_capacity_then_reallocs() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Survey-derived shapes (docs/design/data-shapes.md §7 follow-up 2, docs/plans/event-sizing.md W1)
+// Survey-derived shapes (docs/design/data-shapes.md, docs/plans/event-sizing.md)
 // ---------------------------------------------------------------------------------------------
 //
-// Today's numbers for the six shapes the data-shape survey asked for and nothing in this suite
-// sat at. They are a *baseline*, not a target: the sizing bake-off exists to change several of
-// them, and the only way to say whether an arm helped is to have had the number first. Each
-// fixture's own doc comment (`crates/logit-bench/src/fixtures.rs`) cites the survey row it models
-// and says what is modelled rather than captured.
+// The six shapes the data-shape survey measured. Each fixture's doc comment
+// (`crates/logit-bench/src/fixtures.rs`) cites the survey row it models and says what is modelled
+// rather than captured.
 //
-// Three measurements per shape, the three `docs/design/data-shapes.md` §6 says the decision turns
-// on: **build** (through the real parser where one produces the shape), **clone** (§6: "Whether a
-// benchmark clones changes the answer" -- VRL's crossover moved from ~128 fields to ~16 once the
-// benchmark cloned), and a native **encode + decode** round trip, the one codec that reads an
-// exact attribute count off the wire and then cannot use it (`native/value.rs`'s
-// `read_attr_map_at`, against `native/record.rs`'s reserving `read_record_list_into`).
+// Three measurements per shape, the three `docs/design/data-shapes.md` §6 says a sizing decision
+// turns on: **build** (through the real parser where one produces the shape), **clone** (VRL's
+// flat-versus-tree crossover moved from ~128 fields to ~16 once its benchmark cloned), and a
+// native **encode + decode** round trip, the one codec that reads an exact attribute count off
+// the wire and can't use it (`read_attr_map_at`, against `read_record_list_into`, which reserves).
 
 /// The build half: `tail_in`'s one attribute plus [`fixtures::FLAT_JSON_LOG_BODY`]'s eleven JSON
-/// keys, merged by the real `json` transform into **12** -- the commonest measured log width
+/// keys, merged by `json` into 12, the commonest measured log width
 /// (`docs/design/data-shapes.md` §5.3).
 ///
-/// One allocation, and it is the `AttrMap` spill: the 12th attribute crosses the 8-slot inline
-/// capacity, which by [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`] costs one
-/// 768-byte buffer with room for 16. Nothing else on the path allocates -- every value is a
-/// zero-copy slice of the message `Bytes`, and `json`'s scratch and key cache are warm. This is
-/// the same "exactly one, for the spill" result `json_parse_one_event` reports at 10 attributes:
-/// the width between 9 and 16 is free of *further* allocations, which is precisely why the
+/// One allocation, the `AttrMap` spill: one 768-byte buffer with room for 16
+/// ([`attr_map_spills_to_double_its_inline_capacity_then_reallocs`]). Every value is a zero-copy
+/// slice of the message, and `json`'s scratch and key cache are warm. [`json_parse_one_event`]
+/// reports the same one at 10 attributes: widths 9 through 16 add no allocations, which is why an
 /// allocation count alone is the wrong proxy for what a wider map costs.
 #[test]
 fn json_parse_flat_json_log_event() {
@@ -4083,15 +3497,11 @@ fn json_parse_flat_json_log_event() {
     expect_allocs("json: parse 12-attribute flat log", stats, 1);
 }
 
-/// The nested shape, and the one that shows what `Value::Map` costs: **five** allocations for a
-/// 10-attribute event, against [`json_parse_flat_json_log_event`]'s one for twelve.
-///
-/// One is the map spill, as everywhere else. The other **four are the nested maps** -- `req{}`,
-/// `res{}` and the `headers{}` inside each -- because `Value::Map` is `Box<AttrMap>`
-/// (`crates/logit-core/src/value.rs`), so every nested object is a fresh 392-byte box whatever
-/// its width. `docs/design/data-shapes.md` §6's "nested maps multiply whatever is chosen" is this
-/// number: a pino-http leg pays four inline footprints per event on top of the event's own, and
-/// each of them scales 1:1 with any change to `AttrMap`'s inline capacity.
+/// The nested pino-http shape: five allocations for a 10-attribute event, against
+/// [`json_parse_flat_json_log_event`]'s one for twelve. One is the map spill. The other four are
+/// the nested maps (`req{}`, `res{}`, and the `headers{}` inside each): `Value::Map` is
+/// `Box<AttrMap>`, so every nested object is a fresh 392-byte box whatever its width. Each of the
+/// four scales with any change to `AttrMap`'s inline capacity (`docs/design/data-shapes.md` §6).
 #[test]
 fn json_parse_pino_http_nested_event() {
     let resource = fixtures::resource();
@@ -4109,18 +3519,15 @@ fn json_parse_pino_http_nested_event() {
     expect_allocs("json: parse 10-attribute nested pino-http log", stats, 5);
 }
 
-/// The widest log class in the survey, at 30 attributes: **three** allocations and, uniquely among
-/// these shapes, **two reallocations** -- the growth chain
-/// [`attr_map_spills_to_double_its_inline_capacity_then_reallocs`] pins. The map spills at 9 (cap
-/// 16), grows to 32 at 17, and at 30 sits in a 1536-byte buffer holding 1440 bytes of entries,
-/// having moved the whole thing twice.
+/// The widest log class in the survey, 30 attributes: three allocations and two reallocations.
+/// The map spills at 9 (capacity 16) and grows to 32 at 17
+/// ([`attr_map_spills_to_double_its_inline_capacity_then_reallocs`]), ending in a 1536-byte buffer
+/// holding 1440 bytes of entries.
 ///
-/// Two of the three allocations are not the map at all: PostgreSQL's error message quotes an
-/// identifier (`"orders_pkey"`), so that one value carries a JSON escape and cannot be sliced
-/// zero-copy out of the body the way every other value here is. That is a real property of the
-/// format rather than a fixture artifact -- a constraint-violation line always names the
-/// constraint -- and it is worth keeping visible: on the widest, highest-rate log class, the
-/// *attribute container* is one allocation of the three.
+/// Only one of the three is the map. PostgreSQL's error message quotes an identifier
+/// (`"orders_pkey"`), so that value carries a JSON escape and can't be sliced zero-copy; it costs
+/// the other two. That's a property of the format, not the fixture: a constraint-violation line
+/// always names the constraint.
 #[test]
 fn json_parse_access_log_event() {
     let resource = fixtures::resource();
@@ -4139,8 +3546,8 @@ fn json_parse_access_log_event() {
     assert_eq!(stats.reallocs, 2, "the map grows 8 -> 16 -> 32 on the way to 30 entries");
 }
 
-/// Parses each of the three JSON-bodied survey shapes and clones the result, so every shape's
-/// per-branch fan-out cost is measured off the same starting event the build tests produce.
+/// Runs `json` over a JSON-bodied survey shape, so the clone and round-trip tests start from the
+/// event the build tests produce.
 fn parsed_survey_event(make: fn() -> logit_core::Event) -> logit_core::Event {
     let resource = fixtures::resource();
     let mut json = fixtures::json_parser();
@@ -4157,11 +3564,8 @@ fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
     expect_allocs(label, stats, expected);
 }
 
-/// What one extra fan-out branch costs for each survey shape -- the measurement
-/// `docs/design/data-shapes.md` §6 says a sizing benchmark must include, since VRL's own
-/// flat-versus-tree crossover moved from about 128 fields to about 16 once its benchmark cloned.
-///
-/// The spread is the finding, and it is not the spread the attribute counts predict:
+/// `Event::clone` (one extra fan-out branch) for each survey shape. The spread isn't the one the
+/// attribute counts predict:
 ///
 /// | Shape | Attributes | `Event::clone` allocations |
 /// |---|--:|--:|
@@ -4171,21 +3575,16 @@ fn expect_clone_allocs(label: &str, event: &logit_core::Event, expected: u64) {
 /// | 17-attribute server span | 17 | 1 |
 /// | 3-record collectd event | 6 | 1 |
 ///
-/// A spilled `AttrMap` costs exactly **one** allocation to clone no matter how far past 8 it is
-/// -- smallvec clones `len` entries into one fresh buffer (sized by `reserve`, so to the next
-/// power of two: 768 bytes for 12 entries, 1536 for 30 -- not exactly, as a first draft of this
-/// comment said; `tests/attr_arms.rs` pins the bytes) -- so the 30-attribute access log and the
-/// 12-attribute log are indistinguishable by allocation count and differ only in entries copied
-/// (30 against 12, plus the 864-byte `Event` itself either way). What *does*
-/// move the number is nesting: the pino-http record's four boxed `Value::Map`s are four more
-/// allocations on a *narrower* event. An allocation-count-denominated sizing argument would rank
-/// these three shapes in an order the byte-movement one does not, which is the plan's point about
-/// the proxy inverting.
+/// A spilled `AttrMap` costs one allocation to clone however far past 8 it is: smallvec clones the
+/// entries into one fresh buffer, sized by `reserve` to the next power of two (768 bytes for 12
+/// entries, 1536 for 30; `tests/attr_arms.rs` pins the bytes). The 30- and 12-attribute logs differ
+/// only in entries copied, plus the 864-byte `Event` either way. Nesting moves the count: the
+/// pino-http record's four boxed `Value::Map`s add four on a narrower event. Ranked by allocations,
+/// these shapes fall in a different order than ranked by bytes moved.
 ///
-/// The collectd event is the one whose single allocation is not its attribute map: six attributes
-/// fit inline, and the allocation is `MetricList`'s spill past its one inline slot (17.4% of
-/// collectd events, `docs/design/data-shapes.md` §3 -- the only measured `MetricList` spill in the
-/// survey). The span's is its map, with no `events`/`links` `Vec`s to pay for, the exact
+/// The collectd event's one allocation is `MetricList`'s spill past its one inline slot, not its
+/// six inline attributes (17.4% of collectd events, `docs/design/data-shapes.md` §3, the only
+/// measured `MetricList` spill). The span's is its map, with no `events`/`links` `Vec`s: the
 /// complement of [`clone_span_event`].
 #[test]
 fn clone_survey_shapes() {
@@ -4215,19 +3614,14 @@ fn clone_survey_shapes() {
 /// The batch-level pair: a five-event OpenTelemetry batch sharing a 17-attribute `Resource`
 /// (`docs/design/data-shapes.md` §3's median batch carrying §4's median resource).
 ///
-/// **Six allocations, and none of them is the resource.** One is the batch's own `Vec<Event>`;
-/// the other five are the events' own maps, because the measured median OpenTelemetry log record
-/// carries **9** attributes -- one past the inline capacity, so every event on this leg spills by
-/// a single slot. The 17-attribute resource, the widest map in the survey and always spilled, is
-/// `Arc`-shared and costs a refcount bump (`crates/logit-core/src/event.rs`). That asymmetry is
-/// worth stating plainly before any sizing decision: the widest attribute set in the
-/// OpenTelemetry picture is the one place `AttrMap`'s capacity is nearly free, and the narrowest
-/// margin -- one slot -- is what five events per batch pay for.
+/// Six allocations, none of them the resource: the batch's `Vec<Event>` plus the five events'
+/// maps. The median OpenTelemetry log record carries 9 attributes, one past inline capacity, so
+/// every event spills by one slot. The 17-attribute resource, always spilled, is `Arc`-shared and
+/// costs a refcount bump. The widest map is nearly free; the one-slot margin is what each event
+/// pays.
 ///
-/// Both halves are pinned because they are different code paths to the same number:
-/// `EventBatch::clone` directly, and `unwrap_batch` falling back to it on a contended
-/// `Delivered::Shared` (`docs/design/memory.md` §3's copy-on-write path, the shape a two-mutating-
-/// consumer fan-out always takes).
+/// Pinned on two code paths to the same number: `EventBatch::clone` directly, and `unwrap_batch`
+/// falling back to it on a contended `Delivered::Shared` (a two-mutating-consumer fan-out).
 #[test]
 fn clone_enriched_resource_batch() {
     let batch = fixtures::enriched_resource_batch();
@@ -4280,13 +3674,11 @@ fn expect_native_round_trip_allocs(
     expect_allocs(&format!("native: decode {label}"), stats, decode_allocs);
 }
 
-/// A native round trip per survey shape. Encode and decode are pinned separately because they
-/// fail differently: the encoder's cost is per field written (it grows with width), while the
-/// decoder's is flat in width and is where the plan's lead finding lives --
-/// `read_attr_map_at` (`crates/logit-proto/src/native/value.rs`) reads the exact attribute count
-/// off the wire and then throws it away, because `AttrMap` has no `with_capacity`. A 30-attribute
-/// map is therefore rebuilt by 30 sorted inserts into a map that spills and reallocs twice on the
-/// way, which is the `reallocs` column below, not the `allocs` one.
+/// A native round trip per survey shape, encode and decode pinned separately. Encode grows with
+/// fields written; decode is flat in width. `read_attr_map_at` reads the exact attribute count off
+/// the wire and discards it, because `AttrMap` has no `with_capacity`, so a 30-attribute map is
+/// rebuilt by 30 sorted inserts that spill and then realloc twice. That growth shows in reallocs,
+/// which this test doesn't assert.
 ///
 /// | Shape | encode | decode |
 /// |---|--:|--:|
@@ -4296,10 +3688,9 @@ fn expect_native_round_trip_allocs(
 /// | 17-attribute server span | 20 | 5 |
 /// | 3-record collectd event | 20 | 5 |
 ///
-/// Decode is 5 for every flat shape regardless of width -- one `Vec<Event>`, one map spill, and
-/// the frame's own buffers -- and 9 for the nested one, for `json`'s reason: four boxed
-/// `Value::Map`s. Encode tracks field count rather than attribute count: the span and the
-/// three-record collectd event both write more *structure* than the 12-attribute log.
+/// Decode is 5 for every flat shape (one `Vec<Event>`, one spill, and the frame's buffers) and
+/// 9 for the nested one (four boxed `Value::Map`s). Encode tracks fields rather than attributes:
+/// the span and the three-record collectd event write more structure than the 12-attribute log.
 #[test]
 fn native_round_trip_survey_shapes() {
     expect_native_round_trip_allocs(
@@ -4334,9 +3725,8 @@ fn native_round_trip_survey_shapes() {
     );
 }
 
-/// The batch round trip, where the 17-attribute `Resource` is on the wire rather than `Arc`-shared
-/// -- `logit_proto::native` writes it once per batch (`crates/logit-proto/src/native/`), so this
-/// is the one measurement in this section where the resource's own width is paid.
+/// The batch round trip, where the 17-attribute `Resource` goes on the wire once per batch: the
+/// one measurement in this section that pays for the resource's width.
 #[test]
 fn native_round_trip_enriched_resource_batch() {
     let batch = fixtures::enriched_resource_batch();
@@ -4361,13 +3751,7 @@ fn native_round_trip_enriched_resource_batch() {
 // Native wire format (logit_proto::native)
 // ---------------------------------------------------------------------------------------------
 
-/// `NativeEncoder::encode`, one event, warmed so the dictionary's interner lookups have already
-/// happened once (see this file's own doc comment). The reference nginx pipeline chain above never
-/// touches this codec, so this stands as its own section rather than extending the "full ingest
-/// chain" story those tests tell. It exists for the same reason every other
-/// exact-equality assertion here does: an allocation regression in `crates/logit-proto/src/native/`
-/// should fail `script/test`, not wait for someone to notice
-/// `crates/logit-bench/benches/wire_format.rs`'s numbers drift.
+/// `NativeEncoder::encode` on one nginx event, warm: 30.
 #[test]
 fn native_encode_one_event() {
     let batch = fixtures::nginx_batch(1);
@@ -4376,21 +3760,16 @@ fn native_encode_one_event() {
 
     let (framed, stats) = measure(|| encoder.encode(&batch).expect("should encode"));
     assert!(!framed.is_empty());
-    // 23 -> 32 (W1, metrics-model-v2): the per-record TLV reshape in
-    // `crates/logit-proto/src/native/record.rs` costs 2 new `write_field` temp-buffer
-    // allocations per `MetricRecord` (`write_record_list` now length-prefixes each list entry
-    // individually so an unrecognized field inside one doesn't desync the rest of the list, and
-    // `MetricRecord.kind` is now wrapped in its own `write_field` rather than written straight
-    // into the record's buffer) plus 1 for `LogRecord.message` gaining the same wrapper -- `nginx_
-    // event` carries 4 metrics and 1 log, so 4*2 + 1 = 9.
-    // 32 -> 30: the two distributions are inline `Samples` now rather than single-sample
-    // `DdSketch`es ([`kv_metrics_one_event`]); a `Distribution` record serializes its sketch
-    // through `to_java_bytes` (one blob allocation each), a `Samples` writes its values directly.
+    // Among the 30: `write_field`'s temp buffers, 2 per `MetricRecord` (`write_record_list`'s
+    // per-entry length prefix, which keeps an unrecognized field from desyncing the list, and the
+    // wrapped `MetricRecord.kind`) plus 1 for `LogRecord.message`: 4*2 + 1 = 9 for this event's 4
+    // metrics and 1 log. The two `Samples` are written from their values; a `Distribution` would
+    // add one `to_java_bytes` blob each.
     expect_allocs("native: encode 1 event", stats, 30);
 }
 
-/// The decode-side mirror of [`native_encode_one_event`]. `decode_into` appends into a caller-held
-/// `Vec<Event>` the same way every other decoder in this suite does (`docs/design/memory.md` §2).
+/// The decode-side mirror of [`native_encode_one_event`]: 8. `decode_into` appends into a
+/// caller-held `Vec<Event>`, as every other decoder here does.
 #[test]
 fn native_decode_one_event() {
     let batch = fixtures::nginx_batch(1);
@@ -4404,24 +3783,16 @@ fn native_decode_one_event() {
     let (_, stats) =
         measure(|| decoder.decode_into(framed.clone(), 0, &mut events).expect("should decode"));
     assert_eq!(events.len(), 1);
-    // 8 -> 9 -> 8 (W1, metrics-model-v2): the per-record TLV reshape briefly cost a second spill
-    // allocation here -- `read_event`'s `FIELD_METRICS` arm built the metrics list in two steps,
-    // `read_record_list` returning its own freshly allocated `Vec<MetricRecord>` and then
-    // `.into_iter().collect()`-ing that into the event's `MetricList` (`SmallVec<[MetricRecord;
-    // 1]>`), which spills to a second, separate heap buffer since a `SmallVec`'s `FromIterator`
-    // can't reuse a donor `Vec`'s allocation. `read_record_list_into`
-    // (`crates/logit-proto/src/native/record.rs`) removes that: it decodes straight into a
-    // caller-supplied destination (`reserve` once up front, then push per item), so `FIELD_METRICS`
-    // now decodes directly into the event's own `MetricList`, back down to one allocation for the
-    // list -- exactly the old positional format's cost.
+    // `FIELD_METRICS` decodes through `read_record_list_into` straight into the event's
+    // `MetricList` (one `reserve`, then a push per record): one allocation for the list. Collecting
+    // an intermediate `Vec<MetricRecord>` into the `SmallVec` would cost a second, since
+    // `SmallVec`'s `FromIterator` can't reuse the donor `Vec`'s buffer.
     expect_allocs("native: decode 1 event", stats, 8);
 }
 
-/// `logit_out::send`'s own encode+frame step, exercised through the exact primitives it calls
-/// (`native::encode_batch` then `frame::write_frame_with_flags`) rather than through
-/// `NativeEncoder` -- `docs/plans/native-transport.md` workstream F. Same cost as
-/// [`native_encode_one_event`] today (both paths do the same two steps), but pinned separately so
-/// a future change to just one of the two sinks' code paths is caught here.
+/// `logit_out`'s encode+frame step through the primitives it calls (`native::encode_batch`, then
+/// `frame::write_frame_with_flags`) rather than `NativeEncoder`: 30, the same two steps as
+/// [`native_encode_one_event`], pinned separately so a change to either path shows.
 #[test]
 fn logit_out_encode_and_frame_one_batch() {
     let batch = fixtures::nginx_batch(1);
@@ -4444,20 +3815,14 @@ fn logit_out_encode_and_frame_one_batch() {
         .expect("should frame")
     });
     assert!(!framed.is_empty());
-    // 23 -> 32 (W1, metrics-model-v2): same cause as [`native_encode_one_event`] -- this path
-    // calls the same `native::encode_batch`.
-    // 32 -> 30 alongside `native_encode_one_event`: same two steps, same inline-`Samples` saving.
+    // Same `native::encode_batch` as `native_encode_one_event`, so the same breakdown.
     expect_allocs("logit_out: encode + frame 1 batch", stats, 30);
 }
 
-/// `logit_in`'s own read+decode step, exercised through the exact primitives its per-connection
-/// loop calls once a whole frame's bytes are already in memory (`frame::read_frame_with_header`
-/// then `native::decode_batch`) -- `docs/plans/native-transport.md` workstream F. One allocation
-/// cheaper than [`native_decode_one_event`]: `NativeDecoder::decode_into` additionally
-/// `out.extend(batch.events)`s into a caller-held `Vec`, but `logit_in` has no such buffer to
-/// extend -- `decode_batch` already returns an owned `EventBatch` with its own freshly allocated
-/// `Vec<Event>` directly, which `Fanout::send` takes as-is (see `crates/logit-inputs/src/
-/// logit.rs`'s own module doc comment for why there is no scratch buffer to warm here).
+/// `logit_in`'s read+decode step through the primitives its connection loop calls on a buffered
+/// frame (`frame::read_frame_with_header`, then `native::decode_batch`): 7, one less than
+/// [`native_decode_one_event`]. `NativeDecoder::decode_into` also extends a caller-held `Vec`;
+/// `decode_batch` returns an owned `EventBatch` that `Fanout::send` takes as-is.
 #[test]
 fn logit_in_read_and_decode_one_batch() {
     let batch = fixtures::nginx_batch(1);
@@ -4475,23 +3840,15 @@ fn logit_in_read_and_decode_one_batch() {
         logit_proto::native::decode_batch(&mut payload).expect("should decode").events.len()
     });
     assert_eq!(event_count, 1);
-    // 7 -> 8 -> 7 (W1, metrics-model-v2): same cause and same fix as
-    // [`native_decode_one_event`] -- this path calls the same `native::decode_batch`, which now
-    // decodes `FIELD_METRICS` straight into the event's `MetricList` via `read_record_list_into`
-    // instead of collecting through an intermediate `Vec`.
+    // Same `native::decode_batch` as `native_decode_one_event`, including its one-allocation
+    // `MetricList` decode.
     expect_allocs("logit_in: read + decode 1 batch", stats, 7);
 }
 
-/// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp with a byte-count assertion --
-/// the thing `crates/logit-proto/src/native/dict.rs`'s own unit tests can't do, since a plain
-/// `assert!(matches!(.., Err(_)))` on a rejected count passes identically whether or not the
-/// allocation was actually clamped (see the re-review of ADR `native-wire-format-encoding`'s fix
-/// commit, which flagged exactly this gap). A frame declaring a dictionary count of 1,000,000 with
-/// no entries behind it makes `Dict::read` allocate its `Vec` and then fail on the very first
-/// entry's length read, so the measured region is (almost) entirely that one allocation: clamped,
-/// it's ~4096 `Symbol`s (4 bytes each, `crates/logit-core/tests/type_sizes.rs`) -- under 20 KB;
-/// unclamped, it would be ~3.8 MB. The two orders of magnitude apart is exactly what would fail
-/// loudly if the `.min(4096)` clamp were ever removed.
+/// Pins `Dict::read`'s `Vec::with_capacity(count.min(4096))` clamp by bytes, which `dict.rs`'s
+/// unit tests can't: a rejected count fails the same whether or not the allocation was clamped. A
+/// declared count of 1,000,000 with no entries makes `Dict::read` allocate its `Vec`, then fail on
+/// the first entry. Clamped, that's ~4096 4-byte `Symbol`s, under 20 KB; unclamped, ~3.8 MB.
 #[test]
 fn native_dict_read_clamps_its_capacity_to_a_count_far_larger_than_4096() {
     use logit_proto::native::dict::Dict;

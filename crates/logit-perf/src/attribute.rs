@@ -1,26 +1,18 @@
-//! `logit-perf attribute`: where a scenario's time actually goes, per node.
+//! `logit-perf attribute`: where a scenario's time goes, per node.
 //!
-//! The measurement `run` produces is one number for a whole graph. This answers the next
-//! question -- *which node* -- without a profiler, out of numbers the runtime already records
-//! about itself: `logit.component.process.duration`, `.send.blocked.duration`, `.send.duration`,
-//! the received/sent counters, and the sink queues' `buffer.utilization`, each stamped with the
-//! emitting component's `component`/`kind`/`role` (`docs/design/internal-telemetry.md`).
+//! `run` produces one number for a whole graph; this says which node it goes to, without a
+//! profiler, from what the runtime records about itself: `logit.component.process.duration`,
+//! `.send.blocked.duration`, `.send.duration`, the received/sent counters, and sink queues'
+//! `buffer.utilization`, each stamped with `component`/`kind`/`role`
+//! (`docs/design/internal-telemetry.md`). They're read through the leg [`crate::telemetry_leg`]
+//! appends.
 //!
-//! Getting at them takes a temporary `internal -> file_out format: native` leg appended to a copy
-//! of the scenario. That machinery lives in [`crate::telemetry_leg`] -- `run` needs the identical
-//! leg for a `Driven` scenario's delivered-event denominator, so it is shared rather than
-//! duplicated. This module is what's left once it's hoisted out: reading the decoded points as a
-//! per-node table, and the verdict drawn from it.
+//! **The harness's own two nodes are in the table.** `__perf_internal` and `__perf_dump` are
+//! ordinary rows, so attribution's cost is visible, but the verdict and count check exclude them.
 //!
-//! **The harness's own two nodes are in the table.** `__perf_internal` and `__perf_dump` appear as
-//! ordinary rows -- what attribution costs is worth seeing, not hiding -- but are excluded from
-//! the verdict and the count check, which are about the graph under test.
-//!
-//! **Driven scenarios work here too.** A real-socket scenario has no `generate_in` to wait on, so
-//! `attribute` blasts it exactly the way `run` does (`crate::run`'s `Drive::Driven`) and then reads
-//! the same dump. Its count check is necessarily looser: a UDP scenario is *allowed* to lose
-//! datagrams, which is the whole reason it exists, so "every node saw every event" is not a
-//! property to warn about here -- `run` is where the sent/received/dropped accounting is checked.
+//! **Driven scenarios work here too.** `attribute` blasts a real-socket scenario as `run` does
+//! (`crate::run`'s `Drive::Driven`) and reads the same dump. Its count check doesn't warn about
+//! loss, which a UDP scenario is allowed; `run` checks the sent/received/dropped accounting.
 
 use crate::load::{CpuSet, LoadPlan};
 use crate::run::{self, Drive, SpawnConfig};
@@ -34,8 +26,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// The runtime's uniform per-component metrics this reads (`docs/design/internal-telemetry.md`'s
-/// "Two layers of instrumentation" tables). Named as constants rather than inline literals
-/// because each appears twice -- once in [`fold_metric`], once in a test asserting the fold.
+/// "Two layers of instrumentation").
 pub(crate) const EVENTS_RECEIVED: &str = "logit.component.events.received";
 const EVENTS_SENT: &str = "logit.component.events.sent";
 const BATCHES_RECEIVED: &str = "logit.component.batches.received";
@@ -49,20 +40,17 @@ const BATCHES_DROPPED: &str = "logit.component.batches.dropped";
 
 pub struct AttributeArgs {
     pub scenario: String,
-    /// The appended `internal`'s drain cadence. Shorter means more drains, so more of the run is
-    /// captured before the final one -- but every drain is itself work inside the process being
-    /// measured, so this trades resolution against perturbation.
+    /// The appended `internal`'s drain interval: shorter captures more of the run before the final
+    /// drain, but each drain is work inside the measured process.
     pub interval: Duration,
     pub settle: Duration,
     pub timeout: Duration,
     pub shutdown_timeout: Duration,
     pub no_build: bool,
     pub profile: String,
-    /// Measure this binary instead of building one -- see `run::RunArgs::logit_bin`'s doc, same
-    /// semantics (implies skipping the build; a relative path resolves against the repo root).
+    /// Measure this binary instead of building one, as `run::RunArgs::logit_bin`.
     pub logit_bin: Option<std::path::PathBuf>,
-    /// Sender/child CPU pinning, for a driven scenario -- ignored by a generated one, which has no
-    /// sender of its own. See [`crate::load::CpuSet`].
+    /// Sender CPU pinning; only a driven scenario has a sender. See [`crate::load::CpuSet`].
     pub pin_sender: Option<CpuSet>,
     pub pin_child: Option<CpuSet>,
 }
@@ -73,17 +61,15 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
     }
     let scenarios_dir = root.join("perf/scenarios");
     let scenario = scenario::find(&scenarios_dir, &args.scenario)?;
-    // Fresh spool before this leg's own spawn -- same reasoning as `run`'s per-repeat clear
-    // (`crate::spool`'s module doc).
+    // A fresh spool, as `run` clears per repeat (`crate::spool`).
     crate::spool::clear(root, &scenario)?;
     let logit_bin =
         run::build_and_locate(root, &args.profile, args.no_build, args.logit_bin.as_deref())?;
 
     let workdir = telemetry_leg::make_workdir("attribute")?;
     let dump_path = workdir.join("attribute.native");
-    // A stale dump from an earlier run at this pid would decode as this run's frames and silently
-    // inflate every total. Checked rather than deleted: something already sitting here means an
-    // assumption this code makes is wrong, which is worth surfacing rather than papering over.
+    // A stale dump at this pid would decode as this run's frames and inflate every total. Refused
+    // rather than deleted: its presence means an assumption here is wrong.
     if dump_path.exists() {
         bail!(
             "{} already exists -- a previous `attribute` run left it behind; remove it (or its \
@@ -94,10 +80,8 @@ pub fn attribute(root: &Path, args: AttributeArgs) -> anyhow::Result<()> {
 
     let outcome = attribute_in(&logit_bin, &scenario, &args, &dump_path);
     match &outcome {
-        // Only on success: a failed run's partial dump is the one thing anyone debugging the
-        // failure would want to look at, so it's left in place and named. (The rewritten scenario
-        // is not -- it's deterministic from the original, and its own `Drop` removes it either
-        // way, so leaving it next to the shipped scenarios would be litter, not evidence.)
+        // Only on success: a failed run's partial dump is kept for debugging. The rewritten
+        // scenario is removed either way; it's reproducible from the original.
         Ok(()) => {
             let _ = fs::remove_dir_all(&workdir);
         }
@@ -123,8 +107,7 @@ fn attribute_in(
 
     telemetry_leg::validate(logit_bin, &config_path)?;
 
-    // A driven scenario's ring is rendered before the child is even spawned, so a broken spec
-    // fails in a second rather than after a full startup.
+    // Rendered before spawning, so a broken spec fails before a full startup.
     let plan = match &scenario.workload {
         Workload::Generated { .. } => None,
         Workload::Driven(_) => Some(LoadPlan::build(&scenario.load_spec_path()?, &source)?),
@@ -147,8 +130,7 @@ fn attribute_in(
         config: &config_path,
         drive,
         pin_child: args.pin_child.as_ref(),
-        // Always: the appended `internal` listener's drain loop runs until shutdown, so this
-        // graph can never exit on its own the way a plain `generate_in -> null_out` one does.
+        // The appended `internal`'s drain loop runs until shutdown.
         needs_sigterm: true,
         settle: args.settle,
         timeout: args.timeout,
@@ -173,11 +155,8 @@ fn attribute_in(
             events.len()
         );
     }
-    // Denominated over what actually reached the deepest node, for both kinds of scenario: for a
-    // generated one that equals `count` unless the graph collapses events, and for a driven one it
-    // is the only honest denominator there is. Reported here rather than folded into a `Sample`:
-    // with the attribution leg attached these numbers describe a graph with two extra nodes in it,
-    // which is not the graph `run` measures.
+    // Denominated over the peak node's `events.received`, not the sink's (`peak_received`). Not a
+    // `Sample`: with the leg attached, this graph has two nodes `run` doesn't measure.
     let delivered = peak_received(&nodes);
     println!(
         "   {:.0} events/s, {:.3} us/event, {:.1} MiB peak RSS (with the attribution leg attached)",
@@ -197,10 +176,8 @@ fn attribute_in(
     Ok(())
 }
 
-/// Producer id -> the ids of every component that lists it in `sources:`. Read off the *original*
-/// scenario, so the appended dump leg never appears in it. This is the only topology `attribute`
-/// knows: it's what lets the verdict say which consumer a blocked producer was waiting on,
-/// instead of an unhelpful "something downstream".
+/// Producer id to the ids of every component listing it in `sources:`, read from the original
+/// scenario (no dump leg). Lets the verdict name the consumers a blocked producer waited on.
 fn consumer_map(yaml: &str) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
     let value: serde_norway::Value = serde_norway::from_str(yaml).context("parsing YAML")?;
     let components = value
@@ -223,10 +200,11 @@ fn consumer_map(yaml: &str) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
     Ok(map)
 }
 
-/// A Σ over a drained `Distribution`: total seconds and how many observations produced them.
-/// Both come straight off the sketch (`DdSketch::sum`/`count`) -- the sum is exact, not a
-/// quantile estimate, and `internal` merges every timing at one `(name, tags)` key into one
-/// sketch per drain, so summing across drains reconstructs the whole run's total.
+/// A Σ over a drained `Distribution`: total seconds and observation count.
+///
+/// Both come off the sketch (`DdSketch::sum`/`count`); the sum is exact, not a quantile estimate.
+/// `internal` merges every timing at one `(name, tags)` key into one sketch per drain, so summing
+/// across drains gives the whole run's total.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Total {
     pub secs: f64,
@@ -244,8 +222,7 @@ impl Total {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct NodeStats {
     /// The component kind (`json`, `null_out`, ...) and role (`listener`/`transform`/`sink`) the
-    /// drain stamped alongside `component`. Empty only for a node whose every point somehow
-    /// lacked them, which the runtime never produces.
+    /// drain stamps alongside `component`.
     pub kind: String,
     pub role: String,
     pub events_received: f64,
@@ -255,11 +232,11 @@ pub struct NodeStats {
     pub process: Total,
     pub send_blocked: Total,
     pub send: Total,
-    /// The high-water mark of this sink's queue fill, not an average -- a queue that was briefly
-    /// full is the interesting fact, and averaging it away is exactly how backpressure hides.
+    /// The high-water mark of this sink's queue fill, not an average: averaging hides a queue that
+    /// was briefly full.
     pub buffer_utilization: Option<f64>,
-    /// `reason` tag -> total, for both drop counters. Kept per-reason because
-    /// `overflow_oldest` and `send_failed` are different bugs.
+    /// `reason` tag to total, per reason because `overflow_oldest` and `send_failed` are different
+    /// bugs.
     pub events_dropped: BTreeMap<String, f64>,
     pub batches_dropped: BTreeMap<String, f64>,
 }
@@ -325,9 +302,8 @@ fn fold_metric(node: &mut NodeStats, name: &str, kind: &MetricKind, reason: &str
     }
 }
 
-/// A counter's value. `internal` drains a `count` as `MetricKind::counter(v)` -- a delta,
-/// monotonic `Sum` -- so this is the one shape these ever arrive in; anything else is ignored
-/// rather than coerced, since misreading a gauge as a count would silently inflate a total.
+/// A counter's value. `internal` drains a count as a `Sum`; anything else is ignored rather than
+/// coerced, since reading a gauge as a count would inflate a total.
 fn sum_value(kind: &MetricKind) -> f64 {
     match kind {
         MetricKind::Sum(sum) => sum.value,
@@ -383,9 +359,7 @@ fn print_table(nodes: &BTreeMap<String, NodeStats>) {
     }
 }
 
-/// Every node, hottest first. Ties break on the id so the table is deterministic run to run --
-/// two nodes with no recorded process time at all (a listener, say) would otherwise swap places
-/// between runs on nothing but map iteration luck.
+/// Every node, hottest first, ties broken on id so the table is deterministic.
 fn by_process_time(nodes: &BTreeMap<String, NodeStats>) -> Vec<(&String, &NodeStats)> {
     let mut rows: Vec<(&String, &NodeStats)> = nodes.iter().collect();
     rows.sort_by(|(a_id, a), (b_id, b)| {
@@ -400,14 +374,9 @@ fn by_process_time(nodes: &BTreeMap<String, NodeStats>) -> Vec<(&String, &NodeSt
 
 /// The one-line answer, plus a line per back-pressured producer.
 ///
-/// Two different things make a node "the bottleneck," and they point in opposite directions. The
-/// largest Σ `process.duration` is a node doing the most work itself. Σ `send.blocked.duration`
-/// is a node that *couldn't hand its work on* -- there the constraint is whoever it was sending
-/// to, not the node reporting the time, which is why each such line names the consumers rather
-/// than the blocked producer alone.
-///
-/// The harness's own appended nodes are excluded from both: they are this tool's overhead, not
-/// part of the graph under test.
+/// The largest Σ `process.duration` is the node doing the most work itself. Σ
+/// `send.blocked.duration` is a node that couldn't hand work on: the constraint is downstream, so
+/// each such line names the consumers. The harness's own nodes are excluded from both.
 pub fn verdict(
     nodes: &BTreeMap<String, NodeStats>,
     consumers: &BTreeMap<String, Vec<String>>,
@@ -462,15 +431,11 @@ pub fn verdict(
     lines
 }
 
-/// The largest `events.received` any node under test recorded. The harness's own two nodes are
-/// excluded: `__perf_dump` receives the telemetry stream, which has nothing to do with the
-/// workload.
+/// The largest `events.received` any node under test recorded, excluding the harness's nodes.
 ///
-/// **A summary line, not a denominator.** This is the *shallowest* interesting number, not the
-/// deepest: in a graph where a transform drops events, the node with the largest `events.received`
-/// is the one *before* the drop. That is the right thing for `attribute`'s table, which is
-/// describing where work happened; it is the wrong thing for events/s, which has to be denominated
-/// over what actually came out the far end. `crate::run` uses [`delivered_at_sink`] for that.
+/// **A summary, not `run`'s denominator.** Where a transform drops events, the peak node is the
+/// one before the drop: right for describing where work happened, wrong for events/s, which
+/// `crate::run` takes from [`delivered_at_sink`].
 pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
     nodes
         .iter()
@@ -479,19 +444,13 @@ pub fn peak_received(nodes: &BTreeMap<String, NodeStats>) -> u64 {
         .fold(0.0_f64, f64::max) as u64
 }
 
-/// `events.received` at the graph's terminal sink -- the denominator a driven scenario's
-/// `events_per_s`/`cpu_us_per_event` and `--verify`'s exact-count assertion are computed over.
+/// `events.received` at the graph's terminal sink: the denominator of a driven scenario's
+/// `events_per_s`/`cpu_us_per_event` and of `--verify`'s exact count.
 ///
-/// Selected by the `role` attribute the drain stamps on every point
-/// (`docs/design/internal-telemetry.md`), not by taking a maximum: the maximum is the shallowest
-/// receiver, which equals the sink only for a graph that drops nothing between them. Today's
-/// `statsd_in → null_out` scenarios are such a graph, so the two agree; the moment a driven
-/// scenario grows a filtering transform they stop agreeing, and the maximum would quietly
-/// overstate delivery by exactly what the transform dropped.
+/// Selected by the drain's `role` attribute, not a maximum: the maximum is the shallowest
+/// receiver, which overstates delivery by whatever a filtering transform drops.
 ///
-/// A graph with several sinks has no single answer, so it is asked for one rather than guessed at:
-/// the load spec's `sink:` names which to denominate over. With one sink -- every scenario that
-/// exists today -- the field is unnecessary and omitted.
+/// With several sinks the load spec's `sink:` must name one; with one sink it's omitted.
 pub fn delivered_at_sink(
     nodes: &BTreeMap<String, NodeStats>,
     named: Option<&str>,
@@ -536,23 +495,17 @@ fn render_ids<'a>(ids: impl Iterator<Item = &'a String>) -> String {
     }
 }
 
-/// Checks the decoded counters against what the scenario said it would produce, since a per-node
-/// breakdown that doesn't add up is describing something other than this run. Returns the lines to
-/// print -- one statement of what was seen, plus a warning per mismatch.
+/// Checks the decoded counters against what the scenario said it would produce; a breakdown that
+/// doesn't add up describes some other run. Returns a line of what was seen plus a warning per
+/// mismatch.
 ///
-/// For a [`Workload::Generated`] scenario the generator's `events.sent` is the strict check: it is
-/// the same number the `generation complete` line already reported, arriving by an entirely
-/// different path, so a mismatch means the dump is missing drains (`internal`'s final drain on
-/// shutdown is what normally makes these agree -- without it the last partial interval never
-/// lands). The peak `events.received` is the looser one: it equals `count` for any graph that
-/// neither drops nor collapses events, which is every scenario except an `aggregate` one, where
-/// fewer is correct by construction.
+/// For a [`Workload::Generated`] scenario, the generator's `events.sent` must equal `count`: it's
+/// the `generation complete` number by a separate path, so a mismatch means missing drains (the
+/// final drain on shutdown normally closes the gap). The peak `events.received` equals `count`
+/// unless the graph drops or collapses events, as `aggregate` does.
 ///
-/// For a [`Workload::Driven`] scenario neither check applies. There is no generator to compare
-/// against, and a shortfall against the datagrams sent is not a symptom -- kernel and queue drops
-/// are the *point* of a real-socket scenario, and `run` is where that accounting is checked
-/// properly (against `logit.input.kernel.drops`, which this table doesn't carry). Warning here
-/// would report an expected property as a fault.
+/// A [`Workload::Driven`] scenario gets neither check: it has no generator, loss is expected, and
+/// `run` checks the accounting against `logit.input.kernel.drops`, which this table lacks.
 pub fn check_counts(nodes: &BTreeMap<String, NodeStats>, workload: &Workload) -> Vec<String> {
     let measured: Vec<(&String, &NodeStats)> =
         nodes.iter().filter(|(id, _)| !NodeStats::is_harness(id)).collect();
@@ -884,10 +837,7 @@ mod tests {
         }
     }
 
-    /// The case that makes the denominator's *definition* matter rather than its value: a middle
-    /// node that received more than the sink did. `peak_received` reports the middle node, which
-    /// is right for `attribute`'s table and would silently overstate delivery by exactly what the
-    /// transform dropped if it were used as the denominator.
+    /// A middle node receiving more than the sink: the denominator must be the sink's count.
     #[test]
     fn delivered_at_sink_reports_the_sink_not_the_busiest_node() {
         let nodes = BTreeMap::from([

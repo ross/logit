@@ -1,20 +1,13 @@
-//! The built-in `logfmt` and `kv` transforms: parse a log record's message as `key=value` pairs
-//! and merge them into the event's attributes, exactly like `json` but for two different flat,
-//! text (not JSON) grammars. See `docs/adr/logfmt-and-kv-parsing.md` for the design decisions
-//! this implements.
+//! `logfmt` and `kv`: parse a log message as `key=value` pairs and merge them into the event's
+//! attributes, as `json` does for JSON. See `docs/adr/logfmt-and-kv-parsing.md`.
 //!
-//! `logfmt` is the fixed, de-facto convention (`level=info msg="hello world" dur=3ms`) --
-//! whitespace-delimited pairs, `"`-quoted values with backslash escapes, zero required config.
-//! `kv` is a literal splitter with **required** `pair_sep`/`kv_sep` and no quoting at all
-//! (`a=1&b=2`, `a: 1, b: 2`) -- two distinct `ComponentKind`s sharing this module and a scan tail,
-//! not one kind with a mode flag, mirroring `keep`/`remove` and `keep_signals`/`drop_signals`'s
-//! existing precedent.
+//! `logfmt` is the de-facto convention (`level=info msg="hello world" dur=3ms`):
+//! whitespace-delimited pairs, `"`-quoted values with backslash escapes, no required config. `kv`
+//! is a literal splitter with required `pair_sep`/`kv_sep` and no quoting (`a=1&b=2`,
+//! `a: 1, b: 2`). They're two `ComponentKind`s sharing this module, not one kind with a mode flag.
 //!
-//! Both are stateless -- like `json`, only `process` is overridden; `flush_interval`/`flush` keep
-//! the `Transform` trait's defaults. Both always produce `Value::Str` (or `Value::Bool(true)` for
-//! an opted-in bareword) -- never numeric coercion, unlike `json`'s type-by-JSON-syntax rule; a
-//! downstream `scale`/`kv_metrics` still works fine against a `Value::Str` (`crate::numeric`
-//! parses it).
+//! Both are stateless and always produce `Value::Str` (or `Value::Bool(true)` for an opted-in
+//! bareword), never a number; `scale`/`kv_metrics` downstream coerce through `crate::numeric`.
 
 use bytes::Bytes;
 use logit_core::interner::KeyCache;
@@ -27,18 +20,16 @@ const fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-/// `true` if `s` contains nothing but the four whitespace bytes [`is_ws`] recognizes (including
-/// the empty string) -- the line between "there was genuinely nothing to parse" (no diagnostic)
-/// and "there was content, but none of it parsed" (a real `parse_failure`).
+/// `true` if `s` is empty or only [`is_ws`] bytes: nothing to parse, so `NoPairs` gets no
+/// `parse_failure` diagnostic.
 fn is_blank(s: &str) -> bool {
     s.bytes().all(is_ws)
 }
 
 enum ParseError {
-    /// A `"` was opened but never closed (or its closing `"` was consumed as an escape target) --
-    /// carries the byte offset of the opening quote, for the diagnostic message.
+    /// A `"` never closed (or its closing `"` was an escape target), at this byte offset.
     UnterminatedQuote(usize),
-    /// Nothing in the line produced a real pair -- see each parser's own `saw_pair` bookkeeping.
+    /// Nothing in the line produced a `key<sep>value` pair; barewords don't count.
     NoPairs,
 }
 
@@ -53,31 +44,22 @@ impl fmt::Display for ParseError {
     }
 }
 
-/// Moves every pair out of `scratch` into `attrs`, via [`AttrMap::insert_sym`] rather than
-/// `resolve()` -> `insert(&str)` -- `scratch`'s keys are already `Symbol`s (interned straight off
-/// the message's byte slice), so re-resolving one to a `&str` just to re-intern it would be pure
-/// waste. Last-write-wins on a duplicate key is free here: `scratch` may push the same key twice
-/// (a duplicate in the source line), and `insert_sym` overwrites on collision, so merging in push
-/// order makes the later occurrence win -- identical to `json`'s own duplicate-key policy.
+/// Moves every pair out of `scratch` into `attrs` by `Symbol`.
+///
+/// Merging in push order makes a duplicate key's later occurrence win, as in `json`.
 fn merge_into(scratch: &mut Vec<(Symbol, Value)>, attrs: &mut AttrMap) {
     for (key, value) in scratch.drain(..) {
         attrs.insert_sym(key, value);
     }
 }
 
-/// Consumes the five escapes `logfmt` understands; anything else (including a lone trailing
-/// backslash, which [`scan_quoted`] never hands this since it always pairs a backslash with the
-/// byte after it) is preserved verbatim, backslash included. The only allocating path in this
-/// module -- every other value is a [`bytes::Bytes::slice`] of the original message.
+/// Resolves the five escapes `logfmt` understands; any other escape is kept verbatim, backslash
+/// included.
 ///
-/// `shrink_to_fit` before the final conversion is load-bearing, not cosmetic: every escape this
-/// function understands consumes two source bytes and emits one, so `out.len()` is *always*
-/// strictly less than the `with_capacity(bytes.len())` estimate whenever there was any escape to
-/// resolve at all -- and `bytes::Bytes::from(Vec<u8>)` allocates a second, separate `Shared`
-/// control block up front (eagerly, not lazily) whenever `len() != capacity()`, rather than the
-/// single deferred-promotion allocation it costs when they match. `shrink_to_fit` turns that
-/// mismatch into a `realloc` (already paid for by the initial `with_capacity`, and not what
-/// `crates/logit-bench/tests/allocations.rs` asserts on) instead of a second, independent `alloc`.
+/// The only allocating path in this module; every other value is a [`bytes::Bytes::slice`] of the
+/// message. `shrink_to_fit` matters: any escape makes `out` shorter than its capacity, and
+/// `Bytes::from(Vec<u8>)` then allocates a separate `Shared` block eagerly. Shrinking turns that
+/// into a `realloc`, which `crates/logit-bench/tests/allocations.rs` doesn't count as an `alloc`.
 fn unescape(bytes: &[u8]) -> Bytes {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -104,10 +86,11 @@ fn unescape(bytes: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
-/// Scans a `"`-quoted value starting at `s[i] == b'"'`. Returns the content's `(start, end)` byte
-/// range (exclusive of the quotes), whether it contained any backslash escape, and the byte index
-/// just past the closing `"`. An escape is consumed two bytes at a time (backslash + whatever
-/// follows) without interpreting it here -- [`unescape`] does that, only when needed.
+/// Scans a `"`-quoted value starting at `s[i] == b'"'`.
+///
+/// Returns the content's `(start, end)` range (quotes excluded), whether it has a backslash
+/// escape, and the index just past the closing `"`. Escapes are skipped two bytes at a time and
+/// left for [`unescape`].
 fn scan_quoted(s: &[u8], i: usize) -> Result<(usize, usize, bool, usize), ParseError> {
     let n = s.len();
     let mut j = i + 1;
@@ -128,16 +111,12 @@ fn scan_quoted(s: &[u8], i: usize) -> Result<(usize, usize, bool, usize), ParseE
     Err(ParseError::UnterminatedQuote(i))
 }
 
-/// Parses `text` (the whole message, already verified valid UTF-8 by the caller) as logfmt into
-/// `out`. `raw` shares `text`'s underlying bytes -- every unquoted or escape-free-quoted value is
-/// sliced straight out of it (`raw.slice`, a `Bytes` refcount bump), never copied. A key is
-/// resolved to its `Symbol` straight off `text`'s own bytes (`&text[key_start..key_end]`), never
-/// through an owned `String` -- safe because every delimiter this scanner splits on (whitespace,
-/// `=`, `"`) is a single-byte ASCII character, so a byte range this function ever slices always
-/// lands on a `text` char boundary -- and through the transform's [`KeyCache`], so a key this
-/// parser has seen before (every key of every line after the first, on a schema-shaped stream)
-/// is one `memcmp` rather than a probe of the process-wide interner. See the EBNF and algorithm
-/// in `docs/adr/logfmt-and-kv-parsing.md`.
+/// Parses `text`, the whole message as validated UTF-8, as logfmt into `out`.
+///
+/// `raw` shares `text`'s bytes, so every value without an escape is a `raw.slice`, never a copy.
+/// Keys are sliced straight off `text`: every delimiter (whitespace, `=`, `"`) is one ASCII byte,
+/// so a slice always lands on a char boundary. They resolve through [`KeyCache`], one `memcmp`
+/// for a repeated key. The grammar is in `docs/adr/logfmt-and-kv-parsing.md`.
 fn parse_logfmt(
     raw: &Bytes,
     text: &str,
@@ -166,8 +145,7 @@ fn parse_logfmt(
         let key_end = i;
 
         if key_end == key_start {
-            // A leading '=' with no key (`=1 a=2`): resynchronize at the next whitespace rather
-            // than treating the rest of the line as unparseable.
+            // No key (`=1 a=2`): resynchronize at the next whitespace.
             while i < n && !is_ws(s[i]) {
                 i += 1;
             }
@@ -195,9 +173,7 @@ fn parse_logfmt(
                 Value::Str(raw.slice(v_start..i))
             }
         } else if bare_keys {
-            // A bareword deliberately does *not* set `saw_pair` -- a line of nothing but
-            // barewords still fails as `NoPairs` even with `bare_keys` on, the same as it would
-            // with `bare_keys` off. See `docs/adr/logfmt-and-kv-parsing.md`.
+            // A bareword doesn't set `saw_pair`: a line of only barewords is still `NoPairs`.
             Value::Bool(true)
         } else {
             telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
@@ -214,10 +190,10 @@ fn parse_logfmt(
     Ok(())
 }
 
-/// Finds `needle`'s first occurrence in `haystack` at or after byte offset `from`, or `None`.
-/// Plain byte search -- both `logfmt`/`kv`'s separators and `text` are valid UTF-8, and finding a
-/// complete, valid UTF-8 string as a byte substring of another always lands on a char boundary
-/// (UTF-8's self-synchronization property), so no separate boundary check is needed.
+/// Finds `needle`'s first occurrence in `haystack` at or after byte offset `from`.
+///
+/// A plain byte search: a valid UTF-8 needle found in valid UTF-8 always lands on a char boundary
+/// (self-synchronization), so no boundary check is needed.
 fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > haystack.len() {
         return None;
@@ -236,9 +212,10 @@ fn trim_ws_range(bytes: &[u8], mut start: usize, mut end: usize) -> std::ops::Ra
     start..end
 }
 
-/// Parses one `kv` segment (`text[seg_start..seg_end]`, already isolated by [`parse_kv`]'s
-/// `pair_sep` split) into at most one pair, pushed onto `out`. See [`parse_kv`]'s own doc comment
-/// for the three distinct empty/bareword/no-separator shapes this handles.
+/// Parses one `kv` segment, `text[seg_start..seg_end]`, into at most one pair on `out`.
+///
+/// A segment with an empty key, or with no `kv_sep` and either blank or `bare_keys` off, is
+/// skipped and counted as `pairs.skipped`.
 #[allow(clippy::too_many_arguments)]
 fn parse_kv_segment(
     raw: &Bytes,
@@ -259,7 +236,6 @@ fn parse_kv_segment(
         Some(idx) => {
             let key_range = trim_ws_range(segment, 0, idx);
             if key_range.is_empty() {
-                // Key empty after trimming -- segment skipped, counted.
                 telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
                 return;
             }
@@ -273,8 +249,7 @@ fn parse_kv_segment(
         None => {
             let key_range = trim_ws_range(segment, 0, segment.len());
             if key_range.is_empty() {
-                // A genuinely empty segment (`a=1&&b=2`, or one that's all whitespace) --
-                // skipped silently: nothing here to report as a failure.
+                // An empty segment (`a=1&&b=2`, or all whitespace).
                 telemetry.count("logit.transform.pairs.skipped", 1.0, &[]);
                 return;
             }
@@ -289,10 +264,10 @@ fn parse_kv_segment(
     }
 }
 
-/// Parses `text` as `kv`: `pair_sep`-separated segments, each split on the *first* `kv_sep`
-/// occurrence within it. No quoting, no escapes -- a value containing `pair_sep` is not
-/// representable (`logfmt` is the component for that shape). See
-/// `docs/adr/logfmt-and-kv-parsing.md`.
+/// Parses `text` as `kv`: `pair_sep`-separated segments, each split on its first `kv_sep`.
+///
+/// No quoting or escapes, so a value containing `pair_sep` isn't representable; that shape needs
+/// `logfmt`.
 #[allow(clippy::too_many_arguments)]
 fn parse_kv(
     raw: &Bytes,
@@ -337,11 +312,10 @@ fn parse_kv(
     Ok(())
 }
 
-/// Reads `event.log.message` as a zero-copy `Bytes` handle (a refcount bump, not a copy) and
-/// verifies it's valid UTF-8 -- shared by [`Logfmt::process`] and [`Kv::process`]. `None` means
-/// "nothing to parse, pass the event through as-is": no log, a non-string message, or a message
-/// that isn't UTF-8 (the last case reports `invalid_utf8` first, since `Value::Str` must always be
-/// valid UTF-8 -- there's no way to represent the failure any other way).
+/// The log message as a zero-copy `Bytes`, verified valid UTF-8.
+///
+/// `None` passes the event through: no log, a message that isn't `Str`/`Bytes`, or invalid UTF-8
+/// (reported as `invalid_utf8`, since every parsed value is a `Value::Str`).
 fn message_bytes(event: &Event, diag: &mut Diagnostics) -> Option<Bytes> {
     let log = event.log.as_ref()?;
     let raw = match &log.message {
@@ -358,24 +332,20 @@ fn message_bytes(event: &Event, diag: &mut Diagnostics) -> Option<Bytes> {
     Some(raw)
 }
 
-/// Parses a log record's message as logfmt (`level=info msg="hello world" dur=3ms`), merging the
-/// resulting key/values into the event's attributes. Additive and pass-through-on-failure, exactly
-/// like `json`. See `docs/adr/logfmt-and-kv-parsing.md`.
+/// Parses a log message as logfmt and merges the pairs into the event's attributes.
+///
+/// Additive, and a failure forwards the event unchanged, as with `json`.
 #[derive(Default)]
 pub struct Logfmt {
-    /// Treat a token with no `=` as a boolean-true flag. Off by default -- see
-    /// `logit_config::ComponentKind::Logfmt::bare_keys`'s doc comment for why.
+    /// Treat a token with no `=` as `true`; see `logit_config`'s `bare_keys` doc for the default.
     bare_keys: bool,
     diag: Diagnostics,
     telemetry: Telemetry,
-    /// Scratch the parsed pairs land in before the all-or-nothing merge, reused across events --
-    /// exactly `JsonParser::scratch`, and for the same reason: a line that fails partway must
-    /// leave `event.attributes` untouched, not half-populated.
+    /// Parsed pairs before the all-or-nothing merge, so a line failing partway leaves
+    /// `event.attributes` untouched. Reused across events.
     scratch: Vec<(Symbol, Value)>,
-    /// Keys seen so far, memoised `&str -> Symbol` -- exactly `JsonParser::keys`, for the same
-    /// reason: a logfmt stream's key set is small and repeats in the same order every line, so
-    /// after the first line every key is one `memcmp` instead of a hash and a shard lock on the
-    /// process-wide interner. See `KeyCache`'s docs for the shape and the bound.
+    /// `&str -> Symbol` memo: a stream's small key set repeats every line, so after the first
+    /// line each key is a `memcmp` rather than an interner hash and shard lock.
     keys: KeyCache,
 }
 
@@ -398,7 +368,6 @@ impl Logfmt {
 impl Transform for Logfmt {
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let Some(raw) = message_bytes(event, &mut self.diag) else { return true };
-        // Constructed only from a buffer `message_bytes` already verified is valid UTF-8.
         let text = std::str::from_utf8(&raw).expect("message_bytes verified valid UTF-8");
 
         self.scratch.clear();
@@ -429,9 +398,8 @@ impl Transform for Logfmt {
     }
 }
 
-/// `logfmt`'s literal, configurable-separator sibling: no quoting, no escapes. See
-/// `docs/adr/logfmt-and-kv-parsing.md` for why this is a distinct `ComponentKind`, sharing this
-/// module rather than a `logfmt` mode flag.
+/// Parses a log message with configured separators and no quoting or escapes, merging the pairs
+/// into the event's attributes.
 pub struct Kv {
     pair_sep: String,
     kv_sep: String,
@@ -572,11 +540,8 @@ mod tests {
         assert_ne!(attr(&event, "status"), Some(&Value::U64(200)));
     }
 
-    /// The per-parser key cache, from `logfmt`'s side: a later line with the same keys in a
-    /// different order, one missing and one new, resolves every repeat to the same `Symbol`
-    /// without touching the interner and grows the cache only by the new key. `nextest` runs
-    /// each test in its own process (`docs/design/memory.md` §7), so `interner::len()` here
-    /// reflects only this test.
+    /// Reordered repeat keys hit the cache and only a new key grows it. `nextest` runs each test
+    /// in its own process, so `interner::len()` reflects only this test.
     #[test]
     fn repeat_keys_in_any_order_are_cache_hits_and_never_touch_the_interner() {
         let mut logfmt = Logfmt::new(false);
@@ -604,8 +569,7 @@ mod tests {
         assert_eq!(logfmt.keys.len(), 4, "only the genuinely new key was added");
     }
 
-    /// `kv`'s side of the same cache, through `parse_kv_segment`'s two push sites (a pair and
-    /// an opted-in bareword).
+    /// `kv`'s pair and bareword push sites both hit the key cache.
     #[test]
     fn kv_repeat_keys_are_cache_hits() {
         let mut kv = Kv::new("&".into(), "=".into(), true);
@@ -955,8 +919,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Shared pass-through shape (both `logfmt` and `kv` -- exercised via `Logfmt` since the
-    // behavior is identical by construction: both share `message_bytes`/`merge_into`).
+    // Shared pass-through shape, exercised via `Logfmt`; `kv` shares `message_bytes`/`merge_into`.
     // -----------------------------------------------------------------------------------------
 
     #[test]

@@ -6,11 +6,9 @@ license.workspace = true
 publish.workspace = true
 description = "Allocation measurement and throughput benchmarks for logit. Dev-only; ships in nothing."
 
-# This crate exists because no other one can hold these measurements: `logit-pipeline` deliberately
-# doesn't depend on any concrete input/transform/output (`docs/design/pipeline-graph.md`'s crate
-# layout), so the only place an end-to-end `syslog_in -> json -> kv_metrics -> keep -> aggregate ->
-# influxdb_out` measurement can live is a crate that depends on all of them. See
-# `docs/design/memory.md`.
+# `logit-pipeline` depends on no concrete input/transform/output (`docs/design/pipeline-graph.md`'s
+# "Crate layout" section), so an end-to-end `syslog_in -> json -> kv_metrics -> keep -> aggregate ->
+# influxdb_out` measurement needs a crate that depends on all of them: this one.
 
 [dependencies]
 logit-config.workspace = true
@@ -22,37 +20,33 @@ logit-transforms.workspace = true
 logit-script.workspace = true
 logit-proto.workspace = true
 bytes.workspace = true
-# The remote-write fixtures below build a `prometheus.WriteRequest` / `io.prometheus.write.v2.Request`
-# straight from the vendored prompb types rather than through `logit_proto::prometheus::remote_write`
-# itself -- a fixture that is the output of the code it measures is not a fixture.
+# The remote-write fixtures build `prometheus.WriteRequest`/`io.prometheus.write.v2.Request` from
+# the vendored prompb types, not through `logit_proto::prometheus::remote_write`: a fixture that is
+# the output of the code it measures is not a fixture.
 prost.workspace = true
 serde.workspace = true
 # The native-wire-format bake-off's other two arms (docs/design/wire-protocol.md's "Encoding:
 # decided — hand-rolled", docs/adr/native-wire-format-encoding.md). Both serialize
-# `bakeoff::wire_mirror::WireBatch`, a plain-data mirror of `EventBatch` -- never the shipped
-# `logit_proto::native` codec, which is hand-rolled either way. `logit-bench` ships in nothing (see
-# this crate's own module doc), so these live in `[dependencies]` rather than `[dev-dependencies]`
-# purely so both `tests/` and `benches/` can reach the same mirror types without duplicating them.
-# `default-features = false`: postcard's two default features (`heapless`, `heapless-cas`) exist
-# for no_std/embedded use (a fixed-capacity buffer instead of `Vec`), which this bake-off arm
-# doesn't need -- `to_allocvec`/`from_bytes` only need `alloc`. Turning them off also drops
-# `heapless`'s own dependency on `atomic-polyfill`, an unmaintained crate `script/audit`
-# (`cargo-deny`) flags (RUSTSEC-2023-0089) -- avoided entirely rather than suppressed.
+# `bakeoff::wire_mirror::WireBatch`, a plain-data mirror of `EventBatch`, never the shipped
+# `logit_proto::native` codec. In `[dependencies]` rather than `[dev-dependencies]` so `tests/` and
+# `benches/` share the mirror types; `logit-bench` ships in nothing either way.
+# `default-features = false`: postcard's defaults (`heapless`, `heapless-cas`) are for no_std use,
+# and `to_allocvec`/`from_bytes` need only `alloc`. It also drops `heapless`'s dependency on
+# `atomic-polyfill`, an unmaintained crate `script/audit` (`cargo-deny`) flags (RUSTSEC-2023-0089),
+# rather than suppressing the advisory.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 rkyv = "0.8"
-# The attribute-sizing arms' mirror of `AttrMap` (`src/bakeoff/attr_arms/`) has to have the same
-# backing store as the real one -- `SmallVec<[(Symbol, Value); 8]>`, at the workspace's version and
-# feature set (`union`), since both the layout and `Clone`'s growth policy are what that arm is
-# measuring. Through the workspace, so it can't drift from `logit-core`'s.
+# The attribute-sizing arms' mirror of `AttrMap` (`src/bakeoff/attr_arms/`) needs the real backing
+# store, `SmallVec<[(Symbol, Value); 8]>` with the `union` feature, since the layout and `Clone`'s
+# growth policy are what it measures. Through the workspace, so it can't drift from `logit-core`'s.
 smallvec.workspace = true
 
 [dev-dependencies]
 divan = "0.1"
-# `benches/size_vs_alloc.rs`'s `#[global_allocator]`, at the same version `logit-cli` ships
+# `benches/size_vs_alloc.rs`'s `#[global_allocator]`, at the version `logit-cli` ships
 # (`docs/adr/jemalloc-global-allocator.md`). That bench measures what an allocation *costs*, so it
-# has to run against the allocator production actually uses -- `benches/pipeline.rs`'s
-# `divan::AllocProfiler` wraps the **system** allocator and counts from inside the timed region,
-# which is the right trade for an allocation-count bench and the wrong one for this.
+# runs on production's allocator; `benches/pipeline.rs`'s `divan::AllocProfiler` wraps the
+# **system** allocator, which suits counting but not this.
 tikv-jemallocator = "0.6"
 tokio.workspace = true
 async-trait.workspace = true
@@ -70,10 +64,10 @@ harness = false
 name = "size_vs_alloc"
 harness = false
 
-# The attribute-sizing arms (`docs/plans/event-sizing.md`'s W3b). Installs the same real jemalloc
-# `#[global_allocator]` as `size_vs_alloc` and for the same reason: these measure what a clone and
-# an allocation *cost*, so they have to run against the allocator production uses. The matching
-# allocation counts live in `tests/attr_arms.rs`, which wraps `System` instead.
+# The attribute-sizing arms (`docs/plans/event-sizing.md`). Installs jemalloc as
+# `#[global_allocator]`, as `size_vs_alloc` does and for the same reason: they measure what a clone
+# and an allocation *cost*. The matching allocation counts live in `tests/attr_arms.rs`, which wraps
+# `System` instead.
 [[bench]]
 name = "attr_arms"
 harness = false
