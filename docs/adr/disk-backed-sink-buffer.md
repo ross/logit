@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-09-09
+updated: 2026-09-24
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -234,3 +234,21 @@ actual code; each is resolved as follows.
 - Explicitly out of scope, filed as new `docs/known-gaps.md` entries: receive-side (`ReceiveQueue`)
   disk backing, per-push fsync, encryption at rest, a spool shared across sinks, segment
   compaction/rewrite, out-of-order acknowledgement (window > 1).
+
+## Amendment: a dropped batch is committed off the spool (2026-09-24)
+
+"Shutdown" above says a disk-backed sink drops nothing at shutdown, and "Scope" says a restart
+resumes from the last committed cursor. Neither covers a batch the destination never accepts.
+`runtime::write_loop` calls `store.commit()` on `Delivery::Dropped` exactly as on
+`Delivery::Delivered`, and it does so whatever the store is. A batch is dropped when its failure
+is permanent or when it's still failing once `buffer.retry_budget` (60s by default) runs out. So a
+destination outage longer than the retry budget discards the spooled batches it couldn't take,
+each counted `batches.dropped{reason="send_failed"}`, and a restart doesn't replay them.
+
+This is deliberate. The spool bounds loss across a process restart; the retry budget bounds loss
+across a destination outage. It's [ADR `buffered-sink-delivery`](buffered-sink-delivery.md)'s
+budget-exhausted rule, inherited unchanged: the sink degrades to dropping and moves to the next
+batch instead of holding one it can't deliver at the head. To ride out a longer outage, raise
+`buffer.retry_budget`.
+[ADR `durable-checkpoint-writes-and-fault-injection`](durable-checkpoint-writes-and-fault-injection.md)
+records this as its decision 7.
