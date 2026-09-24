@@ -40,3 +40,4 @@ libc.workspace = true
 # `cargo test -p <crate>` builds that package's feature set alone, so a sibling's override
 # doesn't carry over, though a `--workspace` build's feature unification hides that.
 tokio = { workspace = true, features = ["test-util"] }
+proptest.workspace = true

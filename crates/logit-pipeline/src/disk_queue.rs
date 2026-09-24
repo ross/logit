@@ -60,7 +60,7 @@ use logit_proto::CodecError;
 /// frame under a new codec byte, as `Provenance` does with `CODEC_NATIVE_V2`: a `V1` record still
 /// replays with empty provenance, and a binary that doesn't know `V2` resyncs past it
 /// (`docs/adr/batch-provenance-on-delivered.md`).
-const CONTEXT_LEN: usize = 24;
+pub(crate) const CONTEXT_LEN: usize = 24;
 
 const LOCK_FILE_NAME: &str = "lock";
 const CURSOR_FILE_NAME: &str = "cursor.json";
@@ -114,12 +114,12 @@ fn decode_context(buf: &[u8]) -> TraceContext {
     TraceContext { trace_id, span_id }
 }
 
-fn segment_path(dir: &Path, seq: u64) -> PathBuf {
+pub(crate) fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("segment-{seq:016}.lgit"))
 }
 
 /// Every `segment-<seq>.lgit` in `dir`, ascending by sequence number. Other files are ignored.
-fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
+pub(crate) fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     let mut seqs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -167,12 +167,12 @@ fn parse_record(buf: &[u8]) -> Result<(BatchContext, Arc<EventBatch>, usize), Co
 }
 
 /// The result of walking every record in a byte range.
-struct WalkOutcome {
+pub(crate) struct WalkOutcome {
     /// Segment offset up to which data is confirmed good. Everything after it is a torn tail or
     /// corruption with no further resync target.
-    good_len: u64,
-    valid_count: u64,
-    corrupt_skipped: u64,
+    pub(crate) good_len: u64,
+    pub(crate) valid_count: u64,
+    pub(crate) corrupt_skipped: u64,
 }
 
 /// Walks every record in `bytes` from `start_offset` (`bytes[0]` is the segment's byte 0),
@@ -183,7 +183,7 @@ struct WalkOutcome {
 /// resyncs forward with `frame::resync`, backing up over the 24-byte context prefix it doesn't
 /// know about. A spurious `MAGIC` match (say, inside a `trace_id`) is tried and skipped if it
 /// doesn't parse.
-fn walk_segment(
+pub(crate) fn walk_segment(
     bytes: &[u8],
     start_offset: u64,
     mut on_record: impl FnMut(u64, BatchContext, Arc<EventBatch>, u64),
@@ -1204,6 +1204,15 @@ impl DiskQueue {
 pub(crate) mod test_support {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{encode_context, DiskQueueConfig, CONTEXT_LEN};
+    use crate::fanout::{BatchContext, TraceContext};
+    use crate::queue::OverflowPolicy;
+    use logit_core::{AttrMap, Event, EventBatch, Provenance, Resource, Value};
+    use logit_proto::frame::{self, Compression};
+    use logit_proto::native;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1221,29 +1230,18 @@ pub(crate) mod test_support {
         batch: &logit_core::EventBatch,
         provenance: logit_core::Provenance,
     ) -> u64 {
-        use super::CONTEXT_LEN;
-        use logit_proto::{frame, native};
-
         let payload = native::encode_batch_v2(batch, provenance);
         let framed =
             frame::write_frame(native::CODEC_NATIVE_V2, frame::Compression::None, &payload)
                 .expect("None compression never fails");
         (CONTEXT_LEN + framed.len()) as u64
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::test_support::scratch_dir;
-    use super::*;
-    use crate::fault::{self, errno};
-    use logit_core::{AttrMap, Event, Registry, Resource, Value};
-
-    fn ctx() -> BatchContext {
+    pub(crate) fn ctx() -> BatchContext {
         BatchContext { trace: TraceContext::new_root(), provenance: Provenance::default() }
     }
 
-    fn batch(marker: &str) -> Arc<EventBatch> {
+    pub(crate) fn batch(marker: &str) -> Arc<EventBatch> {
         let mut attrs = AttrMap::new();
         attrs.insert("marker", Value::str(marker));
         Arc::new(EventBatch {
@@ -1253,13 +1251,17 @@ mod tests {
         })
     }
 
-    fn marker_of(batch: &EventBatch) -> String {
+    pub(crate) fn marker_of(batch: &EventBatch) -> String {
         batch.events[0].attributes.get("marker").and_then(Value::as_str).unwrap().to_string()
     }
 
     /// Sums every point named `name` in drained telemetry, only those carrying `tag` if given.
     /// Tags are on the drained `Event`'s attributes; the name is an interned `MetricRecord::name`.
-    fn metric_sum(events: &[logit_core::Event], name: &str, tag: Option<(&str, &str)>) -> f64 {
+    pub(crate) fn metric_sum(
+        events: &[logit_core::Event],
+        name: &str,
+        tag: Option<(&str, &str)>,
+    ) -> f64 {
         let name_sym = logit_core::interner::intern(name);
         events
             .iter()
@@ -1277,7 +1279,7 @@ mod tests {
             .sum()
     }
 
-    fn config(dir: PathBuf) -> DiskQueueConfig {
+    pub(crate) fn config(dir: PathBuf) -> DiskQueueConfig {
         DiskQueueConfig {
             dir,
             max_bytes: 10 * 1024 * 1024,
@@ -1289,16 +1291,8 @@ mod tests {
         }
     }
 
-    fn open(dir: PathBuf) -> DiskQueue {
-        DiskQueue::open(config(dir), Telemetry::default(), Diagnostics::new("test")).unwrap()
-    }
-
-    fn open_with(config: DiskQueueConfig) -> DiskQueue {
-        DiskQueue::open(config, Telemetry::default(), Diagnostics::new("test")).unwrap()
-    }
-
     /// The on-disk bytes `DiskQueue::push` writes for one record, for hand-built segment files.
-    fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
+    pub(crate) fn raw_record(batch: &EventBatch, ctx: BatchContext) -> Vec<u8> {
         let payload = native::encode_batch_v2(batch, ctx.provenance);
         let framed = frame::write_frame(native::CODEC_NATIVE_V2, Compression::None, &payload)
             .expect("None compression never fails");
@@ -1309,7 +1303,7 @@ mod tests {
     }
 
     /// A `CODEC_NATIVE_V1` record, with no provenance trailer.
-    fn raw_record_v1(batch: &EventBatch, trace: TraceContext) -> Vec<u8> {
+    pub(crate) fn raw_record_v1(batch: &EventBatch, trace: TraceContext) -> Vec<u8> {
         let payload = native::encode_batch(batch);
         let framed = frame::write_frame(native::CODEC_NATIVE_V1, Compression::None, &payload)
             .expect("None compression never fails");
@@ -1317,6 +1311,24 @@ mod tests {
         record.extend_from_slice(&encode_context(trace));
         record.extend_from_slice(&framed);
         record
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{
+        batch, config, ctx, marker_of, metric_sum, raw_record, raw_record_v1, scratch_dir,
+    };
+    use super::*;
+    use crate::fault::{self, errno};
+    use logit_core::{AttrMap, Event, Registry, Resource, Value};
+
+    fn open(dir: PathBuf) -> DiskQueue {
+        DiskQueue::open(config(dir), Telemetry::default(), Diagnostics::new("test")).unwrap()
+    }
+
+    fn open_with(config: DiskQueueConfig) -> DiskQueue {
+        DiskQueue::open(config, Telemetry::default(), Diagnostics::new("test")).unwrap()
     }
 
     #[tokio::test]
