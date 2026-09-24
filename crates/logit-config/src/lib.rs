@@ -1764,6 +1764,15 @@ pub enum ComponentKind {
         #[serde(default)]
         #[schemars(with = "u8")]
         version: RemoteWriteVersion,
+        /// How each remote-write request body is compressed. `snappy`, the default, is the Snappy
+        /// block format both remote-write specs mandate, and every receiver accepts it. `zstd` is
+        /// the VictoriaMetrics remote write protocol: the same 1.0 request compressed with zstd
+        /// instead, which VictoriaMetrics, vmagent, and `logit`'s own `prometheus_in` accept and
+        /// Prometheus and Mimir reject. There is no negotiation and no fallback: a receiver that
+        /// rejects `zstd` fails every batch, so pick what the receiver accepts. `zstd` needs
+        /// `version: 1`. Sender mode only.
+        #[serde(default)]
+        compression: RemoteWriteCompression,
         /// Per-request timeout on the remote-write POST. Defaults to `10s`; `0s` is rejected.
         /// Sender mode only.
         #[serde(
@@ -1835,6 +1844,17 @@ impl From<RemoteWriteVersion> for u8 {
             RemoteWriteVersion::V2 => 2,
         }
     }
+}
+
+/// How `prometheus_out`'s `endpoint:` sender compresses a request body. Defaults to `snappy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteWriteCompression {
+    /// Snappy block compression, what both remote-write specs mandate.
+    #[default]
+    Snappy,
+    /// zstd, the VictoriaMetrics remote write protocol. Remote-write 1.0 only.
+    Zstd,
 }
 
 /// `prometheus_out`'s `path` default. `pub` so graph validation can tell a set registry-mode
@@ -4873,6 +4893,7 @@ mod tests {
                 max_series,
                 endpoint,
                 version,
+                compression,
                 timeout,
                 headers,
                 endpoint_tls,
@@ -4887,6 +4908,7 @@ mod tests {
                 assert_eq!(max_series, 100_000);
                 assert_eq!(endpoint, None, "registry mode sets no sender field");
                 assert_eq!(version, RemoteWriteVersion::V1);
+                assert_eq!(compression, RemoteWriteCompression::Snappy);
                 assert_eq!(timeout, Duration::from_secs(10));
                 assert!(headers.is_empty());
                 assert_eq!(endpoint_tls, TlsClientConfig::default());
@@ -4949,7 +4971,8 @@ mod tests {
     fn prometheus_out_reads_the_sender_mode_fields() {
         let component: Component = serde_json::from_str(
             r#"{"type": "prometheus_out", "sources": ["in"],
-                "endpoint": "https://mimir:8080/api/v1/push", "version": 2, "timeout": "30s",
+                "endpoint": "https://mimir:8080/api/v1/push", "version": 2, "compression": "zstd",
+                "timeout": "30s",
                 "headers": {"X-Scope-OrgID": "tenant-a"},
                 "endpoint_tls": {"ca_file": "ca.pem"}}"#,
         )
@@ -4959,6 +4982,7 @@ mod tests {
                 bind,
                 endpoint,
                 version,
+                compression,
                 timeout,
                 headers,
                 endpoint_tls,
@@ -4967,6 +4991,7 @@ mod tests {
                 assert_eq!(bind, None);
                 assert_eq!(endpoint.as_deref(), Some("https://mimir:8080/api/v1/push"));
                 assert_eq!(version, RemoteWriteVersion::V2);
+                assert_eq!(compression, RemoteWriteCompression::Zstd);
                 assert_eq!(timeout, Duration::from_secs(30));
                 assert_eq!(headers.get("X-Scope-OrgID").map(String::as_str), Some("tenant-a"));
                 assert_eq!(endpoint_tls.ca_file.as_deref(), Some("ca.pem"));

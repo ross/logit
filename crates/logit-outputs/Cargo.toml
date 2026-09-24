@@ -22,9 +22,6 @@ http.workspace = true
 http-body-util.workspace = true
 # otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
-# prometheus_out's remote-write bodies: Snappy block format, the one `Content-Encoding` both
-# remote-write specs define (docs/adr/prometheus-remote-write.md).
-snap.workspace = true
 # otlp_out TLS on both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): a
 # `rustls::ClientConfig` from config PEM, wrapped around `hyper-util`'s pooled gRPC client by
 # `hyper-rustls`; `webpki-roots` is the Mozilla root set `reqwest` bundles for the HTTP side.
@@ -43,6 +40,8 @@ logit-pipeline = { workspace = true, features = ["fault-injection"] }
 # Remote-write sender tests decode the captured body as the vendored prompb message, not this
 # codec's own view of it.
 prost.workspace = true
+# ...and Snappy-decompress it directly, so decoding at all proves the block format, not framed.
+snap.workspace = true
 # influxdb.rs's test that a Lua stage doesn't change an attribute's tag inclusion
 # (`bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage`).
 logit-script.workspace = true

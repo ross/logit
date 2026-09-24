@@ -28,9 +28,10 @@ crc32c.workspace = true
 # string-or-number rules (ADR `otlp-json-decoding`).
 serde_json.workspace = true
 base64.workspace = true
-# Prometheus remote-write's Snappy block compression. Only prometheus/generated/mod.rs's round-trip
-# test calls it here; the remote-write sink and receiver compress in logit-outputs/logit-inputs.
+# Prometheus remote-write's two body encodings, Snappy block format and zstd, both through
+# prometheus/compression.rs, which the remote-write sink and receiver share.
 snap.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 # Generated corpora for the property tests (most of tests/*_fixed_point.rs, src/otlp/metrics.rs).

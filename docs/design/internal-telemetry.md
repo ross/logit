@@ -784,15 +784,19 @@ like, and counting it would add one point per probe interval to this key forever
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"}` | count | one per request, one class per row of the module doc's routes table. See below. |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
 | bind | `logit.input.write.duration` | timing | one per request, every exit included, which is why the count and the timer live in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
 These are this component's own spellings, not `otlp_in`'s, which has no request-level counters to
 mirror. In `logit.input.writes`:
 
+- `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
+  than downgrading to Snappy, reads as `encoding="zstd"`.
 - `unsupported` is a `415` on `Content-Encoding` *or* `Content-Type`.
-- `oversize` is a `413` from either the compressed body or Snappy's declared decompressed length.
+- `oversize` is a `413` from either the compressed body or its decompressed size: Snappy's
+  declared length, or for zstd a declared content size, a window, or a streaming decode past
+  the cap.
 - `timeout` is a `408` from a body that stopped arriving. It's **only reachable where
   `idle_timeout:` is set**, because the per-frame stall bound is derived from it and it's off by
   default. On a default `bind:` this class never fires, and a half-uploaded request holds its

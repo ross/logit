@@ -1,0 +1,24 @@
+# Leg 2 of `script/victoria-interop`: `prometheus_out` remote-write 2.0 into VictoriaMetrics,
+# which is expected to refuse it. The harness reads the status and body from this process's
+# `remote_write_rejected` diagnostic, and confirms no `vi_rw2_*` series reached storage.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: rw2
+      metric:
+        name: vi_rw2_gauge
+        kind: gauge
+        value: 42
+
+  victoria_metrics:
+    type: prometheus_out
+    sources: [gauge_gen]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 2

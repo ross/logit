@@ -34,9 +34,6 @@ rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 # prometheus_in's scrape client (docs/adr/prometheus-scrape-and-exposition.md).
 reqwest.workspace = true
-# `prometheus_in`'s remote-write receiver (docs/adr/prometheus-remote-write.md): Snappy *block*
-# decompression of every request body, the only `Content-Encoding` either wire version defines.
-snap.workspace = true
 # `generate_in`'s `generation complete` line (docs/plans/load-test-harness.md). Not through
 # `logit_core::Diagnostics` like every other self-diagnostic here: the perf harness reads
 # `events`/`batches`/`elapsed` as fields off the JSON log line, and `Diagnostics` renders one
@@ -54,6 +51,9 @@ logit-pipeline = { workspace = true, features = ["fault-injection"] }
 # `prometheus_in`'s receiver tests hand-build a remote-write 1.0 request with no `metadata[]`:
 # the shape a real Prometheus sends, which `remote_write::encode` never produces.
 prost.workspace = true
+# `prometheus_in`'s receiver tests Snappy-compress request bodies directly, the way a sender does,
+# rather than through the receiver's own `logit_proto::prometheus::compression`.
+snap.workspace = true
 # tests/statsd_to_aggregate.rs needs a real `Aggregator` to prove a decoded `GaugeDelta`
 # resolves. Dev-only: the library never depends on `logit-transforms`.
 logit-transforms.workspace = true

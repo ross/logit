@@ -1,0 +1,33 @@
+# Leg 10 of `script/victoria-interop`: `prometheus_in`'s remote-write receiver as one of vmagent's
+# two `-remoteWrite.url`s. vmagent sends zstd first; a receiver without zstd answers `415`, and
+# vmagent repacks as Snappy and stays on it for this remote. The harness reads both halves from
+# the files below: the received series, and `logit.input.writes` by `class` from `internal`.
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  from_vmagent:
+    type: prometheus_in
+    bind: 0.0.0.0:9201
+
+  received:
+    type: stdio_out
+    sources: [from_vmagent]
+    target: /out/vmagent-in-received.log
+
+  self:
+    type: internal
+    interval: 5s
+    span_sample_rate: 0.0
+    logs: off
+
+  writes:
+    type: has_attributes
+    sources: [self]
+    attributes:
+      component: from_vmagent
+
+  telemetry:
+    type: stdio_out
+    sources: [writes]
+    target: /out/vmagent-in-telemetry.log
