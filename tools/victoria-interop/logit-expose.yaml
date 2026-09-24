@@ -1,0 +1,41 @@
+# Leg 3 of `script/victoria-interop`: `prometheus_out` in exposition mode, scraped by vmagent
+# (`vmagent-scrape.yaml`), which remote-writes the series on to VictoriaMetrics. The same series
+# reach `logit-vmagent-in.yaml` over vmagent's second `-remoteWrite.url` (leg 10).
+admin:
+  bind: 127.0.0.1:9600
+
+components:
+  gauge_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: expose
+      metric:
+        name: vi_expose_gauge
+        kind: gauge
+        value: 7
+
+  counter_gen:
+    type: generate_in
+    rate: 1
+    batch: 1
+    event:
+      attributes:
+        leg: expose
+      metric:
+        name: vi_expose_requests
+        kind: sum
+        value: 1
+
+  cumulative:
+    type: aggregate
+    sources: [counter_gen]
+    interval: 5s
+    temporality: cumulative
+
+  exposition:
+    type: prometheus_out
+    sources: [gauge_gen, cumulative]
+    bind: 0.0.0.0:9464

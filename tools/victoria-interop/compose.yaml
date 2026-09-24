@@ -1,0 +1,105 @@
+# The stack `script/victoria-interop` drives: VictoriaMetrics, VictoriaLogs, VictoriaTraces,
+# vmagent, and one `logit` per leg from the release image. See README.md here, and
+# docs/plans/victoriametrics-interop.md's "W1's legs" for what each leg proves.
+#
+# `script/victoria-interop` runs this under the compose project `victoria-interop` with an
+# `--env-file` it writes, which sets:
+#
+#   VICTORIA_INTEROP_OUT    the host run directory, mounted at /out in every `logit` service
+#   VICTORIA_INTEROP_IMAGE  the `logit` release image tag (`script/image victoria-interop`)
+#
+# Nothing binds a host port: the harness queries every backend from a container on this network.
+# No `container_name`, so a second stack under another project name can't collide with this one.
+
+name: victoria-interop
+
+networks:
+  default:
+    name: victoria-interop-net
+
+x-logit: &logit
+  image: ${VICTORIA_INTEROP_IMAGE:-logit:victoria-interop}
+  depends_on: [victoria-metrics, victoria-logs, victoria-traces]
+  # `run` only: the configs set `admin:` for the image's HEALTHCHECK.
+  entrypoint: ["logit", "run", "/config.yaml"]
+  command: []
+
+services:
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:v1.152.0
+    command:
+      - -graphiteListenAddr=:2003
+      # The committed remote-write fixtures the harness replays carry their capture's timestamps;
+      # the default one-month retention would drop them silently once they age past it.
+      - -retentionPeriod=100y
+      # OTLP over HTTP (`/opentelemetry/v1/metrics`) is on by default and takes no flag.
+
+  victoria-logs:
+    image: victoriametrics/victoria-logs:v1.52.0
+    command:
+      - -syslog.listenAddr.tcp=:514
+
+  victoria-traces:
+    image: victoriametrics/victoria-traces:v0.11.1
+    command:
+      # Off by default. `-otlpGRPC.tls` defaults to true and then requires a certificate.
+      - -otlpGRPCListenAddr=:4317
+      - -otlpGRPC.tls=false
+
+  vmagent:
+    image: victoriametrics/vmagent:v1.152.0
+    depends_on: [victoria-metrics, logit-expose, logit-vmagent-in]
+    volumes:
+      - ./vmagent-scrape.yaml:/etc/vmagent/scrape.yaml:ro,z
+    command:
+      - -promscrape.config=/etc/vmagent/scrape.yaml
+      # Leg 3: vmagent's default wire (zstd) straight to VictoriaMetrics.
+      - -remoteWrite.url=http://victoria-metrics:8428/api/v1/write
+      # Leg 10: the same series to `logit`'s receiver, where zstd is refused before W2.
+      - -remoteWrite.url=http://logit-vmagent-in:9201/api/v1/write
+      - -remoteWrite.tmpDataPath=/tmp/vmagent-remotewrite-data
+      - -remoteWrite.flushInterval=2s
+
+  logit-rw1:
+    <<: *logit
+    volumes: ["./logit-rw1.yaml:/config.yaml:ro,z"]
+
+  logit-rw2:
+    <<: *logit
+    volumes: ["./logit-rw2.yaml:/config.yaml:ro,z"]
+
+  logit-expose:
+    <<: *logit
+    volumes: ["./logit-expose.yaml:/config.yaml:ro,z"]
+
+  logit-influx:
+    <<: *logit
+    volumes: ["./logit-influx.yaml:/config.yaml:ro,z"]
+
+  logit-graphite:
+    <<: *logit
+    volumes: ["./logit-graphite.yaml:/config.yaml:ro,z"]
+
+  logit-otlp-http:
+    <<: *logit
+    volumes: ["./logit-otlp-http.yaml:/config.yaml:ro,z"]
+
+  logit-otlp-grpc:
+    <<: *logit
+    volumes: ["./logit-otlp-grpc.yaml:/config.yaml:ro,z"]
+
+  logit-syslog:
+    <<: *logit
+    volumes: ["./logit-syslog.yaml:/config.yaml:ro,z"]
+
+  logit-federate:
+    <<: *logit
+    volumes:
+      - ./logit-federate.yaml:/config.yaml:ro,z
+      - ${VICTORIA_INTEROP_OUT:?set by script/victoria-interop}:/out:z
+
+  logit-vmagent-in:
+    <<: *logit
+    volumes:
+      - ./logit-vmagent-in.yaml:/config.yaml:ro,z
+      - ${VICTORIA_INTEROP_OUT:?set by script/victoria-interop}:/out:z
