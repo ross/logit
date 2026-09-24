@@ -5,27 +5,24 @@
 //! the key's value is hashed through `logit_core::sampling`'s frozen contract and kept iff
 //! `sampling::keep(hash, rate)`; with no key, a per-instance counter mixed with a random seed
 //! stands in for a draw. A configured key the event doesn't carry falls to `missing`. Every event
-//! sharing a key gets the same verdict -- in this node, in every other `sample` node configured
-//! with the same rate, and in every other `logit` process -- with nothing propagated. That
-//! property is the whole reason this is a native kind rather than `math.random()` in `lua`.
+//! sharing a key gets the same verdict in every `sample` node with the same rate, in every `logit`
+//! process, with nothing propagated. That property is why this is a native kind rather than
+//! `math.random()` in `lua`.
 //!
-//! Never mutates an event: it only ever decides whether to forward one.
+//! Never mutates an event: it only decides whether to forward one.
 //!
 //! **`always_keep` compares under `crate::value_matches`**, so it inherits `has_attributes`'
-//! rules exactly -- including that a `Bool` never matches a string: `value: true` does not match
-//! a logfmt line's `sampling.keep=true`, which arrives as `Str("true")`. Write `value: "true"`
-//! for that producer, or omit `value:` to match any value.
+//! rules, including that a `Bool` never matches a string: `value: true` does not match a logfmt
+//! line's `sampling.keep=true`, which arrives as `Str("true")`. Write `value: "true"` for that
+//! producer, or omit `value:` to match any value.
 //!
-//! **Telemetry** is tallied in plain integers per event and emitted once per batch from
-//! `end_batch` (`kv_metrics`' `Tally` pattern): `logit.transform.events.filtered` (the filter
-//! family's counter -- the dropped count, emitted even when `0` so the series registers) and
-//! `logit.transform.sample.decisions{outcome, by}` for each non-zero cell. `by` is `override` for
-//! an `always_keep` hit, `key` for a hashed verdict, `random` for a keyless sampler's draw, and
-//! `missing` for an event whose configured key was absent -- whatever `missing:` then did with it,
-//! a random draw included, so the cell counts exactly the events the key didn't cover. The node
-//! runtime also counts every drop as `logit.component.events.dropped{reason="absorbed"}`
-//! (`crates/logit-pipeline/src/runtime.rs`'s `process_batch`), as it does for any transform that
-//! returns `false`.
+//! **Telemetry** is tallied per event and emitted once per batch from `end_batch`:
+//! `logit.transform.events.filtered` (the dropped count, emitted even when `0` so the series
+//! registers) and `logit.transform.sample.decisions{outcome, by}` for each non-zero cell. `by` is
+//! `override` for an `always_keep` hit, `key` for a hashed verdict, `random` for a keyless draw,
+//! and `missing` for an event whose configured key was absent, whatever `missing:` then did with
+//! it. The node runtime also counts every drop as
+//! `logit.component.events.dropped{reason="absorbed"}`.
 //!
 //! Zero allocations per event, pinned by `crates/logit-bench/tests/allocations.rs`: keys and the
 //! override field are interned once at construction, lookups are `AttrMap::get_sym`, and the hash
@@ -38,9 +35,7 @@ use logit_core::{Event, Resource, Symbol, Telemetry, Value};
 use logit_pipeline::Transform;
 use std::sync::Arc;
 
-/// What to hash. Mirrors `logit_config::SampleKey` -- `logit-transforms` doesn't depend on
-/// `logit-config` (`docs/design/pipeline-graph.md`'s crate layout), so the CLI converts, the
-/// `keep_values`/`flatten` pattern.
+/// What to hash. Mirrors `logit_config::SampleKey`; `logit-cli` converts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SampleKey {
     /// `span.trace_id`, else `log.trace.trace_id`, hashed as 32 lowercase hex characters.
@@ -102,8 +97,8 @@ impl Compiled {
         }
     }
 
-    /// The attribute/resource value this names on `event`, if any. `TraceId` is never looked up
-    /// through here -- it isn't a `Value`.
+    /// The attribute/resource value this names on `event`, if any; always `None` for `TraceId`,
+    /// which isn't a `Value`.
     fn lookup<'a>(self, resource: &'a Resource, event: &'a Event) -> Option<&'a Value> {
         match self {
             Compiled::TraceId => None,
@@ -205,8 +200,8 @@ pub struct Sample {
 }
 
 impl Sample {
-    /// `rate` is the fraction kept; graph rule 61 has already checked it (and everything else
-    /// here), so this never fails.
+    /// Builds a sampler keeping fraction `rate`; graph rule 61 has already validated every
+    /// argument.
     pub fn new(
         rate: f64,
         key: Option<SampleKey>,
@@ -231,7 +226,7 @@ impl Sample {
         self
     }
 
-    /// See [`crate::Keep::with_telemetry`]. No `Diagnostics`: nothing here can fail.
+    /// Attaches a telemetry handle; nothing here can fail, so no `Diagnostics`.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self

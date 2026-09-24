@@ -1,8 +1,8 @@
-//! `shape`: an observer that rewrites each event in place into a *measurement* of the shape that
-//! event had -- attribute counts, nesting, key and value lengths, value types, metric and span
-//! widths -- and, on its flush interval, the per-batch and cumulative facts `process` has nowhere
-//! to put. See `docs/adr/shape-observer-component.md`, which is this module's design authority,
-//! and `docs/plans/data-shape-survey.md`, the survey it was built to instrument.
+//! `shape`: an observer that rewrites each event in place into a measurement of its shape
+//! (attribute counts, nesting, key and value lengths, value types, metric and span widths), and on
+//! its flush interval emits the per-batch and cumulative facts `process` has nowhere to put.
+//! `docs/adr/shape-observer-component.md` is the design; `docs/plans/data-shape-survey.md` is
+//! the survey it instruments.
 //!
 //! Tapped off a flow by ordinary fan-out, never placed in it:
 //!
@@ -11,24 +11,20 @@
 //!            └─> shape ─> aggregate ─> any sink
 //! ```
 //!
-//! Three properties are load-bearing, and a reviewer should check all three on any change here:
+//! Check all three properties on any change here:
 //!
 //! - **It emits counts and lengths only.** No attribute key, attribute value, log body, or metric
-//!   name from an observed event appears in anything this component produces -- not in a metric,
-//!   not in a tag, not in a diagnostic or a telemetry point. That is what lets its output leave an
-//!   environment the traffic itself can't. The two deliberate edges are `resource: keep` (an
-//!   operator opting the *batch's* resource through, [`Shape::with_resource_kept`]) and the
-//!   batch's `Scope`, which passes through because `Transform` has no hook to substitute one.
-//! - **It emits raw values and never summarizes.** Every distribution-shaped quantity is a
-//!   [`MetricKind::Samples`], the same raw kind `statsd_in` decodes a timer to and `kv_metrics`
-//!   derives a `distributions:` entry to. Sketching, windowing and keying are an `aggregate`
-//!   downstream's decision -- `docs/adr/lossless-transit.md`'s "summarization is opt-in and
-//!   named."
+//!   name from an observed event appears in anything it produces: not a metric, a tag, a
+//!   diagnostic, or a telemetry point. That's what lets its output leave an environment the
+//!   traffic can't. The two exceptions are `resource: keep` ([`Shape::with_resource_kept`]) and
+//!   the batch's `Scope`, which passes through because `Transform` has no hook to replace it.
+//! - **It emits raw `Samples`, never a sketch.** Every distribution-shaped quantity is a
+//!   [`MetricKind::Samples`]; sketching, windowing, and keying are a downstream `aggregate`'s
+//!   job (`docs/adr/lossless-transit.md`'s "summarization is opt-in and named").
 //! - **Every name it emits is interned once, at construction** ([`Names`]), never per event.
 //!
-//! A measurement event carries on the order of a dozen metric records, so it always spills
-//! `MetricList`'s single inline slot -- accepted by design, and pinned rather than left to be
-//! discovered (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md` §2).
+//! A measurement event carries about a dozen metric records, so it always spills `MetricList`'s
+//! inline slot; `crates/logit-bench/tests/allocations.rs` pins that (`docs/design/memory.md` §2).
 
 use bytes::Bytes;
 use logit_core::interner::{intern, resolve, Symbol};
@@ -43,33 +39,29 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How many batches' worth of per-batch measurements one flush window retains before dropping
-/// (and counting) the rest -- a DoS/memory guard, not a tuning knob, the same role
-/// `aggregate`'s `max_retained_series` plays for series. A window holds one `f64` per batch per
-/// per-batch metric, so this bounds that at four `Vec`s of 4096 across every `source`.
+/// Batches one flush window records before dropping and counting the rest: a memory guard, not a
+/// tuning knob, like `aggregate`'s `max_retained_series`. Bounds the window at four `Vec<f64>`s of
+/// 4096 across every `source`.
 const MAX_BATCHES_PER_WINDOW: usize = 4096;
 
-/// `logit_config::ComponentKind::Shape`'s `max_tracked_keys` default, mirrored here so a direct
-/// [`Shape::new`] caller (a test, a bench) gets the same bound a config does.
+/// `logit_config::ComponentKind::Shape`'s `max_tracked_keys` default, so a direct
+/// [`Shape::new`] caller gets the same bound a config does.
 pub const DEFAULT_MAX_TRACKED_KEYS: usize = 4096;
 
-/// `logit_config::ComponentKind::Shape`'s `max_tracked_keysets` default -- see
-/// [`DEFAULT_MAX_TRACKED_KEYS`].
+/// `logit_config::ComponentKind::Shape`'s `max_tracked_keysets` default.
 pub const DEFAULT_MAX_TRACKED_KEYSETS: usize = 4096;
 
-/// The reported value types, in [`Value`]'s own variant order. `I64` and `U64` deliberately share
-/// one `int` bucket: which of the two a decoder produced is an artifact of the wire format it read
-/// (`serde_json` picks `U64` for an unsigned literal, the native format round-trips whichever it
-/// was encoded from), not a fact about the producer's data shape, and this component exists to
-/// describe the latter.
+/// The reported value types, in [`Value`]'s variant order. `I64` and `U64` share one `int` bucket:
+/// which one a decoder produced is an artifact of the wire format (`serde_json` picks `U64` for an
+/// unsigned literal), not of the producer's data.
 const VALUE_TYPES: usize = 9;
 
 /// One name suffix per [`VALUE_TYPES`] bucket -- `logit.shape.values.<suffix>`.
 const VALUE_TYPE_NAMES: [&str; VALUE_TYPES] =
     ["null", "bool", "int", "float", "bytes", "string", "timestamp", "array", "map"];
 
-/// Which [`VALUE_TYPES`] bucket a value counts in. Matched exhaustively on purpose: a new `Value`
-/// variant must fail to compile here rather than silently vanish from the survey.
+/// Which [`VALUE_TYPES`] bucket a value counts in. Exhaustive, so a new `Value` variant fails to
+/// compile here instead of vanishing from the survey.
 fn value_type_index(value: &Value) -> usize {
     match value {
         Value::Null => 0,
@@ -84,16 +76,14 @@ fn value_type_index(value: &Value) -> usize {
     }
 }
 
-/// The `signal` tag's eight values, indexed by the bitmask `log | metric<<1 | span<<2`. Joined
-/// with `+` in a fixed log/metric/span order so signal *co-occurrence* -- the thing
-/// `docs/design/memory.md` §0's workload table has no evidence for -- falls out downstream as an
-/// ordinary tag value rather than needing three separate booleans recombined by hand.
+/// The `signal` tag's eight values, indexed by the bitmask `log | metric<<1 | span<<2`. One
+/// `+`-joined value rather than three booleans, so signal co-occurrence is an ordinary tag value
+/// downstream.
 const SIGNAL_NAMES: [&str; 8] =
     ["none", "log", "metric", "log+metric", "span", "log+span", "metric+span", "log+metric+span"];
 
-/// Every metric name and tag key this component emits, interned once at [`Shape::new`]. The point
-/// of the struct is that nothing below ever calls `intern` again: `intern`/`resolve` are probes on
-/// the process-wide table (`docs/design/memory.md` §4), and this runs once per *record* per event.
+/// Every metric name and tag key this component emits, interned once at [`Shape::new`] so the
+/// per-record path never probes the process-wide table (`docs/design/memory.md` §4).
 struct Names {
     events: Symbol,
     attributes: Symbol,
@@ -121,9 +111,7 @@ struct Names {
     tag_signal: Symbol,
     tag_source: Symbol,
     tag_tap: Symbol,
-    /// The eight `signal` tag values, pre-built as `Value`s rather than interned symbols: a tag
-    /// lands on an `AttrMap` as a `Value`, and `Bytes::from_static` over a `&'static str` costs no
-    /// allocation to build or to clone.
+    /// The eight `signal` tag values as static `Value`s, free to build and to clone.
     signals: [Value; 8],
 }
 
@@ -163,24 +151,20 @@ impl Names {
     }
 }
 
-/// A `&'static str` as a `Value::Str` with no allocation -- `Bytes::from_static` borrows rather
-/// than copying. Every string this component ever emits goes through here or
-/// [`symbol_value`]: both are `&'static`, which is exactly why no tag value costs anything.
+/// A `&'static str` as a `Value::Str` with no allocation. Every string this component emits goes
+/// through here or [`symbol_value`], which is why no tag value allocates.
 fn static_str_value(s: &'static str) -> Value {
     Value::Str(Bytes::from_static(s.as_bytes()))
 }
 
-/// A component *id* (this component's own name, or a batch's `origin`) as a tag value.
-/// `interner::resolve` hands back a `&'static str`, so this allocates nothing either. Only ever
-/// applied to a `Symbol` naming a pipeline component -- never to an observed attribute key.
+/// A component id (this component's, or a batch's `origin`) as a tag value, allocation-free
+/// because `resolve` returns `&'static str`. Never apply it to an observed attribute key.
 fn symbol_value(sym: Symbol) -> Value {
     static_str_value(resolve(sym))
 }
 
-/// Per-event scratch, owned by the component and cleared per event rather than rebuilt: after the
-/// first event of each shape these `Vec`s never allocate again, which is what keeps `process`'s
-/// pinned cost to the `MetricList` spill and the `Samples` that genuinely outgrow
-/// `SAMPLES_INLINE`.
+/// Per-event scratch, cleared rather than rebuilt, so `process`'s pinned cost is only the
+/// `MetricList` spill and any `Samples` that outgrow `SAMPLES_INLINE`.
 #[derive(Default)]
 struct Scratch {
     key_bytes: Vec<f64>,
@@ -202,12 +186,11 @@ impl Scratch {
     }
 }
 
-/// Accounts one attribute value and everything under it, returning that value's own nesting
-/// depth: `0` for a scalar, `1 + max(child depth)` for an `Array`/`Map` (so an empty container is
-/// `1`). Recursive over `Array`/`Map` exactly as `Event::estimated_heap_bytes`'s own
-/// `value_heap_bytes` already is (`crates/logit-core/src/event.rs`) -- an event whose nesting
-/// could overflow the stack here would already have overflowed it on the queue push that got it
-/// this far.
+/// Accounts one attribute value and everything under it, returning its nesting depth: `0` for a
+/// scalar, `1 + max(child depth)` for an `Array`/`Map` (an empty container is `1`).
+///
+/// Unbounded recursion is safe here: `value_heap_bytes` (behind `Event::estimated_heap_bytes`)
+/// recurses the same way on the queue push that delivered the event, so it would overflow first.
 fn walk(value: &Value, scratch: &mut Scratch) -> u32 {
     scratch.type_counts[value_type_index(value)] += 1;
     match value {
@@ -239,8 +222,7 @@ fn walk(value: &Value, scratch: &mut Scratch) -> u32 {
     }
 }
 
-/// A log body's length in bytes: a `Str`/`Bytes` body's own length, `0` for any other `Value` a
-/// body could legally be (a Lua script can set one to a number). Never the body itself.
+/// A log body's length in bytes, or `0` for a non-string body (Lua can set a number).
 fn body_len(message: &Value) -> usize {
     match message {
         Value::Str(b) | Value::Bytes(b) => b.len(),
@@ -248,11 +230,9 @@ fn body_len(message: &Value) -> usize {
     }
 }
 
-/// A key-set's identity: a 64-bit hash of the event's `Symbol` sequence. `AttrMap` iterates in
-/// sorted-`Symbol` order (`AttrMap::iter`), so two events carrying the same keys hash the same
-/// with no sort and no allocation. The length is hashed first so `{a}` and `{a, b}` can't collide
-/// through a prefix. A hash, not the keys themselves: a *count* of distinct key-sets is a shape
-/// measurement, the key-sets themselves would be observed data.
+/// A key-set's identity: a 64-bit hash of the event's `Symbol` sequence. `AttrMap::iter` yields
+/// sorted `Symbol`s, so equal key-sets hash equal with no sort. The length goes first so a prefix
+/// can't collide. A hash, because the key-sets themselves would be observed data.
 fn keyset_hash(attrs: &AttrMap) -> u64 {
     let mut hasher = DefaultHasher::new();
     (attrs.len() as u64).hash(&mut hasher);
@@ -269,9 +249,8 @@ fn signal_index(event: &Event) -> usize {
         | (usize::from(event.span.is_some()) << 2)
 }
 
-/// One flush window's per-batch measurements for one `source`: one value per batch seen since the
-/// last flush, in arrival order. Four parallel `Vec`s rather than a `Vec` of structs so each one
-/// can be handed straight to `Samples::new`.
+/// One flush window's per-batch measurements for one `source`, one value per batch in arrival
+/// order. Parallel `Vec`s so each goes straight to `Samples::new`.
 #[derive(Default)]
 struct BatchSamples {
     events: Vec<f64>,
@@ -280,9 +259,8 @@ struct BatchSamples {
     keysets: Vec<f64>,
 }
 
-/// The batch currently being processed, accumulated across `observe_scope`/`map_resource`/
-/// `process` and committed by `end_batch` -- `process` cannot emit a second event, so there is
-/// nowhere else for a per-batch fact to go (`docs/adr/shape-observer-component.md`).
+/// The current batch, accumulated across `observe_scope`/`map_resource`/`process` and committed
+/// by `end_batch`, because `process` can't emit a second event to carry a per-batch fact.
 #[derive(Default)]
 struct BatchTally {
     events: u64,
@@ -296,29 +274,26 @@ pub struct Shape {
     max_tracked_keys: usize,
     max_tracked_keysets: usize,
     names: Names,
-    /// One cached, empty resource, substituted by `map_resource` under the default
-    /// `resource: drop` -- allocated once here, `Arc`-cloned per batch, never per event.
+    /// The empty resource `map_resource` substitutes under the default `resource: drop`,
+    /// `Arc`-cloned per batch.
     empty_resource: Arc<Resource>,
-    /// This component's own configured id, when the registry gave it one
-    /// (`logit_cli::pipeline::build_spec`) -- the `tap` tag, so two taps feeding one `aggregate`
-    /// stay distinct series.
+    /// The `tap` tag: this component's id, so two taps feeding one `aggregate` stay distinct.
     tap: Option<Symbol>,
-    /// The current batch's provenance `origin` -- the `source` tag. Cached per batch from
-    /// `observe_provenance`, exactly as `has_provenance` caches the same value.
+    /// The `source` tag: the current batch's provenance `origin`, cached as `has_provenance`
+    /// caches it.
     source: Option<Symbol>,
     scratch: Scratch,
     batch: BatchTally,
-    /// Distinct key-set hashes seen *within the current batch*. Cleared (not rebuilt) per batch.
+    /// Distinct key-set hashes in the current batch.
     batch_keysets: HashSet<u64>,
-    /// This flush window's per-batch measurements, keyed by `source`. A `BTreeMap` rather than a
-    /// `HashMap` so a flush emits its events in a deterministic order.
+    /// This window's per-batch measurements by `source`; a `BTreeMap` so flush order is
+    /// deterministic.
     window: BTreeMap<Option<Symbol>, BatchSamples>,
     window_batches: usize,
-    /// Every distinct top-level attribute key seen since start, capped at `max_tracked_keys`.
+    /// Distinct top-level attribute keys since start, capped at `max_tracked_keys`.
     keys: HashSet<Symbol>,
-    /// Every distinct top-level key-set seen since start and how many events carried it, capped
-    /// at `max_tracked_keysets`. The counts are what `keyset_share.top1`/`.top5` are computed
-    /// from.
+    /// Distinct top-level key-sets since start with their event counts (for `keyset_share`),
+    /// capped at `max_tracked_keysets`.
     keysets: HashMap<u64, u64>,
     keys_untracked: u64,
     keysets_untracked: u64,
@@ -328,8 +303,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// `interval` is the flush cadence for the per-batch and cumulative measurements -- the
-    /// per-event ones ride out on the events themselves and don't wait for it.
+    /// `interval` paces the per-batch and cumulative measurements; per-event ones don't wait.
     pub fn new(interval: Duration) -> Self {
         Shape {
             interval,
@@ -355,37 +329,30 @@ impl Shape {
         }
     }
 
-    /// `true` forwards the incoming batch resource unchanged (`resource: keep`); `false`, the
-    /// default, substitutes one cached empty `Resource` so no resource attribute value flows out
-    /// of this component at all. See the module doc's counts-only property -- this is one of its
-    /// two deliberate edges, and it is the operator's to opt into.
+    /// `true` (`resource: keep`) forwards the batch resource unchanged, an operator-chosen
+    /// exception to the counts-only property. The default substitutes an empty `Resource`.
     pub fn with_resource_kept(mut self, keep: bool) -> Self {
         self.keep_resource = keep;
         self
     }
 
-    /// Bounds on the two cumulative tables. Past either cap a new key/key-set is counted as
-    /// overflow rather than tracked; entries already in the table keep counting, so the shares
-    /// stay meaningful for what *is* tracked.
+    /// Caps the two cumulative tables. Past a cap a new key or key-set is counted as overflow;
+    /// tracked entries keep counting, so the shares stay meaningful for what is tracked.
     pub fn with_caps(mut self, max_tracked_keys: usize, max_tracked_keysets: usize) -> Self {
         self.max_tracked_keys = max_tracked_keys;
         self.max_tracked_keysets = max_tracked_keysets;
         self
     }
 
-    /// This component's own id, emitted as the `tap` tag. A pipeline component name, not observed
-    /// data -- `logit_cli::pipeline::build_spec` passes the same `id` it builds the telemetry
-    /// handle from.
+    /// Sets this component's id, emitted as the `tap` tag (a component name, not observed data).
     pub fn with_name(mut self, id: &str) -> Self {
         self.tap = Some(intern(id));
         self
     }
 
-    /// Attaches a telemetry handle -- this component's own drop counters
-    /// (`logit.transform.batches.dropped`, `logit.transform.keys.untracked`,
-    /// `logit.transform.keysets.untracked`). Nothing it reports names anything observed: they are
-    /// counts of things *not* recorded, which is the one thing a bounded table must never do
-    /// silently (`docs/design/internal-telemetry.md`).
+    /// Attaches a telemetry handle for the drop counters (`logit.transform.batches.dropped`,
+    /// `.keys.untracked`, `.keysets.untracked`): counts of what a bounded table didn't record,
+    /// naming nothing observed.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -395,8 +362,7 @@ impl Shape {
         self.interval
     }
 
-    /// Stamps `source`/`tap` onto a flush-emitted event's attributes. The per-event path stamps
-    /// `signal` alongside these two; a flush emission has no one signal to name.
+    /// Stamps `source`/`tap` onto a flush-emitted event, which has no one `signal` to name.
     fn tag(&self, attrs: &mut AttrMap, source: Option<Symbol>) {
         if let Some(source) = source {
             attrs.insert_sym(self.names.tag_source, symbol_value(source));
@@ -406,9 +372,8 @@ impl Shape {
         }
     }
 
-    /// The counts of the five most common tracked key-sets, descending. A fixed five-slot
-    /// insertion scan rather than a sort: it allocates nothing, and five is the largest `top`
-    /// this component reports.
+    /// The counts of the five most common tracked key-sets, descending, by an allocation-free
+    /// five-slot insertion scan.
     fn top_keyset_counts(&self) -> [u64; 5] {
         let mut top = [0u64; 5];
         for &count in self.keysets.values() {
@@ -425,7 +390,7 @@ impl Shape {
         top
     }
 
-    /// Records one top-level key against the cumulative distinct-key set, respecting the cap.
+    /// Records one top-level key in the capped distinct-key set.
     fn track_key(&mut self, key: Symbol) {
         if self.keys.contains(&key) {
             return;
@@ -438,8 +403,8 @@ impl Shape {
         self.keys.insert(key);
     }
 
-    /// Records one key-set against the cumulative key-set table, respecting the cap. An
-    /// already-tracked key-set keeps counting past the cap; only a *new* one is turned away.
+    /// Records one key-set in the capped key-set table. Past the cap, only a new key-set is
+    /// turned away; a tracked one keeps counting.
     fn track_keyset(&mut self, keyset: u64) {
         if let Some(count) = self.keysets.get_mut(&keyset) {
             *count += 1;
@@ -454,8 +419,8 @@ impl Shape {
     }
 }
 
-/// Appends a raw-observation record. `Samples`, never a sketch: summarization is an `aggregate`
-/// downstream's named decision (`docs/adr/lossless-transit.md`).
+/// Appends a raw-observation record: `Samples`, never a sketch, because summarization is a
+/// downstream `aggregate`'s decision (`docs/adr/lossless-transit.md`).
 fn push_samples(metrics: &mut MetricList, name: Symbol, values: impl IntoIterator<Item = f64>) {
     metrics.push(MetricRecord::new(name, MetricKind::Samples(Samples::new(values))));
 }
@@ -469,14 +434,12 @@ fn push_gauge(metrics: &mut MetricList, name: Symbol, value: f64) {
 }
 
 impl Transform for Shape {
-    /// Measures the event, then **replaces** it: the log, span, metrics and attributes it arrived
-    /// with are dropped, and what goes downstream is `logit.shape.*` records under the same
-    /// timestamp, tagged `signal`/`source`/`tap`. Always returns `true` -- nothing is ever
-    /// absorbed, because an absorbed event is a measurement lost.
+    /// Measures the event, then replaces its log, span, metrics, and attributes with
+    /// `logit.shape.*` records under the same timestamp, tagged `signal`/`source`/`tap`. Always
+    /// returns `true`: an absorbed event is a lost measurement.
     ///
-    /// Everything is measured *before* anything is mutated, and the two containers being
-    /// overwritten (`event.attributes`, `event.metrics`) are cleared and refilled rather than
-    /// replaced, so a spilled backing allocation is reused instead of freed and re-made.
+    /// Measures before mutating, and clears and refills `attributes`/`metrics` rather than
+    /// replacing them, so a spilled allocation is reused.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let signal = self.names.signals[signal_index(event)].clone();
 
@@ -484,8 +447,7 @@ impl Transform for Shape {
         self.scratch.reset();
         let mut value_depth = 0u32;
         for (key, value) in event.attributes.iter() {
-            // `resolve` is a probe on the process-wide table, once per key per event. Real cost,
-            // accepted: a `Symbol` carries no length, and this is a tap branch, not the hot path.
+            // A `resolve` per key: a `Symbol` carries no length. Accepted on a tap branch.
             self.scratch.key_bytes.push(resolve(key).len() as f64);
             value_depth = value_depth.max(walk(value, &mut self.scratch));
         }
@@ -510,9 +472,8 @@ impl Transform for Shape {
         let keyset = keyset_hash(&event.attributes);
 
         // -- fold into the batch and the cumulative tables --------------------------------------
-        // A second pass over the keys rather than folding this into the measuring loop above:
-        // that loop holds `&mut self.scratch` for `walk`, and `track_key` needs `&mut self`.
-        // Both are plain integer/set work over an already-warm table, and the map is small.
+        // A second pass: the loop above holds `&mut self.scratch`, and `track_key` needs
+        // `&mut self`.
         for (key, _) in event.attributes.iter() {
             self.track_key(key);
         }
@@ -547,14 +508,12 @@ impl Transform for Shape {
 
         let out = &mut event.metrics;
         out.clear();
-        // One growth for the whole append rather than one per doubling -- `kv_metrics`' own
-        // `reserve` reasoning, and here it is certain rather than likely: a measurement event
-        // always carries more than `MetricList`'s single inline slot.
+        // One growth for the whole append; a measurement event always spills the inline slot.
         out.reserve(record_count);
 
         push_counter(out, self.names.events, 1.0);
-        // Always emitted, zero included: "this event carried no attributes at all" is data, and a
-        // distribution that silently omits its zeroes is a distribution of the wrong population.
+        // Emitted even at zero: a distribution that omits its zeroes describes the wrong
+        // population.
         push_samples(out, self.names.attributes, [attributes]);
         push_samples(out, self.names.nested_maps, [nested_maps]);
         push_samples(out, self.names.value_depth, [f64::from(value_depth)]);
@@ -599,23 +558,19 @@ impl Transform for Shape {
         true
     }
 
-    /// Caches the batch's `origin` as the `source` tag -- `has_provenance`'s idiom exactly
-    /// (`crates/logit-transforms/src/provenance.rs`): a per-batch fact read back by `process`,
-    /// never widened into a per-event parameter.
+    /// Caches the batch's `origin` as the `source` tag, as `has_provenance` does.
     fn observe_provenance(&mut self, provenance: Provenance) {
         self.source = provenance.origin;
     }
 
-    /// Records the incoming scope's attribute count. The scope itself passes through untouched --
-    /// `Transform` has no hook to substitute one, and a scope names an instrumentation library
-    /// rather than carrying payload (`docs/adr/shape-observer-component.md`).
+    /// Records the incoming scope's attribute count. The scope passes through: `Transform` has
+    /// no hook to replace it, and it names an instrumentation library, not payload.
     fn observe_scope(&mut self, scope: Option<Arc<Scope>>) {
         self.batch.scope_attributes = scope.map_or(0, |scope| scope.attributes.len() as u64);
     }
 
-    /// Records the **incoming** resource's attribute count, then substitutes one cached empty
-    /// `Resource` unless the operator asked to keep it. Both halves happen here because this is
-    /// the one hook that sees the resource a batch arrived under.
+    /// Records the incoming resource's attribute count, then substitutes the empty `Resource`
+    /// unless `resource: keep`. This is the only hook that sees the incoming resource.
     fn map_resource(&mut self, resource: &Arc<Resource>) -> Option<Arc<Resource>> {
         self.batch.resource_attributes = resource.attributes.len() as u64;
         if self.keep_resource {
@@ -625,9 +580,8 @@ impl Transform for Shape {
         }
     }
 
-    /// Commits the batch's measurements into this flush window, and resets for the next one.
-    /// Past [`MAX_BATCHES_PER_WINDOW`] a batch is dropped and counted rather than silently
-    /// forgotten -- the count names no source and no key, only how many batches went unrecorded.
+    /// Commits the batch into this flush window and resets. Past [`MAX_BATCHES_PER_WINDOW`] a
+    /// batch is dropped and counted.
     fn end_batch(&mut self) {
         let keysets = self.batch_keysets.len() as f64;
         let tally = std::mem::take(&mut self.batch);
@@ -649,14 +603,11 @@ impl Transform for Shape {
         Some(self.interval)
     }
 
-    /// Emits one event per `source` seen this window (the per-batch measurements) plus exactly one
-    /// event carrying the cumulative gauges -- the latter unconditionally, since a gauge nobody
-    /// re-reports reads downstream as a value that still holds.
+    /// Emits one event per `source` seen this window (the per-batch measurements) plus one event
+    /// of cumulative gauges, always, since a gauge nobody re-reports reads as still holding.
     ///
-    /// Everything goes out under the same empty resource and no scope, regardless of
-    /// `resource: keep`: a window spans many batches, so there is no single resource to keep.
-    /// Links are empty -- this component attributes nothing across batches the way `aggregate`'s
-    /// flush does.
+    /// Everything goes out under the empty resource and no scope, even with `resource: keep`: a
+    /// window spans many batches. Links are empty.
     fn flush(&mut self, now: i64) -> FlushOutput {
         if self.keys_untracked > 0 {
             self.telemetry.count("logit.transform.keys.untracked", self.keys_untracked as f64, &[]);
@@ -787,11 +738,9 @@ mod tests {
         }
     }
 
-    /// The nginx reference shape as `crates/logit-bench/src/fixtures.rs`' `nginx_event` produces
-    /// it: ten top-level attributes and four derived metrics. Reconstructed here rather than
-    /// imported -- `logit-bench` depends on this crate, not the other way round -- but pinned to
-    /// the same counts, which is what `docs/plans/data-shape-survey.md`'s acceptance check cares
-    /// about.
+    /// `logit-bench`'s `nginx_event` shape (this crate can't depend on it): ten top-level
+    /// attributes and four derived metrics, the counts `docs/plans/data-shape-survey.md`'s
+    /// acceptance check relies on.
     fn nginx_shaped_event() -> Event {
         let mut event = Event::log(
             0,
@@ -954,9 +903,7 @@ mod tests {
         let mut widths = samples(&event, "logit.shape.nested_map_width").unwrap().to_vec();
         widths.sort_by(f64::total_cmp);
         assert_eq!(widths, vec![1.0, 1.0, 2.0]);
-        // Two levels of map: the `k8s` value is a map (1) whose `deep` value is another (2). The
-        // scalar at the bottom is not a level of its own -- depth counts containers, so an
-        // all-scalar event is 0.
+        // `k8s` (1) holds `deep` (2); depth counts containers, not the scalar at the bottom.
         assert_eq!(one(&event, "logit.shape.value_depth"), 2.0, "k8s -> deep");
         assert_eq!(counter(&event, "logit.shape.values.map"), Some(3.0));
         assert_eq!(counter(&event, "logit.shape.values.int"), Some(3.0), "nested ints count too");
@@ -1135,8 +1082,7 @@ mod tests {
 
     // -- per-batch accumulation and flush --------------------------------------------------------
 
-    /// Drives one whole batch through the hooks in the order `process_batch` calls them
-    /// (`crates/logit-pipeline/src/runtime.rs`).
+    /// Drives one batch through the hooks in `logit_pipeline::runtime::process_batch`'s order.
     fn run_batch(
         shape: &mut Shape,
         origin: Option<&str>,
@@ -1384,10 +1330,8 @@ mod tests {
 
     // -- the counts-only property --------------------------------------------------------------
 
-    /// The property this component exists for, asserted end to end: nothing an observed event
-    /// carried -- an attribute key, an attribute value, a log body, a metric name, a span name, a
-    /// resource attribute -- appears anywhere in what `shape` emits, on the per-event path or the
-    /// flush path, in a metric name, a tag key, or a tag value.
+    /// No observed key, value, body, metric name, span name, or resource attribute appears in
+    /// any metric name, tag key, or tag value `shape` emits, per-event or on flush.
     #[test]
     fn no_observed_key_or_value_appears_anywhere_in_the_output() {
         const SECRETS: [&str; 6] = [
@@ -1447,8 +1391,7 @@ mod tests {
         }
     }
 
-    /// Everything a measurement event can possibly carry as text: every metric name and unit,
-    /// every tag key, and every tag value.
+    /// Every metric name, unit, tag key, and tag value a measurement event carries.
     fn render(event: &Event) -> String {
         let mut out = String::new();
         for m in event.metrics.iter() {

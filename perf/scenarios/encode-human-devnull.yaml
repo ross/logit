@@ -1,18 +1,13 @@
-# The human-readable encoder in situ (docs/plans/load-test-harness.md's scenario table):
-# generate_in straight into file_out at /dev/null under the default `format: human`
-# (logit_outputs::stdio::EventDump), rather than null_out -- a real sink doing real encode-and-write
-# work, unlike every other scenario here. Pairs with encode-native-devnull to compare the two
-# encoders' cost against the identical event stream; the gap between this scenario's numbers and
-# passthrough's is the encoder's own cost.
+# The human-readable encoder in situ: generate_in straight into file_out at /dev/null under the
+# default `format: human` (logit_outputs::stdio::EventDump), a real sink doing real encode-and-write
+# work. Pairs with encode-native-devnull on the identical event stream; the gap from passthrough is
+# the encoder's own cost. Scenario table: docs/plans/load-test-harness.md, "Scenarios".
 #
 #   script/perf run --scenario encode-human-devnull
 #
-# `rotate:` is required -- graph rule 29 rejects a `file_out` whose rotation block would never
-# rotate at all (`stdio_out` already covers that case). `max_bytes: "100GiB"` is comfortably above
-# anything this scenario's count could ever encode, so it's a config-validity formality here, not
-# a real rotation trigger -- rotating `/dev/null` mid-run would be nonsensical, and calendar
-# rotation (`interval:`) risks tripping for real if a run happens to straddle an hour/day boundary,
-# which a byte bound this large never will.
+# `rotate:` is required: graph rule 29 rejects a `file_out` whose rotation block would never
+# rotate. `max_bytes: "100GiB"` is above anything this count can encode, so it never triggers;
+# calendar rotation (`interval:`) could trip for real if a run straddled an hour or day boundary.
 components:
   gen:
     type: generate_in

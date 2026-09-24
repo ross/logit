@@ -1,11 +1,10 @@
-//! The native frame header: a fixed, versioned envelope around one codec's payload bytes. See
-//! `docs/design/wire-protocol.md` for the full format, including the dictionary-first payload
-//! encoding this header wraps (`crate::native`).
+//! The native frame: a fixed, versioned 24-byte header (CRC-32C over the possibly
+//! lz4-compressed payload) around one codec's payload bytes. `docs/design/wire-protocol.md`'s
+//! "Framing" section has the layout; `crate::native` is the payload.
 //!
-//! A frame is the unit both the wire and a file agree on: `write_frame`/`read_frame` work
-//! identically writing to a `TcpStream` or appending to a file, which is what lets a durable
-//! buffer and a socket write share one encoder (`docs/design/wire-protocol.md`: the `logit_in`/
-//! `logit_out` connection and the on-disk formats are the same format, not two).
+//! A socket write and a file append use the same `write_frame`/`read_frame` pair: the
+//! `logit_in`/`logit_out` connection, `file_out`'s native format, and the disk spool are one
+//! format, and a file is a concatenation of frames.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -14,51 +13,32 @@ use crate::CodecError;
 pub const MAGIC: [u8; 4] = *b"LGIT";
 pub const VERSION: u16 = 1;
 
-/// Bit 0 of [`FrameHeader::flags`]: this frame carries a control payload (a `logit_in`/`logit_out`
-/// handshake or ack, `crate::native::control`) rather than a native-v1 batch. `flags`/the header's
-/// reserved bytes were always spare room for exactly this kind of later use -- see `HEADER_LEN`'s
-/// own doc comment and `docs/design/wire-protocol.md`. The bit clear means an ordinary data frame;
-/// no other bit is assigned yet.
+/// Bit 0 of [`FrameHeader::flags`]: the payload is a `logit_in`/`logit_out` handshake or ack
+/// (`crate::native::control`), not a batch. No other bit is assigned.
 pub const FLAG_CONTROL: u16 = 1 << 0;
 
-/// The largest payload a single frame may declare, checked before `uncompressed_len` -- a raw,
-/// unvalidated `u32` off the wire -- is ever used to size an allocation. A frame at this cap is
-/// already far larger than any batch `logit` produces; a crafted 30-byte lz4 frame could otherwise
-/// name a multi-gigabyte `uncompressed_len` and force the allocation attempt before a single byte
-/// of payload had been looked at. Same reasoning as `crate::native::dict`'s
-/// `MAX_SANE_DICT_ENTRIES` and `crate::native`'s `MAX_SANE_EVENT_COUNT`.
+/// The largest `uncompressed_len` a reader accepts, checked before that untrusted `u32` sizes an
+/// allocation: otherwise a crafted 30-byte lz4 frame could force a multi-gigabyte one. Same
+/// reasoning as `native::dict`'s `MAX_SANE_DICT_ENTRIES` and `native`'s `MAX_SANE_EVENT_COUNT`.
 ///
-/// **Deliberately asymmetric with `write_frame`.** This bound guards a decoder reading untrusted
-/// bytes; nothing stops `write_frame` from encoding a payload larger than this and producing a
-/// frame its own `read_frame` would then reject. Nothing in this codebase produces a batch
-/// anywhere near 64 MiB, so that asymmetry stays theoretical in practice -- but a writer that must
-/// never emit a frame its own reader would refuse doesn't rely on that, it checks explicitly.
-///
-/// `pub` because both a reader and a writer outside this module need the same ceiling:
-/// - `logit_in` (`crates/logit-inputs/src/logit.rs`) checks an incoming frame's declared lengths
-///   against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` *before* reading the body off
-///   the socket, not just after -- this constant is that shared ceiling.
-/// - the durable sink buffer (`crates/logit-pipeline/src/disk_queue.rs`) checks an encoded frame
-///   against this bound itself before ever writing it, dropping the batch instead of spooling
-///   something its own segment reader could not read back.
+/// `write_frame` doesn't enforce it, so it can produce a frame `read_frame` rejects. A writer
+/// that must never do that checks this bound itself: `DiskQueue`
+/// (`crates/logit-pipeline/src/disk_queue.rs`) drops an oversize batch rather than spool it. A
+/// reader outside this module shares it too: `logit_in` (`crates/logit-inputs/src/logit.rs`)
+/// checks declared lengths against `min(MAX_SANE_UNCOMPRESSED_LEN, peer.max_frame_bytes)` before
+/// reading a body off the socket.
 pub const MAX_SANE_UNCOMPRESSED_LEN: u32 = 64 * 1024 * 1024;
 
-/// The largest `compressed_len` a frame may declare, checked the same way and for the same
-/// reason as `MAX_SANE_UNCOMPRESSED_LEN` above -- but not simply reused as the same value: lz4's
-/// worst case expands rather than shrinks a payload, so a legitimately-written frame whose
-/// payload sits at the uncompressed cap can declare slightly more compressed bytes than that,
-/// and reusing the uncompressed cap directly here would make `write_frame` able to produce a
-/// frame its own `read_frame` then refuses. This is the uncompressed cap plus lz4's own
-/// documented worst-case expansion, wide enough to admit exactly that legitimate case while
-/// still bounding the allocation a corrupted length field can force.
+/// The largest `compressed_len` a reader accepts: [`MAX_SANE_UNCOMPRESSED_LEN`] plus lz4's
+/// documented worst-case expansion, since an incompressible payload at the uncompressed cap
+/// compresses to slightly more bytes than the cap.
 const MAX_SANE_COMPRESSED_LEN: u32 =
     MAX_SANE_UNCOMPRESSED_LEN + MAX_SANE_UNCOMPRESSED_LEN / 255 + 16;
 
 /// The fixed header size in bytes: 4 (magic) + 2 (version) + 2 (flags) + 1 (codec) +
 /// 1 (compression) + 2 (reserved) + 4 (uncompressed_len) + 4 (compressed_len) + 4 (crc32c) = 24.
-/// Chosen over the 20 bytes an earlier skeleton comment named so every multi-byte field after
-/// `compression` starts on a 4-byte boundary -- `reserved` is spare room for a flag or a narrow
-/// field a later version needs, not padding to be removed.
+/// `reserved` keeps every later multi-byte field 4-byte aligned and is room for a future flag or
+/// narrow field; it isn't padding to remove.
 pub const HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,11 +47,9 @@ pub enum Compression {
     #[default]
     None = 0,
     Lz4 = 1,
-    /// Reserved, not encodable or decodable yet -- the real `zstd` crate builds C via `zstd-sys`,
-    /// which breaks ADR `containerized-development`'s "no host toolchain" property, and the
-    /// pure-Rust alternatives aren't yet competitive on ratio or speed. See
-    /// `docs/adr/native-wire-format-encoding.md`. `write_frame` and `read_frame` both reject this
-    /// discriminant with [`CodecError::Unsupported`] rather than silently treating it as `None`.
+    /// Reserved: `write_frame` and `read_frame` both reject it with [`CodecError::Unsupported`].
+    /// The `zstd` crate builds C, which breaks ADR `containerized-development`, and the pure-Rust
+    /// ones aren't competitive (ADR `native-wire-format-encoding`).
     Zstd = 2,
 }
 
@@ -86,8 +64,8 @@ impl Compression {
     }
 }
 
-/// Fixed, versioned framing so an incompatible future payload format can be rejected (or,
-/// eventually, negotiated) cleanly rather than corrupting the stream.
+/// A frame's header. The version lets a reader reject an incompatible payload format cleanly
+/// instead of corrupting the stream.
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
     pub version: u16,
@@ -112,22 +90,12 @@ impl FrameHeader {
         out.put_u32_le(self.crc32c);
     }
 
-    /// Reads exactly [`HEADER_LEN`] bytes off the front of `bytes`, advancing it past the header
-    /// so the caller's remaining slice is the payload. Rejects a wrong magic or an unrecognized
-    /// version outright -- both mean this isn't a frame this reader can make sense of at all,
-    /// as opposed to a within-format decode error.
+    /// Reads [`HEADER_LEN`] bytes off the front of `bytes`, leaving the payload. A wrong magic is
+    /// `Malformed`, an unknown version `Unsupported`, and fewer than [`HEADER_LEN`] bytes
+    /// [`CodecError::Truncated`].
     ///
-    /// `pub` so a stream or file reader outside this module can peel off one header at a time
-    /// without going through the whole-frame `read_frame` -- `docs/design/wire-protocol.md`. Two
-    /// callers need exactly that: `logit_in`'s per-connection loop parses a header it has already
-    /// `read_exact`'d off a socket, separately from reading the (possibly much larger) body, since
-    /// `read_frame`'s all-at-once shape doesn't fit a socket that never hands over a whole frame's
-    /// bytes atomically the way a `Bytes` buffer does; and the durable spool's segment reader walks
-    /// a file the same way.
-    ///
-    /// Too few bytes to hold a header is [`CodecError::Truncated`], not [`CodecError::Malformed`]:
-    /// that's exactly "come back with more bytes" for a live stream, or "this is where a torn
-    /// write ends" for a file, neither of which is a claim that the bytes present are wrong.
+    /// `pub` for a reader that takes the header before the body: `logit_in` parses the header it
+    /// `read_exact`'d off the socket before reading the body, and `DiskQueue` walks a segment file.
     pub fn read(bytes: &mut Bytes) -> Result<Self, CodecError> {
         if bytes.len() < HEADER_LEN {
             return Err(CodecError::Truncated { needed: HEADER_LEN - bytes.len() });
@@ -162,15 +130,10 @@ impl FrameHeader {
     }
 }
 
-/// Frames `payload` under `codec`, compressing it with `compression` first if requested and
-/// checksumming the bytes that actually go on the wire (the *compressed* bytes, matching
-/// `docs/design/wire-protocol.md`'s "crc32c over the (possibly compressed) payload" -- a corrupt
-/// compressed stream is caught before decompression ever runs on it, rather than handing
-/// `lz4_flex` untrusted input and hoping it fails safely).
+/// Frames `payload` under `codec`, compressing it first if asked.
 ///
-/// Rejects `Compression::Zstd` with [`CodecError::Unsupported`] rather than panicking, symmetric
-/// with [`read_frame`]'s existing decode-side rejection -- `Compression` is a public enum whose
-/// `Zstd` variant any caller may construct.
+/// The CRC covers the compressed bytes, so a reader catches corruption before `lz4_flex` sees
+/// them. Rejects `Compression::Zstd` with [`CodecError::Unsupported`].
 pub fn write_frame(
     codec: u8,
     compression: Compression,
@@ -179,8 +142,8 @@ pub fn write_frame(
     write_frame_with_flags(codec, compression, 0, payload)
 }
 
-/// [`write_frame`], with the header's `flags` field set to `flags` instead of always `0` -- the
-/// entry point a control frame (`crate::native::control`, [`FLAG_CONTROL`]) writes through.
+/// [`write_frame`] with the header's `flags` set; a control frame ([`FLAG_CONTROL`]) writes
+/// through this.
 pub fn write_frame_with_flags(
     codec: u8,
     compression: Compression,
@@ -213,18 +176,15 @@ pub fn write_frame_with_flags(
     Ok(out.freeze())
 }
 
-/// The inverse of [`write_frame`]: reads one frame off the front of `bytes` (advancing it past
-/// that frame, so a caller holding a longer buffer of concatenated frames -- a file, a stream --
-/// can call this in a loop), verifies the checksum, decompresses, and returns `(codec, payload)`.
-/// Drops the header's `flags` -- see [`read_frame_with_header`] for a caller (`logit_in`) that
-/// needs them, e.g. to tell a control frame from a data frame before decoding either.
+/// Reads one frame off the front of `bytes`, verifies its CRC, decompresses it, and returns
+/// `(codec, payload)`. Advances `bytes`, so a caller loops over concatenated frames. Drops
+/// `flags`; [`read_frame_with_header`] keeps them.
 pub fn read_frame(bytes: &mut Bytes) -> Result<(u8, Bytes), CodecError> {
     let (header, payload) = read_frame_with_header(bytes)?;
     Ok((header.codec, payload))
 }
 
-/// [`read_frame`], returning the full [`FrameHeader`] (so a caller can read `flags`,
-/// `compression`, etc.) instead of just `codec`.
+/// [`read_frame`], returning the whole [`FrameHeader`] instead of just `codec`.
 pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes), CodecError> {
     let header = FrameHeader::read(bytes)?;
     if header.uncompressed_len > MAX_SANE_UNCOMPRESSED_LEN {
@@ -270,9 +230,7 @@ pub fn read_frame_with_header(bytes: &mut Bytes) -> Result<(FrameHeader, Bytes),
     Ok((header, payload))
 }
 
-/// `lz4_flex::block::compress_into` needs a pre-sized output buffer rather than allocating one
-/// itself (the crate's modern, non-deprecated API) -- `get_maximum_output_size` gives the worst
-/// case, and the buffer is truncated to what was actually written.
+/// Sizes the output to lz4's worst case, then truncates to what `compress_into` wrote.
 fn lz4_compress(payload: &[u8]) -> Vec<u8> {
     let max_len = lz4_flex::block::get_maximum_output_size(payload.len());
     let mut out = vec![0u8; max_len];
@@ -282,12 +240,9 @@ fn lz4_compress(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The inverse of [`lz4_compress`]. `uncompressed_len` comes straight from this frame's own
-/// header, so the output buffer is allocated at exactly the right size -- no guessing, no resize.
-/// The buffer is then truncated to what `decompress_into` actually wrote: `lz4_flex` is happy to
-/// write *fewer* bytes than the buffer holds, so without this the returned `Vec` would always be
-/// `uncompressed_len` long regardless, and [`read_frame`]'s length check below would be a
-/// tautology that silently accepted a short decompression padded with zero bytes.
+/// The inverse of [`lz4_compress`], sized from the header's `uncompressed_len`. Truncates to
+/// what `decompress_into` wrote: without that, a short decompression would come back zero-padded
+/// and [`read_frame`]'s length check could never fail.
 fn lz4_decompress(
     compressed: &[u8],
     uncompressed_len: usize,
@@ -298,13 +253,11 @@ fn lz4_decompress(
     Ok(out)
 }
 
-/// Scans forward in `bytes` for the next occurrence of [`MAGIC`] -- how a reader resynchronizes
-/// after a torn write (a process killed mid-append to a durable buffer file) instead of failing
-/// the whole file. Returns the number of bytes skipped, or `None` if `MAGIC` doesn't occur at all
-/// (the remainder is definitely not a frame start and should be discarded). Doesn't itself
-/// validate that a frame actually starts there -- a caller should still expect
-/// [`read_frame`]/[`FrameHeader::read`] to reject a spurious match (e.g. `MAGIC` occurring inside
-/// a log message's bytes) and resume scanning past it.
+/// Returns the offset of the next [`MAGIC`] in `bytes`, or `None` if there is none: how a reader
+/// skips past a torn write instead of failing the whole file.
+///
+/// A match isn't validated. `MAGIC` can occur inside a payload, so a caller expects
+/// [`read_frame`] to reject a spurious match and scans on past it.
 pub fn resync(bytes: &[u8]) -> Option<usize> {
     bytes.windows(MAGIC.len()).position(|w| w == MAGIC)
 }
@@ -328,8 +281,7 @@ mod tests {
     fn round_trips_lz4_compressed() {
         let payload = "repeat ".repeat(200);
         let framed = write_frame(7, Compression::Lz4, payload.as_bytes()).unwrap();
-        // A real repeated payload should actually compress -- otherwise this test isn't
-        // exercising the lz4 path at all.
+        // Guards that the lz4 path ran at all.
         assert!(framed.len() < payload.len(), "expected compression to shrink the payload");
         let mut bytes = framed;
         let (codec, out) = read_frame(&mut bytes).unwrap();
@@ -360,7 +312,6 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let mut bad = write_frame(1, Compression::None, b"x").unwrap();
-        // Corrupt the first magic byte.
         let mut mutated = BytesMut::from(&bad[..]);
         mutated[0] = b'X';
         bad = mutated.freeze();
@@ -413,9 +364,7 @@ mod tests {
 
     #[test]
     fn rejects_zstd_as_unsupported_until_it_is_implemented() {
-        // write_frame now rejects Compression::Zstd with Unsupported directly (see the test
-        // above), so this constructs the header by hand to reach the *decode*-side rejection
-        // specifically.
+        // write_frame refuses zstd, so build the header by hand to reach the decode side.
         let mut header = BytesMut::new();
         header.put_slice(&MAGIC);
         header.put_u16_le(VERSION);
@@ -491,13 +440,8 @@ mod tests {
         assert_eq!(header.flags, 0);
     }
 
-    /// F5: `compressed_len` (header bytes 16..20, verified against `FrameHeader::write` above --
-    /// magic 0..4, version 4..6, flags 6..8, codec 8, compression 9, reserved 10..12,
-    /// uncompressed_len 12..16, compressed_len 16..20, crc32c 20..24) previously had no upper
-    /// bound before being used to size a read, unlike `uncompressed_len` a few lines above it.
-    /// This is the proof it's now capped, and that a corrupted length field is correctly
-    /// classified as `Malformed` (corruption -- resync past it) rather than `Truncated`
-    /// (indistinguishable from a genuine short read/clean end-of-file).
+    /// An over-cap `compressed_len` (header bytes 16..20) is `Malformed`, so a reader resyncs
+    /// past it, not `Truncated`, which would read as a clean end of file.
     #[test]
     fn rejects_a_compressed_len_over_the_sanity_cap() {
         let framed = write_frame(1, Compression::None, b"small").unwrap();

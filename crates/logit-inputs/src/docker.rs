@@ -1,11 +1,24 @@
 //! `docker_in`: tails Docker's json-file container logs (`<root>/<id>/<id>-json.log`) and stamps
-//! per-container resource attributes read from the sibling `config.v2.json` -- no docker socket,
-//! no HTTP client. Built on the exact same driver `tail_in` (`crate::tail`) uses, swapping in
-//! [`DockerDecoder`] for [`crate::tail::LineDecoder`] and [`PathPattern::docker_containers`]
-//! (`crate::tail::PathPattern`) for `tail_in`'s own config-driven patterns. See
-//! `docs/adr/file-tailing-and-docker-json-logs.md` and
-//! `docs/adr/docker-container-identity-and-minimal-watches.md` (identity refresh via
-//! [`DockerDecoderFactory::refresh_cache`], a cache keyed on `config.v2.json`'s own stat).
+//! per-container resource attributes read from the sibling `config.v2.json`, with no docker
+//! socket and no HTTP client. It runs on `tail_in`'s driver (`crate::tail`), with
+//! [`DockerDecoder`] in place of [`crate::tail::LineDecoder`] and
+//! [`PathPattern::docker_containers`] in place of config-driven patterns. `receive:` takes the
+//! tail listener's batch-assembly fields.
+//!
+//! - **Selection** ([`ContainerFilter`]): `containers:` entries match a container's name or an id
+//!   prefix of at least 12 hex characters; `discover: true` follows every container, including
+//!   later ones. Graph rule 27 rejects neither being set.
+//! - **Identity**: the resource carries `container.id`, `container.name`, `container.image.name`,
+//!   `container.image.tag`, and `container.label.<key>` for each key in `labels:`
+//!   ([`ContainerMeta::resource`]). `config.v2.json` is re-read on a poll tick only when its stat
+//!   changes ([`DockerDecoderFactory::refresh_cache`]). While it has never been read successfully
+//!   (missing or malformed), lines still flow with a `container.id`-only resource and a
+//!   `metadata_error` diagnostic.
+//! - **Diagnostics** of its own: `bad_time` (read time used instead), `long_line`,
+//!   `metadata_error`, and the info keys `container_renamed` and `container_deselected`.
+//!
+//! See `docs/adr/file-tailing-and-docker-json-logs.md` and
+//! `docs/adr/docker-container-identity-and-minimal-watches.md`.
 
 use crate::tail::{DecoderFactory, PathPattern, Refresh, TailConfig, TailDecoder, Tailer};
 use anyhow::Context;
@@ -18,10 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::watch as shutdown_watch;
 
-/// Which containers under `root` this listener follows. Explicit by default -- a container not
-/// named here is never tailed, even if it exists -- with `discover: true` as the opt-in to follow
-/// everything, including containers that appear after startup. See the ADR's "Selection" section
-/// for why explicit is the default.
+/// Which containers under `root` this listener follows: only those named, unless `discover: true`
+/// follows every one, including containers that appear after startup. The file-tailing ADR's
+/// "Selection" section says why explicit is the default.
 pub struct ContainerFilter {
     entries: Vec<String>,
     discover: bool,
@@ -32,12 +44,9 @@ impl ContainerFilter {
         Self { entries, discover }
     }
 
-    /// `dir_name` is the container's full id (the directory name under `root`); `name` is its
-    /// human name from `config.v2.json`, when known (`None` if metadata couldn't be read yet --
-    /// only an id-prefix entry can still match in that case). Each `entries` value matches either
-    /// exactly against `name`, or as a prefix (at least 12 hex characters, config-validated by
-    /// graph rule 27 doesn't check this specifically, but a shorter or non-hex entry simply never
-    /// matches an id) of `dir_name`.
+    /// Whether an entry equals `name` or is an id prefix of `dir_name` (the full id). `name` is
+    /// `None` while `config.v2.json` is unread, so only an id prefix can match then. Graph rule 27
+    /// doesn't check an entry's shape; a shorter or non-hex entry never matches an id.
     fn matches(&self, dir_name: &str, name: Option<&str>) -> bool {
         if self.discover {
             return true;
@@ -52,10 +61,8 @@ fn is_id_prefix(entry: &str, dir_name: &str) -> bool {
     entry.len() >= 12 && entry.bytes().all(|b| b.is_ascii_hexdigit()) && dir_name.starts_with(entry)
 }
 
-/// One container's identity and image reference, read from the sibling `config.v2.json`. Read at
-/// open, and re-read on every later `scan` via [`DockerDecoderFactory::refresh_cache`], which
-/// skips the actual `read`+parse unless the file's own stat has changed since
-/// (`docs/adr/docker-container-identity-and-minimal-watches.md`).
+/// One container's identity and image reference, read from the sibling `config.v2.json` through
+/// [`DockerDecoderFactory::refresh_cache`].
 pub(crate) struct ContainerMeta {
     id: String,
     name: String,
@@ -80,10 +87,8 @@ struct ConfigV2Config {
 }
 
 impl ContainerMeta {
-    /// `dir` is one container's own directory under `root` (its name is the container's full
-    /// id). Fails if `config.v2.json` is missing, unreadable, or doesn't parse as expected --
-    /// the caller ([`DockerDecoderFactory`]) degrades to an id-only resource rather than treating
-    /// this as fatal to tailing the container's log.
+    /// Reads `dir/config.v2.json`, where `dir`'s name is the full container id. Fails if the file
+    /// is missing, unreadable, or malformed; the caller degrades to an id-only resource.
     pub(crate) fn read(dir: &Path) -> anyhow::Result<Self> {
         let path = dir.join("config.v2.json");
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -98,11 +103,10 @@ impl ContainerMeta {
         &self.name
     }
 
-    /// Builds this container's resource: `container.id`/`container.name`/`container.image.name`/
-    /// `container.image.tag` always, plus `container.label.<key>` for every key in `label_keys`
-    /// that this container actually carries -- opt-in, never every label (a label's value is
-    /// operator-controlled data, not `logit`'s to expose unasked; see the ADR's event/resource
-    /// shape section).
+    /// Builds this container's resource: `container.id`, `container.name`,
+    /// `container.image.name`, `container.image.tag` (when the reference has one), and
+    /// `container.label.<key>` for each key in `label_keys` the container carries. Labels are
+    /// opt-in (the file-tailing ADR's "Event and resource shape").
     pub(crate) fn resource(&self, label_keys: &[String]) -> Arc<Resource> {
         let mut attrs = AttrMap::new();
         attrs.insert("container.id", self.id.as_str());
@@ -122,10 +126,8 @@ impl ContainerMeta {
 }
 
 /// Splits a Docker image reference into `(name, tag)`. A digest reference (`app@sha256:...`) has
-/// no tag half by this scheme -- the `@` half is the identity, not a human-chosen tag. Otherwise
-/// splits on the reference's *last* `:`, and only if nothing after it contains a `/` -- a `:` that
-/// introduces a registry port (`registry:5000/app`) is not a tag separator, and the part after it
-/// containing `/` is what tells the two apart.
+/// no tag. Otherwise splits on the last `:`, unless a `/` follows it: that `:` introduces a
+/// registry port (`registry:5000/app`), not a tag.
 fn split_image_ref(image: &str) -> (String, Option<String>) {
     if image.contains('@') {
         return (image.to_string(), None);
@@ -138,13 +140,10 @@ fn split_image_ref(image: &str) -> (String, Option<String>) {
     }
 }
 
-/// Held across [`DockerDecoder::decode_line`] calls while Docker's own json-file driver has split
-/// one logical container-log line across more than one JSON entry (its writer buffers in ~16 KiB
-/// chunks; an entry whose `log` field doesn't yet end in `\n` is a fragment, not a whole line).
-/// `timestamp`/`stream`/`attrs` are always taken from the *closing* entry (the one whose `log`
-/// finally does end in `\n`) -- the entries making up one logical line are written by the same
-/// daemon call in immediate succession, so the difference is negligible, and keeping only the
-/// latest avoids holding onto values that will just be overwritten.
+/// A container-log line Docker's json-file driver split across entries (it writes in ~16 KiB
+/// chunks; an entry whose `log` doesn't end in `\n` is a fragment), held across
+/// [`DockerDecoder::decode_line`] calls. The emitted `timestamp`/`stream`/`attrs` are the latest
+/// entry's; one daemon call writes all the fragments in immediate succession.
 #[derive(Default)]
 struct PartialEntry {
     message: String,
@@ -153,20 +152,15 @@ struct PartialEntry {
     attrs: Vec<(String, String)>,
 }
 
-/// `docker_in`'s own [`TailDecoder`]: decodes Docker's json-file envelope, reassembles a
-/// split-across-entries line (see [`PartialEntry`]), and stamps every event with this container's
-/// resource -- built at open (by [`DockerDecoderFactory::open`]) and kept live afterward by
-/// [`DockerDecoderFactory::refresh`], which reaches into `resource` directly (same module,
-/// private field) to swap it on an identity change. Never looks inside the envelope's own `log`
-/// field past reassembling it -- the inner application line stays whatever downstream transform
-/// (`json`, typically) an operator chains after this, exactly as it would for `tail_in`.
+/// `docker_in`'s [`TailDecoder`]: decodes Docker's json-file envelope, reassembles split lines
+/// (see [`PartialEntry`]), and stamps every event with the container's resource, which
+/// `DockerDecoderFactory::refresh` swaps in place on an identity change. Never parses the inner
+/// application line in `log`; that is a downstream `json` transform's job.
 pub struct DockerDecoder {
     resource: Arc<Resource>,
     partial: Option<PartialEntry>,
-    /// Set once an in-progress reassembly has already been dropped for exceeding
-    /// `max_line_bytes` -- every further fragment is silently discarded (not re-counted, not
-    /// re-diagnosed) until the one that finally closes the line clears it, mirroring
-    /// `crate::tail::line::LineSplitter`'s own `dropping` flag.
+    /// Set once a reassembly is dropped for exceeding `max_line_bytes`: later fragments are
+    /// discarded uncounted until the closing one clears it, as in `LineSplitter`'s `dropping`.
     dropping: bool,
     max_line_bytes: usize,
     diag: Diagnostics,
@@ -302,17 +296,14 @@ impl TailDecoder for DockerDecoder {
 
     fn close(&mut self, out: &mut Vec<Event>) {
         if let Some(partial) = self.partial.take() {
-            // Already bounds-checked on every fragment append (`decode_line` above) -- a held
-            // partial here is always within `max_line_bytes`, so this always emits.
+            // Every fragment append is bounds-checked, so a held partial always fits.
             self.emit(partial.timestamp, partial.stream, &partial.attrs, partial.message, out);
         }
     }
 
     fn reset(&mut self) {
-        // Both halves of the reassembly state, not just `partial`: a stale `dropping == true`
-        // surviving a truncation silently *swallows* the new generation's first complete entry
-        // (the entry that clears the flag is itself discarded), the mirror of the splicing a
-        // stale `partial` causes.
+        // Both halves: a stale `dropping` would swallow the new generation's first complete
+        // entry, as a stale `partial` would splice into it.
         self.partial = None;
         self.dropping = false;
     }
@@ -322,9 +313,8 @@ impl TailDecoder for DockerDecoder {
     }
 }
 
-/// Enough of `config.v2.json`'s own stat to notice it was rewritten -- Docker typically rewrites
-/// it via a tmp-file-plus-rename, so `ino` usually changes too, not just `mtime`/`len`; comparing
-/// all four is cheap and catches either style of rewrite.
+/// Enough of `config.v2.json`'s stat to notice a rewrite, whether in place or by the daemon's
+/// usual tmp-file-plus-rename (which changes `ino`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigStat {
     dev: u64,
@@ -352,27 +342,20 @@ struct Identity {
     resource: Arc<Resource>,
 }
 
-/// One container directory's cached read, keyed by that directory in
-/// [`DockerDecoderFactory::meta`]. Read once, then refreshed only when `config.v2.json`'s own
-/// stat changes -- see [`DockerDecoderFactory::refresh_cache`].
+/// One container directory's cached `config.v2.json` read, refreshed by
+/// [`DockerDecoderFactory::refresh_cache`].
 #[derive(Default)]
 struct CachedMeta {
-    /// The stat `identity` (or the last failed attempt) was read at. `None` means the file
-    /// couldn't be stat'd at all (missing, or a transient race) -- deliberately never compared
-    /// equal to itself by [`DockerDecoderFactory::refresh_cache`], so a not-yet-existing config
-    /// is retried every scan rather than settling into a permanently-stale "unchanged" state.
+    /// The stat of the last read attempt. `None` (the file couldn't be stat'd) never counts as
+    /// unchanged, so a not-yet-existing config is retried every scan.
     stat: Option<ConfigStat>,
-    /// `None` until a read has ever succeeded for this directory -- `open`/`accept` degrade to
-    /// [`id_only_resource`] while this is `None`.
+    /// `None` until a read succeeds; `open` uses [`id_only_resource`] until then.
     identity: Option<Identity>,
-    /// Set once a read attempt has failed since `identity` was last refreshed -- gates
-    /// `metadata_error` to fire once per failure, not once per poll tick for as long as it
-    /// persists (`Diagnostics::warn_throttled` counts every call into
-    /// `logit.component.diagnostics` even while it throttles the log line itself).
+    /// Set on a failed read; gates `metadata_error` to once per failure rather than once per
+    /// poll tick (`warn_throttled` counts every call even while it throttles the log line).
     failed: bool,
-    /// Stamped with `DockerDecoderFactory::generation` on every `accept`/`refresh` that touches
-    /// this entry -- what lets `end_scan` evict entries no live path reached this scan, bounding
-    /// `meta` by containers currently on the host rather than containers ever seen.
+    /// The scan generation that last touched this entry; `end_scan` evicts the rest, bounding
+    /// `meta` by containers on the host now rather than ever.
     seen: u64,
 }
 
@@ -383,17 +366,12 @@ fn id_only_resource(container_dir: &Path) -> Arc<Resource> {
     Arc::new(Resource { attributes: attrs, ..Default::default() })
 }
 
-/// Turns a discovered `<root>/<id>/<id>-json.log` path into a [`DockerDecoder`]: applies
-/// [`ContainerFilter`] (reading `config.v2.json` only when it needs the container's name to do
-/// so -- `discover: true` never reads it at this stage) in [`accept`](DecoderFactory::accept),
-/// builds the resource every line carries from that same cached read in
-/// [`open`](DecoderFactory::open), and keeps it current from there through
-/// [`refresh`](DecoderFactory::refresh) on every later scan. Every one of those three goes
-/// through `meta`/[`refresh_cache`](DockerDecoderFactory::refresh_cache), so a poll tick costs
-/// one `stat` per container rather than a read and a parse. A container whose metadata has never
-/// been read successfully degrades to a `container.id`-only resource (diagnosed
-/// `metadata_error`) rather than not being tailed at all -- lines still flow, just without the
-/// richer identity, until a later read succeeds.
+/// Turns a discovered `<root>/<id>/<id>-json.log` path into a [`DockerDecoder`]:
+/// [`accept`](DecoderFactory::accept) applies the [`ContainerFilter`] (never reading
+/// `config.v2.json` under `discover: true`), [`open`](DecoderFactory::open) builds the resource,
+/// and [`refresh`](DecoderFactory::refresh) keeps it current each scan. All three go through
+/// [`refresh_cache`](DockerDecoderFactory::refresh_cache), so a poll tick costs one `stat` per
+/// container. A container never read successfully is tailed with a `container.id`-only resource.
 struct DockerDecoderFactory {
     filter: ContainerFilter,
     labels: Vec<String>,
@@ -404,11 +382,9 @@ struct DockerDecoderFactory {
 }
 
 impl DockerDecoderFactory {
-    /// Brings `dir`'s cached identity up to date, reading and parsing `config.v2.json` only when
-    /// its stat differs from the one the cached entry was built from. A read failure leaves
-    /// `identity` exactly as it was (a container that had a good identity keeps it; one that
-    /// never had one stays on [`id_only_resource`]) and is diagnosed only on the transition into
-    /// failure -- every later scan silently keeps retrying until the stat changes again.
+    /// Brings `dir`'s cached identity up to date, reading `config.v2.json` only when its stat
+    /// changed. A failed read keeps the previous identity (or none) and is diagnosed only on the
+    /// transition into failure.
     fn refresh_cache(&mut self, dir: &Path) {
         let stat = std::fs::metadata(dir.join("config.v2.json"))
             .ok()
@@ -416,18 +392,16 @@ impl DockerDecoderFactory {
         let entry = self.meta.entry(dir.to_path_buf()).or_default();
         entry.seen = self.generation;
         if stat.is_some() && stat == entry.stat {
-            return; // unchanged since the last read at this exact stat
+            return; // unchanged since the last read
         }
         entry.stat = stat;
         match ContainerMeta::read(dir) {
             Ok(meta) => {
                 entry.failed = false;
                 let resource = meta.resource(&self.labels);
-                // Keep the existing `Arc` when the rebuilt `Resource` compares equal --
-                // `config.v2.json` is rewritten by the daemon for reasons unrelated to identity
-                // (restart counts, healthcheck results) far more often than an operator renames a
-                // container, and a fresh `Arc` on every such rewrite would force a spurious
-                // `ResourceChange` flush on every tailed line of every container, constantly.
+                // Keep the existing `Arc` when the rebuilt `Resource` compares equal: the daemon
+                // rewrites `config.v2.json` for restart counts and healthchecks, and a fresh `Arc`
+                // each time would force a spurious `ResourceChange` flush.
                 let resource = match &entry.identity {
                     Some(existing) if existing.resource == resource => existing.resource.clone(),
                     _ => resource,
@@ -452,8 +426,7 @@ impl DockerDecoderFactory {
 impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
     fn accept(&mut self, path: &Path) -> bool {
         if self.filter.discover {
-            return true; // never reads config.v2.json at this stage -- see the ADR's Selection
-                         // section; the field-level `discover` short-circuit is unconditional
+            return true; // selecting needs no config.v2.json read
         }
         let Some(container_dir) = path.parent() else { return false };
         let Some(dir_name) = container_dir.file_name().and_then(|n| n.to_str()) else {
@@ -468,8 +441,7 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
         let container_dir = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("{}: no parent directory", path.display()))?;
-        // Already fresh in the ordinary case: `open_tracked` always calls `accept` for this same
-        // path first, in the same `scan`, which already ran this exact read.
+        // Usually just a stat: `accept` already refreshed this path earlier in the same scan.
         self.refresh_cache(container_dir);
         let resource = match self.cached(container_dir) {
             Some(identity) => identity.resource.clone(),
@@ -485,12 +457,9 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
         };
         self.refresh_cache(container_dir);
         let Some(identity) = self.cached(container_dir) else { return Refresh::Unchanged };
-        // Selection before identity, deliberately: a container renamed out of `containers:` is
-        // closing, and the decoder's resource must NOT be swapped for it -- whatever
-        // `close_decoder` flushes on the way out should carry the identity this listener actually
-        // read those lines under, not the new one it's no longer allowed to follow.
-        // `discover: true` can never reach this branch (`ContainerFilter::matches` returns `true`
-        // unconditionally in that mode, before looking at anything).
+        // Selection before identity: a container renamed out of `containers:` is closing, and
+        // what `close_decoder` flushes must carry the identity those lines were read under, so its
+        // resource is not swapped. Never taken under `discover: true`.
         if !self.filter.matches(dir_name, Some(identity.name.as_str())) {
             self.diag.info(
                 "container_deselected",
@@ -519,8 +488,8 @@ impl DecoderFactory<DockerDecoder> for DockerDecoderFactory {
     }
 }
 
-/// `docker_in`: tails every currently-selected container's json-file log under `root`, built on
-/// the same [`Tailer`] driver `tail_in` (`crate::tail::TailInput`) uses.
+/// `docker_in`: tails every selected container's json-file log under `root` on `tail_in`'s
+/// [`Tailer`] driver. See this module's doc.
 pub struct DockerInput {
     inner: Tailer<DockerDecoder, DockerDecoderFactory>,
 }
@@ -555,7 +524,7 @@ impl DockerInput {
         self
     }
 
-    /// The currently-configured knobs -- test introspection, mirroring `TailInput::config`.
+    /// The configured knobs, for tests.
     pub fn config(&self) -> &TailConfig {
         self.inner.config()
     }
@@ -713,8 +682,7 @@ mod tests {
         .unwrap();
         assert!(out.is_empty(), "the whole dropped reassembly should never emit, even once closed");
 
-        // A fresh line afterward behaves normally again -- short enough to fit the same tiny
-        // 10-byte bound this test uses to force the drop above.
+        // A fresh line within the 10-byte bound decodes normally again.
         d.decode_line(
             line(r#"{"log":"ok\n","stream":"stdout","time":"2026-08-17T19:35:46.300000000Z"}"#),
             0,
@@ -765,8 +733,7 @@ mod tests {
     fn docker_in_never_parses_the_inner_application_line() {
         let mut d = decoder();
         let mut out = Vec::new();
-        // The application's own log line happens to itself look like JSON -- docker_in must
-        // treat it as an opaque string, not decode it a second time.
+        // The inner line looks like JSON but must stay an opaque string.
         d.decode_line(
             line(
                 r#"{"log":"{\"level\":\"info\",\"msg\":\"hello\"}\n","stream":"stdout","time":"2026-08-17T19:35:46.000000000Z"}"#,
@@ -1069,8 +1036,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["old"]);
 
-        // "Recreated": the old container directory disappears, a new id appears under the same
-        // name.
+        // Recreated: the old directory disappears and a new id appears under the same name.
         std::fs::remove_dir_all(root.join(&old_id)).unwrap();
         let new_id = "2".repeat(64);
         let log_new = container(&root, &new_id, "web", "nginx:1.25");
@@ -1090,13 +1056,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // -- W2: live container identity (docs/adr/docker-container-identity-and-minimal-watches.md) -
+    // -- live container identity (docs/adr/docker-container-identity-and-minimal-watches.md) ---
 
-    /// The core property: a `docker rename` (a `config.v2.json` rewrite) is picked up on the next
-    /// poll tick, and the resource swap goes through the accumulator's own `Arc::ptr_eq` check --
-    /// a batch never mixes two identities, and the rename never retroactively relabels a line
-    /// already emitted under the old name. `discover: true` -- selection isn't under test here
-    /// (W3's job).
+    /// A `docker rename` takes effect on a fresh batch, never relabelling earlier lines.
     #[tokio::test]
     async fn a_rewritten_config_v2_json_changes_the_name_on_a_fresh_batch_boundary() {
         let root = scratch_dir("docker-identity-refresh");
@@ -1123,21 +1085,16 @@ mod tests {
             Some("before")
         );
 
-        // Rewrite `config.v2.json` in place -- a `docker rename`, from `logit`'s point of view.
+        // A `docker rename`, as seen on disk.
         std::fs::write(
             root.join(&id).join("config.v2.json"),
             r#"{"Name":"/after","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Give a poll tick a chance to refresh the identity *before* the next line exists to
-        // read: identity refresh only ever happens on a `scan` (`Tailer::refresh_identity`), but
-        // `drain` -- the thing that actually decodes a line -- runs on every loop iteration,
-        // including one driven by the (equally 15ms) flush timer rather than the poll timer. A
-        // line written immediately after the rewrite, with no gap, can race a flush-driven drain
-        // that reads it before the next poll-driven scan has refreshed anything, and get decoded
-        // under the stale identity -- not a production bug (identity refresh is documented as
-        // bounded by `poll_interval`, not "as of the very next byte"), but this test's own
-        // assertion needs the refresh to have already landed.
+        // Let a poll tick refresh the identity before the next line exists. Refresh happens only
+        // on a `scan`, but a flush-timer `drain` can decode a line first, under the stale
+        // identity. Refresh is bounded by `poll_interval`, so that isn't a bug, but this
+        // assertion needs the refresh to have landed.
         tokio::time::sleep(Duration::from_millis(60)).await;
         std::fs::OpenOptions::new()
             .append(true)
@@ -1171,9 +1128,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A `config.v2.json` that's momentarily unreadable (the race the ADR names: a container
-    /// directory appearing a moment before its config does) recovers on its own once the file
-    /// settles, instead of sticking as `container.id`-only for the life of the handle.
+    /// A `config.v2.json` that appears late recovers the full resource on a later poll tick.
     #[tokio::test]
     async fn a_metadata_read_that_fails_then_succeeds_recovers_the_full_resource() {
         let root = scratch_dir("docker-identity-recover");
@@ -1204,18 +1159,14 @@ mod tests {
             Some(id.as_str())
         );
 
-        // The config appears -- the race resolving itself, the same as a real container whose
-        // directory is created a moment before `config.v2.json` is written into it.
+        // The config appears, as it does when Docker creates the directory first.
         std::fs::write(
             dir.join("config.v2.json"),
             r#"{"Name":"/recovered","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
         )
         .unwrap();
-        // Give a poll tick a chance to refresh the identity before the next line exists to read
-        // -- see the identically-shaped sleep and comment in
-        // `a_rewritten_config_v2_json_changes_the_name_on_a_fresh_batch_boundary` above for why
-        // this is needed: a flush-driven `drain` can otherwise decode this line before the next
-        // poll-driven `scan` has refreshed anything.
+        // Let a poll tick refresh the identity first; see the same sleep in
+        // `a_rewritten_config_v2_json_changes_the_name_on_a_fresh_batch_boundary`.
         tokio::time::sleep(Duration::from_millis(60)).await;
         std::fs::OpenOptions::new()
             .append(true)
@@ -1245,11 +1196,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The batching-correctness half of the value-equality check in `refresh_cache`: a
-    /// `config.v2.json` rewrite that changes only fields this factory doesn't track (or doesn't
-    /// change the rebuilt `Resource`'s value at all) must never force a new `Arc` -- otherwise
-    /// every unrelated daemon rewrite (restart counts, healthcheck results) would shatter batching
-    /// for that container.
+    /// A rewrite that reproduces the same `Resource` keeps the same `Arc`, so batching holds.
     #[tokio::test]
     async fn a_stat_changing_rewrite_that_reproduces_the_same_resource_keeps_the_same_arc() {
         let root = scratch_dir("docker-identity-nop-rewrite");
@@ -1272,9 +1219,7 @@ mod tests {
         let batch1 = unwrap_batch(rx.recv().await.expect("first batch"));
         assert_eq!(messages(&batch1.events), vec!["one"]);
 
-        // Rewritten, but to the exact same name/image/labels this factory stamps onto the
-        // resource -- a daemon rewrite for an untracked reason (a restart counter, a healthcheck
-        // field this repo never reads), not an identity change.
+        // Same name/image/labels: a daemon rewrite for an untracked field.
         std::fs::write(
             root.join(&id).join("config.v2.json"),
             r#"{"Name":"/steady","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
@@ -1308,12 +1253,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // -- W3: selection follows the rename (docs/adr/docker-container-identity-and-minimal-
-    // watches.md) --
+    // -- selection follows the rename (docs/adr/docker-container-identity-and-minimal-watches.md)
 
-    /// A container renamed out of an explicit `containers:` list stops flowing -- and does so
-    /// without draining the container to EOF first, since it's still running: only the lines
-    /// already read before the rename arrive.
+    /// A container renamed out of `containers:` stops flowing without draining to EOF.
     #[tokio::test]
     async fn a_container_renamed_out_of_the_explicit_selection_stops_flowing() {
         let root = scratch_dir("docker-deselect");
@@ -1365,9 +1307,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A container renamed back into the selection resumes rather than replaying its whole log,
-    /// and lines written while it was away are delivered once it's selected again -- under the
-    /// identity current when they're finally read.
+    /// Renamed back in, a container resumes without replaying, delivering lines written meanwhile.
     #[tokio::test]
     async fn a_container_renamed_back_into_the_selection_resumes_without_replaying() {
         let root = scratch_dir("docker-reselect");
@@ -1390,7 +1330,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["one"]);
 
-        // Renamed away, then back -- with a line written while it was away, which must survive.
+        // Renamed away, then back, with a line written while away.
         std::fs::write(
             root.join(&id).join("config.v2.json"),
             r#"{"Name":"/elsewhere","Config":{"Image":"nginx:1.25","Labels":{}}}"#,
@@ -1434,7 +1374,7 @@ mod tests {
         let root = scratch_dir("docker-rotate");
         let id = "3".repeat(64);
         let log = container(&root, &id, "web", "nginx:1.25");
-        // A stale rotated file sitting right next to the real one -- must never match.
+        // A rotated file beside the real one must never match.
         std::fs::write(
             log.with_extension("log.1"),
             format!(
@@ -1486,9 +1426,7 @@ mod tests {
         .unwrap();
 
         let (fanout, mut rx) = recording_fanout(8);
-        // discover mode -- accept() never needs metadata, so a missing config.v2.json must not
-        // stop discovery either; open()'s own fallback (unit-tested directly above) is what
-        // handles the missing-metadata case for the resource itself.
+        // discover mode: `accept` needs no metadata, so a missing config.v2.json can't stop it.
         let filter = ContainerFilter::new(vec![], true);
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
         let (tx, handle) = spawn(input, fanout);
@@ -1500,15 +1438,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F1, superseded by `docs/adr/docker-container-identity-and-minimal-watches.md`: `docker_in`
-    /// no longer watches each container's own subdirectory, only `root` (Docker's per-container
-    /// state directories are direct children of it, so `root` alone already catches a container
-    /// *arriving*). A log file appearing a moment later *inside an already-existing* container
-    /// directory is therefore not an `inotify` event at all -- nothing changed under `root`
-    /// itself -- and is picked up on the next `poll_interval` tick instead, exactly as it would be
-    /// under `watch: poll`. This pins that contract, inverted from what this test asserted before
-    /// the watch-set change: discovery here is poll-bound even under `WatchMode::Inotify`.
-    /// `discover: true` -- selection isn't what's under test.
+    /// Only `root` is watched, so a log file created inside an existing container directory is
+    /// found on the next poll tick even under inotify (the identity ADR's "Watch set").
     #[tokio::test]
     async fn under_inotify_a_container_log_created_after_its_directory_is_discovered_only_on_the_poll_tick(
     ) {
@@ -1522,17 +1453,14 @@ mod tests {
         let input = DockerInput::new(root.clone(), filter, vec![], config);
         let (tx, handle) = spawn(input, fanout);
 
-        // Let the initial scan run (and start watching `root`) against an empty directory before
-        // the container appears at all.
+        // Let the initial scan start watching an empty `root`.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let id = "6".repeat(64);
-        // Directory + config.v2.json only -- no log file yet, exactly the race Docker itself
-        // creates (the container directory appears a moment before the log file inside it).
+        // Directory and config.v2.json only, as Docker creates them before the log file.
         let log_path = container(&root, &id, "web", "nginx:1.25");
 
-        // Give `root`'s own IN_CREATE (the container directory appearing) time to be handled --
-        // it finds no log file yet, since none exists at that point.
+        // Let `root`'s IN_CREATE be handled; it finds no log file yet.
         tokio::time::sleep(Duration::from_millis(30)).await;
         std::fs::write(
             &log_path,
@@ -1543,9 +1471,7 @@ mod tests {
         )
         .unwrap();
 
-        // Well within the 300ms poll_interval, and nothing under `root` itself changed when the
-        // log file appeared inside the already-existing container directory -- must not be
-        // discovered yet.
+        // Within the 300ms poll_interval and with nothing changed under `root`: not found yet.
         let too_soon =
             tokio::time::timeout(Duration::from_millis(100), expect_events(&mut rx, 1)).await;
         assert!(
@@ -1564,11 +1490,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F1's other half, still true after `docs/adr/docker-container-identity-and-minimal-watches.md`
-    /// (unlike its sibling above): a truncation of an already-tracked container log is still
-    /// noticed via `inotify`, near-immediately -- not because the container's directory is
-    /// watched (it isn't, any more), but because the *file itself* now has its own watch,
-    /// registered when `docker_in` opened it. `O_TRUNC` fires `IN_MODIFY` on that watch directly.
+    /// A tracked log's truncation is noticed before the poll tick: the file has its own watch,
+    /// and `O_TRUNC` fires `IN_MODIFY` on it.
     #[tokio::test]
     async fn under_inotify_a_truncated_container_log_is_noticed_before_the_poll_interval() {
         let root = scratch_dir("docker-inotify-truncate");
@@ -1595,8 +1518,7 @@ mod tests {
         let events = expect_events(&mut rx, 1).await;
         assert_eq!(messages(&events), vec!["first"]);
 
-        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter length
-        // -- a real truncation, not a rotation.
+        // `std::fs::write` opens with `O_TRUNC`: same inode, shorter length, a truncation.
         std::fs::write(
             &log_path,
             format!(
@@ -1617,9 +1539,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F2: a docker log truncation must reset `DockerDecoder`'s own `partial`, not just
-    /// `LineSplitter`'s -- modeled on `driver.rs`'s
-    /// `a_truncation_discards_the_partial_line_held_from_the_previous_generation`.
+    /// A truncation discards `DockerDecoder`'s held `partial`, not just `LineSplitter`'s.
     #[tokio::test]
     async fn a_truncation_discards_a_docker_partial_entry_held_from_the_previous_generation() {
         let root = scratch_dir("docker-truncate-partial");
@@ -1638,7 +1558,7 @@ mod tests {
         let input = DockerInput::new(root.clone(), filter, vec![], fast_tail_config());
         let (tx, handle) = spawn(input, fanout);
 
-        // Give the tailer time to read the fragment and hold it -- nothing should emit yet.
+        // Let the tailer read and hold the fragment; nothing emits yet.
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(rx.try_recv().is_err(), "an unterminated fragment must not emit before its close");
 
@@ -1652,7 +1572,7 @@ mod tests {
             gen2.len(),
             gen1.len()
         );
-        // `std::fs::write` opens with `O_TRUNC` on the existing path -- same inode, shorter length.
+        // `std::fs::write` opens with `O_TRUNC`: same inode, shorter length.
         std::fs::write(&log_path, &gen2).unwrap();
 
         let events = expect_events(&mut rx, 1).await;
@@ -1670,18 +1590,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// F2's other half: a truncation must also clear a stale `dropping == true`, or the very next
-    /// generation's first complete entry is silently swallowed clearing it.
+    /// A truncation clears a stale `dropping`, so the next generation's first entry survives.
     #[tokio::test]
     async fn a_truncation_clears_a_docker_dropping_state_so_the_next_generation_is_not_swallowed() {
         let root = scratch_dir("docker-truncate-dropping");
         let id = "9".repeat(64);
         let log_path = container(&root, &id, "web", "nginx:1.25");
 
-        // Three fragment entries, none terminated -- individually each envelope line is well under
-        // 200 bytes (the splitter passes each through fine), but the three fragments' `log` values
-        // accumulate past `max_line_bytes` (200) inside `DockerDecoder`'s own reassembly, which
-        // then starts (and stays) `dropping` until an entry finally closes the line.
+        // Three unterminated fragments, each under 200 bytes so the splitter passes them, whose
+        // reassembly passes `max_line_bytes` (200) and leaves the decoder `dropping`.
         let fragment = "y".repeat(80);
         let mut gen1 = String::new();
         for i in 0..3 {

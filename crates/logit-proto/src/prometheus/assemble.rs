@@ -3,13 +3,11 @@
 //! unlike [`super::text`] -- nothing here knows what a line, a label ref or a protobuf field looks
 //! like.
 //!
-//! **Why this is its own module.** Prometheus' wire shapes are *flat*: every format the project
-//! speaks -- text 0.0.4, OpenMetrics, and remote-write 1.0/2.0 alike -- carries a histogram as a
-//! handful of independently-named series and leaves it to the reader to notice that
-//! `x_bucket`/`x_sum`/`x_count` are one metric. That reassembly is the same problem in all three,
-//! and getting it wrong in one of them but not the others would be an invisible divergence in a
-//! mapping table [`super`]'s module doc claims is shared. So it lives once, here, and both syntax
-//! modules feed it [`Sample`]s.
+//! **Why this is its own module.** Every Prometheus wire shape (text 0.0.4, OpenMetrics,
+//! remote-write 1.0/2.0) is *flat*: a histogram is a handful of independently-named series, and the
+//! reader has to notice that `x_bucket`/`x_sum`/`x_count` are one metric. Doing that reassembly in
+//! one place keeps [`super`]'s shared mapping table from diverging per syntax; both syntax modules
+//! feed it [`Sample`]s.
 //!
 //! ## What an assembler decides
 //!
@@ -44,22 +42,28 @@
 //! `unknown_suffix` skip above -- so the suffix scan steps over it and the raw name opens its own
 //! implicit family instead.
 //!
-//! Which matters most for the one classic kind whose *bare* name is a sample. A summary with no
+//! The rule matters for the one classic kind whose *bare* name is a sample. A summary with no
 //! metadata behind it arrives as `x{quantile=…}`, `x_sum`, `x_count`, and remote-write sorts a
-//! request's series by name, so the bare one always lands first and opens the implicit `x`. Without
-//! this rule its two suffixed siblings would both be thrown away -- which is exactly what a
-//! recorded corpus of real Prometheus 3.14 requests turned out to be losing, two samples per scrape
-//! (`testdata/interop/prometheus/README.md`). A histogram never armed it, having no bare-named
-//! sample at all, which is why the round trip looked sound. The flat decode is *flatter* than the
-//! producer's shape; it is not lossier.
+//! request's series by name, so the bare one lands first and opens the implicit `x`. Without this
+//! rule its two suffixed siblings would both be skipped; the recorded Prometheus 3.14 corpus
+//! (`testdata/interop/prometheus/README.md`) exercises it. A histogram has no bare-named sample, so
+//! it never hits this path. The flat decode is *flatter* than the producer's shape; it is not
+//! lossier.
 //!
 //! ## Declaring lazily
 //!
 //! A transport that carries a request's metadata separately from its samples (remote-write) can
 //! hand over a whole [`Declarations`] table up front with [`Assembler::with_declarations`], and
 //! several assemblers can share one by reference. A declared family is then materialized **only
-//! when a sample name actually routes to it** -- one hash lookup per suffix on the miss path in
+//! when a sample name routes to it** -- one hash lookup per suffix on the miss path in
 //! [`Assembler::route`], and nothing at all for a family nobody sampled.
+//!
+//! That laziness is a bound, not a micro-optimization. Remote-write decodes into one assembler per
+//! distinct sample timestamp, and both the timestamp count and the declaration count come off the
+//! wire; replaying every declaration into every group would let a small compressed body ask for
+//! `groups x declarations` accumulators, each with an owned name, a `Vec` and a `HashMap` that live
+//! until [`Assembler::finish`]. Declaring on demand makes the cost proportional to the samples the
+//! request carries.
 //!
 //! [`Assembler::with_seed`] adds a **second** table under the first, for the transport whose
 //! metadata does not arrive with its samples *at all* (a Prometheus 1.0 sender ships it in requests
@@ -86,28 +90,21 @@
 //! The give-way only applies while the seeded family holds **no series**. Once a sibling sample of
 //! the same input has routed into it, the input itself agrees with the seed about the shape, and a
 //! sample that contradicts it is the producer's own inconsistency rather than a stale memory --
-//! counted as it always was. Un-declaring also clears the seeded mark, so every later decision
-//! about that family reads exactly as it would have with no seed at all.
+//! counted as usual. Un-declaring also clears the seeded mark, so every later decision about that
+//! family reads as it would have with no seed at all.
 //!
 //! Without this, a remembered type is a way to *lose* data that a stateless decode would have kept:
 //! one sender declaring `foo` a histogram would make another sender's plain `foo` gauge disappear
 //! for as long as the caller remembers it. The seed exists to type samples, never to reject them.
 //!
-//! That laziness is a bound, not a micro-optimization. Remote-write decodes into one assembler per
-//! distinct sample timestamp, and both the timestamp count and the declaration count come off the
-//! wire; replaying every declaration into every group would let a small compressed body ask for
-//! `groups x declarations` accumulators, each with an owned name, a `Vec` and a `HashMap` that live
-//! until [`Assembler::finish`]. Declaring on demand makes the cost proportional to the samples the
-//! request actually carries.
-//!
 //! ## What an assembler does *not* decide
 //!
 //! Anything a dialect or a transport owns: how a body is tokenized, whether a name is well-formed
-//! for its syntax, what a timestamp's unit is, whether a `# EOF` is required, and -- the one that
-//! needed care to split -- how a `_created` sample's *instant* is read. That value is a timestamp,
-//! and reading it back out of the already-parsed `f64` would have rounded it at epoch magnitude
-//! (19 significant digits against an `f64`'s 15-16), so [`Sample::value_text`] carries the source
-//! token and [`parse_created_seconds`] reads it digit by digit. A transport whose created
+//! for its syntax, what a timestamp's unit is, whether a `# EOF` is required, and how a `_created`
+//! sample's *instant* is read. That value is a timestamp, and reading it back out of the
+//! already-parsed `f64` would round it at epoch magnitude (19 significant digits against an
+//! `f64`'s 15-16), so [`Sample::value_text`] carries the source token and
+//! [`parse_created_seconds`] reads it digit by digit. A transport whose created
 //! timestamps arrive in their own integer field -- remote-write 2.0's `Sample.start_timestamp` --
 //! has no such token, passes `None`, and hands the instant over through
 //! [`Assembler::push_created`] instead.
@@ -141,7 +138,7 @@ enum Role {
 }
 
 /// Every suffix any Prometheus format gives meaning to. Order matters only in that a longer suffix
-/// must be tried before a shorter one it ends with; none of these overlap that way today.
+/// must be tried before a shorter one it ends with; none of these overlap that way.
 const SUFFIXES: [(&str, Role); 8] = [
     ("_total", Role::Primary),
     ("_info", Role::Primary),
@@ -242,10 +239,9 @@ impl Declarations {
 
 /// One entry of a [`Declarations`] table.
 ///
-/// The description text is `Arc<str>` rather than `String` for the caller's sake, not this
-/// module's: a metadata cache holds the same strings and rebuilds its table whenever it changes, so
-/// sharing them makes that a refcount bump instead of a copy of every remembered description. Here
-/// it is read once per materialized family and costs the same either way.
+/// The description text is `Arc<str>` for the caller's sake: a metadata cache holds the same
+/// strings and rebuilds its table whenever it changes, so sharing them makes that a refcount bump
+/// instead of a copy of every remembered description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
     pub kind: FamilyType,
@@ -289,8 +285,7 @@ struct FamilyAccum {
 struct SeriesAccum {
     labels: Vec<(String, String)>,
     /// This series carries no reading at all -- a remote-write stale marker. It wins over every
-    /// accumulated value below, which is the point: a producer that marks a series stale is saying
-    /// the samples stop here, not that they take some particular value.
+    /// accumulated value below: a stale series has stopped, not taken some particular value.
     stale: bool,
     value: Option<f64>,
     buckets: Vec<(f64, u64)>,
@@ -321,10 +316,8 @@ pub(super) struct Assembler<'a> {
     /// assembler decoding the same request -- see the module doc's "Declaring lazily" section.
     declarations: Option<&'a Declarations>,
     /// A second table, consulted only where [`Assembler::declarations`] has nothing to say about a
-    /// name: what a *caller* remembers from earlier requests, where this one carries none. Two
-    /// tables rather than one merged table because the merge would be per request over the whole
-    /// remembered set, and the remembered set is the one thing here that is bounded by a config cap
-    /// rather than by the request in hand.
+    /// name: what a *caller* remembers from earlier requests. Kept separate rather than merged --
+    /// see the module doc's "Declaring lazily" section.
     seed: Option<&'a Declarations>,
     families: Vec<FamilyAccum>,
     index: HashMap<String, usize>,
@@ -341,8 +334,8 @@ impl<'a> Assembler<'a> {
         }
     }
 
-    /// Declarations to materialize lazily, as sample names route to them. Sharing one table across
-    /// the assemblers of one request is the point: see the module doc.
+    /// Declarations to materialize lazily, as sample names route to them, shared across the
+    /// assemblers of one request (see the module doc's "Declaring lazily" section).
     pub(super) fn with_declarations(mut self, declarations: &'a Declarations) -> Self {
         self.declarations = Some(declarations);
         self
@@ -428,12 +421,11 @@ impl<'a> Assembler<'a> {
     /// it would create a `foo_bucket` family that then *beats* a sibling series' `HISTOGRAM`
     /// declaration of `foo`, since [`Assembler::route`] prefers an exact name match over the suffix
     /// scan -- leaving that histogram bucket-less. Waiting until the sample has routed asks the
-    /// question the other way round, which is the only way it has an answer.
+    /// question the other way round.
     ///
-    /// Silent rather than counted when the family is already described: the series never claimed to
-    /// be describing *that* family -- it was describing itself, and which family that turned out to
-    /// mean is this assembler's conclusion, not the sender's. Reporting a `duplicate_metadata` the
-    /// producer did not commit would be reporting our own inference.
+    /// Uncounted when the family is already described: the series described itself, and which
+    /// family that means is this assembler's inference, so a `duplicate_metadata` here would count
+    /// something the producer did not do.
     pub(super) fn describe(&mut self, sample_name: &str, help: Option<&str>, unit: Option<&str>) {
         let Some((family, _)) = self.route_existing(sample_name) else { return };
         // Borrowed, not taken: one description can be offered to every group a series touched, and
@@ -576,11 +568,11 @@ impl<'a> Assembler<'a> {
     /// An exemplar the transport already attached to a series of its own accord, rather than one
     /// riding a sample line. Returns whether it was stored.
     ///
-    /// Two differences from [`Assembler::push`], both deliberate. There is no role filter:
+    /// Two differences from [`Assembler::push`]. There is no role filter:
     /// OpenMetrics only *has* somewhere to write an exemplar on a `_total` or `_bucket` line,
     /// whereas remote-write carries them in a per-series field, so the producer has already said
     /// which series it meant and dropping one for sitting on the "wrong" sample would lose data the
-    /// wire really carried. And this **creates nothing** -- no family, no series: an exemplar is an
+    /// wire carried. And this **creates nothing** -- no family, no series: an exemplar is an
     /// example of a reading, so a series with no reading here is one this assembler should not be
     /// made to invent (it would come back out as an `incomplete_series` skip, having swallowed the
     /// exemplar on the way).
@@ -656,8 +648,8 @@ impl<'a> Assembler<'a> {
     }
 
     /// Which family and role a sample name belongs to: an exact family-name match first (so a gauge
-    /// genuinely called `foo_sum` beats a histogram called `foo`), then a known suffix over a
-    /// declared family, then a fresh implicit family.
+    /// called `foo_sum` beats a histogram called `foo`), then a known suffix over a declared
+    /// family, then a fresh implicit family.
     ///
     /// `labels` is read, never taken: the two roles whose value is split across the label set
     /// (`le`, `quantile`) can only be *checked* here, and only for a seeded family -- see
@@ -688,15 +680,8 @@ impl<'a> Assembler<'a> {
         for (suffix, role) in SUFFIXES {
             let Some(base) = name.strip_suffix(suffix) else { continue };
             let Some(idx) = self.index.get(base).copied() else { continue };
-            // **Only a declared base claims a suffix.** An implicit family exists because some
-            // earlier sample was called exactly that and nothing said what it was -- it is a guess
-            // about one name, not a statement about a family that has parts. `suffix_applies` is
-            // false for every role under `Unknown`/`Untyped`, so matching here could only ever
-            // reach the skip below and throw the sample away: a summary arriving with no metadata
-            // opens the implicit `foo` on its `foo{quantile=..}` line (remote-write sorts by name,
-            // so the bare one comes first) and then loses `foo_sum` and `foo_count` to it. The raw
-            // name is free to be a family of its own instead, which is what the flat, untyped
-            // decode the module doc describes actually means.
+            // Only a declared base claims a suffix (module doc): matching an implicit family here
+            // could only reach the `unknown_suffix` skip below, so the raw name opens its own.
             if !self.families[idx].typed {
                 continue;
             }
@@ -705,9 +690,9 @@ impl<'a> Assembler<'a> {
                 return Some((idx, role, suffix == "_total"));
             }
             if self.abandon_seeded(idx, decoder) {
-                // The *base* was the guess; the raw name is untouched and free to be a family of
-                // its own, so there is nothing to reopen -- the seeded family simply keeps no
-                // series and disappears at `finish`.
+                // The *base* was the guess; the raw name is free to be a family of its own, so
+                // there is nothing to reopen -- the seeded family keeps no series and disappears
+                // at `finish`.
                 break;
             }
             decoder.skipped("unknown_suffix");
@@ -749,9 +734,8 @@ impl<'a> Assembler<'a> {
     }
 
     /// Un-declares a family the seed materialized, leaving the implicit family the raw sample name
-    /// would have opened by itself. Only ever called with no series stored, so nothing is re-homed
-    /// -- and `from_seed` clears with it, because what is left is an ordinary implicit family and
-    /// every later routing decision about it should read exactly as it would with no seed at all.
+    /// would have opened by itself. Only called with no series stored, so nothing is re-homed;
+    /// `from_seed` clears too, so later routing reads as it would with no seed at all.
     fn reopen_implicit(&mut self, idx: usize) {
         let implicit = self.implicit;
         let family = &mut self.families[idx];
@@ -906,8 +890,8 @@ impl<'a> Assembler<'a> {
 /// routing table above, for a transport that declares a type against a series without naming the
 /// family (remote-write 2.0's per-series `Metadata`, which has a type but no family-name field).
 ///
-/// Only a suffix that the type actually gives meaning to is stripped, so a `gauge` genuinely called
-/// `foo_sum` keeps its name and a `histogram`'s `foo_sum` resolves to `foo`. A name that *is* only
+/// Only a suffix that the type gives meaning to is stripped, so a `gauge` called `foo_sum` keeps
+/// its name and a `histogram`'s `foo_sum` resolves to `foo`. A name that *is* only
 /// its suffix (`_total`) keeps it: stripping there would leave a family with no name at all.
 pub(super) fn family_base(sample_name: &str, kind: FamilyType) -> &str {
     for (suffix, role) in SUFFIXES {
@@ -923,9 +907,8 @@ pub(super) fn family_base(sample_name: &str, kind: FamilyType) -> &str {
     sample_name
 }
 
-/// Sets `slot` unless it already holds a value; returns whether this was a duplicate (the first
-/// value always wins, which is what a strict parser rejecting the body would effectively have
-/// kept).
+/// Sets `slot` unless it already holds a value; returns whether this was a duplicate. The first
+/// value wins: the one a strict parser would have read before rejecting the body.
 fn replace_once<T>(slot: &mut Option<T>, value: T) -> bool {
     if slot.is_some() {
         return true;
@@ -953,10 +936,9 @@ fn finish_series(
         created,
         exemplars,
     } = accum;
-    // A stale marker is the whole point: it says this series has no reading, so whatever else
-    // arrived for it does not get to supply one. Checked before the per-type completeness rules
-    // below, which would otherwise report an `incomplete_series` for a series that is complete in
-    // the only way a stale one can be.
+    // A stale series has no reading, so whatever else arrived for it does not supply one. Checked
+    // before the per-type completeness rules, which would otherwise count a stale series as
+    // `incomplete_series`.
     if stale {
         return Some(Series { labels, point: Point::Stale, timestamp, created, exemplars });
     }
@@ -1018,8 +1000,8 @@ fn take_label(labels: &mut Vec<(String, String)>, name: &str) -> Option<String> 
 }
 
 /// A label value or sample value as a number: Rust's own `f64` grammar already covers Go's
-/// `ParseFloat` shapes plus case-insensitive `nan`/`inf`/`infinity` with an optional sign, which is
-/// exactly what the exposition formats allow and a superset of what protobuf can carry.
+/// `ParseFloat` shapes plus case-insensitive `nan`/`inf`/`infinity` with an optional sign: what the
+/// exposition formats allow, and a superset of what protobuf can carry.
 pub(super) fn parse_number(s: &str) -> Option<f64> {
     if s.is_empty() {
         return None;
@@ -1028,7 +1010,7 @@ pub(super) fn parse_number(s: &str) -> Option<f64> {
 }
 
 /// A count sample (`_count`, `_gcount`, a bucket) as the `u64` the model holds. OpenMetrics writes
-/// these as floats (`42.0`), and a `gaugehistogram`'s may genuinely be fractional -- rounded here,
+/// these as floats (`42.0`), and a `gaugehistogram`'s may be fractional -- rounded here,
 /// since [`logit_core::Histogram`]'s bucket counts are integers.
 fn count_value(v: f64) -> Option<u64> {
     if v.is_finite() && v >= 0.0 {
@@ -1059,11 +1041,10 @@ fn created_nanos(value: f64, text: Option<&str>) -> Option<i64> {
 
 /// Decimal *seconds* → unix nanoseconds, read digit by digit rather than through an `f64`: an
 /// epoch-nanosecond instant needs 19 significant digits and an `f64` holds 15-16, so a float round
-/// trip would silently move the sample in time. Covers the plain `[SIGN] DIGIT+ ["." DIGIT*]` form
-/// every real producer emits; OpenMetrics' `realnumber` production also permits an exponent
-/// (`1.605281325e9`), which has no digit-exact reading at all, so that form -- and only that form
-/// -- falls back to `f64`, accepting its ~1µs resolution at epoch magnitude rather than rejecting a
-/// legal timestamp.
+/// trip would move the sample in time. Covers the plain `[SIGN] DIGIT+ ["." DIGIT*]` form every
+/// real producer emits; OpenMetrics' `realnumber` production also permits an exponent
+/// (`1.605281325e9`), which has no digit-exact reading, so that form alone falls back to `f64`,
+/// accepting its ~1µs resolution at epoch magnitude rather than rejecting a legal timestamp.
 ///
 /// The scale is fixed at seconds because a `_created` sample's value is decimal seconds in *both*
 /// exposition dialects (text 0.0.4 has no `_created` of its own, so one found there is read the
@@ -1097,7 +1078,7 @@ pub(super) fn parse_scaled_decimal(s: &str, scale: i64) -> Option<i64> {
 
 /// Exemplar labels → an [`Exemplar`]: `trace_id`/`span_id` become a [`TraceRef`] when both are
 /// valid hex (and are consumed); every other label, and an invalid id, stays in
-/// `filtered_attributes` rather than being silently dropped. The all-zero-is-invalid rule is
+/// `filtered_attributes` rather than being dropped. The all-zero-is-invalid rule is
 /// [`TraceRef::from_bytes`]'s, applied here as everywhere else.
 ///
 /// Shared because every format spells an exemplar's trace reference as those two labels --

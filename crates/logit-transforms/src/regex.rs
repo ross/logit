@@ -1,14 +1,11 @@
 //! `regex`: matches a pattern against a log message (or, with `field:`, a named attribute),
 //! turning every named capture group into an attribute of that name. See
-//! `docs/adr/regex-transform.md` for the design decisions this implements.
+//! `docs/adr/regex-transform.md`.
 //!
-//! Stateless in the `Transform` sense -- like `json`/`scale`, only `process` is overridden;
-//! `flush_interval`/`flush` keep the trait's defaults. Not stateless in memory, though:
-//! `RegexParser` holds a `CaptureLocations` reused across events, the same idea as `JsonParser`'s
-//! `scratch`.
+//! No flush state, but `RegexParser` reuses one `CaptureLocations` across events.
 //!
-//! A root module named `regex` makes a plain `use regex::Regex;` ambiguous with the extern crate
-//! (E0659) -- the leading `::` below disambiguates.
+//! A root module named `regex` makes `use regex::Regex;` ambiguous with the extern crate (E0659);
+//! the leading `::` below disambiguates.
 
 use ::regex::{CaptureLocations, Regex};
 use bytes::Bytes;
@@ -19,25 +16,20 @@ use std::sync::Arc;
 
 pub struct RegexParser {
     re: Regex,
-    /// Interned attribute name per capture-group index -- `None` for group 0 (the whole match)
-    /// and for every unnamed group. Built once in [`RegexParser::new`] from
-    /// `Regex::capture_names`, not re-derived per event.
+    /// Interned attribute name per capture-group index; `None` for group 0 and unnamed groups.
     names: Vec<Option<Symbol>>,
-    /// Reused across events -- `captures_read` fills this in place instead of allocating a fresh
-    /// `Captures` per line.
+    /// Filled in place by `captures_read`, so no `Captures` is allocated per line.
     locs: CaptureLocations,
-    /// `None` matches `log.message`; `Some` matches that attribute instead. Interned once, at
-    /// construction, rather than on every event.
+    /// `None` matches `log.message`; `Some` matches that attribute instead.
     field: Option<Symbol>,
     telemetry: Telemetry,
 }
 
 impl RegexParser {
-    /// Compiles `pattern`. Fallible here and infallible at every call site that matters: graph
-    /// validation (`crates/logit-pipeline/src/graph.rs`'s rule 31) already compiled the same
-    /// pattern successfully, so `build_spec` can only ever reach this with a pattern it knows is
-    /// valid -- see `crates/logit-cli/src/pipeline.rs`'s `build_spec` for why its own `?` on this
-    /// call is unreachable in practice.
+    /// Compiles `pattern`.
+    ///
+    /// Graph rule 31 already compiled the same pattern, so the error is unreachable from
+    /// `logit-cli`'s `build_spec`.
     pub fn new(pattern: &str, field: Option<&str>) -> Result<Self, ::regex::Error> {
         let re = Regex::new(pattern)?;
         let names = re.capture_names().map(|n| n.map(intern)).collect();
@@ -45,8 +37,9 @@ impl RegexParser {
         Ok(Self { re, names, locs, field: field.map(intern), telemetry: Telemetry::default() })
     }
 
-    /// Attaches a telemetry handle -- see `Scale::with_telemetry` for why there's no
-    /// `Diagnostics` builder alongside it: a non-matching line is a silent skip, never an error.
+    /// Attaches a telemetry handle.
+    ///
+    /// There's no `Diagnostics` builder: a non-matching line is a skip, never an error.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
@@ -54,20 +47,14 @@ impl RegexParser {
 }
 
 impl Transform for RegexParser {
-    /// Matches `self.re` against the log message (or, with `field:`, a named attribute), and
-    /// writes every participating named capture into `event.attributes` as `Value::Str` -- a
-    /// zero-copy slice of the matched buffer, never a fresh `String` (`docs/adr/regex-transform.md`).
-    /// First match only: a second match would just overwrite the first's attributes under this
-    /// flat-`AttrMap` model. A non-participating capture, or one that matched the empty string,
-    /// contributes no attribute at all -- not `Value::Null`, not `""`.
+    /// Writes each named capture of the first match into `event.attributes`.
     ///
-    /// An event with no log, a non-string message, a missing/non-string `field` attribute, non-
-    /// UTF-8 bytes, or a pattern that doesn't match are all silent skips -- pass-through, never a
-    /// dropped event, and never a diagnostic (`docs/adr/scale-transform.md`'s "silent skip is
-    /// documented behavior" precedent). Records `logit.transform.matched`/`.matched.skipped`,
-    /// mirroring `scale`'s `scaled`/`scaled.skipped`, on every path -- exactly one of the two,
-    /// once per event, regardless of how many attributes a match contributed. This always returns
-    /// `true`.
+    /// Each value is a `Value::Str` slice of the matched buffer, never a fresh `String`. A
+    /// non-participating or empty capture adds no attribute (not `Value::Null`, not `""`).
+    ///
+    /// No log, a message or `field` attribute that isn't `Str`/`Bytes`, non-UTF-8 bytes, or no
+    /// match all pass the event through untouched with no diagnostic. Every event records one of
+    /// `logit.transform.matched`/`.matched.skipped`, however many attributes it gained.
     fn process(&mut self, _resource: &Arc<Resource>, event: &mut Event) -> bool {
         let bytes: Bytes = match self.field {
             None => match event.log.as_ref().map(|log| &log.message) {
@@ -388,9 +375,8 @@ mod tests {
         assert_eq!(attr(&event, "sql"), Some(&Value::I64(1)), "the untouched attribute survives");
     }
 
-    /// Pointer-range zero-copy check, following `json.rs`'s `borrowed_str_bytes` reasoning: a
-    /// captured `Value::Str` must be a slice of the original message buffer, never a fresh
-    /// allocation.
+    /// Whether `inner` lies within `outer`'s buffer: a captured `Value::Str` must be a slice of
+    /// the message, never a fresh allocation.
     fn points_into(outer: &Bytes, inner: &Bytes) -> bool {
         let outer_start = outer.as_ptr() as usize;
         let outer_end = outer_start + outer.len();

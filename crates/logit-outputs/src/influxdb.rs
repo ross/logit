@@ -1,12 +1,16 @@
-//! InfluxDB 2.x line-protocol output -- the output side of the v0.1 vertical slice
-//! (`docs/OVERVIEW.md`), writing to `/api/v2/write` with org/bucket query params and a
-//! `Token` auth header. Matches the `influxdb` service seeded in `compose.yaml` for local testing.
+//! InfluxDB 2.x line-protocol output: `POST /api/v2/write` with org/bucket query params and a
+//! `Token` auth header. Matches the `influxdb` service seeded in `compose.yaml`.
 //!
-//! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag -- those are
-//! protocol-namespaced carriers `statsd_in` stamps for `statsd_out`'s own dedicated wire segments
-//! (`statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
-//! `statsd.service_check.*`, rule (b) of `docs/adr/lossless-transit.md`), not ordinary tags --
-//! mirroring `statsd_out`'s identical filter in `crates/logit-outputs/src/statsd.rs`.
+//! The reference `Encoder` sink: [`InfluxLineEncoder`] renders one opaque body per batch, and
+//! [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a [`Fault`]; retry
+//! timing belongs to `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`).
+//!
+//! It keeps its own client and classifier (`status_class`, `is_retryable_status`,
+//! `classify_transport_error`) rather than `crate::http`'s. The table is the same today, but its
+//! client never disables redirects, so it inherits `reqwest`'s `limited(10)`: a tracked gap in
+//! `docs/known-gaps.md`, closed by moving to `crate::http::build_client`.
+//!
+//! [`render_tag_suffix`] never emits a `statsd.`-prefixed attribute as a tag; see its doc.
 
 use crate::Output;
 use anyhow::Context;
@@ -18,20 +22,18 @@ use logit_core::{
 use logit_pipeline::Fault;
 use logit_proto::{CodecError, Encoder};
 use std::collections::HashMap;
-// `std::fmt::Write`, for `write!` into a `String` -- formatting straight into the output buffer
-// instead of building an intermediate `String` per number (`docs/design/memory.md`).
+// `write!` into a `String`: formats straight into the output buffer, no `String` per number
+// (`docs/design/memory.md`).
 use std::fmt::Write;
 use std::time::Duration;
 
-/// `reqwest` has no request timeout by default. Without one, a server that accepts the TCP
-/// connection but never responds would hang this output's `send` future -- and the pipeline
-/// worker driving it -- indefinitely.
+/// `reqwest` has no request timeout by default; without one, a server that accepts the connection
+/// but never responds hangs `send`, and the pipeline worker driving it, forever.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 429 (InfluxDB's own rate-limit response) and any 5xx are treated as transient (`Fault::Ambiguous`
-/// -- see [`Fault`]) -- 429 is a deliberate, narrow deviation from "a 4xx stays a hard failure" (see
-/// ADR `service-lifecycle-and-output-retry`). Every other 4xx (`Fault::Permanent`) is a config error (a bad org/bucket/token), never
-/// worth retrying.
+/// 429 (InfluxDB's rate-limit response) and any 5xx are transient, [`Fault::Ambiguous`]; 429 is
+/// the one 4xx exception (ADR `service-lifecycle-and-output-retry`). Every other 4xx is a config
+/// error (bad org, bucket, or token), [`Fault::Permanent`].
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status.as_u16() == 429
 }
@@ -43,16 +45,11 @@ pub struct InfluxDbOutput {
     token: String,
     client: reqwest::Client,
     encoder: InfluxLineEncoder,
-    /// This attempt's request timeout. `send` makes exactly one attempt per call now
-    /// (`docs/adr/buffered-sink-delivery.md` -- retry timing moved to the generic writer in
-    /// `logit-pipeline`), so there's no "remaining retry budget" left to clamp this against any
-    /// more; it's simply what `with_timeout` set (or [`DEFAULT_TIMEOUT`]), applied to `client` at
-    /// build time and passed again per-request for clarity.
+    /// Per-request timeout: what `with_timeout` set, else [`DEFAULT_TIMEOUT`]. `send` makes one
+    /// attempt, so there's no retry budget to clamp it against.
     request_timeout: Duration,
-    /// Component-specific detail beyond the runtime's uniform layer-2 metrics (`docs/design/
-    /// internal-telemetry.md`'s "layer 3") -- which response class came back, which
-    /// `run_output`'s own `logit.component.send.duration`/`.errors` can't see inside a single
-    /// `send` call.
+    /// Layer-3 detail (`docs/design/internal-telemetry.md`): the response class, which
+    /// `run_output`'s `logit.component.send.*` can't see inside one `send`.
     telemetry: Telemetry,
 }
 
@@ -77,24 +74,22 @@ impl InfluxDbOutput {
         self
     }
 
-    /// Attaches a component id to this output's encoder diagnostics (per-metric encode failures).
-    /// `InfluxDbOutput` itself no longer has any diagnostics of its own to attribute -- it stopped
-    /// retrying (`docs/adr/buffered-sink-delivery.md`), and the generic writer that now owns
-    /// retry timing gets its own `Diagnostics` handle from `logit-pipeline::runtime::write_loop`.
+    /// Attaches the encoder's diagnostics handle (per-metric encode failures). Retry diagnostics
+    /// come from `logit-pipeline`'s writer, not this sink.
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.encoder = self.encoder.with_diagnostics(diag);
         self
     }
 
-    /// Attaches a telemetry handle -- see the `telemetry` field's doc comment.
+    /// Attaches the layer-3 telemetry handle.
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
         self.telemetry = telemetry;
         self
     }
 }
 
-/// A coarse response-status bucket, `&'static str` so it's directly usable as a telemetry tag
-/// value (`logit_core::telemetry::Tag`) with no per-response allocation or interning.
+/// A coarse response-status bucket, `&'static str` so it's a telemetry tag value with no
+/// per-response allocation or interning.
 fn status_class(status: reqwest::StatusCode) -> &'static str {
     match status.as_u16() / 100 {
         1 => "1xx",
@@ -115,16 +110,14 @@ fn build_client(timeout: Duration) -> reqwest::Client {
 
 #[async_trait::async_trait]
 impl Output for InfluxDbOutput {
-    /// Exactly one attempt per call -- no loop, no sleep. Retry timing/budget now belongs to the
-    /// generic writer in `logit-pipeline` (`docs/adr/buffered-sink-delivery.md`); this only
-    /// classifies what happened and reports it via [`Fault`] (`.context(fault)`).
+    /// One attempt per call, no loop or sleep: retry timing and budget belong to
+    /// `logit-pipeline`'s writer (`docs/adr/buffered-sink-delivery.md`). This classifies the
+    /// outcome and attaches it as `.context(fault)`.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
         let body = self.encoder.encode(batch)?;
-        // Read here, *before* the empty-body early return below: a batch every one of whose lines
-        // turned out unencodable still normalized the tags it normalized, and an operator chasing
-        // a missing tag value needs to see that even when nothing was written. Guarded rather
-        // than counted unconditionally so an ordinary batch doesn't upsert a permanent zero
-        // series into `logit_core::telemetry` for a normalization that never happens here.
+        // Before the empty-body return: a batch whose every line was unencodable still normalized
+        // its tags, and an operator chasing a missing tag value needs to see that. Guarded so an
+        // ordinary batch doesn't upsert a permanent zero series.
         if self.encoder.multi_value_tags > 0 {
             self.telemetry.count(
                 "logit.output.tags.normalized",
@@ -133,9 +126,8 @@ impl Output for InfluxDbOutput {
             );
         }
         if body.is_empty() {
-            // Nothing in this batch had a line-protocol encoding (e.g. every event carried only
-            // a log or span and no metrics, or every metric was a Set -- see `metric_fields`
-            // below). Not an error; nothing to write.
+            // Nothing had a line-protocol encoding (e.g. log- or span-only events, or every
+            // metric was skipped by `render_fields`). Not an error; nothing to write.
             return Ok(());
         }
 
@@ -189,25 +181,21 @@ impl Output for InfluxDbOutput {
         }
     }
 
-    /// The line-protocol encoder derives every point's timestamp from `event.timestamp`, and its
-    /// per-batch collision-disambiguation map (`InfluxLineEncoder::series`) is cleared at the top
-    /// of every `encode` call -- so re-encoding and re-sending a buffered batch on retry produces
-    /// byte-for-byte the same body as the first attempt, and InfluxDB treats an identical
-    /// `(measurement, tag set, timestamp)` write as an idempotent overwrite, not a second point.
+    /// Every point's timestamp derives from `event.timestamp`, and the per-batch collision map
+    /// (`InfluxLineEncoder::series`) is cleared at the top of every `encode`, so a retry re-encodes
+    /// byte-for-byte the same body. InfluxDB treats an identical `(measurement, tag set,
+    /// timestamp)` write as an idempotent overwrite, not a second point.
     /// See `docs/adr/buffered-sink-delivery.md`.
     fn duplicate_safe(&self) -> bool {
         true
     }
 }
 
-/// Classifies a transport-level (connection never got an HTTP response at all) failure.
-/// `reqwest::Error::is_connect()` is `true` specifically for a failure to establish the
-/// connection itself (e.g. connection refused, DNS failure) -- provably "the destination never
-/// saw this batch," `Fault::Clean`, confirmed against a real connection-refused failure in
-/// `connect_refused_is_reliably_classified_as_a_clean_fault` below rather than assumed. Everything
-/// else (a request timeout, a body read failure mid-response, ...) may have reached the
-/// destination before failing, so it's `Fault::Ambiguous`, never `Clean` -- the duplicate-safety
-/// argument for `at_most_once` depends on `Clean` never over-claiming.
+/// Classifies a failure that got no HTTP response. `is_connect()` means the connection was never
+/// established (refused, DNS failure): the destination never saw the batch, `Fault::Clean`,
+/// pinned by `connect_refused_is_reliably_classified_as_a_clean_fault`. Anything else (a timeout,
+/// a failed body read) may have reached the destination, so it's `Fault::Ambiguous`:
+/// `at_most_once`'s duplicate-safety argument depends on `Clean` never over-claiming.
 fn classify_transport_error(err: &reqwest::Error) -> Fault {
     if err.is_connect() {
         Fault::Clean
@@ -216,51 +204,38 @@ fn classify_transport_error(err: &reqwest::Error) -> Fault {
     }
 }
 
-/// Encodes an [`EventBatch`] as InfluxDB line protocol. Split out from [`InfluxDbOutput`] so the
-/// encoding logic is directly unit-testable without an HTTP server.
+/// Encodes an [`EventBatch`] as InfluxDB line protocol.
 ///
-/// Only an event's `metrics` have a line-protocol mapping; its log body and span (if any) are
-/// skipped (`docs/OVERVIEW.md`'s v0.1 slice is metrics-only -- there's no established convention
-/// yet for what a log line or span becomes in InfluxDB, and guessing one isn't this output's job).
-/// An event can carry several metrics at once now (`docs/adr/multi-payload-events.md`), so
-/// each one becomes its own line, sharing that event's tags.
-/// Public only so `logit-bench` can measure encoding in isolation, the same reason this is split
-/// out from [`InfluxDbOutput`] at all -- `docs/design/memory.md` quotes a per-point allocation
-/// count that has to come from calling this directly, with no HTTP server in the picture.
-/// Reusable buffers, and the batch-scoped series map, live on the encoder rather than being
-/// allocated per call, per event, or per line. Encoding is the single largest allocation cost in
-/// the pipeline (`docs/design/memory.md`), and almost all of it was short-lived `String`s built
-/// and dropped inside one line's encoding. `encode` clears each of these at the point its scope
-/// begins, so reuse changes nothing about the bytes produced -- only how often the allocator is
-/// asked for them. `Default` still gives an encoder with everything empty.
+/// Only `metrics` have a line-protocol mapping; a log body or span is skipped, since InfluxDB has
+/// no established convention for either. Each metric on an event becomes its own line sharing
+/// that event's tags (`docs/adr/multi-payload-events.md`).
+///
+/// Public so `logit-bench` can drive it with no HTTP server: `docs/design/memory.md` pins its
+/// allocation count (`influx_encode_100_events`). Reusable buffers and the batch-scoped series
+/// map live on the encoder, not per call, event, or line, because short-lived per-line `String`s
+/// were once the pipeline's largest allocation cost. `encode` clears each where its scope begins,
+/// so reuse never changes the bytes produced.
 #[derive(Default)]
 pub struct InfluxLineEncoder {
     diag: Diagnostics,
-    /// The `,key=value` tag suffix for the event being encoded. Batch-scoped buffer, event-scoped
-    /// contents: rebuilt once per event and shared across that event's metrics.
+    /// The `,key=value` tag suffix, rebuilt once per event and shared across its metrics.
     tag_suffix: String,
-    /// One complete line, assembled before being committed to the output (see
-    /// [`encode_metric_line`] for why a line is built separately rather than appended in place).
+    /// One complete line, built before it reaches the output (see [`encode_metric_line`]).
     line: String,
     /// The `k=v,k=v` field set for the line being assembled.
     fields: String,
-    /// Scratch space for rendering one non-string tag value. A `Value::Str` tag is borrowed
-    /// directly and never touches this.
+    /// Scratch for rendering one non-string tag value; a `Value::Str` tag is borrowed instead.
     scratch: String,
-    /// Scratch for [`allocate_timestamp`]'s path-compression walk. Reused because a fresh
-    /// `Vec::new()` allocates the moment the walk visits anything, i.e. on every timestamp
-    /// collision -- and a statsd multi-value datagram collides on essentially every line.
+    /// Scratch for [`allocate_timestamp`]'s walk. A fresh `Vec` would allocate on every timestamp
+    /// collision, and a statsd multi-value datagram collides on nearly every line.
     visited: Vec<i64>,
-    /// Per-series "next free timestamp slot" successor maps -- see [`encode_metric_line`]'s
-    /// comment for what this is for. Cleared at the start of every `encode`, which keeps it
-    /// batch-scoped exactly as before while letting the maps' allocations survive across batches.
+    /// Per-series "next free timestamp slot" successor maps (see [`encode_metric_line`]). Cleared
+    /// at the start of every `encode`: batch-scoped contents, allocations kept across batches.
     series: HashMap<String, HashMap<i64, i64>>,
-    /// Multi-value tags this batch collapsed to their last element -- see [`render_tag_suffix`].
-    /// Batch-scoped like `series` (zeroed at the top of `encode`), and read by
-    /// [`InfluxDbOutput::send`] straight after `encode` returns, because [`Encoder::encode`]'s
-    /// signature has nowhere to report it: one opaque `Bytes` per batch and no stats out-param.
-    /// `pub` for the same reason the type is -- `logit-bench` constructs and drives this encoder
-    /// directly.
+    /// Multi-value tags this batch collapsed to their last element (see [`render_tag_suffix`]).
+    /// Zeroed at the top of `encode` and read by [`InfluxDbOutput::send`] right after, because
+    /// [`Encoder::encode`] returns only one opaque `Bytes`. `pub` because `logit-bench` drives
+    /// this encoder directly.
     pub multi_value_tags: usize,
 }
 
@@ -274,27 +249,18 @@ impl InfluxLineEncoder {
 impl Encoder for InfluxLineEncoder {
     fn encode(&mut self, batch: &EventBatch) -> Result<Bytes, CodecError> {
         let mut buf = String::new();
-        // InfluxDB identifies a point by (measurement, tag set, timestamp) -- fields play no
-        // part in identity, and a second point with the same identity overwrites the first
-        // rather than coexisting. Two events in the same batch that share a measurement+tag-set
-        // *and* timestamp would therefore collide silently; `encode_metric_line` disambiguates
-        // them. `self.series` holds, per series, a "next free slot" successor map covering every
-        // timestamp actually allocated to it so far -- not just the most recent one (see the
-        // comment at its use site for why that's not enough either, and for what the successor
-        // map buys over a plain occupied-set). Cleared here, so it stays batch-scoped -- not
-        // per-event or per-metric: that's what lets it disambiguate collisions across the whole
-        // batch. It lives on the encoder only so its allocations outlive one call.
+        // InfluxDB identifies a point by (measurement, tag set, timestamp); fields play no part,
+        // and a second point with the same identity overwrites the first. `encode_metric_line`
+        // disambiguates same-identity points using `self.series`, which must stay batch-scoped
+        // (not per-event or per-metric) to catch collisions across the whole batch.
         self.series.clear();
-        // Batch-scoped, exactly like `self.series` above: `InfluxDbOutput::send` reads it once per
-        // `encode` call, so it must not carry the previous batch's count into this one.
+        // Batch-scoped too: `send` reads it once per `encode`.
         self.multi_value_tags = 0;
         for event in &batch.events {
             if event.metrics.is_empty() {
                 continue; // a log-only, span-only, or empty event: nothing to encode
             }
-            // Tags come from `resource.attributes` + `event.attributes` only -- nothing
-            // metric-specific -- so they're identical for every metric on this event. Rendered
-            // once per event, not once per metric.
+            // Tags depend only on resource and event attributes, so render once per event.
             render_tag_suffix(
                 &mut self.tag_suffix,
                 &mut self.scratch,
@@ -303,11 +269,10 @@ impl Encoder for InfluxLineEncoder {
                 &mut self.multi_value_tags,
             );
             for metric in &event.metrics {
-                // A `NO_RECORDED_VALUE`-flagged point (`docs/adr/lossless-transit.md`,
-                // `crates/logit-core/src/metric.rs`'s `flags` doc) has no genuine reading to
-                // write -- InfluxDB is not OTLP, so unlike `otlp_out` this sink can't keep the
-                // point flagged; it must skip and count it rather than write its default `0`
-                // value as though it were real (`docs/known-gaps.md`'s cross-protocol table).
+                // A `NO_RECORDED_VALUE`-flagged point has no reading, and line protocol can't
+                // carry the flag the way OTLP does, so skip it under the throttled
+                // `no_recorded_value` diagnostic rather than write its default `0` as real
+                // (`docs/known-gaps.md`'s cross-protocol table; `MetricRecord`'s `flags` doc).
                 if metric.is_no_recorded_value() {
                     self.diag.warn_throttled(
                         "no_recorded_value",
@@ -319,14 +284,11 @@ impl Encoder for InfluxLineEncoder {
                     );
                     continue;
                 }
-                // One bad metric shouldn't drop its event's other metrics, let alone the rest of
-                // the batch, so this logs and skips rather than propagating via `?`. Deliberately
-                // on the inner, per-metric loop: a `Set` or `#`-prefixed metric sharing an event
-                // with a perfectly good one must not take the good one down with it.
+                // Logged and skipped per metric, not propagated: a `SetMembers` or `#`-prefixed
+                // metric must not take down a good sibling on the same event, or the batch.
                 //
-                // The buffers are passed as separate `&mut` arguments rather than reached through
-                // `self` inside the callee: they're disjoint fields, which the borrow checker
-                // accepts here and would not through a `&mut self` method.
+                // Buffers go in as separate `&mut` arguments: disjoint field borrows the borrow
+                // checker accepts here but not through a `&mut self` method.
                 if let Err(err) = encode_metric_line(
                     &mut buf,
                     &mut self.line,
@@ -337,10 +299,8 @@ impl Encoder for InfluxLineEncoder {
                     &mut self.series,
                     &mut self.visited,
                 ) {
-                    // A `GaugeDelta` reaching a sink is a distinct, greppable failure mode from an
-                    // ordinary encode error -- it means the pipeline is missing an `aggregate`
-                    // component, not that this particular metric is malformed. See
-                    // `docs/adr/relative-gauge-adjustments.md`.
+                    // Its own key: a `GaugeDelta` here means the pipeline lacks an `aggregate`,
+                    // not that the metric is malformed (`docs/adr/relative-gauge-adjustments.md`).
                     let key = if matches!(metric.kind, MetricKind::GaugeDelta(_)) {
                         "gauge_delta_unresolved"
                     } else {
@@ -354,50 +314,35 @@ impl Encoder for InfluxLineEncoder {
     }
 }
 
-/// Renders the `,key=value,key=value` line-protocol tag suffix for one event into `suffix`
-/// (cleared first): resource attributes first, event attributes overriding on key collision (an
-/// event-level tag is more specific than the batch-wide resource it came from). Depends on nothing
-/// metric-specific, so it's computed once per event and shared across every metric that event
-/// carries. Infallible by construction: a tag that can't be represented (an empty key/value, or
-/// one with an embedded newline -- line protocol has no escape for that at all) is dropped
-/// individually rather than escalated to a whole-point error.
+/// Renders one event's `,key=value,key=value` tag suffix into `suffix` (cleared first): resource
+/// attributes, with event attributes overriding on a key collision. Infallible: a tag that can't
+/// be represented (an empty key or value, an embedded newline, which line protocol can't escape)
+/// is dropped alone rather than failing the point.
 ///
-/// Every attribute whose key starts with `statsd.` is skipped outright, uncounted -- mirroring
-/// `statsd_out`'s own `build_tag_suffix` filter (`crates/logit-outputs/src/statsd.rs`) and its
-/// reasoning: `statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
-/// `statsd.service_check.*` are protocol-namespaced carriers `statsd_in` stamps for its own
-/// dedicated wire segments (rule (b), `docs/adr/lossless-transit.md`), not ordinary tags. Without
-/// this filter, `statsd.service_check.message` or `statsd.event.title` -- either of which can
-/// legitimately be long, free-form text -- would round-trip into InfluxDB as a `,key=value` tag,
-/// which InfluxDB indexes and where a high-cardinality/free-text value is a real cost, not merely
-/// a cosmetic one.
+/// Every `statsd.`-prefixed key is skipped, uncounted, mirroring `statsd_out`'s
+/// `build_tag_suffix`: those are carriers `statsd_in` stamps for `statsd_out`'s own wire segments
+/// (rule (b), `docs/adr/lossless-transit.md`), not tags. Without the filter,
+/// `statsd.service_check.message` or `statsd.event.title`, free text, would become an indexed,
+/// high-cardinality InfluxDB tag.
 ///
-/// The two attribute maps are **merge-joined** ([`crate::attrs::merged`]) rather than combined by
-/// cloning the resource's map and inserting the event's over the top -- no copy of an `AttrMap`
-/// per event, and no `resolve` -> `intern` round trip that re-inserting every key would cost.
+/// The maps are merge-joined ([`crate::attrs::merged`]) rather than cloned and re-inserted: no
+/// `AttrMap` copy per event and no `resolve` -> `intern` round trip per key.
 ///
 /// ## Multi-value tags: last-value-wins, counted
 ///
-/// A repeated DogStatsD tag key reaches this sink as a [`Value::Array`] in wire order
-/// (`logit_inputs::statsd::insert_tags`; `statsd_out` re-expands it to one tag per element). Line
-/// protocol's tag set is a **map** -- one key, one value -- so there is no faithful rendering of a
-/// multi-value tag here at all. This renders the **last** representable element, walking backwards
-/// so a trailing unrepresentable element falls through to the one before it, and adds one to
-/// `normalized` per such attribute that actually reaches the wire (an array whose chosen element
-/// is then dropped for being empty or newline-bearing reports nothing, exactly as the equivalent
-/// scalar does). "Last" specifically, not first: it reproduces byte for byte the
-/// `team=b` this sink emitted back when the *decoder* collapsed a repeated key to its last token,
-/// so no existing InfluxDB expectation changes and the counter is the only new signal. An empty or
-/// entirely unrepresentable `Array` drops the tag with no counter -- the same silent path every
-/// other unrepresentable value takes.
+/// A repeated DogStatsD tag key arrives as a [`Value::Array`] in wire order
+/// (`logit_inputs::statsd::insert_tags`). Line protocol's tag set is a map, one value per key, so
+/// this renders the **last** representable element, walking backwards past unrepresentable ones.
+/// Last, not first, matches what a decoder that collapsed repeated keys wrote, so existing
+/// InfluxDB series don't change. `normalized` counts only an array whose chosen element reaches
+/// the wire; an empty or wholly unrepresentable `Array` drops the tag uncounted, as any other
+/// unrepresentable value does.
 ///
-/// `normalized` is reported as `logit.output.tags.normalized{reason="multi_value"}` (via
-/// [`InfluxLineEncoder::multi_value_tags`], which [`InfluxDbOutput::send`] reads). **Unlike every
-/// other `*.normalized` reason in `docs/design/internal-telemetry.md`, this one is lossy**: every
-/// `messages.normalized` reason is a lossless-but-different rendering of the same information,
-/// whereas this genuinely discards the non-last elements. It is a `normalized` rather than a
-/// `dropped` because the tag itself survives and the point still lands -- but an operator reading
-/// it should read it as data loss.
+/// It's reported as `logit.output.tags.normalized{reason="multi_value"}` via
+/// [`InfluxLineEncoder::multi_value_tags`]. **Unlike every other `*.normalized` reason in
+/// `docs/design/internal-telemetry.md`, this one is lossy**: it discards the non-last elements.
+/// It's `normalized`, not `dropped`, because the tag and the point still land; read it as data
+/// loss.
 fn render_tag_suffix(
     suffix: &mut String,
     scratch: &mut String,
@@ -413,11 +358,9 @@ fn render_tag_suffix(
         }
         let is_multi_value = matches!(value, Value::Array(_));
         let rendered = match value {
-            // Last representable element, walked backwards -- see this function's "Multi-value
-            // tags" section. Rendered twice for the chosen element (once to find it, once to
-            // borrow it out of `scratch`) because `tag_value`'s borrow ties its result to
-            // `scratch`, so the search can't hold onto a candidate; both renders reuse `scratch`
-            // and neither allocates, and the scalar path below never reaches this arm at all.
+            // The chosen element is rendered twice (to find it, then to borrow it) because
+            // `tag_value`'s result borrows `scratch`, so the search can't hold a candidate.
+            // Neither render allocates.
             Value::Array(elements) => {
                 let mut chosen = None;
                 for (i, element) in elements.iter().enumerate().rev() {
@@ -436,11 +379,8 @@ fn render_tag_suffix(
         let Some(value) = rendered else {
             continue;
         };
-        // InfluxDB 2.x rejects an empty tag value outright, and line protocol has no escape for
-        // an embedded newline in a tag value at all -- either would previously have corrupted or
-        // rejected this whole line (and, via a since-fixed shared-buffer bug, everything after it
-        // in the batch). Drop just this one tag rather than the whole metric: the point is still
-        // meaningful without it.
+        // InfluxDB 2.x rejects an empty tag value, and line protocol can't escape a newline;
+        // either would corrupt or reject the line. Drop this tag, not the point.
         if key.is_empty()
             || value.is_empty()
             || key.contains(['\n', '\r'])
@@ -448,10 +388,8 @@ fn render_tag_suffix(
         {
             continue;
         }
-        // Counted here, past every remaining drop check, so the counter means "a multi-value tag
-        // reached the wire collapsed to one element" rather than merely "an `Array` was seen" --
-        // an array whose chosen element then turns out to be empty or newline-bearing disappears
-        // on the silent path above, exactly as the equivalent scalar does, and reports nothing.
+        // Counted past every drop check: the counter means "a collapsed multi-value tag reached
+        // the wire", not "an `Array` was seen".
         if is_multi_value {
             *normalized += 1;
         }
@@ -462,8 +400,8 @@ fn render_tag_suffix(
     }
 }
 
-/// One metric's line, appended to `buf`. `line` and `fields` are caller-owned scratch buffers,
-/// cleared here -- see [`InfluxLineEncoder`]'s fields for why they're not local.
+/// One metric's line, appended to `buf`. `line` and `fields` are the encoder's reused scratch
+/// buffers, cleared here.
 #[allow(clippy::too_many_arguments)]
 fn encode_metric_line(
     buf: &mut String,
@@ -476,15 +414,13 @@ fn encode_metric_line(
     visited: &mut Vec<i64>,
 ) -> Result<(), CodecError> {
     if !render_fields(fields, &metric.kind)? {
-        // Every field was non-finite (see `push_float`) or otherwise unrepresentable -- an
-        // empty line is invalid line protocol, so skip rather than write one.
+        // Every field was non-finite or unrepresentable; an empty field set is invalid.
         return Ok(());
     }
 
     let measurement = resolve(metric.name);
-    // A line whose first character is '#' is a comment in line protocol -- a metric name that
-    // happens to start with '#' would otherwise be silently swallowed by InfluxDB (the write
-    // still reports success) rather than actually stored.
+    // A line starting with '#' is a line-protocol comment: InfluxDB would discard it while the
+    // write still reports success.
     if measurement.starts_with('#') {
         return Err(CodecError::Malformed(format!(
             "measurement name {measurement:?} can't be encoded: a leading '#' is a line-protocol \
@@ -492,60 +428,37 @@ fn encode_metric_line(
         )));
     }
 
-    // Built in a separate buffer first, not `buf` directly: if a later step rejects (there are
-    // none right now, but there were -- see `render_tag_suffix`'s doc comment for the history),
-    // only a complete, valid line ever reaches `buf`. "measurement + tags" is also the
-    // series-identity key fed to `series_allocated_timestamps` below -- the tag half is shared
-    // across an event's metrics (see `encode`), but the measurement isn't, so this prefix still
-    // has to be rebuilt once per metric even though `tag_suffix` itself is computed only once.
+    // Built in `line`, not `buf`, so a later rejection (a timestamp overflow below) leaves no
+    // partial line in `buf`. "measurement + tags" is also the series-identity key; the tag half
+    // is shared across an event's metrics but the measurement isn't, so it's rebuilt per metric.
     line.clear();
     push_escaped_measurement(line, measurement);
     line.push_str(tag_suffix);
-    // Where the series-identity prefix ends. Everything appended past this point (fields, the
-    // timestamp) is not part of the series key.
+    // Where the series-identity prefix ends; fields and timestamp aren't part of it.
     let series_key_len = line.len();
-    // Disambiguate same-series collisions within this batch (see `encode`'s comment).
+    // Disambiguate same-series collisions within this batch (see `encode`'s comment). The
+    // simpler schemes are each wrong:
+    // - +1ns per prior occurrence collides again on out-of-order input (101 then 100 both
+    //   become 101).
+    // - max(last + 1, own) per series moves a timestamp that didn't collide (101 then 100
+    //   becomes 101 then 102).
+    // - A `HashSet` of taken slots, re-probed from `timestamp` each time, is O(k^2) for k
+    //   duplicates: `statsd_in` stamps one timestamp on a whole datagram, and its multi-value
+    //   form (`x:1:1:1...|c`) expands to one event per value, so a ~65KB datagram makes
+    //   k ~30,000, ~450 million lookups.
     //
-    // Three schemes were tried before this one:
-    // - "Add 1ns per prior occurrence, in arrival order" only produces distinct timestamps if
-    //   same-series events already arrive sorted. Out of order -- e.g. timestamps 101 then 100 --
-    //   the first gets stamped 101 (0 prior occurrences) and the second gets 100+1=101 too,
-    //   colliding again.
-    // - "Track the last timestamp emitted per series, enforce max(last+1, own)" fixes that, but
-    //   over-corrects: it forces every subsequent same-series event forward regardless of whether
-    //   its *own* timestamp actually collides with anything. For 101 then 100, it emits 101 then
-    //   102 -- even though 100 was completely free -- discarding a real, distinct timestamp for
-    //   no reason. The gap only grows with how out-of-order the input is.
-    // - "Track every timestamp actually allocated in a `HashSet`, linearly re-probing forward
-    //   from `event.timestamp` on every call" gets both of the above right, but restarts the
-    //   probe from scratch for every duplicate: *k* same-series/same-timestamp events cost
-    //   0 + 1 + ... + (k-1) lookups, O(k^2). `logit-inputs::statsd` stamps one timestamp on an
-    //   entire datagram and its multi-value form (`x:1:1:1...|c`) expands into one event per
-    //   value, so a single ~65KB datagram can make k ~30,000 -- ~450 million lookups.
+    // `allocate_timestamp` is a union-find "smallest free slot >= t" allocator with path
+    // compression: a free timestamp is returned untouched regardless of arrival order, a
+    // collision costs a 1ns nudge, and repeated collisions stay amortized-cheap.
     //
-    // Correct *and* amortized-cheap: a per-series successor map, same idea as a union-find
-    // "smallest free slot >= t" allocator with path compression. `allocate_timestamp` walks the
-    // chain of already-occupied slots starting at `timestamp`, and repoints every slot it visits
-    // directly at the free slot it finds -- so the next probe starting anywhere on that chain
-    // jumps straight there instead of re-walking it. A timestamp that isn't already used is still
-    // returned untouched, regardless of arrival order; only a genuine collision costs a 1ns
-    // nudge, and repeated collisions on the same series no longer cost more than a couple of
-    // lookups each once the chain has been compressed once.
+    // Several metrics on one event (`docs/adr/multi-payload-events.md`): distinct names are
+    // distinct series and keep the event's timestamp; a repeated name takes the collision path
+    // and produces byte-for-byte what `k` separate events would. That holds only while
+    // `series_allocated_timestamps` stays batch-scoped.
     //
-    // Needs no algorithmic change for an event carrying several metrics
-    // (docs/adr/multi-payload-events.md): distinct metric names on one event produce
-    // distinct series keys (they differ by measurement) and never collide, so they keep the
-    // event's own timestamp untouched; a *repeated* metric name on one event (e.g. `kv_metrics`
-    // configured to add the same counter twice, or two aggregated series that happen to share a
-    // name) takes exactly the collision path below, one series key, `k` allocations -- the same
-    // amortized-cheap walk, byte-for-byte the same output as if those metrics had arrived as `k`
-    // separate events. `series_allocated_timestamps` staying hoisted at batch scope (`encode`,
-    // above) is what makes this true -- don't move it to per-event or per-metric scope.
-    // Looked up before inserting, so the common path -- a series already seen in this batch --
-    // costs one extra hash instead of one `String` allocation for a key that is then thrown away.
-    // (`entry` would need the key up front, and `get_mut`-then-`insert` can't share one borrow
-    // without polonius.) The key is the prefix of `line` computed above, borrowed for the lookup
-    // and only cloned when it turns out to be new.
+    // Looked up before inserting, so a series already seen costs one extra hash instead of a
+    // throwaway `String` key. (`entry` needs an owned key up front, and `get_mut`-then-`insert`
+    // can't share one borrow without polonius.)
     let series_key = &line[..series_key_len];
     if !series_allocated_timestamps.contains_key(series_key) {
         series_allocated_timestamps.insert(series_key.to_string(), HashMap::new());
@@ -560,11 +473,8 @@ fn encode_metric_line(
         ))
     })?;
 
-    // This matters in practice today: `logit-inputs::statsd` assigns one timestamp to an entire
-    // datagram, and its multi-value form (`name:1:2:3|c`) expands into several otherwise-
-    // identical events, all sharing that timestamp -- a nanosecond-scale perturbation here is far
-    // below any input's actual timing resolution, and far simpler than guessing at how to
-    // aggregate same-series samples together, which the source protocol never specified.
+    // A nanosecond nudge is below any input's timing resolution, and simpler than guessing how
+    // to aggregate same-series samples, which the source protocol never specified.
 
     line.push(' ');
     line.push_str(fields);
@@ -580,21 +490,13 @@ fn encode_metric_line(
 /// the allocation in `next_free` so a later call sees it as taken. `next_free` maps an occupied
 /// timestamp to the next candidate to try after it; a timestamp with no entry is free.
 ///
-/// This is a union-find "smallest free slot" allocator with path compression: the walk from
-/// `requested` to the eventual free slot passes through zero or more occupied timestamps, and
-/// every one of them gets repointed straight at the free slot (well, `free + 1`, since the free
-/// slot itself is about to become occupied) before returning. A later call starting anywhere on
-/// that walked chain -- including `requested` itself, on a repeat collision -- then reaches the
-/// (new) free slot in one hop instead of re-walking however much of the chain got probed before.
-/// That's what keeps *k* collisions on one series amortized-cheap instead of the O(k^2) cost of
-/// re-probing an occupied set from `requested` on every call (see the comment at the call site).
+/// Path compression: every occupied timestamp the walk passes is repointed at `free + 1` (the
+/// free slot itself is about to be taken), so a later call starting anywhere on that chain,
+/// including a repeat of `requested`, reaches the next free slot in one hop.
 ///
-/// Returns `None` if the free slot the walk lands on is `i64::MAX`: that timestamp is treated as
-/// permanently unusable (never recorded as occupied, so a repeat request lands here again rather
-/// than looping) purely so `successor` never has to wrap and `next_free` can never contain a
-/// self-loop. `i64::MAX` nanoseconds is the year 2262, so in practice this only ever fires for a
-/// series with over 2^63 timestamps already allocated at or after `requested` -- not reachable
-/// from any real batch.
+/// Returns `None` if the walk lands on `i64::MAX`. That slot is never recorded as occupied, so
+/// `successor` never wraps and `next_free` never holds a self-loop. `i64::MAX` ns is the year
+/// 2262, so no real batch reaches it.
 fn allocate_timestamp(
     next_free: &mut HashMap<i64, i64>,
     visited: &mut Vec<i64>,
@@ -606,8 +508,7 @@ fn allocate_timestamp(
         visited.push(cur);
         cur = next;
     }
-    // `cur` is now free. Reserve it, and repoint every occupied slot visited on the way here
-    // directly at its successor so the next walk through any of them stops immediately.
+    // `cur` is free: reserve it and repoint every visited slot at its successor.
     let successor = cur.checked_add(1)?;
     next_free.insert(cur, successor);
     for slot in visited.drain(..) {
@@ -616,34 +517,8 @@ fn allocate_timestamp(
     Some(cur)
 }
 
-/// Renders one metric's line-protocol field set as `k=v,k=v` into `out` (cleared first), returning
-/// whether anything was written. `false` means every field was unrepresentable, which makes the
-/// whole point unwritable -- an empty field set is invalid line protocol.
-///
-/// `Sum`/`Gauge` are a single `value` field -- `Sum` regardless of temporality or monotonicity:
-/// line protocol has no notion of either, so a cumulative or non-monotonic sum still just writes
-/// its current `value`. `Samples` sketches its raw observations into a temporary `DdSketch` (each
-/// value re-weighted by its sample rate via `DdSketch::add_weighted`) and renders exactly like
-/// `Distribution` below -- `count` (as an unsigned integer -- see [`push_uint`]) plus a few fixed
-/// quantiles. `Histogram` maps its buckets onto fields directly; `Summary` maps its quantiles onto
-/// fields keyed by the raw quantile value rather than a rounded percentage, since rounding isn't
-/// collision-free (0.991 and 0.994 would both round to "p99" and overwrite each other within one
-/// line's field set). `Set` is real now (`logit_core::metric::HyperLogLog`, `docs/plans/
-/// lossless-transit.md`'s W2) -- its estimate renders as a single unsigned `value` field, the
-/// same [`push_uint`] formatting `count=` already uses. `SetMembers` is still raw, unsummarized
-/// data with nothing to render a scalar field from, so it still returns an error rather than
-/// inventing a meaningless one -- as does `ExponentialHistogram`, cross-protocol debt line
-/// protocol has no shape for (`docs/plans/lossless-transit.md`).
-///
-/// **Field names are written unescaped, and that is not a shortcut.** Every name this can produce
-/// is either a literal (`value`, `count`) or built purely out of formatted numbers
-/// (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering can contain a backslash, comma,
-/// equals, or space -- so the escaping the previous version applied was provably a no-op, and the
-/// output is byte-for-byte what it was. A future field name derived from anything user-supplied
-/// would have to go back through [`push_escaped_tag`].
-/// Shared by `MetricKind::Distribution` and `MetricKind::Samples` (once re-sketched) -- `count` (as
-/// an unsigned integer -- see [`push_uint`]) plus a few fixed quantiles. Unconditional on `count`,
-/// so a rendered sketch always has at least one field.
+/// `Distribution` and re-sketched `Samples` fields: `count` as an unsigned integer
+/// ([`push_uint`]) plus p50/p90/p99. `count` is unconditional, so there's always one field.
 fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
     out.push_str("count=");
     push_uint(out, sketch.count() as u64);
@@ -656,6 +531,24 @@ fn render_sketch_fields(out: &mut String, sketch: &DdSketch) {
     }
 }
 
+/// Renders one metric's `k=v,k=v` field set into `out` (cleared first). Returns `false` when
+/// every field was unrepresentable: an empty field set is invalid line protocol.
+///
+/// - `Sum`/`Gauge`: one `value` field. Line protocol has no temporality or monotonicity, so a
+///   cumulative or non-monotonic `Sum` writes its current `value` too.
+/// - `Distribution`, and `Samples` re-sketched with each value weighted by its inverse sample rate:
+///   [`render_sketch_fields`].
+/// - `Histogram`: a `bucket_<bound>` field per finite bound.
+/// - `Summary`: fields keyed by the raw quantile, not a rounded percentage, since rounding isn't
+///   collision-free (0.991 and 0.994 both round to "p99" and would overwrite each other).
+/// - `Set`: its `HyperLogLog` estimate as an unsigned `value`.
+/// - `SetMembers` (raw members, no scalar to render) and `ExponentialHistogram` (no line-protocol
+///   shape; `docs/plans/lossless-transit.md`) are errors, as is an unresolved `GaugeDelta`.
+///
+/// **Field names are written unescaped.** Each is a literal (`value`, `count`) or built from
+/// formatted numbers (`p50`, `bucket_1.5`, `q0.99`), and no `f64`/`u32` rendering contains a
+/// backslash, comma, equals, or space. A field name derived from user input would have to go
+/// through [`push_escaped_tag`].
 fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError> {
     out.clear();
 
@@ -676,9 +569,8 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
             render_sketch_fields(out, sketch);
         }
         MetricKind::Samples(s) => {
-            // Re-sketch the raw observations into a temporary `DdSketch` -- each value re-weighted
-            // by the inverse of its sample rate, the same extrapolation `aggregate` applies when it
-            // builds a real `Distribution` from a run of these -- and render exactly like one.
+            // Weighted by the inverse sample rate, the same extrapolation `aggregate` applies
+            // when it builds a `Distribution` from these.
             let mut sketch = DdSketch::new();
             let weight = s.weight();
             for v in &s.values {
@@ -705,9 +597,6 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
             }
         }
         MetricKind::Set(hll) => {
-            // `HyperLogLog` is real now (`docs/plans/lossless-transit.md`'s W2) -- render its
-            // estimate as an unsigned integer field, the same `push_uint` formatting `count=`
-            // already uses for a sketch's own count.
             out.push_str("value=");
             push_uint(out, hll.estimate());
         }
@@ -732,33 +621,27 @@ fn render_fields(out: &mut String, kind: &MetricKind) -> Result<bool, CodecError
     Ok(!out.is_empty())
 }
 
-/// Comma between field entries, for the two kinds whose field count isn't known up front. Keyed
-/// off "has anything been written yet" rather than a loop index, because entries are skipped for
-/// non-finite values and an index would put a leading comma on a line whose first bucket was
-/// skipped.
+/// Comma between field entries. Keyed off "anything written yet", not a loop index: non-finite
+/// entries are skipped, and an index would leave a leading comma when the first one was.
 fn separator(out: &mut String) {
     if !out.is_empty() {
         out.push(',');
     }
 }
 
-/// Line protocol has no representation for non-finite floats. Every caller guards with
-/// `is_finite` before reaching this (writing `value=NaN` would have InfluxDB reject the whole
-/// write); a client can produce one today -- statsd's `f64::parse` accepts the literal text
-/// "NaN"/"inf" -- so that guard isn't theoretical.
+/// Formats a finite float. Line protocol has no non-finite floats, and `value=NaN` makes InfluxDB
+/// reject the whole write, so every caller checks `is_finite` first; statsd's `f64::parse`
+/// accepts "NaN" and "inf", so the check isn't theoretical.
 ///
-/// `write!` rather than `to_string()`: identical output (`to_string` is `format!("{}")`), no
-/// intermediate allocation. `pub(crate)`: `statsd_out` renders the same `Sum`/`Gauge` values (a
-/// delta, monotonic `MetricKind::counter` for the `Sum`) and needs identical, non-locale-dependent
-/// float formatting.
+/// `pub(crate)`: `statsd_out` renders the same `Sum`/`Gauge` values and needs identical,
+/// locale-independent formatting.
 pub(crate) fn push_float(out: &mut String, v: f64) {
     debug_assert!(v.is_finite(), "callers must reject non-finite values before formatting");
     let _ = write!(out, "{v}");
 }
 
-/// Line-protocol unsigned-integer field (the `u` suffix, InfluxDB 2.x). Without it, a bare number
-/// is parsed as `f64` by default, which loses integer semantics and, above 2^53, exactness --
-/// real concerns for a count that legitimately grows past that in a long-running series.
+/// Line-protocol unsigned-integer field (the `u` suffix, InfluxDB 2.x). A bare number parses as
+/// `f64`, losing integer semantics and, above 2^53, exactness for a long-running count.
 fn push_uint(out: &mut String, v: u64) {
     let _ = write!(out, "{v}u");
 }
@@ -767,12 +650,10 @@ fn push_i64(out: &mut String, v: i64) {
     let _ = write!(out, "{v}");
 }
 
-/// One tag value as a `&str`, or `None` for a `Value` with no sensible plain-text tag
-/// representation. A `Value::Str` is borrowed straight out of the attribute (no copy, since it's
-/// already UTF-8 `Bytes`); everything else is formatted into `scratch`, which is cleared first and
-/// reused across tags. `pub(crate)`: `statsd_out` needs the identical `Value` -> tag-text mapping
-/// for its own DogStatsD tags (cross-sink reuse precedent: `syslog.rs` already does this with
-/// `crate::stdio::render_value`).
+/// One tag value as a `&str`, or `None` for a `Value` with no plain-text tag form: `Null`,
+/// `Bytes`, `Timestamp`, `Array`, and `Map` (a nested attribute is dropped; `flatten` exists for
+/// that). A `Value::Str` is borrowed, not copied; a scalar is formatted into `scratch` (cleared
+/// first). `pub(crate)`: `statsd_out` needs the identical `Value` -> tag-text mapping.
 pub(crate) fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a str> {
     match v {
         Value::Str(s) => std::str::from_utf8(s).ok(),
@@ -787,7 +668,6 @@ pub(crate) fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a
             };
             Some(scratch.as_str())
         }
-        // Null, Bytes, Timestamp, Array, and Map have no sensible plain-text tag representation.
         Value::Null | Value::Bytes(_) | Value::Timestamp(_) | Value::Array(_) | Value::Map(_) => {
             None
         }
@@ -796,11 +676,9 @@ pub(crate) fn tag_value<'a>(scratch: &'a mut String, v: &'a Value) -> Option<&'a
 
 /// Appends `s` with line protocol's measurement escaping (`\`, `,`, and space).
 ///
-/// Written straight into `out` rather than returned as a new `String`: the previous chained
-/// `.replace()` form allocated once per replacement -- three or four `String`s per measurement or
-/// tag -- *whether or not anything actually needed escaping*, which was the single biggest
-/// contributor to this encoder's allocation count (`docs/design/memory.md`). The common case here
-/// copies one contiguous run and allocates nothing.
+/// Written into `out`, not returned: chained `.replace()` allocates per replacement whether or
+/// not anything needs escaping, and dominated this encoder's allocation count
+/// (`docs/design/memory.md`). The common case copies one run and allocates nothing.
 fn push_escaped_measurement(out: &mut String, s: &str) {
     push_escaped(out, s, &['\\', ',', ' ']);
 }
@@ -818,8 +696,7 @@ fn push_escaped(out: &mut String, s: &str, needs_escape: &[char]) {
     while let Some(i) = rest.find(needs_escape) {
         out.push_str(&rest[..i]);
         out.push('\\');
-        // The matched character, which `find` guarantees is one of `needs_escape` and therefore
-        // one byte of ASCII.
+        // The matched character: one of `needs_escape`, so one ASCII byte.
         out.push_str(&rest[i..i + 1]);
         rest = &rest[i + 1..];
     }
@@ -848,9 +725,7 @@ mod tests {
         )
     }
 
-    /// Like `metric_event`, but with an explicit timestamp -- the leverage point for the
-    /// `allocate_timestamp` regression tests below, all of which care about the exact timestamp
-    /// a series of events shares.
+    /// A counter event at an explicit timestamp, for the `allocate_timestamp` tests.
     fn counter_event_at(ts: i64, name: &str, v: f64) -> Event {
         let mut event = metric_event(name, MetricKind::counter(v), &[]);
         event.timestamp = ts;
@@ -870,8 +745,7 @@ mod tests {
         assert_eq!(out, "page.views,env=prod value=3 1700000000000000000\n");
     }
 
-    /// A cumulative (or non-monotonic) `Sum` renders identically to a delta-monotonic one -- line
-    /// protocol has no notion of temporality or monotonicity, only a current `value`.
+    /// A cumulative, non-monotonic `Sum` renders the same as a delta-monotonic one.
     #[test]
     fn a_cumulative_sum_renders_the_same_as_a_counter() {
         let out = encode(vec![metric_event(
@@ -925,8 +799,7 @@ mod tests {
 
     #[test]
     fn summary_quantile_keys_do_not_collide_when_rounded_percentage_would() {
-        // 0.991 and 0.994 both round to "p99" under a percentage-rounding scheme -- the whole
-        // point of this test is that they must not collapse onto the same field key.
+        // 0.991 and 0.994 both round to "p99"; they must not share a field key.
         let out = encode(vec![metric_event(
             "req.latency",
             MetricKind::Summary(Summary {
@@ -940,8 +813,7 @@ mod tests {
         assert!(out.contains("q0.994=20"), "got: {out}");
     }
 
-    /// `Samples` re-sketches its raw observations, at `sample_rate: 1.0` (unweighted), and renders
-    /// exactly like a `Distribution` built from the same values would.
+    /// Unweighted `Samples` render like a `Distribution` of the same values.
     #[test]
     fn samples_renders_like_a_distribution_built_from_the_same_values() {
         let out = encode(vec![metric_event(
@@ -956,9 +828,8 @@ mod tests {
         assert!(out.contains("p50="));
     }
 
-    /// A NaN `sample_rate` must degrade to unweighted samples, not to an empty sketch --
-    /// `Samples::weight` is NaN-safe where a bare `f64::clamp` isn't (`count=0u` here would mean
-    /// both observations silently vanished).
+    /// A NaN `sample_rate` degrades to unweighted samples, not an empty sketch (`count=0u`):
+    /// `Samples::weight` is NaN-safe where a bare `f64::clamp` isn't.
     #[test]
     fn samples_with_a_nan_sample_rate_still_render_every_observation() {
         let mut samples = logit_core::Samples::new([120.0, 130.0]);
@@ -968,11 +839,7 @@ mod tests {
         assert!(out.contains("p50="), "got: {out}");
     }
 
-    /// `SetMembers`/`ExponentialHistogram` have no line-protocol encoding yet (cross-protocol
-    /// debt, `docs/plans/lossless-transit.md`) -- `render_fields` returns `Malformed` for them, but
-    /// `encode` logs and skips per-metric errors rather than propagating them (same reasoning as
-    /// `set_metrics_are_skipped_not_fatal` above), so a sibling metric on the same batch still
-    /// comes through.
+    /// An unencodable `SetMembers` is skipped and a sibling metric in the batch still lands.
     #[test]
     fn set_members_has_no_line_protocol_encoding_yet() {
         let out = encode(vec![
@@ -1012,10 +879,7 @@ mod tests {
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
-    /// `statsd.*` attributes -- `statsd_in`'s protocol-namespaced carriers for `statsd_out`'s own
-    /// wire segments (`statsd.type`/`statsd.container_id`/`statsd.timestamp`/`statsd.event.*`/
-    /// `statsd.service_check.*`) -- must never round-trip into InfluxDB as a tag; a sibling
-    /// ordinary attribute still comes through.
+    /// `statsd.*` carriers never become tags; an ordinary sibling attribute still does.
     #[test]
     fn statsd_dot_attributes_never_become_tags() {
         let out = encode(vec![metric_event(
@@ -1043,14 +907,8 @@ mod tests {
         assert!(out.contains("path=a\\,b\\ c\\=d"), "got: {out}");
     }
 
-    /// The concrete behavioral consequence `docs/design/lua-value-type-preservation.md` and PR #6
-    /// review discussion_r3887008990 describe: `tag_value` treats `Value::Bytes` and
-    /// `Value::Str` differently (the former is excluded from tags, the latter included), so a
-    /// Lua enrichment stage that carelessly changes an attribute's variant on an unmodified
-    /// round-trip -- which it used to, before `logit-script`'s `AttrsProxy::__newindex` grew its
-    /// no-op-assignment rule -- silently changes what gets written to InfluxDB with no error and
-    /// no script-visible signal. This closes the loop end to end: a `Bytes` attribute must stay
-    /// excluded from tags even after passing through a Lua stage that touches every attribute.
+    /// A `Bytes` attribute stays out of tags after a Lua stage reassigns every attribute
+    /// (`docs/design/lua-value-type-preservation.md`).
     #[test]
     fn bytes_attribute_stays_excluded_from_tags_after_a_lua_enrichment_stage() {
         let worker = logit_script::ScriptWorker::new(
@@ -1100,9 +958,7 @@ mod tests {
         assert!(!out.contains("env=staging"), "got: {out}");
     }
 
-    /// `encode`, plus the multi-value-tag count the encoder accumulated on the way -- `encode`
-    /// throws its encoder away, and that count is the one thing [`Encoder::encode`]'s signature
-    /// has no way to return.
+    /// `encode`, plus the multi-value-tag count [`Encoder::encode`] can't return.
     fn encode_counting_multi_value(events: Vec<Event>) -> (String, usize) {
         let mut encoder = InfluxLineEncoder::default();
         let bytes = encoder.encode(&batch_with(events)).expect("encode should succeed");
@@ -1110,18 +966,14 @@ mod tests {
         (out, encoder.multi_value_tags)
     }
 
-    /// A counter event carrying one `Value::Array` attribute -- the shape a repeated DogStatsD tag
-    /// key arrives in. `metric_event` only takes `&str` values, so this has to go in by hand.
+    /// A counter event with one `Value::Array` attribute, as a repeated DogStatsD tag arrives.
     fn event_with_array_tag(key: &str, elements: Vec<Value>) -> Event {
         let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
         event.attributes.insert(key, Value::Array(elements));
         event
     }
 
-    /// Line protocol's tag set is a map, so a multi-value tag has no faithful rendering here: the
-    /// **last** representable element wins, reproducing the `team=b` this sink emitted back when
-    /// the decoder itself collapsed a repeated key -- and it is counted, because unlike every
-    /// other `*.normalized` reason this one loses data.
+    /// A multi-value tag renders its last element and is counted once per attribute.
     #[test]
     fn a_multi_value_tag_renders_its_last_element_and_is_counted() {
         let (out, normalized) = encode_counting_multi_value(vec![event_with_array_tag(
@@ -1150,8 +1002,7 @@ mod tests {
         assert_eq!(normalized, 1);
     }
 
-    /// An empty or entirely unrepresentable `Array` drops the tag on the same silent path every
-    /// other unrepresentable value takes -- nothing was normalized, so nothing is counted.
+    /// An empty or wholly unrepresentable `Array` drops the tag uncounted.
     #[test]
     fn an_empty_or_all_unrepresentable_array_tag_drops_the_tag_with_no_count() {
         let (out, normalized) =
@@ -1167,8 +1018,7 @@ mod tests {
         assert_eq!(normalized, 0);
     }
 
-    /// `multi_value_tags` is batch-scoped, like `series` -- zeroed at the top of every `encode`,
-    /// so `send` reading it after one call can never see the previous batch's count added in.
+    /// `multi_value_tags` is zeroed per `encode`, not accumulated across batches.
     #[test]
     fn the_multi_value_tag_count_is_zeroed_per_encode_not_accumulated_across_batches() {
         let mut encoder = InfluxLineEncoder::default();
@@ -1182,10 +1032,7 @@ mod tests {
         }
     }
 
-    /// A `NO_RECORDED_VALUE`-flagged point must be skipped, not written as a fabricated `value=0`
-    /// -- fix 3 in PR #123's review (`docs/adr/lossless-transit.md`, `docs/known-gaps.md`'s
-    /// cross-protocol table). A sibling metric on the same event still comes through, same shape
-    /// as `set_metrics_are_skipped_not_fatal` below.
+    /// A `NO_RECORDED_VALUE` point is skipped, not written as `value=0`; a sibling still lands.
     #[test]
     fn a_no_recorded_value_point_is_skipped_not_written_as_a_fabricated_zero() {
         let mut flagged = metric_event("conns", MetricKind::Gauge(0.0), &[]);
@@ -1195,11 +1042,7 @@ mod tests {
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
-    /// `Set` is real now (`docs/plans/lossless-transit.md`'s W2) -- its estimate renders as an
-    /// unsigned `value` field, closing the "no line-protocol encoding" error this test used to
-    /// pin (see git history for the pre-W2 version of this test, `set_metrics_are_skipped_not_
-    /// fatal`; `set_members_has_no_line_protocol_encoding_yet` below still pins the still-raw
-    /// `SetMembers` kind's own error).
+    /// A `Set` renders its `HyperLogLog` estimate as an unsigned `value` field.
     #[test]
     fn set_metrics_render_their_hyperloglog_estimate() {
         let mut hll = logit_core::HyperLogLog::default();
@@ -1213,10 +1056,7 @@ mod tests {
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
-    /// A `GaugeDelta` reaching this encoder means the pipeline is missing an `aggregate`
-    /// component (`docs/adr/relative-gauge-adjustments.md`) -- it must be dropped, not
-    /// written as though it were an absolute value, and its sibling metric in the same batch must
-    /// still come through untouched, matching `set_metrics_are_skipped_not_fatal` above.
+    /// An unresolved `GaugeDelta` is dropped, not written as absolute; a sibling still lands.
     #[test]
     fn gauge_delta_is_skipped_not_fatal() {
         let out = encode(vec![
@@ -1227,9 +1067,7 @@ mod tests {
         assert!(out.contains("page.views value=1"), "got: {out}");
     }
 
-    /// The distinct, greppable diagnostic key this workstream's plan calls for --
-    /// `gauge_delta_unresolved`, not the generic `encode_error` every other unrepresentable kind
-    /// reports under.
+    /// A `GaugeDelta` reports `gauge_delta_unresolved`, not the generic `encode_error`.
     #[test]
     fn gauge_delta_reports_its_own_diagnostic_key() {
         let registry = logit_core::Registry::new();
@@ -1275,8 +1113,6 @@ mod tests {
 
     #[test]
     fn measurement_name_starting_with_hash_is_rejected_not_silently_dropped() {
-        // A line starting with '#' is a comment in line protocol -- writing it would make
-        // InfluxDB report success while storing nothing. It must be rejected up front instead.
         let out = encode(vec![
             metric_event("#requests", MetricKind::counter(1.0), &[]),
             metric_event("page.views", MetricKind::counter(1.0), &[]),
@@ -1295,9 +1131,7 @@ mod tests {
 
     #[test]
     fn tag_value_with_embedded_newline_does_not_corrupt_the_rest_of_the_batch() {
-        // This used to write a truncated, newline-less fragment straight into the shared buffer
-        // and bail, corrupting whatever line got appended after it. Two full, valid lines must
-        // come out the other side of a batch containing a newline-poisoned tag value in between.
+        // A newline-bearing tag must not leave a fragment that corrupts the next line.
         let out = encode(vec![
             metric_event("ok.before", MetricKind::counter(1.0), &[]),
             metric_event("bad", MetricKind::counter(1.0), &[("env", "prod\ninjected")]),
@@ -1311,11 +1145,7 @@ mod tests {
 
     #[test]
     fn multi_value_samples_in_one_batch_are_not_collapsed_by_influxdb_point_identity() {
-        // InfluxDB identifies a point by (measurement, tag set, timestamp); `logit-inputs::statsd`
-        // assigns one timestamp to an entire datagram, so its multi-value form (`name:1:2:3|c`)
-        // decodes into three events sharing a measurement, tag set, *and* timestamp. Written
-        // verbatim, the second and third would silently overwrite the first in InfluxDB, leaving
-        // only "3" stored. All three must survive as distinct points.
+        // statsd's `name:1:2:3|c` decodes to three same-identity events; all three must survive.
         let same_ts = 1_700_000_000_000_000_000;
         let events: Vec<Event> = [1.0, 2.0, 3.0]
             .into_iter()
@@ -1337,14 +1167,7 @@ mod tests {
 
     #[test]
     fn out_of_order_same_series_timestamps_keep_their_real_value_when_unoccupied() {
-        // A "track the last emitted timestamp, enforce max(last+1, own)" scheme fixes the
-        // original collision but over-corrects: it forces *every* subsequent same-series event
-        // forward regardless of whether its own timestamp actually collides with anything. For
-        // ts=101 then ts=100, that emits 101 then 102 -- even though 100 was completely free,
-        // discarding a real, distinct timestamp for no reason (and the gap only grows with how
-        // out-of-order the input is). The fix probes forward from each event's *own* timestamp,
-        // only advancing while that exact slot is already taken by this series -- so this must
-        // emit exactly 100 and 101, not 101 and 102.
+        // 101 then 100 must emit 101 and 100, not max(last + 1, own)'s 101 and 102.
         let events = vec![
             counter_event_at(101, "page.views", 1.0),
             counter_event_at(100, "page.views", 2.0),
@@ -1360,13 +1183,7 @@ mod tests {
 
     #[test]
     fn large_same_timestamp_batch_allocates_a_contiguous_range_without_quadratic_blowup() {
-        // `logit-inputs::statsd` assigns one timestamp to an entire datagram, and its
-        // multi-value form (`x:1:1:1...|c`) expands into one event per value -- so a single
-        // ~65KB datagram can decode into tens of thousands of same-series, same-timestamp
-        // events. A scheme that re-probes an occupied `HashSet` from `event.timestamp` on every
-        // call costs 0 + 1 + ... + (N-1) lookups here -- O(N^2), effectively a hang at this N.
-        // This test is a correctness assertion (exact allocated range), but it also stands in as
-        // the performance regression guard: it must stay fast. Don't shrink N to "simplify" it.
+        // Also the O(N^2) regression guard (an effective hang at this N); don't shrink N.
         const N: i64 = 50_000;
         let start_ts = 1_700_000_000_000_000_000;
         let events: Vec<Event> =
@@ -1387,9 +1204,7 @@ mod tests {
 
     #[test]
     fn interleaved_timestamps_on_one_series_allocate_without_gaps_or_duplicates() {
-        // Two original timestamps whose forward-probe ranges would overlap (100 x3, 101 x2) must
-        // still produce a clean, contiguous, duplicate-free allocation: path compression must
-        // never let one walk skip over a slot another walk is about to claim.
+        // Overlapping probe ranges (100 x3, 101 x2): path compression must not skip a free slot.
         let events: Vec<Event> = [100, 100, 100, 101, 101]
             .into_iter()
             .map(|ts| counter_event_at(ts, "page.views", 1.0))
@@ -1402,10 +1217,7 @@ mod tests {
         assert_eq!(timestamps, vec![100, 101, 102, 103, 104], "got: {out}");
     }
 
-    /// Proves hoisting tag rendering out of the per-metric loop (`render_tag_suffix`,
-    /// `encode`'s inner loop) didn't change output: distinctly-named metrics on one event never
-    /// collide in `allocate_timestamp` (different measurements mean different series keys), so
-    /// each keeps the event's own timestamp untouched, and each still carries the event's tags.
+    /// Distinct metrics on one event each get a line with the event's tags and timestamp.
     #[test]
     fn several_metrics_on_one_event_share_its_tags_and_each_get_a_line() {
         let mut event = metric_event("requests", MetricKind::counter(1.0), &[("env", "prod")]);
@@ -1430,11 +1242,7 @@ mod tests {
         }
     }
 
-    /// Case B from `allocate_timestamp`'s doc comment: the *same* metric name appearing twice on
-    /// one event -- a genuinely new input shape this refactor introduces (e.g. `kv_metrics`
-    /// configured to add one counter twice, or two upstream series that happen to share a name
-    /// landing on one event) -- takes exactly the collision path a repeated statsd value used to,
-    /// byte-for-byte the same allocator behavior.
+    /// A metric name repeated on one event takes the same collision path as separate events.
     #[test]
     fn the_same_metric_name_twice_on_one_event_gets_distinct_timestamps() {
         let mut event = metric_event("page.views", MetricKind::counter(1.0), &[]);
@@ -1449,15 +1257,9 @@ mod tests {
         assert!(out.contains("value=2 1700000000000000001"), "got: {out}");
     }
 
-    /// Pins the error handling's move to the inner, per-metric loop (`encode`): today's
-    /// `set_metrics_are_skipped_not_fatal` and `measurement_name_starting_with_hash_is_rejected_
-    /// not_silently_dropped` use separate events and so don't actually exercise this -- a bad
-    /// metric sharing an event with a good one must not take the good one down too.
+    /// A bad metric sharing an event with a good one skips only itself.
     #[test]
     fn a_bad_metric_skips_only_itself_not_the_rest_of_its_event() {
-        // `SetMembers`, not `Set` -- `Set` renders now (`set_metrics_render_their_hyperloglog_
-        // estimate` above); `SetMembers` is still raw, unsummarized data with no line-protocol
-        // encoding.
         let mut event = metric_event(
             "unique.users",
             MetricKind::SetMembers(vec![bytes::Bytes::from_static(b"a")]),
@@ -1476,9 +1278,7 @@ mod tests {
         );
     }
 
-    /// The nginx shape end to end: an access-log event that a `kv_metrics`-style transform has
-    /// added a derived metric to. The metric should be written; the log body is simply ignored,
-    /// not an error.
+    /// A log event carrying a derived metric writes the metric and ignores the log body.
     #[test]
     fn a_mixed_log_and_metric_event_writes_the_metric_and_ignores_the_log() {
         let mut event = Event::log(
@@ -1503,10 +1303,9 @@ mod tests {
         assert_eq!(out, "nginx.requests value=1 1700000000000000000\n");
     }
 
-    /// A bare HTTP/1.1 server: writes back one canned response per accepted connection (repeating
-    /// the last one past the end of the list), then closes. `Connection: close` on every response
-    /// means reqwest opens a fresh connection per request rather than reusing one, so the returned
-    /// counter is exactly the number of `send` calls that reached this server.
+    /// A bare HTTP/1.1 server: one canned response per connection (the last repeats), then close.
+    /// `Connection: close` forces a fresh connection per request, so the counter equals the
+    /// number of `send` calls that reached it.
     async fn canned_server(
         responses: Vec<&'static str>,
     ) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -1524,9 +1323,8 @@ mod tests {
                 let i = count_task.fetch_add(1, Ordering::SeqCst);
                 let response = responses.get(i).or(responses.last()).copied().unwrap_or("");
                 let mut buf = [0u8; 8192];
-                // Drain (some of) the request so the client's write isn't left blocked on a full
-                // socket buffer; a short timeout in case a client sends nothing (shouldn't happen
-                // here, but a hung read must not wedge this server thread).
+                // Drain some of the request so the client's write can't block; the timeout keeps
+                // a silent client from wedging this task.
                 let _ =
                     tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -1554,9 +1352,7 @@ mod tests {
         batch_with(vec![metric_event("x", MetricKind::counter(1.0), &[])])
     }
 
-    /// `send` now makes exactly one attempt per call -- retry timing moved to `logit-pipeline`'s
-    /// generic writer (`docs/adr/buffered-sink-delivery.md`). A success is still a plain
-    /// `Ok(())`, single attempt.
+    /// A success is `Ok(())` after one attempt.
     #[tokio::test]
     async fn a_successful_response_returns_ok_on_the_first_attempt() {
         let (addr, count) = canned_server(vec![RESP_204]).await;
@@ -1593,8 +1389,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_429_rate_limit_response_is_classified_ambiguous() {
-        // 429 is InfluxDB's own rate-limit response and genuinely transient -- the one deliberate
-        // deviation from "a 4xx is a hard failure" (ADR `service-lifecycle-and-output-retry`).
         let (addr, count) = canned_server(vec![RESP_429]).await;
         let mut output = output_against(addr).await;
 
@@ -1623,9 +1417,7 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one attempt");
     }
 
-    /// A request timeout is a transport failure that may still have reached the server before the
-    /// response was lost -- `Fault::Ambiguous`, never `Fault::Clean`. The stalled server accepts
-    /// the connection (so this genuinely isn't "connection refused") and never responds.
+    /// A timeout against a server that accepts and never answers is `Ambiguous`, never `Clean`.
     #[tokio::test]
     async fn a_request_timeout_is_classified_ambiguous() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1649,12 +1441,7 @@ mod tests {
         );
     }
 
-    /// The throwaway check this workstream's plan explicitly calls for: does
-    /// `reqwest::Error::is_connect()` actually distinguish "never reached the server" from other
-    /// transport failures? Verified against a genuinely refused connection (a bound-then-dropped
-    /// listener -- nothing is listening on `addr` by the time this connects) rather than assumed.
-    /// The whole duplicate-safety argument for `at_most_once` rests on `Fault::Clean` never
-    /// over-claiming, so this has to actually hold, not just look plausible.
+    /// A refused connection is `Clean`: pins `is_connect()`, which `at_most_once` relies on.
     #[tokio::test]
     async fn connect_refused_is_reliably_classified_as_a_clean_fault() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1677,10 +1464,7 @@ mod tests {
         );
     }
 
-    /// `logit.output.tags.normalized{reason="multi_value"}` has to be emitted **before** `send`'s
-    /// empty-body early return: a batch whose every line turned out unencodable still normalized
-    /// the tags it normalized, and an operator chasing a missing tag value needs to see it. The
-    /// unreachable port is part of the assertion -- an empty body must never reach the HTTP call.
+    /// The multi-value counter fires before the empty-body return (port 1 is never contacted).
     #[tokio::test]
     async fn the_multi_value_tag_counter_is_emitted_even_when_the_batch_encodes_to_nothing() {
         let registry = logit_core::Registry::new();
@@ -1693,8 +1477,7 @@ mod tests {
         )
         .with_telemetry(telemetry);
 
-        // A NaN counter renders no line at all (`non_finite_values_are_skipped_...`), so the body
-        // is empty -- but its tag was still collapsed from two elements to one.
+        // A NaN counter renders no line, but its tag still collapsed.
         let mut event = metric_event("bad", MetricKind::counter(f64::NAN), &[]);
         event.attributes.insert("team", Value::Array(vec![Value::str("a"), Value::str("b")]));
         output
@@ -1721,10 +1504,7 @@ mod tests {
         assert_eq!(counted, 1.0);
     }
 
-    /// The layer-3 telemetry example (`docs/design/internal-telemetry.md`): every response class
-    /// actually seen should be visible, not just whether `send` succeeded. No more
-    /// `logit.output.retries` here -- that counter moved with the retry loop itself, into
-    /// `logit-pipeline::runtime::write_loop` (`logit.component.retries`).
+    /// `send` records one `logit.output.requests` per call, tagged by status class.
     #[tokio::test]
     async fn send_records_one_request_per_call_by_status_class() {
         let (addr, _count) = canned_server(vec![RESP_503]).await;

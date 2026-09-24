@@ -2,24 +2,16 @@
 //! about its own behavior. See `docs/design/internal-telemetry.md` and
 //! `docs/adr/internal-telemetry-as-pipeline-events.md`.
 //!
-//! Mirrors [`crate::diag`]'s shape deliberately -- [`Telemetry::default`] is a disabled, no-op
-//! handle, so a component that never receives a live one keeps working with zero added cost: no
-//! allocation, no clock read, one predictable branch per call. A handle only does anything once a
-//! config's `internal` component asks for a live [`Registry`] (`crates/logit-inputs/src/
-//! internal.rs`) and every component is built with a handle to it.
+//! Like [`crate::diag`], [`Telemetry::default`] is a disabled handle: no allocation, no clock
+//! read, one predictable branch per call. A handle is live only when a config has an `internal`
+//! component, which gets a [`Registry`] that hands every component its handle.
 //!
-//! **Not a scrape target, and not a second aggregation model.** A point is coalesced with any
-//! later point sharing its `(name, tags)` only to avoid flooding the pipeline with one-point
-//! events between drains -- [`Registry::drain`] emits whatever accumulated since the last call,
-//! using exactly the merges `logit-transforms::Aggregator` already performs on real events (sum
-//! for counts, last-write-wins for gauges, sketch merge for timings). That's what lets a real
-//! `aggregate` component attached downstream extend this to any actual time window *correctly*,
-//! because the merges compose -- this module deliberately doesn't take statsd clients'
-//! "batch raw samples, let the server aggregate" option for timings: `MetricKind` does carry a
-//! raw-sample representation ([`crate::MetricKind::Samples`], which `statsd_in` has produced since
-//! W3), but self-telemetry's own points are still merged eagerly into one sketch per drain here, on
-//! purpose, since there is no later `aggregate` stage guaranteed to run over internal telemetry the
-//! way one might over real events.
+//! **Not a scrape target, and not a second aggregation model.** Points sharing a `(name, tags)`
+//! coalesce between drains only to avoid flooding the pipeline, using the merges
+//! `logit-transforms::Aggregator` performs (sum for counts, last write for gauges, sketch merge for
+//! timings). Those merges compose, so a downstream `aggregate` extends them to any window
+//! correctly. Timings are sketched eagerly rather than kept as [`crate::MetricKind::Samples`]
+//! because no `aggregate` is guaranteed to run over internal telemetry.
 
 use crate::interner::intern;
 use crate::{
@@ -32,83 +24,62 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// A tag on a point. Both halves are `&'static str` by convention, not by type-system force --
-/// documented here, followed by every shipped component: `("class", "5xx")`, never a raw path or
-/// peer address. This matters more here than it would elsewhere: the process-wide attribute
-/// interner never evicts (`docs/known-gaps.md`), so a runtime-derived tag *value* would leak for
-/// the life of the process. Cardinality is the tag author's responsibility, same as any other
-/// interned key in this codebase.
+/// A tag on a point. Both halves are `&'static str` by convention, not by type:
+/// `("class", "5xx")`, never a raw path or peer address. The process-wide interner never evicts
+/// (`docs/known-gaps.md`), so a runtime-derived tag value would leak for the life of the process.
 pub type Tag = (&'static str, &'static str);
 
-/// Caps the number of distinct `(name, tags)` keys one component's buffer will hold between
-/// drains. Not a volume limit under normal traffic -- repeat points at the same key coalesce, so
-/// volume is bounded by distinct keys, not by how often a component calls in -- this exists only
-/// to bound a component that ignores the tag-cardinality convention above. Beyond the cap, a new
-/// key is dropped and counted (`ComponentBuffer::drain`'s `logit.internal.points.dropped`), never
-/// silently grown: the same "bound and count the drop" shape every mature statsd client uses for
-/// its own overflow.
+/// Caps distinct `(name, tags)` keys per component buffer between drains.
+///
+/// Repeat points coalesce, so this bounds only a component that ignores the [`Tag`] convention.
+/// A new key past the cap is dropped and counted as
+/// `logit.internal.points.dropped{reason="cardinality"}`.
 const MAX_KEYS_PER_COMPONENT: usize = 1024;
 
-/// Tag keys reserved for a point's own component identity (`ComponentBuffer::base_attrs`) --
-/// never allowed to become part of a point's cardinality key. Without this, two calls tagged
-/// `("kind", "a")` and `("kind", "b")` would occupy two distinct keys here (correctly, from
-/// `PointKey`'s point of view: they really are different tag sets) but both drain with the *same*
-/// real `kind` -- overwriting a caller-supplied `kind` at drain time (below) stops one from
-/// spoofing the other's identity, but does nothing about the two of them wasting a slot in the
-/// bounded key space each and emitting two externally indistinguishable points instead of one
-/// coalesced count. Filtering here, before a key is ever constructed, is what actually restores
-/// coalescing -- drain-time overwriting alone only fixes the label, not the accounting.
+/// Tag keys reserved for a point's component identity (`ComponentBuffer::base_attrs`), filtered
+/// out of a point's key in [`PointKey::new`].
+///
+/// Overwriting identity at drain time alone would stop spoofing, but `("kind", "a")` and
+/// `("kind", "b")` would still occupy two slots and drain as two indistinguishable points.
+/// Filtering before the key is built is what keeps them coalescing.
 const RESERVED_TAG_KEYS: [&str; 3] = ["component", "kind", "role"];
 
-/// Whether `key` is reserved for a point's own component identity -- see [`RESERVED_TAG_KEYS`].
-/// Public so a caller-facing binding (`crates/logit-script/src/telemetry.rs`) can reject a
-/// reserved key with a clear error at the point a script actually used it, rather than only
-/// discovering the same filter silently applied once a point reaches this buffer.
+/// Whether `key` is reserved for a point's identity (see [`RESERVED_TAG_KEYS`]). Public so the Lua
+/// binding (`crates/logit-script/src/telemetry.rs`) can reject one with a clear error instead of
+/// having it filtered silently.
 pub fn is_reserved_tag_key(key: &str) -> bool {
     RESERVED_TAG_KEYS.contains(&key)
 }
 
-/// Caps the number of spans one component's buffer will hold between drains -- a volume bound,
-/// not a cardinality one: unlike a point, a span never coalesces with another one (two visits to
-/// the same node are two distinct spans, always), so nothing else bounds this except drain
-/// interval × sample rate. Beyond the cap, a new span is dropped and counted
-/// (`ComponentBuffer::drain`'s `logit.internal.spans.dropped{reason="buffer_full"}`), the same
-/// bound-and-count-the-drop shape [`MAX_KEYS_PER_COMPONENT`] uses for points.
+/// Caps spans per component buffer between drains: a volume bound, since spans never coalesce.
+/// A span past the cap is dropped and counted as
+/// `logit.internal.spans.dropped{reason="buffer_full"}`.
 const MAX_SPANS_PER_COMPONENT: usize = 512;
 
-/// Caps the number of logs one component's buffer will hold between drains -- a volume bound,
-/// same reasoning as [`MAX_SPANS_PER_COMPONENT`]: a log never coalesces with another one. Beyond
-/// the cap, a new log is dropped and counted (`ComponentBuffer::drain`'s
-/// `logit.internal.logs.dropped{reason="buffer_full"}`). See `docs/plans/operator-surface.md`,
-/// workstream D.
+/// Caps logs per component buffer between drains: a volume bound, since logs never coalesce. A log
+/// past the cap is dropped and counted as `logit.internal.logs.dropped{reason="buffer_full"}`.
 const MAX_LOGS_PER_COMPONENT: usize = 256;
 
-/// Caps the number of [`SpanLink`]s one span will carry -- the same reasoning
-/// `logit-transforms::Aggregator`'s own `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES` bound has (a
-/// flush absorbing an unbounded number of contributing batches shouldn't let one span's own size
-/// grow without limit). Beyond the cap, a link is dropped and counted on the guard itself, as
-/// `logit.internal.span.links.dropped{reason="cardinality"}` -- immediately, not batched to drain
-/// time, since [`SpanGuard`] already holds a live handle back into this same buffer.
+/// Caps [`SpanLink`]s per span, so a flush absorbing many batches can't grow one span without
+/// limit (the same reason as `aggregate`'s `MAX_CONTRIBUTING_CONTEXTS_PER_SERIES`). A link past the
+/// cap is counted immediately as `logit.internal.span.links.dropped{reason="cardinality"}`.
 const MAX_LINKS_PER_SPAN: usize = 32;
 
-/// The default `span_sample_rate` (`logit_config::ComponentKind::Internal`) when a config's
-/// `internal` component doesn't set one. Below `1.0` deliberately: span volume is a different
-/// shape than metric volume -- one span per node-visit per batch, where a metric point coalesces
-/// between drains -- so keeping everything by default would multiply internal telemetry's own
-/// volume in a way metrics never do. See `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
+/// The `span_sample_rate` an `internal` component gets when it doesn't set one.
+///
+/// Below `1.0` because spans don't coalesce: one per node visit per batch would multiply internal
+/// telemetry's volume in a way points never do. See
+/// `docs/adr/internal-span-emission-and-deterministic-sampling.md`.
 pub const DEFAULT_SPAN_SAMPLE_RATE: f64 = 0.1;
 
-/// Deterministic on `trace_id`, so every node -- and every `logit` process in a split-collection
-/// topology (`docs/OVERVIEW.md`) -- reaches the same keep/drop verdict independently, with no
-/// propagation and no extra bytes on `TraceContext`/`Delivered`: a kept trace is kept at every
-/// hop, a dropped one dropped at every hop, without any node ever telling another its answer.
-/// Same shape as OTel's `TraceIdRatioBased` sampler.
+/// Whether to keep `trace_id`'s spans at `rate`, deterministically, like OTel's
+/// `TraceIdRatioBased`.
 ///
-/// The low 8 `trace_id` bytes, big-endian, straight into [`crate::sampling::keep`] (the top 53
-/// bits of them against `rate * 2^53` -- that fn's doc says why 53) with no hash: these are
-/// `logit`'s own pipeline trace ids, random by construction and never an application's. The
-/// `sample` transform hashes its key instead, so the two reach different verdicts for the same 16
-/// bytes on purpose (`docs/adr/consistent-sampling-component.md`).
+/// Every node, and every `logit` process in a split-collection topology, reaches the same verdict
+/// with nothing propagated. The low 8 bytes, big-endian, go straight into
+/// [`crate::sampling::keep`] with no hash: these are `logit`'s own random pipeline trace ids,
+/// never an application's. The `sample` transform hashes its key instead, so the two reach
+/// different verdicts for the same 16 bytes (`docs/adr/consistent-sampling-component.md`).
 pub fn trace_is_sampled(trace_id: &[u8; 16], rate: f64) -> bool {
     let x = u64::from_be_bytes(trace_id[8..16].try_into().expect("8 bytes"));
     crate::sampling::keep(x, rate)
@@ -124,9 +95,7 @@ enum Pending {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PointKey {
     name: &'static str,
-    /// Sorted so a caller's tag order never creates a spurious second key for what's really the
-    /// same point. Never contains a [`RESERVED_TAG_KEYS`] entry -- filtered out in [`PointKey::new`]
-    /// before this is built, not just overwritten cosmetically later.
+    /// Sorted, so tag order never makes a second key. Never holds a [`RESERVED_TAG_KEYS`] entry.
     tags: SmallVec<[Tag; 4]>,
 }
 
@@ -139,16 +108,14 @@ impl PointKey {
     }
 }
 
-/// One component's telemetry handle. `Clone` is cheap (an `Arc` bump). [`Telemetry::default`] is
-/// the disabled handle every component starts with -- every method on it is a no-op that touches
-/// nothing, not even the clock ([`Telemetry::timer`]'s doc comment).
+/// One component's telemetry handle; `Clone` is an `Arc` bump. [`Telemetry::default`] is the
+/// disabled handle, on which every method is a no-op that doesn't even read the clock.
 #[derive(Clone, Debug, Default)]
 pub struct Telemetry(Option<Arc<ComponentBuffer>>);
 
 impl Telemetry {
-    /// Adds `n` to a counter, sum-coalesced with any pending point at the same `(name, tags)`
-    /// until the next drain, then emitted as a monotonic delta `MetricKind::Sum`
-    /// ([`MetricKind::counter`]).
+    /// Adds `n` to a counter, summed per `(name, tags)` until the next drain and emitted as
+    /// [`MetricKind::counter`].
     pub fn count(&self, name: &'static str, n: f64, tags: &[Tag]) {
         let Some(buf) = &self.0 else { return };
         buf.upsert(
@@ -162,15 +129,14 @@ impl Telemetry {
         );
     }
 
-    /// Sets a gauge, last-write-wins against any pending point at the same `(name, tags)` until
-    /// the next drain, then emitted as `MetricKind::Gauge`.
+    /// Sets a gauge, last write wins per `(name, tags)` until the next drain.
     pub fn gauge(&self, name: &'static str, v: f64, tags: &[Tag]) {
         let Some(buf) = &self.0 else { return };
         buf.upsert(name, tags, || Pending::Gauge(v), |p| *p = Pending::Gauge(v));
     }
 
-    /// Records one duration sample, merged into one `DdSketch` with any pending point at the same
-    /// `(name, tags)` until the next drain, then emitted as `MetricKind::Distribution`.
+    /// Records one duration in seconds, sketched per `(name, tags)` until the next drain and
+    /// emitted as `MetricKind::Distribution`.
     pub fn timing(&self, name: &'static str, d: Duration, tags: &[Tag]) {
         let Some(buf) = &self.0 else { return };
         let secs = d.as_secs_f64();
@@ -193,32 +159,26 @@ impl Telemetry {
         );
     }
 
-    /// A guard that records one `timing` sample for `name` when dropped (or via
-    /// [`Timer::stop`]). Reads the clock only when this handle is live -- a disabled handle's
-    /// timer never calls `Instant::now()` at all, so timing a hot path costs nothing when nobody
-    /// asked for telemetry.
+    /// A guard that records one `timing` sample for `name` when dropped (or via [`Timer::stop`]).
+    /// A disabled handle's timer never reads the clock, so timing a hot path is free.
     pub fn timer(&self, name: &'static str) -> Timer {
         Timer { telemetry: self.clone(), name, start: self.0.as_ref().map(|_| Instant::now()) }
     }
 
-    /// Whether this handle is live. Lets a caller skip building tags/values for a call it would
-    /// otherwise make unconditionally, when that work isn't already free.
+    /// Whether this handle is live, so a caller can skip building tags or values that aren't free.
     pub fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
 
-    /// Opens a span for this component's one visit to one unit of work -- see
-    /// `docs/adr/internal-span-emission-and-deterministic-sampling.md` for what "one unit of
-    /// work" means per node kind. The sample decision (`trace_is_sampled`) is made here, from
-    /// `trace_id` alone, before any span-shaped state exists at all: an unsampled trace gets the
-    /// same `SpanGuard::disabled()` a disabled handle's [`Telemetry::timer`] returns, so every
-    /// method on it is an immediate no-op and nothing about this call allocates or reads the
-    /// clock beyond the one comparison `trace_is_sampled` itself does.
+    /// Opens a span for this component's visit to one unit of work (per node kind, see
+    /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`).
     ///
-    /// `span_id`/`parent_span_id` are supplied, not minted here -- the caller (`Fanout::send`,
-    /// `run_transform`, ...) already minted the `TraceContext` this span's identity comes from,
-    /// because that same context is also what gets sent downstream (`Fanout::send_with_own_context`).
-    /// Minting a second, unrelated id here would desynchronize the two.
+    /// Sampling ([`trace_is_sampled`]) is decided here from `trace_id` alone. An unsampled or
+    /// disabled span gets a stateless guard whose methods are no-ops: no allocation, no clock
+    /// read.
+    ///
+    /// The caller supplies `span_id`/`parent_span_id` from the `TraceContext` it already minted
+    /// and sends downstream; minting another id here would desynchronize the two.
     pub fn span(
         &self,
         op: &'static str,
@@ -251,16 +211,11 @@ impl Telemetry {
     }
 }
 
-/// The wall-clock Unix-nanosecond "now" -- read exactly once per span, at
-/// [`Telemetry::span`]'s own call, never again at finish (see [`PendingSpan::started_at`]'s doc
-/// comment for why: a second independent read is what this whole split avoids).
+/// Wall-clock Unix nanoseconds. A span reads it once, at start, never at finish (see
+/// [`PendingSpan::started_at`]).
 ///
-/// The `#[cfg(test)]` override below exists purely so a test can simulate a wall clock that jumps
-/// (an NTP correction, an admin `date` call) *between* a span's start and its finish, without an
-/// actual multi-second sleep -- see `a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start`.
-/// Never compiled into a non-test binary: the thread-local's own overhead (a branch and a
-/// thread-local read) would otherwise be paid on every single span, sampled or not, for a facility
-/// only tests use.
+/// The `#[cfg(test)]` override lets a test jump the wall clock mid-span without sleeping; it's
+/// test-only so production spans don't pay a thread-local read.
 fn now_unix_nanos() -> i64 {
     #[cfg(test)]
     {
@@ -276,14 +231,10 @@ fn now_unix_nanos() -> i64 {
 
 /// See [`Telemetry::timer`].
 ///
-/// **Recording on `Drop` means a cancelled `.await` still records a sample** -- if the future
-/// holding this `Timer` is dropped mid-wait (e.g. `run_input`'s shutdown-racing `tokio::select!`
-/// in `crates/logit-pipeline/src/runtime.rs` winning while a listener is mid-`Fanout::send`), the
-/// elapsed time reflects time-to-cancellation, not a completed operation. Accepted rather than
-/// worked around: it's inherent to the record-on-`Drop` idiom every call site here relies on, the
-/// effect is confined to one metric's statistical shape, and it only fires during a shutdown race
-/// -- exactly the window an operator is more likely to be watching this for "is it stuck," where a
-/// short, truncated sample is a reasonable enough signal anyway.
+/// **A cancelled `.await` still records a sample.** If the future holding a `Timer` is dropped
+/// mid-wait (e.g. `run_input`'s shutdown `select!` winning mid-`Fanout::send`), the sample is
+/// time-to-cancellation. Accepted: it's inherent to record-on-`Drop`, it only happens in a
+/// shutdown race, and a truncated sample still answers "is it stuck".
 #[must_use = "a Timer records nothing until it is dropped or stopped"]
 pub struct Timer {
     telemetry: Telemetry,
@@ -292,9 +243,8 @@ pub struct Timer {
 }
 
 impl Timer {
-    /// Records the elapsed time now, under `tags`, instead of waiting for `Drop` (which always
-    /// records under no tags -- use this when the tags aren't known until the timed work
-    /// finishes, e.g. an HTTP response's status class).
+    /// Records the elapsed time now under `tags`; `Drop` records under none. For tags known only
+    /// when the work finishes, e.g. an HTTP status class.
     pub fn stop(mut self, tags: &[Tag]) {
         if let Some(start) = self.start.take() {
             self.telemetry.timing(self.name, start.elapsed(), tags);
@@ -310,76 +260,53 @@ impl Drop for Timer {
     }
 }
 
-/// One span, still being built -- everything [`Telemetry::span`] captured plus whatever
-/// [`SpanGuard`]'s own methods add before it is finished. Turned into a real `Event` carrying a
-/// `SpanRecord` only at drain time (`ComponentBuffer::drain`'s span pass), same as a `Pending`
-/// point is only turned into a `MetricRecord` there -- this type never leaves this module.
+/// A span still being built; becomes an `Event` carrying a `SpanRecord` only at drain time.
 #[derive(Debug)]
 struct PendingSpan {
-    /// Unix nanoseconds -- becomes the drained `Event::timestamp`, *not* the drain time
-    /// (`ComponentBuffer::drain`'s doc comment).
+    /// Unix nanoseconds; the drained `Event::timestamp`, not the drain time.
     start: i64,
-    /// Captured alongside `start`, from the same [`Telemetry::span`] call -- a monotonic clock
-    /// reading `end` is derived from at finish time (`started_at.elapsed()`), instead of a second
-    /// independent `SystemTime::now()` read. Two independent wall-clock reads would let the
-    /// *system* clock moving backward between them (an NTP correction, an admin `date` call --
-    /// plausible over a long span, e.g. a retrying sink send) produce `end < start`, an invalid
-    /// duration downstream; `Instant` is guaranteed monotonically non-decreasing on every platform
-    /// this project ships to, so `start + elapsed` can never precede `start`, structurally, by
-    /// construction -- not merely "usually doesn't."
+    /// Monotonic reading taken with `start`; `end` is `start + started_at.elapsed()`.
+    ///
+    /// A second wall-clock read at finish could land before `start` if the system clock steps
+    /// backward mid-span (NTP, an admin `date`), plausible over a long retrying send. `Instant`
+    /// never goes backward, so `end >= start` by construction.
     started_at: Instant,
-    /// Unix nanoseconds, set when the guard finishes (`SpanGuard::finish`/`Drop`) -- becomes
-    /// `SpanRecord::end_timestamp`. `0` until then; never observed in that state, since nothing
-    /// reads a `PendingSpan` before it's pushed to the buffer, which only ever happens once `end`
-    /// has been set.
+    /// Unix nanoseconds, set at finish; `0` until then, but a span is only pushed once it's set.
     end: i64,
     trace_id: [u8; 16],
     span_id: [u8; 8],
     parent_span_id: Option<[u8; 8]>,
-    /// `"process"|"flush"|"send"|"deliver"` -- half of the drained span's name (the other half is
-    /// this component's own `kind`, joined at drain time: `"aggregate process"`).
+    /// `"process"|"flush"|"send"|"deliver"`; drains as the span name after the component's
+    /// `kind` (`"aggregate process"`).
     op: &'static str,
     kind: SpanKind,
     status: SpanStatus,
-    /// How many events this node's emission carried -- `0` for a transform visit that absorbed
-    /// everything. Drained as a non-interned `Value::I64` attribute (`events`), never a tag: a
-    /// per-span count has no cardinality to bound.
+    /// Events this visit emitted; `0` for a transform that absorbed everything.
     events: u64,
     links: Vec<SpanLink>,
-    /// Extra `(key, value)` attributes a call site chose to attach (`SpanGuard::tag`, e.g.
-    /// `write_loop`'s `("fault", "ambiguous")` on a failed delivery) -- unlike a point's tags,
-    /// never filtered against [`RESERVED_TAG_KEYS`]: every call site recording a span is this
-    /// project's own Rust code, not untrusted script input, so there's no adversarial caller to
-    /// defend a span's identity attributes against the way point tags must be.
+    /// Extra attributes from [`SpanGuard::tag`]. Not filtered against [`RESERVED_TAG_KEYS`]: only
+    /// this project's own Rust code records spans, never script input.
     tags: SmallVec<[Tag; 2]>,
 }
 
-/// One `tracing` event at or above [`TelemetryLayer`]'s threshold, captured into its component's
-/// buffer -- turned into a real `Event` carrying a [`LogRecord`] only at drain time
-/// (`ComponentBuffer::drain`'s log pass), same as a [`PendingSpan`]. See
-/// `docs/plans/operator-surface.md`, workstream D.
+/// One `tracing` event captured by [`TelemetryLayer`]; becomes an `Event` carrying a
+/// [`LogRecord`] only at drain time.
 #[derive(Debug)]
 struct PendingLog {
-    /// Unix nanoseconds, read at capture time (`now_unix_nanos()`) -- becomes the drained
-    /// `Event::timestamp`, same as a point or a span's own `start`: this is when the event
-    /// actually happened, not when it happened to drain.
+    /// Unix nanoseconds at capture; the drained `Event::timestamp`, not the drain time.
     ts: i64,
     level: Severity,
-    /// The `key` field on the `tracing` event that produced this, or a stable placeholder when
-    /// absent -- see [`TelemetryLayer::on_event`]'s own comment on the two fallback cases.
+    /// The event's `key` field, or a placeholder (see `TelemetryLayer::on_event`).
     key: String,
     message: String,
 }
 
-/// A guard opened by [`Telemetry::span`], recording one [`SpanRecord`]-carrying `Event` when it
-/// finishes -- mirrors [`Timer`]'s shape exactly, including the "disabled/unsampled holds no
-/// state" trick that makes an unsampled span free: every method below is an immediate return
-/// when `span` is `None`.
+/// A guard opened by [`Telemetry::span`] that records one span when it finishes or drops. When
+/// disabled or unsampled it holds no state and every method returns immediately.
 #[must_use = "a SpanGuard records nothing until it is dropped or finished"]
 pub struct SpanGuard {
-    /// `Telemetry(Some(_))` back into the same buffer this span will drain into -- reused (rather
-    /// than a bare `Arc<ComponentBuffer>`) so [`SpanGuard::link`] can count an over-cap drop via
-    /// the ordinary `Telemetry::count` path with no second field.
+    /// A live handle to the buffer this span drains into, so [`SpanGuard::link`] can count an
+    /// over-cap drop through `Telemetry::count`.
     telemetry: Telemetry,
     span: Option<PendingSpan>,
 }
@@ -389,9 +316,8 @@ impl SpanGuard {
         SpanGuard { telemetry: Telemetry::default(), span: None }
     }
 
-    /// Sets the emitted-events count -- see [`PendingSpan::events`]'s doc comment for what this
-    /// means per node kind. Overwrites, rather than adds: every call site calls this at most once,
-    /// with the final count for the one emission this span records.
+    /// Sets the emitted-events count, drained as the `events` attribute. Overwrites rather than
+    /// adds: call it once with the final count.
     pub fn events(&mut self, n: u64) {
         if let Some(span) = &mut self.span {
             span.events = n;
@@ -413,45 +339,36 @@ impl SpanGuard {
         span.links.push(link);
     }
 
-    /// [`SpanGuard::link`], for every link in `links` -- each still counted individually against
-    /// the per-span cap, not as one all-or-nothing batch.
+    /// [`SpanGuard::link`] for each of `links`; each counts against the cap individually.
     pub fn links(&mut self, links: impl IntoIterator<Item = SpanLink>) {
         for link in links {
             self.link(link);
         }
     }
 
-    /// Attaches an extra `(key, value)` attribute, alongside this span's `logit.node.op`/
-    /// `events`/identity attributes at drain time -- e.g. `write_loop`'s `("fault", "ambiguous")`
-    /// on a failed delivery.
+    /// Attaches an extra attribute, e.g. `("fault", "ambiguous")` on a failed delivery.
     pub fn tag(&mut self, k: &'static str, v: &'static str) {
         if let Some(span) = &mut self.span {
             span.tags.push((k, v));
         }
     }
 
-    /// Marks this span's status `Error` -- e.g. a sink's `deliver_with_retry` giving up. A span
-    /// that never calls this or [`SpanGuard::ok`] drains as `Ok` (`PendingSpan`'s status starts
-    /// `Ok`, not `Unset`): a node visit that completes without an explicit error is a success,
-    /// the same default every shipped call site relies on.
+    /// Marks this span's status `Error`, e.g. a sink's `deliver_with_retry` giving up. A span that
+    /// never calls this drains as `Ok`, not `Unset`: completing without an error is a success.
     pub fn error(&mut self) {
         if let Some(span) = &mut self.span {
             span.status = SpanStatus::Error;
         }
     }
 
-    /// Explicitly marks this span's status `Ok` -- rarely needed (see [`SpanGuard::error`]'s doc
-    /// comment on the default), but available so a call site that computes success/failure from a
-    /// branch can say so directly rather than relying on "didn't call `error`."
+    /// Marks this span's status `Ok`, the default (see [`SpanGuard::error`]).
     pub fn ok(&mut self) {
         if let Some(span) = &mut self.span {
             span.status = SpanStatus::Ok;
         }
     }
 
-    /// Finishes this span now, pushing it to its component's buffer -- explicit alternative to
-    /// letting [`Drop`] do the same at the end of this guard's scope, for a call site that wants
-    /// the finish to happen at a precise point rather than implicitly.
+    /// Finishes this span now rather than at `Drop`.
     pub fn finish(mut self) {
         self.finish_inner();
     }
@@ -459,10 +376,8 @@ impl SpanGuard {
     fn finish_inner(&mut self) {
         let Some(mut span) = self.span.take() else { return };
         let Some(buf) = self.telemetry.0.as_ref() else { return };
-        // `start + elapsed`, never a second `now_unix_nanos()` read -- see `PendingSpan::started_at`'s
-        // doc comment. `as i64` after `.min(i64::MAX as u128)` is a saturating conversion: a span
-        // living longer than ~292 years is never real, but this must not panic or wrap negative on
-        // the (impossible in practice) day it happens.
+        // Never a second wall-clock read (see `PendingSpan::started_at`). Saturates rather than
+        // wrapping negative past ~292 years.
         let elapsed_nanos = span.started_at.elapsed().as_nanos().min(i64::MAX as u128) as i64;
         span.end = span.start.saturating_add(elapsed_nanos);
         buf.push_span(span);
@@ -475,9 +390,9 @@ impl Drop for SpanGuard {
     }
 }
 
-/// One component's buffer: every point it has recorded since the last [`Registry::drain`],
-/// keyed and coalesced by `(name, tags)`. Not exported -- reached only through [`Telemetry`]
-/// (write side) and [`Registry`] (drain side).
+/// One component's points (coalesced by `(name, tags)`), spans, and logs since the last
+/// [`Registry::drain`]. Reached only through [`Telemetry`] (write side) and [`Registry`] (drain
+/// side).
 #[derive(Debug)]
 pub struct ComponentBuffer {
     id: String,
@@ -486,21 +401,15 @@ pub struct ComponentBuffer {
     points: Mutex<HashMap<PointKey, Pending>>,
     /// Distinct keys rejected by the [`MAX_KEYS_PER_COMPONENT`] cap since the last drain.
     dropped: AtomicU64,
-    /// Every span recorded (`SpanGuard::finish`/`Drop`) since the last drain -- a plain `Vec`, not
-    /// a keyed map like `points`: spans are unique by construction (no two node-visits share a
-    /// `span_id`), so there is nothing here to coalesce.
+    /// Finished spans since the last drain; unkeyed, since spans never coalesce.
     spans: Mutex<Vec<PendingSpan>>,
     /// Spans rejected by the [`MAX_SPANS_PER_COMPONENT`] cap since the last drain.
     spans_dropped: AtomicU64,
-    /// Every log captured by [`TelemetryLayer`] for this component since the last drain -- a
-    /// plain `Vec`, same reasoning as `spans`: nothing here coalesces.
+    /// Logs [`TelemetryLayer`] captured for this component since the last drain; unkeyed.
     logs: Mutex<Vec<PendingLog>>,
     /// Logs rejected by the [`MAX_LOGS_PER_COMPONENT`] cap since the last drain.
     logs_dropped: AtomicU64,
-    /// Copied from [`Registry`] at construction (never changes after) so [`Telemetry::span`]
-    /// never needs a second lock beyond whichever one this buffer's own state already takes --
-    /// process-wide, set once, per graph validation rule 13 guaranteeing at most one `internal`
-    /// component (`crates/logit-pipeline/src/graph.rs`).
+    /// Copied from [`Registry`] at construction so [`Telemetry::span`] takes no registry lock.
     span_sample_rate: f64,
 }
 
@@ -520,9 +429,7 @@ impl ComponentBuffer {
         }
     }
 
-    /// Pushes `span`, dropping and counting it (`logit.internal.spans.dropped{reason=
-    /// "buffer_full"}`, drained alongside the points-side `logit.internal.points.dropped`) past
-    /// [`MAX_SPANS_PER_COMPONENT`] rather than growing this buffer without bound.
+    /// Pushes `span`, or counts it dropped past [`MAX_SPANS_PER_COMPONENT`].
     fn push_span(&self, span: PendingSpan) {
         let mut spans = self.spans.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if spans.len() >= MAX_SPANS_PER_COMPONENT {
@@ -533,9 +440,7 @@ impl ComponentBuffer {
         spans.push(span);
     }
 
-    /// Pushes `log`, dropping and counting it (`logit.internal.logs.dropped{reason=
-    /// "buffer_full"}`) past [`MAX_LOGS_PER_COMPONENT`] -- the same bound-and-count-the-drop
-    /// shape [`ComponentBuffer::push_span`] uses.
+    /// Pushes `log`, or counts it dropped past [`MAX_LOGS_PER_COMPONENT`].
     fn push_log(&self, log: PendingLog) {
         let mut logs = self.logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if logs.len() >= MAX_LOGS_PER_COMPONENT {
@@ -546,9 +451,8 @@ impl ComponentBuffer {
         logs.push(log);
     }
 
-    /// Turns one finished [`PendingSpan`] into its drained `Event`. `name` is built here, not at
-    /// `SpanGuard` construction -- the one place this touches a `String`, off the hot path, since
-    /// it only happens for a span that both got sampled and survived to a drain.
+    /// Turns one finished [`PendingSpan`] into its drained `Event`. The name `String` is built
+    /// here, off the hot path, only for a sampled span that reached a drain.
     fn span_event(&self, span: PendingSpan) -> Event {
         let mut attrs = AttrMap::new();
         for (k, v) in &span.tags {
@@ -583,8 +487,7 @@ impl ComponentBuffer {
         update: impl FnOnce(&mut Pending),
     ) {
         let key = PointKey::new(name, tags);
-        // Never held across an `.await` -- every call site is a synchronous emit, not a
-        // long-lived guard, so a `std::sync::Mutex` (no extra dependency) is the right tool here.
+        // Never held across an `.await`, so a `std::sync::Mutex` suffices.
         let mut points = self.points.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = points.get_mut(&key) {
             update(existing);
@@ -605,16 +508,13 @@ impl ComponentBuffer {
         attrs
     }
 
-    /// Takes every point and span buffered since the last call, emitting one [`Event`] per
-    /// `(name, tags)` point key plus one per finished span, stamped `now` -- **with one
-    /// exception: a span event's `Event::timestamp` is the span's own `start`, never `now`.**
-    /// `now` is the drain time, not when the work the span records actually happened, and
-    /// `SpanRecord`'s own doc comment already makes `Event::timestamp` the span's start; stamping
-    /// it with the drain time instead would make every span drift later than reality by however
-    /// long it sat in this buffer. Also emits `logit.internal.points.dropped{reason=
-    /// "cardinality"}` and `logit.internal.spans.dropped{reason="buffer_full"}` if either cap
-    /// rejected anything meanwhile -- self-telemetry reporting its own losses, the same
-    /// convention every mature statsd client follows for its own send failures.
+    /// Takes everything buffered since the last call: one [`Event`] per point key, span, and log,
+    /// plus a drop counter for each cap that rejected anything.
+    ///
+    /// Points and counters are stamped `now`. **A span is stamped with its own `start` and a log
+    /// with its capture time, never `now`**: `Event::timestamp` is a span's start
+    /// (`SpanRecord`'s doc), and the drain time would make both look later by however long they
+    /// sat here.
     fn drain(&self, now: i64) -> Vec<Event> {
         let points = {
             let mut points = self.points.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -641,12 +541,8 @@ impl ComponentBuffer {
                 + usize::from(logs_dropped > 0),
         );
         for (key, pending) in points {
-            // `key.tags` never holds a reserved key at all (filtered out in `PointKey::new`, so a
-            // caller-supplied `kind` tag couldn't fragment cardinality against the real one even
-            // before reaching here). Identity is still inserted last, as defense in depth: if that
-            // filter were ever bypassed, `AttrMap::insert`'s overwrite-on-collision behavior means
-            // identity would still win, so a caller-supplied tag still could not relabel which
-            // component a point is attributed to.
+            // `PointKey::new` already filtered reserved keys; inserting identity last is defense
+            // in depth, since `AttrMap::insert` overwrites on collision.
             let mut attrs = AttrMap::new();
             for (k, v) in &key.tags {
                 attrs.insert(k, *v);
@@ -721,49 +617,32 @@ impl ComponentBuffer {
     }
 }
 
-/// The process-wide set of every component's [`ComponentBuffer`]. Built once, per run, only when
-/// a config's `internal` component exists (`crates/logit-cli/src/pipeline.rs`); every component is
-/// then handed a [`Telemetry`] from [`Registry::telemetry_for`], and the `internal` component
-/// itself drains it on its own configured interval. No config with an `internal` component means
-/// no `Registry` is ever built, and every handle stays [`Telemetry::default`] -- see this crate's
-/// `telemetry` module doc for what that guarantees.
+/// The process-wide set of component buffers, built once per run only when the config has an
+/// `internal` component. Every component gets its handle from [`Registry::telemetry_for`], and the
+/// `internal` component drains it on its interval.
 pub struct Registry {
     buffers: Mutex<Vec<Arc<ComponentBuffer>>>,
-    /// The `span_sample_rate` every [`ComponentBuffer`] this registry creates is stamped with --
-    /// see [`Registry::with_span_sampling`].
+    /// Stamped onto every [`ComponentBuffer`] this registry creates.
     span_sample_rate: f64,
 }
 
 impl Registry {
-    /// Same as [`Registry::with_span_sampling`] at [`DEFAULT_SPAN_SAMPLE_RATE`] -- the rate a
-    /// config's `internal` component gets when it doesn't set `span_sample_rate` explicitly.
+    /// [`Registry::with_span_sampling`] at [`DEFAULT_SPAN_SAMPLE_RATE`].
     pub fn new() -> Arc<Self> {
         Self::with_span_sampling(DEFAULT_SPAN_SAMPLE_RATE)
     }
 
-    /// Builds a registry whose every component buffer samples spans at `rate` (`0.0..=1.0`,
-    /// [`trace_is_sampled`]) -- process-wide, since graph validation rule 13
-    /// (`crates/logit-pipeline/src/graph.rs`) already guarantees at most one `internal` component
-    /// per config, so there is only ever one rate to set. `crates/logit-cli/src/pipeline.rs::prepare`
-    /// reads this off the config's `internal` component (`ComponentKind::Internal::span_sample_rate`)
-    /// and calls this instead of [`Registry::new`] whenever one exists.
+    /// A registry whose buffers sample spans at `rate` (`0.0..=1.0`, [`trace_is_sampled`]).
+    /// Process-wide: graph rule 13 allows at most one `internal` component, so there's one rate.
     pub fn with_span_sampling(rate: f64) -> Arc<Self> {
         Arc::new(Self { buffers: Mutex::new(Vec::new()), span_sample_rate: rate })
     }
 
-    /// Registers a new buffer for component `id` and returns a live handle to it. `kind`/`role`
-    /// are stamped onto every point this handle ever records (`component`/`kind`/`role`
-    /// attributes) -- pass the config `type` tag and the arity role, both known once at
-    /// construction, never per call.
+    /// Registers a buffer for component `id` and returns a live handle to it. `kind` (the config
+    /// `type`) and `role` are stamped onto everything the handle records.
     ///
-    /// A second call for an `id` already registered returns a handle to the *same* buffer rather
-    /// than creating a second, independent one -- every call site today (`logit-cli::pipeline::
-    /// prepare`) registers each id exactly once, so this only matters for a caller this crate
-    /// doesn't have yet (a hot-reload/reconfiguration path, say); without it, two buffers stamped
-    /// with the same `component` attribute would coalesce and drain independently, racing each
-    /// other under what looks downstream like one component. `kind`/`role` are taken from
-    /// whichever call registered first; a later call's values are ignored, same as they would be
-    /// if that caller had simply kept its first handle around instead of asking again.
+    /// A repeat `id` gets the same buffer, keeping its first `kind`/`role`: two buffers with one
+    /// `component` attribute would drain as two racing copies of what looks like one component.
     pub fn telemetry_for(&self, id: &str, kind: &'static str, role: &'static str) -> Telemetry {
         let mut buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = buffers.iter().find(|buf| buf.id == id) {
@@ -774,12 +653,9 @@ impl Registry {
         Telemetry(Some(buf))
     }
 
-    /// Pushes `log` into `component_id`'s own buffer -- [`TelemetryLayer::on_event`]'s only way
-    /// to reach a buffer without exposing [`ComponentBuffer`] itself. A silent no-op if
-    /// `component_id` names no registered buffer (should not happen in practice: every component
-    /// gets a `Telemetry` handle -- and therefore a registered buffer -- at startup, including
-    /// the `internal` component itself, which is where an unattributed event's `component_id`
-    /// always points).
+    /// Pushes `log` into `component_id`'s buffer, for `TelemetryLayer::on_event`. A no-op for an
+    /// unregistered id, which shouldn't happen: every component, `internal` included, registers
+    /// at startup.
     fn push_log(&self, component_id: &str, log: PendingLog) {
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(buf) = buffers.iter().find(|buf| buf.id == component_id) {
@@ -787,44 +663,31 @@ impl Registry {
         }
     }
 
-    /// Drains every registered component's buffer, in registration order, into one flat list of
-    /// events. Registration order is deterministic (`crates/logit-cli/src/pipeline.rs` builds
-    /// components in sorted-id order), so drain output is reproducible across runs, which matters
-    /// for tests more than for production use.
+    /// Drains every buffer, in registration order (sorted by id, so reproducible), into one list.
     pub fn drain(&self, now: i64) -> Vec<Event> {
-        // Cloning the `Vec<Arc<_>>` (cheap: one refcount bump per component) rather than holding
-        // the registry lock while draining each buffer -- draining calls into each buffer's own
-        // lock, and nothing here needs the registry's own lock held that long.
+        // Clone the `Arc`s rather than hold the registry lock across each buffer's drain.
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         buffers.iter().flat_map(|buf| buf.drain(now)).collect()
     }
 }
 
-/// A `tracing_subscriber::Layer` that captures every event at its activated threshold or above
-/// into the pipeline as an ordinary log event -- turning `logit`'s own self-logging into just
-/// another producer into this same buffer, exactly the shape ADR
-/// `internal-telemetry-as-pipeline-events` names as the future the design was left open for ("a
-/// future `tracing` subscriber could itself feed `Diagnostics`/`Telemetry`, same as any other
-/// producer"). See `docs/plans/operator-surface.md`, workstream D.
+/// A `tracing_subscriber::Layer` that captures `logit`-targeted events at or above its threshold
+/// into the component buffers as log events. See `docs/design/internal-telemetry.md`'s "Logs"
+/// section.
 ///
-/// Starts **inactive** -- every event is a no-op until [`TelemetryLayer::activate`] is called,
-/// deliberately: `logit-cli::main` installs this layer (inside the global subscriber, via
-/// `.init()`) *before* the config is even loaded, so a bad `--log-level` still fails fast and
-/// `starting` still logs even for a config that fails to resolve, same as before this workstream
-/// -- there is no stable API to add a layer to an already-`.init()`-ed subscriber, so the layer
-/// itself has to exist from the start, with its real target filled in once the config's own
-/// `internal` component (if any) is known, slightly later. A config with no `internal`
-/// component, or `logs: off`, simply never calls `activate`, forever -- the exact same
-/// zero-cost-when-unconfigured shape [`Telemetry::default`] already has.
+/// Starts **inactive**: every event is a no-op until [`TelemetryLayer::activate`].
+/// `logit-cli::main` installs it in the global subscriber before the config loads (so a bad
+/// `--log-level` fails fast and `starting` logs even for a config that won't resolve), and there's
+/// no stable API to add a layer after `.init()`. A config with no `internal` component, or
+/// `logs: off`, never activates it, which costs nothing, like [`Telemetry::default`].
 #[derive(Clone, Default)]
 pub struct TelemetryLayer(Arc<std::sync::RwLock<Option<ActiveTelemetryLayer>>>);
 
 struct ActiveTelemetryLayer {
     registry: Arc<Registry>,
     threshold: Severity,
-    /// The operator-chosen *id* of the config's `internal` component -- `"internal"` is its
-    /// *kind*, not its id (e.g. `self` in `demo/logit.yaml`). Where an event carrying no
-    /// `component` field lands.
+    /// The `internal` component's id (not its kind; `self` in `demo/logit.yaml`), where an event
+    /// with no `component` field lands.
     internal_id: String,
 }
 
@@ -833,10 +696,8 @@ impl TelemetryLayer {
         Self::default()
     }
 
-    /// Fills in the real capture target -- `logit-cli::main`, once the config's `internal`
-    /// component (if any) and its `logs` threshold are known. Every event before this call (and,
-    /// for a config with no `internal` component or `logs: off`, every event for the life of the
-    /// process) is a no-op.
+    /// Starts capturing into `registry` at `threshold`, once the config's `internal` component and
+    /// its `logs:` setting are known. Events before this call are not captured.
     pub fn activate(
         &self,
         registry: Arc<Registry>,
@@ -848,29 +709,19 @@ impl TelemetryLayer {
             Some(ActiveTelemetryLayer { registry, threshold, internal_id: internal_id.into() });
     }
 
-    /// The per-layer filter this layer must be installed *with* -- `logit-cli::main::init_logging`
-    /// applies it via `tracing_subscriber::Layer::with_filter`, and scopes the
-    /// `--log-level`/`LOGIT_LOG` `EnvFilter` the same way onto the stderr `fmt` layer, so that
-    /// stderr verbosity and internal-log capture stay two independent knobs.
+    /// The per-layer filter this layer must be installed with (`Layer::with_filter`), with the
+    /// `--log-level`/`LOGIT_LOG` `EnvFilter` scoped the same way onto the stderr layer, so stderr
+    /// verbosity and capture stay independent.
     ///
-    /// Installed as a *global* filter instead (`registry().with(env_filter)`), an operator's
-    /// `--log-level error` would return `Interest::never()` for every `warn` callsite -- a verdict
-    /// `tracing-core` caches at that callsite for the life of the process -- and this layer's
-    /// `on_event` would simply never run: `internal: { logs: warn }` would silently become
-    /// `error`, and the drop would happen upstream of the registry, where not even a
-    /// `logit.internal.logs.dropped` counter can see it. `LOGIT_LOG=off` would disable capture
-    /// outright.
+    /// As a global filter, `--log-level error` would return `Interest::never()` for every `warn`
+    /// callsite, which `tracing-core` caches for the life of the process: `on_event` would never
+    /// run, `logs: warn` would silently become `error`, and no drop counter could see it.
     ///
-    /// `target: "logit"` is exactly what `on_event` already requires (this crate's own
-    /// self-diagnostics, never a dependency's `tracing` instrumentation). `WARN` is a static cap
-    /// rather than the configured threshold because this layer is built before the config is even
-    /// loaded -- sound because `logit_config::InternalLogs` offers only `warn`/`error`/`off`
-    /// (`logit-cli::pipeline::severity_for_logs`), so `WARN` is never stricter than a reachable
-    /// threshold and the real gate stays `on_event`'s own `threshold` check. It is a cap rather
-    /// than *no* filter for a reason: an unfiltered layer reports no `max_level_hint`, which drags
-    /// the process-wide static max level up to `TRACE` and makes every `debug!`/`trace!` callsite
-    /// in every dependency evaluate dynamically -- moving the bug rather than fixing it. If
-    /// `InternalLogs` ever gains a level below `warn`, this cap moves down with it.
+    /// `WARN` is a static cap, not the configured threshold, because the layer exists before the
+    /// config loads. That's sound while `logit_config::InternalLogs` offers only
+    /// `warn`/`error`/`off`; `on_event`'s threshold check is the real gate. A level below `warn`
+    /// must lower this cap. It's a cap rather than no filter because an unfiltered layer reports
+    /// no `max_level_hint`, raising the static max level to `TRACE` for every dependency.
     pub fn capture_filter() -> tracing_subscriber::filter::Targets {
         tracing_subscriber::filter::Targets::new()
             .with_target("logit", tracing_subscriber::filter::LevelFilter::WARN)
@@ -898,10 +749,8 @@ where
     ) {
         let inner = self.0.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(inner) = &*inner else { return }; // not yet activated, or never will be
-                                                   // Only this crate's own self-diagnostics, not every dependency's own `tracing`
-                                                   // instrumentation (hyper's, tokio's, ...) -- every call site this layer is meant to
-                                                   // capture (`Diagnostics`, the runtime's lifecycle events) sets this target explicitly.
         if event.metadata().target() != "logit" {
+            // Not `logit`'s own diagnostics (which set this target explicitly): a dependency's.
             return;
         }
         let level = severity_from_level(*event.metadata().level());
@@ -909,11 +758,8 @@ where
             return;
         }
 
-        // `tracing`'s field values arrive through visitor callbacks, not a map -- the same
-        // capturing-`Visit` shape `crates/logit-core/src/diag.rs`'s own tests use, and for the
-        // same reason: a string field's value (`component`, `key`) and the formatted message
-        // both surface via `record_debug` (quoted, since the underlying `fmt::Arguments` is
-        // recorded through `Debug`), hence the `trim_matches('"')` below.
+        // String fields and the message can arrive through `record_debug`, quoted; hence the
+        // `trim_matches('"')`.
         struct Visitor {
             component: Option<String>,
             key: Option<String>,
@@ -936,11 +782,8 @@ where
         let mut visitor = Visitor { component: None, key: None, message: String::new() };
         event.record(&mut visitor);
 
-        // Two fallbacks, both deliberate: an event with no `component` field (a runtime lifecycle
-        // event -- `ready`, `shutdown signal received`) is attributed to the `internal` component
-        // itself, under the stable key `"process"`; an event *with* a `component` but no `key`
-        // field (`Diagnostics::warn`, which never sets one) still needs some key, so it gets the
-        // generic placeholder `"log"` rather than an empty string.
+        // No `component` (a lifecycle event like `ready`): the `internal` component, key
+        // `"process"`. A `component` with no `key` (`Diagnostics::warn`): key `"log"`.
         let (target_id, key) = match visitor.component {
             Some(component) => (component, visitor.key.unwrap_or_else(|| "log".to_string())),
             None => (inner.internal_id.clone(), "process".to_string()),
@@ -957,17 +800,12 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    // `now_unix_nanos`'s test-only wall-clock override -- see that fn's own doc comment.
-    // `pub(super)` so `now_unix_nanos` (defined in the parent module) can read it; nothing outside
-    // this crate ever sees it, `#[cfg(test)]` on both this module and the read site keeps it out
-    // of a non-test binary entirely.
+    // `now_unix_nanos`'s wall-clock override.
     thread_local! {
         pub(super) static CLOCK_OVERRIDE: Cell<Option<i64>> = const { Cell::new(None) };
     }
 
-    /// Sets the wall clock `now_unix_nanos()` will report on this thread until
-    /// [`clear_test_clock`] is called -- thread-local, and `cargo nextest` runs each test in its
-    /// own process, so this can't leak into a sibling test.
+    /// Sets what `now_unix_nanos()` reports on this thread until [`clear_test_clock`].
     fn set_test_clock(nanos: i64) {
         CLOCK_OVERRIDE.with(|cell| cell.set(Some(nanos)));
     }
@@ -987,10 +825,6 @@ mod tests {
         telemetry.count("x", 1.0, &[]);
         telemetry.gauge("x", 1.0, &[]);
         telemetry.timing("x", Duration::from_secs(1), &[]);
-        // `timer()` on a disabled handle must not call `Instant::now()` -- there is nothing to
-        // assert about a clock read directly, so this asserts the observable consequence: the
-        // guard's `start` is `None`, proven by dropping it recording nothing (no panic, and
-        // nothing to drain, since a disabled handle has no buffer at all).
         drop(telemetry.timer("y"));
     }
 
@@ -1088,11 +922,7 @@ mod tests {
         assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("listener"));
     }
 
-    /// A caller-supplied tag can never relabel which component a point is attributed to -- a real
-    /// risk once a tag key is chosen by something less constrained than this codebase's own
-    /// `&'static str` call sites (a Lua script, `crates/logit-script/src/telemetry.rs`). Proven
-    /// directly against `Telemetry::count`, not just against the Lua binding, since the guarantee
-    /// belongs to `ComponentBuffer::drain` regardless of who supplied the tag.
+    /// A caller-supplied tag can't relabel which component a point is attributed to.
     #[test]
     fn a_tag_named_component_kind_or_role_cannot_override_the_real_identity() {
         let registry = Registry::new();
@@ -1110,11 +940,7 @@ mod tests {
         assert_eq!(attrs.get("role").and_then(|v| v.as_str()), Some("transform"));
     }
 
-    /// The gap overwriting identity at drain time alone left open: two counts tagged with
-    /// *different* values under a reserved key must still coalesce into one point, not occupy two
-    /// separate (and, once identity is overwritten, externally indistinguishable) cardinality
-    /// slots. Proven by checking there is exactly one drained event summing both counts, not just
-    /// that the identity attributes come out right.
+    /// Different values under a reserved tag key coalesce into one point, not two slots.
     #[test]
     fn reserved_tags_with_different_values_still_coalesce_into_one_point() {
         let registry = Registry::new();
@@ -1139,9 +965,7 @@ mod tests {
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("noisy", "lua", "transform");
         for i in 0..MAX_KEYS_PER_COMPONENT + 5 {
-            // Leak the formatted tag value as `'static` for this test only -- production tags are
-            // always genuinely `'static` (compile-time constants); this is the cheapest way to
-            // manufacture that many distinct *test* keys without changing the API's shape.
+            // Leaked to satisfy `Tag`'s `'static`; production tags are constants.
             let value: &'static str = Box::leak(i.to_string().into_boxed_str());
             telemetry.count("m", 1.0, &[("i", value)]);
         }
@@ -1212,16 +1036,11 @@ mod tests {
             MetricKind::Sum(s) => assert_eq!(s.value, 2.0),
             other => panic!("expected Sum, got {other:?}"),
         }
-        // The first registration's kind/role wins -- a later call didn't silently overwrite it.
+        // The first registration's kind/role wins.
         assert_eq!(events[0].attributes.get("kind").and_then(|v| v.as_str()), Some("statsd_in"));
     }
 
-    /// Pins the caveat documented on `Timer`: recording on `Drop` means a `Timer` dropped without
-    /// ever observing the "real" elapsed time (e.g. because the future holding it was cancelled)
-    /// still records *something*, deliberately -- there is no way to distinguish "completed" from
-    /// "cancelled" from inside `Drop` alone, and that's accepted, not a bug this test exists to
-    /// catch. What it does pin: a `Timer` explicitly dropped early still records exactly one
-    /// sample, never zero and never a panic.
+    /// A `Timer` dropped early (as by a cancelled `.await`) records one sample, per `Timer`'s doc.
     #[test]
     fn a_timer_dropped_early_still_records_exactly_one_sample() {
         let registry = Registry::new();
@@ -1253,10 +1072,7 @@ mod tests {
         id
     }
 
-    /// Test-only trace id generation -- `next_id_bytes` (`crates/logit-pipeline/src/fanout.rs`) is
-    /// a sibling crate's private helper, not reachable here, so this reimplements "many plausible,
-    /// non-degenerate ids" using nothing more exotic than `RandomState`'s own per-call entropy.
-    /// Fine for a distributional test; not a claim about production id quality.
+    /// Plausible random ids from `RandomState`'s entropy, good enough for a distributional test.
     fn random_trace_ids(n: usize) -> Vec<[u8; 16]> {
         use std::hash::{BuildHasher, Hasher};
         let state = std::collections::hash_map::RandomState::new();
@@ -1282,10 +1098,6 @@ mod tests {
     fn a_disabled_handle_opens_a_span_that_records_nothing_and_never_reads_the_clock() {
         let telemetry = Telemetry::default();
         let mut span = telemetry.span("send", SpanKind::Producer, trace_id(1), span_id(1), None);
-        // Every method is callable and a no-op -- nothing to assert about a clock read directly
-        // (same reasoning as `Timer`'s own disabled test), so this asserts the observable
-        // consequence instead: dropping the guard records nothing (no panic, and this handle has
-        // no buffer to drain in the first place).
         span.events(3);
         span.tag("k", "v");
         span.error();
@@ -1316,9 +1128,7 @@ mod tests {
         }
     }
 
-    /// Exact verdicts for fixed ids, not just determinism or a proportion: the bit source (the
-    /// top 53 bits of the low 8 bytes, big-endian) and the compare are both pinned, so a refactor
-    /// of `trace_is_sampled` that changes which ids it keeps fails here.
+    /// Pins exact verdicts for fixed ids, so a change in which ids are kept fails here.
     #[test]
     fn the_sampler_reaches_pinned_verdicts_for_fixed_trace_ids() {
         fn id(high: u64, low: u64) -> [u8; 16] {
@@ -1413,15 +1223,7 @@ mod tests {
         assert_ne!(span_event.timestamp, 1, "must not be stamped with the drain time");
     }
 
-    /// The clock-safety guarantee `PendingSpan::started_at`'s doc comment describes, proven
-    /// directly rather than merely asserted after one lucky run: simulates a wall clock that jumps
-    /// backward between a span's start and its finish (an NTP correction, an admin `date` call) via
-    /// `now_unix_nanos`'s test-only override, and shows `end_timestamp` still can't precede
-    /// `Event::timestamp` (the span's own start) -- because `finish_inner` never reads the wall
-    /// clock a second time at all, only `started_at.elapsed()` (`Instant`, monotonic on every
-    /// platform this project ships to). Against a two-independent-`SystemTime::now()`-reads
-    /// version, the exact backward jump below would produce `end < start` every time, not
-    /// occasionally -- this is a structural guarantee, not a timing-dependent one.
+    /// A backward wall-clock jump mid-span can't make `end_timestamp` precede the start.
     #[test]
     fn a_wall_clock_moving_backward_between_start_and_finish_cannot_make_end_precede_start() {
         let registry = Registry::with_span_sampling(1.0);
@@ -1429,8 +1231,7 @@ mod tests {
 
         set_test_clock(1_000_000_000); // T0: an arbitrary wall-clock start
         let span = telemetry.span("deliver", SpanKind::Client, trace_id(1), span_id(1), None);
-        // The wall clock jumps backward by a full second while the span is still open -- far
-        // larger than any real elapsed time this test's own execution could add on its own.
+        // Back a full second, far more than the test's own elapsed time.
         set_test_clock(0);
         drop(span);
         clear_test_clock();
@@ -1512,7 +1313,7 @@ mod tests {
         assert!(find_span_event(&events).is_some(), "a span event");
     }
 
-    // -- workstream D: `TelemetryLayer` (docs/plans/operator-surface.md) --
+    // -- `TelemetryLayer` --
 
     use tracing_subscriber::layer::Layer as _;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1588,8 +1389,6 @@ mod tests {
     fn an_inactive_layer_captures_nothing() {
         let registry = Registry::new();
         registry.telemetry_for("x", "json", "transform");
-        // Never activated -- the default state, and what a config with no `internal` component
-        // or `logs: off` leaves it at forever.
         let layer = TelemetryLayer::new();
 
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -1603,13 +1402,8 @@ mod tests {
 
     #[test]
     fn a_strict_env_filter_does_not_suppress_capture() {
-        // The regression this pins: with `--log-level`/`LOGIT_LOG`'s `EnvFilter` installed
-        // globally (`registry().with(filter)`) rather than scoped to the stderr layer,
-        // `EnvFilter::register_callsite` returns `Interest::never()` for a `warn` callsite under
-        // `error` -- a verdict `tracing-core` caches at that callsite for the life of the process
-        // -- so `on_event` never runs at all and `internal: { logs: warn }` silently becomes
-        // `error`. This builds the same shape `logit-cli::main::init_logging` builds: the
-        // `EnvFilter` scoped to the rendering layer, `TelemetryLayer::capture_filter` on this one.
+        // A global `EnvFilter` would cache `Interest::never()` for `warn` under `error` (see
+        // `capture_filter`); this builds `init_logging`'s per-layer shape.
         let registry = Registry::new();
         registry.telemetry_for("x", "json", "transform");
         let layer = TelemetryLayer::new();

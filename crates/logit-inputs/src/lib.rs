@@ -1,19 +1,15 @@
-//! Per-protocol input implementations. The v0.1 vertical slice target is `statsd`
-//! (`docs/OVERVIEW.md`); other protocols implement the same trait incrementally.
+//! Per-protocol input implementations: the `Input` behind every `*_in` component kind, and
+//! `internal`.
 //!
-//! The `Input` trait itself lives in `logit-pipeline`
-//! (`docs/design/pipeline-graph.md`'s "Crate layout" section) -- this crate depends on that one
-//! for the trait, not the other way around, so the pipeline runtime never has to know about any
-//! concrete protocol.
+//! The `Input` trait lives in `logit-pipeline` (`docs/design/pipeline-graph.md`, "Crate layout"):
+//! this crate depends on that one, not the other way around, so the pipeline runtime never knows
+//! about a concrete protocol.
 
-// This crate carries two of the codebase's three raw-`libc` production `unsafe` call sites
-// (`udp.rs`'s `recvmmsg`, `tail/watch.rs`'s hand-rolled inotify) -- see
-// `docs/adr/out-of-ci-unsafe-verification.md`. Denied at the crate level rather than promoted to
-// `[workspace.lints]`: a workspace-wide `unsafe_op_in_unsafe_fn` deny has real fallout in
-// `logit-bench`'s and `logit-perf`'s own `unsafe` (dev-only crates with no stake in this
-// cluster's review bar, and no `SAFETY:` comment immediately preceding every unsafe operation
-// today), so the bar is drawn narrowly around the two crates that actually hold this cluster's
-// code instead.
+// This crate holds two of the codebase's three raw-`libc` production `unsafe` call sites
+// (`udp.rs`'s `recvmmsg`, `tail/watch.rs`'s inotify; `docs/adr/out-of-ci-unsafe-verification.md`).
+// Denied per crate, not in `[workspace.lints]`, because a workspace-wide deny would fire on
+// `logit-bench`'s and `logit-perf`'s dev-only `unsafe`, which don't hold this bar (a `SAFETY:`
+// comment before every unsafe operation).
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
