@@ -27,10 +27,12 @@
 //! occasionally makes one small blocking cursor write (with two `fsync`s) and one file deletion,
 //! never a segment read or write.
 //!
-//! **Every filesystem failure is observed.** A failed cursor write, segment `create`, `flush`,
+//! **Filesystem failures are observed.** A failed cursor write, segment `create`, `flush`,
 //! `fsync`, or unlink counts `logit.component.buffer.disk.errors{op}` and is diagnosed
 //! (`cursor_error` for the cursor, `disk_fs_error` for the rest). Each mutating operation is
-//! preceded by a [`crate::fault`] check, so tests can fail or freeze it.
+//! preceded by a [`crate::fault`] check, so tests can fail or freeze it. The one exception to
+//! both is the torn-tail repair's `set_len` in `write_record`, which is still unchecked and
+//! unobserved.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -74,7 +76,7 @@ const READ_CHUNK_INITIAL: usize = 8 * 1024;
 const DISK_SEGMENTS: &str = "logit.component.buffer.disk.segments";
 const DISK_REPLAYED: &str = "logit.component.buffer.disk.replayed";
 const DISK_TRUNCATED: &str = "logit.component.buffer.disk.truncated";
-/// Tagged `op`: `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`.
+/// Tagged `op`: `cursor`, `flush`, `fsync`, `create`, or `unlink`.
 const DISK_ERRORS: &str = "logit.component.buffer.disk.errors";
 
 const SEGMENT_CREATE: Point = Point::new(sites::SPOOL_SEGMENT, Op::Create);

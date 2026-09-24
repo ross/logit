@@ -326,7 +326,7 @@ disk-backed sink never emits `reason="shutdown"`, because it drops nothing at sh
   means the previous process ended mid-write, which an ordinary `SIGKILL` does. Note it; don't
   alert on it alone.
 - `logit.component.buffer.disk.errors{op}` (count): a failed spool filesystem operation, `op` one
-  of `cursor`, `flush`, `fsync`, `create`, `truncate`, or `unlink`. Alert on any nonzero value: the
+  of `cursor`, `flush`, `fsync`, `create`, or `unlink`. Alert on any nonzero value: the
   durability level above no longer holds. A failed `cursor` write means more replay after a
   restart; a failed `fsync` means a power loss can lose more.
 

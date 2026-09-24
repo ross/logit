@@ -473,7 +473,7 @@ Disk-backed sinks (`DiskQueue`) also emit:
 | `logit.component.buffer.disk.segments` | gauge | segment files currently on disk |
 | `logit.component.buffer.disk.replayed` | count | records found between the resume point and the end of all segments, at `DiskQueue::open` |
 | `logit.component.buffer.disk.truncated` | count | a torn tail found and truncated at `DiskQueue::open` |
-| `logit.component.buffer.disk.errors{op=...}` | count | a failed spool filesystem operation that doesn't drop a batch, `op` one of `cursor` (a `cursor.json` write), `flush`, `fsync` (a segment or the spool directory), `create` (a rotation's new segment), `truncate` (the torn-tail repair), `unlink` (a consumed segment) |
+| `logit.component.buffer.disk.errors{op=...}` | count | a failed spool filesystem operation that doesn't drop a batch, `op` one of `cursor` (a `cursor.json` write), `flush`, `fsync` (a segment or the spool directory), `create` (a rotation's new segment), `unlink` (a consumed segment) |
 
 Each `disk.errors` point is also diagnosed: `op="cursor"` under
 `logit.component.diagnostics{key="cursor_error"}` (the key `DiskQueue::open` already uses for an
