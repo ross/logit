@@ -153,3 +153,7 @@ Three facts from the survey drive the shape of the decision:
   tracer-direct topology runs through `datadog_trace_out` and a real Agent.
 - Nine survey facts remain unverified against Datadog's closed backend and are settled by the
   plan's W7 against a trial org and a real Agent; whichever changes a decision here amends it.
+- The hand-rolled `DdSketch` store measures +4.2% CPU on `aggregate` and +4.4% on `json-parse` on
+  the perf VM, both sketch-heavy paths, and no measurable cost anywhere else
+  ([`docs/design/performance.md`](../design/performance.md) §9). Accepted: bin-for-bin Datadog
+  parity needs the Agent's own bin mapping, not a cheaper store that doesn't match it.

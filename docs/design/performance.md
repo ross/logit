@@ -1357,6 +1357,90 @@ depend on the count. The first estimates were too generous across the board: the
 point for the "the first session that runs them should expect to retune them" line these
 scenarios' YAML and `docs/plans/load-test-harness.md` already carried.
 
+## 9. Datadog stack: the sparse sketch store and serde_json's float_roundtrip (2026-09-24)
+
+**Result: the sketch store's cost is accepted, and `float_roundtrip`'s gate is cleared.** [ADR
+`datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) hand-rolls `DdSketch` to
+match the Datadog Agent's own bin mapping bin-for-bin; this session measures what that costs against
+`main`, and separately closes [`docs/known-gaps.md`](../known-gaps.md#datadog)'s open
+`float_roundtrip` question (`serde_json`'s exactly-rounded float parser, enabled workspace-wide for
+the Datadog JSON routes).
+
+### Box facts and protocol
+
+| Fact | Value |
+|---|---|
+| VM size | `Standard_F8as_v6` (8 vCPU, SMT off — 8 full physical cores, `docs/adr/disposable-azure-perf-vm.md`) |
+| CPU model | AMD EPYC 9V74 80-Core Processor (Genoa, cloud SKU) — from `perf/results/*.json`'s `cpu_model` |
+| `nproc` | 8 — from the same JSON |
+| `rustc` | `rustc 1.98.1 (48a229cea 2026-09-01)` — from the same JSON |
+| Profile | `release` |
+| `box_state` | empty `{}` on every result file, same as every other VM session in this document |
+| `main` binary | source `main`, sha `22a6b0312fbdfbfd1fdc7e8d9a88935d67189059`, sha256 `1ffe112b2ae0bfbfc168862b3b986c1888c22d658ea745783a88f8b2c5090b8d` |
+| `dd-w1` binary | source `dd/w1`, sha `d844e73bc5ebf263777e8359c70293c60508c92a`, sha256 `59e891a5895d379ab7088769a3db382767f470c30f40d469f5752722cacf00c2` |
+| `dd-w2b` binary | source `dd/w2b`, sha `c17828c604b28be0534ccbf1f262505d5d4969e7`, sha256 `6349605695d5af575a54cab4cff6ba9cdf1689d50b579aa78c3537c243bf41c0` |
+
+All three `sha256`s are distinct, confirmed before any scenario ran.
+
+**Protocol.** `script/vm build main dd/w1 dd/w2b` built the three binaries once; seven scenarios
+(`passthrough`, `aggregate`, `json-parse`, `json-parse-x3`, `json-parse-access-log`,
+`json-parse-app-log`, `json-parse-nested-log`) then each ran two interleaved rounds of `script/perf
+run --repeat 3 --profile release --no-build --logit-bin perf/bins/<slug>/logit` per binary (round 1:
+every binary back to back; round 2: the same order again), the same discipline §7 and §8 use. The
+three repeats from each round pool into one **median of 6** per scenario/binary, with
+`spread = (max − min) / min` over those six read as the noise floor a delta has to clear. The
+session ran detached on the VM (`nohup`/`setsid` via a driver script), so a dropped SSH session
+didn't kill it; `vm-warmup`'s throwaway repeat was excluded, as it always is.
+
+### CPU µs/event (median of 6; deltas in %, + = slower, − = faster)
+
+| scenario | main | dd-w1 | dd-w2b | Δ w1/main | Δ w2b/w1 | Δ w2b/main | spread (max of the three) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| aggregate | 0.325 | 0.339 | 0.340 | **+4.18%** | +0.39% | **+4.59%** | 0.79% |
+| json-parse | 0.895 | 0.934 | 0.927 | **+4.40%** | −0.76% | **+3.60%** | 1.44% |
+| json-parse-access-log | 3.210 | 3.250 | 3.189 | +1.26% | **−1.89%** | −0.65% | 1.61% |
+| json-parse-app-log | 1.387 | 1.399 | 1.384 | +0.89% | −1.10% | −0.23% | 2.49% |
+| json-parse-nested-log | 2.331 | 2.289 | 2.330 | −1.80% | +1.82% | −0.01% | 4.83% |
+| json-parse-x3 | 2.460 | 2.474 | 2.461 | +0.58% | −0.55% | +0.02% | 3.72% |
+| passthrough | 0.330 | 0.330 | 0.329 | +0.02% | −0.32% | −0.30% | 0.98% |
+
+(Bold = delta exceeds that scenario's own spread, i.e. material.)
+
+### Peak RSS, MiB (median of 6; deltas in %, + = larger, − = smaller)
+
+| scenario | main | dd-w1 | dd-w2b | Δ w1/main | Δ w2b/w1 | Δ w2b/main | spread (max of the three) |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| aggregate | 66.1 | 66.2 | 68.9 | +0.19% | +4.03% | +4.23% | 9.84% |
+| json-parse | 96.2 | 97.0 | 102.0 | +0.88% | +5.15% | +6.07% | 47.03% |
+| json-parse-access-log | 62.2 | 58.7 | 60.3 | −5.53% | +2.65% | −3.03% | 12.32% |
+| json-parse-app-log | 61.9 | 61.8 | 61.3 | −0.17% | −0.75% | −0.92% | 9.91% |
+| json-parse-nested-log | 66.4 | 66.9 | 66.6 | +0.79% | −0.44% | +0.34% | 25.56% |
+| json-parse-x3 | 84.5 | 80.8 | 80.0 | −4.33% | −0.99% | −5.28% | 8.20% |
+| passthrough | 68.6 | 66.7 | 67.1 | −2.83% | +0.67% | −2.18% | 8.32% |
+
+No RSS delta exceeds its scenario's own spread — every RSS delta above is inside the noise floor.
+
+### Reading
+
+`dd/w1`'s hand-rolled `DdSketch` store costs +4.2% on `aggregate` and +4.4% on `json-parse`, the
+only two CPU deltas in either table that clear their own spread. Both scenarios have a sketch on
+the hot path — `aggregate` sketches every series, and `json-parse`'s `kv_metrics` stage sketches a
+`Samples` metric at the sink — while every scenario without one (`passthrough`,
+`json-parse-access-log`, `-app-log`, `-nested-log`, `-x3`) is flat within noise end to end, `main`
+to `dd-w2b`. This is accepted: bin-for-bin Datadog parity needs the Agent's own bin mapping, and a
+cheaper store that didn't match it would relay a sketch that reads differently at Datadog's end
+([`docs/known-gaps.md`](../known-gaps.md#datadog)'s sketch-store entry).
+
+`dd/w2b`'s `serde_json` `float_roundtrip` feature is flat within noise on every `json-parse*`
+scenario: the one delta that clears spread at that step, `json-parse-access-log`'s −1.89% against a
+1.61% spread, is a speedup, not the slowdown the feature's ~2×-on-float-parsing cost would predict,
+and no other `json-parse*` scenario moves with it. `docs/known-gaps.md`'s `float_roundtrip` entry
+is closed on this evidence: the feature stays enabled workspace-wide with no measurable cost.
+
+Peak RSS is uninformative here: every delta, at every step, falls inside that scenario's own
+spread, including two very wide ones (`json-parse`'s 47% spread, `json-parse-nested-log`'s 26%). No
+RSS conclusion should be drawn from this session.
+
 ## Open questions
 
 - **When and how the harness runs during development is deliberately undecided**, as

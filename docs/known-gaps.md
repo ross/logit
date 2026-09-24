@@ -866,24 +866,21 @@ search for an old symptom still finds what fixed it and what, if anything, is st
 
 ## Datadog
 
-- **`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
-  unmeasured.** The Datadog JSON routes (v1 series, v2 JSON series, distribution points) need an
-  exactly rounded float parser to be a fixed point: `serde_json`'s default parser isn't correctly
-  rounded (it can land a value one or two ulps off the nearest `f64`, and re-parsing its own
-  shortest output can move it again), which would otherwise drift a relayed metric value on every
-  `datadog_in -> datadog_out` hop. `crates/logit-proto/Cargo.toml` enables `float_roundtrip` on
-  its `serde_json` dependency; Cargo unifies features across the workspace, so this also applies
-  to `otlp_in`'s OTLP/JSON decoding and, transitively, the `json` transform's parse path.
-  `serde_json` documents the feature as costing about 2x on float parsing.
-  - **Consequence:** a `json`-heavy pipeline (or `otlp_in`'s JSON leg) may parse floats slower by
-    an unmeasured amount; nothing else in the request changes.
-  - **Revisit trigger:** measure on the perf VM with `script/perf` (the `json` scenarios) against
-    a `main` binary before this stack merges, in the same VM session as W1's sketch-store
-    measurement. If the cost is material, the fallback is a codec-local exact parse of number
-    tokens in `logit_proto::datadog` rather than a workspace-wide tolerance, per
-    [ADR `event-sizing-and-allocation-strategy`](adr/event-sizing-and-allocation-strategy.md)'s
-    rule that a parsing/allocation-strategy change needs a real binary measurement, not a
-    micro-benchmark, before it's believed.
+- ~~**`serde_json`'s `float_roundtrip` feature is enabled workspace-wide and its cost is
+  unmeasured.**~~ **Closed.** Measured on the perf VM, `dd/w1` against `dd/w2b`
+  (`docs/design/performance.md` §9): every `json-parse*` scenario is flat within noise, so the
+  feature's cost is unmeasurable in practice and it stays on workspace-wide.
+- **The hand-rolled `DdSketch` store costs about 4% CPU on a sketch-heavy stage.** `aggregate`
+  sketches every series, and `kv_metrics` sketches a `Samples` metric at the sink on `json-parse`'s
+  path; both pay for it: `aggregate` measures 0.339 vs 0.325 µs/event and `json-parse` 0.934 vs
+  0.895 µs/event, `dd/w1` against `main` (`docs/design/performance.md` §9).
+  - **Consequence:** accepted for bin-for-bin Datadog parity — a cheaper store that didn't match
+    the Agent's own bin mapping would relay a sketch that reads differently at Datadog's end ([ADR
+    `datadog-agent-and-intake-relay`](adr/datadog-agent-and-intake-relay.md)).
+  - **Revisit trigger:** the Agent's own mitigation is a fixed-size key buffer
+    (`pkg/util/quantile/agent.go` buffers 512 keys and merges them into the sorted store in one
+    pass) instead of a binary search plus `Vec::insert` per value. Measure on the VM before
+    believing it helps.
 
 ## syslog
 
