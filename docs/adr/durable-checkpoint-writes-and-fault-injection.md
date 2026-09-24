@@ -68,13 +68,15 @@ reviewer can check.
    its own tmp+rename code. The helper is synchronous.
 
 2. **Where each caller runs it.** The spool calls the helper inline from `persist_cursor`, which
-   `DiskQueue::commit` reaches through `advance_read_cursor` and `roll_read_cursor`, on the runtime
-   thread and under the queue's state lock. That is the blocking write `commit` already makes,
-   now with two fsyncs. It stays inline because it runs at most once per `checkpoint_interval`
-   (1s by default) and once per segment roll, and because keeping `commit` synchronous is what
-   keeps `write_loop`'s delivery path free of a new `.await` (the disk ADR's correction 2). The
-   tail calls the helper through `tokio::task::spawn_blocking`, and `CheckpointStore::write`
-   becomes `async`.
+   `DiskQueue::commit` reaches through `advance_read_cursor` and `roll_read_cursor`, but never
+   under the queue's state lock: it copies the cursor under the lock, releases the lock, runs the
+   helper, then locks again to record the result. A persist's two fsyncs therefore stall only the
+   committing sink task, never a concurrent `push` or `peek` waiting on the state mutex. That is
+   the blocking write `commit` already makes, now with two fsyncs. It stays inline because it runs
+   at most once per `checkpoint_interval` (1s by default) and once per segment roll, and because
+   keeping `commit` synchronous is what keeps `write_loop`'s delivery path free of a new `.await`
+   (the disk ADR's correction 2). The tail calls the helper through
+   `tokio::task::spawn_blocking`, and `CheckpointStore::write` becomes `async`.
 
 3. **Observed failures, with these names.**
    - Spool: `logit.component.buffer.disk.errors` (count), tagged `op` = `cursor`, `flush`,
@@ -210,8 +212,9 @@ script is needed. This list is filled in as each workstream lands.
   though `logit-bench` never asks for it. `disk_queue_push_one_batch` and
   `disk_queue_peek_cached_costs_nothing` must stay exact with the seam present. A change to the
   disarmed path that allocates or takes a lock fails those pins; that is the pins working.
-- **Each cursor persist costs two fsyncs more than today,** inline in `commit`, at most once per
-  `checkpoint_interval` plus once per segment roll. A `logit-perf` disk-spool scenario is the
+- **Each cursor persist costs two fsyncs more than today,** inline in `commit`, outside the state
+  lock, at most once per `checkpoint_interval` plus once per segment roll. Today's persist runs
+  under that lock, so moving it out is part of the change. A `logit-perf` disk-spool scenario is the
   follow-up if it shows up in delivery latency.
 - **The tail checkpoint write moves off the runtime thread** (decision 2); `CheckpointStore::load`
   stays a blocking read at bind, an accepted startup cost.
