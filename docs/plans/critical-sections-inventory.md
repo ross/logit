@@ -2343,10 +2343,11 @@ surveyor's.
   of the bound and unlinks it after persisting the cursor, counted `op="unlink"` on failure
   (`a_segment_left_behind_by_a_failed_unlink_is_removed_at_the_next_open`). The blocking cursor
   write inside `commit` is unchanged and still unmeasured.
-- **Perf follow-up (dur/w8):** measured, then moved. The durable persist on every roll cost
-  16–27% of `buffered-small-segments`'s events/s on the perf VM (`docs/design/performance.md` §3),
-  so a roll now queues its cursor and unlinks to a per-spool worker thread and `commit` returns
-  without waiting. The worker still persists before it unlinks, and jobs queue under the state lock
+- **Perf follow-up (dur/w8):** the line above, "The blocking cursor write inside `commit` is
+  unchanged and still unmeasured", no longer holds: it was measured, then moved. The durable
+  persist on every roll cost 16–27% of `buffered-small-segments`'s events/s on the perf VM
+  (`docs/design/performance.md` §3), so a roll now queues its cursor and unlinks to a per-spool
+  worker thread and `commit` returns without waiting. The worker still persists before it unlinks, and jobs queue under the state lock
   in cursor order; `a_segment_roll_returns_before_its_cursor_is_durable_and_unlinks_after_it_is`,
   `a_crash_before_the_worker_persists_replays_and_loses_nothing`,
   `a_crash_after_the_persist_but_before_the_unlinks_is_cleaned_at_open`, and
