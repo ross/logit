@@ -2963,7 +2963,7 @@
           ]
         },
         "max_files": {
-          "description": "Files to keep, active plus rotated. Defaults to `5`; `0` is rejected.",
+          "description": "Files to keep, active plus rotated. Defaults to `5`. Must be between `1` and `1000` (`MAX_ROTATE_FILES`): 1000 keeps 999 rotated files, about 2.7 years of daily files or 41 days of hourly ones.",
           "default": 5,
           "type": "integer",
           "format": "uint32",

@@ -76,8 +76,8 @@
 //!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
 //!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
 //! 29. A `file_out` whose `rotate:` sets neither `max_bytes` nor `interval` (use `stdio_out` for an
-//!     unrotated file), or a `rotate.max_bytes`/`max_files` of `0`
-//!     (`docs/adr/rotating-file-output.md`).
+//!     unrotated file), a `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above
+//!     `logit_config::MAX_ROTATE_FILES` (`docs/adr/rotating-file-output.md`).
 //! 30. A `kv` with an empty `pair_sep`/`kv_sep`, `pair_sep == kv_sep`, or a `kv_sep` containing
 //!     `pair_sep`: since `pair_sep` splits first, each is a certain no-op or garbage
 //!     (`docs/adr/logfmt-and-kv-parsing.md`). `logfmt` needs no rule: its one field is a `bool`.
@@ -1226,7 +1226,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 29: `file_out`'s `rotate:`. With neither trigger it never rotates, which is what
     // `stdio_out` is for, so the message points there. `max_bytes: 0`/`max_files: 0` are impossible
-    // bounds.
+    // bounds, and `max_files` above `MAX_ROTATE_FILES` makes every rotation a syscall storm.
     for (id, component) in &components {
         if let ComponentKind::FileOut { path, rotate, .. } = &component.kind {
             if rotate.max_bytes.is_none() && rotate.interval.is_none() {
@@ -1246,6 +1246,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 anyhow::bail!(
                     "component '{id}': 'rotate.max_files' must be at least 1 -- 0 would delete \
                      the file it just rotated"
+                );
+            }
+            if rotate.max_files > logit_config::MAX_ROTATE_FILES {
+                anyhow::bail!(
+                    "component '{id}': 'rotate.max_files' must be at most {} -- every rotation \
+                     renames each retained file",
+                    logit_config::MAX_ROTATE_FILES
                 );
             }
         }
@@ -6614,6 +6621,41 @@ mod tests {
             ),
         ]));
         assert!(err.contains("'rotate.max_files' must be at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_max_files_over_the_ceiling_is_rejected() {
+        let err = expect_err(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: logit_config::MAX_ROTATE_FILES + 1,
+                }),
+            ),
+        ]));
+        assert!(err.contains("'out'"), "got: {err}");
+        assert!(err.contains("'rotate.max_files' must be at most 1000"), "got: {err}");
+    }
+
+    #[test]
+    fn file_out_with_max_files_at_the_ceiling_is_accepted() {
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            (
+                "out",
+                vec!["in"],
+                file_out(logit_config::RotateConfig {
+                    max_bytes: Some(1024),
+                    interval: None,
+                    max_files: logit_config::MAX_ROTATE_FILES,
+                }),
+            ),
+        ]))
+        .expect("max_files at the ceiling should validate fine");
     }
 
     #[test]

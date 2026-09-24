@@ -2508,6 +2508,12 @@ impl JsonSchema for StdioTarget {
     }
 }
 
+/// The largest `rotate.max_files` graph validation accepts. It counts the active file, so 1000
+/// keeps 999 rotated files: about 2.7 years of daily files, or 41 days of hourly ones. Every
+/// rotation stats and renames each retained file, so a larger value makes each rotation slower
+/// without a use a count-based policy needs.
+pub const MAX_ROTATE_FILES: u32 = 1000;
+
 /// `file_out`'s rotation policy. At least one of `max_bytes`/`interval` must be set; a config
 /// that would never rotate is rejected (use `stdio_out` for an unrotated file). `max_files`
 /// counts every file `file_out` maintains, active plus rotated, so `max_files * max_bytes` reads
@@ -2525,7 +2531,9 @@ pub struct RotateConfig {
     /// triggers a rotation.
     #[serde(default)]
     pub interval: Option<RotateInterval>,
-    /// Files to keep, active plus rotated. Defaults to `5`; `0` is rejected.
+    /// Files to keep, active plus rotated. Defaults to `5`. Must be between `1` and `1000`
+    /// (`MAX_ROTATE_FILES`): 1000 keeps 999 rotated files, about 2.7 years of daily files or 41
+    /// days of hourly ones.
     pub max_files: u32,
 }
 

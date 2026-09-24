@@ -301,7 +301,8 @@ silently ignored. `0` for a count or duration bound is usually impossible, not s
 26. A `tail_in` with no `paths`, an empty entry, or a `*` outside the final path component.
 27. A `docker_in` that would tail nothing, or with an empty or duplicate entry or an empty `root`.
 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
-29. A `file_out` that would never rotate, or a `rotate.max_bytes`/`max_files` of `0`.
+29. A `file_out` that would never rotate, a `rotate.max_bytes`/`max_files` of `0`, or a
+    `max_files` above 1000 (`logit_config::MAX_ROTATE_FILES`).
 30. A `kv` with an empty, identical, or overlapping `pair_sep`/`kv_sep`.
 31. A `regex` with an empty `field`, or a `pattern` that fails to compile or has no named group.
 32. A `csv` with no `columns`, an empty or duplicate column name, or an unusable `delimiter`.
